@@ -1,0 +1,55 @@
+# Local development stack. Secrets come from a gitignored .env file
+# (copy .env.example). Postgres backs the comms domain (message/permission
+# state, DESIGN.md §5). After `docker compose up -d postgres`, run
+# `uv run alembic upgrade head` (with DATABASE_URL pointed at this service)
+# to create the schema — see README.md's "Database / migrations" section.
+services:
+  agent-comms-mcp:
+    build: .
+    ports:
+      - "${MCP_PORT:-8080}:${MCP_PORT:-8080}"
+    environment:
+      # Bind 0.0.0.0 inside the container so the port mapping works
+      # (prod binds loopback behind the Tailscale sidecar).
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: ${MCP_PORT:-8080}
+      BASE_URL: http://localhost:${MCP_PORT:-8080}
+      MCP_TOKEN_STORAGE_PATH: /data/fastmcp-tokens
+      OKTA_ISSUER_URL: ${OKTA_ISSUER_URL}
+      OKTA_CLIENT_ID: ${OKTA_CLIENT_ID}
+      OKTA_CLIENT_SECRET: ${OKTA_CLIENT_SECRET}
+      MCP_JWT_SECRET: ${MCP_JWT_SECRET}
+      AGENT_JWT_SECRET: ${AGENT_JWT_SECRET}
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/agent_comms
+    volumes:
+      - token-storage:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16.6
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: agent_comms
+    ports:
+      # Host port 55432, not the default 5432: this dev machine (and likely
+      # others') runs a native Postgres already bound to 5432, which would
+      # otherwise silently collide with this container's port mapping. Only
+      # the HOST side moves — the container's internal port (and therefore
+      # the `agent-comms-mcp` service's DATABASE_URL above, which reaches
+      # this container by service name on the Docker network) stays on the
+      # standard 5432. See README.md's "Local development" section.
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  token-storage:
+  postgres-data:

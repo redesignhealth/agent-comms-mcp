@@ -1,0 +1,70 @@
+[project]
+name = "agent-comms-mcp"
+version = "0.1.0"
+description = "MCP service for permissioned, structured agent-to-agent communications"
+license = {text = "MIT"}
+requires-python = ">=3.12"
+# Exact version pins for reproducible builds.
+dependencies = [
+    "alembic==1.18.5",
+    "asyncpg==0.31.0",
+    "fastmcp==3.4.2",
+    # greenlet is SQLAlchemy's async bridge — pinned explicitly (exact-pin
+    # policy) rather than left as a floating transitive dep.
+    "greenlet==3.5.4",
+    "httpx==0.28.1",
+    "py-key-value-aio[filetree]==0.4.5",
+    "pydantic==2.12.5",
+    "sqlalchemy[asyncio]==2.0.51",
+    "structlog==25.5.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==9.0.3",
+    "pytest-asyncio==1.3.0",
+    "ruff==0.15.14",
+    "mypy==2.1.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# Nested `with` blocks are the established test idiom in the MCP fleet
+# (mock patch + pytest.raises at distinct indentation levels aids readability).
+"tests/*" = ["SIM117"]
+# Alembic autogenerates these; they're reviewed but not hand-formatted, so
+# don't hold them to the same line-length bar as authored code.
+"migrations/versions/*" = ["E501"]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+# "tests/" excludes this project's test suite from strict mode.
+exclude = ["tests/"]
+
+[[tool.mypy.overrides]]
+module = ["key_value.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.setuptools]
+# Flat-layout app (main.py, providers/, etc.) — no installable package.
+# The Dockerfile uses `uv sync --no-install-project` so the wheel is never built.
+py-modules = []
+
+[tool.uv]
+# Supply-chain defense: refuse packages published in the last 7 days.
+exclude-newer = "7 days"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

@@ -1,0 +1,232 @@
+"""SQLAlchemy models for the comms domain.
+
+Schema conventions:
+snake_case plural table names, UUID primary keys, TEXT over VARCHAR,
+TIMESTAMPTZ everywhere, ``created_at``/``updated_at`` on every mutable
+table, explicit ``idx_{table}_{columns}`` indexes.
+
+Domain invariants enforced at the schema level:
+- ``messages`` and ``audit_log`` are append-only. No code path anywhere in
+  this service updates or deletes rows in either table; the ORM models
+  exist only for INSERT and SELECT.
+- ``messages`` carries a per-conversation monotonic ``seq`` guarded by
+  ``UNIQUE(conversation_id, seq)``; assignment is serialized via
+  ``SELECT ... FOR UPDATE`` on the conversation row (see service.py).
+- Closed status/state vocabularies get CHECK constraints. Open
+  vocabularies (``conversations.type``, ``messages.type``) are validated
+  against the versioned schema registry in schemas.py instead, so adding
+  a conversation type is a code change, not a migration.
+"""
+
+from __future__ import annotations
+
+import uuid
+from datetime import datetime
+from typing import Any
+
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TIMESTAMP, UUID
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+from schemas import MAX_DISPLAY_NAME_LENGTH
+
+# Closed vocabularies (CHECK-constrained). Conversation/message *types* are
+# open vocabularies owned by schemas.py.
+AGENT_STATUSES = ("active", "suspended")
+CONVERSATION_STATES = ("active", "completed", "canceled", "expired")
+PARTICIPANT_ROLES = ("owner", "member")
+PARTICIPANT_STATUSES = ("invited", "active", "left", "declined")
+
+
+class Base(DeclarativeBase):
+    type_annotation_map = {  # noqa: RUF012 — SQLAlchemy declarative config, not mutable state
+        datetime: TIMESTAMP(timezone=True),
+        dict[str, Any]: JSONB,
+    }
+
+
+def _uuid_pk() -> Mapped[uuid.UUID]:
+    return mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=text("gen_random_uuid()"),
+    )
+
+
+def _created_at() -> Mapped[datetime]:
+    return mapped_column(nullable=False, server_default=text("now()"))
+
+
+def _updated_at() -> Mapped[datetime]:
+    # ORM-managed only (onupdate=...) — there is no DB-level BEFORE UPDATE
+    # trigger. A raw SQL UPDATE (a bulk data-fix migration, an admin
+    # backfill, etc.) that bypasses the ORM will NOT refresh this column.
+    # Go through the ORM for every mutation of a row using this helper
+    # (``conversations``, most notably, whose ``state`` mutates in place)
+    # or this timestamp goes stale silently.
+    return mapped_column(nullable=False, server_default=text("now()"), onupdate=text("now()"))
+
+
+class Agent(Base):
+    """A board-admitted agent, bound to an OAuth-verified owner.
+
+    ``sub`` is the agent's agent-jwt JWT subject and the board-wide identity
+    key. ``owner_sub``/``owner_email`` always come from verified token
+    claims at bind time — never from tool parameters.
+    """
+
+    __tablename__ = "agents"
+    __table_args__ = (CheckConstraint(f"status IN {AGENT_STATUSES!r}", name="ck_agents_status"),)
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    sub: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
+    owner_sub: Mapped[str] = mapped_column(Text, nullable=False)
+    owner_email: Mapped[str] = mapped_column(Text, nullable=False)
+    display_name: Mapped[str] = mapped_column(String(MAX_DISPLAY_NAME_LENGTH), nullable=False)
+    accepted_types: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    # Not one of DESIGN.md §5's five listed columns, but an additive,
+    # non-conflicting bookkeeping field: the idempotent `comms_register`
+    # tool (§4) re-binds an existing agent row on every call, and needs a
+    # timestamp for "last (re)registered" distinct from `created_at`.
+    bound_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _updated_at()
+
+
+class Conversation(Base):
+    """A typed, expiring conversation between board agents."""
+
+    __tablename__ = "conversations"
+    __table_args__ = (
+        CheckConstraint(f"state IN {CONVERSATION_STATES!r}", name="ck_conversations_state"),
+        Index("idx_conversations_state_expires_at", "state", "expires_at"),
+        Index("idx_conversations_created_by_created_at", "created_by", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    type: Mapped[str] = mapped_column(Text, nullable=False)
+    state: Mapped[str] = mapped_column(Text, nullable=False)
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("agents.id"), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(nullable=False)
+    # Frozen verified owner-set snapshot at creation time (DESIGN.md §9),
+    # ``{"owners": [...]}`` — populated only for
+    # ``internal``/``asymmetric`` conversations (NULL for ``open``, which
+    # has no ownership concept). ``service.invite`` reads this to reject an
+    # invite that would introduce an owner outside the frozen set, rather
+    # than silently expanding it or re-deriving it from current
+    # participants (which would let a later invite retroactively loosen
+    # admission for prior messages).
+    owner_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _updated_at()
+
+
+class Participant(Base):
+    """Membership row — membership IS visibility (checked at call time).
+
+    Per DESIGN.md §4 (invite/accept revision): everyone added via
+    ``start_conversation`` or ``invite`` starts as ``invited``, not
+    ``active`` — no unilateral disclosure. ``joined_at`` is set only when
+    the participant explicitly accepts (``invited`` -> ``active``);
+    ``invited_at`` records when the invite/creation happened.
+    """
+
+    __tablename__ = "participants"
+    __table_args__ = (
+        CheckConstraint(f"role IN {PARTICIPANT_ROLES!r}", name="ck_participants_role"),
+        CheckConstraint(f"status IN {PARTICIPANT_STATUSES!r}", name="ck_participants_status"),
+        Index("idx_participants_agent_id_status", "agent_id", "status"),
+    )
+
+    # The (conversation_id, agent_id) pair is the primary key, which also
+    # provides the spec's UNIQUE(conversation_id, agent_id). No surrogate
+    # `id` column: nothing else in the schema needs to reference an
+    # individual participant row, so the composite PK is simpler and is
+    # the idiomatic SQLAlchemy 2.x shape for a pure association/membership
+    # table.
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id"), primary_key=True
+    )
+    agent_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agents.id"), primary_key=True)
+    role: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    invited_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("agents.id"), nullable=True)
+    invited_at: Mapped[datetime] = mapped_column(nullable=False, server_default=text("now()"))
+    joined_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    last_read_seq: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+
+
+class Message(Base):
+    """Append-only, schema-validated typed message. Never updated/deleted."""
+
+    __tablename__ = "messages"
+    __table_args__ = (
+        # Doubles as the (conversation_id, seq) read index.
+        UniqueConstraint("conversation_id", "seq", name="uq_messages_conversation_id_seq"),
+        Index(
+            "idx_messages_conversation_id_sender_id_created_at",
+            "conversation_id",
+            "sender_id",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id"), nullable=False
+    )
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    sender_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agents.id"), nullable=False)
+    type: Mapped[str] = mapped_column(Text, nullable=False)
+    schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = _created_at()
+
+
+class AuditLog(Base):
+    """Append-only audit trail: every mutation and every authorization denial."""
+
+    __tablename__ = "audit_log"
+    __table_args__ = (
+        Index("idx_audit_log_conversation_id", "conversation_id"),
+        Index("idx_audit_log_at", "at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    at: Mapped[datetime] = mapped_column(nullable=False, server_default=text("now()"))
+    actor_sub: Mapped[str] = mapped_column(Text, nullable=False)
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    agent_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("agents.id"), nullable=True)
+    conversation_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("conversations.id"), nullable=True
+    )
+    message_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("messages.id"), nullable=True)
+    detail: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
+
+__all__ = [
+    "AGENT_STATUSES",
+    "CONVERSATION_STATES",
+    "PARTICIPANT_ROLES",
+    "PARTICIPANT_STATUSES",
+    "Agent",
+    "AuditLog",
+    "Base",
+    "Conversation",
+    "Message",
+    "Participant",
+]
