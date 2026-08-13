@@ -8,15 +8,6 @@ requires-python = ">=3.12"
 authors = [
     {name = "Redesign Health", email = "tech@redesignhealth.com"},
 ]
-
-[project.urls]
-Homepage = "https://github.com/redesignhealth/agent-comms-mcp"
-Repository = "https://github.com/redesignhealth/agent-comms-mcp"
-Issues = "https://github.com/redesignhealth/agent-comms-mcp/issues"
-
-[project.scripts]
-agent-comms-mcp = "main:_cli"
-
 # Exact version pins for reproducible builds.
 dependencies = [
     "alembic==1.18.5",
@@ -31,6 +22,14 @@ dependencies = [
     "sqlalchemy[asyncio]==2.0.51",
     "structlog==25.5.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/redesignhealth/agent-comms-mcp"
+Repository = "https://github.com/redesignhealth/agent-comms-mcp"
+Issues = "https://github.com/redesignhealth/agent-comms-mcp/issues"
+
+[project.scripts]
+agent-comms-mcp = "main:_cli"
 
 [dependency-groups]
 dev = [
