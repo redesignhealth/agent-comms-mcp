@@ -283,7 +283,8 @@ async def health(request: Request) -> PlainTextResponse:
     return PlainTextResponse("ok")
 
 
-if __name__ == "__main__":
+def _cli() -> None:
+    """Entry point for the ``agent-comms-mcp`` console script."""
     # Fail fast on a missing/malformed DATABASE_URL at process start rather
     # than lazily on the first tool call that touches the DB (db.get_engine
     # builds the engine lazily so DB-less unit tests can import this module
@@ -298,3 +299,7 @@ if __name__ == "__main__":
         host=os.environ.get("MCP_HOST", "127.0.0.1"),
         port=int(os.environ.get("MCP_PORT", "8080")),
     )
+
+
+if __name__ == "__main__":
+    _cli()

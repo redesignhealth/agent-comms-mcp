@@ -3,7 +3,20 @@ name = "agent-comms-mcp"
 version = "0.1.0"
 description = "MCP service for permissioned, structured agent-to-agent communications"
 license = {text = "MIT"}
+readme = "README.md"
 requires-python = ">=3.12"
+authors = [
+    {name = "Redesign Health", email = "tech@redesignhealth.com"},
+]
+
+[project.urls]
+Homepage = "https://github.com/redesignhealth/agent-comms-mcp"
+Repository = "https://github.com/redesignhealth/agent-comms-mcp"
+Issues = "https://github.com/redesignhealth/agent-comms-mcp/issues"
+
+[project.scripts]
+agent-comms-mcp = "main:_cli"
+
 # Exact version pins for reproducible builds.
 dependencies = [
     "alembic==1.18.5",
@@ -57,9 +70,12 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 
 [tool.setuptools]
-# Flat-layout app (main.py, providers/, etc.) — no installable package.
-# The Dockerfile uses `uv sync --no-install-project` so the wheel is never built.
-py-modules = []
+py-modules = [
+    "auth", "db", "exceptions", "identity", "main",
+    "models", "observability", "scopes", "schemas",
+    "service", "state_machine",
+]
+packages = ["providers", "migrations", "migrations.versions"]
 
 [tool.uv]
 # Supply-chain defense: refuse packages published in the last 7 days.
