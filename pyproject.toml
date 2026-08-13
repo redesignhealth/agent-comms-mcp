@@ -1,6 +1,6 @@
 [project]
 name = "agent-comms-mcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "MCP service for permissioned, structured agent-to-agent communications"
 license = {text = "MIT"}
 readme = "README.md"
@@ -30,6 +30,7 @@ Issues = "https://github.com/redesignhealth/agent-comms-mcp/issues"
 
 [project.scripts]
 agent-comms-mcp = "main:_cli"
+agent-comms-mcp-migrate = "migrate:_cli"
 
 [dependency-groups]
 dev = [
@@ -70,7 +71,7 @@ testpaths = ["tests"]
 
 [tool.setuptools]
 py-modules = [
-    "auth", "db", "exceptions", "identity", "main",
+    "auth", "db", "exceptions", "identity", "main", "migrate",
     "models", "observability", "scopes", "schemas",
     "service", "state_machine",
 ]
