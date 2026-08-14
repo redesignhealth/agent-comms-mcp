@@ -52,10 +52,13 @@ git checkout -b hotfix/vX.Y.Z vX.Y.(Z-1)
 # apply fix
 git push origin hotfix/vX.Y.Z
 # open a PR targeting main and merge it
-# wait for CI to pass on main for this SHA, then:
-gh release create vX.Y.Z --title "vX.Y.Z" --notes "..."
+# after CI passes on main, capture the exact SHA to avoid tagging a later commit:
+git fetch origin main
+HOTFIX_SHA=$(git rev-parse origin/main)
+gh release create vX.Y.Z --target "$HOTFIX_SHA" --title "vX.Y.Z" --notes "..."
 ```
 
-> **Important:** Create the release only after the hotfix SHA is on main and CI has passed.
-> The `gh release create` command above tags the current `main` HEAD by default.
-> If no successful push-triggered CI run is found for the release SHA, the deploy job will fail.
+> **Important:** Always use `--target <sha>` when creating a hotfix release. Without it,
+> `gh release create` tags whatever `main` HEAD is at that moment, which can be a later
+> commit if other work was merged after yours. If no successful push-triggered CI run is
+> found for the release SHA, the deploy job will fail.
