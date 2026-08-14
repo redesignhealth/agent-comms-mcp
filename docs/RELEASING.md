@@ -25,8 +25,10 @@
    ```
    Or via the GitHub UI: Releases → Draft a new release → tag `vX.Y.Z`.
 
-4. **Verify the publish workflow** passes at:
+4. **Verify both triggered workflows** pass at:
    `https://github.com/redesignhealth/agent-comms-mcp/actions`
+   - `publish.yml` — publishes the Python wheel to PyPI
+   - `deploy.yml` — builds the Docker image, deploys to dev ECS, then promotes to prod ECS
 
 5. **Confirm the package is live** on PyPI:
    ```bash
@@ -50,3 +52,8 @@ git checkout -b hotfix/vX.Y.Z vX.Y.(Z-1)
 git push origin hotfix/vX.Y.Z
 gh release create vX.Y.Z --target hotfix/vX.Y.Z --title "vX.Y.Z" --notes "..."
 ```
+
+> **Important:** `deploy.yml` verifies a successful CI run exists for the release SHA before deploying.
+> Push the hotfix branch and open a PR against main (or trigger CI manually via `gh workflow run CI`)
+> so CI runs against the hotfix SHA before you create the release. If no successful CI run is found,
+> the deploy job will fail immediately.
