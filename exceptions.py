@@ -50,16 +50,21 @@ service/tools boundary:
   already stated in the tool's own docstring — there's nothing to usefully
   enumerate.
 
-- ``SchemaVersionMismatchError``: at ``comms_start_conversation``, no wire
-  schema version falls inside every participant's declared
-  ``[min_schema_version, max_schema_version]`` capability range. Specific
-  by design, same reasoning as ``UnknownConversationTypeError``: the
-  version range each participant negotiates with is protocol-capability
-  information (bounded, small, and something every legitimate caller
-  needs to reason about to pick compatible counterparties), not a fact
-  about another agent's private state — DESIGN.md's anti-enumeration rule
-  targets conversation/agent existence and membership, not this fixed
-  wire-protocol vocabulary.
+- ``SchemaVersionMismatchError``: at ``comms_start_conversation`` (and
+  ``comms_invite``'s re-check against an already-pinned conversation), no
+  wire schema version falls inside every participant's declared
+  ``[min_schema_version, max_schema_version]`` capability range. Distinct
+  from the uniform ``AccessDeniedError`` because THAT a mismatch occurred is
+  not an enumeration risk — the caller already named every participant in
+  the request and knows a negotiation was attempted. UNLIKE
+  ``UnknownConversationTypeError``'s ``CONVERSATION_TYPES``, though, a
+  specific agent's registered ``[min, max]`` range IS per-caller state, not
+  a fixed public vocabulary — so ``str()`` of this exception deliberately
+  does NOT include the actual floor/ceiling values that were compared
+  (Argus round 1: an initiator who controls their own declared range could
+  otherwise bisect a target's exact range by varying it across repeated
+  calls). The specific numbers are still recorded in the audit log's
+  ``detail`` (server-side only) via ``service._deny_schema_version_mismatch``.
 
 Payload/schema validation failures are NOT redefined here: they reuse
 ``schemas.PayloadValidationError`` directly, which is already a distinct,
@@ -112,10 +117,10 @@ class UnknownConversationTypeError(Exception):
 
 class SchemaVersionMismatchError(Exception):
     """No wire schema version is inside every participant's declared
-    ``[min_schema_version, max_schema_version]`` range at
-    ``comms_start_conversation``. Message is specific by design — see the
-    module docstring for why naming this fixed, public capability-range
-    mismatch is not an enumeration risk."""
+    ``[min_schema_version, max_schema_version]`` range (at
+    ``comms_start_conversation`` or ``comms_invite``). The fact of a
+    mismatch is client-visible by design, but the message deliberately
+    omits the actual range values compared — see the module docstring."""
 
 
 __all__ = [

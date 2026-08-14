@@ -578,6 +578,26 @@ class TestRegister:
                 },
             )
 
+    async def test_register_min_schema_version_below_one_rejected(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """TECH-5160 (Argus round 1): the lower-bound guard applies at the
+        tool layer too, not just service.register_agent directly."""
+        token = _token("agent-schema-below-one-tool")
+        with pytest.raises(ToolError, match="invalid_request"):
+            await _call(
+                main,
+                test_session_factory,
+                token,
+                "comms_register",
+                {
+                    "display_name": "Below One",
+                    "accepted_types": ["availability_request"],
+                    "min_schema_version": 0,
+                    "max_schema_version": 0,
+                },
+            )
+
     async def test_whoami_omits_schema_version_before_registration(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
@@ -1178,6 +1198,38 @@ class TestRateLimitAndSchemaErrors:
         message = str(exc_info.value)
         assert "schema_version_mismatch" in message
         assert message != "access_denied: not authorized for this resource"
+        # Anti-enumeration (Argus round 1): the exact registered ranges
+        # (1 vs 2) must not appear in the client-visible message, even
+        # though they're what actually mismatched.
+        assert "1" not in message
+        assert "2" not in message
+
+    async def test_start_conversation_response_includes_negotiated_schema_version(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """TECH-5160 (Argus round 1): the negotiated version must be
+        discoverable from the response, not just silently applied."""
+        await _register(main, test_session_factory, "sv-response-owner")
+        await _register(main, test_session_factory, "sv-response-target")
+        token_owner = _token("sv-response-owner")
+
+        list_result = await _call(main, test_session_factory, token_owner, "comms_list_agents")
+        target_id = next(
+            a["agent_id"] for a in list_result["agents"] if a["sub"] == "sv-response-target"
+        )
+
+        started = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [target_id],
+                "initial_message": _availability_request(),
+            },
+        )
+        assert started["schema_version"] == 1
 
 
 # --- Membership mutation tools: invite / leave / decline_invite ---------------------

@@ -32,6 +32,7 @@ never reach it.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
@@ -42,6 +43,7 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.auth import AccessToken
 from fastmcp.server.dependencies import get_access_token
+from sqlalchemy.exc import InterfaceError, OperationalError
 
 import service
 from db import get_session_factory
@@ -63,6 +65,13 @@ from schemas import (
 from scopes import is_interactive_token, scopes_for_token
 
 comms_server: FastMCP[Any] = FastMCP("comms")
+
+# Plain stdlib logging, matching service.py's own module logger convention
+# (see its docstring comment) -- this exists solely so a genuine
+# connectivity/config failure swallowed by comms_whoami's best-effort
+# schema-version lookup (see below) still lands somewhere instead of being
+# silently discarded.
+logger = logging.getLogger(__name__)
 
 
 # --- Identity / session plumbing -------------------------------------------------
@@ -281,11 +290,26 @@ async def whoami(agent_key: str | None = None) -> dict[str, Any]:
         if agent is not None:
             result["min_schema_version"] = agent.min_schema_version
             result["max_schema_version"] = agent.max_schema_version
-    except Exception:
-        # Diagnostic tool, DB-optional (see docstring) — a lookup failure
-        # (unregistered caller already handled above via agent is None,
-        # DB unreachable, etc.) just omits these fields.
-        pass
+    except (RuntimeError, OperationalError, InterfaceError, OSError) as exc:
+        # Diagnostic tool, DB-optional (see docstring) — genuine
+        # connectivity/configuration failures (DATABASE_URL unset --
+        # db.get_session_factory's require_env raises RuntimeError --
+        # unreachable Postgres, a dropped connection mid-query) just omit
+        # these fields, same as the already-handled "not registered yet"
+        # case (agent is None, above). Narrowed to these types (Argus round
+        # 1) rather than a bare `except Exception` -- a bare catch would
+        # ALSO swallow a genuine programming/schema bug (a renamed
+        # get_agent_by_sub, a migration not yet applied) indistinguishably
+        # from an ordinary unregistered caller, silently returning a
+        # successful-looking, field-less response for a broken deploy.
+        # Logged at WARNING, not silently dropped, so a genuine outage is
+        # still visible in the tool's own logs even though the caller sees
+        # a clean response.
+        logger.warning(
+            "whoami: schema-version lookup failed (%s), omitting fields",
+            type(exc).__name__,
+            exc_info=True,
+        )
     return result
 
 
@@ -378,11 +402,16 @@ async def register(
     agent_key = _validate_agent_key(agent_key)
     sub = _compose_sub(base_sub, agent_key)
 
-    if min_schema_version > max_schema_version:
-        raise ToolError(
-            "invalid_request: min_schema_version must be <= max_schema_version "
-            f"(got min={min_schema_version}, max={max_schema_version})"
-        )
+    # Shared with service.register_agent's own guard
+    # (service.validate_schema_version_range) so tightening the rule in one
+    # place tightens it in both layers (Argus round 1) — this tool-layer
+    # call exists only to surface a specific ToolError instead of the
+    # generic bare-ValueError mapping _map_service_errors would otherwise
+    # give it.
+    try:
+        service.validate_schema_version_range(min_schema_version, max_schema_version)
+    except ValueError as exc:
+        raise ToolError(f"invalid_request: {exc}") from None
 
     async with get_session_factory()() as session, _map_service_errors():
         agent = await service.register_agent(
@@ -481,12 +510,14 @@ async def start_conversation(
       The board computes the actual wire version to use as the highest
       version every participant (you + every named target) mutually
       supports, per each agent's ``comms_register``-time
-      ``min_schema_version``/``max_schema_version`` — and uses THAT value
-      for the opening message regardless of what you pass here. If no
-      version is inside every participant's supported range, the call is
-      refused entirely (no conversation/message is created). Only ``1``
-      exists today, so this is a no-op in practice until a second schema
-      version is introduced.
+      ``min_schema_version``/``max_schema_version``, clamped to the
+      highest version this board itself implements — and uses THAT value
+      for the opening message regardless of what you pass here (returned
+      as ``schema_version`` in the response, so the negotiated pin is
+      discoverable). If no version is inside every participant's
+      supported range, the call is refused entirely (no
+      conversation/message is created). ``comms_invite`` re-checks any
+      later-added participant against this same pinned version.
     """
     token = _require_token()
     base_sub = _require_identity(token)
@@ -524,6 +555,11 @@ async def start_conversation(
         "target_agent_ids": [str(t) for t in target_uuids],
         "expires_at": _iso(conversation.expires_at),
         "created_at": _iso(conversation.created_at),
+        # TECH-5160: the actually-negotiated version (see
+        # service.start_conversation's transient
+        # `conversation.negotiated_schema_version` attribute), NOT
+        # necessarily the caller-supplied `schema_version` above.
+        "schema_version": conversation.negotiated_schema_version,  # type: ignore[attr-defined]
     }
 
 

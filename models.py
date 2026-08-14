@@ -99,7 +99,7 @@ class Agent(Base):
         # backstop mirroring the same ``min <= max`` validation
         # ``service.register_agent`` already performs at the app layer.
         CheckConstraint(
-            "min_schema_version <= max_schema_version",
+            "min_schema_version >= 1 AND min_schema_version <= max_schema_version",
             name="ck_agents_schema_version_range",
         ),
         # Backs service.lookup_agent_by_email's
@@ -152,8 +152,12 @@ class Agent(Base):
     # TECH-5160: wire-schema version range this agent declares it can
     # correctly interpret. Both default to 1 (today's only version) via a
     # server_default in the migration, so existing rows backfill cleanly.
-    min_schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
-    max_schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    min_schema_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default=text("1")
+    )
+    max_schema_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default=text("1")
+    )
     # Not one of DESIGN.md §5's five listed columns, but an additive,
     # non-conflicting bookkeeping field: the idempotent `comms_register`
     # tool (§4) re-binds an existing agent row on every call, and needs a
@@ -241,6 +245,16 @@ class Message(Base):
             "sender_id",
             "created_at",
         ),
+        # TECH-5160: backs service._enforce_sender_global_rate_limit's
+        # WHERE sender_id = ... AND created_at > ... query (no
+        # conversation_id predicate) -- the index above has conversation_id
+        # as its leading column, so Postgres can't use it for a query that
+        # never filters on conversation_id, and would sequential-scan
+        # `messages` on every post_message/start_conversation call
+        # (Argus round 1). Same "declare here too, not just in the
+        # migration" convention as every other migration-created index in
+        # this file.
+        Index("idx_messages_sender_id_created_at", "sender_id", "created_at"),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
