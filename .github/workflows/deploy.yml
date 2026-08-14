@@ -19,6 +19,8 @@ jobs:
   deploy-dev:
     name: Deploy (dev)
     runs-on: ubuntu-latest
+    # Skip pre-releases — only deploy on full releases.
+    if: ${{ !github.event.release.prerelease }}
     # No environment: — OIDC sub is ref:refs/tags/* which the dev role trusts.
     permissions:
       id-token: write
@@ -31,10 +33,10 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Verify CI passed for this SHA
-        # Checks for a successful CI run on the exact commit being deployed.
-        # Prefers push-triggered runs (main branch). For hotfix branches where
-        # CI runs via pull_request events, logs a notice and falls back to any
-        # successful run. Primary protection remains branch protection rules on main.
+        # Requires a successful push-triggered CI run on the exact commit being deployed.
+        # This ensures the commit was merged to main and CI passed before deployment.
+        # Hotfixes must be merged to main (or a protected branch CI runs against) before
+        # creating a release — there is no fallback to PR-triggered runs.
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -50,19 +52,8 @@ jobs:
             --json databaseId \
             --jq 'length')
           if [ "$count" -eq 0 ]; then
-            echo "NOTICE: No push-triggered CI run found; checking for pull_request-triggered run (hotfix path)."
-            count=$(gh run list \
-              --repo "$GH_REPO" \
-              --commit "$GH_SHA" \
-              --workflow CI \
-              --status success \
-              --event pull_request \
-              --limit 1 \
-              --json databaseId \
-              --jq 'length')
-          fi
-          if [ "$count" -eq 0 ]; then
-            echo "ERROR: No successful CI run found for $GH_SHA — refusing to deploy." >&2
+            echo "ERROR: No successful push-triggered CI run found for $GH_SHA — refusing to deploy." >&2
+            echo "Ensure the commit is merged to main and CI has passed before creating a release." >&2
             exit 1
           fi
           echo "CI check passed for $GH_SHA."
@@ -140,7 +131,6 @@ jobs:
     # ensuring prod image promotion cannot be triggered by unprotected jobs.
     permissions:
       id-token: write
-      contents: read
     steps:
       - name: Configure AWS credentials (prod)
         uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
@@ -151,21 +141,21 @@ jobs:
       - name: Login to ECR
         uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
 
-      - name: Verify prod role can read dev ECR image
+      - name: Verify prod role can pull dev ECR image
         # The prod role has ReadDevECRForPromotion permissions on rh-platform-dev/apps/reclaw-comms-mcp.
-        # This step fails fast with a clear error if that permission is absent,
-        # rather than letting docker pull fail with a cryptic auth message.
+        # batch-get-image tests the same permissions (ecr:BatchGetImage) that docker pull uses,
+        # failing fast with a clear error rather than letting docker pull fail with a cryptic message.
         env:
           DIGEST: ${{ needs.deploy-dev.outputs.image-digest }}
         run: |
-          if ! aws ecr describe-images \
+          if ! aws ecr batch-get-image \
             --repository-name rh-platform-dev/apps/reclaw-comms-mcp \
             --image-ids imageDigest="$DIGEST" \
-            --query 'imageDetails[0].imageDigest' --output text > /dev/null 2>&1; then
-            echo "ERROR: prod role cannot read dev ECR image ($DIGEST). Check ReadDevECRForPromotion IAM permission." >&2
+            --query 'images[0].imageId.imageDigest' --output text > /dev/null 2>&1; then
+            echo "ERROR: prod role cannot pull dev ECR image ($DIGEST). Check ReadDevECRForPromotion IAM permission." >&2
             exit 1
           fi
-          echo "Dev ECR read access confirmed."
+          echo "Dev ECR pull access confirmed."
 
       - name: Promote dev image to prod ECR (by digest)
         env:
@@ -185,6 +175,8 @@ jobs:
             exit 1
           fi
           echo "Prod ECR push confirmed: $PROD_DIGEST"
+          echo "prod-digest=$PROD_DIGEST" >> "$GITHUB_OUTPUT"
+        id: push-prod
 
       - name: Download current prod task definition
         run: |
@@ -195,7 +187,8 @@ jobs:
 
       - name: Update app container image in prod task definition
         env:
-          IMAGE: 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform/apps/reclaw-comms-mcp:sha-${{ github.sha }}
+          # Use digest reference to pin the exact image pushed — tags are mutable.
+          IMAGE: 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform/apps/reclaw-comms-mcp@${{ steps.push-prod.outputs.prod-digest }}
         run: |
           python3 - <<'EOF'
           import json, sys, os
