@@ -1,8 +1,10 @@
-# Build, push to dev ECR, and deploy to dev ECS on every release.
+# Build, push to dev ECR, and deploy to dev ECS on every full release.
+# Pre-releases (GitHub "pre-release" flag) are skipped — deploy-dev has an
+# `if: !prerelease` guard so neither job runs on pre-releases.
 # After dev is stable, deploy-prod promotes the dev-validated image to prod ECR and deploys.
 # IAM trust: deploy-dev uses ref:refs/tags/*; deploy-prod uses environment:production.
 # The prod ECR push role trusts only environment:production — it cannot be assumed
-# from unprotected jobs, ensuring prod image promotion is always gated.
+# from unprotected jobs for any release that actually reaches deploy-prod.
 name: Deploy to ECS
 
 on:
@@ -37,9 +39,8 @@ jobs:
 
       - name: Verify CI passed for this SHA
         # Requires a successful push-triggered CI run on the exact commit being deployed.
-        # This ensures the commit was merged to main and CI passed before deployment.
-        # Hotfixes must be merged to main (or a protected branch CI runs against) before
-        # creating a release — there is no fallback to PR-triggered runs.
+        # Uses the workflow filename (ci.yml) rather than the display name to avoid
+        # silently breaking if the workflow's `name:` field is ever renamed.
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -48,7 +49,7 @@ jobs:
           count=$(gh run list \
             --repo "$GH_REPO" \
             --commit "$GH_SHA" \
-            --workflow CI \
+            --workflow ci.yml \
             --status success \
             --event push \
             --limit 1 \
@@ -74,16 +75,14 @@ jobs:
         id: push-dev
         env:
           DEV_IMAGE: 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform-dev/apps/reclaw-comms-mcp:sha-${{ github.sha }}
-          GH_SHA: ${{ github.sha }}
         run: |
           docker build -t "$DEV_IMAGE" .
           docker push "$DEV_IMAGE"
-          DIGEST=$(aws ecr describe-images \
-            --repository-name rh-platform-dev/apps/reclaw-comms-mcp \
-            --image-ids imageTag=sha-"$GH_SHA" \
-            --query 'imageDetails[0].imageDigest' --output text)
+          # Retrieve digest from the local Docker daemon's record of the pushed image.
+          # Using docker inspect avoids a separate ECR API call and any indexing delay.
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$DEV_IMAGE" | cut -d'@' -f2)
           if [ -z "$DIGEST" ] || [ "$DIGEST" = "None" ]; then
-            echo "ERROR: could not retrieve image digest from ECR — push may have failed" >&2
+            echo "ERROR: could not retrieve image digest after push" >&2
             exit 1
           fi
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
@@ -147,40 +146,37 @@ jobs:
 
       - name: Verify prod role can pull dev ECR image
         # The prod role has ReadDevECRForPromotion permissions on rh-platform-dev/apps/reclaw-comms-mcp.
-        # batch-get-image tests the same permissions (ecr:BatchGetImage) that docker pull uses,
-        # failing fast with a clear error rather than letting docker pull fail with a cryptic message.
+        # batch-get-image tests ecr:BatchGetImage (same as docker pull). Exit code is 0 even on
+        # ImageNotFoundException, so we check the images[] array length in the output.
         env:
           DIGEST: ${{ needs.deploy-dev.outputs.image-digest }}
         run: |
-          if ! aws ecr batch-get-image \
+          FOUND=$(aws ecr batch-get-image \
             --repository-name rh-platform-dev/apps/reclaw-comms-mcp \
             --image-ids imageDigest="$DIGEST" \
-            --query 'images[0].imageId.imageDigest' --output text > /dev/null 2>&1; then
+            --query 'images[0].imageId.imageDigest' --output text 2>&1)
+          if [ -z "$FOUND" ] || [ "$FOUND" = "None" ]; then
             echo "ERROR: prod role cannot pull dev ECR image ($DIGEST). Check ReadDevECRForPromotion IAM permission." >&2
             exit 1
           fi
-          echo "Dev ECR pull access confirmed."
+          echo "Dev ECR pull access confirmed: $FOUND"
 
       - name: Promote dev image to prod ECR (by digest)
+        id: push-prod
         env:
           DEV_IMAGE: 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform-dev/apps/reclaw-comms-mcp@${{ needs.deploy-dev.outputs.image-digest }}
           PROD_IMAGE: 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform/apps/reclaw-comms-mcp:sha-${{ github.sha }}
-          GH_SHA: ${{ github.sha }}
         run: |
           docker pull "$DEV_IMAGE"
           docker tag "$DEV_IMAGE" "$PROD_IMAGE"
           docker push "$PROD_IMAGE"
-          PROD_DIGEST=$(aws ecr describe-images \
-            --repository-name rh-platform/apps/reclaw-comms-mcp \
-            --image-ids imageTag=sha-"$GH_SHA" \
-            --query 'imageDetails[0].imageDigest' --output text)
+          PROD_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$PROD_IMAGE" | cut -d'@' -f2)
           if [ -z "$PROD_DIGEST" ] || [ "$PROD_DIGEST" = "None" ]; then
             echo "ERROR: could not verify prod ECR image after push — push may have failed" >&2
             exit 1
           fi
           echo "Prod ECR push confirmed: $PROD_DIGEST"
           echo "prod-digest=$PROD_DIGEST" >> "$GITHUB_OUTPUT"
-        id: push-prod
 
       - name: Download current prod task definition
         run: |
