@@ -36,10 +36,12 @@ jobs:
         # successful run. Primary protection remains branch protection rules on main.
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          GH_SHA: ${{ github.sha }}
         run: |
           count=$(gh run list \
-            --repo "${{ github.repository }}" \
-            --commit "${{ github.sha }}" \
+            --repo "$GH_REPO" \
+            --commit "$GH_SHA" \
             --workflow CI \
             --status success \
             --event push \
@@ -49,8 +51,8 @@ jobs:
           if [ "$count" -eq 0 ]; then
             echo "NOTICE: No push-triggered CI run found; checking for pull_request-triggered run (hotfix path)."
             count=$(gh run list \
-              --repo "${{ github.repository }}" \
-              --commit "${{ github.sha }}" \
+              --repo "$GH_REPO" \
+              --commit "$GH_SHA" \
               --workflow CI \
               --status success \
               --event pull_request \
@@ -59,10 +61,10 @@ jobs:
               --jq 'length')
           fi
           if [ "$count" -eq 0 ]; then
-            echo "ERROR: No successful CI run found for ${{ github.sha }} — refusing to deploy." >&2
+            echo "ERROR: No successful CI run found for $GH_SHA — refusing to deploy." >&2
             exit 1
           fi
-          echo "CI check passed for ${{ github.sha }}."
+          echo "CI check passed for $GH_SHA."
 
       - name: Configure AWS credentials (dev)
         uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
@@ -77,12 +79,13 @@ jobs:
         id: push-dev
         env:
           DEV_IMAGE: 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform-dev/apps/reclaw-comms-mcp:sha-${{ github.sha }}
+          GH_SHA: ${{ github.sha }}
         run: |
           docker build -t "$DEV_IMAGE" .
           docker push "$DEV_IMAGE"
           DIGEST=$(aws ecr describe-images \
             --repository-name rh-platform-dev/apps/reclaw-comms-mcp \
-            --image-ids imageTag=sha-${{ github.sha }} \
+            --image-ids imageTag=sha-"$GH_SHA" \
             --query 'imageDetails[0].imageDigest' --output text)
           if [ -z "$DIGEST" ] || [ "$DIGEST" = "None" ]; then
             echo "ERROR: could not retrieve image digest from ECR — push may have failed" >&2
@@ -98,10 +101,12 @@ jobs:
             --output json > /tmp/task-def-dev.json
 
       - name: Update app container image in dev task definition
+        env:
+          IMAGE: 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform-dev/apps/reclaw-comms-mcp:sha-${{ github.sha }}
         run: |
           python3 - <<'EOF'
-          import json, sys
-          IMAGE = "082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform-dev/apps/reclaw-comms-mcp:sha-${{ github.sha }}"
+          import json, sys, os
+          IMAGE = os.environ['IMAGE']
           with open('/tmp/task-def-dev.json') as f:
               td = json.load(f)
           if not any(c['name'] == 'app' for c in td['containerDefinitions']):
@@ -165,13 +170,14 @@ jobs:
         env:
           DEV_IMAGE: 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform-dev/apps/reclaw-comms-mcp@${{ needs.deploy-dev.outputs.image-digest }}
           PROD_IMAGE: 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform/apps/reclaw-comms-mcp:sha-${{ github.sha }}
+          GH_SHA: ${{ github.sha }}
         run: |
           docker pull "$DEV_IMAGE"
           docker tag "$DEV_IMAGE" "$PROD_IMAGE"
           docker push "$PROD_IMAGE"
           PROD_DIGEST=$(aws ecr describe-images \
             --repository-name rh-platform/apps/reclaw-comms-mcp \
-            --image-ids imageTag=sha-${{ github.sha }} \
+            --image-ids imageTag=sha-"$GH_SHA" \
             --query 'imageDetails[0].imageDigest' --output text)
           if [ -z "$PROD_DIGEST" ] || [ "$PROD_DIGEST" = "None" ]; then
             echo "ERROR: could not verify prod ECR image after push — push may have failed" >&2
@@ -187,10 +193,12 @@ jobs:
             --output json > /tmp/task-def-prod.json
 
       - name: Update app container image in prod task definition
+        env:
+          IMAGE: 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform/apps/reclaw-comms-mcp:sha-${{ github.sha }}
         run: |
           python3 - <<'EOF'
-          import json, sys
-          IMAGE = "082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform/apps/reclaw-comms-mcp:sha-${{ github.sha }}"
+          import json, sys, os
+          IMAGE = os.environ['IMAGE']
           with open('/tmp/task-def-prod.json') as f:
               td = json.load(f)
           if not any(c['name'] == 'app' for c in td['containerDefinitions']):
