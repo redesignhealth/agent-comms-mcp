@@ -1,5 +1,5 @@
 # Build and push Docker image to ECR, then deploy to ECS, on every release.
-# Runs after the publish job in publish.yml succeeds — same release trigger.
+# Triggered by the same release event as publish.yml; runs independently (no ordering dependency).
 # IAM roles trust redesignhealth/agent-comms-mcp release tags via OIDC.
 name: Deploy to ECS
 
@@ -14,6 +14,9 @@ jobs:
     permissions:
       id-token: write
       contents: read
+    concurrency:
+      group: deploy-dev
+      cancel-in-progress: false
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -45,10 +48,14 @@ jobs:
       - name: Update app container image in dev task definition
         run: |
           python3 - <<'EOF'
-          import json
+          import json, sys
           IMAGE = "082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform-dev/apps/reclaw-comms-mcp:sha-${{ github.sha }}"
           with open('/tmp/task-def-dev.json') as f:
               td = json.load(f)
+          updated = [c for c in td['containerDefinitions'] if c['name'] == 'app']
+          if not updated:
+              print("ERROR: no container named 'app' in task definition", file=sys.stderr)
+              sys.exit(1)
           for c in td['containerDefinitions']:
               if c['name'] == 'app':
                   c['image'] = IMAGE
@@ -71,14 +78,32 @@ jobs:
     name: Deploy (prod)
     runs-on: ubuntu-latest
     needs: deploy-dev
+    environment: production
     permissions:
       id-token: write
       contents: read
+    concurrency:
+      group: deploy-prod
+      cancel-in-progress: false
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: Configure AWS credentials (prod)
+      - name: Configure AWS credentials (dev — pull dev-validated image)
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          role-to-assume: arn:aws:iam::082533342824:role/rh-platform-dev-github-actions-ecr-push-role
+          aws-region: us-east-1
+
+      - name: Login to ECR (dev)
+        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
+
+      - name: Pull dev-validated image
+        env:
+          DEV_IMAGE: 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform-dev/apps/reclaw-comms-mcp:sha-${{ github.sha }}
+        run: docker pull "$DEV_IMAGE"
+
+      - name: Configure AWS credentials (prod — push and deploy)
         uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
         with:
           role-to-assume: arn:aws:iam::082533342824:role/rh-platform-github-actions-ecr-push-role
@@ -87,12 +112,13 @@ jobs:
       - name: Login to ECR (prod)
         uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
 
-      - name: Build and push image (prod)
+      - name: Promote image to prod ECR
         env:
-          IMAGE: 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform/apps/reclaw-comms-mcp:sha-${{ github.sha }}
+          DEV_IMAGE: 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform-dev/apps/reclaw-comms-mcp:sha-${{ github.sha }}
+          PROD_IMAGE: 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform/apps/reclaw-comms-mcp:sha-${{ github.sha }}
         run: |
-          docker build -t "$IMAGE" .
-          docker push "$IMAGE"
+          docker tag "$DEV_IMAGE" "$PROD_IMAGE"
+          docker push "$PROD_IMAGE"
 
       - name: Download current prod task definition
         run: |
@@ -104,10 +130,14 @@ jobs:
       - name: Update app container image in prod task definition
         run: |
           python3 - <<'EOF'
-          import json
+          import json, sys
           IMAGE = "082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform/apps/reclaw-comms-mcp:sha-${{ github.sha }}"
           with open('/tmp/task-def-prod.json') as f:
               td = json.load(f)
+          updated = [c for c in td['containerDefinitions'] if c['name'] == 'app']
+          if not updated:
+              print("ERROR: no container named 'app' in task definition", file=sys.stderr)
+              sys.exit(1)
           for c in td['containerDefinitions']:
               if c['name'] == 'app':
                   c['image'] = IMAGE
