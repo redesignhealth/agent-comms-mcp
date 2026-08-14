@@ -26,9 +26,13 @@
 
 3. **Create a GitHub release** (full release, not pre-release):
    ```bash
-   gh release create vX.Y.Z --title "vX.Y.Z" --generate-notes
+   # Capture the commit you just pushed — avoids tagging the wrong commit
+   # if main moves (e.g. another merge) between your push and the release.
+   RELEASE_SHA=$(git rev-parse HEAD)
+   gh release create vX.Y.Z --title "vX.Y.Z" --generate-notes --target "$RELEASE_SHA"
    ```
-   Or via the GitHub UI: Releases → Draft a new release → tag `vX.Y.Z`.
+   Or via the GitHub UI: Releases → Draft a new release → tag `vX.Y.Z`, set
+   **Target** to the version-bump commit SHA.
    **Do not check "Set as a pre-release"** — pre-releases skip `deploy.yml`.
 
 4. **Verify both triggered workflows** pass at:

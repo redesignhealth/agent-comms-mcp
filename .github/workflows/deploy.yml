@@ -139,6 +139,7 @@ jobs:
     # ensuring prod image promotion cannot be triggered by unprotected jobs.
     permissions:
       id-token: write
+      contents: read
     steps:
       - name: Configure AWS credentials (prod)
         uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
@@ -168,16 +169,23 @@ jobs:
             echo "ERROR: prod role cannot find dev ECR image ($DIGEST) — image not found." >&2
             exit 1
           fi
-          # 2. Test ecr:GetDownloadUrlForLayer (layer URL fetch) using the first layer digest
-          LAYER_DIGEST=$(echo "$MANIFEST" | python3 -c \
-            "import json,sys; m=json.load(sys.stdin); print(m.get('layers', m.get('fsLayers', [{}]))[0].get('digest', m.get('fsLayers', [{}])[0].get('blobSum', '')))" 2>/dev/null)
-          if [ -n "$LAYER_DIGEST" ] && [ "$LAYER_DIGEST" != "None" ]; then
-            if ! aws ecr get-download-url-for-layer \
-              --repository-name rh-platform-dev/apps/reclaw-comms-mcp \
-              --layer-digest "$LAYER_DIGEST" > /dev/null; then
-              echo "ERROR: prod role GetDownloadUrlForLayer failed for dev ECR image. Check ReadDevECRForPromotion IAM permission." >&2
-              exit 1
-            fi
+          # 2. Test ecr:GetDownloadUrlForLayer (layer URL fetch) using the first layer digest.
+          # Fail explicitly if we can't extract a layer digest — a parse failure that silently
+          # skips this check would defeat the purpose of the probe.
+          if ! LAYER_DIGEST=$(echo "$MANIFEST" | python3 -c \
+            "import json,sys; m=json.load(sys.stdin); layers=m.get('layers',m.get('fsLayers',[])); print(layers[0].get('digest',layers[0].get('blobSum',''))) if layers else sys.exit(1)"); then
+            echo "ERROR: could not extract layer digest from dev ECR manifest — manifest format unexpected." >&2
+            exit 1
+          fi
+          if [ -z "$LAYER_DIGEST" ] || [ "$LAYER_DIGEST" = "None" ]; then
+            echo "ERROR: empty layer digest extracted from dev ECR manifest." >&2
+            exit 1
+          fi
+          if ! aws ecr get-download-url-for-layer \
+            --repository-name rh-platform-dev/apps/reclaw-comms-mcp \
+            --layer-digest "$LAYER_DIGEST" > /dev/null; then
+            echo "ERROR: prod role GetDownloadUrlForLayer failed for dev ECR image. Check ReadDevECRForPromotion IAM permission." >&2
+            exit 1
           fi
           echo "Dev ECR pull access confirmed (BatchGetImage + GetDownloadUrlForLayer)."
 
