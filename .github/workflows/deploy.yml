@@ -47,12 +47,13 @@ jobs:
             --json databaseId \
             --jq 'length')
           if [ "$count" -eq 0 ]; then
-            echo "NOTICE: No push-triggered CI run found; checking for PR-triggered run (hotfix path)."
+            echo "NOTICE: No push-triggered CI run found; checking for pull_request-triggered run (hotfix path)."
             count=$(gh run list \
               --repo "${{ github.repository }}" \
               --commit "${{ github.sha }}" \
               --workflow CI \
               --status success \
+              --event pull_request \
               --limit 1 \
               --json databaseId \
               --jq 'length')
@@ -151,11 +152,10 @@ jobs:
         env:
           DIGEST: ${{ needs.deploy-dev.outputs.image-digest }}
         run: |
-          found=$(aws ecr describe-images \
+          if ! aws ecr describe-images \
             --repository-name rh-platform-dev/apps/reclaw-comms-mcp \
             --image-ids imageDigest="$DIGEST" \
-            --query 'imageDetails[0].imageDigest' --output text 2>&1) || true
-          if [ -z "$found" ] || [ "$found" = "None" ] || echo "$found" | grep -q "Error\|error\|denied"; then
+            --query 'imageDetails[0].imageDigest' --output text > /dev/null 2>&1; then
             echo "ERROR: prod role cannot read dev ECR image ($DIGEST). Check ReadDevECRForPromotion IAM permission." >&2
             exit 1
           fi
@@ -169,6 +169,15 @@ jobs:
           docker pull "$DEV_IMAGE"
           docker tag "$DEV_IMAGE" "$PROD_IMAGE"
           docker push "$PROD_IMAGE"
+          PROD_DIGEST=$(aws ecr describe-images \
+            --repository-name rh-platform/apps/reclaw-comms-mcp \
+            --image-ids imageTag=sha-${{ github.sha }} \
+            --query 'imageDetails[0].imageDigest' --output text)
+          if [ -z "$PROD_DIGEST" ] || [ "$PROD_DIGEST" = "None" ]; then
+            echo "ERROR: could not verify prod ECR image after push — push may have failed" >&2
+            exit 1
+          fi
+          echo "Prod ECR push confirmed: $PROD_DIGEST"
 
       - name: Download current prod task definition
         run: |
