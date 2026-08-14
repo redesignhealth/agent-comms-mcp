@@ -116,7 +116,7 @@ jobs:
               if c['name'] == 'app':
                   c['image'] = IMAGE
           for field in ['taskDefinitionArn','revision','status','requiresAttributes',
-                        'compatibilities','registeredAt','registeredBy','enableFaultInjection']:
+                        'compatibilities','registeredAt','registeredBy']:
               td.pop(field, None)
           with open('/tmp/task-def-dev.json', 'w') as f:
               json.dump(td, f)
@@ -139,7 +139,6 @@ jobs:
     # ensuring prod image promotion cannot be triggered by unprotected jobs.
     permissions:
       id-token: write
-      contents: read
     steps:
       - name: Configure AWS credentials (prod)
         uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
@@ -234,7 +233,7 @@ jobs:
               if c['name'] == 'app':
                   c['image'] = IMAGE
           for field in ['taskDefinitionArn','revision','status','requiresAttributes',
-                        'compatibilities','registeredAt','registeredBy','enableFaultInjection']:
+                        'compatibilities','registeredAt','registeredBy']:
               td.pop(field, None)
           with open('/tmp/task-def-prod.json', 'w') as f:
               json.dump(td, f)

@@ -24,24 +24,34 @@
    git push
    ```
 
-3. **Create a GitHub release** (full release, not pre-release):
+3. **Wait for CI to pass** on the version bump commit before creating the release.
+   `deploy.yml` checks for a successful CI run on the exact release SHA — creating a
+   release before CI finishes causes the deploy job to fail immediately.
    ```bash
-   # Capture the commit you just pushed — avoids tagging the wrong commit
-   # if main moves (e.g. another merge) between your push and the release.
    RELEASE_SHA=$(git rev-parse HEAD)
+   gh run watch \
+     "$(gh run list --workflow ci.yml --event push --branch main \
+          --commit "$RELEASE_SHA" --limit 1 --json databaseId --jq '.[0].databaseId')" \
+     --exit-status
+   ```
+
+4. **Create a GitHub release** (full release, not pre-release):
+   ```bash
+   # Use --target to pin the exact commit — avoids tagging the wrong commit
+   # if main moves (e.g. another merge) between your push and the release.
    gh release create vX.Y.Z --title "vX.Y.Z" --generate-notes --target "$RELEASE_SHA"
    ```
    Or via the GitHub UI: Releases → Draft a new release → tag `vX.Y.Z`, set
    **Target** to the version-bump commit SHA.
    **Do not check "Set as a pre-release"** — pre-releases skip `deploy.yml`.
 
-4. **Verify both triggered workflows** pass at:
+5. **Verify both triggered workflows** pass at:
    `https://github.com/redesignhealth/agent-comms-mcp/actions`
    - `publish.yml` — publishes the Python wheel to PyPI
    - `deploy.yml` — builds the Docker image, deploys to dev ECS, then promotes to prod ECS
      (the `deploy-prod` job requires approval from a `production` environment reviewer)
 
-5. **Confirm the package is live** on PyPI:
+6. **Confirm the package is live** on PyPI:
    ```bash
    pip index versions agent-comms-mcp
    ```
