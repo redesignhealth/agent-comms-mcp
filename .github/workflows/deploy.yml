@@ -78,11 +78,13 @@ jobs:
         run: |
           docker build -t "$DEV_IMAGE" .
           docker push "$DEV_IMAGE"
-          # Retrieve digest from the local Docker daemon's record of the pushed image.
-          # Using docker inspect avoids a separate ECR API call and any indexing delay.
-          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$DEV_IMAGE" | cut -d'@' -f2)
+          # Grep for the specific dev ECR registry in RepoDigests to avoid relying on
+          # index ordering, which is not guaranteed when an image has multiple tags/refs.
+          DIGEST=$(docker inspect --format='{{range .RepoDigests}}{{println .}}{{end}}' "$DEV_IMAGE" \
+            | grep '^082533342824\.dkr\.ecr\.us-east-1\.amazonaws\.com/rh-platform-dev/apps/reclaw-comms-mcp@' \
+            | head -1 | cut -d'@' -f2)
           if [ -z "$DIGEST" ] || [ "$DIGEST" = "None" ]; then
-            echo "ERROR: could not retrieve image digest after push" >&2
+            echo "ERROR: could not retrieve dev ECR image digest after push" >&2
             exit 1
           fi
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
@@ -151,12 +153,19 @@ jobs:
         env:
           DIGEST: ${{ needs.deploy-dev.outputs.image-digest }}
         run: |
-          FOUND=$(aws ecr batch-get-image \
+          # batch-get-image exits 0 even on ImageNotFoundException (image not found goes to
+          # failures[], not an error exit), so check both the exit code (catches auth failures)
+          # and the output (catches image-not-found). Do NOT use 2>&1 — that would capture
+          # AWS CLI error messages into $FOUND and cause auth failures to pass silently.
+          if ! FOUND=$(aws ecr batch-get-image \
             --repository-name rh-platform-dev/apps/reclaw-comms-mcp \
             --image-ids imageDigest="$DIGEST" \
-            --query 'images[0].imageId.imageDigest' --output text 2>&1)
-          if [ -z "$FOUND" ] || [ "$FOUND" = "None" ]; then
+            --query 'images[0].imageId.imageDigest' --output text); then
             echo "ERROR: prod role cannot pull dev ECR image ($DIGEST). Check ReadDevECRForPromotion IAM permission." >&2
+            exit 1
+          fi
+          if [ -z "$FOUND" ] || [ "$FOUND" = "None" ]; then
+            echo "ERROR: prod role cannot pull dev ECR image ($DIGEST) — image not found in ECR." >&2
             exit 1
           fi
           echo "Dev ECR pull access confirmed: $FOUND"
@@ -170,7 +179,10 @@ jobs:
           docker pull "$DEV_IMAGE"
           docker tag "$DEV_IMAGE" "$PROD_IMAGE"
           docker push "$PROD_IMAGE"
-          PROD_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$PROD_IMAGE" | cut -d'@' -f2)
+          # Grep for the specific prod ECR registry to avoid index ordering assumptions.
+          PROD_DIGEST=$(docker inspect --format='{{range .RepoDigests}}{{println .}}{{end}}' "$PROD_IMAGE" \
+            | grep '^082533342824\.dkr\.ecr\.us-east-1\.amazonaws\.com/rh-platform/apps/reclaw-comms-mcp@' \
+            | head -1 | cut -d'@' -f2)
           if [ -z "$PROD_DIGEST" ] || [ "$PROD_DIGEST" = "None" ]; then
             echo "ERROR: could not verify prod ECR image after push — push may have failed" >&2
             exit 1
