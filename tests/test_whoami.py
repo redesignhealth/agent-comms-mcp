@@ -143,13 +143,18 @@ class TestWhoami:
         assert "min_schema_version" not in result
         assert "max_schema_version" not in result
 
-    def test_db_connectivity_failure_still_returns_identity_fields(self) -> None:
+    def test_db_connectivity_failure_still_returns_identity_fields(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
         """TECH-5160 (Argus round 1): a genuine connectivity/config failure
         (DATABASE_URL unset, Postgres unreachable, etc.) must not break
         whoami's core identity/scopes contract -- it only omits the
         schema-version fields, exactly like the unregistered-caller case,
         but via the narrowed (RuntimeError/OperationalError/InterfaceError/
-        OSError) except clause rather than the agent-is-None branch."""
+        OSError) except clause rather than the agent-is-None branch. Also
+        asserts the swallowed failure is actually logged (Argus round 2:
+        a prior version of this test never checked this, so the log call
+        could be deleted without failing anything)."""
         token = MagicMock()
         token.claims = {"iss": "agent-jwt", "sub": "ea-agent-svc", "scopes": ["comms:read"]}
 
@@ -159,6 +164,7 @@ class TestWhoami:
                 "providers.comms.get_session_factory",
                 side_effect=RuntimeError("Required environment variable DATABASE_URL is not set"),
             ),
+            caplog.at_level("WARNING", logger="providers.comms"),
         ):
             result = asyncio.run(_whoami())
 
@@ -168,6 +174,7 @@ class TestWhoami:
         assert result["scopes"] == ["comms:read"]
         assert "min_schema_version" not in result
         assert "max_schema_version" not in result
+        assert any("schema-version lookup" in r.message for r in caplog.records)
 
     def test_unnarrowed_exception_is_not_swallowed(self) -> None:
         """TECH-5160 (Argus round 1): a genuine programming/schema bug in

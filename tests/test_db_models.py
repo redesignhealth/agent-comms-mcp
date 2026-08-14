@@ -238,6 +238,11 @@ class TestSchema:
         assert constraint_def is not None, "ck_agents_schema_version_range constraint missing"
         assert "min_schema_version" in constraint_def
         assert "max_schema_version" in constraint_def
+        # Argus round 2: the prior assertions only checked both column
+        # names appeared, which would still pass even if the >= 1 lower
+        # bound (added specifically to close a 0/negative-range security
+        # gap) were ever reverted.
+        assert ">= 1" in constraint_def
 
     async def test_conversations_columns(self, engine: AsyncEngine) -> None:
         cols = await _columns(engine, "conversations")

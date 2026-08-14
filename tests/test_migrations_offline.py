@@ -88,8 +88,8 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
     # the DB-level >= 1 / <= max CHECK constraint, and the
     # (sender_id, created_at) index backing
     # service._enforce_sender_global_rate_limit (Argus round 1).
-    assert "ADD COLUMN min_schema_version INTEGER DEFAULT '1' NOT NULL" in result.stdout
-    assert "ADD COLUMN max_schema_version INTEGER DEFAULT '1' NOT NULL" in result.stdout
+    assert "ADD COLUMN min_schema_version INTEGER DEFAULT 1 NOT NULL" in result.stdout
+    assert "ADD COLUMN max_schema_version INTEGER DEFAULT 1 NOT NULL" in result.stdout
     assert (
         "ALTER TABLE agents ADD CONSTRAINT ck_agents_schema_version_range "
         "CHECK (min_schema_version >= 1 AND min_schema_version <= max_schema_version)"

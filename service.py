@@ -293,17 +293,34 @@ async def _deny_schema_version_mismatch(
     agent_id: uuid.UUID,
     conversation_id: uuid.UUID | None,
     participant_ids: list[uuid.UUID],
-    common_floor: int,
-    common_ceiling: int,
+    required_min: int,
+    available_max: int,
 ) -> NoReturn:
-    # The exact common_floor/common_ceiling values are recorded in the
-    # audit detail (server-side only) but deliberately NOT included in the
-    # raised message (Argus round 1, security): unlike
-    # UnknownConversationTypeError's fixed CONVERSATION_TYPES vocabulary,
-    # an agent's registered [min, max] range is its own per-agent state --
-    # an initiator could otherwise recover a target's exact range by
-    # varying its own declared range across repeated start_conversation
-    # calls and bisecting on which side of the mismatch it lands.
+    """Audit + raise the schema-version-mismatch denial.
+
+    ``required_min``/``available_max`` carry different underlying
+    computations at this function's two call sites (Argus round 2, audit
+    clarity) — ``start_conversation`` passes the negotiated-set's
+    ``max(min_schema_version)``/clamped-``min(max_schema_version)``
+    (see ``_negotiate_schema_version``), while ``invite`` passes a single
+    new target's own ``min_schema_version``/the conversation's already-
+    pinned version (see ``_conversation_pinned_schema_version``). Both are
+    still "the floor that was required" vs. "the ceiling that was
+    available" in the audit record, which is why one field pair covers
+    both — but the two call sites are NOT computing the same thing, so
+    don't assume ``required_min``/``available_max`` are directly
+    comparable in the audit trail across a start-vs-invite denial without
+    checking which call site produced the row.
+
+    The exact values are recorded in the audit detail (server-side only)
+    but deliberately NOT included in the raised message (Argus round 1,
+    security): unlike ``UnknownConversationTypeError``'s fixed
+    ``CONVERSATION_TYPES`` vocabulary, an agent's registered ``[min, max]``
+    range is its own per-agent state -- an initiator could otherwise
+    recover a target's exact range by varying its own declared range
+    across repeated ``start_conversation``/``invite`` calls and bisecting
+    on which side of the mismatch it lands.
+    """
     _audit(
         session,
         actor_sub=actor_sub,
@@ -312,8 +329,8 @@ async def _deny_schema_version_mismatch(
         conversation_id=conversation_id,
         detail={
             "participant_agent_ids": [str(p) for p in participant_ids],
-            "required_min": common_floor,
-            "common_max": common_ceiling,
+            "required_min": required_min,
+            "available_max": available_max,
         },
     )
     await session.commit()
@@ -362,8 +379,8 @@ async def _negotiate_schema_version(
             agent_id=initiator.id,
             conversation_id=None,
             participant_ids=[p.id for p in participants],
-            common_floor=required_floor,
-            common_ceiling=negotiated_version,
+            required_min=required_floor,
+            available_max=negotiated_version,
         )
     return negotiated_version
 
@@ -467,14 +484,29 @@ async def _conversation_pinned_schema_version(
     ``invite`` to re-check a new participant against the already-pinned
     version, closing the gap where inviting could otherwise admit a
     participant whose declared range excludes it.
+
+    Raises ``RuntimeError`` (an internal invariant violation, mapped to
+    the generic ToolError at the tools boundary — see
+    ``_map_service_errors``'s docstring) if the seq-1 row is somehow
+    missing — every conversation this function is ever called on already
+    passed ``_load_participant_for_transition``, which requires the
+    conversation to exist, and ``start_conversation`` always writes seq-1
+    atomically with the conversation row itself (Argus round 2: prefer
+    this explicit, diagnosable failure over ``scalar_one()``'s
+    ``NoResultFound`` leaking out as an unmapped internal error).
     """
-    return (
+    result = (
         await session.execute(
             select(Message.schema_version).where(
                 Message.conversation_id == conversation_id, Message.seq == 1
             )
         )
-    ).scalar_one()
+    ).scalar_one_or_none()
+    if result is None:
+        raise RuntimeError(
+            f"invariant violation: conversation {conversation_id} has no seq-1 message"
+        )
+    return result
 
 
 def _maybe_expire(session: AsyncSession, actor_sub: str, conversation: Conversation) -> None:
@@ -1715,8 +1747,8 @@ async def invite(
             agent_id=inviter_agent_id,
             conversation_id=conversation.id,
             participant_ids=[inviter_agent_id, target.id],
-            common_floor=target.min_schema_version,
-            common_ceiling=pinned_version,
+            required_min=target.min_schema_version,
+            available_max=pinned_version,
         )
     await _authorize_invite_owner_freeze(
         session,

@@ -284,27 +284,39 @@ async def whoami(agent_key: str | None = None) -> dict[str, Any]:
         "caller_type": "interactive" if interactive else "service",
         "scopes": scopes_for_token(token),
     }
+    # Diagnostic tool, DB-optional (see docstring) — genuine connectivity/
+    # configuration failures just omit the schema-version fields, same as
+    # the already-handled "not registered yet" case (agent is None, below).
+    # Deliberately narrow and split into two distinct try blocks (Argus
+    # round 2) rather than one broad catch spanning both the session-
+    # factory construction and the query: `RuntimeError` is ONLY expected
+    # from `get_session_factory()` itself (`db.require_env` raises it for
+    # a missing `DATABASE_URL`) -- a `RuntimeError` surfacing from inside
+    # the query/lookup instead would be a genuine, unrelated programming
+    # bug that this except clause must not also swallow. Logged at
+    # WARNING, not silently dropped, so a genuine outage is still visible
+    # in the tool's own logs even though the caller sees a clean response.
     try:
-        async with get_session_factory()() as session:
+        session_factory = get_session_factory()
+    except RuntimeError as exc:
+        logger.warning(
+            "whoami: schema-version lookup unavailable (%s), omitting fields",
+            type(exc).__name__,
+            exc_info=True,
+        )
+        return result
+    try:
+        async with session_factory() as session:
             agent = await service.get_agent_by_sub(session, composed_sub)
         if agent is not None:
             result["min_schema_version"] = agent.min_schema_version
             result["max_schema_version"] = agent.max_schema_version
-    except (RuntimeError, OperationalError, InterfaceError, OSError) as exc:
-        # Diagnostic tool, DB-optional (see docstring) — genuine
-        # connectivity/configuration failures (DATABASE_URL unset --
-        # db.get_session_factory's require_env raises RuntimeError --
-        # unreachable Postgres, a dropped connection mid-query) just omit
-        # these fields, same as the already-handled "not registered yet"
-        # case (agent is None, above). Narrowed to these types (Argus round
-        # 1) rather than a bare `except Exception` -- a bare catch would
-        # ALSO swallow a genuine programming/schema bug (a renamed
-        # get_agent_by_sub, a migration not yet applied) indistinguishably
-        # from an ordinary unregistered caller, silently returning a
-        # successful-looking, field-less response for a broken deploy.
-        # Logged at WARNING, not silently dropped, so a genuine outage is
-        # still visible in the tool's own logs even though the caller sees
-        # a clean response.
+    except (OperationalError, InterfaceError, OSError) as exc:
+        # A genuine programming/schema bug (a renamed get_agent_by_sub, a
+        # migration not yet applied) raises something OTHER than these
+        # connection-level types and is deliberately left to propagate,
+        # rather than being indistinguishable from an ordinary unregistered
+        # caller / DB outage (Argus round 1).
         logger.warning(
             "whoami: schema-version lookup failed (%s), omitting fields",
             type(exc).__name__,

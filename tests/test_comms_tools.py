@@ -1198,11 +1198,15 @@ class TestRateLimitAndSchemaErrors:
         message = str(exc_info.value)
         assert "schema_version_mismatch" in message
         assert message != "access_denied: not authorized for this resource"
-        # Anti-enumeration (Argus round 1): the exact registered ranges
-        # (1 vs 2) must not appear in the client-visible message, even
-        # though they're what actually mismatched.
-        assert "1" not in message
-        assert "2" not in message
+        # Anti-enumeration (Argus round 1): the message is a fixed,
+        # deterministic string with no embedded range values at all --
+        # asserting full equality (rather than "no digits", which is
+        # fragile against unrelated future digits in the text, per Argus
+        # round 2) is both stronger and more specific here.
+        assert message == (
+            "schema_version_mismatch: no wire schema version is supported by "
+            "every participant in this conversation"
+        )
 
     async def test_start_conversation_response_includes_negotiated_schema_version(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
@@ -1322,6 +1326,55 @@ class TestMembershipTools:
                     "payload": _availability_response(),
                 },
             )
+
+    async def test_invite_schema_version_mismatch_surfaces_as_tool_error(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """TECH-5160 (Argus round 2): comms_invite's SchemaVersionMismatchError
+        path has service-layer coverage (TestInviteSchemaVersionRecheck in
+        test_service.py) but this exercises the actual _map_service_errors
+        integration through the real mounted tool."""
+        await _register(main, test_session_factory, "inv-sv-owner")
+        await _register(main, test_session_factory, "inv-sv-member")
+        await _register(
+            main,
+            test_session_factory,
+            "inv-sv-incompatible",
+            min_schema_version=2,
+            max_schema_version=2,
+        )
+
+        token_owner = _token("inv-sv-owner")
+        list_result = await _call(main, test_session_factory, token_owner, "comms_list_agents")
+        ids = {a["sub"]: a["agent_id"] for a in list_result["agents"]}
+
+        started = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [ids["inv-sv-member"]],
+                "initial_message": _availability_request(),
+            },
+        )
+        conversation_id = started["conversation_id"]
+
+        with pytest.raises(ToolError) as exc_info:
+            await _call(
+                main,
+                test_session_factory,
+                token_owner,
+                "comms_invite",
+                {
+                    "conversation_id": conversation_id,
+                    "target_agent_id": ids["inv-sv-incompatible"],
+                },
+            )
+        message = str(exc_info.value)
+        assert "schema_version_mismatch" in message
+        assert message != "access_denied: not authorized for this resource"
 
 
 class TestTaskLifecycleToolLayer:

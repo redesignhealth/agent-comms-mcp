@@ -136,8 +136,8 @@ Five tables. `messages` and `audit_log` are append-only: no UPDATE/DELETE paths 
 
 ```
 agents id, sub UNIQUE, owner_sub, owner_email, display_name,
- accepted_types text[] (max 20 types, 256 chars each),
- status(active|suspended), bound_at, timestamps
+ accepted_types text[] (max 20 types, 100 chars each),
+ status(active|suspended), min/max_schema_version (TECH-5160), bound_at, timestamps
 conversations id, type, state(active|completed|canceled|expired),
  created_by, expires_at, owner_snapshot jsonb (nullable),
  timestamps

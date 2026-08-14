@@ -701,6 +701,17 @@ class TestSchemaVersionNegotiation:
             (await session.execute(text("SELECT * FROM messages"))).mappings().all()
         )
         assert message_rows == []
+        # Argus round 2: the prior version of this test asserted atomicity
+        # for Conversation/Message only, despite the docstring's broader
+        # "conversation/participant/message" claim -- Participant rows for
+        # both the owner (role=owner) and target (role=member) are exactly
+        # what start_conversation would have inserted between the
+        # Conversation row and the seq-1 Message, so they're the most
+        # likely place a partial-rollback bug would actually surface.
+        participant_rows = (
+            (await session.execute(select(Participant))).scalars().all()
+        )
+        assert participant_rows == []
         actions = (
             (await session.execute(select(AuditLog.action).where(AuditLog.agent_id == owner.id)))
             .scalars()

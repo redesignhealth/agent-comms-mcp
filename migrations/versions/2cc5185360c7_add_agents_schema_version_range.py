@@ -52,7 +52,12 @@ def upgrade() -> None:
             "min_schema_version",
             sa.Integer(),
             nullable=False,
-            server_default="1",
+            # sa.text("1"), not a bare "1" string (Argus round 2): the
+            # codebase convention for an integer server_default (see
+            # ef8394b37c8d's last_read_seq -- server_default=sa.text("0"))
+            # is a raw-SQL text() default, not a plain Python string, which
+            # SQLAlchemy instead treats as a quoted literal.
+            server_default=sa.text("1"),
         ),
     )
     op.add_column(
@@ -61,7 +66,7 @@ def upgrade() -> None:
             "max_schema_version",
             sa.Integer(),
             nullable=False,
-            server_default="1",
+            server_default=sa.text("1"),
         ),
     )
     # >= 1, not just <= max: a 0/negative pair would otherwise pass this
@@ -82,7 +87,12 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index("idx_messages_sender_id_created_at", table_name="messages")
+    # if_exists=True (Argus round 2): mirrors upgrade()'s own
+    # if_not_exists=True -- without it, a downgrade on an environment
+    # where this index was somehow never created (or already dropped)
+    # fails outright instead of no-op'ing, the same asymmetry
+    # 6d2a8e63e469/da3e1646c44d's drop_index calls already guard against.
+    op.drop_index("idx_messages_sender_id_created_at", table_name="messages", if_exists=True)
     op.drop_constraint("ck_agents_schema_version_range", "agents", type_="check")
     op.drop_column("agents", "max_schema_version")
     op.drop_column("agents", "min_schema_version")
