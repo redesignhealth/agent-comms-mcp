@@ -50,6 +50,17 @@ service/tools boundary:
   already stated in the tool's own docstring — there's nothing to usefully
   enumerate.
 
+- ``SchemaVersionMismatchError``: at ``comms_start_conversation``, no wire
+  schema version falls inside every participant's declared
+  ``[min_schema_version, max_schema_version]`` capability range. Specific
+  by design, same reasoning as ``UnknownConversationTypeError``: the
+  version range each participant negotiates with is protocol-capability
+  information (bounded, small, and something every legitimate caller
+  needs to reason about to pick compatible counterparties), not a fact
+  about another agent's private state — DESIGN.md's anti-enumeration rule
+  targets conversation/agent existence and membership, not this fixed
+  wire-protocol vocabulary.
+
 Payload/schema validation failures are NOT redefined here: they reuse
 ``schemas.PayloadValidationError`` directly, which is already a distinct,
 specific exception type.
@@ -99,9 +110,18 @@ class UnknownConversationTypeError(Exception):
     not an enumeration risk."""
 
 
+class SchemaVersionMismatchError(Exception):
+    """No wire schema version is inside every participant's declared
+    ``[min_schema_version, max_schema_version]`` range at
+    ``comms_start_conversation``. Message is specific by design — see the
+    module docstring for why naming this fixed, public capability-range
+    mismatch is not an enumeration risk."""
+
+
 __all__ = [
     "AccessDeniedError",
     "InvalidConversationStateError",
     "RateLimitExceededError",
+    "SchemaVersionMismatchError",
     "UnknownConversationTypeError",
 ]

@@ -198,7 +198,7 @@ scroll-to-load-more use case.
 | Tool | Scope | Notes |
 |---|---|---|
 | `comms_whoami` | comms:read | caller identity/scopes |
-| `comms_register` | comms:write | idempotent self-provisioning: display_name, accepted_types (max 20, 256 chars each) |
+| `comms_register` | comms:write | idempotent self-provisioning: display_name, accepted_types (max 20, 256 chars each), min/max_schema_version (default 1/1, TECH-5160 capability negotiation) |
 | `comms_list_agents` | comms:read | directory (internal domain, enumeration acceptable). Returns agent UUIDs used as target identifiers in other tools |
 | `comms_lookup_agent_by_email` | comms:read | directory lookup by owner email; `{"agent": ..., "found": bool}`. O(1) targeted equivalent of paginating `comms_list_agents` -- see §10's enumeration-posture note |
 | `comms_start_conversation` | comms:write | type + up to 50 target agent UUIDs (from `comms_list_agents`) + initial request payload |
@@ -387,6 +387,38 @@ previous dedicated `tasks` table had its own `MAX_TASK_CREATES_PER_HOUR = 30`
 bucket — the shared limit is 3× tighter. Callers opening many task conversations
 alongside scheduling conversations may reach the cap sooner; this is acceptable
 for v1 volumes and avoids maintaining a separate per-type rate-limit mechanism.
+
+`MAX_MESSAGES_PER_CONVERSATION_PER_HOUR = 30` and `MAX_CONVERSATION_STARTS_PER_HOUR = 10`
+are each scoped narrower than the board as a whole — a sender could otherwise flood
+many DIFFERENT conversations, each comfortably under the per-conversation cap, and
+disclose/probe at a much higher aggregate rate (TECH-5160). `MAX_MESSAGES_PER_SENDER_PER_HOUR = 120`
+closes that gap: a board-level cap on one sender's TOTAL message volume across
+every conversation combined, checked additively (never in place of) the two
+narrower limits above, from both `post_message` and `start_conversation`'s
+seq-1 message path. 120 is generous relative to the per-conversation cap — an
+agent legitimately juggling 3-4 concurrent negotiations at up to 30 msgs/hour
+each stays comfortably under it; it exists to catch cross-conversation spraying,
+not to constrain normal multi-negotiation traffic. This is board-level
+defense-in-depth: it protects the board itself even if a counterparty's own
+agent-local rate limiter has a bug or is bypassed entirely by a compromised
+agent that skips the standard negotiation library altogether.
+
+### Wire-schema capability negotiation
+
+Agents declare `min_schema_version`/`max_schema_version` (both default `1`,
+today's only version) at `comms_register` time — the range of wire-schema
+versions their own code can correctly interpret. `start_conversation` is the
+one place a fresh participant set is first assembled, so that's where the
+board negotiates: `negotiated_version = min(participant.max_schema_version)`
+across the initiator + every named target, verified to be `>=
+max(participant.min_schema_version)` across the same set. If some version
+satisfies both, the conversation is pinned to it (overriding whatever
+`schema_version` the caller passed — that parameter is advisory only); if no
+version satisfies both, the conversation is refused outright
+(`SchemaVersionMismatchError`, specific by design — see `exceptions.py`).
+This combined refuse-or-degrade rule is deliberately evaluated once, at open
+time, not on every later message — a message's own per-message
+`schema_version` field is a separate, agent-local defense-in-depth concern.
 
 ### Known gap: `platform_get_agent_owners`
 

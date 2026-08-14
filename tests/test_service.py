@@ -39,6 +39,7 @@ from exceptions import (
     AccessDeniedError,
     InvalidConversationStateError,
     RateLimitExceededError,
+    SchemaVersionMismatchError,
     UnknownConversationTypeError,
 )
 from models import Agent, AuditLog, Conversation, Participant
@@ -52,6 +53,7 @@ from service import (
     CONVERSATION_TTL,
     MAX_CONVERSATION_STARTS_PER_HOUR,
     MAX_MESSAGES_PER_CONVERSATION_PER_HOUR,
+    MAX_MESSAGES_PER_SENDER_PER_HOUR,
     AgentTableOwnershipClient,
     OwnershipClient,
     accept_invite,
@@ -414,6 +416,32 @@ class TestRegisterAgent:
                 accepted_types=["availability_request", "bogus"],
             )
 
+    async def test_schema_version_defaults_to_one_one(self, session: AsyncSession) -> None:
+        """TECH-5160: min/max_schema_version default to 1/1 (today's only
+        wire schema version) when not supplied."""
+        agent = await _register(session, "agent-schema-default")
+        assert agent.min_schema_version == 1
+        assert agent.max_schema_version == 1
+
+    async def test_schema_version_range_persisted(self, session: AsyncSession) -> None:
+        agent = await _register(
+            session, "agent-schema-range", min_schema_version=1, max_schema_version=2
+        )
+        assert agent.min_schema_version == 1
+        assert agent.max_schema_version == 2
+
+    async def test_min_schema_version_over_max_rejected(self, session: AsyncSession) -> None:
+        """TECH-5160: min_schema_version > max_schema_version is a plain
+        input-validation failure (not an authorization decision), same
+        posture as the other malformed-input ``ValueError`` cases above."""
+        with pytest.raises(ValueError, match="min_schema_version must be <= max_schema_version"):
+            await _register(
+                session,
+                "agent-bad-schema-range",
+                min_schema_version=3,
+                max_schema_version=2,
+            )
+
 
 # --- start_conversation --------------------------------------------------------
 
@@ -565,6 +593,87 @@ class TestStartConversation:
             message_type="task_cancel",
         )
         assert conversation.state == "canceled"
+
+
+class TestSchemaVersionNegotiation:
+    """TECH-5160: capability negotiation at ``start_conversation``.
+
+    Computed generically via ``min``/``max`` of the registered ranges
+    rather than hardcoding ``1`` everywhere, so these assertions would
+    still hold if a future agent registered e.g. ``[1, 2]``.
+    """
+
+    async def test_overlapping_ranges_negotiate_to_common_max(
+        self, session: AsyncSession
+    ) -> None:
+        owner = await _register(
+            session, "owner-schema-ok", min_schema_version=1, max_schema_version=1
+        )
+        target = await _register(
+            session, "target-schema-ok", min_schema_version=1, max_schema_version=1
+        )
+        expected_negotiated = min(owner.max_schema_version, target.max_schema_version)
+        assert max(owner.min_schema_version, target.min_schema_version) <= expected_negotiated
+
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+        )
+        assert conversation.state == "active"
+        message = (
+            await session.execute(
+                text(
+                    "SELECT schema_version FROM messages "
+                    "WHERE conversation_id = :cid AND seq = 1"
+                ),
+                {"cid": conversation.id},
+            )
+        ).scalar_one()
+        assert message == expected_negotiated
+
+    async def test_non_overlapping_ranges_refused_and_atomic(
+        self, session: AsyncSession
+    ) -> None:
+        """No version is inside both participants' ranges -- the board
+        refuses to open the conversation at all, and (transactionally) no
+        conversation/participant/message row is left behind."""
+        owner = await _register(
+            session, "owner-schema-mismatch", min_schema_version=1, max_schema_version=1
+        )
+        target = await _register(
+            session, "target-schema-mismatch", min_schema_version=2, max_schema_version=2
+        )
+
+        with pytest.raises(SchemaVersionMismatchError):
+            await start_conversation(
+                session,
+                actor_sub=owner.sub,
+                initiator_agent_id=owner.id,
+                conversation_type="open",
+                target_agent_ids=[target.id],
+                initial_message=_request_payload(),
+            )
+
+        conversation_rows = (
+            (await session.execute(select(Conversation).where(Conversation.created_by == owner.id)))
+            .scalars()
+            .all()
+        )
+        assert conversation_rows == []
+        message_rows = (
+            (await session.execute(text("SELECT * FROM messages"))).mappings().all()
+        )
+        assert message_rows == []
+        actions = (
+            (await session.execute(select(AuditLog.action).where(AuditLog.agent_id == owner.id)))
+            .scalars()
+            .all()
+        )
+        assert "denied.schema_version_mismatch" in actions
 
 
 class _FakeOwnershipClient:
@@ -2460,6 +2569,114 @@ class TestRateLimits:
             .all()
         )
         assert "denied.rate_limited" in actions
+
+    async def test_sender_global_rate_limit_spans_many_conversations(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-5160: MAX_MESSAGES_PER_SENDER_PER_HOUR caps a sender's TOTAL
+        message volume across ALL conversations combined — defense-in-depth
+        against a sender staying under MAX_MESSAGES_PER_CONVERSATION_PER_HOUR
+        in each of many DIFFERENT conversations while flooding in aggregate.
+        """
+        owner = await _register(session, "rl-owner-3")
+        flooder = await _register(session, "rl-flooder-3")
+
+        # Spread MAX_MESSAGES_PER_SENDER_PER_HOUR messages across enough
+        # distinct conversations that no single conversation ever
+        # approaches MAX_MESSAGES_PER_CONVERSATION_PER_HOUR -- isolating
+        # the global limit from the per-conversation one.
+        num_conversations = 5
+        per_conversation = MAX_MESSAGES_PER_SENDER_PER_HOUR // num_conversations
+        assert per_conversation < MAX_MESSAGES_PER_CONVERSATION_PER_HOUR
+        assert per_conversation * num_conversations == MAX_MESSAGES_PER_SENDER_PER_HOUR
+
+        for _ in range(num_conversations):
+            conversation = await start_conversation(
+                session,
+                actor_sub=owner.sub,
+                initiator_agent_id=owner.id,
+                conversation_type="open",
+                target_agent_ids=[flooder.id],
+                initial_message=_request_payload(),
+            )
+            await accept_invite(
+                session,
+                actor_sub=flooder.sub,
+                agent_id=flooder.id,
+                conversation_id=conversation.id,
+            )
+            for _ in range(per_conversation):
+                await post_message(
+                    session,
+                    actor_sub=flooder.sub,
+                    sender_agent_id=flooder.id,
+                    conversation_id=conversation.id,
+                    message_type="counter_proposal",
+                    payload=_counter_proposal_payload(),
+                )
+
+        # One more conversation, brand new (0 prior messages there), so the
+        # per-conversation check alone would pass -- only the global,
+        # cross-conversation cap should fire here.
+        overflow_conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[flooder.id],
+            initial_message=_request_payload(),
+        )
+        await accept_invite(
+            session,
+            actor_sub=flooder.sub,
+            agent_id=flooder.id,
+            conversation_id=overflow_conversation.id,
+        )
+        with pytest.raises(RateLimitExceededError):
+            await post_message(
+                session,
+                actor_sub=flooder.sub,
+                sender_agent_id=flooder.id,
+                conversation_id=overflow_conversation.id,
+                message_type="counter_proposal",
+                payload=_counter_proposal_payload(),
+            )
+        actions = (
+            (
+                await session.execute(
+                    select(AuditLog.action).where(AuditLog.agent_id == flooder.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert "denied.rate_limited" in actions
+
+        # A DIFFERENT sender in the same window is entirely unaffected.
+        other_sender = await _register(session, "rl-other-3")
+        other_conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[other_sender.id],
+            initial_message=_request_payload(),
+        )
+        await accept_invite(
+            session,
+            actor_sub=other_sender.sub,
+            agent_id=other_sender.id,
+            conversation_id=other_conversation.id,
+        )
+        message = await post_message(
+            session,
+            actor_sub=other_sender.sub,
+            sender_agent_id=other_sender.id,
+            conversation_id=other_conversation.id,
+            message_type="counter_proposal",
+            payload=_counter_proposal_payload(),
+        )
+        assert message.seq == 2
 
 
 # --- expiry -----------------------------------------------------------------------

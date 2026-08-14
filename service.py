@@ -118,6 +118,7 @@ from exceptions import (
     AccessDeniedError,
     InvalidConversationStateError,
     RateLimitExceededError,
+    SchemaVersionMismatchError,
     UnknownConversationTypeError,
 )
 from models import Agent, AuditLog, Conversation, Message, Participant
@@ -167,6 +168,19 @@ CONVERSATION_TTL: dict[str, timedelta] = {
 # directly (no Redis — DESIGN.md §5: "No Redis until it matters").
 MAX_MESSAGES_PER_CONVERSATION_PER_HOUR = 30
 MAX_CONVERSATION_STARTS_PER_HOUR = 10
+# Board-level, cross-conversation defense-in-depth (TECH-5160): the two
+# limits above are each scoped to a single conversation (or to opening new
+# ones), so a sender could still flood MANY DIFFERENT conversations, each
+# comfortably under MAX_MESSAGES_PER_CONVERSATION_PER_HOUR, and disclose or
+# probe at a much higher aggregate rate than either limit alone suggests.
+# This caps a sender's TOTAL message volume across every conversation
+# combined. 120 is deliberately generous relative to the per-conversation
+# cap: an agent legitimately juggling several concurrent negotiations at up
+# to 30 msgs/hour each in 3-4 conversations stays comfortably under this;
+# it exists to catch a sender spraying messages across many conversations
+# to evade the per-conversation cap, not to constrain normal multi-
+# negotiation traffic.
+MAX_MESSAGES_PER_SENDER_PER_HOUR = 120
 
 
 def _now() -> datetime:
@@ -269,6 +283,69 @@ async def _deny_rate_limited(
     )
     await session.commit()
     raise RateLimitExceededError(message, reason=limit_name)
+
+
+async def _deny_schema_version_mismatch(
+    session: AsyncSession,
+    *,
+    actor_sub: str,
+    agent_id: uuid.UUID,
+    participant_ids: list[uuid.UUID],
+    common_floor: int,
+    common_ceiling: int,
+) -> NoReturn:
+    _audit(
+        session,
+        actor_sub=actor_sub,
+        action="denied.schema_version_mismatch",
+        agent_id=agent_id,
+        detail={
+            "participant_agent_ids": [str(p) for p in participant_ids],
+            "required_min": common_floor,
+            "common_max": common_ceiling,
+        },
+    )
+    await session.commit()
+    raise SchemaVersionMismatchError(
+        "schema_version_mismatch: no wire schema version is supported by every "
+        f"participant (highest mutually-supported max is {common_ceiling}, but "
+        f"at least one participant requires a version >= {common_floor})"
+    )
+
+
+async def _negotiate_schema_version(
+    session: AsyncSession, *, actor_sub: str, initiator: Agent, targets: list[Agent]
+) -> int:
+    """Compute the highest wire schema version every participant mutually
+    supports, refusing to open the conversation if no such version exists.
+
+    TECH-5160 capability negotiation, evaluated once at ``start_conversation``
+    (a fresh participant set is only ever assembled here, not on every later
+    message — a message's own per-message ``schema_version`` field is the
+    sibling agent-local defense-in-depth layer's concern, not this one's).
+
+    Combined refuse-vs-degrade rule: ``negotiated_version`` is the lowest
+    common denominator (``min`` of every participant's declared
+    ``max_schema_version``). If that value is still >= every participant's
+    declared ``min_schema_version`` (i.e. it falls inside every
+    participant's ``[min, max]`` range), the conversation degrades to it.
+    Otherwise there is no version at all that every participant can
+    correctly interpret, and opening is refused entirely
+    (``SchemaVersionMismatchError``).
+    """
+    participants = [initiator, *targets]
+    negotiated_version = min(p.max_schema_version for p in participants)
+    required_floor = max(p.min_schema_version for p in participants)
+    if required_floor > negotiated_version:
+        await _deny_schema_version_mismatch(
+            session,
+            actor_sub=actor_sub,
+            agent_id=initiator.id,
+            participant_ids=[p.id for p in participants],
+            common_floor=required_floor,
+            common_ceiling=negotiated_version,
+        )
+    return negotiated_version
 
 
 async def _deny_bad_schema(
@@ -599,6 +676,8 @@ async def register_agent(
     owner_email: str,
     display_name: str,
     accepted_types: list[str],
+    min_schema_version: int = 1,
+    max_schema_version: int = 1,
 ) -> Agent:
     """Idempotently create or re-bind the board ``Agent`` row for ``sub``.
 
@@ -634,7 +713,20 @@ async def register_agent(
     An ``accepted_types`` containing a value outside ``MESSAGE_TYPES``
     instead raises ``UnknownConversationTypeError`` (exceptions.py) --
     specific and client-safe by design, unlike the cases above.
+
+    ``min_schema_version``/``max_schema_version`` (TECH-5160, both default
+    to ``1``, today's only version) declare the wire-schema version range
+    this agent's own code can correctly interpret. ``start_conversation``
+    negotiates down to the highest version every participant in a new
+    conversation mutually supports, refusing to open at all if no version
+    is inside every participant's range — see
+    ``service._negotiate_schema_version``. Raises ``ValueError`` if
+    ``min_schema_version > max_schema_version`` (checked alongside the
+    other input-validation failures above, not as an authorization
+    decision).
     """
+    if min_schema_version > max_schema_version:
+        raise ValueError("min_schema_version must be <= max_schema_version")
     sub = sub.strip()
     if not sub:
         raise ValueError("sub must be non-empty")
@@ -692,6 +784,8 @@ async def register_agent(
             accepted_types=normalized_types,
             status="active",
             bound_at=now,
+            min_schema_version=min_schema_version,
+            max_schema_version=max_schema_version,
         )
         session.add(agent)
     else:
@@ -715,6 +809,8 @@ async def register_agent(
         agent.accepted_types = normalized_types
         agent.status = "active"
         agent.bound_at = now
+        agent.min_schema_version = min_schema_version
+        agent.max_schema_version = max_schema_version
     await session.flush()
     _audit(
         session,
@@ -1109,8 +1205,12 @@ async def start_conversation(
     target list (input-validation, not authorization); ``AccessDeniedError``
     (uniform) if any target is unknown/inactive, or the participant set
     fails admission; ``RateLimitExceededError`` past the per-initiator
-    hourly cap; ``schemas.PayloadValidationError`` if ``initial_message``
-    fails schema validation.
+    conversation-start hourly cap OR the board-level per-sender-across-all-
+    conversations hourly cap (TECH-5160); ``SchemaVersionMismatchError`` if
+    no wire schema version falls inside every participant's declared
+    ``[min_schema_version, max_schema_version]`` range;
+    ``schemas.PayloadValidationError`` if ``initial_message`` fails schema
+    validation.
     """
     initiator = await _require_active_agent(
         session, actor_sub=actor_sub, agent_id=initiator_agent_id
@@ -1127,6 +1227,14 @@ async def start_conversation(
         raise ValueError("target_agent_ids must name at least one other agent")
 
     await _enforce_start_rate_limit(session, actor_sub=actor_sub, initiator=initiator)
+    # start_conversation inserts its seq-1 message directly (below), rather
+    # than delegating to post_message — so the board-level global rate
+    # limit has to be enforced here too, or opening many new conversations
+    # would be an easy way to route around it (post_message's own call
+    # never sees the opening message). See _enforce_sender_global_rate_limit.
+    await _enforce_sender_global_rate_limit(
+        session, actor_sub=actor_sub, sender_agent_id=initiator.id
+    )
     targets = await _resolve_targets(
         session,
         actor_sub=actor_sub,
@@ -1140,6 +1248,16 @@ async def start_conversation(
         targets=targets,
         conversation_type=conversation_type,
         ownership_client=ownership_client,
+    )
+
+    # TECH-5160 capability negotiation: the caller-supplied schema_version
+    # is NOT trusted as the actual wire version — it is overridden by the
+    # highest version every participant (initiator + all targets) mutually
+    # supports, refusing outright if no such version exists at all. See
+    # _negotiate_schema_version's docstring for the combined refuse-vs-
+    # degrade rule.
+    schema_version = await _negotiate_schema_version(
+        session, actor_sub=actor_sub, initiator=initiator, targets=targets
     )
 
     try:
@@ -1595,6 +1713,44 @@ async def _enforce_message_rate_limit(
         )
 
 
+async def _enforce_sender_global_rate_limit(
+    session: AsyncSession, *, actor_sub: str, sender_agent_id: uuid.UUID
+) -> None:
+    """Board-level defense-in-depth (TECH-5160): cap a sender's TOTAL
+    message volume across ALL conversations combined, not just within one.
+
+    Additive to ``_enforce_message_rate_limit``, not a replacement — both
+    are always checked. This one protects the board itself even if a
+    counterparty's own agent-local rate limiter has a bug or is bypassed
+    entirely by a compromised agent that doesn't run the standard
+    negotiation library at all. See ``MAX_MESSAGES_PER_SENDER_PER_HOUR``'s
+    definition for why 120 is the chosen ceiling.
+    """
+    one_hour_ago = _now() - timedelta(hours=1)
+    count = (
+        await session.execute(
+            select(func.count())
+            .select_from(Message)
+            .where(
+                Message.sender_id == sender_agent_id,
+                Message.created_at > one_hour_ago,
+            )
+        )
+    ).scalar_one()
+    if count >= MAX_MESSAGES_PER_SENDER_PER_HOUR:
+        await _deny_rate_limited(
+            session,
+            actor_sub=actor_sub,
+            agent_id=sender_agent_id,
+            conversation_id=None,
+            limit_name="messages_per_sender_per_hour",
+            message=(
+                f"rate_limited: at most {MAX_MESSAGES_PER_SENDER_PER_HOUR} "
+                "messages per sender per hour, across all conversations"
+            ),
+        )
+
+
 async def _all_non_owners_declined(session: AsyncSession, conversation_id: uuid.UUID) -> bool:
     """Whether every ``role='member'`` participant is currently ``declined``.
 
@@ -1932,13 +2088,17 @@ async def post_message(
     decisive — see ``_require_message_sender_role``).
 
     Raises ``RateLimitExceededError`` past the per-sender-per-conversation
-    hourly cap; ``InvalidConversationStateError`` if ``message_type`` is not
-    legal in the conversation's current state (state-machine violation,
-    including after lazy expiry); ``AccessDeniedError`` (uniform) if
-    ``message_type`` is sender-role-restricted and the sender's role
-    doesn't match; ``schemas.PayloadValidationError`` if ``payload`` fails
-    schema validation, or if a ``needs_clarification``'s ``about_seq`` does
-    not reference an existing prior message.
+    hourly cap OR the board-level per-sender-across-all-conversations hourly
+    cap (``_enforce_sender_global_rate_limit``, TECH-5160 defense-in-depth
+    against a sender spraying messages across many conversations to evade
+    the per-conversation cap); ``InvalidConversationStateError`` if
+    ``message_type`` is not legal in the conversation's current state
+    (state-machine violation, including after lazy expiry);
+    ``AccessDeniedError`` (uniform) if ``message_type`` is sender-role-
+    restricted and the sender's role doesn't match;
+    ``schemas.PayloadValidationError`` if ``payload`` fails schema
+    validation, or if a ``needs_clarification``'s ``about_seq`` does not
+    reference an existing prior message.
     """
     await _require_active_agent(session, actor_sub=actor_sub, agent_id=sender_agent_id)
     conversation, participant = await _load_participant_for_transition(
@@ -1952,6 +2112,9 @@ async def post_message(
 
     await _enforce_message_rate_limit(
         session, actor_sub=actor_sub, sender_agent_id=sender_agent_id, conversation=conversation
+    )
+    await _enforce_sender_global_rate_limit(
+        session, actor_sub=actor_sub, sender_agent_id=sender_agent_id
     )
 
     if not is_message_legal(conversation.state, message_type):

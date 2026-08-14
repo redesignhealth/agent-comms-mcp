@@ -180,6 +180,32 @@ class TestSchema:
         assert constraint_def is not None, "ck_agents_accepted_types_max constraint missing"
         assert "cardinality" in constraint_def
 
+    async def test_agents_schema_version_range_columns_default_and_constraint(
+        self, engine: AsyncEngine
+    ) -> None:
+        """TECH-5160: min/max_schema_version backfill to 1/1 and are
+        DB-level constrained to min <= max (migration 2cc5185360c7)."""
+        cols = await _columns(engine, "agents")
+        assert "min_schema_version" in cols
+        assert "max_schema_version" in cols
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                text("SELECT min_schema_version, max_schema_version FROM agents LIMIT 0")
+            )
+            assert result is not None  # columns queryable without error
+            constraint_def = (
+                await conn.execute(
+                    text(
+                        "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                        "WHERE conrelid = 'agents'::regclass "
+                        "AND conname = 'ck_agents_schema_version_range'"
+                    )
+                )
+            ).scalar_one_or_none()
+        assert constraint_def is not None, "ck_agents_schema_version_range constraint missing"
+        assert "min_schema_version" in constraint_def
+        assert "max_schema_version" in constraint_def
+
     async def test_conversations_columns(self, engine: AsyncEngine) -> None:
         cols = await _columns(engine, "conversations")
         for expected in (
