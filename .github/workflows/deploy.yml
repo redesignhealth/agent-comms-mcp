@@ -1,0 +1,127 @@
+# Build and push Docker image to ECR, then deploy to ECS, on every release.
+# Runs after the publish job in publish.yml succeeds — same release trigger.
+# IAM roles trust redesignhealth/agent-comms-mcp release tags via OIDC.
+name: Deploy to ECS
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  deploy-dev:
+    name: Deploy (dev)
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Configure AWS credentials (dev)
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          role-to-assume: arn:aws:iam::082533342824:role/rh-platform-dev-github-actions-ecr-push-role
+          aws-region: us-east-1
+
+      - name: Login to ECR (dev)
+        id: ecr-dev
+        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
+
+      - name: Build and push image (dev)
+        env:
+          IMAGE: 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform-dev/apps/reclaw-comms-mcp:sha-${{ github.sha }}
+        run: |
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+
+      - name: Download current dev task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition rh-reclaw-comms-dev \
+            --query taskDefinition \
+            --output json > /tmp/task-def-dev.json
+
+      - name: Update app container image in dev task definition
+        run: |
+          python3 - <<'EOF'
+          import json
+          IMAGE = "082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform-dev/apps/reclaw-comms-mcp:sha-${{ github.sha }}"
+          with open('/tmp/task-def-dev.json') as f:
+              td = json.load(f)
+          for c in td['containerDefinitions']:
+              if c['name'] == 'app':
+                  c['image'] = IMAGE
+          for field in ['taskDefinitionArn','revision','status','requiresAttributes',
+                        'compatibilities','registeredAt','registeredBy']:
+              td.pop(field, None)
+          with open('/tmp/task-def-dev.json', 'w') as f:
+              json.dump(td, f)
+          EOF
+
+      - name: Deploy to ECS (dev)
+        uses: aws-actions/amazon-ecs-deploy-task-definition@df9643053eda01f169e64a0e60233aacca83799a # v2.2.0
+        with:
+          task-definition: /tmp/task-def-dev.json
+          service: rh-reclaw-comms-dev
+          cluster: rh-platform-dev-cluster
+          wait-for-service-stability: true
+
+  deploy-prod:
+    name: Deploy (prod)
+    runs-on: ubuntu-latest
+    needs: deploy-dev
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Configure AWS credentials (prod)
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          role-to-assume: arn:aws:iam::082533342824:role/rh-platform-github-actions-ecr-push-role
+          aws-region: us-east-1
+
+      - name: Login to ECR (prod)
+        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
+
+      - name: Build and push image (prod)
+        env:
+          IMAGE: 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform/apps/reclaw-comms-mcp:sha-${{ github.sha }}
+        run: |
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+
+      - name: Download current prod task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition rh-reclaw-comms \
+            --query taskDefinition \
+            --output json > /tmp/task-def-prod.json
+
+      - name: Update app container image in prod task definition
+        run: |
+          python3 - <<'EOF'
+          import json
+          IMAGE = "082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform/apps/reclaw-comms-mcp:sha-${{ github.sha }}"
+          with open('/tmp/task-def-prod.json') as f:
+              td = json.load(f)
+          for c in td['containerDefinitions']:
+              if c['name'] == 'app':
+                  c['image'] = IMAGE
+          for field in ['taskDefinitionArn','revision','status','requiresAttributes',
+                        'compatibilities','registeredAt','registeredBy']:
+              td.pop(field, None)
+          with open('/tmp/task-def-prod.json', 'w') as f:
+              json.dump(td, f)
+          EOF
+
+      - name: Deploy to ECS (prod)
+        uses: aws-actions/amazon-ecs-deploy-task-definition@df9643053eda01f169e64a0e60233aacca83799a # v2.2.0
+        with:
+          task-definition: /tmp/task-def-prod.json
+          service: rh-reclaw-comms
+          cluster: rh-platform-cluster
+          wait-for-service-stability: true
