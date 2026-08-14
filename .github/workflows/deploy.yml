@@ -23,6 +23,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
+      actions: read
     outputs:
       image-digest: ${{ steps.push-dev.outputs.digest }}
     steps:
