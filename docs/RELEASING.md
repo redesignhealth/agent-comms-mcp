@@ -70,15 +70,19 @@ git push origin hotfix/vX.Y.Z
 #    Wait for CI to pass on the merge commit on main.
 
 # 4. Capture the exact merge commit SHA (avoids tagging a later commit
-#    if main moved after your merge):
-git fetch origin main
-HOTFIX_SHA=$(gh pr view <PR_NUMBER> --json mergeCommit --jq '.mergeCommit.oid')
+#    if main moved after your merge). Replace <PR_NUMBER> with your PR number.
+HOTFIX_SHA=$(gh pr view <PR_NUMBER> --json mergeCommit --jq '.mergeCommit.oid // empty')
+if [ -z "$HOTFIX_SHA" ]; then
+  echo "ERROR: PR is not merged yet or mergeCommit.oid is not available" >&2
+  exit 1
+fi
+echo "Hotfix merge commit: $HOTFIX_SHA"
 
 # 5. Create the release targeting that exact SHA
 gh release create vX.Y.Z --target "$HOTFIX_SHA" --title "vX.Y.Z" --notes "..."
 ```
 
 > **Important:** Use `--target "$HOTFIX_SHA"` with the merge commit OID from `gh pr view`.
-> Do not use `git rev-parse origin/main` — if another PR merged after yours, that SHA
-> will point at a different commit that CI hasn't validated for this release.
+> The `// empty` filter surfaces a null OID (PR not yet merged) as an error rather than
+> silently creating a release targeting the wrong SHA.
 > If no successful push-triggered CI run is found for the release SHA, the deploy job will fail.
