@@ -169,11 +169,13 @@ never logged.
 
 ## Deployment
 
-The service is a standard Python HTTP process backed by PostgreSQL. The
-included `Dockerfile` and `docker-compose.yml` cover local and self-hosted
-deployments.
+The service is a standard Python HTTP process backed by PostgreSQL.
 
-**Quick start (Docker Compose):**
+**Production (ECS):** creating a GitHub release triggers `.github/workflows/deploy.yml`,
+which builds the Docker image, deploys to dev ECS, then promotes the same image to prod ECS.
+See [docs/RELEASING.md](docs/RELEASING.md) for the full release process.
+
+**Local / self-hosted (Docker Compose):**
 
 ```bash
 cp .env.example .env   # fill in real values
