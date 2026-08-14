@@ -149,6 +149,30 @@ from state_machine import (
 # (CloudWatch, via the ECS log driver) instead of being silently discarded.
 logger = logging.getLogger(__name__)
 
+# Module-level invariant check (Argus round 5), not an in-function guard:
+# invite()'s schema-version-mismatch denial path (see the comment at its
+# _deny_schema_version_mismatch call) computes its audit-detail fields
+# ("required_min"/"available_max") correctly only for the direction
+# reachable while MAX_REGISTERED_SCHEMA_VERSION == 1. An in-function check
+# placed inside that one denial branch would fire only on that one
+# authorization path -- writing no audit row and emitting no log for what
+# would be a security-relevant deny event, since
+# _deny_schema_version_mismatch (which does both) is never reached if this
+# check raises first. Checking it here instead means a deploy that ships a
+# second schema version without revisiting that comment crash-loops at
+# import time, loudly, rather than silently mislabeling an audit row deep
+# inside a request. A plain `if`/`raise`, not a bare `assert` -- this
+# module already avoids `assert` for invariant checks elsewhere (see the
+# "stripped under python -O" comment on the migration-context bind check)
+# since an assert would silently vanish under -O, making this check itself
+# as fragile as the thing it guards against.
+if MAX_REGISTERED_SCHEMA_VERSION != 1:
+    raise RuntimeError(
+        "invite()'s schema-mismatch audit semantics (service.py) assume "
+        "MAX_REGISTERED_SCHEMA_VERSION == 1 -- revisit that call site's audit-field "
+        "comment before shipping a second schema version"
+    )
+
 # --- Policy constants --------------------------------------------------------
 
 # Default conversation TTL by conversation type.
@@ -1753,23 +1777,16 @@ async def invite(
         # CHECK constraint already enforces every registered
         # max_schema_version >= 1), so this isn't fixed here — revisit
         # once a second schema version makes that direction reachable.
-        # Mechanically enforced (Argus round 4), not just documented, and a
-        # plain `if`/`raise` rather than a bare `assert` -- this module
-        # already avoids `assert` for invariant checks elsewhere (see the
-        # "stripped under python -O" comment on the migration-context
-        # bind check) since an assert would silently vanish under -O,
-        # making this check itself as fragile as the thing it guards
-        # against. This fails loudly the moment
-        # MAX_REGISTERED_SCHEMA_VERSION moves past 1, forcing whoever adds
-        # that second schema version to revisit this comment's now-invalid
-        # unreachability argument rather than silently shipping mislabeled
-        # audit rows for the "target is too OLD for the pin" direction.
-        if MAX_REGISTERED_SCHEMA_VERSION != 1:
-            raise RuntimeError(
-                "invite's schema-mismatch audit semantics assume "
-                "MAX_REGISTERED_SCHEMA_VERSION == 1 (see the comment above) -- revisit "
-                "before shipping a second schema version"
-            )
+        # The invariant this comment depends on (MAX_REGISTERED_SCHEMA_VERSION
+        # == 1) is mechanically enforced at IMPORT time, not here (Argus
+        # round 5) — see the module-level check near this constant's
+        # import above. An in-function check at this exact spot would fire
+        # only inside this one denial branch, on this one authorization
+        # path, writing no audit row and no log for what would be a
+        # security-relevant event; failing at import time instead means a
+        # deploy with an unreviewed second schema version crash-loops at
+        # startup, loudly, rather than silently mislabeling this one
+        # audit row's fields the first time this branch is ever hit.
         await _deny_schema_version_mismatch(
             session,
             actor_sub=actor_sub,

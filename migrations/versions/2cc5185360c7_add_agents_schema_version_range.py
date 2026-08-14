@@ -74,6 +74,20 @@ def upgrade() -> None:
     # >= 1, not just <= max: a 0/negative pair would otherwise pass this
     # constraint and route straight into a broken negotiation (no schema
     # registered below version 1) -- Argus round 1, security.
+    # NOT guarded with an if_not_exists-equivalent (Argus round 5 asked for
+    # one; verified against the actual installed Alembic that
+    # create_check_constraint's if_not_exists kwarg does not exist -- it's
+    # silently accepted as an unrecognized dialect kwarg with a SAWarning
+    # and has zero effect on the emitted DDL -- and Postgres itself has no
+    # `ADD CONSTRAINT IF NOT EXISTS` syntax at all to fall back to, unlike
+    # DROP CONSTRAINT). This is the same accepted, already-documented
+    # asymmetry as 6d2a8e63e469's own two constraint adds (see that file's
+    # docstring): upgrade() only ever needs to run from a clean base (this
+    # revision has never been applied anywhere -- see the in-place-
+    # amendment note above), so there is no partially-upgraded state for
+    # this specific step to resume into, unlike downgrade()'s constraint
+    # drop above, which real re-run scenarios during this PR's own review
+    # cycle actually exercised.
     op.create_check_constraint(
         "ck_agents_schema_version_range",
         "agents",
@@ -89,25 +103,24 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # if_exists=True (Argus round 2): mirrors upgrade()'s own
-    # if_not_exists=True -- without it, a downgrade on an environment
-    # where this index was somehow never created (or already dropped)
-    # fails outright instead of no-op'ing, the same asymmetry
-    # 6d2a8e63e469/da3e1646c44d's drop_index calls already guard against.
+    # Every DROP below is guarded (if_exists=True, or raw `DROP ... IF
+    # EXISTS` SQL for the constraint, which has no if_exists kwarg at all
+    # -- see 6d2a8e63e469's own comment on that exact limitation).
+    # Rationale correction (Argus round 5): earlier rounds' comments here
+    # cited "a downgrade that failed partway between these drops" as the
+    # motivation -- that premise doesn't hold. migrations/env.py wraps
+    # every migration run in context.begin_transaction() plus
+    # pg_advisory_xact_lock, so a single `alembic downgrade` invocation's
+    # DDL either all commits or all rolls back; Postgres never leaves this
+    # table half-downgraded from one run failing midway. The real
+    # motivation for guarding every DROP anyway is protection against
+    # OUT-OF-BAND DDL drift -- an admin manually dropping one of these
+    # columns/the index/the constraint outside Alembic entirely, or an
+    # environment whose migration history diverges from what these
+    # guards assume -- the same class of drift 6d2a8e63e469's own
+    # docstring already names as its reason for guarding every DROP in
+    # that migration's downgrade().
     op.drop_index("idx_messages_sender_id_created_at", table_name="messages", if_exists=True)
-    # Raw SQL with IF EXISTS, not op.drop_constraint() (Argus round 3):
-    # op.drop_constraint() has no if_exists kwarg at all (see
-    # 6d2a8e63e469's own comment on this exact limitation), so pairing it
-    # with the if_exists=True drop_index above would leave this downgrade
-    # asymmetrically idempotent -- a retry of a partially-applied downgrade
-    # would silently no-op the index drop but hard-error on this
-    # constraint drop. da3e1646c44d/6d2a8e63e469 already use this same
-    # raw-SQL-with-IF-EXISTS workaround for check constraints.
     op.execute("ALTER TABLE agents DROP CONSTRAINT IF EXISTS ck_agents_schema_version_range")
-    # if_exists=True on both (Argus round 4), matching 15ef34885e30's own
-    # `op.drop_column("conversations", "owner_snapshot", if_exists=True)`
-    # precedent -- without it, a retry of a downgrade that failed partway
-    # between these two drops hard-errors instead of no-op'ing on the
-    # column that's already gone.
     op.drop_column("agents", "max_schema_version", if_exists=True)
     op.drop_column("agents", "min_schema_version", if_exists=True)
