@@ -1,7 +1,6 @@
 """Schema tests for the comms domain models — real Postgres only.
 
-Per the RH backend standard (topics/02-backend.md: "real databases in
-tests"), this module never mocks the database. It runs the Alembic
+This module never mocks the database. It runs the Alembic
 migration chain against a live Postgres (the ``postgres`` service in
 docker-compose.yml, or whatever ``DATABASE_URL`` points at) and asserts
 that all five tables, their key columns, and the indexes called out in

@@ -78,9 +78,8 @@ def _hash_token(token: str) -> str:
 def require_env(name: str) -> str:
     """Return a required environment variable, failing fast if missing/empty.
 
-    No silent defaults for secrets (RH security standard + the
-    secret-loading-fallback-consistency failure mode): a missing required
-    value must crash at startup, not surface later as a broken auth path.
+    No silent defaults for secrets: a missing required value must crash at
+    startup, not surface later as a broken auth path.
     """
     value = os.environ.get(name)
     if not value:

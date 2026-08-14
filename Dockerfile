@@ -1,5 +1,4 @@
-# Multi-stage build per the RH container-security checklist
-# (topics/09-security.md): pinned slim base, non-root runtime user,
+# Multi-stage build: pinned slim base, non-root runtime user,
 # no secrets in the image.
 
 # Pinned by digest (not the mutable `3.12-slim` tag) so the base image is

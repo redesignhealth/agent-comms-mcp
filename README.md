@@ -151,7 +151,7 @@ uv run alembic revision --autogenerate -m "<description>"
 ```
 
 `tests/test_db_models.py` (and the other real-database test modules) run
-against this same real Postgres instance (no mocking, per the RH standard)
+against this same real Postgres instance (no mocking)
 and skip gracefully with a clear reason if they can't connect.
 
 Configuration is env-driven and **fail-fast**: the service refuses to start

@@ -19,7 +19,7 @@ This repo is only the comms layer. Out of scope, by explicit decision:
 
 ## 2. Why this shape (research summary)
 
-Reviewed Aug 2026: shipping EA products (Howie, Lindy, Skej, Clara, historically
+Reviewed Aug 2026: shipping EA products (Lindy, Skej, Clara, historically
 Amy/x.ai), Google A2A (Linux Foundation, spec v1.0), MCP auth spec (2025-06-18 /
 2025-11-25), IBM ACP (merged into A2A), Cisco AGNTCY, ANP, Microsoft Entra Agent ID,
 and the inter-agent security literature (Invariant Labs tool poisoning, Zenity
@@ -396,8 +396,7 @@ requires resolving each agent's verified owner set. In v1, the interim
 correct for every agent registered today (all are single-owner), but insufficient
 for shared agents that serve multiple owners.
 
-The real `platform_get_agent_owners` endpoint does not yet exist; no Linear ticket
-tracks it. Until it does, `asymmetric` conversations can be exercised end-to-end
+The real `platform_get_agent_owners` endpoint does not yet exist. Until it does, `asymmetric` conversations can be exercised end-to-end
 only in tests (with faked ownership), not in production against real agents.
 The seam is already injected (`OwnershipClient` parameter on all functions that
 need it) — swapping `AgentTableOwnershipClient` for a real HTTP client is the
