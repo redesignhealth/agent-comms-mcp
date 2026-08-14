@@ -1741,6 +1741,18 @@ async def invite(
     # (Argus round 1).
     pinned_version = await _conversation_pinned_schema_version(session, conversation.id)
     if not (target.min_schema_version <= pinned_version <= target.max_schema_version):
+        # Audit field semantics note (Argus round 3): this "required_min/
+        # available_max" pairing is directionally accurate for the case
+        # that's actually reachable today (pinned_version <
+        # target.min_schema_version — the target requires newer than
+        # what's pinned). The OTHER direction (pinned_version >
+        # target.max_schema_version — the target is too OLD for the pin)
+        # would instead want target.max_schema_version as the "available"
+        # ceiling, not pinned_version itself; that direction is currently
+        # unreachable (MAX_REGISTERED_SCHEMA_VERSION == 1, and the DB
+        # CHECK constraint already enforces every registered
+        # max_schema_version >= 1), so this isn't fixed here — revisit
+        # once a second schema version makes that direction reachable.
         await _deny_schema_version_mismatch(
             session,
             actor_sub=actor_sub,

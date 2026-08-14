@@ -93,6 +93,14 @@ def downgrade() -> None:
     # fails outright instead of no-op'ing, the same asymmetry
     # 6d2a8e63e469/da3e1646c44d's drop_index calls already guard against.
     op.drop_index("idx_messages_sender_id_created_at", table_name="messages", if_exists=True)
-    op.drop_constraint("ck_agents_schema_version_range", "agents", type_="check")
+    # Raw SQL with IF EXISTS, not op.drop_constraint() (Argus round 3):
+    # op.drop_constraint() has no if_exists kwarg at all (see
+    # 6d2a8e63e469's own comment on this exact limitation), so pairing it
+    # with the if_exists=True drop_index above would leave this downgrade
+    # asymmetrically idempotent -- a retry of a partially-applied downgrade
+    # would silently no-op the index drop but hard-error on this
+    # constraint drop. da3e1646c44d/6d2a8e63e469 already use this same
+    # raw-SQL-with-IF-EXISTS workaround for check constraints.
+    op.execute("ALTER TABLE agents DROP CONSTRAINT IF EXISTS ck_agents_schema_version_range")
     op.drop_column("agents", "max_schema_version")
     op.drop_column("agents", "min_schema_version")

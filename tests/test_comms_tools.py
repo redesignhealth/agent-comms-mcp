@@ -1373,7 +1373,14 @@ class TestMembershipTools:
                 },
             )
         message = str(exc_info.value)
-        assert "schema_version_mismatch" in message
+        # Full equality (Argus round 3), matching the sibling
+        # start_conversation test's strengthened assertion -- locks in the
+        # anti-enumeration property at the integration level, not just
+        # "the string mentions the right topic".
+        assert message == (
+            "schema_version_mismatch: no wire schema version is supported by "
+            "every participant in this conversation"
+        )
         assert message != "access_denied: not authorized for this resource"
 
 

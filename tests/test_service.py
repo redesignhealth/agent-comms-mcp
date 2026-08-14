@@ -708,15 +708,37 @@ class TestSchemaVersionNegotiation:
         # what start_conversation would have inserted between the
         # Conversation row and the seq-1 Message, so they're the most
         # likely place a partial-rollback bug would actually surface.
+        # Filtered by the two agents actually involved (Argus round 3),
+        # matching conversation_rows' defensive pattern above rather than
+        # asserting on the whole table.
         participant_rows = (
-            (await session.execute(select(Participant))).scalars().all()
-        )
-        assert participant_rows == []
-        actions = (
-            (await session.execute(select(AuditLog.action).where(AuditLog.agent_id == owner.id)))
+            (
+                await session.execute(
+                    select(Participant).where(
+                        Participant.agent_id.in_([owner.id, target.id])
+                    )
+                )
+            )
             .scalars()
             .all()
         )
+        assert participant_rows == []
+        audit_rows = (
+            await session.execute(
+                select(AuditLog.action, AuditLog.detail).where(AuditLog.agent_id == owner.id)
+            )
+        ).all()
+        actions = [row.action for row in audit_rows]
+        # Argus round 3: verify the renamed audit detail keys
+        # (required_min/available_max, not the old common_floor/
+        # common_ceiling parameter names) actually land in the audit row,
+        # not just that SOME denial happened.
+        mismatch_row = next(
+            row for row in audit_rows if row.action == "denied.schema_version_mismatch"
+        )
+        assert mismatch_row.detail is not None
+        assert mismatch_row.detail["required_min"] == 2
+        assert mismatch_row.detail["available_max"] == 1
         assert "denied.schema_version_mismatch" in actions
 
     async def test_negotiation_clamps_to_board_max(self, session: AsyncSession) -> None:
@@ -870,6 +892,57 @@ class TestInviteSchemaVersionRecheck:
             target_agent_id=compatible.id,
         )
         assert participant.status == "invited"
+
+    async def test_invite_raises_runtime_error_if_seq_one_message_missing(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-5160 (Argus round 3): _conversation_pinned_schema_version's
+        internal-invariant guard. This state (a conversation with no seq-1
+        message) should never occur via any public code path -- reproduced
+        here only by deleting the row directly -- but if it ever did,
+        invite must fail with a diagnosable RuntimeError rather than an
+        unmapped NoResultFound leaking out of scalar_one()."""
+        owner = await _register(
+            session, "owner-invite-no-seq1", min_schema_version=1, max_schema_version=1
+        )
+        member = await _register(
+            session, "member-invite-no-seq1", min_schema_version=1, max_schema_version=1
+        )
+        other = await _register(
+            session, "other-invite-no-seq1", min_schema_version=1, max_schema_version=1
+        )
+
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[member.id],
+            initial_message=_request_payload(),
+        )
+        # audit_log.message_id FKs to messages.id -- clear the referencing
+        # audit rows first, or the DELETE below violates that constraint.
+        await session.execute(
+            text(
+                "DELETE FROM audit_log WHERE message_id IN "
+                "(SELECT id FROM messages WHERE conversation_id = :cid AND seq = 1)"
+            ),
+            {"cid": conversation.id},
+        )
+        await session.execute(
+            text("DELETE FROM messages WHERE conversation_id = :cid AND seq = 1"),
+            {"cid": conversation.id},
+        )
+        await session.commit()
+
+        with pytest.raises(RuntimeError, match="no seq-1 message"):
+            await invite(
+                session,
+                actor_sub=owner.sub,
+                inviter_agent_id=owner.id,
+                conversation_id=conversation.id,
+                target_agent_id=other.id,
+            )
 
 
 class _FakeOwnershipClient:

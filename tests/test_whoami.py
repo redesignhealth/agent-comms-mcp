@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastmcp.exceptions import ToolError
+from sqlalchemy.exc import OperationalError
 
 # ``@comms_server.tool`` registers the coroutine and returns it unchanged
 # in fastmcp 3.4.2, so the tool body can be invoked directly.
@@ -147,14 +148,18 @@ class TestWhoami:
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         """TECH-5160 (Argus round 1): a genuine connectivity/config failure
-        (DATABASE_URL unset, Postgres unreachable, etc.) must not break
-        whoami's core identity/scopes contract -- it only omits the
-        schema-version fields, exactly like the unregistered-caller case,
-        but via the narrowed (RuntimeError/OperationalError/InterfaceError/
-        OSError) except clause rather than the agent-is-None branch. Also
-        asserts the swallowed failure is actually logged (Argus round 2:
-        a prior version of this test never checked this, so the log call
-        could be deleted without failing anything)."""
+        (DATABASE_URL unset here) must not break whoami's core
+        identity/scopes contract -- it only omits the schema-version
+        fields, exactly like the unregistered-caller case. Specifically
+        exercises the FIRST of whoami's two try-blocks (Argus round 3
+        docstring correction: this patches get_session_factory itself to
+        raise, so it hits block 1's narrow RuntimeError catch and returns
+        early -- block 2's separate OperationalError/InterfaceError/OSError
+        catch, for a failure during the query itself, is covered by
+        ``test_db_query_failure_still_returns_identity_fields`` below).
+        Also asserts the swallowed failure is actually logged (Argus round
+        2: a prior version of this test never checked this, so the log
+        call could be deleted without failing anything)."""
         token = MagicMock()
         token.claims = {"iss": "agent-jwt", "sub": "ea-agent-svc", "scopes": ["comms:read"]}
 
@@ -175,6 +180,40 @@ class TestWhoami:
         assert "min_schema_version" not in result
         assert "max_schema_version" not in result
         assert any("schema-version lookup" in r.message for r in caplog.records)
+
+    def test_db_query_failure_still_returns_identity_fields(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """TECH-5160 (Argus round 3): distinct from the test above -- this
+        exercises whoami's SECOND try-block, where get_session_factory()
+        itself succeeds but the query fails with a connection-level error
+        (OperationalError/InterfaceError/OSError) mid-lookup. Same outcome
+        contract as block 1's failure (identity fields intact,
+        schema-version fields omitted, a WARNING logged), but via the
+        code path block 1's own test structurally cannot reach."""
+        token = MagicMock()
+        token.claims = {"iss": "agent-jwt", "sub": "ea-agent-svc", "scopes": ["comms:read"]}
+
+        with (
+            patch("providers.comms.get_access_token", return_value=token),
+            _patched_session_factory(),
+            patch(
+                "providers.comms.service.get_agent_by_sub",
+                AsyncMock(
+                    side_effect=OperationalError("SELECT 1", {}, Exception("connection reset"))
+                ),
+            ),
+            caplog.at_level("WARNING", logger="providers.comms"),
+        ):
+            result = asyncio.run(_whoami())
+
+        assert result["identity"] == "ea-agent-svc"
+        assert result["issuer"] == "agent-jwt"
+        assert result["caller_type"] == "service"
+        assert result["scopes"] == ["comms:read"]
+        assert "min_schema_version" not in result
+        assert "max_schema_version" not in result
+        assert any("schema-version lookup failed" in r.message for r in caplog.records)
 
     def test_unnarrowed_exception_is_not_swallowed(self) -> None:
         """TECH-5160 (Argus round 1): a genuine programming/schema bug in
