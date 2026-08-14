@@ -214,20 +214,29 @@ async def _register(
     accepted_types: list[str] | None = None,
     owner_sub: str | None = None,
     owner_email: str | None = None,
+    min_schema_version: int | None = None,
+    max_schema_version: int | None = None,
 ) -> dict[str, Any]:
     token = _token(sub, owner_sub=owner_sub, owner_email=owner_email)
+    args: dict[str, Any] = {
+        "display_name": display_name or sub,
+        # Permissive default so tests unrelated to the accepted_types
+        # capability gate don't need to opt in per-type; those tests
+        # narrow this explicitly via the accepted_types param.
+        "accepted_types": accepted_types or sorted(MESSAGE_TYPES),
+    }
+    # TECH-5160: only included when a test opts in, so most callers keep
+    # exercising the 1/1 default path unchanged.
+    if min_schema_version is not None:
+        args["min_schema_version"] = min_schema_version
+    if max_schema_version is not None:
+        args["max_schema_version"] = max_schema_version
     result: dict[str, Any] = await _call(
         main,
         test_session_factory,
         token,
         "comms_register",
-        {
-            "display_name": display_name or sub,
-            # Permissive default so tests unrelated to the accepted_types
-            # capability gate don't need to opt in per-type; those tests
-            # narrow this explicitly via the accepted_types param.
-            "accepted_types": accepted_types or sorted(MESSAGE_TYPES),
-        },
+        args,
     )
     return result
 
@@ -511,6 +520,94 @@ class TestRegister:
                 "comms_register",
                 {"display_name": "Entry Length Test", "accepted_types": ["x" * 101]},
             )
+
+    async def test_register_schema_version_defaults_and_persists(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """TECH-5160: min/max_schema_version default to 1/1 and round-trip
+        through both comms_register's own response and comms_whoami."""
+        token = _token("agent-schema-default")
+        result = await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {"display_name": "Schema Default", "accepted_types": ["availability_request"]},
+        )
+        assert result["min_schema_version"] == 1
+        assert result["max_schema_version"] == 1
+
+        whoami = await _call(main, test_session_factory, token, "comms_whoami")
+        assert whoami["min_schema_version"] == 1
+        assert whoami["max_schema_version"] == 1
+
+    async def test_register_explicit_schema_version_range_persists(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        token = _token("agent-schema-explicit")
+        result = await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {
+                "display_name": "Schema Explicit",
+                "accepted_types": ["availability_request"],
+                "min_schema_version": 1,
+                "max_schema_version": 2,
+            },
+        )
+        assert result["min_schema_version"] == 1
+        assert result["max_schema_version"] == 2
+
+    async def test_register_min_schema_version_over_max_rejected(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        token = _token("agent-schema-bad-range")
+        with pytest.raises(ToolError, match="invalid_request"):
+            await _call(
+                main,
+                test_session_factory,
+                token,
+                "comms_register",
+                {
+                    "display_name": "Bad Range",
+                    "accepted_types": ["availability_request"],
+                    "min_schema_version": 3,
+                    "max_schema_version": 2,
+                },
+            )
+
+    async def test_register_min_schema_version_below_one_rejected(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """TECH-5160 (Argus round 1): the lower-bound guard applies at the
+        tool layer too, not just service.register_agent directly."""
+        token = _token("agent-schema-below-one-tool")
+        with pytest.raises(ToolError, match="invalid_request"):
+            await _call(
+                main,
+                test_session_factory,
+                token,
+                "comms_register",
+                {
+                    "display_name": "Below One",
+                    "accepted_types": ["availability_request"],
+                    "min_schema_version": 0,
+                    "max_schema_version": 0,
+                },
+            )
+
+    async def test_whoami_omits_schema_version_before_registration(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """A caller who hasn't called comms_register yet gets the same
+        whoami shape as before TECH-5160 — no schema-version fields, and no
+        error just for having never registered (whoami is DB-optional)."""
+        token = _token("agent-never-registered")
+        whoami = await _call(main, test_session_factory, token, "comms_whoami")
+        assert "min_schema_version" not in whoami
+        assert "max_schema_version" not in whoami
 
 
 # --- AXI empty-state / shape spot checks --------------------------------------------
@@ -1057,6 +1154,87 @@ class TestRateLimitAndSchemaErrors:
                 },
             )
 
+    async def test_schema_version_mismatch_error_is_specific_not_uniform(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """TECH-5160: an initiator and target with non-overlapping declared
+        schema-version ranges get a specific ``ToolError``, not the uniform
+        access-denied string — same anti-enumeration posture as the other
+        specific errors in this class (rate limits, schema validation,
+        unknown conversation type)."""
+        await _register(
+            main,
+            test_session_factory,
+            "sv-mismatch-owner",
+            min_schema_version=1,
+            max_schema_version=1,
+        )
+        await _register(
+            main,
+            test_session_factory,
+            "sv-mismatch-target",
+            min_schema_version=2,
+            max_schema_version=2,
+        )
+        token_owner = _token("sv-mismatch-owner")
+
+        list_result = await _call(main, test_session_factory, token_owner, "comms_list_agents")
+        target_id = next(
+            a["agent_id"] for a in list_result["agents"] if a["sub"] == "sv-mismatch-target"
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            await _call(
+                main,
+                test_session_factory,
+                token_owner,
+                "comms_start_conversation",
+                {
+                    "conversation_type": "open",
+                    "target_agent_ids": [target_id],
+                    "initial_message": _availability_request(),
+                },
+            )
+        message = str(exc_info.value)
+        assert "schema_version_mismatch" in message
+        assert message != "access_denied: not authorized for this resource"
+        # Anti-enumeration (Argus round 1): the message is a fixed,
+        # deterministic string with no embedded range values at all --
+        # asserting full equality (rather than "no digits", which is
+        # fragile against unrelated future digits in the text, per Argus
+        # round 2) is both stronger and more specific here.
+        assert message == (
+            "schema_version_mismatch: no wire schema version is supported by "
+            "every participant in this conversation"
+        )
+
+    async def test_start_conversation_response_includes_negotiated_schema_version(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """TECH-5160 (Argus round 1): the negotiated version must be
+        discoverable from the response, not just silently applied."""
+        await _register(main, test_session_factory, "sv-response-owner")
+        await _register(main, test_session_factory, "sv-response-target")
+        token_owner = _token("sv-response-owner")
+
+        list_result = await _call(main, test_session_factory, token_owner, "comms_list_agents")
+        target_id = next(
+            a["agent_id"] for a in list_result["agents"] if a["sub"] == "sv-response-target"
+        )
+
+        started = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [target_id],
+                "initial_message": _availability_request(),
+            },
+        )
+        assert started["schema_version"] == 1
+
 
 # --- Membership mutation tools: invite / leave / decline_invite ---------------------
 
@@ -1146,6 +1324,123 @@ class TestMembershipTools:
                     "conversation_id": conversation_id,
                     "message_type": "availability_response",
                     "payload": _availability_response(),
+                },
+            )
+
+    async def test_invite_schema_version_mismatch_surfaces_as_tool_error(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """TECH-5160 (Argus round 2): comms_invite's SchemaVersionMismatchError
+        path has service-layer coverage (TestInviteSchemaVersionRecheck in
+        test_service.py) but this exercises the actual _map_service_errors
+        integration through the real mounted tool."""
+        await _register(main, test_session_factory, "inv-sv-owner")
+        await _register(main, test_session_factory, "inv-sv-member")
+        await _register(
+            main,
+            test_session_factory,
+            "inv-sv-incompatible",
+            min_schema_version=2,
+            max_schema_version=2,
+        )
+
+        token_owner = _token("inv-sv-owner")
+        list_result = await _call(main, test_session_factory, token_owner, "comms_list_agents")
+        ids = {a["sub"]: a["agent_id"] for a in list_result["agents"]}
+
+        started = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [ids["inv-sv-member"]],
+                "initial_message": _availability_request(),
+            },
+        )
+        conversation_id = started["conversation_id"]
+
+        with pytest.raises(ToolError) as exc_info:
+            await _call(
+                main,
+                test_session_factory,
+                token_owner,
+                "comms_invite",
+                {
+                    "conversation_id": conversation_id,
+                    "target_agent_id": ids["inv-sv-incompatible"],
+                },
+            )
+        message = str(exc_info.value)
+        # Full equality (Argus round 3), matching the sibling
+        # start_conversation test's strengthened assertion -- locks in the
+        # anti-enumeration property at the integration level, not just
+        # "the string mentions the right topic".
+        assert message == (
+            "schema_version_mismatch: no wire schema version is supported by "
+            "every participant in this conversation"
+        )
+        assert message != "access_denied: not authorized for this resource"
+
+    async def test_invite_runtime_error_surfaces_as_generic_tool_error(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        session: AsyncSession,
+    ) -> None:
+        """TECH-5160 (Argus round 4): tool-boundary coverage for
+        service._conversation_pinned_schema_version's internal-invariant
+        RuntimeError (service-layer coverage already exists in
+        test_service.py's TestInviteSchemaVersionRecheck) -- confirms
+        _map_service_errors' bare-RuntimeError branch actually applies to
+        comms_invite, not just that the service layer raises it."""
+        await _register(main, test_session_factory, "inv-rte-owner")
+        await _register(main, test_session_factory, "inv-rte-member")
+        await _register(main, test_session_factory, "inv-rte-other")
+
+        token_owner = _token("inv-rte-owner")
+        list_result = await _call(main, test_session_factory, token_owner, "comms_list_agents")
+        ids = {a["sub"]: a["agent_id"] for a in list_result["agents"]}
+
+        started = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [ids["inv-rte-member"]],
+                "initial_message": _availability_request(),
+            },
+        )
+        conversation_id = started["conversation_id"]
+
+        # Simulate the internal-invariant violation directly -- this state
+        # is unreachable via any public tool call, only reproduced here by
+        # deleting the seq-1 message's audit reference then the row itself.
+        await session.execute(
+            text(
+                "DELETE FROM audit_log WHERE message_id IN "
+                "(SELECT id FROM messages WHERE conversation_id = :cid AND seq = 1)"
+            ),
+            {"cid": conversation_id},
+        )
+        await session.execute(
+            text("DELETE FROM messages WHERE conversation_id = :cid AND seq = 1"),
+            {"cid": conversation_id},
+        )
+        await session.commit()
+
+        with pytest.raises(ToolError, match="invalid_request"):
+            await _call(
+                main,
+                test_session_factory,
+                token_owner,
+                "comms_invite",
+                {
+                    "conversation_id": conversation_id,
+                    "target_agent_id": ids["inv-rte-other"],
                 },
             )
 

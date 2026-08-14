@@ -118,6 +118,7 @@ from exceptions import (
     AccessDeniedError,
     InvalidConversationStateError,
     RateLimitExceededError,
+    SchemaVersionMismatchError,
     UnknownConversationTypeError,
 )
 from models import Agent, AuditLog, Conversation, Message, Participant
@@ -126,6 +127,7 @@ from schemas import (
     MAX_ACCEPTED_TYPE_LENGTH,
     MAX_ACCEPTED_TYPES,
     MAX_DISPLAY_NAME_LENGTH,
+    MAX_REGISTERED_SCHEMA_VERSION,
     MESSAGE_TYPES,
     PayloadValidationError,
     is_boundary_safe,
@@ -147,6 +149,30 @@ from state_machine import (
 # (CloudWatch, via the ECS log driver) instead of being silently discarded.
 logger = logging.getLogger(__name__)
 
+# Module-level invariant check (Argus round 5), not an in-function guard:
+# invite()'s schema-version-mismatch denial path (see the comment at its
+# _deny_schema_version_mismatch call) computes its audit-detail fields
+# ("required_min"/"available_max") correctly only for the direction
+# reachable while MAX_REGISTERED_SCHEMA_VERSION == 1. An in-function check
+# placed inside that one denial branch would fire only on that one
+# authorization path -- writing no audit row and emitting no log for what
+# would be a security-relevant deny event, since
+# _deny_schema_version_mismatch (which does both) is never reached if this
+# check raises first. Checking it here instead means a deploy that ships a
+# second schema version without revisiting that comment crash-loops at
+# import time, loudly, rather than silently mislabeling an audit row deep
+# inside a request. A plain `if`/`raise`, not a bare `assert` -- this
+# module already avoids `assert` for invariant checks elsewhere (see the
+# "stripped under python -O" comment on the migration-context bind check)
+# since an assert would silently vanish under -O, making this check itself
+# as fragile as the thing it guards against.
+if MAX_REGISTERED_SCHEMA_VERSION != 1:
+    raise RuntimeError(
+        "invite()'s schema-mismatch audit semantics (service.py) assume "
+        "MAX_REGISTERED_SCHEMA_VERSION == 1 -- revisit that call site's audit-field "
+        "comment before shipping a second schema version"
+    )
+
 # --- Policy constants --------------------------------------------------------
 
 # Default conversation TTL by conversation type.
@@ -167,6 +193,19 @@ CONVERSATION_TTL: dict[str, timedelta] = {
 # directly (no Redis — DESIGN.md §5: "No Redis until it matters").
 MAX_MESSAGES_PER_CONVERSATION_PER_HOUR = 30
 MAX_CONVERSATION_STARTS_PER_HOUR = 10
+# Board-level, cross-conversation defense-in-depth (TECH-5160): the two
+# limits above are each scoped to a single conversation (or to opening new
+# ones), so a sender could still flood MANY DIFFERENT conversations, each
+# comfortably under MAX_MESSAGES_PER_CONVERSATION_PER_HOUR, and disclose or
+# probe at a much higher aggregate rate than either limit alone suggests.
+# This caps a sender's TOTAL message volume across every conversation
+# combined. 120 is deliberately generous relative to the per-conversation
+# cap: an agent legitimately juggling several concurrent negotiations at up
+# to 30 msgs/hour each in 3-4 conversations stays comfortably under this;
+# it exists to catch a sender spraying messages across many conversations
+# to evade the per-conversation cap, not to constrain normal multi-
+# negotiation traffic.
+MAX_MESSAGES_PER_SENDER_PER_HOUR = 120
 
 
 def _now() -> datetime:
@@ -271,6 +310,105 @@ async def _deny_rate_limited(
     raise RateLimitExceededError(message, reason=limit_name)
 
 
+async def _deny_schema_version_mismatch(
+    session: AsyncSession,
+    *,
+    actor_sub: str,
+    agent_id: uuid.UUID,
+    conversation_id: uuid.UUID | None,
+    participant_ids: list[uuid.UUID],
+    required_min: int,
+    available_max: int,
+) -> NoReturn:
+    """Audit + raise the schema-version-mismatch denial.
+
+    ``required_min``/``available_max`` carry different underlying
+    computations at this function's two call sites (Argus round 2, audit
+    clarity) — ``start_conversation`` passes the negotiated-set's
+    ``max(min_schema_version)``/clamped-``min(max_schema_version)``
+    (see ``_negotiate_schema_version``), while ``invite`` passes a single
+    new target's own ``min_schema_version``/the conversation's already-
+    pinned version (see ``_conversation_pinned_schema_version``). Both are
+    still "the floor that was required" vs. "the ceiling that was
+    available" in the audit record, which is why one field pair covers
+    both — but the two call sites are NOT computing the same thing, so
+    don't assume ``required_min``/``available_max`` are directly
+    comparable in the audit trail across a start-vs-invite denial without
+    checking which call site produced the row.
+
+    The exact values are recorded in the audit detail (server-side only)
+    but deliberately NOT included in the raised message (Argus round 1,
+    security): unlike ``UnknownConversationTypeError``'s fixed
+    ``CONVERSATION_TYPES`` vocabulary, an agent's registered ``[min, max]``
+    range is its own per-agent state -- an initiator could otherwise
+    recover a target's exact range by varying its own declared range
+    across repeated ``start_conversation``/``invite`` calls and bisecting
+    on which side of the mismatch it lands.
+    """
+    _audit(
+        session,
+        actor_sub=actor_sub,
+        action="denied.schema_version_mismatch",
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+        detail={
+            "participant_agent_ids": [str(p) for p in participant_ids],
+            "required_min": required_min,
+            "available_max": available_max,
+        },
+    )
+    await session.commit()
+    raise SchemaVersionMismatchError(
+        "schema_version_mismatch: no wire schema version is supported by "
+        "every participant in this conversation"
+    )
+
+
+async def _negotiate_schema_version(
+    session: AsyncSession, *, actor_sub: str, initiator: Agent, targets: list[Agent]
+) -> int:
+    """Compute the highest wire schema version every participant mutually
+    supports, refusing to open the conversation if no such version exists.
+
+    TECH-5160 capability negotiation, evaluated once at ``start_conversation``
+    (a fresh participant set is only ever assembled here, not on every later
+    message — a message's own per-message ``schema_version`` field is the
+    sibling agent-local defense-in-depth layer's concern, not this one's).
+
+    Combined refuse-vs-degrade rule: the candidate version is the lowest
+    common denominator (``min`` of every participant's declared
+    ``max_schema_version``), clamped down to
+    ``schemas.MAX_REGISTERED_SCHEMA_VERSION`` — the highest version this
+    board's own code actually implements. Without that clamp, two agents
+    that both legitimately declare a ``max_schema_version`` above what the
+    board supports would negotiate to a version nothing can validate
+    payloads against, turning a board capability limit into a confusing
+    ``PayloadValidationError`` on the very next line (Argus round 1). If
+    the clamped candidate is still >= every participant's declared
+    ``min_schema_version`` (i.e. it falls inside every participant's
+    ``[min, max]`` range), the conversation degrades to it. Otherwise there
+    is no version at all that every participant can correctly interpret
+    (or that the board itself supports), and opening is refused entirely
+    (``SchemaVersionMismatchError``).
+    """
+    participants = [initiator, *targets]
+    negotiated_version = min(
+        min(p.max_schema_version for p in participants), MAX_REGISTERED_SCHEMA_VERSION
+    )
+    required_floor = max(p.min_schema_version for p in participants)
+    if required_floor > negotiated_version:
+        await _deny_schema_version_mismatch(
+            session,
+            actor_sub=actor_sub,
+            agent_id=initiator.id,
+            conversation_id=None,
+            participant_ids=[p.id for p in participants],
+            required_min=required_floor,
+            available_max=negotiated_version,
+        )
+    return negotiated_version
+
+
 async def _deny_bad_schema(
     session: AsyncSession,
     *,
@@ -355,6 +493,44 @@ async def _find_participant(
             )
         )
     ).scalar_one_or_none()
+
+
+async def _conversation_pinned_schema_version(
+    session: AsyncSession, conversation_id: uuid.UUID
+) -> int:
+    """The wire schema version this conversation was negotiated/pinned to.
+
+    TECH-5160: rather than a separate persisted ``Conversation`` column
+    (Argus round 1's alternative), the pin is durably recoverable from the
+    conversation's own append-only seq-1 ``Message.schema_version`` —
+    ``start_conversation`` always writes the negotiated version there (see
+    its own docstring), and that row is never updated/deleted. Used by
+    ``invite`` to re-check a new participant against the already-pinned
+    version, closing the gap where inviting could otherwise admit a
+    participant whose declared range excludes it.
+
+    Raises ``RuntimeError`` (an internal invariant violation, mapped to
+    the generic ToolError at the tools boundary — see
+    ``_map_service_errors``'s docstring) if the seq-1 row is somehow
+    missing — every conversation this function is ever called on already
+    passed ``_load_participant_for_transition``, which requires the
+    conversation to exist, and ``start_conversation`` always writes seq-1
+    atomically with the conversation row itself (Argus round 2: prefer
+    this explicit, diagnosable failure over ``scalar_one()``'s
+    ``NoResultFound`` leaking out as an unmapped internal error).
+    """
+    result = (
+        await session.execute(
+            select(Message.schema_version).where(
+                Message.conversation_id == conversation_id, Message.seq == 1
+            )
+        )
+    ).scalar_one_or_none()
+    if result is None:
+        raise RuntimeError(
+            f"invariant violation: conversation {conversation_id} has no seq-1 message"
+        )
+    return result
 
 
 def _maybe_expire(session: AsyncSession, actor_sub: str, conversation: Conversation) -> None:
@@ -591,6 +767,21 @@ def _message_dict(message: Message, sender_sub: str) -> dict[str, Any]:
 # --- Board admission -----------------------------------------------------------
 
 
+def validate_schema_version_range(min_schema_version: int, max_schema_version: int) -> None:
+    """Shared TECH-5160 validation for a declared schema-version range.
+
+    Called from BOTH ``register_agent`` (below) and the ``comms_register``
+    tool layer (``providers/comms.py``) so tightening this rule in one
+    place tightens it everywhere, rather than the two independent guards
+    silently drifting apart (Argus round 1). Raises ``ValueError`` — a
+    plain input-validation failure, not an authorization decision.
+    """
+    if min_schema_version < 1:
+        raise ValueError("min_schema_version must be >= 1")
+    if min_schema_version > max_schema_version:
+        raise ValueError("min_schema_version must be <= max_schema_version")
+
+
 async def register_agent(
     session: AsyncSession,
     *,
@@ -599,6 +790,8 @@ async def register_agent(
     owner_email: str,
     display_name: str,
     accepted_types: list[str],
+    min_schema_version: int = 1,
+    max_schema_version: int = 1,
 ) -> Agent:
     """Idempotently create or re-bind the board ``Agent`` row for ``sub``.
 
@@ -634,7 +827,32 @@ async def register_agent(
     An ``accepted_types`` containing a value outside ``MESSAGE_TYPES``
     instead raises ``UnknownConversationTypeError`` (exceptions.py) --
     specific and client-safe by design, unlike the cases above.
+
+    ``min_schema_version``/``max_schema_version`` (TECH-5160, both default
+    to ``1``, today's only version) declare the wire-schema version range
+    this agent's own code can correctly interpret. ``start_conversation``
+    negotiates down to the highest version every participant in a new
+    conversation mutually supports, refusing to open at all if no version
+    is inside every participant's range — see
+    ``service._negotiate_schema_version``. Raises ``ValueError`` (via
+    ``validate_schema_version_range``) if ``min_schema_version < 1`` or
+    ``min_schema_version > max_schema_version`` (checked alongside the
+    other input-validation failures above, not as an authorization
+    decision).
+
+    Omitting both range parameters on a RE-registration resets an existing
+    agent's declared range to ``1``/``1`` — the same "both absent" default
+    every fresh registration gets — even if that agent had previously
+    declared a wider range. There is deliberately no "leave unchanged if
+    omitted" behavior here, unlike ``owner_sub``: unlike that field (whose
+    silent-overwrite would be a forgeable privilege escalation, see above),
+    accepting a client's stated capability range at face value on every
+    call is the correct posture, and unlike ``owner_email``, an
+    accidentally-narrowed range is safe by construction — it can only make
+    negotiation MORE conservative, never admit a version this agent can't
+    handle.
     """
+    validate_schema_version_range(min_schema_version, max_schema_version)
     sub = sub.strip()
     if not sub:
         raise ValueError("sub must be non-empty")
@@ -692,6 +910,8 @@ async def register_agent(
             accepted_types=normalized_types,
             status="active",
             bound_at=now,
+            min_schema_version=min_schema_version,
+            max_schema_version=max_schema_version,
         )
         session.add(agent)
     else:
@@ -715,6 +935,8 @@ async def register_agent(
         agent.accepted_types = normalized_types
         agent.status = "active"
         agent.bound_at = now
+        agent.min_schema_version = min_schema_version
+        agent.max_schema_version = max_schema_version
     await session.flush()
     _audit(
         session,
@@ -1109,8 +1331,12 @@ async def start_conversation(
     target list (input-validation, not authorization); ``AccessDeniedError``
     (uniform) if any target is unknown/inactive, or the participant set
     fails admission; ``RateLimitExceededError`` past the per-initiator
-    hourly cap; ``schemas.PayloadValidationError`` if ``initial_message``
-    fails schema validation.
+    conversation-start hourly cap OR the board-level per-sender-across-all-
+    conversations hourly cap (TECH-5160); ``SchemaVersionMismatchError`` if
+    no wire schema version falls inside every participant's declared
+    ``[min_schema_version, max_schema_version]`` range;
+    ``schemas.PayloadValidationError`` if ``initial_message`` fails schema
+    validation.
     """
     initiator = await _require_active_agent(
         session, actor_sub=actor_sub, agent_id=initiator_agent_id
@@ -1127,12 +1353,36 @@ async def start_conversation(
         raise ValueError("target_agent_ids must name at least one other agent")
 
     await _enforce_start_rate_limit(session, actor_sub=actor_sub, initiator=initiator)
+    # start_conversation inserts its seq-1 message directly (below), rather
+    # than delegating to post_message — so the board-level global rate
+    # limit has to be enforced here too, or opening many new conversations
+    # would be an easy way to route around it (post_message's own call
+    # never sees the opening message). See _enforce_sender_global_rate_limit.
+    await _enforce_sender_global_rate_limit(
+        session, actor_sub=actor_sub, sender_agent_id=initiator.id
+    )
     targets = await _resolve_targets(
         session,
         actor_sub=actor_sub,
         initiator=initiator,
         target_ids=target_ids,
     )
+
+    # TECH-5160 capability negotiation: the caller-supplied schema_version
+    # is NOT trusted as the actual wire version — it is overridden by the
+    # highest version every participant (initiator + all targets) mutually
+    # supports, refusing outright if no such version exists at all. See
+    # _negotiate_schema_version's docstring for the combined refuse-vs-
+    # degrade rule. Deliberately checked BEFORE _authorize_conversation_open
+    # (Argus round 1): negotiation is pure in-memory computation over
+    # already-loaded Agent rows, while _authorize_conversation_open makes an
+    # external ownership-service call for internal/asymmetric conversations
+    # — running the cheap, purely local check first avoids that round-trip
+    # on a mismatch that would refuse the conversation anyway.
+    schema_version = await _negotiate_schema_version(
+        session, actor_sub=actor_sub, initiator=initiator, targets=targets
+    )
+
     owner_snapshot = await _authorize_conversation_open(
         session,
         actor_sub=actor_sub,
@@ -1281,6 +1531,17 @@ async def start_conversation(
         )
 
     await session.commit()
+    # Not a mapped column (no migration/persistence for this, Argus round
+    # 1's alternative to a new Conversation column): the negotiated version
+    # is durably discoverable via this conversation's own seq-1
+    # Message.schema_version (see _conversation_pinned_schema_version,
+    # used by invite's re-check below), which already exists and is
+    # append-only. This transient attribute exists only so the
+    # SAME in-memory object this call returns can hand the negotiated
+    # value straight to the tools-layer response without a second query
+    # in the common case — it does not survive a fresh fetch of this
+    # conversation from a later call.
+    conversation.negotiated_schema_version = schema_version  # type: ignore[attr-defined]
     return conversation
 
 
@@ -1453,6 +1714,14 @@ async def invite(
     ``owner_snapshot`` (the owner set is frozen at creation, not
     retroactively reconciled against prior messages when it would expand).
     ``open`` conversations have no ownership concept and skip this check.
+
+    TECH-5160: also re-checks the target's declared
+    ``[min_schema_version, max_schema_version]`` range against the version
+    this conversation was already pinned to at ``start_conversation`` time
+    (``_conversation_pinned_schema_version``), raising
+    ``SchemaVersionMismatchError`` if the target can't correctly interpret
+    it -- closing the gap where invite could otherwise admit a participant
+    incompatible with every message already in the conversation.
     """
     conversation, inviter_participant = await _load_participant_for_transition(
         session,
@@ -1487,6 +1756,45 @@ async def invite(
             agent_id=inviter_agent_id,
             conversation_id=conversation.id,
             detail={"target_agent_id": str(target_agent_id)},
+        )
+    # TECH-5160: re-check the new target against the version this
+    # conversation was already pinned to at open time (see
+    # _conversation_pinned_schema_version) -- without this, invite could
+    # silently admit a participant whose own declared range excludes the
+    # version every message in this conversation is already written in
+    # (Argus round 1).
+    pinned_version = await _conversation_pinned_schema_version(session, conversation.id)
+    if not (target.min_schema_version <= pinned_version <= target.max_schema_version):
+        # Audit field semantics note (Argus round 3): this "required_min/
+        # available_max" pairing is directionally accurate for the case
+        # that's actually reachable today (pinned_version <
+        # target.min_schema_version — the target requires newer than
+        # what's pinned). The OTHER direction (pinned_version >
+        # target.max_schema_version — the target is too OLD for the pin)
+        # would instead want target.max_schema_version as the "available"
+        # ceiling, not pinned_version itself; that direction is currently
+        # unreachable (MAX_REGISTERED_SCHEMA_VERSION == 1, and the DB
+        # CHECK constraint already enforces every registered
+        # max_schema_version >= 1), so this isn't fixed here — revisit
+        # once a second schema version makes that direction reachable.
+        # The invariant this comment depends on (MAX_REGISTERED_SCHEMA_VERSION
+        # == 1) is mechanically enforced at IMPORT time, not here (Argus
+        # round 5) — see the module-level check near this constant's
+        # import above. An in-function check at this exact spot would fire
+        # only inside this one denial branch, on this one authorization
+        # path, writing no audit row and no log for what would be a
+        # security-relevant event; failing at import time instead means a
+        # deploy with an unreviewed second schema version crash-loops at
+        # startup, loudly, rather than silently mislabeling this one
+        # audit row's fields the first time this branch is ever hit.
+        await _deny_schema_version_mismatch(
+            session,
+            actor_sub=actor_sub,
+            agent_id=inviter_agent_id,
+            conversation_id=conversation.id,
+            participant_ids=[inviter_agent_id, target.id],
+            required_min=target.min_schema_version,
+            available_max=pinned_version,
         )
     await _authorize_invite_owner_freeze(
         session,
@@ -1591,6 +1899,44 @@ async def _enforce_message_rate_limit(
             message=(
                 f"rate_limited: at most {MAX_MESSAGES_PER_CONVERSATION_PER_HOUR} "
                 "messages per conversation per hour"
+            ),
+        )
+
+
+async def _enforce_sender_global_rate_limit(
+    session: AsyncSession, *, actor_sub: str, sender_agent_id: uuid.UUID
+) -> None:
+    """Board-level defense-in-depth (TECH-5160): cap a sender's TOTAL
+    message volume across ALL conversations combined, not just within one.
+
+    Additive to ``_enforce_message_rate_limit``, not a replacement — both
+    are always checked. This one protects the board itself even if a
+    counterparty's own agent-local rate limiter has a bug or is bypassed
+    entirely by a compromised agent that doesn't run the standard
+    negotiation library at all. See ``MAX_MESSAGES_PER_SENDER_PER_HOUR``'s
+    definition for why 120 is the chosen ceiling.
+    """
+    one_hour_ago = _now() - timedelta(hours=1)
+    count = (
+        await session.execute(
+            select(func.count())
+            .select_from(Message)
+            .where(
+                Message.sender_id == sender_agent_id,
+                Message.created_at > one_hour_ago,
+            )
+        )
+    ).scalar_one()
+    if count >= MAX_MESSAGES_PER_SENDER_PER_HOUR:
+        await _deny_rate_limited(
+            session,
+            actor_sub=actor_sub,
+            agent_id=sender_agent_id,
+            conversation_id=None,
+            limit_name="messages_per_sender_per_hour",
+            message=(
+                f"rate_limited: at most {MAX_MESSAGES_PER_SENDER_PER_HOUR} "
+                "messages per sender per hour, across all conversations"
             ),
         )
 
@@ -1932,13 +2278,17 @@ async def post_message(
     decisive — see ``_require_message_sender_role``).
 
     Raises ``RateLimitExceededError`` past the per-sender-per-conversation
-    hourly cap; ``InvalidConversationStateError`` if ``message_type`` is not
-    legal in the conversation's current state (state-machine violation,
-    including after lazy expiry); ``AccessDeniedError`` (uniform) if
-    ``message_type`` is sender-role-restricted and the sender's role
-    doesn't match; ``schemas.PayloadValidationError`` if ``payload`` fails
-    schema validation, or if a ``needs_clarification``'s ``about_seq`` does
-    not reference an existing prior message.
+    hourly cap OR the board-level per-sender-across-all-conversations hourly
+    cap (``_enforce_sender_global_rate_limit``, TECH-5160 defense-in-depth
+    against a sender spraying messages across many conversations to evade
+    the per-conversation cap); ``InvalidConversationStateError`` if
+    ``message_type`` is not legal in the conversation's current state
+    (state-machine violation, including after lazy expiry);
+    ``AccessDeniedError`` (uniform) if ``message_type`` is sender-role-
+    restricted and the sender's role doesn't match;
+    ``schemas.PayloadValidationError`` if ``payload`` fails schema
+    validation, or if a ``needs_clarification``'s ``about_seq`` does not
+    reference an existing prior message.
     """
     await _require_active_agent(session, actor_sub=actor_sub, agent_id=sender_agent_id)
     conversation, participant = await _load_participant_for_transition(
@@ -1952,6 +2302,9 @@ async def post_message(
 
     await _enforce_message_rate_limit(
         session, actor_sub=actor_sub, sender_agent_id=sender_agent_id, conversation=conversation
+    )
+    await _enforce_sender_global_rate_limit(
+        session, actor_sub=actor_sub, sender_agent_id=sender_agent_id
     )
 
     if not is_message_legal(conversation.state, message_type):

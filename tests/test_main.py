@@ -454,6 +454,23 @@ class TestEndToEnd:
             _ENV_PATCH,
             patch("main.get_access_token", return_value=okta_token),
             patch("providers.comms.get_access_token", return_value=okta_token),
+            # TECH-5160: whoami's best-effort schema-version lookup calls
+            # the REAL db.get_session_factory() unless patched. This module
+            # has no test database of its own (it tests server
+            # composition/middleware, not comms domain logic), and — more
+            # subtly — db.py's engine/session-factory are module-level
+            # singletons: a second test in this same process reusing them
+            # across a DIFFERENT `asyncio.run()`-created event loop than
+            # the one they were first built on fails with "attached to a
+            # different loop", not a clean connectivity error. Patching
+            # this out (same test-injection seam test_comms_tools.py uses)
+            # keeps this test focused on its own actual purpose --
+            # identity/scopes wiring, unaffected by whoami's DB-optional
+            # schema-version fields either way.
+            patch(
+                "providers.comms.get_session_factory",
+                side_effect=RuntimeError("no test database configured for this module"),
+            ),
         ):
             data = asyncio.run(_call())
 
@@ -488,6 +505,12 @@ class TestEndToEnd:
             _ENV_PATCH,
             patch("main.get_access_token", return_value=bot_token),
             patch("providers.comms.get_access_token", return_value=bot_token),
+            # See the sibling interactive-caller test above for why this is
+            # patched (TECH-5160 / db.py's module-level engine singleton).
+            patch(
+                "providers.comms.get_session_factory",
+                side_effect=RuntimeError("no test database configured for this module"),
+            ),
         ):
             data = asyncio.run(_call())
 

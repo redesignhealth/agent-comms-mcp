@@ -39,12 +39,14 @@ from exceptions import (
     AccessDeniedError,
     InvalidConversationStateError,
     RateLimitExceededError,
+    SchemaVersionMismatchError,
     UnknownConversationTypeError,
 )
 from models import Agent, AuditLog, Conversation, Participant
 from schemas import (
     MAX_ACCEPTED_TYPE_LENGTH,
     MAX_PAYLOAD_BYTES,
+    MAX_REGISTERED_SCHEMA_VERSION,
     MESSAGE_TYPES,
     PayloadValidationError,
 )
@@ -52,6 +54,7 @@ from service import (
     CONVERSATION_TTL,
     MAX_CONVERSATION_STARTS_PER_HOUR,
     MAX_MESSAGES_PER_CONVERSATION_PER_HOUR,
+    MAX_MESSAGES_PER_SENDER_PER_HOUR,
     AgentTableOwnershipClient,
     OwnershipClient,
     accept_invite,
@@ -414,6 +417,64 @@ class TestRegisterAgent:
                 accepted_types=["availability_request", "bogus"],
             )
 
+    async def test_schema_version_defaults_to_one_one(self, session: AsyncSession) -> None:
+        """TECH-5160: min/max_schema_version default to 1/1 (today's only
+        wire schema version) when not supplied."""
+        agent = await _register(session, "agent-schema-default")
+        assert agent.min_schema_version == 1
+        assert agent.max_schema_version == 1
+
+    async def test_schema_version_range_persisted(self, session: AsyncSession) -> None:
+        agent = await _register(
+            session, "agent-schema-range", min_schema_version=1, max_schema_version=2
+        )
+        assert agent.min_schema_version == 1
+        assert agent.max_schema_version == 2
+
+    async def test_min_schema_version_over_max_rejected(self, session: AsyncSession) -> None:
+        """TECH-5160: min_schema_version > max_schema_version is a plain
+        input-validation failure (not an authorization decision), same
+        posture as the other malformed-input ``ValueError`` cases above."""
+        with pytest.raises(ValueError, match="min_schema_version must be <= max_schema_version"):
+            await _register(
+                session,
+                "agent-bad-schema-range",
+                min_schema_version=3,
+                max_schema_version=2,
+            )
+
+    async def test_min_schema_version_below_one_rejected(self, session: AsyncSession) -> None:
+        """TECH-5160 (Argus round 1): a 0 or negative min_schema_version
+        passed the original min<=max check alone and routed straight into a
+        broken negotiation (no schema registered below version 1) -- this
+        is the dedicated lower-bound guard closing that gap."""
+        for bad_min in (0, -1):
+            with pytest.raises(ValueError, match="min_schema_version must be >= 1"):
+                await _register(
+                    session,
+                    "agent-schema-below-one",
+                    min_schema_version=bad_min,
+                    max_schema_version=bad_min,
+                )
+
+    async def test_schema_version_reset_on_reregister_when_omitted(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-5160 (Argus round 1, documented behavior): omitting both
+        range params on a re-registration resets to 1/1, the same default a
+        fresh registration gets -- even if a wider range was declared
+        before. This is intentional (see register_agent's docstring): safe
+        by construction, since a narrowed range can only make negotiation
+        MORE conservative, never admit a version this agent can't handle."""
+        first = await _register(
+            session, "agent-schema-reset", min_schema_version=1, max_schema_version=3
+        )
+        assert first.max_schema_version == 3
+
+        second = await _register(session, "agent-schema-reset")
+        assert second.min_schema_version == 1
+        assert second.max_schema_version == 1
+
 
 # --- start_conversation --------------------------------------------------------
 
@@ -565,6 +626,320 @@ class TestStartConversation:
             message_type="task_cancel",
         )
         assert conversation.state == "canceled"
+
+
+class TestSchemaVersionNegotiation:
+    """TECH-5160: capability negotiation at ``start_conversation``.
+
+    Computed generically via ``min``/``max`` of the registered ranges
+    rather than hardcoding ``1`` everywhere, so these assertions would
+    still hold if a future agent registered e.g. ``[1, 2]``.
+    """
+
+    async def test_overlapping_ranges_negotiate_to_common_max(self, session: AsyncSession) -> None:
+        owner = await _register(
+            session, "owner-schema-ok", min_schema_version=1, max_schema_version=1
+        )
+        target = await _register(
+            session, "target-schema-ok", min_schema_version=1, max_schema_version=1
+        )
+        expected_negotiated = min(owner.max_schema_version, target.max_schema_version)
+        assert max(owner.min_schema_version, target.min_schema_version) <= expected_negotiated
+
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+        )
+        assert conversation.state == "active"
+        message = (
+            await session.execute(
+                text(
+                    "SELECT schema_version FROM messages WHERE conversation_id = :cid AND seq = 1"
+                ),
+                {"cid": conversation.id},
+            )
+        ).scalar_one()
+        assert message == expected_negotiated
+
+    async def test_non_overlapping_ranges_refused_and_atomic(self, session: AsyncSession) -> None:
+        """No version is inside both participants' ranges -- the board
+        refuses to open the conversation at all, and (transactionally) no
+        conversation/participant/message row is left behind."""
+        owner = await _register(
+            session, "owner-schema-mismatch", min_schema_version=1, max_schema_version=1
+        )
+        target = await _register(
+            session, "target-schema-mismatch", min_schema_version=2, max_schema_version=2
+        )
+
+        with pytest.raises(SchemaVersionMismatchError):
+            await start_conversation(
+                session,
+                actor_sub=owner.sub,
+                initiator_agent_id=owner.id,
+                conversation_type="open",
+                target_agent_ids=[target.id],
+                initial_message=_request_payload(),
+            )
+
+        conversation_rows = (
+            (await session.execute(select(Conversation).where(Conversation.created_by == owner.id)))
+            .scalars()
+            .all()
+        )
+        assert conversation_rows == []
+        message_rows = (await session.execute(text("SELECT * FROM messages"))).mappings().all()
+        assert message_rows == []
+        # Argus round 2: the prior version of this test asserted atomicity
+        # for Conversation/Message only, despite the docstring's broader
+        # "conversation/participant/message" claim -- Participant rows for
+        # both the owner (role=owner) and target (role=member) are exactly
+        # what start_conversation would have inserted between the
+        # Conversation row and the seq-1 Message, so they're the most
+        # likely place a partial-rollback bug would actually surface.
+        # Filtered by the two agents actually involved (Argus round 3),
+        # matching conversation_rows' defensive pattern above rather than
+        # asserting on the whole table.
+        participant_rows = (
+            (
+                await session.execute(
+                    select(Participant).where(Participant.agent_id.in_([owner.id, target.id]))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert participant_rows == []
+        audit_rows = (
+            await session.execute(
+                select(AuditLog.action, AuditLog.detail).where(AuditLog.agent_id == owner.id)
+            )
+        ).all()
+        actions = [row.action for row in audit_rows]
+        # Argus round 3: verify the renamed audit detail keys
+        # (required_min/available_max, not the old common_floor/
+        # common_ceiling parameter names) actually land in the audit row,
+        # not just that SOME denial happened.
+        mismatch_row = next(
+            row for row in audit_rows if row.action == "denied.schema_version_mismatch"
+        )
+        assert mismatch_row.detail is not None
+        assert mismatch_row.detail["required_min"] == 2
+        assert mismatch_row.detail["available_max"] == 1
+        assert "denied.schema_version_mismatch" in actions
+
+    async def test_negotiation_clamps_to_board_max(self, session: AsyncSession) -> None:
+        """TECH-5160 (Argus round 1): two agents that both legitimately
+        declare a max above what this board's own code implements must
+        degrade to the board's own max, not negotiate to a version nothing
+        can validate payloads against."""
+        above_board_max = MAX_REGISTERED_SCHEMA_VERSION + 1
+        owner = await _register(
+            session,
+            "owner-schema-clamp",
+            min_schema_version=1,
+            max_schema_version=above_board_max,
+        )
+        target = await _register(
+            session,
+            "target-schema-clamp",
+            min_schema_version=1,
+            max_schema_version=above_board_max,
+        )
+        assert min(owner.max_schema_version, target.max_schema_version) > (
+            MAX_REGISTERED_SCHEMA_VERSION
+        )
+
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+        )
+        assert conversation.state == "active"
+        message_schema_version = (
+            await session.execute(
+                text(
+                    "SELECT schema_version FROM messages WHERE conversation_id = :cid AND seq = 1"
+                ),
+                {"cid": conversation.id},
+            )
+        ).scalar_one()
+        assert message_schema_version == MAX_REGISTERED_SCHEMA_VERSION
+
+    async def test_negotiation_refused_when_clamp_drops_below_required_floor(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-5160 (Argus round 1): both agents requiring a version above
+        the board's own max must be refused with SchemaVersionMismatchError
+        -- clamping the candidate down must not let it silently satisfy a
+        min-version floor the pre-clamp candidate no longer meets."""
+        above_board_max = MAX_REGISTERED_SCHEMA_VERSION + 1
+        owner = await _register(
+            session,
+            "owner-schema-clamp-refuse",
+            min_schema_version=above_board_max,
+            max_schema_version=above_board_max,
+        )
+        target = await _register(
+            session,
+            "target-schema-clamp-refuse",
+            min_schema_version=above_board_max,
+            max_schema_version=above_board_max,
+        )
+        with pytest.raises(SchemaVersionMismatchError):
+            await start_conversation(
+                session,
+                actor_sub=owner.sub,
+                initiator_agent_id=owner.id,
+                conversation_type="open",
+                target_agent_ids=[target.id],
+                initial_message=_request_payload(),
+            )
+
+
+class TestInviteSchemaVersionRecheck:
+    """TECH-5160 (Argus round 1): comms_invite must re-check a new
+    participant against the version this conversation was already pinned
+    to, closing the gap where invite could otherwise admit an incompatible
+    participant with no re-check at all."""
+
+    async def test_invite_incompatible_target_refused(self, session: AsyncSession) -> None:
+        owner = await _register(
+            session, "owner-invite-schema", min_schema_version=1, max_schema_version=1
+        )
+        member = await _register(
+            session, "member-invite-schema", min_schema_version=1, max_schema_version=1
+        )
+        incompatible = await _register(
+            session,
+            "incompatible-invite-schema",
+            min_schema_version=MAX_REGISTERED_SCHEMA_VERSION + 1,
+            max_schema_version=MAX_REGISTERED_SCHEMA_VERSION + 1,
+        )
+
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[member.id],
+            initial_message=_request_payload(),
+        )
+
+        with pytest.raises(SchemaVersionMismatchError):
+            await invite(
+                session,
+                actor_sub=owner.sub,
+                inviter_agent_id=owner.id,
+                conversation_id=conversation.id,
+                target_agent_id=incompatible.id,
+            )
+
+        participant_row = await session.get(Participant, (conversation.id, incompatible.id))
+        assert participant_row is None
+        audit_rows = (
+            await session.execute(
+                select(AuditLog.action, AuditLog.detail).where(AuditLog.agent_id == owner.id)
+            )
+        ).all()
+        actions = [row.action for row in audit_rows]
+        assert "denied.schema_version_mismatch" in actions
+        # Argus round 4: mirror start_conversation's equivalent assertion
+        # (TestSchemaVersionNegotiation) so the invite-path required_min/
+        # available_max assignment is guarded against regression too, not
+        # just the action string.
+        mismatch_row = next(
+            row for row in audit_rows if row.action == "denied.schema_version_mismatch"
+        )
+        assert mismatch_row.detail is not None
+        assert mismatch_row.detail["required_min"] == MAX_REGISTERED_SCHEMA_VERSION + 1
+        assert mismatch_row.detail["available_max"] == MAX_REGISTERED_SCHEMA_VERSION
+
+    async def test_invite_compatible_target_succeeds(self, session: AsyncSession) -> None:
+        owner = await _register(
+            session, "owner-invite-schema-ok", min_schema_version=1, max_schema_version=1
+        )
+        member = await _register(
+            session, "member-invite-schema-ok", min_schema_version=1, max_schema_version=1
+        )
+        compatible = await _register(
+            session, "compatible-invite-schema-ok", min_schema_version=1, max_schema_version=1
+        )
+
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[member.id],
+            initial_message=_request_payload(),
+        )
+        participant = await invite(
+            session,
+            actor_sub=owner.sub,
+            inviter_agent_id=owner.id,
+            conversation_id=conversation.id,
+            target_agent_id=compatible.id,
+        )
+        assert participant.status == "invited"
+
+    async def test_invite_raises_runtime_error_if_seq_one_message_missing(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-5160 (Argus round 3): _conversation_pinned_schema_version's
+        internal-invariant guard. This state (a conversation with no seq-1
+        message) should never occur via any public code path -- reproduced
+        here only by deleting the row directly -- but if it ever did,
+        invite must fail with a diagnosable RuntimeError rather than an
+        unmapped NoResultFound leaking out of scalar_one()."""
+        owner = await _register(
+            session, "owner-invite-no-seq1", min_schema_version=1, max_schema_version=1
+        )
+        member = await _register(
+            session, "member-invite-no-seq1", min_schema_version=1, max_schema_version=1
+        )
+        other = await _register(
+            session, "other-invite-no-seq1", min_schema_version=1, max_schema_version=1
+        )
+
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[member.id],
+            initial_message=_request_payload(),
+        )
+        # audit_log.message_id FKs to messages.id -- clear the referencing
+        # audit rows first, or the DELETE below violates that constraint.
+        await session.execute(
+            text(
+                "DELETE FROM audit_log WHERE message_id IN "
+                "(SELECT id FROM messages WHERE conversation_id = :cid AND seq = 1)"
+            ),
+            {"cid": conversation.id},
+        )
+        await session.execute(
+            text("DELETE FROM messages WHERE conversation_id = :cid AND seq = 1"),
+            {"cid": conversation.id},
+        )
+        await session.commit()
+
+        with pytest.raises(RuntimeError, match="no seq-1 message"):
+            await invite(
+                session,
+                actor_sub=owner.sub,
+                inviter_agent_id=owner.id,
+                conversation_id=conversation.id,
+                target_agent_id=other.id,
+            )
 
 
 class _FakeOwnershipClient:
@@ -2460,6 +2835,181 @@ class TestRateLimits:
             .all()
         )
         assert "denied.rate_limited" in actions
+
+    async def test_sender_global_rate_limit_spans_many_conversations(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-5160: MAX_MESSAGES_PER_SENDER_PER_HOUR caps a sender's TOTAL
+        message volume across ALL conversations combined — defense-in-depth
+        against a sender staying under MAX_MESSAGES_PER_CONVERSATION_PER_HOUR
+        in each of many DIFFERENT conversations while flooding in aggregate.
+        """
+        owner = await _register(session, "rl-owner-3")
+        flooder = await _register(session, "rl-flooder-3")
+
+        # Spread MAX_MESSAGES_PER_SENDER_PER_HOUR messages across enough
+        # distinct conversations that no single conversation ever
+        # approaches MAX_MESSAGES_PER_CONVERSATION_PER_HOUR -- isolating
+        # the global limit from the per-conversation one.
+        num_conversations = 5
+        per_conversation = MAX_MESSAGES_PER_SENDER_PER_HOUR // num_conversations
+        assert per_conversation < MAX_MESSAGES_PER_CONVERSATION_PER_HOUR
+        assert per_conversation * num_conversations == MAX_MESSAGES_PER_SENDER_PER_HOUR
+
+        for _ in range(num_conversations):
+            conversation = await start_conversation(
+                session,
+                actor_sub=owner.sub,
+                initiator_agent_id=owner.id,
+                conversation_type="open",
+                target_agent_ids=[flooder.id],
+                initial_message=_request_payload(),
+            )
+            await accept_invite(
+                session,
+                actor_sub=flooder.sub,
+                agent_id=flooder.id,
+                conversation_id=conversation.id,
+            )
+            for _ in range(per_conversation):
+                await post_message(
+                    session,
+                    actor_sub=flooder.sub,
+                    sender_agent_id=flooder.id,
+                    conversation_id=conversation.id,
+                    message_type="counter_proposal",
+                    payload=_counter_proposal_payload(),
+                )
+
+        # One more conversation, brand new (0 prior messages there), so the
+        # per-conversation check alone would pass -- only the global,
+        # cross-conversation cap should fire here.
+        overflow_conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[flooder.id],
+            initial_message=_request_payload(),
+        )
+        await accept_invite(
+            session,
+            actor_sub=flooder.sub,
+            agent_id=flooder.id,
+            conversation_id=overflow_conversation.id,
+        )
+        with pytest.raises(RateLimitExceededError):
+            await post_message(
+                session,
+                actor_sub=flooder.sub,
+                sender_agent_id=flooder.id,
+                conversation_id=overflow_conversation.id,
+                message_type="counter_proposal",
+                payload=_counter_proposal_payload(),
+            )
+        actions = (
+            (await session.execute(select(AuditLog.action).where(AuditLog.agent_id == flooder.id)))
+            .scalars()
+            .all()
+        )
+        assert "denied.rate_limited" in actions
+
+        # A DIFFERENT sender in the same window is entirely unaffected.
+        other_sender = await _register(session, "rl-other-3")
+        other_conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[other_sender.id],
+            initial_message=_request_payload(),
+        )
+        await accept_invite(
+            session,
+            actor_sub=other_sender.sub,
+            agent_id=other_sender.id,
+            conversation_id=other_conversation.id,
+        )
+        message = await post_message(
+            session,
+            actor_sub=other_sender.sub,
+            sender_agent_id=other_sender.id,
+            conversation_id=other_conversation.id,
+            message_type="counter_proposal",
+            payload=_counter_proposal_payload(),
+        )
+        assert message.seq == 2
+
+    async def test_sender_global_rate_limit_also_blocks_start_conversation(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-5160 (Argus round 1): start_conversation inserts its seq-1
+        message via a separate code path from post_message (see the
+        comment in service.start_conversation) -- this exercises that
+        second call site directly, not just post_message's."""
+        owner = await _register(session, "rl-owner-4")
+        flooder = await _register(session, "rl-flooder-4")
+
+        num_conversations = 5
+        per_conversation = MAX_MESSAGES_PER_SENDER_PER_HOUR // num_conversations
+        assert per_conversation < MAX_MESSAGES_PER_CONVERSATION_PER_HOUR
+
+        for _ in range(num_conversations):
+            conversation = await start_conversation(
+                session,
+                actor_sub=owner.sub,
+                initiator_agent_id=owner.id,
+                conversation_type="open",
+                target_agent_ids=[flooder.id],
+                initial_message=_request_payload(),
+            )
+            await accept_invite(
+                session,
+                actor_sub=flooder.sub,
+                agent_id=flooder.id,
+                conversation_id=conversation.id,
+            )
+            for _ in range(per_conversation):
+                await post_message(
+                    session,
+                    actor_sub=flooder.sub,
+                    sender_agent_id=flooder.id,
+                    conversation_id=conversation.id,
+                    message_type="counter_proposal",
+                    payload=_counter_proposal_payload(),
+                )
+
+        # flooder is now at the global cap purely from post_message calls;
+        # flooder's OWN MAX_CONVERSATION_STARTS_PER_HOUR budget is untouched
+        # (all starts above were owner's), so this failure can only be the
+        # global sender rate limit firing inside start_conversation itself.
+        new_target = await _register(session, "rl-new-target-4")
+        with pytest.raises(RateLimitExceededError):
+            await start_conversation(
+                session,
+                actor_sub=flooder.sub,
+                initiator_agent_id=flooder.id,
+                conversation_type="open",
+                target_agent_ids=[new_target.id],
+                initial_message=_request_payload(),
+            )
+        actions = (
+            (await session.execute(select(AuditLog.action).where(AuditLog.agent_id == flooder.id)))
+            .scalars()
+            .all()
+        )
+        assert "denied.rate_limited" in actions
+        # No orphaned conversation/participant/message from the refused call.
+        conversation_rows = (
+            (
+                await session.execute(
+                    select(Conversation).where(Conversation.created_by == flooder.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert conversation_rows == []
 
 
 # --- expiry -----------------------------------------------------------------------

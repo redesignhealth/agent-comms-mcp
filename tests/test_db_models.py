@@ -180,6 +180,69 @@ class TestSchema:
         assert constraint_def is not None, "ck_agents_accepted_types_max constraint missing"
         assert "cardinality" in constraint_def
 
+    async def test_agents_schema_version_range_columns_default_and_constraint(
+        self, engine: AsyncEngine
+    ) -> None:
+        """TECH-5160: min/max_schema_version backfill to 1/1 on a row that
+        omits them (migration 2cc5185360c7's server_default -- Argus round
+        1: a prior version of this test asserted on a ``LIMIT 0`` result
+        object rather than reading back an actual row, so it never verified
+        the backfill value at all), and are DB-level constrained to
+        ``min >= 1 AND min <= max``."""
+        cols = await _columns(engine, "agents")
+        assert "min_schema_version" in cols
+        assert "max_schema_version" in cols
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO agents "
+                    "(sub, owner_sub, owner_email, display_name, accepted_types, status) "
+                    "VALUES (:sub, :owner_sub, :owner_email, :display_name, ARRAY['note'], "
+                    "'active')"
+                ),
+                {
+                    "sub": "test-schema-version-backfill-row",
+                    "owner_sub": "test-schema-version-backfill-row",
+                    "owner_email": "test-schema-version-backfill-row",
+                    "display_name": "test-schema-version-backfill-row",
+                },
+            )
+            row = (
+                await conn.execute(
+                    text(
+                        "SELECT min_schema_version, max_schema_version FROM agents WHERE sub = :sub"
+                    ),
+                    {"sub": "test-schema-version-backfill-row"},
+                )
+            ).one()
+            assert row.min_schema_version == 1
+            assert row.max_schema_version == 1
+            constraint_def = (
+                await conn.execute(
+                    text(
+                        "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                        "WHERE conrelid = 'agents'::regclass "
+                        "AND conname = 'ck_agents_schema_version_range'"
+                    )
+                )
+            ).scalar_one_or_none()
+            # Cleanup: this module has no autouse table-truncation fixture
+            # (unlike test_service.py/test_comms_tools.py), so a row this
+            # test itself inserted must be removed, or it leaks into every
+            # later test/module run against the same database.
+            await conn.execute(
+                text("DELETE FROM agents WHERE sub = :sub"),
+                {"sub": "test-schema-version-backfill-row"},
+            )
+        assert constraint_def is not None, "ck_agents_schema_version_range constraint missing"
+        assert "min_schema_version" in constraint_def
+        assert "max_schema_version" in constraint_def
+        # Argus round 2: the prior assertions only checked both column
+        # names appeared, which would still pass even if the >= 1 lower
+        # bound (added specifically to close a 0/negative-range security
+        # gap) were ever reverted.
+        assert ">= 1" in constraint_def
+
     async def test_conversations_columns(self, engine: AsyncEngine) -> None:
         cols = await _columns(engine, "conversations")
         for expected in (
@@ -286,6 +349,11 @@ class TestSchema:
 
         message_indexes = await _indexes(engine, "messages")
         assert "idx_messages_conversation_id_sender_id_created_at" in message_indexes
+        # TECH-5160 (Argus round 1): backs
+        # service._enforce_sender_global_rate_limit's sender_id/created_at
+        # query, which has no conversation_id predicate and so can't use
+        # the (conversation_id, sender_id, created_at) index above.
+        assert "idx_messages_sender_id_created_at" in message_indexes
 
     async def test_messages_seq_unique_per_conversation(self, engine: AsyncEngine) -> None:
         async with engine.connect() as conn:

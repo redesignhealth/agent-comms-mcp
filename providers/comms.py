@@ -32,6 +32,7 @@ never reach it.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
@@ -42,6 +43,7 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.auth import AccessToken
 from fastmcp.server.dependencies import get_access_token
+from sqlalchemy.exc import InterfaceError, OperationalError
 
 import service
 from db import get_session_factory
@@ -49,6 +51,7 @@ from exceptions import (
     AccessDeniedError,
     InvalidConversationStateError,
     RateLimitExceededError,
+    SchemaVersionMismatchError,
     UnknownConversationTypeError,
 )
 from identity import try_resolve_email
@@ -62,6 +65,13 @@ from schemas import (
 from scopes import is_interactive_token, scopes_for_token
 
 comms_server: FastMCP[Any] = FastMCP("comms")
+
+# Plain stdlib logging, matching service.py's own module logger convention
+# (see its docstring comment) -- this exists solely so a genuine
+# connectivity/config failure swallowed by comms_whoami's best-effort
+# schema-version lookup (see below) still lands somewhere instead of being
+# silently discarded.
+logger = logging.getLogger(__name__)
 
 
 # --- Identity / session plumbing -------------------------------------------------
@@ -178,7 +188,9 @@ async def _map_service_errors() -> AsyncIterator[None]:
     ``CONVERSATION_TYPES`` in its message on purpose: that's this
     service's own fixed, public capability list, not per-caller secret
     state, so naming it is not the kind of enumeration DESIGN.md's
-    anti-enumeration rule is about.
+    anti-enumeration rule is about. ``SchemaVersionMismatchError``
+    (TECH-5160) is the same story for the wire-schema capability range
+    negotiated at ``comms_start_conversation`` — see exceptions.py.
 
     A bare ``ValueError`` is different: the service layer raises it for
     internal parameter-shape problems (e.g. an empty ``display_name`` or
@@ -198,6 +210,7 @@ async def _map_service_errors() -> AsyncIterator[None]:
         RateLimitExceededError,
         PayloadValidationError,
         UnknownConversationTypeError,
+        SchemaVersionMismatchError,
     ) as exc:
         raise ToolError(str(exc)) from None
     except (ValueError, RuntimeError):
@@ -251,18 +264,65 @@ async def whoami(agent_key: str | None = None) -> dict[str, Any]:
 
     When ``agent_key`` is provided, returns the composed identity
     (base_sub::agent_key) that will be used for agent lookups by other tools.
+
+    If this identity has already called ``comms_register``, the response
+    also includes ``min_schema_version``/``max_schema_version`` (TECH-5160)
+    reflecting this agent's currently-registered wire-schema capability
+    range. Omitted entirely if the caller hasn't registered yet, or if the
+    board database is unreachable — this tool doubles as an auth-only
+    diagnostic (verifying token/scope wiring) and must not start requiring
+    DB access to answer the identity/scopes questions it already answers.
     """
     token = _require_token()
     base_sub = _require_identity(token)
     agent_key = _validate_agent_key(agent_key)
     composed_sub = _compose_sub(base_sub, agent_key)
     interactive = is_interactive_token(token)
-    return {
+    result: dict[str, Any] = {
         "identity": composed_sub,
         "issuer": token.claims.get("iss"),
         "caller_type": "interactive" if interactive else "service",
         "scopes": scopes_for_token(token),
     }
+    # Diagnostic tool, DB-optional (see docstring) — genuine connectivity/
+    # configuration failures just omit the schema-version fields, same as
+    # the already-handled "not registered yet" case (agent is None, below).
+    # Deliberately narrow and split into two distinct try blocks (Argus
+    # round 2) rather than one broad catch spanning both the session-
+    # factory construction and the query: `RuntimeError` is ONLY expected
+    # from `get_session_factory()` itself (`db.require_env` raises it for
+    # a missing `DATABASE_URL`) -- a `RuntimeError` surfacing from inside
+    # the query/lookup instead would be a genuine, unrelated programming
+    # bug that this except clause must not also swallow. Logged at
+    # WARNING, not silently dropped, so a genuine outage is still visible
+    # in the tool's own logs even though the caller sees a clean response.
+    try:
+        session_factory = get_session_factory()
+    except RuntimeError as exc:
+        logger.warning(
+            "whoami: schema-version lookup unavailable (%s), omitting fields",
+            type(exc).__name__,
+            exc_info=True,
+        )
+        return result
+    try:
+        async with session_factory() as session:
+            agent = await service.get_agent_by_sub(session, composed_sub)
+        if agent is not None:
+            result["min_schema_version"] = agent.min_schema_version
+            result["max_schema_version"] = agent.max_schema_version
+    except (OperationalError, InterfaceError, OSError) as exc:
+        # A genuine programming/schema bug (a renamed get_agent_by_sub, a
+        # migration not yet applied) raises something OTHER than these
+        # connection-level types and is deliberately left to propagate,
+        # rather than being indistinguishable from an ordinary unregistered
+        # caller / DB outage (Argus round 1).
+        logger.warning(
+            "whoami: schema-version lookup failed (%s), omitting fields",
+            type(exc).__name__,
+            exc_info=True,
+        )
+    return result
 
 
 # --- Board admission ---------------------------------------------------------------
@@ -270,7 +330,11 @@ async def whoami(agent_key: str | None = None) -> dict[str, Any]:
 
 @comms_server.tool
 async def register(
-    display_name: str, accepted_types: list[str], agent_key: str | None = None
+    display_name: str,
+    accepted_types: list[str],
+    min_schema_version: int = 1,
+    max_schema_version: int = 1,
+    agent_key: str | None = None,
 ) -> dict[str, Any]:
     """Self-register or update this agent's board identity.
 
@@ -287,6 +351,19 @@ async def register(
       ``needs_clarification``, ``note``, ``task_assign``, ``task_report``,
       ``task_complete``, ``task_decline``, ``task_cancel``.
       Each entry capped at 100 chars; list capped at 20 entries.
+    - ``min_schema_version``/``max_schema_version`` (TECH-5160): the range
+      of wire-schema versions this agent's own code can correctly
+      interpret. Both default to ``1`` — the only version that exists
+      today, so most callers can omit these entirely. When
+      ``comms_start_conversation`` opens a new conversation, the board
+      negotiates the highest version every participant (initiator + all
+      named targets) mutually supports and refuses to open the
+      conversation at all if no such version exists — so declaring a
+      narrower range than your code actually handles gates you OUT of
+      conversations the board would otherwise negotiate you into, and
+      declaring a wider range than your code actually handles risks being
+      pinned to a version you can't correctly parse. Must satisfy
+      ``min_schema_version <= max_schema_version``.
     - ``agent_key``: stopgap for running multiple agents under
       one token. Appended to the token's verified sub
       (``"{base_sub}::{agent_key}"``) to produce a distinct board row.
@@ -337,6 +414,17 @@ async def register(
     agent_key = _validate_agent_key(agent_key)
     sub = _compose_sub(base_sub, agent_key)
 
+    # Shared with service.register_agent's own guard
+    # (service.validate_schema_version_range) so tightening the rule in one
+    # place tightens it in both layers (Argus round 1) — this tool-layer
+    # call exists only to surface a specific ToolError instead of the
+    # generic bare-ValueError mapping _map_service_errors would otherwise
+    # give it.
+    try:
+        service.validate_schema_version_range(min_schema_version, max_schema_version)
+    except ValueError as exc:
+        raise ToolError(f"invalid_request: {exc}") from None
+
     async with get_session_factory()() as session, _map_service_errors():
         agent = await service.register_agent(
             session,
@@ -345,6 +433,8 @@ async def register(
             owner_email=owner_email,
             display_name=display_name,
             accepted_types=accepted_types,
+            min_schema_version=min_schema_version,
+            max_schema_version=max_schema_version,
         )
 
     return {
@@ -354,6 +444,8 @@ async def register(
         "accepted_types": list(agent.accepted_types),
         "status": agent.status,
         "owner_email": agent.owner_email,
+        "min_schema_version": agent.min_schema_version,
+        "max_schema_version": agent.max_schema_version,
     }
 
 
@@ -426,7 +518,18 @@ async def start_conversation(
     - ``initial_message``: payload dict for the opening message. Must match
       the schema for ``message_type`` (see ``comms_post_message``).
     - ``expires_at``: timezone-aware ISO 8601 datetime; omit for 7-day TTL.
-    - ``schema_version``: only ``1`` exists today.
+    - ``schema_version``: ADVISORY ONLY (TECH-5160 capability negotiation).
+      The board computes the actual wire version to use as the highest
+      version every participant (you + every named target) mutually
+      supports, per each agent's ``comms_register``-time
+      ``min_schema_version``/``max_schema_version``, clamped to the
+      highest version this board itself implements — and uses THAT value
+      for the opening message regardless of what you pass here (returned
+      as ``schema_version`` in the response, so the negotiated pin is
+      discoverable). If no version is inside every participant's
+      supported range, the call is refused entirely (no
+      conversation/message is created). ``comms_invite`` re-checks any
+      later-added participant against this same pinned version.
     """
     token = _require_token()
     base_sub = _require_identity(token)
@@ -464,6 +567,11 @@ async def start_conversation(
         "target_agent_ids": [str(t) for t in target_uuids],
         "expires_at": _iso(conversation.expires_at),
         "created_at": _iso(conversation.created_at),
+        # TECH-5160: the actually-negotiated version (see
+        # service.start_conversation's transient
+        # `conversation.negotiated_schema_version` attribute), NOT
+        # necessarily the caller-supplied `schema_version` above.
+        "schema_version": conversation.negotiated_schema_version,  # type: ignore[attr-defined]
     }
 
 
