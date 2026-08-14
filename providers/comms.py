@@ -383,6 +383,12 @@ async def lookup_agent_by_email(owner_email: str) -> dict[str, Any]:
 
     Same internal-domain trust posture as ``comms_list_agents`` (DESIGN.md
     §10) -- pure directory read, no ``agent_key`` needed.
+
+    A match means an agent *claims* to be represented by ``owner_email``,
+    not that ownership of that email has been verified -- ``owner_email``
+    is a caller-supplied, unverified registration claim (see
+    ``service.lookup_agent_by_email``). Treat this as "who currently
+    claims this email", not "who is proven to own it".
     """
     _require_token()
     async with get_session_factory()() as session:

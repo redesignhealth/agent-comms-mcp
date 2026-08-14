@@ -573,6 +573,26 @@ class TestAxiShapes:
         )
         assert result == {"agent": None, "found": False}
 
+    async def test_lookup_agent_by_email_rejects_over_length_email(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        # One over service.MAX_LOOKUP_EMAIL_LENGTH -- never reaches the
+        # query, so no matching row is required for this to prove the
+        # guard fires rather than a legitimate not-found (mirrors
+        # test_service.py::TestLookupAgentByEmail.test_over_length_fails_closed
+        # at the tool layer).
+        from service import MAX_LOOKUP_EMAIL_LENGTH
+
+        over_length = "a" * (MAX_LOOKUP_EMAIL_LENGTH + 1)
+        result = await _call(
+            main,
+            test_session_factory,
+            _token("dir-agent-1"),
+            "comms_lookup_agent_by_email",
+            {"owner_email": over_length},
+        )
+        assert result == {"agent": None, "found": False}
+
     async def test_lookup_agent_by_email_excludes_suspended_agent(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
@@ -622,6 +642,47 @@ class TestAxiShapes:
         )
         assert result["found"] is True
         assert result["agent"]["sub"] == "ea-new"
+
+    async def test_lookup_agent_by_email_tie_break_falls_through_to_id(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        # The documented equal-bound_at case (see
+        # test_service.py::TestLookupAgentByEmail's equal-bound_at-and-created_at
+        # test): two agents sharing bound_at AND created_at (both forced equal here
+        # via direct SQL UPDATE, not merely left to same-transaction chance)
+        # must still resolve deterministically via the id tiebreaker, not
+        # arbitrarily.
+        await _register(main, test_session_factory, "ea-tie-a", owner_email="tie@example.com")
+        await _register(main, test_session_factory, "ea-tie-b", owner_email="tie@example.com")
+        async with test_session_factory() as session:
+            await session.execute(
+                text(
+                    "UPDATE agents SET bound_at = "
+                    "(SELECT bound_at FROM agents WHERE sub = 'ea-tie-a'), "
+                    "created_at = (SELECT created_at FROM agents WHERE sub = 'ea-tie-a') "
+                    "WHERE sub = 'ea-tie-b'"
+                )
+            )
+            await session.commit()
+            ids = {
+                row[0]: row[1]
+                for row in (
+                    await session.execute(
+                        text("SELECT sub, id FROM agents WHERE sub IN ('ea-tie-a', 'ea-tie-b')")
+                    )
+                ).all()
+            }
+        # Agent.id.asc() -- the smaller id sorts first and wins the tie.
+        expected_sub = "ea-tie-a" if ids["ea-tie-a"] < ids["ea-tie-b"] else "ea-tie-b"
+        result = await _call(
+            main,
+            test_session_factory,
+            _token("dir-agent-1"),
+            "comms_lookup_agent_by_email",
+            {"owner_email": "tie@example.com"},
+        )
+        assert result["found"] is True
+        assert result["agent"]["sub"] == expected_sub
 
     async def test_lookup_agent_by_email_denied_without_read_scope(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]

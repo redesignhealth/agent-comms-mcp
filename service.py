@@ -704,8 +704,12 @@ async def register_agent(
         # re-register to overwrite it would let a caller forge a victim's
         # owner_sub, re-register their own agent under it, and be admitted
         # into that victim's tasks. Freezing it at first registration closes
-        # that path; owner_email carries no admission-decision weight today
-        # so it is unaffected.
+        # that path; owner_email is NOT similarly frozen. Unlike owner_sub,
+        # owner_email now does carry admission-decision weight (as of
+        # TECH-5159's lookup_agent_by_email, which resolves callers by this
+        # field), but it remains a caller-supplied, unverified claim rather
+        # than a proven mailbox ownership fact -- see lookup_agent_by_email's
+        # docstring for the resulting trust-model gap this re-write permits.
         agent.owner_email = owner_email
         agent.display_name = display_name
         agent.accepted_types = normalized_types
@@ -806,6 +810,18 @@ async def lookup_agent_by_email(
     registered" (Argus round 4). Not fixed in this pass: normalizing at
     write time is a broader change to ``register_agent`` than this lookup
     feature's scope.
+
+    This is a claims lookup, not a verified-ownership lookup: ``owner_email``
+    is caller-supplied at registration (an agent-jwt caller can pass any
+    string, and ``register_agent`` overwrites it on every re-registration,
+    see that function's docstring) and is never checked against the actual
+    mailbox. A match here means "some agent currently *claims* to be
+    represented by this ``owner_email``", not "this ``owner_email`` *is*
+    EA-represented by this specific agent" -- i.e. this answers "who
+    currently claims this email", not "who is verified to own it". A
+    malicious caller can register under a victim's email and, because the
+    tiebreak below is ``bound_at`` DESC, a later spoofing re-registration
+    can outrank the legitimate agent in this lookup's result.
 
     ``owner_email`` is NOT a unique column: ``register_agent`` never
     demotes another agent's status when a new ``sub`` registers under the
