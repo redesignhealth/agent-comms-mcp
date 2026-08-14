@@ -33,6 +33,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    column,
     text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TIMESTAMP, UUID
@@ -87,7 +88,47 @@ class Agent(Base):
     """
 
     __tablename__ = "agents"
-    __table_args__ = (CheckConstraint(f"status IN {AGENT_STATUSES!r}", name="ck_agents_status"),)
+    __table_args__ = (
+        CheckConstraint(f"status IN {AGENT_STATUSES!r}", name="ck_agents_status"),
+        # Backs service.lookup_agent_by_email's
+        # func.lower(Agent.owner_email) == ... AND status == "active" ...
+        # ORDER BY bound_at DESC query (TECH-5159, migration bb1ea7d2a0cf).
+        # Declared here too, not just in the migration -- every other
+        # migration-created index in this file has a matching declaration;
+        # without one, a future `alembic revision --autogenerate` sees this
+        # index in the DB but not in metadata and silently emits a DROP
+        # INDEX for it. text() rather than func.lower(Agent.owner_email):
+        # __table_args__ is evaluated before this class's own attributes
+        # exist as a fully-formed class, so "Agent" isn't a valid name yet
+        # at this point in the class body.
+        #
+        # Column 1 stays text("lower(owner_email)") -- Postgres stores a
+        # computed expression like this as a raw expression in
+        # pg_index.indexprs, and Alembic's autogenerate comparator treats
+        # text() as that same kind of opaque expression, so the two compare
+        # equal. Column 2 must NOT also be text() (Argus round 3, verified
+        # via `alembic revision --autogenerate` against a live DB): Postgres
+        # stores `bound_at DESC NULLS LAST` as a plain column reference plus
+        # sort attributes in pg_index.indoption, which autogenerate
+        # introspects as a structured column+modifier, not raw expression
+        # text -- a text()-based declaration never compares equal to that,
+        # so autogenerate kept proposing to DROP this index, defeating the
+        # entire point of declaring it here. column(...).desc().nullslast()
+        # produces the structured form that actually round-trips.
+        #
+        # Both string literals below ("owner_email", "bound_at") are bare
+        # names with no referential tie to the `owner_email`/`bound_at`
+        # mapped_column attributes defined further down this class -- a
+        # future rename of either column won't propagate here, and
+        # autogenerate will silently start proposing DROP + CREATE again.
+        # Keep these in sync by hand if either column is ever renamed.
+        Index(
+            "idx_agents_lower_owner_email_active",
+            text("lower(owner_email)"),
+            column("bound_at").desc().nullslast(),
+            postgresql_where=text("status = 'active'"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
     sub: Mapped[str] = mapped_column(Text, unique=True, nullable=False)

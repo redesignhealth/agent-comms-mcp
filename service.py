@@ -753,6 +753,98 @@ async def list_agents(
     }
 
 
+MAX_LOOKUP_EMAIL_LENGTH = 254  # RFC 5321 4.5.3.1.3 total-address cap
+
+
+async def lookup_agent_by_email(
+    session: AsyncSession, *, owner_email: str
+) -> dict[str, Any] | None:
+    """Directory lookup: is ``owner_email`` bound to a board-active agent?
+
+    This realizes the "handshake registry" concept -- answering "does this
+    email belong to a registered EA" -- directly on the existing ``Agent``
+    table rather than a separate store: ``owner_email``/``sub`` already
+    carry exactly what a caller needs (which email, which board-wide
+    identity), so there is nothing left to duplicate. Formerly its own
+    module (``registry/directory.py``, TECH-4945) inside the negotiation
+    library; folded in here per TECH-5159 once each EA agent started
+    holding its own calendar and that library stopped needing a copy of
+    this lookup for itself -- the comms board is the one place every agent
+    can already reach, so this is where the lookup belongs. See
+    ``docs/DESIGN.md`` §10 for this endpoint's anti-enumeration posture.
+
+    Comparison is case-insensitive (``func.lower``) since OAuth-sourced
+    email claims are not guaranteed to arrive in one canonical case, but
+    does not attempt the fuller NFKC-normalization ``rh_maiea.canonical``
+    applies -- this service has no dependency on that library (by design,
+    per TECH-5158: the negotiation library and the comms board stay
+    decoupled) and plain case-folding covers the realistic input space for
+    values sourced from Okta/Google identity claims. Python's ``str.lower()``
+    (used on the input) and Postgres's ``lower()`` (used on the stored
+    value) can disagree on case-folding for some non-ASCII characters under
+    a non-UTF-8 database collation (Argus round 4) -- not addressed here,
+    since real input is Okta/Google email claims, which are ASCII.
+
+    Fail-closed by construction, matching the retired module's contract:
+    a non-string, empty/whitespace-only, or over-length (see
+    ``MAX_LOOKUP_EMAIL_LENGTH``) ``owner_email`` returns ``None`` rather
+    than raising or querying -- there is no legitimate email this could
+    ever match, and the dangerous failure mode here is a false positive
+    (treating an unregistered counterparty as EA-represented), not a
+    missed match. This validation intentionally lives here rather than at
+    the ``comms_lookup_agent_by_email`` tool boundary (Argus round 4): it
+    mirrors the retired module's own contract, which lived on the type
+    doing the lookup, not its caller.
+
+    This validation is one-sided: ``register_agent`` (the write path) does
+    not strip, lower-case, or length-cap ``owner_email`` before storing it
+    -- including the JWT ``sub``-fallback path (``providers/comms.py``),
+    which can write a non-email URI as ``owner_email`` for a token with no
+    ``email``/``owner_email`` claim. An agent whose stored ``owner_email``
+    has incidental leading/trailing whitespace, or came from that fallback
+    path, will not be found here -- indistinguishable from "not
+    registered" (Argus round 4). Not fixed in this pass: normalizing at
+    write time is a broader change to ``register_agent`` than this lookup
+    feature's scope.
+
+    ``owner_email`` is NOT a unique column: ``register_agent`` never
+    demotes another agent's status when a new ``sub`` registers under the
+    same ``owner_email`` (the ``agent_key`` mechanism -- see that
+    function's docstring -- deliberately allows one owner to run multiple
+    board-active agents under the same email). So multiple active rows
+    for one ``owner_email`` is an expected, not exceptional, state, and
+    this function deterministically returns whichever is most recently
+    (re)bound. Ties break, in order: ``bound_at`` DESC, then ``created_at``
+    DESC (two rows can share the same ``bound_at``/``created_at`` down to
+    the microsecond -- ``created_at`` in particular freezes to transaction
+    start time via ``server_default=text("now()")``, so two agents
+    registered in the same transaction get an identical value), then
+    ``id`` (the UUID primary key, the only column here actually guaranteed
+    unique) as the final, always-deterministic tiebreaker. This is NOT
+    "the" registered EA in any stronger sense. Do not read the
+    ``status == "active"`` filter as "a deregistered agent is
+    never returned": nothing in this codebase currently transitions an
+    agent to ``"suspended"`` (the only other value ``AGENT_STATUSES``
+    allows), so today that filter is inert, future-proofing for
+    deregistration rather than an enforced guarantee.
+    """
+    if not isinstance(owner_email, str):
+        return None
+    normalized = owner_email.strip().lower()
+    if not normalized or len(normalized) > MAX_LOOKUP_EMAIL_LENGTH:
+        return None
+    stmt = (
+        select(Agent)
+        .where(func.lower(Agent.owner_email) == normalized, Agent.status == "active")
+        .order_by(Agent.bound_at.desc().nullslast(), Agent.created_at.desc(), Agent.id.asc())
+        .limit(1)
+    )
+    agent = (await session.execute(stmt)).scalar_one_or_none()
+    if agent is None:
+        return None
+    return _agent_public(agent)
+
+
 async def list_conversations(
     session: AsyncSession,
     *,
@@ -2244,6 +2336,7 @@ def may_assign(creator_owners: AbstractSet[str], assignee_owners: AbstractSet[st
 __all__ = [
     "CONVERSATION_TTL",
     "MAX_CONVERSATION_STARTS_PER_HOUR",
+    "MAX_LOOKUP_EMAIL_LENGTH",
     "MAX_MESSAGES_PER_CONVERSATION_PER_HOUR",
     "AgentTableOwnershipClient",
     "OwnershipClient",
@@ -2256,6 +2349,7 @@ __all__ = [
     "leave",
     "list_agents",
     "list_conversations",
+    "lookup_agent_by_email",
     "may_assign",
     "may_invite",
     "post_message",
