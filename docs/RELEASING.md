@@ -44,17 +44,18 @@ Follow [SemVer](https://semver.org/):
 
 ## Hotfix
 
-`deploy.yml` requires a successful **push-triggered** CI run for the release SHA. There is no
-fallback to PR-triggered runs. The SHA must have been pushed to a branch where CI runs on push
-(i.e. merged to main) before you cut the release.
+`deploy.yml` requires a successful **push-triggered** CI run for the exact release SHA. Hotfixes
+must be merged to main before cutting a release — there is no fallback to PR-triggered runs.
 
 ```bash
 git checkout -b hotfix/vX.Y.Z vX.Y.(Z-1)
-# apply fix, then open a PR and merge it to main
+# apply fix
 git push origin hotfix/vX.Y.Z
-# merge the PR → CI runs on main for this SHA
+# open a PR targeting main and merge it
+# wait for CI to pass on main for this SHA, then:
 gh release create vX.Y.Z --title "vX.Y.Z" --notes "..."
 ```
 
-> **Important:** Create the release only after the hotfix is merged to main and CI passes on main.
+> **Important:** Create the release only after the hotfix SHA is on main and CI has passed.
+> The `gh release create` command above tags the current `main` HEAD by default.
 > If no successful push-triggered CI run is found for the release SHA, the deploy job will fail.

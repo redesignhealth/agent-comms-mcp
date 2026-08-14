@@ -15,6 +15,9 @@ concurrency:
   group: deploy
   cancel-in-progress: false
 
+# Default all jobs to no permissions; each job opts in to exactly what it needs.
+permissions: {}
+
 jobs:
   deploy-dev:
     name: Deploy (dev)
@@ -94,7 +97,8 @@ jobs:
 
       - name: Update app container image in dev task definition
         env:
-          IMAGE: 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform-dev/apps/reclaw-comms-mcp:sha-${{ github.sha }}
+          # Use digest reference to pin the exact image pushed — tags are mutable.
+          IMAGE: 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform-dev/apps/reclaw-comms-mcp@${{ steps.push-dev.outputs.digest }}
         run: |
           python3 - <<'EOF'
           import json, sys, os
