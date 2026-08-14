@@ -78,3 +78,9 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
         "'task_complete', 'task_decline', 'task_report']::text[], "
         "updated_at = now();" in result.stdout
     )
+    # bb1ea7d2a0cf: partial expression index backing lookup_agent_by_email
+    assert (
+        "CREATE INDEX IF NOT EXISTS idx_agents_lower_owner_email_active "
+        "ON agents (lower(owner_email), bound_at DESC NULLS LAST) "
+        "WHERE status = 'active'" in result.stdout
+    )

@@ -61,6 +61,7 @@ from service import (
     leave,
     list_agents,
     list_conversations,
+    lookup_agent_by_email,
     register_agent,
 )
 
@@ -2175,7 +2176,7 @@ class TestMessageTypeAcceptedCapability:
 
 
 class TestTaskLifecycleMessages:
-    """"tasks-as-conversations": task_assign opens a conversation (assigner
+    """ "tasks-as-conversations": task_assign opens a conversation (assigner
     = owner participant, assignee = member participant); task_report is
     non-terminal; task_complete/task_decline/task_cancel are terminal and
     sender-role-restricted."""
@@ -2604,6 +2605,74 @@ class TestListAgents:
         page = await list_agents(session, limit=1)
         assert len(page["agents"]) == 1
         assert page["total_count"] == 3
+
+
+class TestLookupAgentByEmail:
+    async def test_found(self, session: AsyncSession) -> None:
+        await _register(session, "lae-agent", owner_email="Dan@Example.com")
+        result = await lookup_agent_by_email(session, owner_email="  dan@example.com\t")
+        assert result is not None
+        assert result["sub"] == "lae-agent"
+        assert result["owner_email"] == "Dan@Example.com"
+
+    async def test_not_found(self, session: AsyncSession) -> None:
+        assert await lookup_agent_by_email(session, owner_email="nobody@example.com") is None
+
+    async def test_empty_and_non_string_fail_closed(self, session: AsyncSession) -> None:
+        assert await lookup_agent_by_email(session, owner_email="   ") is None
+        assert await lookup_agent_by_email(session, owner_email=None) is None  # type: ignore[arg-type]
+
+    async def test_over_length_fails_closed(self, session: AsyncSession) -> None:
+        # One over MAX_LOOKUP_EMAIL_LENGTH -- never reaches the query, so no
+        # matching row is required for this to prove the guard fires rather
+        # than a legitimate not-found.
+        from service import MAX_LOOKUP_EMAIL_LENGTH
+
+        over_length = "a" * (MAX_LOOKUP_EMAIL_LENGTH + 1)
+        assert await lookup_agent_by_email(session, owner_email=over_length) is None
+
+    async def test_status_filter_excludes_non_active_agent(self, session: AsyncSession) -> None:
+        agent = await _register(session, "lae-suspended", owner_email="suspend@example.com")
+        agent.status = "suspended"
+        await session.flush()
+        await session.commit()
+        assert await lookup_agent_by_email(session, owner_email="suspend@example.com") is None
+
+    async def test_tie_break_prefers_most_recently_bound(self, session: AsyncSession) -> None:
+        # Same owner_email, two distinct subs -- an anticipated state (see
+        # lookup_agent_by_email's docstring): the agent_key mechanism lets
+        # one owner run multiple board-active agents under one email.
+        # bound_at is set explicitly (not relied on via real-time gaps
+        # between the two _register calls, which could tie down to the
+        # microsecond -- Argus round 2) so the ordering this test asserts
+        # is deterministic regardless of wall-clock timing.
+        old = await _register(session, "lae-old", owner_email="multi@example.com")
+        new = await _register(session, "lae-new", owner_email="multi@example.com")
+        old.bound_at = new.bound_at - timedelta(hours=1)
+        await session.flush()
+        await session.commit()
+        result = await lookup_agent_by_email(session, owner_email="multi@example.com")
+        assert result is not None
+        assert result["sub"] == "lae-new"
+
+    async def test_tie_break_falls_through_to_id_on_equal_bound_at_and_created_at(
+        self, session: AsyncSession
+    ) -> None:
+        # The documented equal-bound_at case (Argus round 3): two agents
+        # sharing bound_at AND created_at (both explicitly forced equal
+        # here, not merely left to same-transaction chance) must still
+        # resolve deterministically via the id tiebreaker, not arbitrarily.
+        first = await _register(session, "lae-tie-a", owner_email="tie@example.com")
+        second = await _register(session, "lae-tie-b", owner_email="tie@example.com")
+        second.bound_at = first.bound_at
+        second.created_at = first.created_at
+        await session.flush()
+        await session.commit()
+        # Agent.id.asc() -- the smaller id sorts first and wins the tie.
+        expected_sub = first.sub if first.id < second.id else second.sub
+        result = await lookup_agent_by_email(session, owner_email="tie@example.com")
+        assert result is not None
+        assert result["sub"] == expected_sub
 
 
 # --- inbox -------------------------------------------------------------------------

@@ -51,9 +51,7 @@ class TestTryResolveEmail:
         # Same fail-closed guard as the missing-iss case above, but with an
         # explicit `iss: None` claim rather than an absent key -- must not
         # fall through to trusting the forged `email` claim.
-        token = _fake_token(
-            {"iss": None, "sub": "svc-account-1", "email": "forged@example.com"}
-        )
+        token = _fake_token({"iss": None, "sub": "svc-account-1", "email": "forged@example.com"})
         assert try_resolve_email(token) == "svc-account-1"
 
     def test_interactive_token_trusts_email_claim(self) -> None:

@@ -270,6 +270,9 @@ class TestSchema:
         assert not cols, "tasks table should be dropped"
 
     async def test_designed_indexes_exist(self, engine: AsyncEngine) -> None:
+        agent_indexes = await _indexes(engine, "agents")
+        assert "idx_agents_lower_owner_email_active" in agent_indexes
+
         participant_indexes = await _indexes(engine, "participants")
         assert "idx_participants_agent_id_status" in participant_indexes
 

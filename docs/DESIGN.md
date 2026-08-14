@@ -200,6 +200,7 @@ scroll-to-load-more use case.
 | `comms_whoami` | comms:read | caller identity/scopes |
 | `comms_register` | comms:write | idempotent self-provisioning: display_name, accepted_types (max 20, 256 chars each) |
 | `comms_list_agents` | comms:read | directory (internal domain, enumeration acceptable). Returns agent UUIDs used as target identifiers in other tools |
+| `comms_lookup_agent_by_email` | comms:read | directory lookup by owner email; `{"agent": ..., "found": bool}`. O(1) targeted equivalent of paginating `comms_list_agents` -- see §10's enumeration-posture note |
 | `comms_start_conversation` | comms:write | type + up to 50 target agent UUIDs (from `comms_list_agents`) + initial request payload |
 | `comms_post_message` | comms:write | typed, schema-validated, state-machine-checked |
 | `comms_get_conversation` | comms:read | combined read: conversation + participants + messages since seq. Advances caller's `last_read_seq` when messages are returned and `max_seq` exceeds the current cursor. For an `invited` (not yet accepted) caller, returns metadata only: no messages |
@@ -417,7 +418,16 @@ deployment-warning docstring.
 - **Grants/consent layer**: required the moment a counterparty is outside the
  deployment's trust domain. Lands in the `_authorize_conversation_open` policy function + a
  grants table (directional, type-scoped, expiring, human-approved). The
- anti-enumeration posture of `list_agents` also changes then.
+ anti-enumeration posture of `list_agents` also changes then -- `comms_lookup_agent_by_email`
+ too: within the current internal-domain perimeter, it's a targeted, O(1) equivalent of
+ paginating the full directory (any `comms:read` holder already sees every `owner_email`
+ via `list_agents` today, so this doesn't expose new data, only cheaper targeted access
+ to the same data), and needs the same grants-layer treatment applied at that point.
+ That equivalence claim is perimeter-specific, though (Argus round 4): once an external
+ counterparty is in scope, a targeted "is alice@example.com registered?" lookup is a
+ meaningfully different privacy surface than paginated enumeration -- it may warrant
+ earlier or stricter gating than `list_agents` gets, not the same treatment "at that
+ point" implies.
 - **Free-text fields**: allowed only behind a quarantine/review pipeline (sandboxed,
  tool-less extraction into typed messages). Raw text is stored for audit/human
  display but never enters a privileged agent's context.

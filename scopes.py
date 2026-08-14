@@ -38,6 +38,7 @@ TOOL_SCOPES: dict[str, str] = {
     "comms_whoami": "comms:read",
     # Reads
     "comms_list_agents": "comms:read",
+    "comms_lookup_agent_by_email": "comms:read",
     "comms_list_conversations": "comms:read",
     "comms_get_conversation": "comms:read",
     "comms_inbox": "comms:read",

@@ -213,8 +213,9 @@ async def _register(
     display_name: str | None = None,
     accepted_types: list[str] | None = None,
     owner_sub: str | None = None,
+    owner_email: str | None = None,
 ) -> dict[str, Any]:
-    token = _token(sub, owner_sub=owner_sub)
+    token = _token(sub, owner_sub=owner_sub, owner_email=owner_email)
     result: dict[str, Any] = await _call(
         main,
         test_session_factory,
@@ -273,9 +274,7 @@ class TestRegister:
     async def test_register_persists_and_is_visible_via_whoami(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
-        token = _token(
-            "agent-a", owner_sub="owner-a-human", owner_email="ownera@example.com"
-        )
+        token = _token("agent-a", owner_sub="owner-a-human", owner_email="ownera@example.com")
         result = await _call(
             main,
             test_session_factory,
@@ -534,6 +533,169 @@ class TestAxiShapes:
         assert result["total_count"] == 2
         assert result["has_more"] is False
         assert {a["sub"] for a in result["agents"]} == {"dir-agent-1", "dir-agent-2"}
+
+    async def test_lookup_agent_by_email_finds_registered_agent(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        await _register(main, test_session_factory, "ea-dan", owner_email="Dan@Example.com")
+        result = await _call(
+            main,
+            test_session_factory,
+            _token("dir-agent-1"),
+            "comms_lookup_agent_by_email",
+            {"owner_email": "  dan@example.com\t"},
+        )
+        assert result["found"] is True
+        assert result["agent"]["sub"] == "ea-dan"
+        assert result["agent"]["owner_email"] == "Dan@Example.com"
+
+    async def test_lookup_agent_by_email_unknown_email_returns_none(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        result = await _call(
+            main,
+            test_session_factory,
+            _token("dir-agent-1"),
+            "comms_lookup_agent_by_email",
+            {"owner_email": "nobody@example.com"},
+        )
+        assert result == {"agent": None, "found": False}
+
+    async def test_lookup_agent_by_email_rejects_empty_email(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        result = await _call(
+            main,
+            test_session_factory,
+            _token("dir-agent-1"),
+            "comms_lookup_agent_by_email",
+            {"owner_email": "   "},
+        )
+        assert result == {"agent": None, "found": False}
+
+    async def test_lookup_agent_by_email_rejects_over_length_email(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        # One over service.MAX_LOOKUP_EMAIL_LENGTH -- never reaches the
+        # query, so no matching row is required for this to prove the
+        # guard fires rather than a legitimate not-found (mirrors
+        # test_service.py::TestLookupAgentByEmail.test_over_length_fails_closed
+        # at the tool layer).
+        from service import MAX_LOOKUP_EMAIL_LENGTH
+
+        over_length = "a" * (MAX_LOOKUP_EMAIL_LENGTH + 1)
+        result = await _call(
+            main,
+            test_session_factory,
+            _token("dir-agent-1"),
+            "comms_lookup_agent_by_email",
+            {"owner_email": over_length},
+        )
+        assert result == {"agent": None, "found": False}
+
+    async def test_lookup_agent_by_email_excludes_suspended_agent(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        await _register(
+            main, test_session_factory, "ea-suspended", owner_email="suspend@example.com"
+        )
+        async with test_session_factory() as session:
+            await session.execute(
+                text("UPDATE agents SET status = 'suspended' WHERE sub = 'ea-suspended'")
+            )
+            await session.commit()
+        result = await _call(
+            main,
+            test_session_factory,
+            _token("dir-agent-1"),
+            "comms_lookup_agent_by_email",
+            {"owner_email": "suspend@example.com"},
+        )
+        assert result == {"agent": None, "found": False}
+
+    async def test_lookup_agent_by_email_tie_break_prefers_most_recently_bound(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        # Same owner_email, two distinct subs -- an anticipated state (the
+        # agent_key mechanism lets one owner run multiple board-active
+        # agents under one email), not an error case. bound_at is forced
+        # apart explicitly rather than relied on via real-time gaps between
+        # the two registrations, which could otherwise tie down to the
+        # microsecond (Argus round 2).
+        await _register(main, test_session_factory, "ea-old", owner_email="multi@example.com")
+        await _register(main, test_session_factory, "ea-new", owner_email="multi@example.com")
+        async with test_session_factory() as session:
+            await session.execute(
+                text(
+                    "UPDATE agents SET bound_at = "
+                    "(SELECT bound_at FROM agents WHERE sub = 'ea-new') - interval '1 hour' "
+                    "WHERE sub = 'ea-old'"
+                )
+            )
+            await session.commit()
+        result = await _call(
+            main,
+            test_session_factory,
+            _token("dir-agent-1"),
+            "comms_lookup_agent_by_email",
+            {"owner_email": "multi@example.com"},
+        )
+        assert result["found"] is True
+        assert result["agent"]["sub"] == "ea-new"
+
+    async def test_lookup_agent_by_email_tie_break_falls_through_to_id(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        # The documented equal-bound_at case (see
+        # test_service.py::TestLookupAgentByEmail's equal-bound_at-and-created_at
+        # test): two agents sharing bound_at AND created_at (both forced equal here
+        # via direct SQL UPDATE, not merely left to same-transaction chance)
+        # must still resolve deterministically via the id tiebreaker, not
+        # arbitrarily.
+        await _register(main, test_session_factory, "ea-tie-a", owner_email="tie@example.com")
+        await _register(main, test_session_factory, "ea-tie-b", owner_email="tie@example.com")
+        async with test_session_factory() as session:
+            await session.execute(
+                text(
+                    "UPDATE agents SET bound_at = "
+                    "(SELECT bound_at FROM agents WHERE sub = 'ea-tie-a'), "
+                    "created_at = (SELECT created_at FROM agents WHERE sub = 'ea-tie-a') "
+                    "WHERE sub = 'ea-tie-b'"
+                )
+            )
+            await session.commit()
+            ids = {
+                row[0]: row[1]
+                for row in (
+                    await session.execute(
+                        text("SELECT sub, id FROM agents WHERE sub IN ('ea-tie-a', 'ea-tie-b')")
+                    )
+                ).all()
+            }
+        # Agent.id.asc() -- the smaller id sorts first and wins the tie.
+        expected_sub = "ea-tie-a" if ids["ea-tie-a"] < ids["ea-tie-b"] else "ea-tie-b"
+        result = await _call(
+            main,
+            test_session_factory,
+            _token("dir-agent-1"),
+            "comms_lookup_agent_by_email",
+            {"owner_email": "tie@example.com"},
+        )
+        assert result["found"] is True
+        assert result["agent"]["sub"] == expected_sub
+
+    async def test_lookup_agent_by_email_denied_without_read_scope(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        token = _token("scope-test-lookup", scopes=["comms:write"])
+        with pytest.raises(ToolError, match="requires elevated permissions"):
+            await _call(
+                main,
+                test_session_factory,
+                token,
+                "comms_lookup_agent_by_email",
+                {"owner_email": "nobody@example.com"},
+            )
 
 
 # --- Unregistered-caller path --------------------------------------------------------
@@ -1239,6 +1401,7 @@ class TestScopesUnaffected:
         expected = {
             "comms_register",
             "comms_list_agents",
+            "comms_lookup_agent_by_email",
             "comms_list_conversations",
             "comms_start_conversation",
             "comms_post_message",
