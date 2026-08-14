@@ -30,6 +30,11 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Verify CI passed for this SHA
+        # Checks for a successful push-triggered CI run on the exact commit being
+        # deployed. Push events cover commits on main; for hotfix branches CI runs
+        # via pull_request events, so we fall back to any successful run if no
+        # push-triggered one exists. This is defense-in-depth — the primary
+        # protection is branch protection requiring CI to pass before merging.
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -38,9 +43,20 @@ jobs:
             --commit "${{ github.sha }}" \
             --workflow CI \
             --status success \
+            --event push \
             --limit 1 \
             --json databaseId \
             --jq 'length')
+          if [ "$count" -eq 0 ]; then
+            count=$(gh run list \
+              --repo "${{ github.repository }}" \
+              --commit "${{ github.sha }}" \
+              --workflow CI \
+              --status success \
+              --limit 1 \
+              --json databaseId \
+              --jq 'length')
+          fi
           if [ "$count" -eq 0 ]; then
             echo "ERROR: No successful CI run found for ${{ github.sha }} — refusing to deploy." >&2
             exit 1
@@ -66,6 +82,10 @@ jobs:
             --repository-name rh-platform-dev/apps/reclaw-comms-mcp \
             --image-ids imageTag=sha-${{ github.sha }} \
             --query 'imageDetails[0].imageDigest' --output text)
+          if [ -z "$DIGEST" ] || [ "$DIGEST" = "None" ]; then
+            echo "ERROR: could not retrieve image digest from ECR — push may have failed" >&2
+            exit 1
+          fi
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
 
       - name: Download current dev task definition
