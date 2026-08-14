@@ -1,14 +1,16 @@
-# Build, push to ECR (dev then prod), and deploy to ECS on every release.
-# Triggered by the same release event as publish.yml; runs independently (no ordering dependency).
-# IAM trust: deploy-dev uses ref:refs/tags/* (no environment:); deploy-prod uses environment:production.
+# Build, push to dev ECR, and deploy to dev ECS on every release.
+# After dev is stable, deploy-prod promotes the dev-validated image to prod ECR and deploys.
+# IAM trust: deploy-dev uses ref:refs/tags/*; deploy-prod uses environment:production.
+# The prod ECR push role trusts only environment:production — it cannot be assumed
+# from unprotected jobs, ensuring prod image promotion is always gated.
 name: Deploy to ECS
 
 on:
   release:
     types: [published]
 
-# Serialize entire workflow runs: a second release waits for the first to finish
-# rather than interleaving dev/prod steps from different releases.
+# Serialize entire workflow runs so dev and prod steps from different releases
+# never interleave.
 concurrency:
   group: deploy
   cancel-in-progress: false
@@ -17,11 +19,12 @@ jobs:
   deploy-dev:
     name: Deploy (dev)
     runs-on: ubuntu-latest
-    # No environment: here — keeps the OIDC sub as ref:refs/tags/* so the
-    # dev ECR role trust policy (which trusts ref:refs/tags/*) can be assumed.
+    # No environment: — OIDC sub is ref:refs/tags/* which the dev role trusts.
     permissions:
       id-token: write
       contents: read
+    outputs:
+      image-digest: ${{ steps.push-dev.outputs.digest }}
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -100,28 +103,13 @@ jobs:
           cluster: rh-platform-dev-cluster
           wait-for-service-stability: true
 
-      - name: Configure AWS credentials (prod — promote image after dev verified)
-        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
-        with:
-          role-to-assume: arn:aws:iam::082533342824:role/rh-platform-github-actions-ecr-push-role
-          aws-region: us-east-1
-
-      - name: Login to ECR (prod)
-        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
-
-      - name: Promote dev image to prod ECR (image already in local cache — no re-pull)
-        env:
-          DEV_IMAGE: 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform-dev/apps/reclaw-comms-mcp:sha-${{ github.sha }}
-          PROD_IMAGE: 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform/apps/reclaw-comms-mcp:sha-${{ github.sha }}
-        run: |
-          docker tag "$DEV_IMAGE" "$PROD_IMAGE"
-          docker push "$PROD_IMAGE"
-
   deploy-prod:
     name: Deploy (prod)
     runs-on: ubuntu-latest
     needs: deploy-dev
     environment: production
+    # OIDC sub is environment:production — prod ECR role trusts only this sub,
+    # ensuring prod image promotion cannot be triggered by unprotected jobs.
     permissions:
       id-token: write
       contents: read
@@ -131,6 +119,18 @@ jobs:
         with:
           role-to-assume: arn:aws:iam::082533342824:role/rh-platform-github-actions-ecr-push-role
           aws-region: us-east-1
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
+
+      - name: Promote dev image to prod ECR (by digest)
+        env:
+          DEV_IMAGE: 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform-dev/apps/reclaw-comms-mcp@${{ needs.deploy-dev.outputs.image-digest }}
+          PROD_IMAGE: 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform/apps/reclaw-comms-mcp:sha-${{ github.sha }}
+        run: |
+          docker pull "$DEV_IMAGE"
+          docker tag "$DEV_IMAGE" "$PROD_IMAGE"
+          docker push "$PROD_IMAGE"
 
       - name: Download current prod task definition
         run: |
