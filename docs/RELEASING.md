@@ -54,6 +54,5 @@ gh release create vX.Y.Z --target hotfix/vX.Y.Z --title "vX.Y.Z" --notes "..."
 ```
 
 > **Important:** `deploy.yml` verifies a successful CI run exists for the release SHA before deploying.
-> Push the hotfix branch and open a PR against main (or trigger CI manually via `gh workflow run CI`)
-> so CI runs against the hotfix SHA before you create the release. If no successful CI run is found,
-> the deploy job will fail immediately.
+> Open a PR from your hotfix branch against main so CI runs against the hotfix SHA before you create
+> the release. If no successful CI run is found, the deploy job will fail immediately.

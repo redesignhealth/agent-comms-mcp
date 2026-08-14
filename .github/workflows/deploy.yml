@@ -1,10 +1,6 @@
 # Build, push to ECR (dev then prod), and deploy to ECS on every release.
 # Triggered by the same release event as publish.yml; runs independently (no ordering dependency).
-# IAM roles trust redesignhealth/agent-comms-mcp release tags via OIDC.
-#
-# Flow: deploy-dev builds the image, verifies CI passed, deploys to dev ECS,
-# then promotes (by digest) to prod ECR. deploy-prod only runs ECS deploy —
-# no image build or dev-role assumption needed there.
+# IAM trust: deploy-dev uses ref:refs/tags/* (no environment:); deploy-prod uses environment:production.
 name: Deploy to ECS
 
 on:
@@ -21,12 +17,11 @@ jobs:
   deploy-dev:
     name: Deploy (dev)
     runs-on: ubuntu-latest
-    environment: development
+    # No environment: here — keeps the OIDC sub as ref:refs/tags/* so the
+    # dev ECR role trust policy (which trusts ref:refs/tags/*) can be assumed.
     permissions:
       id-token: write
       contents: read
-    outputs:
-      prod-image: ${{ steps.promote.outputs.prod-image }}
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -69,7 +64,6 @@ jobs:
             --image-ids imageTag=sha-${{ github.sha }} \
             --query 'imageDetails[0].imageDigest' --output text)
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
-          echo "dev-image=$DEV_IMAGE" >> "$GITHUB_OUTPUT"
 
       - name: Download current dev task definition
         run: |
@@ -106,7 +100,7 @@ jobs:
           cluster: rh-platform-dev-cluster
           wait-for-service-stability: true
 
-      - name: Configure AWS credentials (prod — promote image after dev deploy verified)
+      - name: Configure AWS credentials (prod — promote image after dev verified)
         uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
         with:
           role-to-assume: arn:aws:iam::082533342824:role/rh-platform-github-actions-ecr-push-role
@@ -115,16 +109,13 @@ jobs:
       - name: Login to ECR (prod)
         uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
 
-      - name: Promote dev image to prod ECR (by digest)
-        id: promote
+      - name: Promote dev image to prod ECR (image already in local cache — no re-pull)
         env:
-          DEV_IMAGE: 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform-dev/apps/reclaw-comms-mcp@${{ steps.push-dev.outputs.digest }}
+          DEV_IMAGE: 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform-dev/apps/reclaw-comms-mcp:sha-${{ github.sha }}
           PROD_IMAGE: 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform/apps/reclaw-comms-mcp:sha-${{ github.sha }}
         run: |
-          docker pull "$DEV_IMAGE"
           docker tag "$DEV_IMAGE" "$PROD_IMAGE"
           docker push "$PROD_IMAGE"
-          echo "prod-image=$PROD_IMAGE" >> "$GITHUB_OUTPUT"
 
   deploy-prod:
     name: Deploy (prod)
@@ -135,9 +126,6 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-
       - name: Configure AWS credentials (prod)
         uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
         with:
