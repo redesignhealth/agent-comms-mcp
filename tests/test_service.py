@@ -636,9 +636,7 @@ class TestSchemaVersionNegotiation:
     still hold if a future agent registered e.g. ``[1, 2]``.
     """
 
-    async def test_overlapping_ranges_negotiate_to_common_max(
-        self, session: AsyncSession
-    ) -> None:
+    async def test_overlapping_ranges_negotiate_to_common_max(self, session: AsyncSession) -> None:
         owner = await _register(
             session, "owner-schema-ok", min_schema_version=1, max_schema_version=1
         )
@@ -660,17 +658,14 @@ class TestSchemaVersionNegotiation:
         message = (
             await session.execute(
                 text(
-                    "SELECT schema_version FROM messages "
-                    "WHERE conversation_id = :cid AND seq = 1"
+                    "SELECT schema_version FROM messages WHERE conversation_id = :cid AND seq = 1"
                 ),
                 {"cid": conversation.id},
             )
         ).scalar_one()
         assert message == expected_negotiated
 
-    async def test_non_overlapping_ranges_refused_and_atomic(
-        self, session: AsyncSession
-    ) -> None:
+    async def test_non_overlapping_ranges_refused_and_atomic(self, session: AsyncSession) -> None:
         """No version is inside both participants' ranges -- the board
         refuses to open the conversation at all, and (transactionally) no
         conversation/participant/message row is left behind."""
@@ -697,9 +692,7 @@ class TestSchemaVersionNegotiation:
             .all()
         )
         assert conversation_rows == []
-        message_rows = (
-            (await session.execute(text("SELECT * FROM messages"))).mappings().all()
-        )
+        message_rows = (await session.execute(text("SELECT * FROM messages"))).mappings().all()
         assert message_rows == []
         # Argus round 2: the prior version of this test asserted atomicity
         # for Conversation/Message only, despite the docstring's broader
@@ -714,9 +707,7 @@ class TestSchemaVersionNegotiation:
         participant_rows = (
             (
                 await session.execute(
-                    select(Participant).where(
-                        Participant.agent_id.in_([owner.id, target.id])
-                    )
+                    select(Participant).where(Participant.agent_id.in_([owner.id, target.id]))
                 )
             )
             .scalars()
@@ -775,8 +766,7 @@ class TestSchemaVersionNegotiation:
         message_schema_version = (
             await session.execute(
                 text(
-                    "SELECT schema_version FROM messages "
-                    "WHERE conversation_id = :cid AND seq = 1"
+                    "SELECT schema_version FROM messages WHERE conversation_id = :cid AND seq = 1"
                 ),
                 {"cid": conversation.id},
             )
@@ -2918,11 +2908,7 @@ class TestRateLimits:
                 payload=_counter_proposal_payload(),
             )
         actions = (
-            (
-                await session.execute(
-                    select(AuditLog.action).where(AuditLog.agent_id == flooder.id)
-                )
-            )
+            (await session.execute(select(AuditLog.action).where(AuditLog.agent_id == flooder.id)))
             .scalars()
             .all()
         )

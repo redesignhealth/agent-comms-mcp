@@ -210,8 +210,7 @@ class TestSchema:
             row = (
                 await conn.execute(
                     text(
-                        "SELECT min_schema_version, max_schema_version FROM agents "
-                        "WHERE sub = :sub"
+                        "SELECT min_schema_version, max_schema_version FROM agents WHERE sub = :sub"
                     ),
                     {"sub": "test-schema-version-backfill-row"},
                 )
