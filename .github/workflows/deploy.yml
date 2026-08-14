@@ -52,6 +52,7 @@ jobs:
             --workflow ci.yml \
             --status success \
             --event push \
+            --branch main \
             --limit 1 \
             --json databaseId \
             --jq 'length')
@@ -115,7 +116,7 @@ jobs:
               if c['name'] == 'app':
                   c['image'] = IMAGE
           for field in ['taskDefinitionArn','revision','status','requiresAttributes',
-                        'compatibilities','registeredAt','registeredBy']:
+                        'compatibilities','registeredAt','registeredBy','enableFaultInjection']:
               td.pop(field, None)
           with open('/tmp/task-def-dev.json', 'w') as f:
               json.dump(td, f)
@@ -148,28 +149,37 @@ jobs:
       - name: Login to ECR
         uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
 
-      - name: Verify prod role has BatchGetImage access to dev ECR image
-        # Tests ecr:BatchGetImage on rh-platform-dev/apps/reclaw-comms-mcp for the prod role.
-        # Note: docker pull also requires ecr:GetDownloadUrlForLayer; this step is an
-        # early-exit smoke test, not a complete pull simulation. A failure here means
-        # ReadDevECRForPromotion is not configured; success means the manifest is readable.
-        # batch-get-image exits 0 even on ImageNotFoundException (misses go to failures[]),
-        # so we check both the exit code and the output content.
+      - name: Verify prod role can pull dev ECR image
+        # Tests both ecr:BatchGetImage and ecr:GetDownloadUrlForLayer — the two permissions
+        # that docker pull uses. batch-get-image exits 0 even on ImageNotFoundException
+        # (misses go to failures[]), so we check both exit code and output.
         env:
           DIGEST: ${{ needs.deploy-dev.outputs.image-digest }}
         run: |
-          if ! FOUND=$(aws ecr batch-get-image \
+          # 1. Test ecr:BatchGetImage (manifest read)
+          if ! MANIFEST=$(aws ecr batch-get-image \
             --repository-name rh-platform-dev/apps/reclaw-comms-mcp \
             --image-ids imageDigest="$DIGEST" \
-            --query 'images[0].imageId.imageDigest' --output text); then
-            echo "ERROR: prod role cannot access dev ECR image ($DIGEST). Check ReadDevECRForPromotion IAM permission." >&2
+            --query 'images[0].imageManifest' --output text); then
+            echo "ERROR: prod role BatchGetImage failed for dev ECR image ($DIGEST). Check ReadDevECRForPromotion IAM permission." >&2
             exit 1
           fi
-          if [ -z "$FOUND" ] || [ "$FOUND" = "None" ]; then
+          if [ -z "$MANIFEST" ] || [ "$MANIFEST" = "None" ]; then
             echo "ERROR: prod role cannot find dev ECR image ($DIGEST) — image not found." >&2
             exit 1
           fi
-          echo "Dev ECR BatchGetImage access confirmed: $FOUND"
+          # 2. Test ecr:GetDownloadUrlForLayer (layer URL fetch) using the first layer digest
+          LAYER_DIGEST=$(echo "$MANIFEST" | python3 -c \
+            "import json,sys; m=json.load(sys.stdin); print(m.get('layers', m.get('fsLayers', [{}]))[0].get('digest', m.get('fsLayers', [{}])[0].get('blobSum', '')))" 2>/dev/null)
+          if [ -n "$LAYER_DIGEST" ] && [ "$LAYER_DIGEST" != "None" ]; then
+            if ! aws ecr get-download-url-for-layer \
+              --repository-name rh-platform-dev/apps/reclaw-comms-mcp \
+              --layer-digest "$LAYER_DIGEST" > /dev/null; then
+              echo "ERROR: prod role GetDownloadUrlForLayer failed for dev ECR image. Check ReadDevECRForPromotion IAM permission." >&2
+              exit 1
+            fi
+          fi
+          echo "Dev ECR pull access confirmed (BatchGetImage + GetDownloadUrlForLayer)."
 
       - name: Promote dev image to prod ECR (by digest)
         id: push-prod
@@ -216,7 +226,7 @@ jobs:
               if c['name'] == 'app':
                   c['image'] = IMAGE
           for field in ['taskDefinitionArn','revision','status','requiresAttributes',
-                        'compatibilities','registeredAt','registeredBy']:
+                        'compatibilities','registeredAt','registeredBy','enableFaultInjection']:
               td.pop(field, None)
           with open('/tmp/task-def-prod.json', 'w') as f:
               json.dump(td, f)
