@@ -179,7 +179,11 @@ class TestWhoami:
         assert result["scopes"] == ["comms:read"]
         assert "min_schema_version" not in result
         assert "max_schema_version" not in result
-        assert any("schema-version lookup" in r.message for r in caplog.records)
+        # "unavailable", not just "schema-version lookup" (Argus round 4):
+        # the broader substring also matches block 2's "... lookup failed
+        # ..." message below, so it wouldn't actually prove this test hit
+        # block 1 specifically, despite the docstring's claim that it does.
+        assert any("schema-version lookup unavailable" in r.message for r in caplog.records)
 
     def test_db_query_failure_still_returns_identity_fields(
         self, caplog: pytest.LogCaptureFixture

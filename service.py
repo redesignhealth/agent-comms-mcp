@@ -1753,6 +1753,23 @@ async def invite(
         # CHECK constraint already enforces every registered
         # max_schema_version >= 1), so this isn't fixed here — revisit
         # once a second schema version makes that direction reachable.
+        # Mechanically enforced (Argus round 4), not just documented, and a
+        # plain `if`/`raise` rather than a bare `assert` -- this module
+        # already avoids `assert` for invariant checks elsewhere (see the
+        # "stripped under python -O" comment on the migration-context
+        # bind check) since an assert would silently vanish under -O,
+        # making this check itself as fragile as the thing it guards
+        # against. This fails loudly the moment
+        # MAX_REGISTERED_SCHEMA_VERSION moves past 1, forcing whoever adds
+        # that second schema version to revisit this comment's now-invalid
+        # unreachability argument rather than silently shipping mislabeled
+        # audit rows for the "target is too OLD for the pin" direction.
+        if MAX_REGISTERED_SCHEMA_VERSION != 1:
+            raise RuntimeError(
+                "invite's schema-mismatch audit semantics assume "
+                "MAX_REGISTERED_SCHEMA_VERSION == 1 (see the comment above) -- revisit "
+                "before shipping a second schema version"
+            )
         await _deny_schema_version_mismatch(
             session,
             actor_sub=actor_sub,

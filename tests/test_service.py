@@ -854,16 +854,23 @@ class TestInviteSchemaVersionRecheck:
 
         participant_row = await session.get(Participant, (conversation.id, incompatible.id))
         assert participant_row is None
-        actions = (
-            (
-                await session.execute(
-                    select(AuditLog.action).where(AuditLog.agent_id == owner.id)
-                )
+        audit_rows = (
+            await session.execute(
+                select(AuditLog.action, AuditLog.detail).where(AuditLog.agent_id == owner.id)
             )
-            .scalars()
-            .all()
-        )
+        ).all()
+        actions = [row.action for row in audit_rows]
         assert "denied.schema_version_mismatch" in actions
+        # Argus round 4: mirror start_conversation's equivalent assertion
+        # (TestSchemaVersionNegotiation) so the invite-path required_min/
+        # available_max assignment is guarded against regression too, not
+        # just the action string.
+        mismatch_row = next(
+            row for row in audit_rows if row.action == "denied.schema_version_mismatch"
+        )
+        assert mismatch_row.detail is not None
+        assert mismatch_row.detail["required_min"] == MAX_REGISTERED_SCHEMA_VERSION + 1
+        assert mismatch_row.detail["available_max"] == MAX_REGISTERED_SCHEMA_VERSION
 
     async def test_invite_compatible_target_succeeds(self, session: AsyncSession) -> None:
         owner = await _register(

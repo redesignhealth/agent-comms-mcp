@@ -59,6 +59,7 @@ def upgrade() -> None:
             # SQLAlchemy instead treats as a quoted literal.
             server_default=sa.text("1"),
         ),
+        if_not_exists=True,
     )
     op.add_column(
         "agents",
@@ -68,6 +69,7 @@ def upgrade() -> None:
             nullable=False,
             server_default=sa.text("1"),
         ),
+        if_not_exists=True,
     )
     # >= 1, not just <= max: a 0/negative pair would otherwise pass this
     # constraint and route straight into a broken negotiation (no schema
@@ -102,5 +104,10 @@ def downgrade() -> None:
     # constraint drop. da3e1646c44d/6d2a8e63e469 already use this same
     # raw-SQL-with-IF-EXISTS workaround for check constraints.
     op.execute("ALTER TABLE agents DROP CONSTRAINT IF EXISTS ck_agents_schema_version_range")
-    op.drop_column("agents", "max_schema_version")
-    op.drop_column("agents", "min_schema_version")
+    # if_exists=True on both (Argus round 4), matching 15ef34885e30's own
+    # `op.drop_column("conversations", "owner_snapshot", if_exists=True)`
+    # precedent -- without it, a retry of a downgrade that failed partway
+    # between these two drops hard-errors instead of no-op'ing on the
+    # column that's already gone.
+    op.drop_column("agents", "max_schema_version", if_exists=True)
+    op.drop_column("agents", "min_schema_version", if_exists=True)

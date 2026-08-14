@@ -1383,6 +1383,67 @@ class TestMembershipTools:
         )
         assert message != "access_denied: not authorized for this resource"
 
+    async def test_invite_runtime_error_surfaces_as_generic_tool_error(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        session: AsyncSession,
+    ) -> None:
+        """TECH-5160 (Argus round 4): tool-boundary coverage for
+        service._conversation_pinned_schema_version's internal-invariant
+        RuntimeError (service-layer coverage already exists in
+        test_service.py's TestInviteSchemaVersionRecheck) -- confirms
+        _map_service_errors' bare-RuntimeError branch actually applies to
+        comms_invite, not just that the service layer raises it."""
+        await _register(main, test_session_factory, "inv-rte-owner")
+        await _register(main, test_session_factory, "inv-rte-member")
+        await _register(main, test_session_factory, "inv-rte-other")
+
+        token_owner = _token("inv-rte-owner")
+        list_result = await _call(main, test_session_factory, token_owner, "comms_list_agents")
+        ids = {a["sub"]: a["agent_id"] for a in list_result["agents"]}
+
+        started = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [ids["inv-rte-member"]],
+                "initial_message": _availability_request(),
+            },
+        )
+        conversation_id = started["conversation_id"]
+
+        # Simulate the internal-invariant violation directly -- this state
+        # is unreachable via any public tool call, only reproduced here by
+        # deleting the seq-1 message's audit reference then the row itself.
+        await session.execute(
+            text(
+                "DELETE FROM audit_log WHERE message_id IN "
+                "(SELECT id FROM messages WHERE conversation_id = :cid AND seq = 1)"
+            ),
+            {"cid": conversation_id},
+        )
+        await session.execute(
+            text("DELETE FROM messages WHERE conversation_id = :cid AND seq = 1"),
+            {"cid": conversation_id},
+        )
+        await session.commit()
+
+        with pytest.raises(ToolError, match="invalid_request"):
+            await _call(
+                main,
+                test_session_factory,
+                token_owner,
+                "comms_invite",
+                {
+                    "conversation_id": conversation_id,
+                    "target_agent_id": ids["inv-rte-other"],
+                },
+            )
+
 
 class TestTaskLifecycleToolLayer:
     """End-to-end coverage for tasks-as-conversations: task_assign opens a
