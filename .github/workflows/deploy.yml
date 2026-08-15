@@ -11,10 +11,14 @@
 #   main. Carries ECR push/pull permissions only -- nothing reclaw-comms-
 #   specific, since its trust is shared with every other org repo.
 # - ECS deploy role (rh-platform{,-dev}-github-actions-ecs-deploy-reclaw-comms-role):
-#   trusted ONLY by this repo's own OIDC subjects (same tag-ref/environment
-#   split as above, immutable repo-ID form). Carries everything reclaw-comms-
-#   specific: ECS RegisterTaskDefinition/UpdateService/PassRole, and (prod
-#   only) read access to the dev ECR repo for image promotion.
+#   trusted ONLY by this repo's own OIDC subjects, immutable repo-ID form
+#   only (same tag-ref/environment split as above). Carries everything
+#   reclaw-comms-specific: ECS RegisterTaskDefinition/DescribeTaskDefinition/
+#   UpdateService/DescribeServices/TagResource, PassRole to the execution and
+#   task roles, and (prod only) read access to the dev ECR repo for image
+#   promotion -- see the inline comments on each configure-aws-credentials
+#   step below for the full detail, and rh-data-platform's iam.tf for the
+#   canonical action list.
 # The tag-ref and environment:production subjects are mutually exclusive per
 # role instance (dev role never trusts environment:production; prod role
 # never trusts the tag ref) -- see rh-data-platform's iam.tf for the
@@ -115,11 +119,12 @@ jobs:
         # roles) live on a dedicated role, not the ECR push role above -- that
         # role's trust policy is org-wide (any redesignhealth/* repo's main
         # branch), so ECS deploy + PassRole for reclaw-comms must not live in
-        # its inline policy. This role trusts the same tag-ref OIDC subject as
-        # the ECR push role above (repo:redesignhealth/agent-comms-mcp:ref:
-        # refs/tags/v*), scoped only to agent-comms-mcp's own immutable repo
-        # ID -- see rh-data-platform's iam.tf for the exact trust policy and
-        # full action set.
+        # its inline policy. Unlike the ECR push role above (which trusts both
+        # the classic name-based subject and the immutable repo-ID subject),
+        # this higher-privilege role trusts ONLY the confirmed-immutable form
+        # (repo:redesignhealth@<org-id>/agent-comms-mcp@1333468277:ref:refs/
+        # tags/v*) -- see rh-data-platform's iam.tf for the exact trust policy
+        # and full action set.
         uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
         with:
           role-to-assume: arn:aws:iam::082533342824:role/rh-platform-dev-github-actions-ecs-deploy-reclaw-comms-role
@@ -184,7 +189,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
         with:
           role-to-assume: arn:aws:iam::082533342824:role/rh-platform-github-actions-ecs-deploy-reclaw-comms-role
-          role-session-name: agent-comms-prod-ecr-read
+          role-session-name: agent-comms-prod-ecs-deploy-dev-read
           aws-region: us-east-1
 
       - name: Login to ECR (dev image read)
@@ -250,7 +255,7 @@ jobs:
         # `amazon-ecr-login` writes a static bearer token to the docker config
         # at the time it runs (it does not install a credential helper that
         # re-authenticates per docker command), so this second explicit login
-        # is load-bearing after the role switch above — the earlier "Login to
+        # is load-bearing after the role switch above -- the earlier "Login to
         # ECR (dev image read)" token would otherwise still be in effect and
         # lack push access to rh-platform/apps/*. Do not remove this step.
         uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
