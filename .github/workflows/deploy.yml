@@ -1,19 +1,26 @@
 # Build, push to dev ECR, and deploy to dev ECS on every full release.
-# Pre-releases (GitHub "pre-release" flag) skip this workflow entirely —
+# Pre-releases (GitHub "pre-release" flag) skip this workflow entirely --
 # the `if: !prerelease` guard on deploy-dev prevents both jobs from running.
 # After dev is stable, deploy-prod promotes the same image to prod ECR and deploys.
-# IAM trust: deploy-dev uses ref:refs/tags/*; deploy-prod uses environment:production.
-# The prod roles (both ECR push and ECS deploy) trust only environment:production,
-# so they cannot be assumed from deploy-dev or any other unprotected job — prod
-# promotion is always gated.
-# Two roles per environment: the ECR push role (org-wide trust) handles
-# build/push to this repo's own ECR namespace only; a dedicated ECS-deploy
-# role (trusted only by agent-comms-mcp's own OIDC subjects) handles
-# reclaw-comms-specific permissions that must never be reachable via the
-# shared org-wide role: ECS RegisterTaskDefinition/UpdateService + PassRole,
-# and (prod only) read access to the dev ECR repo for image promotion.
-# deploy-prod switches between the two roles multiple times in a single job —
-# see the inline comments on each configure-aws-credentials step.
+#
+# Four IAM roles are involved, two per environment:
+# - ECR push role (rh-platform{,-dev}-github-actions-ecr-push-role): org-wide
+#   trust (any redesignhealth/* repo's main branch), PLUS this repo's own
+#   tag-ref subject (dev) / environment:production subject (prod) added
+#   specifically because this workflow triggers on `release: published`, not
+#   main. Carries ECR push/pull permissions only -- nothing reclaw-comms-
+#   specific, since its trust is shared with every other org repo.
+# - ECS deploy role (rh-platform{,-dev}-github-actions-ecs-deploy-reclaw-comms-role):
+#   trusted ONLY by this repo's own OIDC subjects (same tag-ref/environment
+#   split as above, immutable repo-ID form). Carries everything reclaw-comms-
+#   specific: ECS RegisterTaskDefinition/UpdateService/PassRole, and (prod
+#   only) read access to the dev ECR repo for image promotion.
+# The tag-ref and environment:production subjects are mutually exclusive per
+# role instance (dev role never trusts environment:production; prod role
+# never trusts the tag ref) -- see rh-data-platform's iam.tf for the
+# `local.is_prod` gating. deploy-prod switches between its two roles multiple
+# times in a single job -- see the inline comments on each
+# configure-aws-credentials step.
 name: Deploy to ECS
 
 on:
@@ -76,6 +83,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
         with:
           role-to-assume: arn:aws:iam::082533342824:role/rh-platform-dev-github-actions-ecr-push-role
+          role-session-name: agent-comms-dev-ecr-push
           aws-region: us-east-1
 
       - name: Login to ECR (dev)
@@ -102,14 +110,20 @@ jobs:
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
 
       - name: Configure AWS credentials (dev ECS deploy)
-        # ECS RegisterTaskDefinition/UpdateService + PassRole live on a dedicated
-        # role, not the ECR push role above — that role's trust policy is
-        # org-wide (any redesignhealth/* repo's main branch), so ECS deploy +
-        # PassRole for reclaw-comms must not live in its inline policy. This
-        # role is trusted only by agent-comms-mcp's own OIDC subjects.
+        # ECS RegisterTaskDefinition/DescribeTaskDefinition/UpdateService/
+        # DescribeServices/TagResource + PassRole (to the execution and task
+        # roles) live on a dedicated role, not the ECR push role above -- that
+        # role's trust policy is org-wide (any redesignhealth/* repo's main
+        # branch), so ECS deploy + PassRole for reclaw-comms must not live in
+        # its inline policy. This role trusts the same tag-ref OIDC subject as
+        # the ECR push role above (repo:redesignhealth/agent-comms-mcp:ref:
+        # refs/tags/v*), scoped only to agent-comms-mcp's own immutable repo
+        # ID -- see rh-data-platform's iam.tf for the exact trust policy and
+        # full action set.
         uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
         with:
           role-to-assume: arn:aws:iam::082533342824:role/rh-platform-dev-github-actions-ecs-deploy-reclaw-comms-role
+          role-session-name: agent-comms-dev-ecs-deploy
           aws-region: us-east-1
 
       - name: Download current dev task definition
@@ -170,6 +184,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
         with:
           role-to-assume: arn:aws:iam::082533342824:role/rh-platform-github-actions-ecs-deploy-reclaw-comms-role
+          role-session-name: agent-comms-prod-ecr-read
           aws-region: us-east-1
 
       - name: Login to ECR (dev image read)
@@ -225,15 +240,19 @@ jobs:
       - name: Configure AWS credentials (prod ECR push)
         # Switch to the org-wide ECR push role for the actual write to prod
         # ECR — the deploy role above has no write access to rh-platform/apps/*.
-        # The ECR credential helper re-authenticates per docker command using
-        # whichever AWS credentials are currently active, so this mid-job
-        # switch is safe.
         uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
         with:
           role-to-assume: arn:aws:iam::082533342824:role/rh-platform-github-actions-ecr-push-role
+          role-session-name: agent-comms-prod-ecr-push
           aws-region: us-east-1
 
       - name: Login to ECR (prod push)
+        # `amazon-ecr-login` writes a static bearer token to the docker config
+        # at the time it runs (it does not install a credential helper that
+        # re-authenticates per docker command), so this second explicit login
+        # is load-bearing after the role switch above — the earlier "Login to
+        # ECR (dev image read)" token would otherwise still be in effect and
+        # lack push access to rh-platform/apps/*. Do not remove this step.
         uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
 
       - name: Push image to prod ECR
@@ -255,16 +274,18 @@ jobs:
           echo "prod-digest=$PROD_DIGEST" >> "$GITHUB_OUTPUT"
 
       - name: Configure AWS credentials (prod ECS deploy)
-        # ECS RegisterTaskDefinition/UpdateService + PassRole live on the
-        # dedicated role, not the ECR push role above — that role's trust
-        # policy is org-wide (any redesignhealth/* repo's main branch), so ECS
-        # deploy + PassRole for reclaw-comms must not live in its inline
-        # policy. This role is trusted only by agent-comms-mcp's own OIDC
-        # subjects. Re-assumed here since the previous two steps switched to
-        # the ECR push role for the prod push.
+        # ECS RegisterTaskDefinition/DescribeTaskDefinition/UpdateService/
+        # DescribeServices/TagResource + PassRole (to the execution and task
+        # roles) live on the dedicated role, not the ECR push role above --
+        # that role's trust policy is org-wide (any redesignhealth/* repo's
+        # main branch), so ECS deploy + PassRole for reclaw-comms must not
+        # live in its inline policy. This role is trusted only by
+        # agent-comms-mcp's own OIDC subjects. Re-assumed here since the
+        # previous two steps switched to the ECR push role for the prod push.
         uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
         with:
           role-to-assume: arn:aws:iam::082533342824:role/rh-platform-github-actions-ecs-deploy-reclaw-comms-role
+          role-session-name: agent-comms-prod-ecs-deploy
           aws-region: us-east-1
 
       - name: Download current prod task definition
