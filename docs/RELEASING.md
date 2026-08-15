@@ -6,9 +6,24 @@
 - PyPI trusted publisher configured (already done — `publish.yml`, env `pypi`)
 - GitHub `production` environment configured on the repo with required reviewers
   (gates the `deploy-prod` job — without it, prod deploys are unreviewed)
-- IAM roles `rh-platform-dev-github-actions-ecr-push-role` and
-  `rh-platform-github-actions-ecr-push-role` configured with ECS deploy permissions
-  and correct OIDC trust policies (see deploy.yml header comments)
+- Four IAM roles configured in `redesignhealth/rh-data-platform`, correct OIDC
+  trust policies (see `deploy.yml` header comments for the exact trust split):
+  - `rh-platform-dev-github-actions-ecr-push-role` and
+    `rh-platform-github-actions-ecr-push-role` -- ECR push/pull only
+  - `rh-platform-dev-github-actions-ecs-deploy-reclaw-comms-role` and
+    `rh-platform-github-actions-ecs-deploy-reclaw-comms-role` -- ECS deploy +
+    `PassRole`, plus `ecr:GetAuthorizationToken` and (prod only) read access
+    to the dev ECR repo for image promotion. ECS deploy permissions live
+    **only** on these two roles, not on the ECR push roles above.
+  - **Merge order**: [rh-data-platform#7733](https://github.com/redesignhealth/rh-data-platform/pull/7733)
+    (or its successor, if already merged -- confirm the `github_actions_ecs_deploy_reclaw_comms`
+    role and policy exist in that repo's IAM Terraform) must be merged and
+    applied before cutting a release with this workflow. If the ECS deploy
+    roles don't exist yet: `deploy-dev` will push a new dev image successfully
+    and then fail assuming the role for its ECS deploy steps, leaving dev ECR
+    ahead of what's running; `deploy-prod` fails immediately at its first
+    step (assuming the ECS deploy role for dev-image read), before pushing
+    anything to prod ECR.
 
 ## Steps
 
