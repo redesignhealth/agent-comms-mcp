@@ -518,6 +518,7 @@ class TestRegisterAgent:
         (detail,) = rows[0]
         assert detail["is_shared_requested"] is False
         assert detail["is_shared_effective"] is True
+        assert detail["is_shared_authorized"] is True
 
     async def test_reregister_is_shared_mismatch_is_audited(self, session: AsyncSession) -> None:
         """A re-registration that requests a different ``is_shared`` value
@@ -548,6 +549,7 @@ class TestRegisterAgent:
         _, detail = rows[0]
         assert detail["is_shared_requested"] is True
         assert detail["is_shared_effective"] is False
+        assert detail["is_shared_authorized"] is False
 
     async def test_register_audit_detail_is_shared_effective_vs_requested(
         self, session: AsyncSession

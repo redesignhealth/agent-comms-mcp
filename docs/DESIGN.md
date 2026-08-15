@@ -240,6 +240,11 @@ scroll-to-load-more use case.
  conversations; pre-quarantine pipeline per §10).
 4. Uniform denial messages. Existence of unauthorized resources is never revealed.
 5. Append-only messages and audit. Every mutation and every denial is audited.
+ A third category, bypass-observability, also audits privileged paths that are
+ neither: `agent.boundary_check_bypassed_shared`/`agent.conversation_open_bypassed_shared`
+ (a `comms:admin`-authorized shared sender/initiator skipped the ownership-boundary
+ check, §9) and `agent.reregister_is_shared_ignored` (a re-registration's requested
+ `is_shared` diverged from the frozen row value and was ignored, §5).
 6. Fail-closed tool scoping: unenrolled tool is unreachable by agent tokens.
 7. Rate limits per sender (30 messages/hour/conversation, 10 conversation-starts/hour),
  message size caps, participant cap (50 per conversation), and conversation expiry (7 days).

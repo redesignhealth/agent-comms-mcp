@@ -107,7 +107,7 @@ a denial: they record that a privileged code path was taken, not that
 anything was created or refused. ``agent.boundary_check_bypassed_shared``/
 ``agent.conversation_open_bypassed_shared`` (a ``comms:admin``-authorized
 shared sender/initiator skipped the ownership-boundary check for a
-message/conversation-open respectively — DESIGN.md §9) and
+message/conversation-open respectively -- DESIGN.md §9) and
 ``agent.reregister_is_shared_ignored`` (a re-registration's requested
 ``is_shared`` value diverged from the already-frozen row value and was
 silently ignored, per ``is_shared``'s freeze-at-first-registration rule).
@@ -2115,12 +2115,18 @@ async def _enforce_boundary_crossing(
                 conversation_id=conversation_id,
                 detail={"message_type": message_type},
             )
+            return
         if sender_info.get("is_shared"):
             # Outside the ownership-lookup try/except (Argus round 3): staging
             # this audit inside that block risked a session-state error being
-            # mislabeled as `denied.ownership_unverified`, and the row was
-            # never committed before returning, so a later failure in the
-            # same request could silently roll it back.
+            # mislabeled as `denied.ownership_unverified`. Staged, not
+            # committed (Argus round 4): the caller (post_message) holds a
+            # SELECT ... FOR UPDATE lock on the Conversation row to
+            # serialize seq assignment, and committing here would release
+            # that lock mid-request, letting two concurrent shared senders
+            # race on seq. This audit row is persisted by the caller's own
+            # enclosing commit along with the rest of the operation, exactly
+            # like every other non-`_deny` audit call in this module.
             _audit(
                 session,
                 actor_sub=actor_sub,
@@ -2129,7 +2135,6 @@ async def _enforce_boundary_crossing(
                 conversation_id=conversation_id,
                 detail={"message_type": message_type},
             )
-            await session.commit()
             return
         try:
             sender_owners = frozenset(sender_info.get("owners") or [])
@@ -2151,6 +2156,7 @@ async def _enforce_boundary_crossing(
                 conversation_id=conversation_id,
                 detail={"message_type": message_type},
             )
+            return
         if not sender_owners or any(not owners for owners in other_owner_sets):
             await _deny(
                 session,
