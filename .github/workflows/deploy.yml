@@ -25,6 +25,13 @@
 # `local.is_prod` gating. deploy-prod switches between its two roles multiple
 # times in a single job -- see the inline comments on each
 # configure-aws-credentials step.
+#
+# deploy-prod's last two steps are NOT one of those four roles: they use a
+# GitHub App token (RH_DATA_PLATFORM_DISPATCH_APP_ID/_PRIVATE_KEY secrets) to
+# dispatch rh-data-platform's own deploy-reclaw-comms.yml, so its
+# Terraform-declared image tag stays converged with whatever this workflow
+# just deployed. See that step's inline comment and
+# github.com/redesignhealth/rh-data-platform/issues/7795 for why.
 name: Deploy to ECS
 
 on:
@@ -330,3 +337,64 @@ jobs:
           service: rh-reclaw-comms
           cluster: rh-platform-cluster
           wait-for-service-stability: true
+
+      # rh-data-platform/issues/7795 (2026-08-15 dev+prod outage postmortem):
+      # this workflow deploys reclaw-comms-mcp to ECS directly, completely
+      # out-of-band from rh-data-platform's Terraform, which separately
+      # declares reclaw-comms-mcp's image tag in
+      # infrastructure/environments/{dev,prod}/terraform.tfvars
+      # (reclaw_comms_image_tag) and applies it via
+      # `.github/workflows/deploy-reclaw-comms.yml` +
+      # `terraform.yml` (dev auto-applies on every merge to rh-data-platform's
+      # main). Without this step, Terraform never learns what tag this
+      # workflow just deployed -- the two control planes silently drift, and
+      # the next dev auto-apply reverts the ECS service back to whatever
+      # stale tag is still pinned in tfvars, undoing this deploy. That's
+      # exactly what caused the outage: a tag Terraform still referenced had
+      # aged out of ECR's "keep last 10 sha-tagged images" lifecycle policy.
+      #
+      # Fix: dispatch rh-data-platform's deploy-reclaw-comms.yml with the
+      # exact tag just deployed (same image already pushed to both ECR
+      # repos above), so its validate-image-tag-{dev,prod} jobs pass
+      # trivially and it just bumps terraform.tfvars to match reality. The
+      # image reference in Terraform is `image_uri:image_tag` (a tag, not a
+      # digest) against an IMMUTABLE ECR repo, so re-declaring the same tag
+      # is a safe no-op against the already-running service -- this step
+      # cannot cause an unwanted redeploy or downtime, only convergence.
+      #
+      # This intentionally does NOT touch IAM/OIDC trust in either repo: it
+      # reuses rh-data-platform's existing deploy-reclaw-comms.yml exactly as
+      # designed (that workflow's own header comment already anticipated
+      # being triggered this way) via a plain `gh workflow run` dispatch, the
+      # same mechanism deploy-terraform.yml uses for its own cross-job
+      # GitHub App token. The rejected alternative (stop having Terraform
+      # manage this service at all) would have required carving reclaw-comms
+      # out of rh-data-platform's shared `modules/mcp-server` Terraform
+      # module -- a fleet-wide-blast-radius file already flagged as risky in
+      # rh-data-platform PR #7547 -- for one service, which is why the
+      # tfvars-sync approach here was chosen instead.
+      #
+      # Requires two repo secrets here (RH_DATA_PLATFORM_DISPATCH_APP_ID /
+      # RH_DATA_PLATFORM_DISPATCH_APP_PRIVATE_KEY) for a GitHub App
+      # installed on rh-data-platform with `actions: write` -- provisioning
+      # that app/installation and adding these secrets is a one-time,
+      # human/infra-owner action (see issue #7795); this step no-ops with a
+      # clear failure until that's done, it does not silently skip.
+      - name: Generate rh-data-platform dispatch token
+        id: rh-data-platform-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.RH_DATA_PLATFORM_DISPATCH_APP_ID }}
+          private-key: ${{ secrets.RH_DATA_PLATFORM_DISPATCH_APP_PRIVATE_KEY }}
+          owner: redesignhealth
+          repositories: rh-data-platform
+
+      - name: Sync rh-data-platform terraform.tfvars with the tag just deployed
+        env:
+          GH_TOKEN: ${{ steps.rh-data-platform-token.outputs.token }}
+          IMAGE_TAG: sha-${{ github.sha }}
+        run: |
+          gh workflow run deploy-reclaw-comms.yml \
+            --repo redesignhealth/rh-data-platform \
+            --ref main \
+            -f image_tag="$IMAGE_TAG"
