@@ -90,7 +90,7 @@ class Agent(Base):
     __tablename__ = "agents"
     __table_args__ = (
         CheckConstraint(f"status IN {AGENT_STATUSES!r}", name="ck_agents_status"),
-        # TECH-5160 capability negotiation: the wire-schema version range
+        # Schema-version capability negotiation: the wire-schema version range
         # this agent's own code can correctly interpret, declared at
         # ``comms_register`` time. min/max both default to 1 (today's only
         # version). The board negotiates down to the highest version every
@@ -104,7 +104,7 @@ class Agent(Base):
         ),
         # Backs service.lookup_agent_by_email's
         # func.lower(Agent.owner_email) == ... AND status == "active" ...
-        # ORDER BY bound_at DESC query (TECH-5159, migration bb1ea7d2a0cf).
+        # ORDER BY bound_at DESC query (migration bb1ea7d2a0cf).
         # Declared here too, not just in the migration -- every other
         # migration-created index in this file has a matching declaration;
         # without one, a future `alembic revision --autogenerate` sees this
@@ -118,8 +118,8 @@ class Agent(Base):
         # computed expression like this as a raw expression in
         # pg_index.indexprs, and Alembic's autogenerate comparator treats
         # text() as that same kind of opaque expression, so the two compare
-        # equal. Column 2 must NOT also be text() (Argus round 3, verified
-        # via `alembic revision --autogenerate` against a live DB): Postgres
+        # equal. Column 2 must NOT also be text() -- verified via
+        # `alembic revision --autogenerate` against a live DB: Postgres
         # stores `bound_at DESC NULLS LAST` as a plain column reference plus
         # sort attributes in pg_index.indoption, which autogenerate
         # introspects as a structured column+modifier, not raw expression
@@ -149,7 +149,7 @@ class Agent(Base):
     display_name: Mapped[str] = mapped_column(String(MAX_DISPLAY_NAME_LENGTH), nullable=False)
     accepted_types: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False)
-    # TECH-5160: wire-schema version range this agent declares it can
+    # Wire-schema version range this agent declares it can
     # correctly interpret. Both default to 1 (today's only version) via a
     # server_default in the migration, so existing rows backfill cleanly.
     min_schema_version: Mapped[int] = mapped_column(
@@ -253,13 +253,13 @@ class Message(Base):
             "sender_id",
             "created_at",
         ),
-        # TECH-5160: backs service._enforce_sender_global_rate_limit's
+        # Backs service._enforce_sender_global_rate_limit's
         # WHERE sender_id = ... AND created_at > ... query (no
         # conversation_id predicate) -- the index above has conversation_id
         # as its leading column, so Postgres can't use it for a query that
         # never filters on conversation_id, and would sequential-scan
-        # `messages` on every post_message/start_conversation call
-        # (Argus round 1). Same "declare here too, not just in the
+        # `messages` on every post_message/start_conversation call.
+        # Same "declare here too, not just in the
         # migration" convention as every other migration-created index in
         # this file.
         Index("idx_messages_sender_id_created_at", "sender_id", "created_at"),

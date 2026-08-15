@@ -84,10 +84,10 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
         "ON agents (lower(owner_email), bound_at DESC NULLS LAST) "
         "WHERE status = 'active'" in result.stdout
     )
-    # 2cc5185360c7 (TECH-5160): agents.min/max_schema_version columns,
+    # 2cc5185360c7: agents.min/max_schema_version columns,
     # the DB-level >= 1 / <= max CHECK constraint, and the
     # (sender_id, created_at) index backing
-    # service._enforce_sender_global_rate_limit (Argus round 1).
+    # service._enforce_sender_global_rate_limit.
     assert "ADD COLUMN IF NOT EXISTS min_schema_version INTEGER DEFAULT 1 NOT NULL" in result.stdout
     assert "ADD COLUMN IF NOT EXISTS max_schema_version INTEGER DEFAULT 1 NOT NULL" in result.stdout
     assert (

@@ -225,8 +225,8 @@ async def _register(
         # narrow this explicitly via the accepted_types param.
         "accepted_types": accepted_types or sorted(MESSAGE_TYPES),
     }
-    # TECH-5160: only included when a test opts in, so most callers keep
-    # exercising the 1/1 default path unchanged.
+    # Schema-version fields are only included when a test opts in, so most
+    # callers keep exercising the 1/1 default path unchanged.
     if min_schema_version is not None:
         args["min_schema_version"] = min_schema_version
     if max_schema_version is not None:
@@ -508,7 +508,7 @@ class TestRegister:
     async def test_register_oversized_single_accepted_type_entry_generic_tool_error(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
-        """Boundary test for the per-entry length cap (Argus round 3):
+        """Boundary test for the per-entry length cap:
         a single oversized entry (101 chars) must be rejected at the MCP
         boundary as generic invalid_request, not echoed verbatim."""
         token = _token("agent-oversized-entry-boundary")
@@ -524,7 +524,7 @@ class TestRegister:
     async def test_register_schema_version_defaults_and_persists(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
-        """TECH-5160: min/max_schema_version default to 1/1 and round-trip
+        """min/max_schema_version default to 1/1 and round-trip
         through both comms_register's own response and comms_whoami."""
         token = _token("agent-schema-default")
         result = await _call(
@@ -581,7 +581,7 @@ class TestRegister:
     async def test_register_min_schema_version_below_one_rejected(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
-        """TECH-5160 (Argus round 1): the lower-bound guard applies at the
+        """The lower-bound guard applies at the
         tool layer too, not just service.register_agent directly."""
         token = _token("agent-schema-below-one-tool")
         with pytest.raises(ToolError, match="invalid_request"):
@@ -602,8 +602,9 @@ class TestRegister:
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
         """A caller who hasn't called comms_register yet gets the same
-        whoami shape as before TECH-5160 — no schema-version fields, and no
-        error just for having never registered (whoami is DB-optional)."""
+        whoami shape as before schema-version negotiation was added — no
+        schema-version fields, and no error just for having never registered
+        (whoami is DB-optional)."""
         token = _token("agent-never-registered")
         whoami = await _call(main, test_session_factory, token, "comms_whoami")
         assert "min_schema_version" not in whoami
@@ -882,7 +883,7 @@ class TestAxiShapes:
         # agents under one email), not an error case. bound_at is forced
         # apart explicitly rather than relied on via real-time gaps between
         # the two registrations, which could otherwise tie down to the
-        # microsecond (Argus round 2).
+        # microsecond.
         await _register(main, test_session_factory, "ea-old", owner_email="multi@example.com")
         await _register(main, test_session_factory, "ea-new", owner_email="multi@example.com")
         async with test_session_factory() as session:
@@ -1321,7 +1322,7 @@ class TestRateLimitAndSchemaErrors:
     async def test_schema_version_mismatch_error_is_specific_not_uniform(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
-        """TECH-5160: an initiator and target with non-overlapping declared
+        """An initiator and target with non-overlapping declared
         schema-version ranges get a specific ``ToolError``, not the uniform
         access-denied string — same anti-enumeration posture as the other
         specific errors in this class (rate limits, schema validation,
@@ -1362,11 +1363,11 @@ class TestRateLimitAndSchemaErrors:
         message = str(exc_info.value)
         assert "schema_version_mismatch" in message
         assert message != "access_denied: not authorized for this resource"
-        # Anti-enumeration (Argus round 1): the message is a fixed,
+        # Anti-enumeration: the message is a fixed,
         # deterministic string with no embedded range values at all --
         # asserting full equality (rather than "no digits", which is
-        # fragile against unrelated future digits in the text, per Argus
-        # round 2) is both stronger and more specific here.
+        # fragile against unrelated future digits in the text) is both
+        # stronger and more specific here.
         assert message == (
             "schema_version_mismatch: no wire schema version is supported by "
             "every participant in this conversation"
@@ -1375,7 +1376,7 @@ class TestRateLimitAndSchemaErrors:
     async def test_start_conversation_response_includes_negotiated_schema_version(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
-        """TECH-5160 (Argus round 1): the negotiated version must be
+        """The negotiated version must be
         discoverable from the response, not just silently applied."""
         await _register(main, test_session_factory, "sv-response-owner")
         await _register(main, test_session_factory, "sv-response-target")
@@ -1494,7 +1495,7 @@ class TestMembershipTools:
     async def test_invite_schema_version_mismatch_surfaces_as_tool_error(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
-        """TECH-5160 (Argus round 2): comms_invite's SchemaVersionMismatchError
+        """comms_invite's SchemaVersionMismatchError
         path has service-layer coverage (TestInviteSchemaVersionRecheck in
         test_service.py) but this exercises the actual _map_service_errors
         integration through the real mounted tool."""
@@ -1537,7 +1538,7 @@ class TestMembershipTools:
                 },
             )
         message = str(exc_info.value)
-        # Full equality (Argus round 3), matching the sibling
+        # Full equality, matching the sibling
         # start_conversation test's strengthened assertion -- locks in the
         # anti-enumeration property at the integration level, not just
         # "the string mentions the right topic".
@@ -1553,7 +1554,7 @@ class TestMembershipTools:
         test_session_factory: async_sessionmaker[AsyncSession],
         session: AsyncSession,
     ) -> None:
-        """TECH-5160 (Argus round 4): tool-boundary coverage for
+        """Tool-boundary coverage for
         service._conversation_pinned_schema_version's internal-invariant
         RuntimeError (service-layer coverage already exists in
         test_service.py's TestInviteSchemaVersionRecheck) -- confirms

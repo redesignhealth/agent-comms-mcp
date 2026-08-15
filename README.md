@@ -2,11 +2,11 @@
 
 MCP service for **permissioned, structured agent-to-agent communications**.
 First use case: a user's main agent delegates to a dedicated EA agent, which
-communicates with other people's EA agents to negotiate availability (including
-judgment, not just calendar overlap). Communications are scoped and structured
-— no free text initially. See [`docs/DESIGN.md`](docs/DESIGN.md) for the full
-spec (data model, permission model, message schemas). EA agent logic lives
-elsewhere — this repo is only the comms layer.
+communicates with other people's EA agents to negotiate availability by
+applying judgment to scheduling tradeoffs. Communications are scoped and
+structured: no free text initially. See [`docs/DESIGN.md`](docs/DESIGN.md)
+for the full spec (data model, permission model, message schemas). EA agent
+logic lives elsewhere. This repo is only the comms layer.
 
 ## Layout
 
@@ -30,18 +30,18 @@ tests/               # pytest suite (composition, scope fail-closed, domain logi
 
 ## Domain layer
 
-The comms board is five Postgres tables — `agents`, `conversations`,
-`participants`, `messages`, `audit_log` — with `messages` and
-`audit_log` append-only. An agent self-provisions via `comms_register`,
+The comms board is five Postgres tables: `agents`, `conversations`,
+`participants`, `messages`, `audit_log`. `messages` and
+`audit_log` are append-only. An agent self-provisions via `comms_register`,
 then either starts a conversation (adding named targets as `invited`) or
 gets invited into one. A target only gains message-history read/write
-access after calling `comms_accept` (`invited → active`); declining
+access after calling `comms_accept` (`invited → active`). Declining
 (`comms_decline_invite`) is terminal and grants nothing. Task coordination
 uses task message types (`task_assign`, `task_report`, `task_complete`,
-`task_decline`, `task_cancel`) within ordinary conversations — task state
-lives on `conversations.state`, not a separate table. Conversation types
-(`open`, `internal`, `asymmetric`) gate admission by ownership; message
-types gate boundary crossing via the `boundary_safe` flag — see
+`task_decline`, `task_cancel`) within ordinary conversations: task state
+lives on `conversations.state` alone, with no separate table. Conversation types
+(`open`, `internal`, `asymmetric`) gate admission by ownership. Message
+types gate boundary crossing via the `boundary_safe` flag: see
 [`docs/DESIGN.md`](docs/DESIGN.md) §4–§9 for full details.
 
 ## MCP tool surface
@@ -78,13 +78,13 @@ Both humans and machines POST to the same `/mcp` endpoint; FastMCP
   checks.
 - **Agents / services**: HS256 Bearer JWT with `iss="agent-jwt"`, `sub`, and
   `scopes` claims, verified by a `JWTVerifier` keyed to `AGENT_JWT_SECRET`.
-  Every tool call is then gated by the `TOOL_SCOPES` catalog in `scopes.py`
-  — **fail-closed**: a tool without a registry entry rejects every agent
-  call, denial messages are uniform (anti-enumeration), and each denial emits
-  a structured `scope_denial` log event.
+  Every tool call is then gated by the `TOOL_SCOPES` catalog in `scopes.py`.
+  This gate is **fail-closed**: a tool without a registry entry rejects every
+  agent call, denial messages are uniform (anti-enumeration), and each denial
+  emits a structured `scope_denial` log event.
 
 When adding a tool, enroll its mounted name (`comms_<tool>`) in
-`TOOL_SCOPES` in the same PR — `tests/test_main.py` fails otherwise.
+`TOOL_SCOPES` in the same PR: `tests/test_main.py` fails otherwise.
 
 ## Local development
 
@@ -113,18 +113,18 @@ docker compose up --build
 Tests never touch the network: the Okta OIDC discovery call is patched out
 in every test module that imports `main` (see `tests/test_main.py`'s
 `_OIDC_PATCH`), so `uv run pytest` needs no real Okta tenant, issuer
-reachability, or credentials — only a reachable Postgres for the
+reachability, or credentials. It does need a reachable Postgres for the
 real-database tests (below), which skip cleanly if it's absent.
 
 ### Database / migrations
 
 Postgres is provisioned by `docker-compose.yml`, mapped to **host port
 55432** (container-internal port stays the standard 5432). This dev
-machine — and, per earlier build stages, others too — already runs a
+machine (and, per earlier build stages, others too) already runs a
 native Postgres bound to the default host port 5432, which silently
 collides with `docker-compose.yml`'s old `5432:5432` mapping (you'd connect
 to the wrong database with no error). Moving the compose Postgres's
-*host-side* port to 55432 sidesteps this permanently; nothing about the
+*host-side* port to 55432 sidesteps this permanently. Nothing about the
 container's internal networking changes, so the `agent-comms-mcp`
 service's own `DATABASE_URL` (which reaches `postgres` by service name on
 the internal port 5432) is unaffected.
@@ -141,7 +141,7 @@ uv run alembic upgrade head        # create/upgrade the 5-table schema
 If you still hit a conflict (e.g. something else is bound to 55432), check
 with `lsof -i :55432` and either free the port or change the host-side
 number in `docker-compose.yml`'s `ports:` mapping for the `postgres`
-service (updating `DATABASE_URL` to match) — a single fixed alternate port
+service (updating `DATABASE_URL` to match). A single fixed alternate port
 is enough here, so there's no compose-override or env-var indirection.
 
 To generate a new migration after changing `models.py`:
@@ -198,4 +198,4 @@ start, so migrations apply before the server accepts traffic.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

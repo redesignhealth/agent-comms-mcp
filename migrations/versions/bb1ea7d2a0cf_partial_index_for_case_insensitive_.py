@@ -4,15 +4,15 @@ Revision ID: bb1ea7d2a0cf
 Revises: e1db7c2e6b70
 Create Date: 2026-08-13 16:50:57.343015
 
-TECH-5159: backs ``service.lookup_agent_by_email``'s
+Backs ``service.lookup_agent_by_email``'s
 ``func.lower(Agent.owner_email) == normalized AND Agent.status == "active"``
 query, added the same round as this migration. Without it, that query
 sequential-scans ``agents`` on every call -- fine at today's table size, but
 worth having the index in place before ``comms_lookup_agent_by_email`` sees
 real traffic rather than adding it reactively later.
 
-NOTE on in-place amendment (Argus round 4 correction: an earlier version of
-this note claimed "this service has no deployed environment yet" -- false;
+NOTE on in-place amendment (correcting an earlier version of this note that
+claimed "this service has no deployed environment yet" -- false;
 DESIGN.md §12 has said "Infrastructure: done -- deployed and running" since
 before this PR opened, and `entrypoint.sh` runs `alembic upgrade head`
 automatically on every deploy): like ``18f2d7735523`` before it, this

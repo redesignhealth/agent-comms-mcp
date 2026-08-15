@@ -15,14 +15,14 @@ from sqlalchemy.exc import OperationalError
 # in fastmcp 3.4.2, so the tool body can be invoked directly.
 from providers.comms import whoami as _whoami
 
-# TECH-5160: whoami now does a best-effort DB lookup for
+# whoami now does a best-effort DB lookup for
 # min_schema_version/max_schema_version. Every test below mocks BOTH
-# get_session_factory and service.get_agent_by_sub (Argus round 1) so
+# get_session_factory and service.get_agent_by_sub so
 # these unit tests exercise the intended DB-free-identity /
 # agent-found / agent-not-found paths deliberately, rather than
 # accidentally exercising the connectivity-failure fallback just because
 # no real DATABASE_URL is configured in this test environment (which is
-# what happened before this round: get_session_factory() raised
+# what happened previously: get_session_factory() raised
 # RuntimeError via db.require_env, silently swallowed by whoami's
 # broad-then-narrowed except clause, so these tests passed for the wrong
 # reason and never verified the path they claimed to).
@@ -111,7 +111,7 @@ class TestWhoami:
                 asyncio.run(_whoami())
 
     def test_registered_identity_includes_schema_version_range(self) -> None:
-        """TECH-5160: an identity that has already registered gets
+        """An identity that has already registered gets
         min_schema_version/max_schema_version back from whoami."""
         token = MagicMock()
         token.claims = {"iss": "agent-jwt", "sub": "ea-agent-svc", "scopes": ["comms:read"]}
@@ -147,19 +147,19 @@ class TestWhoami:
     def test_db_connectivity_failure_still_returns_identity_fields(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """TECH-5160 (Argus round 1): a genuine connectivity/config failure
+        """A genuine connectivity/config failure
         (DATABASE_URL unset here) must not break whoami's core
         identity/scopes contract -- it only omits the schema-version
         fields, exactly like the unregistered-caller case. Specifically
-        exercises the FIRST of whoami's two try-blocks (Argus round 3
-        docstring correction: this patches get_session_factory itself to
-        raise, so it hits block 1's narrow RuntimeError catch and returns
-        early -- block 2's separate OperationalError/InterfaceError/OSError
-        catch, for a failure during the query itself, is covered by
-        ``test_db_query_failure_still_returns_identity_fields`` below).
-        Also asserts the swallowed failure is actually logged (Argus round
-        2: a prior version of this test never checked this, so the log
-        call could be deleted without failing anything)."""
+        exercises the FIRST of whoami's two try-blocks: this patches
+        get_session_factory itself to raise, so it hits block 1's narrow
+        RuntimeError catch and returns early -- block 2's separate
+        OperationalError/InterfaceError/OSError catch, for a failure during
+        the query itself, is covered by
+        ``test_db_query_failure_still_returns_identity_fields`` below.
+        Also asserts the swallowed failure is actually logged: a prior
+        version of this test never checked this, so the log call could be
+        deleted without failing anything."""
         token = MagicMock()
         token.claims = {"iss": "agent-jwt", "sub": "ea-agent-svc", "scopes": ["comms:read"]}
 
@@ -179,7 +179,7 @@ class TestWhoami:
         assert result["scopes"] == ["comms:read"]
         assert "min_schema_version" not in result
         assert "max_schema_version" not in result
-        # "unavailable", not just "schema-version lookup" (Argus round 4):
+        # "unavailable", not just "schema-version lookup":
         # the broader substring also matches block 2's "... lookup failed
         # ..." message below, so it wouldn't actually prove this test hit
         # block 1 specifically, despite the docstring's claim that it does.
@@ -188,7 +188,7 @@ class TestWhoami:
     def test_db_query_failure_still_returns_identity_fields(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """TECH-5160 (Argus round 3): distinct from the test above -- this
+        """Distinct from the test above -- this
         exercises whoami's SECOND try-block, where get_session_factory()
         itself succeeds but the query fails with a connection-level error
         (OperationalError/InterfaceError/OSError) mid-lookup. Same outcome
@@ -220,7 +220,7 @@ class TestWhoami:
         assert any("schema-version lookup failed" in r.message for r in caplog.records)
 
     def test_unnarrowed_exception_is_not_swallowed(self) -> None:
-        """TECH-5160 (Argus round 1): a genuine programming/schema bug in
+        """A genuine programming/schema bug in
         the lookup path (anything other than the narrowed connectivity/
         config exception types) must propagate, not be silently absorbed
         into a successful-looking, field-less response."""

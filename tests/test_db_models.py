@@ -183,9 +183,9 @@ class TestSchema:
     async def test_agents_schema_version_range_columns_default_and_constraint(
         self, engine: AsyncEngine
     ) -> None:
-        """TECH-5160: min/max_schema_version backfill to 1/1 on a row that
-        omits them (migration 2cc5185360c7's server_default -- Argus round
-        1: a prior version of this test asserted on a ``LIMIT 0`` result
+        """min/max_schema_version backfill to 1/1 on a row that
+        omits them (migration 2cc5185360c7's server_default -- a prior
+        version of this test asserted on a ``LIMIT 0`` result
         object rather than reading back an actual row, so it never verified
         the backfill value at all), and are DB-level constrained to
         ``min >= 1 AND min <= max``."""
@@ -237,7 +237,7 @@ class TestSchema:
         assert constraint_def is not None, "ck_agents_schema_version_range constraint missing"
         assert "min_schema_version" in constraint_def
         assert "max_schema_version" in constraint_def
-        # Argus round 2: the prior assertions only checked both column
+        # The prior assertions only checked both column
         # names appeared, which would still pass even if the >= 1 lower
         # bound (added specifically to close a 0/negative-range security
         # gap) were ever reverted.
@@ -395,8 +395,7 @@ class TestSchema:
 
         message_indexes = await _indexes(engine, "messages")
         assert "idx_messages_conversation_id_sender_id_created_at" in message_indexes
-        # TECH-5160 (Argus round 1): backs
-        # service._enforce_sender_global_rate_limit's sender_id/created_at
+        # Backs service._enforce_sender_global_rate_limit's sender_id/created_at
         # query, which has no conversation_id predicate and so can't use
         # the (conversation_id, sender_id, created_at) index above.
         assert "idx_messages_sender_id_created_at" in message_indexes
