@@ -2351,6 +2351,52 @@ class TestPostMessageBoundaryCrossing:
         assert exc_info.value.reason == "denied.ownership_unverified"
         assert call_count == 2
 
+    async def test_first_lookup_failure_fail_closed_even_if_deny_does_not_raise(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Symmetric regression test for Argus round 7: the `if
+        sender_info:` guard that skips the second (other-participant)
+        lookup entirely when the FIRST (sender) lookup already failed must
+        still leave `sender_owners` in a state that the function's own
+        final boundary-crossing check re-denies, even if `_deny`'s
+        `NoReturn` contract were ever weakened. Simulated the same way as
+        `test_second_lookup_failure_fail_closed_even_if_deny_does_not_raise`:
+        `_deny` swallows only its first call. If the guard regressed and
+        the code fell through into the second lookup anyway, `_deny` would
+        be called a third time (once for the sender-lookup failure, once
+        more for an other-agent lookup this test never populates data for,
+        and once for the final `not sender_owners` check) -- this asserts
+        exactly two calls, not three, proving the second lookup was never
+        attempted."""
+        owner, _target, conversation, _client = await self._asymmetric_pair(
+            session, ["dan"], ["dan", "priya"]
+        )
+
+        real_deny = _service._deny
+        call_count = 0
+
+        async def _deny_that_swallows_first_call(*args: Any, **kwargs: Any) -> None:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return
+            await real_deny(*args, **kwargs)
+
+        monkeypatch.setattr(_service, "_deny", _deny_that_swallows_first_call)
+
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await post_message(
+                session,
+                actor_sub=owner.sub,
+                sender_agent_id=owner.id,
+                conversation_id=conversation.id,
+                message_type="note",
+                payload={"text": "hello"},
+                ownership_client=_FailingOwnershipClient(),
+            )
+        assert exc_info.value.reason == "denied.ownership_unverified"
+        assert call_count == 2
+
     async def test_empty_owner_set_soft_fail_denied(self, session: AsyncSession) -> None:
         """A post-admission ownership_client that soft-fails to
         ``{"owners": []}`` (rather than raising) must not let
