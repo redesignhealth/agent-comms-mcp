@@ -23,16 +23,21 @@
     `RH_DATA_PLATFORM_DISPATCH_APP_ID` and
     `RH_DATA_PLATFORM_DISPATCH_APP_PRIVATE_KEY`, for a GitHub App installed
     on `rh-data-platform` with `actions: write`. Without them provisioned,
-    `deploy-prod` fails loudly at the "Generate rh-data-platform dispatch
-    token" step -- the service is not deployed, not "deployed but drifted."
+    the "Generate rh-data-platform dispatch token" step fails immediately
+    (bad/missing App credentials) -- the service is not deployed, not
+    "deployed but drifted." If the secrets are present but the App lacks
+    `actions: write` on `rh-data-platform`, token generation succeeds but the
+    separate "Deploy via rh-data-platform's deploy-reclaw-comms.yml" step
+    fails instead, at the `gh workflow run` dispatch call.
   - **Merge order**: [rh-data-platform#7796](https://github.com/redesignhealth/rh-data-platform/pull/7796)
     (or its successor, if already merged -- confirm the IAM role above has
     had its ECS/PassRole grants removed and `deploy-reclaw-comms.yml` exists)
     must be merged and applied before cutting a release with this workflow.
     If it isn't: `deploy-dev` still pushes a new dev image successfully (it
     no longer touches ECS at all, so nothing to fail there); `deploy-prod`
-    pushes to prod ECR and then fails at the dispatch/token step, and the
-    release never reaches ECS in either environment.
+    pushes to prod ECR and then fails at the "Deploy via ... deploy-reclaw-
+    comms.yml" step, and the release never reaches ECS in either
+    environment.
 
 ## Steps
 
@@ -72,8 +77,11 @@
 5. **Verify both triggered workflows** pass at:
    `https://github.com/redesignhealth/agent-comms-mcp/actions`
    - `publish.yml` — publishes the Python wheel to PyPI
-   - `deploy.yml` — builds the Docker image, deploys to dev ECS, then promotes to prod ECS
-     (the `deploy-prod` job requires approval from a `production` environment reviewer)
+   - `deploy.yml` — builds the Docker image and pushes it to dev ECR, then promotes to prod ECR
+     (the `deploy-prod` job requires approval from a `production` environment reviewer). Neither
+     job deploys to ECS directly: `deploy-prod`'s last step dispatches
+     `redesignhealth/rh-data-platform`'s `deploy-reclaw-comms.yml` and waits for it to complete —
+     that workflow's Terraform apply is what actually updates the ECS service.
 
 6. **Confirm the package is live** on PyPI:
    ```bash

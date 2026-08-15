@@ -172,8 +172,12 @@ never logged.
 The service is a standard Python HTTP process backed by PostgreSQL.
 
 **Production (ECS):** creating a GitHub release triggers `.github/workflows/deploy.yml`,
-which builds the Docker image, deploys to dev ECS, then promotes the same image to prod ECS.
-See [docs/RELEASING.md](docs/RELEASING.md) for the full release process.
+which builds the Docker image and pushes it to dev ECR, then promotes the same image to prod
+ECR. That workflow does not deploy to ECS itself -- its last step dispatches
+`redesignhealth/rh-data-platform`'s `deploy-reclaw-comms.yml`, whose Terraform-driven deploy is
+the only thing that ever updates the ECS service (issue #7795: this used to be a second,
+independent deploy path direct to ECS, which is why it's been removed). See
+[docs/RELEASING.md](docs/RELEASING.md) for the full release process.
 
 **Local / self-hosted (Docker Compose):**
 
