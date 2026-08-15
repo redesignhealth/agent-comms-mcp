@@ -1366,9 +1366,15 @@ async def _authorize_conversation_open(
     shared_bypass = conversation_type == "asymmetric" and is_shared_by_id.get(initiator.id, False)
     if shared_bypass:
         # Mirrors _enforce_boundary_crossing's agent.boundary_check_bypassed_shared
-        # audit (Argus round 3): committed immediately, outside any
-        # try/except, so this record survives a later failure in the same
-        # request.
+        # audit: staged, not committed (Argus round 5), for consistency
+        # with that sibling bypass-observability event -- both are
+        # persisted by the caller's own enclosing commit along with the
+        # rest of the operation, exactly like every other non-`_deny`
+        # audit call in this module. (An earlier round committed this one
+        # immediately, since start_conversation holds no row lock here
+        # unlike post_message; that asymmetry in durability between two
+        # events DESIGN.md documents as the same category was itself the
+        # bug -- consistency trumps the now-moot durability advantage.)
         _audit(
             session,
             actor_sub=actor_sub,
@@ -1376,7 +1382,6 @@ async def _authorize_conversation_open(
             agent_id=initiator.id,
             detail={"conversation_type": conversation_type},
         )
-        await session.commit()
     if not shared_bypass and not _pairwise_admitted(conversation_type, participants, owner_sets):
         await _deny(
             session,
@@ -2091,6 +2096,7 @@ async def _enforce_boundary_crossing(
     raising must not silently admit a boundary crossing).
     """
     boundary_safe = is_boundary_safe(message_type, schema_version)
+    sender_info: dict[str, Any] = {}
     sender_owners: frozenset[str] = frozenset()
     other_owners: frozenset[str] = frozenset()
     other_owner_sets: list[frozenset[str]] = []
@@ -2107,6 +2113,13 @@ async def _enforce_boundary_crossing(
                 type(exc).__name__,
                 exc_info=True,
             )
+            # No `return` here (Argus round 5): unlike the deliberate
+            # early-return on a successful bypass below, returning after a
+            # denial would fail OPEN if `_deny`'s NoReturn contract were
+            # ever weakened -- falling through is fail-closed instead,
+            # since `sender_info` is pre-initialized to `{}` above (so
+            # `.get("is_shared")` below is falsy) and the next ownership
+            # check re-denies on the still-empty `sender_owners` default.
             await _deny(
                 session,
                 actor_sub=actor_sub,
@@ -2115,7 +2128,6 @@ async def _enforce_boundary_crossing(
                 conversation_id=conversation_id,
                 detail={"message_type": message_type},
             )
-            return
         if sender_info.get("is_shared"):
             # Outside the ownership-lookup try/except (Argus round 3): staging
             # this audit inside that block risked a session-state error being
@@ -2156,7 +2168,6 @@ async def _enforce_boundary_crossing(
                 conversation_id=conversation_id,
                 detail={"message_type": message_type},
             )
-            return
         if not sender_owners or any(not owners for owners in other_owner_sets):
             await _deny(
                 session,

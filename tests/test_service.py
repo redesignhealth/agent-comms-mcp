@@ -502,7 +502,9 @@ class TestRegisterAgent:
         first = await _register(session, "shared-freeze-downgrade", is_shared=True)
         assert first.is_shared is True
 
-        second = await _register(session, "shared-freeze-downgrade", is_shared=False)
+        second = await _register(
+            session, "shared-freeze-downgrade", is_shared=False, is_shared_authorized=True
+        )
         assert second.id == first.id
         assert second.is_shared is True
 

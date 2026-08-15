@@ -241,7 +241,7 @@ scroll-to-load-more use case.
 4. Uniform denial messages. Existence of unauthorized resources is never revealed.
 5. Append-only messages and audit. Every mutation and every denial is audited.
  A third category, bypass-observability, also audits privileged paths that are
- neither: `agent.boundary_check_bypassed_shared`/`agent.conversation_open_bypassed_shared`
+ neither mutations nor denials: `agent.boundary_check_bypassed_shared`/`agent.conversation_open_bypassed_shared`
  (a `comms:admin`-authorized shared sender/initiator skipped the ownership-boundary
  check, §9) and `agent.reregister_is_shared_ignored` (a re-registration's requested
  `is_shared` diverged from the frozen row value and was ignored, §5).
