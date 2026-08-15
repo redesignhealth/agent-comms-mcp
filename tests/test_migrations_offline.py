@@ -99,3 +99,8 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
         "CREATE INDEX IF NOT EXISTS idx_messages_sender_id_created_at "
         "ON messages (sender_id, created_at)" in result.stdout
     )
+    # a1b2c3d4e5f6: agents.is_shared column (idempotent add/drop guards).
+    assert (
+        "ALTER TABLE agents ADD COLUMN IF NOT EXISTS is_shared BOOLEAN DEFAULT false NOT NULL"
+        in result.stdout
+    )

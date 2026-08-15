@@ -94,11 +94,23 @@ expand a frozen owner set), ``denied.unknown_conversation_type`` (a
 conversation row's ``type`` isn't in ``schemas.CONVERSATION_TYPES`` — a
 migration/data-integrity gap, e.g. a legacy pre-rename row — distinct from
 an actual ownership-boundary crossing), ``denied.boundary_crossing``/
-``denied.wrong_sender_role`` (DESIGN.md §9 Axis 2's per-message checks), and
+``denied.wrong_sender_role`` (DESIGN.md §9 Axis 2's per-message checks),
 ``denied.message_type_not_accepted`` (a recipient hasn't declared
 ``message_type`` in their own ``accepted_types`` — a capability gate, not a
 trust boundary, so it applies universally, even to ``internal`` traffic
-that boundary-crossing itself always allows).
+that boundary-crossing itself always allows), and
+``denied.is_shared_requires_elevated_scope`` (a caller without ``comms:admin``
+tried to self-declare ``is_shared=True`` at first registration).
+
+Bypass-observability actions are a third category, neither a mutation nor
+a denial: they record that a privileged code path was taken, not that
+anything was created or refused. ``agent.boundary_check_bypassed_shared``/
+``agent.conversation_open_bypassed_shared`` (a ``comms:admin``-authorized
+shared sender/initiator skipped the ownership-boundary check for a
+message/conversation-open respectively -- DESIGN.md §9) and
+``agent.reregister_is_shared_ignored`` (a re-registration's requested
+``is_shared`` value diverged from the already-frozen row value and was
+silently ignored, per ``is_shared``'s freeze-at-first-registration rule).
 """
 
 from __future__ import annotations
@@ -663,22 +675,29 @@ async def _load_participant_for_read(
 
 async def _owner_sets_for(
     agents: list[Agent], ownership_client: OwnershipClient
-) -> dict[uuid.UUID, frozenset[str]]:
-    """Resolve each agent's verified owner set, one lookup at a time.
+) -> tuple[dict[uuid.UUID, frozenset[str]], dict[uuid.UUID, bool]]:
+    """Resolve each agent's verified owner set and ``is_shared`` flag, one
+    lookup at a time.
 
     Sequential, not concurrent (e.g. via ``asyncio.gather``):
     ``AgentTableOwnershipClient.get_agent_owners`` shares this call's
     ``AsyncSession``, which SQLAlchemy's ``AsyncSession`` does not support
     across concurrent coroutines.
 
+    Returns ``(owner_sets, is_shared_by_id)`` so callers needing an
+    individual participant's ``is_shared`` flag (e.g. the initiator) can
+    reuse this single pass instead of issuing a second lookup.
+
     Callers MUST fail closed on any exception raised here (see
-    ``OwnershipClient``'s docstring) — this helper does not catch.
+    ``OwnershipClient``'s docstring) - this helper does not catch.
     """
     owner_sets: dict[uuid.UUID, frozenset[str]] = {}
+    is_shared_by_id: dict[uuid.UUID, bool] = {}
     for agent in agents:
         info = await ownership_client.get_agent_owners(agent.id)
         owner_sets[agent.id] = frozenset(info.get("owners") or [])
-    return owner_sets
+        is_shared_by_id[agent.id] = bool(info.get("is_shared"))
+    return owner_sets, is_shared_by_id
 
 
 def _pairwise_admitted(
@@ -792,6 +811,8 @@ async def register_agent(
     accepted_types: list[str],
     min_schema_version: int = 1,
     max_schema_version: int = 1,
+    is_shared: bool = False,
+    is_shared_authorized: bool = False,
 ) -> Agent:
     """Idempotently create or re-bind the board ``Agent`` row for ``sub``.
 
@@ -801,6 +822,22 @@ async def register_agent(
     accepted as a parameter." This function performs NO token
     verification of its own; it persists exactly what it is given. Never
     call it with owner_sub/owner_email taken from untrusted tool arguments.
+
+    SECURITY: ``is_shared_authorized`` gates ``is_shared=True`` on FIRST
+    registration only (a re-registration can never change the already-frozen
+    ``is_shared`` value, so the gate is a no-op there). ``is_shared`` is an
+    admission-decision input — it lets its holder skip the pairwise
+    ownership-boundary check in ``_authorize_conversation_open`` and
+    ``_enforce_boundary_crossing`` — so self-declaring it at registration
+    with only the baseline write scope would be a privilege escalation.
+    Callers MUST compute this from the caller's own verified token (e.g. an
+    elevated ``comms:admin`` scope or platform-provisioning identity) and
+    pass ``True`` only when that check passes. Defaults to ``False``
+    (fail-closed): an admission-decision-input gate must never silently
+    grant its privilege to a caller that forgets the kwarg. Direct
+    service-layer callers that need the convenience of a permissive
+    default (e.g. tests) should set it in their own helper, not rely on
+    this signature's default.
 
     Idempotent: calling again with the same ``sub`` updates
     ``display_name``/``accepted_types``/``owner_email`` in place (unique on
@@ -901,6 +938,18 @@ async def register_agent(
     existing = (await session.execute(select(Agent).where(Agent.sub == sub))).scalar_one_or_none()
     now = _now()
     created = existing is None
+    if created and is_shared and not is_shared_authorized:
+        # First-registration self-escalation: `is_shared` is frozen after
+        # this point (see the re-registration branch below), so this is the
+        # only moment a caller could ever mint a permanently privileged
+        # agent. Deny before the row is created — audited the same as every
+        # other fail-closed denial in this module.
+        await _deny(
+            session,
+            actor_sub=sub,
+            action="denied.is_shared_requires_elevated_scope",
+            detail={"display_name": display_name},
+        )
     if existing is None:
         agent = Agent(
             sub=sub,
@@ -909,6 +958,7 @@ async def register_agent(
             display_name=display_name,
             accepted_types=normalized_types,
             status="active",
+            is_shared=is_shared,
             bound_at=now,
             min_schema_version=min_schema_version,
             max_schema_version=max_schema_version,
@@ -916,20 +966,42 @@ async def register_agent(
         session.add(agent)
     else:
         agent = existing
-        # owner_sub is deliberately NOT overwritten on re-registration —
-        # it is now read by
-        # AgentTableOwnershipClient as the input to may_assign's admission
-        # decision, and agent-jwt extra claims (including owner_sub) are
-        # caller-supplied and unverified (providers/comms.py). Allowing a
-        # re-register to overwrite it would let a caller forge a victim's
-        # owner_sub, re-register their own agent under it, and be admitted
-        # into that victim's tasks. Freezing it at first registration closes
-        # that path; owner_email is NOT similarly frozen. Unlike owner_sub,
-        # owner_email now does carry admission-decision weight (as of
-        # TECH-5159's lookup_agent_by_email, which resolves callers by this
-        # field), but it remains a caller-supplied, unverified claim rather
-        # than a proven mailbox ownership fact -- see lookup_agent_by_email's
-        # docstring for the resulting trust-model gap this re-write permits.
+        if is_shared != agent.is_shared:
+            # Re-registration can never change the already-frozen `is_shared`
+            # value (see the comment below), so this has no effect on the
+            # row -- but leaving it unaudited would let repeated probing of
+            # this escalation vector (or an accidental downgrade attempt) go
+            # unnoticed. Note only, not a `_deny()` call: nothing is
+            # actually being denied here.
+            _audit(
+                session,
+                actor_sub=sub,
+                action="agent.reregister_is_shared_ignored",
+                agent_id=agent.id,
+                detail={
+                    "is_shared_requested": is_shared,
+                    "is_shared_effective": agent.is_shared,
+                    "is_shared_authorized": is_shared_authorized,
+                },
+            )
+        # owner_sub and is_shared are deliberately NOT overwritten on
+        # re-registration. owner_sub is read by AgentTableOwnershipClient
+        # as the input to may_assign's admission decision, and agent-jwt
+        # extra claims (including owner_sub) are caller-supplied and
+        # unverified (providers/comms.py). Allowing a re-register to
+        # overwrite it would let a caller forge a victim's owner_sub,
+        # re-register their own agent under it, and be admitted into that
+        # victim's tasks. is_shared is frozen for the same reason: it's an
+        # admission-decision input (shared senders bypass the
+        # boundary-crossing check) and must not be escalatable
+        # post-registration. Freezing both at first registration closes
+        # those paths; owner_email is NOT similarly frozen. Unlike
+        # owner_sub, owner_email now does carry admission-decision weight
+        # (as of TECH-5159's lookup_agent_by_email, which resolves callers
+        # by this field), but it remains a caller-supplied, unverified
+        # claim rather than a proven mailbox ownership fact -- see
+        # lookup_agent_by_email's docstring for the resulting trust-model
+        # gap this re-write permits.
         agent.owner_email = owner_email
         agent.display_name = display_name
         agent.accepted_types = normalized_types
@@ -943,7 +1015,11 @@ async def register_agent(
         actor_sub=sub,
         action="agent.register",
         agent_id=agent.id,
-        detail={"created": created},
+        # `is_shared` is the effective/persisted row value (agent.is_shared);
+        # `is_shared_requested` is the caller-supplied value. These can
+        # diverge on re-registration, since is_shared is frozen -- do not
+        # conflate them.
+        detail={"created": created, "is_shared": agent.is_shared, "is_shared_requested": is_shared},
     )
     await session.commit()
     return agent
@@ -1253,8 +1329,9 @@ async def _authorize_conversation_open(
     if conversation_type == "open":
         return None
     owner_sets: dict[uuid.UUID, frozenset[str]] = {}
+    is_shared_by_id: dict[uuid.UUID, bool] = {}
     try:
-        owner_sets = await _owner_sets_for(participants, ownership_client)
+        owner_sets, is_shared_by_id = await _owner_sets_for(participants, ownership_client)
     except Exception as exc:
         logger.warning(
             "ownership lookup failed opening a conversation: %s",
@@ -1281,7 +1358,31 @@ async def _authorize_conversation_open(
             agent_id=initiator.id,
             detail={"conversation_type": conversation_type},
         )
-    if not _pairwise_admitted(conversation_type, participants, owner_sets):
+    # The shared-initiator bypass only applies to `asymmetric` — the type
+    # `is_shared` exists to bridge (DESIGN.md §9). `internal` requires every
+    # participant to share one owner set BY CONSTRUCTION; letting a shared
+    # initiator skip that check would let it open an `internal` conversation
+    # across disjoint owners, defeating the type's invariant entirely.
+    shared_bypass = conversation_type == "asymmetric" and is_shared_by_id.get(initiator.id, False)
+    if shared_bypass:
+        # Mirrors _enforce_boundary_crossing's agent.boundary_check_bypassed_shared
+        # audit: staged, not committed (Argus round 5), for consistency
+        # with that sibling bypass-observability event -- both are
+        # persisted by the caller's own enclosing commit along with the
+        # rest of the operation, exactly like every other non-`_deny`
+        # audit call in this module. (An earlier round committed this one
+        # immediately, since start_conversation holds no row lock here
+        # unlike post_message; that asymmetry in durability between two
+        # events DESIGN.md documents as the same category was itself the
+        # bug -- consistency trumps the now-moot durability advantage.)
+        _audit(
+            session,
+            actor_sub=actor_sub,
+            action="agent.conversation_open_bypassed_shared",
+            agent_id=initiator.id,
+            detail={"conversation_type": conversation_type},
+        )
+    if not shared_bypass and not _pairwise_admitted(conversation_type, participants, owner_sets):
         await _deny(
             session,
             actor_sub=actor_sub,
@@ -1995,27 +2096,30 @@ async def _enforce_boundary_crossing(
     raising must not silently admit a boundary crossing).
     """
     boundary_safe = is_boundary_safe(message_type, schema_version)
+    sender_info: dict[str, Any] = {}
     sender_owners: frozenset[str] = frozenset()
     other_owners: frozenset[str] = frozenset()
     other_owner_sets: list[frozenset[str]] = []
     if conversation_type == "asymmetric" and not boundary_safe:
+        # Sequential, not asyncio.gather: AgentTableOwnershipClient's
+        # get_agent_owners shares this call's AsyncSession, which
+        # SQLAlchemy's AsyncSession does not support across concurrent
+        # coroutines.
         try:
-            # Sequential, not asyncio.gather: AgentTableOwnershipClient's
-            # get_agent_owners shares this call's AsyncSession, which
-            # SQLAlchemy's AsyncSession does not support across concurrent
-            # coroutines.
             sender_info = await ownership_client.get_agent_owners(sender_agent_id)
-            sender_owners = frozenset(sender_info.get("owners") or [])
-            for pid in other_agent_ids:
-                info = await ownership_client.get_agent_owners(pid)
-                other_owner_sets.append(frozenset(info.get("owners") or []))
-            other_owners = frozenset().union(*other_owner_sets) if other_owner_sets else frozenset()
         except Exception as exc:
             logger.warning(
                 "ownership lookup failed checking boundary crossing: %s",
                 type(exc).__name__,
                 exc_info=True,
             )
+            # No `return` here (Argus round 5): unlike the deliberate
+            # early-return on a successful bypass below, returning after a
+            # denial would fail OPEN if `_deny`'s NoReturn contract were
+            # ever weakened -- falling through is fail-closed instead,
+            # since `sender_info` is pre-initialized to `{}` above (so
+            # `.get("is_shared")` below is falsy) and the next ownership
+            # check re-denies on the still-empty `sender_owners` default.
             await _deny(
                 session,
                 actor_sub=actor_sub,
@@ -2024,6 +2128,68 @@ async def _enforce_boundary_crossing(
                 conversation_id=conversation_id,
                 detail={"message_type": message_type},
             )
+        if sender_info.get("is_shared"):
+            # Outside the ownership-lookup try/except (Argus round 3): staging
+            # this audit inside that block risked a session-state error being
+            # mislabeled as `denied.ownership_unverified`. Staged, not
+            # committed (Argus round 4): the caller (post_message) holds a
+            # SELECT ... FOR UPDATE lock on the Conversation row to
+            # serialize seq assignment, and committing here would release
+            # that lock mid-request, letting two concurrent shared senders
+            # race on seq. This audit row is persisted by the caller's own
+            # enclosing commit along with the rest of the operation, exactly
+            # like every other non-`_deny` audit call in this module.
+            _audit(
+                session,
+                actor_sub=actor_sub,
+                action="agent.boundary_check_bypassed_shared",
+                agent_id=sender_agent_id,
+                conversation_id=conversation_id,
+                detail={"message_type": message_type},
+            )
+            return
+        # `if sender_info:` (Argus round 6), not just proceeding
+        # unconditionally: when the first lookup failed, `sender_info` is
+        # still `{}` and `sender_owners` is still its empty default, so
+        # there is nothing for this second lookup to add -- skipping it
+        # avoids both a wasted round trip and a second
+        # `denied.ownership_unverified` audit row for the same underlying
+        # failure if `_deny`'s NoReturn contract were ever weakened.
+        if sender_info:
+            try:
+                sender_owners = frozenset(sender_info.get("owners") or [])
+                for pid in other_agent_ids:
+                    info = await ownership_client.get_agent_owners(pid)
+                    other_owner_sets.append(frozenset(info.get("owners") or []))
+                other_owners = (
+                    frozenset().union(*other_owner_sets) if other_owner_sets else frozenset()
+                )
+            except Exception as exc:
+                logger.warning(
+                    "ownership lookup failed checking boundary crossing: %s",
+                    type(exc).__name__,
+                    exc_info=True,
+                )
+                # Force `sender_owners` back to empty (Argus round 6): it may
+                # already hold a real, non-empty value from the assignment
+                # above, computed before this loop raised. Left as-is, a
+                # `_deny` that failed to raise would fall through to the
+                # `not sender_owners` check below with a *non-empty*
+                # `sender_owners` and an *empty* `other_owners` (never
+                # reached its assignment) -- and an empty `other_owners` is
+                # a subset of any `sender_owners`, so
+                # `is_boundary_crossing_safe` would admit the message.
+                # Resetting here keeps this except block fail-closed the
+                # same way the first one already is.
+                sender_owners = frozenset()
+                await _deny(
+                    session,
+                    actor_sub=actor_sub,
+                    action="denied.ownership_unverified",
+                    agent_id=sender_agent_id,
+                    conversation_id=conversation_id,
+                    detail={"message_type": message_type},
+                )
         if not sender_owners or any(not owners for owners in other_owner_sets):
             await _deny(
                 session,
@@ -2061,7 +2227,7 @@ async def _enforce_boundary_crossing(
                 conversation_id=conversation_id,
                 detail={
                     "message_type": message_type,
-                    "sender_is_shared": len(sender_owners) > 1,
+                    "sender_multi_owner": len(sender_owners) > 1,
                     "other_owners_outside_sender": bool(other_owners - sender_owners),
                 },
             )
@@ -2658,20 +2824,10 @@ class AgentTableOwnershipClient:
     """Interim ``OwnershipClient`` until the platform's real ownership
     endpoint ships.
 
-    Wraps the existing ``agents.owner_sub`` column as a single-element
-    owner set; ``is_shared`` is always ``False`` since no shared-agent
-    concept exists in this schema yet. This is exactly correct for every
-    agent registered today: two agents bound to the same ``owner_sub``
-    (e.g. two agents belonging to one person) intersect via ``may_assign``
-    precisely as they should, and unrelated agents correctly do not. Swap
-    this for a real platform-backed client the moment shared agents exist
-    — the ``OwnershipClient`` protocol is the seam, not this class.
-
-    Safe to use as an authorization input specifically because
-    ``register_agent`` freezes ``owner_sub`` at first registration and
-    never overwrites it on re-registration (see that function) — reading
-    it here would otherwise let a caller forge a victim's ``owner_sub``
-    via a re-register call.
+    Wraps the existing ``agents`` columns: ``owner_sub`` as a
+    single-element owner set, and ``is_shared`` from the DB (frozen at
+    first registration). Safe to use as an authorization input because
+    both columns are frozen at first registration — see ``register_agent``.
     """
 
     def __init__(self, session: AsyncSession) -> None:
@@ -2681,7 +2837,7 @@ class AgentTableOwnershipClient:
         agent = await _find_agent_by_id(self._session, agent_id)
         if agent is None:
             raise LookupError(f"unknown agent {agent_id}")
-        return {"is_shared": False, "owners": [agent.owner_sub]}
+        return {"is_shared": agent.is_shared, "owners": [agent.owner_sub]}
 
 
 def may_assign(creator_owners: AbstractSet[str], assignee_owners: AbstractSet[str]) -> bool:

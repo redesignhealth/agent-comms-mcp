@@ -243,6 +243,52 @@ class TestSchema:
         # gap) were ever reverted.
         assert ">= 1" in constraint_def
 
+    async def test_agents_is_shared_column_default_and_not_null(self, engine: AsyncEngine) -> None:
+        """Migration a1b2c3d4e5f6: ``is_shared`` backfills to ``False`` on
+        a row that omits it, and is NOT NULL at the DB level."""
+        cols = await _columns(engine, "agents")
+        assert "is_shared" in cols
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO agents "
+                    "(sub, owner_sub, owner_email, display_name, accepted_types, status) "
+                    "VALUES (:sub, :owner_sub, :owner_email, :display_name, ARRAY['note'], "
+                    "'active')"
+                ),
+                {
+                    "sub": "test-is-shared-backfill-row",
+                    "owner_sub": "test-is-shared-backfill-row",
+                    "owner_email": "test-is-shared-backfill-row",
+                    "display_name": "test-is-shared-backfill-row",
+                },
+            )
+            row = (
+                await conn.execute(
+                    text("SELECT is_shared FROM agents WHERE sub = :sub"),
+                    {"sub": "test-is-shared-backfill-row"},
+                )
+            ).one()
+            assert row.is_shared is False
+            nullable = (
+                await conn.execute(
+                    text(
+                        "SELECT is_nullable FROM information_schema.columns "
+                        "WHERE table_schema = 'public' AND table_name = 'agents' "
+                        "AND column_name = 'is_shared'"
+                    )
+                )
+            ).scalar_one_or_none()
+            # Cleanup: this module has no autouse table-truncation fixture,
+            # so a row this test itself inserted must be removed, or it
+            # leaks into every later test/module run against the same
+            # database.
+            await conn.execute(
+                text("DELETE FROM agents WHERE sub = :sub"),
+                {"sub": "test-is-shared-backfill-row"},
+            )
+        assert nullable == "NO"
+
     async def test_conversations_columns(self, engine: AsyncEngine) -> None:
         cols = await _columns(engine, "conversations")
         for expected in (

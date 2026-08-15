@@ -158,6 +158,14 @@ class Agent(Base):
     max_schema_version: Mapped[int] = mapped_column(
         Integer, nullable=False, default=1, server_default=text("1")
     )
+    # Frozen at first registration (service.register_agent) - an
+    # admission-decision input (DESIGN.md §9), so a later re-registration
+    # must never be able to change it. Self-declaring True on first
+    # registration requires the caller's token to carry `comms:admin`
+    # (scopes.py); see providers.comms.register.
+    is_shared: Mapped[bool] = mapped_column(
+        nullable=False, default=False, server_default=text("false")
+    )
     # Not one of DESIGN.md §5's five listed columns, but an additive,
     # non-conflicting bookkeeping field: the idempotent `comms_register`
     # tool (§4) re-binds an existing agent row on every call, and needs a

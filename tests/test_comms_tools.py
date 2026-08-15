@@ -609,6 +609,170 @@ class TestRegister:
         assert "min_schema_version" not in whoami
         assert "max_schema_version" not in whoami
 
+    async def test_register_is_shared_true_requires_admin_scope(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """A caller with only the baseline ``comms:write`` scope cannot
+        self-declare ``is_shared=True`` on first registration -- it is an
+        admission-decision input (DESIGN.md §9), so unscoped self-escalation
+        would be a privilege escalation. See ``scopes.py``'s ``comms:admin``
+        entry and ``service.register_agent``'s ``is_shared_authorized``."""
+        token = _token("agent-is-shared-unauthorized", scopes=["comms:read", "comms:write"])
+        with pytest.raises(
+            ToolError, match=re.escape("access_denied: not authorized for this resource")
+        ) as exc_info:
+            await _call(
+                main,
+                test_session_factory,
+                token,
+                "comms_register",
+                {
+                    "display_name": "Unauthorized Shared",
+                    "accepted_types": ["availability_request"],
+                    "is_shared": True,
+                },
+            )
+        assert "is_shared" not in str(exc_info.value)
+
+    async def test_register_is_shared_true_with_admin_scope_succeeds(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """The ``comms:admin`` scope is what lets a caller mint a shared
+        agent on first registration; the response echoes ``is_shared``."""
+        token = _token(
+            "agent-is-shared-authorized", scopes=["comms:read", "comms:write", "comms:admin"]
+        )
+        result = await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {
+                "display_name": "Authorized Shared",
+                "accepted_types": ["availability_request"],
+                "is_shared": True,
+            },
+        )
+        assert result["is_shared"] is True
+
+    async def test_register_is_shared_default_false_no_admin_scope_needed(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """The default (``is_shared`` omitted, i.e. ``False``) never needs
+        the elevated scope -- only requesting ``True`` does."""
+        token = _token("agent-is-shared-default", scopes=["comms:read", "comms:write"])
+        result = await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {"display_name": "Default Not Shared", "accepted_types": ["availability_request"]},
+        )
+        assert result["is_shared"] is False
+
+    async def test_register_is_shared_frozen_at_mcp_boundary(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Tool-layer counterpart to
+        ``test_service.test_is_shared_frozen_on_reregister``: re-registering
+        through the MCP tool without the admin scope the second time neither
+        gets denied (the gate only fires on FIRST registration) nor changes
+        the already-frozen stored value -- freeze semantics hold at this
+        boundary too."""
+        admin_token = _token(
+            "agent-is-shared-freeze-mcp", scopes=["comms:read", "comms:write", "comms:admin"]
+        )
+        first = await _call(
+            main,
+            test_session_factory,
+            admin_token,
+            "comms_register",
+            {
+                "display_name": "Freeze v1",
+                "accepted_types": ["availability_request"],
+                "is_shared": True,
+            },
+        )
+        assert first["is_shared"] is True
+
+        unauthorized_token = _token(
+            "agent-is-shared-freeze-mcp", scopes=["comms:read", "comms:write"]
+        )
+        second = await _call(
+            main,
+            test_session_factory,
+            unauthorized_token,
+            "comms_register",
+            {
+                "display_name": "Freeze v2",
+                "accepted_types": ["availability_request"],
+                "is_shared": True,
+            },
+        )
+        assert second["is_shared"] is True
+        assert second["display_name"] == "Freeze v2"
+
+    async def test_register_is_shared_false_to_true_upgrade_attempt_stays_false(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """The freeze boundary in the OTHER direction: an agent first
+        registered with ``is_shared=False`` cannot be upgraded to ``True``
+        on re-registration, even without attempting the admin-scope gate
+        (freeze is checked before authorization would even matter, since
+        ``is_shared_authorized`` only gates FIRST registration)."""
+        token = _token("agent-is-shared-upgrade-attempt", scopes=["comms:read", "comms:write"])
+        first = await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {"display_name": "Upgrade v1", "accepted_types": ["availability_request"]},
+        )
+        assert first["is_shared"] is False
+
+        second = await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {
+                "display_name": "Upgrade v2",
+                "accepted_types": ["availability_request"],
+                "is_shared": True,
+            },
+        )
+        assert second["is_shared"] is False
+        assert second["display_name"] == "Upgrade v2"
+
+    async def test_register_is_shared_true_interactive_caller_no_admin_scope_needed(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Interactive (Okta) callers bypass scope checks entirely elsewhere
+        in this module (``is_interactive_token``); the same bypass applies
+        to the ``comms:admin`` gate on ``is_shared=True`` -- an interactive
+        caller needs no scopes claim at all to set it on first registration."""
+        interactive_token = MagicMock()
+        interactive_token.claims = {
+            "iss": "https://agent-comms.example/mcp",
+            "sub": "interactive-shared-owner",
+            "email": "interactive-shared-owner@example.com",
+        }
+        interactive_token.scopes = []
+        interactive_token.client_id = "interactive-shared-owner"
+
+        result = await _call(
+            main,
+            test_session_factory,
+            interactive_token,
+            "comms_register",
+            {
+                "display_name": "Interactive Shared",
+                "accepted_types": ["availability_request"],
+                "is_shared": True,
+            },
+        )
+        assert result["is_shared"] is True
+
 
 # --- AXI empty-state / shape spot checks --------------------------------------------
 
