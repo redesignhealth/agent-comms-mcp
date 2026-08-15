@@ -244,7 +244,11 @@ scroll-to-load-more use case.
  neither mutations nor denials: `agent.boundary_check_bypassed_shared`/`agent.conversation_open_bypassed_shared`
  (a `comms:admin`-authorized shared sender/initiator skipped the ownership-boundary
  check, §9) and `agent.reregister_is_shared_ignored` (a re-registration's requested
- `is_shared` diverged from the frozen row value and was ignored, §5).
+ `is_shared` diverged from the frozen row value and was ignored, §5). Unlike denial
+ events (committed immediately by the denial helper), bypass-observability events
+ are staged within the request's own transaction and are only persisted if that
+ transaction ultimately commits -- a deliberate consistency tradeoff shared by
+ both bypass events, not a durability guarantee.
 6. Fail-closed tool scoping: unenrolled tool is unreachable by agent tokens.
 7. Rate limits per sender (30 messages/hour/conversation, 10 conversation-starts/hour),
  message size caps, participant cap (50 per conversation), and conversation expiry (7 days).

@@ -2148,26 +2148,48 @@ async def _enforce_boundary_crossing(
                 detail={"message_type": message_type},
             )
             return
-        try:
-            sender_owners = frozenset(sender_info.get("owners") or [])
-            for pid in other_agent_ids:
-                info = await ownership_client.get_agent_owners(pid)
-                other_owner_sets.append(frozenset(info.get("owners") or []))
-            other_owners = frozenset().union(*other_owner_sets) if other_owner_sets else frozenset()
-        except Exception as exc:
-            logger.warning(
-                "ownership lookup failed checking boundary crossing: %s",
-                type(exc).__name__,
-                exc_info=True,
-            )
-            await _deny(
-                session,
-                actor_sub=actor_sub,
-                action="denied.ownership_unverified",
-                agent_id=sender_agent_id,
-                conversation_id=conversation_id,
-                detail={"message_type": message_type},
-            )
+        # `if sender_info:` (Argus round 6), not just proceeding
+        # unconditionally: when the first lookup failed, `sender_info` is
+        # still `{}` and `sender_owners` is still its empty default, so
+        # there is nothing for this second lookup to add -- skipping it
+        # avoids both a wasted round trip and a second
+        # `denied.ownership_unverified` audit row for the same underlying
+        # failure if `_deny`'s NoReturn contract were ever weakened.
+        if sender_info:
+            try:
+                sender_owners = frozenset(sender_info.get("owners") or [])
+                for pid in other_agent_ids:
+                    info = await ownership_client.get_agent_owners(pid)
+                    other_owner_sets.append(frozenset(info.get("owners") or []))
+                other_owners = (
+                    frozenset().union(*other_owner_sets) if other_owner_sets else frozenset()
+                )
+            except Exception as exc:
+                logger.warning(
+                    "ownership lookup failed checking boundary crossing: %s",
+                    type(exc).__name__,
+                    exc_info=True,
+                )
+                # Force `sender_owners` back to empty (Argus round 6): it may
+                # already hold a real, non-empty value from the assignment
+                # above, computed before this loop raised. Left as-is, a
+                # `_deny` that failed to raise would fall through to the
+                # `not sender_owners` check below with a *non-empty*
+                # `sender_owners` and an *empty* `other_owners` (never
+                # reached its assignment) -- and an empty `other_owners` is
+                # a subset of any `sender_owners`, so
+                # `is_boundary_crossing_safe` would admit the message.
+                # Resetting here keeps this except block fail-closed the
+                # same way the first one already is.
+                sender_owners = frozenset()
+                await _deny(
+                    session,
+                    actor_sub=actor_sub,
+                    action="denied.ownership_unverified",
+                    agent_id=sender_agent_id,
+                    conversation_id=conversation_id,
+                    detail={"message_type": message_type},
+                )
         if not sender_owners or any(not owners for owners in other_owner_sets):
             await _deny(
                 session,
