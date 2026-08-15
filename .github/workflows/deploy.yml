@@ -331,11 +331,16 @@ jobs:
         # a false-green (or false-red) deploy result. So this captures a
         # timestamp immediately before dispatching, then polls specifically
         # for a workflow_dispatch run created at or after that timestamp,
-        # taking the EARLIEST such match (not just the newest run overall).
-        # This is NOT a fully deterministic guarantee (Argus round 3,
-        # SUGGESTION): a concurrent dispatch of this same workflow by another
-        # actor in the window between our dispatch and GitHub indexing it
-        # could in principle be selected instead. Accepted as a real, small
+        # taking the LATEST such match. Argus round 4, BLOCKING: an earlier
+        # version took the EARLIEST match combined with a 60s clock-skew
+        # backdate -- that combination deterministically selects an OLDER
+        # concurrent run (e.g. an operator's manual rollback dispatched
+        # shortly before this release) over the one this step just fired.
+        # Our own dispatch is always the most recent eligible run once it's
+        # indexed, so "latest" is both the fix and the correct semantics --
+        # this is NOT a fully deterministic guarantee: a concurrent dispatch
+        # by another actor landing AFTER ours but before the poll captures
+        # it could still be selected instead. Accepted as a real, small
         # residual risk rather than adding a unique run-name/displayTitle
         # correlation for what is, in practice, a workflow only this job and
         # a human running a manual rollback ever dispatch.
@@ -343,35 +348,47 @@ jobs:
         # timeout-minutes on this step (below) bounds a hung downstream run
         # so it can't hold the deploy concurrency slot and the production
         # environment lock indefinitely. A timeout here does NOT cancel the
-        # downstream rh-data-platform run -- Terraform apply/ECS
+        # downstream rh-data-platform run by default -- Terraform apply/ECS
         # stabilization keeps proceeding independently, so a timeout means
         # "we stopped watching," not "the deploy failed." The trap below
-        # attempts a best-effort cancellation once $RUN_ID is known, so a
-        # timeout that fires after that point actually stops the downstream
-        # run rather than leaving it to finish unobserved; see
-        # docs/RELEASING.md for the operator-facing version of this caveat.
+        # makes a BEST-EFFORT attempt to cancel the downstream run once
+        # $RUN_ID is known, using background+wait (not a plain foreground
+        # `gh run watch`) specifically so bash actually delivers the signal
+        # promptly instead of deferring it until the foreground command
+        # exits on its own -- but GitHub Actions' own timeout enforcement
+        # can still escalate to SIGKILL on the whole process tree before the
+        # handler completes, so this is not a guarantee. See
+        # docs/RELEASING.md for the operator-facing version of this caveat,
+        # including what to check if a timeout leaves rh-data-platform's
+        # Terraform state locked mid-apply.
         timeout-minutes: 20
         env:
           GH_TOKEN: ${{ steps.rh-data-platform-token.outputs.token }}
           IMAGE_TAG: sha-${{ github.sha }}
         run: |
-          # Small safety margin against the runner clock running ahead of
-          # GitHub's servers (Argus round 3, SUGGESTION): createdAt is
-          # server-assigned, so if the runner clock is even slightly fast,
-          # a >= comparison against the unadjusted dispatch time could never
-          # match our own run.
-          DISPATCH_TIME=$(date -u -d '-60 seconds' +%Y-%m-%dT%H:%M:%SZ)
+          # Narrow safety margin (Argus round 4, BLOCKING follow-on: the
+          # prior 60s margin combined with earliest-match was what caused
+          # the rollback-collision bug above) against the runner clock
+          # running very slightly ahead of GitHub's servers -- createdAt is
+          # server-assigned, so if the runner clock is even slightly fast, a
+          # >= comparison against the unadjusted dispatch time could never
+          # match our own run. 10s comfortably covers realistic NTP drift
+          # without reopening the wide collision window 60s did.
+          DISPATCH_TIME=$(date -u -d '-10 seconds' +%Y-%m-%dT%H:%M:%SZ)
           gh workflow run deploy-reclaw-comms.yml \
             --repo redesignhealth/rh-data-platform \
             --ref main \
             -f image_tag="$IMAGE_TAG"
 
           RUN_ID=""
-          trap '[ -n "$RUN_ID" ] && gh run cancel "$RUN_ID" --repo redesignhealth/rh-data-platform 2>/dev/null; true' TERM
+          trap '[ -n "$RUN_ID" ] && (gh run cancel "$RUN_ID" --repo redesignhealth/rh-data-platform 2>/dev/null || true); exit 1' TERM
           # 20 x 15s = 5 minutes -- GitHub's own docs note workflow_dispatch
           # runs can take a while to appear in the run list under load
           # (Argus round 3, SUGGESTION: the original 60s ceiling was too
-          # tight and risked a false-negative "run not found" failure).
+          # tight and risked a false-negative "run not found" failure). This
+          # discovery loop's own time is additional to the watch below, so
+          # the effective downstream-run budget is up to ~15 minutes
+          # watching, not the full 20 (see docs/RELEASING.md).
           for _ in $(seq 1 20); do
             sleep 15
             RUN_ID=$(gh run list \
@@ -381,7 +398,7 @@ jobs:
               --limit 10 \
               --json databaseId,createdAt | \
               jq -r --arg t "$DISPATCH_TIME" \
-                '[.[] | select(.createdAt >= $t)] | sort_by(.createdAt) | .[0].databaseId // empty')
+                '[.[] | select(.createdAt >= $t)] | sort_by(.createdAt) | last | .databaseId // empty')
             if [ -n "$RUN_ID" ]; then
               break
             fi
@@ -391,6 +408,13 @@ jobs:
             exit 1
           fi
           echo "Watching rh-data-platform run $RUN_ID (dispatched at $DISPATCH_TIME)..."
+          # Backgrounded + waited on, not a plain foreground call: bash
+          # defers a trapped signal until the foreground command exits on
+          # its own, which would defeat the whole point of the trap above on
+          # a hung/slow watch. Signals delivered to the shell while it's
+          # blocked in `wait` are handled immediately instead.
           gh run watch "$RUN_ID" \
             --repo redesignhealth/rh-data-platform \
-            --exit-status
+            --exit-status &
+          WATCH_PID=$!
+          wait "$WATCH_PID"

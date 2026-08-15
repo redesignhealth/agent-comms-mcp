@@ -31,14 +31,23 @@
     the requested permission isn't granted to the App installation, with an
     error like "Requested permissions are not available" rather than a bad
     credentials error. The dispatch step is never reached either way.
-    The dispatch step has its own separate failure mode: a 20-minute
-    `timeout-minutes` ceiling on watching the downstream run. If
-    `deploy-reclaw-comms.yml` takes longer than that (dev+prod Terraform
-    apply plus ECS stabilization), this step fails even though the
-    downstream deploy is still proceeding -- a best-effort `trap` cancels
-    the downstream run in that case, but check rh-data-platform's Actions
-    tab to confirm actual ECS state before assuming a red run means nothing
-    deployed.
+    The dispatch step has its own separate failure mode: `timeout-minutes: 20`
+    on the step overall, but up to 5 minutes of that is spent discovering the
+    dispatched run before watching even starts -- the effective downstream
+    watch budget is closer to ~15 minutes, not the full 20. If
+    `deploy-reclaw-comms.yml` (dev+prod Terraform apply plus ECS
+    stabilization) takes longer than that, this step fails even though the
+    downstream deploy may still be proceeding -- a best-effort `trap`
+    attempts to cancel the downstream run in that case (not guaranteed:
+    GitHub Actions can escalate to SIGKILL on the whole process tree before
+    the handler runs), but check rh-data-platform's Actions tab to confirm
+    actual ECS state before assuming a red run means nothing deployed.
+    **If the trap's cancellation lands mid-`terraform apply`**, it can leave
+    rh-data-platform's Terraform backend with a held state lock -- the next
+    deploy attempt (from any service, not just this one) fails immediately
+    on lock acquisition with no explanation. Check for a stuck lock and run
+    the equivalent of `terraform force-unlock` in rh-data-platform, or
+    escalate to whoever owns that repo's Terraform state, before re-releasing.
   - **Merge order**: [rh-data-platform#7796](https://github.com/redesignhealth/rh-data-platform/pull/7796)
     (or its successor, if already merged -- confirm the IAM role above has
     had its ECS/PassRole grants removed and `deploy-reclaw-comms.yml` exists)
