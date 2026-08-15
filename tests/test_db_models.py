@@ -274,7 +274,8 @@ class TestSchema:
                 await conn.execute(
                     text(
                         "SELECT is_nullable FROM information_schema.columns "
-                        "WHERE table_name = 'agents' AND column_name = 'is_shared'"
+                        "WHERE table_schema = 'public' AND table_name = 'agents' "
+                        "AND column_name = 'is_shared'"
                     )
                 )
             ).scalar_one_or_none()

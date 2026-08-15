@@ -956,18 +956,19 @@ async def register_agent(
         session.add(agent)
     else:
         agent = existing
-        if is_shared and not is_shared_authorized:
+        if is_shared != agent.is_shared:
             # Re-registration can never change the already-frozen `is_shared`
             # value (see the comment below), so this has no effect on the
             # row -- but leaving it unaudited would let repeated probing of
-            # this escalation vector go unnoticed. Note only, not a
-            # `_deny()` call: nothing is actually being denied here.
+            # this escalation vector (or an accidental downgrade attempt) go
+            # unnoticed. Note only, not a `_deny()` call: nothing is
+            # actually being denied here.
             _audit(
                 session,
                 actor_sub=sub,
                 action="agent.reregister_is_shared_ignored",
                 agent_id=agent.id,
-                detail={"is_shared_requested": True},
+                detail={"is_shared_requested": is_shared, "is_shared_effective": agent.is_shared},
             )
         # owner_sub and is_shared are deliberately NOT overwritten on
         # re-registration. owner_sub is read by AgentTableOwnershipClient
@@ -1000,7 +1001,7 @@ async def register_agent(
         actor_sub=sub,
         action="agent.register",
         agent_id=agent.id,
-        detail={"created": created, "is_shared": is_shared},
+        detail={"created": created, "is_shared": agent.is_shared, "is_shared_requested": is_shared},
     )
     await session.commit()
     return agent
@@ -2070,6 +2071,14 @@ async def _enforce_boundary_crossing(
             # coroutines.
             sender_info = await ownership_client.get_agent_owners(sender_agent_id)
             if sender_info.get("is_shared"):
+                _audit(
+                    session,
+                    actor_sub=actor_sub,
+                    action="agent.boundary_check_bypassed_shared",
+                    agent_id=sender_agent_id,
+                    conversation_id=conversation_id,
+                    detail={"message_type": message_type},
+                )
                 return
             sender_owners = frozenset(sender_info.get("owners") or [])
             for pid in other_agent_ids:

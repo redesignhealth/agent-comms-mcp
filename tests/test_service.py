@@ -506,6 +506,36 @@ class TestRegisterAgent:
         assert second.id == first.id
         assert second.is_shared is True
 
+    async def test_reregister_is_shared_mismatch_is_audited(self, session: AsyncSession) -> None:
+        """A re-registration that requests a different ``is_shared`` value
+        than the frozen row has no effect on the row (see the freeze tests
+        above), but must still leave an audit trail of the mismatch --
+        otherwise repeated probing of this escalation vector (or an
+        accidental downgrade attempt) goes unnoticed."""
+        first = await _register(
+            session, "shared-mismatch-audit", is_shared=False, is_shared_authorized=True
+        )
+        assert first.is_shared is False
+
+        second = await _register(
+            session, "shared-mismatch-audit", is_shared=True, is_shared_authorized=False
+        )
+        assert second.id == first.id
+        assert second.is_shared is False
+
+        rows = (
+            await session.execute(
+                select(AuditLog.action, AuditLog.detail).where(
+                    AuditLog.actor_sub == "shared-mismatch-audit",
+                    AuditLog.action == "agent.reregister_is_shared_ignored",
+                )
+            )
+        ).all()
+        assert len(rows) == 1
+        _, detail = rows[0]
+        assert detail["is_shared_requested"] is True
+        assert detail["is_shared_effective"] is False
+
     async def test_is_shared_true_denied_without_authorization(self, session: AsyncSession) -> None:
         """First registration with ``is_shared=True`` and
         ``is_shared_authorized=False`` (the fail-closed default) is denied
