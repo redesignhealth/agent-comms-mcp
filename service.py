@@ -94,11 +94,13 @@ expand a frozen owner set), ``denied.unknown_conversation_type`` (a
 conversation row's ``type`` isn't in ``schemas.CONVERSATION_TYPES`` — a
 migration/data-integrity gap, e.g. a legacy pre-rename row — distinct from
 an actual ownership-boundary crossing), ``denied.boundary_crossing``/
-``denied.wrong_sender_role`` (DESIGN.md §9 Axis 2's per-message checks), and
+``denied.wrong_sender_role`` (DESIGN.md §9 Axis 2's per-message checks),
 ``denied.message_type_not_accepted`` (a recipient hasn't declared
 ``message_type`` in their own ``accepted_types`` — a capability gate, not a
 trust boundary, so it applies universally, even to ``internal`` traffic
-that boundary-crossing itself always allows).
+that boundary-crossing itself always allows), and
+``denied.is_shared_requires_elevated_scope`` (a caller without ``comms:admin``
+tried to self-declare ``is_shared=True`` at first registration).
 """
 
 from __future__ import annotations
@@ -677,7 +679,7 @@ async def _owner_sets_for(
     reuse this single pass instead of issuing a second lookup.
 
     Callers MUST fail closed on any exception raised here (see
-    ``OwnershipClient``'s docstring) — this helper does not catch.
+    ``OwnershipClient``'s docstring) - this helper does not catch.
     """
     owner_sets: dict[uuid.UUID, frozenset[str]] = {}
     is_shared_by_id: dict[uuid.UUID, bool] = {}
@@ -938,7 +940,6 @@ async def register_agent(
             action="denied.is_shared_requires_elevated_scope",
             detail={"display_name": display_name},
         )
-        raise AssertionError("_deny is NoReturn; unreachable")  # defense in depth (Argus round 2)
     if existing is None:
         agent = Agent(
             sub=sub,
@@ -955,6 +956,19 @@ async def register_agent(
         session.add(agent)
     else:
         agent = existing
+        if is_shared and not is_shared_authorized:
+            # Re-registration can never change the already-frozen `is_shared`
+            # value (see the comment below), so this has no effect on the
+            # row -- but leaving it unaudited would let repeated probing of
+            # this escalation vector go unnoticed. Note only, not a
+            # `_deny()` call: nothing is actually being denied here.
+            _audit(
+                session,
+                actor_sub=sub,
+                action="agent.reregister_is_shared_ignored",
+                agent_id=agent.id,
+                detail={"is_shared_requested": True},
+            )
         # owner_sub and is_shared are deliberately NOT overwritten on
         # re-registration. owner_sub is read by AgentTableOwnershipClient
         # as the input to may_assign's admission decision, and agent-jwt
@@ -986,7 +1000,7 @@ async def register_agent(
         actor_sub=sub,
         action="agent.register",
         agent_id=agent.id,
-        detail={"created": created},
+        detail={"created": created, "is_shared": is_shared},
     )
     await session.commit()
     return agent
@@ -2113,7 +2127,7 @@ async def _enforce_boundary_crossing(
                 conversation_id=conversation_id,
                 detail={
                     "message_type": message_type,
-                    "sender_is_shared": len(sender_owners) > 1,
+                    "sender_multi_owner": len(sender_owners) > 1,
                     "other_owners_outside_sender": bool(other_owners - sender_owners),
                 },
             )

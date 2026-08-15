@@ -432,7 +432,7 @@ async def register(
 
     # Shared with service.register_agent's own guard
     # (service.validate_schema_version_range) so tightening the rule in one
-    # place tightens it in both layers (Argus round 1) — this tool-layer
+    # place tightens it in both layers (Argus round 1) -- this tool-layer
     # call exists only to surface a specific ToolError instead of the
     # generic bare-ValueError mapping _map_service_errors would otherwise
     # give it.

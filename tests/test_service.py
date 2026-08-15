@@ -484,7 +484,7 @@ class TestRegisterAgent:
         assert second.max_schema_version == 1
 
     async def test_is_shared_frozen_on_reregister(self, session: AsyncSession) -> None:
-        """``is_shared`` is frozen at first registration — re-registering with
+        """``is_shared`` is frozen at first registration -- re-registering with
         a different value must not overwrite it (same freeze semantics as
         ``owner_sub``: both are admission-decision inputs)."""
         first = await _register(session, "shared-freeze", is_shared=False)

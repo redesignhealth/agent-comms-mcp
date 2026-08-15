@@ -618,7 +618,9 @@ class TestRegister:
         would be a privilege escalation. See ``scopes.py``'s ``comms:admin``
         entry and ``service.register_agent``'s ``is_shared_authorized``."""
         token = _token("agent-is-shared-unauthorized", scopes=["comms:read", "comms:write"])
-        with pytest.raises(ToolError, match="access_denied"):
+        with pytest.raises(
+            ToolError, match=re.escape("access_denied: not authorized for this resource")
+        ) as exc_info:
             await _call(
                 main,
                 test_session_factory,
@@ -630,6 +632,7 @@ class TestRegister:
                     "is_shared": True,
                 },
             )
+        assert "is_shared" not in str(exc_info.value)
 
     async def test_register_is_shared_true_with_admin_scope_succeeds(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]

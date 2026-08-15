@@ -6,7 +6,7 @@ Create Date: 2026-08-14 00:00:00.000000
 
 DEPLOYMENT: no stop-then-start needed -- this is a plain additive, backward-
 compatible column with a ``server_default``, and ``entrypoint.sh`` already
-runs ``agent-comms-mcp-migrate`` before ``agent-comms-mcp`` starts serving,
+runs ``alembic upgrade head`` before ``agent-comms-mcp`` starts serving,
 atomically, on every container startup. A normal rolling deploy is safe:
 each new container migrates-then-serves before taking traffic, and an
 old container still running (with code that never references
@@ -42,8 +42,9 @@ def upgrade() -> None:
             nullable=False,
             server_default=sa.text("false"),
         ),
+        if_not_exists=True,
     )
 
 
 def downgrade() -> None:
-    op.drop_column("agents", "is_shared")
+    op.drop_column("agents", "is_shared", if_exists=True)

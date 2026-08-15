@@ -177,7 +177,9 @@ Design notes:
  at first registration (re-registering with a different value has no effect)
  and self-declaring `True` at first registration requires the caller's token
  to carry an elevated `comms:admin` scope (or be an interactive/Okta caller);
- without it, `comms_register` denies with `denied.is_shared_requires_elevated_scope`.
+ without it, `comms_register` denies with `denied.is_shared_requires_elevated_scope`
+ (this is the audit-log reason key only; the caller receives the generic
+ `access_denied` message).
  There is intentionally no conversion path from `is_shared=false` to `true` for an
  existing agent (v1): the only way to become shared is `comms:admin`-authorized first
  registration of a NEW agent identity. An existing agent that needs to become shared
