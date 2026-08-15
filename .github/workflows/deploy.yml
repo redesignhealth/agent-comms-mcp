@@ -281,22 +281,47 @@ jobs:
       # `gh workflow run` dispatch, the same mechanism deploy-terraform.yml
       # uses for its own cross-job GitHub App token.
       #
+      # UNLIKE the old sync-only design, a failure here now means the
+      # service was NOT deployed -- this is the only deploy mechanism left,
+      # not a best-effort tfvars sync running after an already-completed ECS
+      # deploy. Don't read a red run here as "safe, just drifted"; the new
+      # image never reached ECS.
+      #
+      # deploy-reclaw-comms.yml's single dispatch covers BOTH dev and prod in
+      # one run (its deploy-dev and deploy-prod jobs both fire from this one
+      # workflow_dispatch, gated only on the image tag already existing in
+      # both ECR repos, which it does by the time this step runs) -- no
+      # separate dev-side dispatch is needed.
+      #
       # Requires two repo secrets here (RH_DATA_PLATFORM_DISPATCH_APP_ID /
       # RH_DATA_PLATFORM_DISPATCH_APP_PRIVATE_KEY) for a GitHub App
       # installed on rh-data-platform with `actions: write` -- provisioning
       # that app/installation and adding these secrets is a one-time,
-      # human/infra-owner action (see issue #7795); this step no-ops with a
-      # clear failure until that's done, it does not silently skip.
+      # human/infra-owner action (see issue #7795 and docs/RELEASING.md's
+      # Prerequisites section); this step fails loudly, not silently, until
+      # that's done.
       - name: Generate rh-data-platform dispatch token
         id: rh-data-platform-token
-        uses: actions/create-github-app-token@v1
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
         with:
           app-id: ${{ secrets.RH_DATA_PLATFORM_DISPATCH_APP_ID }}
           private-key: ${{ secrets.RH_DATA_PLATFORM_DISPATCH_APP_PRIVATE_KEY }}
           owner: redesignhealth
           repositories: rh-data-platform
+          # Downscope to exactly the permission this token is used for --
+          # without this it carries every permission the App installation
+          # has been granted on rh-data-platform, not just Actions.
+          permission-actions: write
 
-      - name: Sync rh-data-platform terraform.tfvars with the tag just deployed
+      - name: Deploy via rh-data-platform's deploy-reclaw-comms.yml
+        # `gh workflow run` only enqueues the dispatch -- it returns 0 the
+        # moment GitHub's API accepts the request, before the workflow even
+        # starts. A bare dispatch with no outcome check would report this
+        # job green even if deploy-reclaw-comms.yml then failed (bad image
+        # tag, tfvars merge conflict, a permissions problem) and the actual
+        # ECS deploy never happened -- silently recreating issue #7795 one
+        # hop downstream. So this step polls the dispatched run to
+        # completion and fails if it fails.
         env:
           GH_TOKEN: ${{ steps.rh-data-platform-token.outputs.token }}
           IMAGE_TAG: sha-${{ github.sha }}
@@ -305,3 +330,20 @@ jobs:
             --repo redesignhealth/rh-data-platform \
             --ref main \
             -f image_tag="$IMAGE_TAG"
+          # Give the dispatch a moment to register as a run before listing --
+          # GitHub's API can otherwise return zero matches for a request it
+          # just accepted.
+          sleep 5
+          RUN_ID=$(gh run list \
+            --repo redesignhealth/rh-data-platform \
+            --workflow deploy-reclaw-comms.yml \
+            --limit 1 \
+            --json databaseId --jq '.[0].databaseId')
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+            echo "ERROR: could not find the dispatched deploy-reclaw-comms.yml run -- cannot confirm the deploy succeeded." >&2
+            exit 1
+          fi
+          echo "Watching rh-data-platform run $RUN_ID..."
+          gh run watch "$RUN_ID" \
+            --repo redesignhealth/rh-data-platform \
+            --exit-status

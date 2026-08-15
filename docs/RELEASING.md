@@ -6,24 +6,33 @@
 - PyPI trusted publisher configured (already done — `publish.yml`, env `pypi`)
 - GitHub `production` environment configured on the repo with required reviewers
   (gates the `deploy-prod` job — without it, prod deploys are unreviewed)
-- Four IAM roles configured in `redesignhealth/rh-data-platform`, correct OIDC
+- Three IAM roles configured in `redesignhealth/rh-data-platform`, correct OIDC
   trust policies (see `deploy.yml` header comments for the exact trust split):
   - `rh-platform-dev-github-actions-ecr-push-role` and
     `rh-platform-github-actions-ecr-push-role` -- ECR push/pull only
-  - `rh-platform-dev-github-actions-ecs-deploy-reclaw-comms-role` and
-    `rh-platform-github-actions-ecs-deploy-reclaw-comms-role` -- ECS deploy +
-    `PassRole`, plus `ecr:GetAuthorizationToken` and (prod only) read access
-    to the dev ECR repo for image promotion. ECS deploy permissions live
-    **only** on these two roles, not on the ECR push roles above.
-  - **Merge order**: [rh-data-platform#7733](https://github.com/redesignhealth/rh-data-platform/pull/7733)
-    (or its successor, if already merged -- confirm the `github_actions_ecs_deploy_reclaw_comms`
-    role and policy exist in that repo's IAM Terraform) must be merged and
-    applied before cutting a release with this workflow. If the ECS deploy
-    roles don't exist yet: `deploy-dev` will push a new dev image successfully
-    and then fail assuming the role for its ECS deploy steps, leaving dev ECR
-    ahead of what's running; `deploy-prod` fails immediately at its first
-    step (assuming the ECS deploy role for dev-image read), before pushing
-    anything to prod ECR.
+  - `rh-platform-github-actions-ecs-deploy-reclaw-comms-role` (prod instance
+    only -- `deploy-dev` no longer assumes this role) -- read-only access to
+    the dev ECR repo, for `deploy-prod` to promote the dev image to prod ECR.
+    **This role carries no ECS or `PassRole` permissions as of issue #7795**:
+    this workflow no longer deploys to ECS directly at all -- see the next
+    bullet.
+  - **This workflow does not deploy to ECS.** `deploy-prod`'s last step
+    dispatches `redesignhealth/rh-data-platform`'s `deploy-reclaw-comms.yml`,
+    whose own `deploy-terraform.yml` calls are the only thing that ever
+    deploys this service. Two repo secrets gate that dispatch:
+    `RH_DATA_PLATFORM_DISPATCH_APP_ID` and
+    `RH_DATA_PLATFORM_DISPATCH_APP_PRIVATE_KEY`, for a GitHub App installed
+    on `rh-data-platform` with `actions: write`. Without them provisioned,
+    `deploy-prod` fails loudly at the "Generate rh-data-platform dispatch
+    token" step -- the service is not deployed, not "deployed but drifted."
+  - **Merge order**: [rh-data-platform#7796](https://github.com/redesignhealth/rh-data-platform/pull/7796)
+    (or its successor, if already merged -- confirm the IAM role above has
+    had its ECS/PassRole grants removed and `deploy-reclaw-comms.yml` exists)
+    must be merged and applied before cutting a release with this workflow.
+    If it isn't: `deploy-dev` still pushes a new dev image successfully (it
+    no longer touches ECS at all, so nothing to fail there); `deploy-prod`
+    pushes to prod ECR and then fails at the dispatch/token step, and the
+    release never reaches ECS in either environment.
 
 ## Steps
 
