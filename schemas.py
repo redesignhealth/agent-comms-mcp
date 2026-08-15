@@ -84,8 +84,8 @@ CONVERSATION_TYPES: frozenset[str] = frozenset({"internal", "asymmetric", "open"
 MAX_PARTICIPANTS_PER_CONVERSATION = 50
 MAX_DISPLAY_NAME_LENGTH = 255
 MAX_ACCEPTED_TYPES = 20
-# Per-entry length cap for a single accepted_types string (Argus round 2,
-# security): MAX_ACCEPTED_TYPES bounds the LIST length, but nothing
+# Per-entry length cap for a single accepted_types string:
+# MAX_ACCEPTED_TYPES bounds the LIST length, but nothing
 # previously bounded each entry's own length -- a caller could submit 20
 # arbitrarily large strings, all pass the count check, then get echoed
 # back verbatim in UnknownConversationTypeError's message. Every real
@@ -424,15 +424,15 @@ MESSAGE_SCHEMAS: dict[tuple[str, int], MessageSchema] = {
 MESSAGE_TYPES: frozenset[str] = frozenset(mt for mt, _ in MESSAGE_SCHEMAS)
 
 # Highest schema_version this board's own code actually implements (today:
-# 1, for every message type above). TECH-5160's start_conversation
-# capability negotiation (service._negotiate_schema_version) clamps the
+# 1, for every message type above). start_conversation's capability
+# negotiation (service._negotiate_schema_version) clamps the
 # highest version two agents mutually claim to support down to this value
 # -- without the clamp, two agents that both (legitimately, per
 # comms_register's own validation) declare max_schema_version=2 would
 # negotiate to version 2, and the very next validate_payload call would
 # fail with an "unknown message schema" PayloadValidationError instead of
 # a clear capability-limit error, even though the mismatch is the BOARD's
-# limitation, not theirs (Argus round 1).
+# limitation, not theirs.
 MAX_REGISTERED_SCHEMA_VERSION: int = max(v for _, v in MESSAGE_SCHEMAS)
 
 

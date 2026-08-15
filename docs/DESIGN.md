@@ -1,4 +1,4 @@
-# agent-comms-mcp — Design
+# agent-comms-mcp: Design
 
 Status: **agreed v1 plan** (2026-08-11), the spec of record for the comms layer.
 
@@ -40,11 +40,11 @@ Key findings that drove the design:
  across all documented attacks: strictly typed, schema-validated messages, never
  free text into a privileged agent's context. Hence: **no free-text fields in v1.**
 5. "Paperclip" (paperclip.ing) is an intra-company agent-orchestration platform
- (tickets, org charts, budgets), not an EA or cross-user comms product. Its human
+ (tickets, org charts, budgets), distinct in purpose from an EA or cross-user comms product. Its human
  approval gates and budget auto-pause are good prior art for the EA side, out of
  scope here.
 
-## 3. Architecture decision: hub, not peer-to-peer
+## 3. Architecture decision: hub over peer-to-peer
 
 One central board (this MCP server) that all EA agents connect to as clients, vs. per-agent
 servers with discovery and signed cards. Rationale: one audit trail, no
@@ -62,25 +62,27 @@ never accepted as a parameter.
 admission: token issuance is the permissioned ceremony, and it happens upstream of this
 service. Agent rows are self-provisioned on first authenticated call via an idempotent
 `register` tool (sets `display_name`, `accepted_types`). The `status` column
-(`active`/`suspended`) is an ops kill-switch, not a permission concept.
+(`active`/`suspended`) is an ops kill-switch. It carries no permission
+semantics: no authorization decision reads it.
 
-**`agent_key` — stopgap for one-token-per-many-agents.** The board's
+**`agent_key`: stopgap for one-token-per-many-agents.** The board's
 `sub` is keyed on the caller's verified token identity, which today is one Okta sub
-per *human*, not per agent: the platform mints every EA-managed agent acting for a given
-human the same agent-jwt token `sub`, because it has no way yet to carry a distinct,
-verified per-agent identity in the token or in message metadata. Without a fix,
-`register`'s idempotent upsert on `agents.sub` collapses all of a human's agents into
-one row — the second `register` call silently overwrites the first's `display_name`/
-`accepted_types` (observed: an agent named "Pepper Pots" overwrote one named
-"Bond 007"). `register` accepts an optional `agent_key`, appended to the verified
-base identity to form `sub` (`f"{base_sub}::{agent_key}"`) — a self-chosen partition
-*within* an already-verified identity, not a substitute for one. `owner_sub`/
-`owner_email` are still derived solely from the base identity, computed before this
-composition, so they are unaffected by `agent_key` and admission decisions
-(`may_assign`) stay keyed on real verified ownership; two different owners can pass
-an identical `agent_key` string without colliding, since the prefix differs. This is
-explicitly a stopgap: the durable fix is for the platform to mint each agent its own
-distinct verified identity, at which point `agent_key` should be removed.
+per *human*, shared across every agent that human runs: the platform mints every
+EA-managed agent acting for a given human the same agent-jwt token `sub`, because it
+has no way yet to carry a distinct, verified per-agent identity in the token or in
+message metadata. Without a fix, `register`'s idempotent upsert on `agents.sub`
+collapses all of a human's agents into one row: the second `register` call silently
+overwrites the first's `display_name`/`accepted_types` (observed: an agent named
+"Pepper Pots" overwrote one named "Bond 007"). `register` accepts an optional
+`agent_key`, appended to the verified base identity to form `sub`
+(`f"{base_sub}::{agent_key}"`): a self-chosen partition *within* an already-verified
+identity. It never substitutes for verified identity itself. `owner_sub`/`owner_email`
+are still derived solely from the base identity, computed before this composition, so
+they are unaffected by `agent_key`, and admission decisions (`may_assign`) stay keyed
+on verified ownership. Two different owners can pass an identical `agent_key` string
+without colliding, since the prefix differs. This is explicitly a stopgap: the durable
+fix is for the platform to mint each agent its own distinct verified identity, at which
+point `agent_key` should be removed.
 
 **Permissions live in three places:**
 
@@ -96,26 +98,27 @@ input to an already-reachable tool is accepted. See `scopes.py`'s `:admin` verb 
 
 **Scope enforcement applies only to agent-jwt (headless agent) tokens.** Interactive
 callers authenticated via Okta bypass scope checks entirely. Scope enforcement is the
-agent-token access gate, not a human-user gate.
+agent-token access gate. It never gates human users.
 
 **Membership rules (v1):**
 
 - Any registered agent may start a conversation with N other agents. All named
  targets must exist and be active. (`accepted_types` is not checked at
- invitation/join time — conversation-type admission is Axis 1's ownership
+ invitation/join time: conversation-type admission is Axis 1's ownership
  rule below, unrelated to which message types a target has declared. It is
- enforced on each message send instead — see the capability gate below.
+ enforced on each message send instead: see the capability gate below.
  Because starting a conversation requires an initial message, a target
  that hasn't declared that message's type still causes conversation
- creation to fail — an admission-shaped effect via the mandatory first
- message, not a separate admission check of its own.)
+ creation to fail. That failure is an admission-shaped effect of the
+ mandatory first message; it is never a separate admission check in its
+ own right.)
  The creator becomes an `active` participant with `role=owner`. **Named targets are
  added as `invited`, never `active` on creation** (see acceptance flow below).
 - **Any active member may invite others** (creator is `owner` so this can tighten to
  owner-only as a policy change, without a migration). New invitees also start as
  `invited`: no unilateral disclosure. This applies uniformly regardless of who does
  the inviting.
-- **Acceptance gates visibility, not just participation.** An `invited` participant
+- **Acceptance gates visibility as well as participation.** An `invited` participant
  can see minimal metadata (conversation type, who invited them, current member
  list) but **not** message history or content. Calling `comms_accept` flips
  `invited → active`, which grants full history read and posting rights from that
@@ -131,8 +134,8 @@ agent-token access gate, not a human-user gate.
  members. Leaving revokes access immediately.
 - No pairwise grants in v1 (within the deployment's trust domain: colleagues don't need a consent
  handshake to ask availability). Conversation-open authorization is routed through a
- single policy function (`_authorize_conversation_open` in `service.py` — a
- module-private implementation hook, not a public API), which is the seam where a
+ single policy function (`_authorize_conversation_open` in `service.py`: a
+ module-private implementation hook, never exposed as a public API), which is the seam where a
  grants/consent layer lands when external counterparties arrive.
 
 ## 5. Data model (Postgres)
@@ -142,7 +145,7 @@ Five tables. `messages` and `audit_log` are append-only: no UPDATE/DELETE paths 
 ```
 agents id, sub UNIQUE, owner_sub, owner_email, display_name,
  accepted_types text[] (max 20 types, 100 chars each),
- status(active|suspended), min/max_schema_version (TECH-5160),
+ status(active|suspended), min/max_schema_version,
  is_shared boolean (default false, frozen at first registration),
  bound_at, timestamps
 conversations id, type, state(active|completed|canceled|expired),
@@ -173,19 +176,19 @@ Design notes:
 - `bound_at` on agents tracks when each agent last registered (updated on every
  `comms_register` call, including re-registration).
 - `is_shared` marks an agent that spans ownership boundaries (e.g. a bot serving
- multiple users). It is an admission-decision input — see §9 — so it is frozen
- at first registration (re-registering with a different value has no effect)
+ multiple users). It is an admission-decision input (see §9), so it is frozen
+ at first registration (re-registering with a different value has no effect),
  and self-declaring `True` at first registration requires the caller's token
- to carry an elevated `comms:admin` scope (or be an interactive/Okta caller);
- without it, `comms_register` denies with `denied.is_shared_requires_elevated_scope`
- (this is the audit-log reason key only; the caller receives the generic
+ to carry an elevated `comms:admin` scope (or be an interactive/Okta caller).
+ Without it, `comms_register` denies with `denied.is_shared_requires_elevated_scope`
+ (this is the audit-log reason key only: the caller receives the generic
  `access_denied` message).
  There is intentionally no conversion path from `is_shared=false` to `true` for an
  existing agent (v1): the only way to become shared is `comms:admin`-authorized first
  registration of a NEW agent identity. An existing agent that needs to become shared
- has no supported upgrade; this is a deliberate scope-narrowing for v1, not an
- oversight, consistent with `is_shared` being an admission-decision input that must
- never change under an identity already in use.
+ has no supported upgrade. This is a deliberate scope-narrowing for v1: the
+ limitation is intentional, consistent with `is_shared` being an admission-decision
+ input that must never change under an identity already in use.
 
 ## 6. Message schemas (two-axis model)
 
@@ -218,8 +221,8 @@ scroll-to-load-more use case.
 
 | Tool | Scope | Notes |
 |---|---|---|
-| `comms_whoami` | comms:read | caller identity/scopes; also returns this identity's registered min/max_schema_version (TECH-5160) via a best-effort DB lookup if already `comms_register`'d -- omitted if not yet registered or the DB is unreachable (this tool remains usable as an auth-only diagnostic either way) |
-| `comms_register` | comms:write | idempotent self-provisioning: display_name, accepted_types (max 20, 100 chars each), min/max_schema_version (default 1/1, TECH-5160 capability negotiation); `is_shared=True` on first registration additionally requires comms:admin (see §5) |
+| `comms_whoami` | comms:read | caller identity/scopes; also returns this identity's registered min/max_schema_version via a best-effort DB lookup if already `comms_register`'d -- omitted if not yet registered or the DB is unreachable (this tool remains usable as an auth-only diagnostic either way) |
+| `comms_register` | comms:write | idempotent self-provisioning: display_name, accepted_types (max 20, 100 chars each), min/max_schema_version (default 1/1, for schema-version capability negotiation); `is_shared=True` on first registration additionally requires comms:admin (see §5) |
 | `comms_list_agents` | comms:read | directory (internal domain, enumeration acceptable). Returns agent UUIDs used as target identifiers in other tools |
 | `comms_lookup_agent_by_email` | comms:read | directory lookup by owner email; `{"agent": ..., "found": bool}`. O(1) targeted equivalent of paginating `comms_list_agents` -- see §10's enumeration-posture note |
 | `comms_start_conversation` | comms:write | type + up to 50 target agent UUIDs (from `comms_list_agents`) + initial request payload |
@@ -247,8 +250,8 @@ scroll-to-load-more use case.
  `is_shared` diverged from the frozen row value and was ignored, §5). Unlike denial
  events (committed immediately by the denial helper), bypass-observability events
  are staged within the request's own transaction and are only persisted if that
- transaction ultimately commits -- a deliberate consistency tradeoff shared by
- both bypass events, not a durability guarantee.
+ transaction ultimately commits. This is a deliberate consistency tradeoff shared
+ by both bypass events: it makes no separate durability guarantee.
 6. Fail-closed tool scoping: unenrolled tool is unreachable by agent tokens.
 7. Rate limits per sender (30 messages/hour/conversation, 10 conversation-starts/hour),
  message size caps, participant cap (50 per conversation), and conversation expiry (7 days).
@@ -263,10 +266,11 @@ coordination through the same conversations/messages layer.
 
 The original §9 rejected this shape because "messages is append-only while a
 task's status mutates in place." That objection doesn't apply: task state lives
-on `conversations.state` (already mutable via `completed`/`canceled`), not
-folded out of the message stream. A `task_complete` message triggers the same
-state-machine transition that `confirm` already triggers for scheduling — no new
-mechanism. The append-only invariant on `messages` is untouched.
+on `conversations.state` (already mutable via `completed`/`canceled`) without
+needing to be folded out of the message stream. A `task_complete` message
+triggers the same state-machine transition that `confirm` already triggers for
+scheduling: no new mechanism is needed. The append-only invariant on `messages`
+is untouched.
 
 ### Axis 1: conversation type → admission policy
 
@@ -276,15 +280,15 @@ mechanism. The append-only invariant on `messages` is untouched.
 | `internal` | all participants share identical verified owner sets (no exception — a shared initiator does not bypass this) | same-owner multi-agent coordination (e.g. CoS ↔ EA) |
 | `asymmetric` | all pairwise owner-set intersections are non-empty, **except**: a shared initiator (`agents.is_shared=True`) is admitted without the pairwise check | cross-owner task delegation where a shared agent bridges two users |
 
-Ownership is resolved via an injected `OwnershipClient` seam (never
-`agents.owner_sub` directly — a shared agent's row can't represent multiple
-owners). Fails closed (`denied.ownership_unverified`) on any lookup error. The
-interim `AgentTableOwnershipClient` wraps `agents.owner_sub` as a single-element
-set — correct for every agent registered today; swap for the real platform
-endpoint once shared agents exist.
+Ownership is resolved via an injected `OwnershipClient` seam. It is never read
+from `agents.owner_sub` directly, since a shared agent's row can't represent
+multiple owners. Fails closed (`denied.ownership_unverified`) on any lookup
+error. The interim `AgentTableOwnershipClient` wraps `agents.owner_sub` as a
+single-element set: correct for every agent registered today. Swap it for the
+real platform endpoint once shared agents exist.
 
 For `internal`/`asymmetric` conversations, the verified owner-set union is frozen
-at creation time in `conversations.owner_snapshot` (JSONB, nullable — `open` does
+at creation time in `conversations.owner_snapshot` (JSONB, nullable: `open` does
 not use it). Subsequent invites are checked against this snapshot: an invite that
 would expand the owner set is denied, preventing unilateral de-isolation of an
 `internal` conversation.
@@ -295,16 +299,16 @@ Each message type declares `boundary_safe: bool` independent of conversation typ
 The flag gates legality within a conversation:
 
 - `open` conversations require `boundary_safe=True` (raw scheduling data must
- never cross an owner boundary — only judgments).
+ never cross an owner boundary: only judgments do).
 - `internal` conversations allow any message type (all parties are the same
  owner).
-- `asymmetric` conversations allow `boundary_safe=True` always; `boundary_safe=False`
- only when the message does not cross an ownership boundary (sender's owner set
- must be a superset of all other active-or-invited participants' owner sets — an
- invited-but-not-yet-accepted participant's owner set was already validated against
- the owner snapshot at invite time, so including them here keeps the boundary check
- consistent with that snapshot invariant rather than leaving a one-post gap until
- they accept), **except**: a shared sender (`agents.is_shared=True`) may post
+- `asymmetric` conversations allow `boundary_safe=True` always. `boundary_safe=False`
+ is allowed only when the message does not cross an ownership boundary (sender's
+ owner set must be a superset of all other active-or-invited participants' owner
+ sets: an invited-but-not-yet-accepted participant's owner set was already
+ validated against the owner snapshot at invite time, so including them here
+ keeps the boundary check consistent with that snapshot invariant and closes a
+ one-post gap that would otherwise persist until they accept), **except**: a shared sender (`agents.is_shared=True`) may post
  `boundary_safe=False` messages in `asymmetric` conversations unconditionally,
  without the ownership-boundary check.
 
@@ -335,30 +339,31 @@ Independent of, and checked alongside, the `boundary_safe` crossing rule above:
 every other **active** participant/target must have `message_type` in their
 own `agents.accepted_types`, or the send is denied
 (`denied.message_type_not_accepted`, uniform `AccessDeniedError`, detail omits
-which recipient rejected it or their declared set — for consistency with
-`denied.boundary_crossing`'s denial shape, not because `accepted_types`
-itself is secret: it's already public via `comms_list_agents`).
+which recipient rejected it or their declared set: this keeps the denial shape
+consistent with `denied.boundary_crossing`. `accepted_types` itself carries no
+secrecy requirement; it is already public via `comms_list_agents`).
 
 The "active" scoping means two different things depending on which call this
-runs from — both are the capability gate, not two separate mechanisms:
+runs from. Both call sites enforce the very same capability gate, never two
+separate mechanisms:
 
 - **`start_conversation`**: the named targets themselves are checked
- directly (see "Membership rules" above) — they aren't yet participants at
+ directly (see "Membership rules" above): they aren't yet participants at
  all at this point, let alone `invited`, so this is the gate's only chance
  to catch a target that can't handle the opening message before any row is
  created.
 - **`post_message`** (on an already-open conversation): scoped to
- currently-**active** participants only — invited-but-not-yet-accepted
+ currently-**active** participants only. Invited-but-not-yet-accepted
  participants are excluded here, unlike the boundary-crossing check's
  active-or-invited set. Inviting someone must not retroactively block sends
  between the already-active members just because the invitee hasn't
- declared support yet; the check simply applies to them once they accept
- and become active, exactly like any other active participant. This is
- only deferred going forward, not retroactive: `comms_accept` grants full
- conversation history, so an invitee that never declared some earlier
- message type will still see those messages once it joins. That's an
- accepted consequence of scoping the live gate to active participants,
- not a gap in the gate itself.
+ declared support yet. The check simply applies to them once they accept
+ and become active, exactly like any other active participant. This
+ deferral applies only going forward; it is never retroactive:
+ `comms_accept` grants full conversation history, so an invitee that never
+ declared some earlier message type will still see those messages once it
+ joins. That's an accepted consequence of scoping the live gate to active
+ participants. It is not a gap in the gate itself.
 
 This is deliberately **universal**, unlike `boundary_safe`: `boundary_safe`
 answers a trust question (is this payload shaped safely enough to cross an
@@ -366,31 +371,33 @@ ownership boundary), which `internal` conversations are exempt from by
 construction (no boundary exists between same-owner participants).
 `accepted_types` answers a capability question (does this specific running
 agent's own implementation know what to do with this message type at all),
-which has nothing to do with trust — a missing handler is a missing handler
+which has nothing to do with trust: a missing handler is a missing handler
 whether the sender is a stranger or your own other agent. So this check
 applies even to `internal` traffic: if two of your own agents need to
 exchange `task_report` messages, both must have declared `task_report` in
 their `accepted_types`, exactly as any other pair would.
 
-Checked per-recipient, not aggregated across the other side the way
-`boundary_safe`'s owner-set check is — `accepted_types` is a fact about one
-specific agent's deployment, not about an owner as a whole.
+Checked per-recipient: each recipient's own `accepted_types` is evaluated
+independently, unlike `boundary_safe`'s owner-set check, which aggregates
+across the other side. `accepted_types` is a fact about one specific agent's
+deployment, never about an owner as a whole.
 
 **Rollout**: turning a previously-unenforced field into a hard gate risks
 breaking any agent already registered under the old "informational, no
 effect" contract. Migration `e1db7c2e6b70` backfills every pre-existing
 `agents` row's `accepted_types` to the full message-type set as of that
-migration's authoring time — a one-time grandfather clause, not a permanent
-behavior, and not dynamically resolved from the current schema (a type
-added later is not retroactively included). Agents registered after that
-migration runs are unaffected; their own declared set is enforced normally,
-including any later re-registration that deliberately narrows it.
+migration's authoring time: a one-time grandfather clause. It is never a
+permanent behavior and is never dynamically resolved from the current
+schema (a type added later is not retroactively included). Agents
+registered after that migration runs are unaffected. Their own declared
+set is enforced normally, including any later re-registration that
+deliberately narrows it.
 
-**Known consequence — lifecycle-coherence is not validated**: nothing
+**Known consequence: lifecycle-coherence is not validated**: nothing
 prevents registering (or inviting) an agent whose `accepted_types` omits
 every consent/lifecycle message type relevant to a conversation it's
 active in (e.g. `confirm`, `decline`, `task_complete`, `task_cancel`). Such
-an agent can strand a conversation — every lifecycle-transitioning send to
+an agent can strand a conversation: every lifecycle-transitioning send to
 it is denied, and there's no forced-progress mechanism other than
 `comms_leave`, which is state-neutral. Callers (and higher-level tools like
 an EA agent) are responsible for choosing lifecycle-coherent declared sets;
@@ -408,7 +415,7 @@ Conversation expiry is enforced lazily on access (`expires_at`, checked in
 | `internal` | 30 days | Same-owner coordination may span longer planning horizons |
 
 All three are overridable via the `expires_at` parameter at conversation creation.
-A completed or canceled conversation's `expires_at` is not retroactively cleared —
+A completed or canceled conversation's `expires_at` is not retroactively cleared:
 it simply becomes irrelevant once the conversation is terminal.
 
 ### Rate limits
@@ -416,22 +423,22 @@ it simply becomes irrelevant once the conversation is terminal.
 Task-type conversations (`task_assign` openers) consume from the same
 `MAX_CONVERSATION_STARTS_PER_HOUR = 10` bucket as scheduling negotiations. The
 previous dedicated `tasks` table had its own `MAX_TASK_CREATES_PER_HOUR = 30`
-bucket — the shared limit is 3× tighter. Callers opening many task conversations
+bucket: the shared limit is 3× tighter. Callers opening many task conversations
 alongside scheduling conversations may reach the cap sooner; this is acceptable
 for v1 volumes and avoids maintaining a separate per-type rate-limit mechanism.
 
 `MAX_MESSAGES_PER_CONVERSATION_PER_HOUR = 30` and `MAX_CONVERSATION_STARTS_PER_HOUR = 10`
-are each scoped narrower than the board as a whole — a sender could otherwise flood
+are each scoped narrower than the board as a whole: a sender could otherwise flood
 many DIFFERENT conversations, each comfortably under the per-conversation cap, and
-disclose/probe at a much higher aggregate rate (TECH-5160). `MAX_MESSAGES_PER_SENDER_PER_HOUR = 120`
+disclose/probe at a much higher aggregate rate. `MAX_MESSAGES_PER_SENDER_PER_HOUR = 120`
 closes that gap: a board-level cap on one sender's TOTAL message volume across
 every conversation combined, checked additively (never in place of) the two
 narrower limits above, from both `post_message` and `start_conversation`'s
-seq-1 message path. 120 is generous relative to the per-conversation cap —
+seq-1 message path. 120 is generous relative to the per-conversation cap:
 an agent legitimately juggling 3 concurrent negotiations at max rate
 (3 × 30 = 90) stays comfortably under it; at 4 (4 × 30 = 120) it reaches the
-cap exactly. It exists to catch cross-conversation spraying, not to
-constrain normal multi-negotiation traffic. This is board-level
+cap exactly. It exists to catch cross-conversation spraying. It is not meant
+to constrain normal multi-negotiation traffic. This is board-level
 defense-in-depth: it protects the board itself even if a counterparty's own
 agent-local rate limiter has a bug or is bypassed entirely by a compromised
 agent that skips the standard negotiation library altogether.
@@ -439,45 +446,46 @@ agent that skips the standard negotiation library altogether.
 ### Wire-schema capability negotiation
 
 Agents declare `min_schema_version`/`max_schema_version` (both default `1`,
-today's only version) at `comms_register` time — the range of wire-schema
+today's only version) at `comms_register` time: the range of wire-schema
 versions their own code can correctly interpret. `start_conversation` is the
 one place a fresh participant set is first assembled, so that's where the
 board negotiates: the candidate version is `min(participant.max_schema_version)`
 across the initiator + every named target, clamped down to
 `schemas.MAX_REGISTERED_SCHEMA_VERSION` (the highest version this board's
-own code actually implements — today, 1) so two agents that both legitimately
+own code actually implements, today 1) so two agents that both legitimately
 declare a max above what the board supports degrade gracefully instead of
 negotiating to a version nothing can validate payloads against. The clamped
 candidate is then verified to be `>= max(participant.min_schema_version)`
 across the same set. If it is, the conversation is pinned to it (overriding
-whatever `schema_version` the caller passed — that parameter is advisory
-only) and the pin is durably recoverable from the conversation's own
+whatever `schema_version` the caller passed: that parameter is advisory
+only), and the pin is durably recoverable from the conversation's own
 append-only seq-1 `Message.schema_version` (no separate `Conversation`
-column); `comms_start_conversation`'s response also returns it directly. If
-no version satisfies both, the conversation is refused outright
-(`SchemaVersionMismatchError`, specific by design — see `exceptions.py` —
-though the error message itself omits the actual floor/ceiling values, since
-an agent's registered range is its own per-caller state, not a fixed public
-vocabulary like `CONVERSATION_TYPES`, and exposing the exact numbers would
-let an initiator bisect a target's range across repeated calls).
+column). `comms_start_conversation`'s response also returns it directly. If
+no version satisfies both, the conversation is refused outright with
+`SchemaVersionMismatchError` (specific by design; see `exceptions.py`). The
+error message itself omits the actual floor/ceiling values, since an
+agent's registered range is private per-caller state, unlike a fixed
+public vocabulary such as `CONVERSATION_TYPES`. Exposing the exact numbers
+would let an initiator bisect a target's range across repeated calls.
 `comms_invite` re-checks a later-added participant against this same pinned
 version, closing the gap a pure open-time check would otherwise leave. This
 combined refuse-or-degrade rule is deliberately evaluated once, at open
-time, not on every later message — a message's own per-message
+time, never on every later message: a message's own per-message
 `schema_version` field is a separate, agent-local defense-in-depth concern.
 
 ### Known gap: `platform_get_agent_owners`
 
 The `internal`/`asymmetric` admission logic (and `note`'s boundary-crossing check)
 requires resolving each agent's verified owner set. In v1, the interim
-`AgentTableOwnershipClient` wraps `agents.owner_sub` as a single-element set —
+`AgentTableOwnershipClient` wraps `agents.owner_sub` as a single-element set:
 correct for every agent registered today (all are single-owner), but insufficient
 for shared agents that serve multiple owners.
 
-The real `platform_get_agent_owners` endpoint does not yet exist. Until it does, `asymmetric` conversations can be exercised end-to-end
-only in tests (with faked ownership), not in production against real agents.
+The real `platform_get_agent_owners` endpoint does not yet exist. Until it does,
+`asymmetric` conversations can be exercised end-to-end only in tests (with faked
+ownership); production testing against real agents is not yet possible.
 The seam is already injected (`OwnershipClient` parameter on all functions that
-need it) — swapping `AgentTableOwnershipClient` for a real HTTP client is the
+need it): swapping `AgentTableOwnershipClient` for a real HTTP client is the
 only change needed when the platform endpoint ships.
 
 ### Known gap: rolling-deploy safety of the `tasks`-table-drop migration
@@ -485,9 +493,9 @@ only change needed when the platform endpoint ships.
 `migrations/versions/da3e1646c44d_drop_tasks_table.py` drops `audit_log.task_id`.
 `entrypoint.sh` runs `alembic upgrade head` in the new container before the old
 container drains, so a standard rolling deploy of this image would break every
-audit-log write (not just task-scoped ones) from any still-running old container
+audit-log write, task-scoped or otherwise, from any still-running old container
 for the entire drain window. This PR must ship as a stop-then-start deploy, or
-during a confirmed-idle traffic window — see that migration file's own
+during a confirmed-idle traffic window: see that migration file's own
 deployment-warning docstring.
 
 ## 10. Known extensions (explicitly deferred)
@@ -495,16 +503,16 @@ deployment-warning docstring.
 - **Grants/consent layer**: required the moment a counterparty is outside the
  deployment's trust domain. Lands in the `_authorize_conversation_open` policy function + a
  grants table (directional, type-scoped, expiring, human-approved). The
- anti-enumeration posture of `list_agents` also changes then -- `comms_lookup_agent_by_email`
- too: within the current internal-domain perimeter, it's a targeted, O(1) equivalent of
+ anti-enumeration posture of `list_agents` also changes then: `comms_lookup_agent_by_email`
+ too. Within the current internal-domain perimeter, it's a targeted, O(1) equivalent of
  paginating the full directory (any `comms:read` holder already sees every `owner_email`
  via `list_agents` today, so this doesn't expose new data, only cheaper targeted access
  to the same data), and needs the same grants-layer treatment applied at that point.
- That equivalence claim is perimeter-specific, though (Argus round 4): once an external
+ That equivalence claim is perimeter-specific, though: once an external
  counterparty is in scope, a targeted "is alice@example.com registered?" lookup is a
- meaningfully different privacy surface than paginated enumeration -- it may warrant
- earlier or stricter gating than `list_agents` gets, not the same treatment "at that
- point" implies.
+ meaningfully different privacy surface than paginated enumeration. It may warrant
+ earlier or stricter gating than `list_agents` gets; the "at that point" phrasing
+ above should not be read as promising identical treatment.
 - **Free-text fields**: allowed only behind a quarantine/review pipeline (sandboxed,
  tool-less extraction into typed messages). Raw text is stored for audit/human
  display but never enters a privileged agent's context.
@@ -513,7 +521,7 @@ deployment-warning docstring.
 
 ## 11. Deployment
 
-See [README.md — Deployment](../README.md#deployment) for setup and
+See [README.md: Deployment](../README.md#deployment) for setup and
 configuration. The service is a standard Python HTTP process: a PostgreSQL
 database, env-var-sourced secrets, and `entrypoint.sh` runs
 `alembic upgrade head` automatically before the server starts.
@@ -523,10 +531,10 @@ database, env-var-sourced secrets, and `entrypoint.sh` runs
 1. ~~Standards-compliant scaffold~~: done (FastMCP + MultiAuth, scopes middleware,
  structlog, Docker, CI, tests green, connectivity verified end-to-end with an
  agent JWT over streamable HTTP).
-2. ~~Domain layer~~: done — SQLAlchemy models + Alembic migrations, service layer
+2. ~~Domain layer~~: done: SQLAlchemy models + Alembic migrations, service layer
  with the access rules above (including invite→accept and the two-axis
  conversation/message-type model), Pydantic schemas, MCP tools, tests against
  real Postgres (uniform denials, membership enforcement, invite/accept/decline
  flow, seq race-safety, state machine, expiry, rate limits, audit completeness).
-3. ~~Infrastructure~~: done — deployed and running.
+3. ~~Infrastructure~~: done: deployed and running.
 4. Integrate: EA agents connect as MCP clients with agent JWTs.

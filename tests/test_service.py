@@ -203,7 +203,7 @@ async def _register(session: AsyncSession, sub: str, **overrides: Any) -> Agent:
         "accepted_types": sorted(MESSAGE_TYPES),
         # register_agent's own default is False (fail-closed) so a future
         # caller that omits the kwarg doesn't silently grant shared-agent
-        # privileges (Argus round 2). This test helper is the one place
+        # privileges. This test helper is the one place
         # that convenience default belongs instead -- most service-layer
         # tests here call `_register(..., is_shared=True)` directly and
         # aren't testing the scope gate itself (that's TestRegisterAgent's
@@ -328,7 +328,7 @@ class TestRegisterAgent:
         self, session: AsyncSession
     ) -> None:
         """The ``MAX_ACCEPTED_TYPES`` count check runs before the
-        unknown-type check (Argus round 1, security): an oversized list of
+        unknown-type check: an oversized list of
         entirely-unknown type strings must still be rejected by the count
         cap, not have every entry echoed back verbatim in an
         ``UnknownConversationTypeError`` message with no size bound of its
@@ -344,7 +344,7 @@ class TestRegisterAgent:
         self, session: AsyncSession
     ) -> None:
         """An empty ``accepted_types`` list is a distinct failure from
-        "contains an unknown type" (Argus round 1): there is no unknown
+        "contains an unknown type": there is no unknown
         value to usefully enumerate, so this stays a bare ``ValueError``
         rather than ``UnknownConversationTypeError`` -- the prior behavior
         raised the latter with the confusing message
@@ -360,7 +360,7 @@ class TestRegisterAgent:
     async def test_oversized_single_accepted_type_entry_rejected(
         self, session: AsyncSession
     ) -> None:
-        """The per-entry length cap (Argus round 2, security): a single
+        """The per-entry length cap: a single
         oversized string must be rejected before it can be echoed back
         verbatim in an ``UnknownConversationTypeError`` message -- the count
         cap alone does not bound how long any one entry is."""
@@ -377,7 +377,7 @@ class TestRegisterAgent:
     async def test_accepted_type_entry_at_max_length_succeeds(
         self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Boundary-value test (Argus round 3): an entry exactly at
+        """Boundary-value test: an entry exactly at
         MAX_ACCEPTED_TYPE_LENGTH must be accepted. No real MESSAGE_TYPES
         value is anywhere near 100 characters, so this monkeypatches the
         known-types set with a synthetic entry at exactly the cap -- the
@@ -426,8 +426,8 @@ class TestRegisterAgent:
             )
 
     async def test_schema_version_defaults_to_one_one(self, session: AsyncSession) -> None:
-        """TECH-5160: min/max_schema_version default to 1/1 (today's only
-        wire schema version) when not supplied."""
+        """Schema-version capability negotiation: min/max_schema_version
+        default to 1/1 (today's only wire schema version) when not supplied."""
         agent = await _register(session, "agent-schema-default")
         assert agent.min_schema_version == 1
         assert agent.max_schema_version == 1
@@ -440,7 +440,7 @@ class TestRegisterAgent:
         assert agent.max_schema_version == 2
 
     async def test_min_schema_version_over_max_rejected(self, session: AsyncSession) -> None:
-        """TECH-5160: min_schema_version > max_schema_version is a plain
+        """min_schema_version > max_schema_version is a plain
         input-validation failure (not an authorization decision), same
         posture as the other malformed-input ``ValueError`` cases above."""
         with pytest.raises(ValueError, match="min_schema_version must be <= max_schema_version"):
@@ -452,7 +452,7 @@ class TestRegisterAgent:
             )
 
     async def test_min_schema_version_below_one_rejected(self, session: AsyncSession) -> None:
-        """TECH-5160 (Argus round 1): a 0 or negative min_schema_version
+        """A 0 or negative min_schema_version
         passed the original min<=max check alone and routed straight into a
         broken negotiation (no schema registered below version 1) -- this
         is the dedicated lower-bound guard closing that gap."""
@@ -468,7 +468,7 @@ class TestRegisterAgent:
     async def test_schema_version_reset_on_reregister_when_omitted(
         self, session: AsyncSession
     ) -> None:
-        """TECH-5160 (Argus round 1, documented behavior): omitting both
+        """Documented behavior: omitting both
         range params on a re-registration resets to 1/1, the same default a
         fresh registration gets -- even if a wider range was declared
         before. This is intentional (see register_agent's docstring): safe
@@ -868,7 +868,7 @@ class TestStartConversation:
 
 
 class TestSchemaVersionNegotiation:
-    """TECH-5160: capability negotiation at ``start_conversation``.
+    """Schema-version capability negotiation at ``start_conversation``.
 
     Computed generically via ``min``/``max`` of the registered ranges
     rather than hardcoding ``1`` everywhere, so these assertions would
@@ -933,14 +933,15 @@ class TestSchemaVersionNegotiation:
         assert conversation_rows == []
         message_rows = (await session.execute(text("SELECT * FROM messages"))).mappings().all()
         assert message_rows == []
-        # Argus round 2: the prior version of this test asserted atomicity
-        # for Conversation/Message only, despite the docstring's broader
-        # "conversation/participant/message" claim -- Participant rows for
-        # both the owner (role=owner) and target (role=member) are exactly
-        # what start_conversation would have inserted between the
-        # Conversation row and the seq-1 Message, so they're the most
-        # likely place a partial-rollback bug would actually surface.
-        # Filtered by the two agents actually involved (Argus round 3),
+        # This test asserts atomicity
+        # for Participant rows too, not just Conversation/Message, matching
+        # the docstring's broader "conversation/participant/message" claim
+        # -- Participant rows for both the owner (role=owner) and target
+        # (role=member) are exactly what start_conversation would have
+        # inserted between the Conversation row and the seq-1 Message, so
+        # they're the most likely place a partial-rollback bug would
+        # actually surface.
+        # Filtered by the two agents actually involved,
         # matching conversation_rows' defensive pattern above rather than
         # asserting on the whole table.
         participant_rows = (
@@ -959,7 +960,7 @@ class TestSchemaVersionNegotiation:
             )
         ).all()
         actions = [row.action for row in audit_rows]
-        # Argus round 3: verify the renamed audit detail keys
+        # Verify the renamed audit detail keys
         # (required_min/available_max, not the old common_floor/
         # common_ceiling parameter names) actually land in the audit row,
         # not just that SOME denial happened.
@@ -972,7 +973,7 @@ class TestSchemaVersionNegotiation:
         assert "denied.schema_version_mismatch" in actions
 
     async def test_negotiation_clamps_to_board_max(self, session: AsyncSession) -> None:
-        """TECH-5160 (Argus round 1): two agents that both legitimately
+        """Two agents that both legitimately
         declare a max above what this board's own code implements must
         degrade to the board's own max, not negotiate to a version nothing
         can validate payloads against."""
@@ -1015,7 +1016,7 @@ class TestSchemaVersionNegotiation:
     async def test_negotiation_refused_when_clamp_drops_below_required_floor(
         self, session: AsyncSession
     ) -> None:
-        """TECH-5160 (Argus round 1): both agents requiring a version above
+        """Both agents requiring a version above
         the board's own max must be refused with SchemaVersionMismatchError
         -- clamping the candidate down must not let it silently satisfy a
         min-version floor the pre-clamp candidate no longer meets."""
@@ -1044,7 +1045,7 @@ class TestSchemaVersionNegotiation:
 
 
 class TestInviteSchemaVersionRecheck:
-    """TECH-5160 (Argus round 1): comms_invite must re-check a new
+    """comms_invite must re-check a new
     participant against the version this conversation was already pinned
     to, closing the gap where invite could otherwise admit an incompatible
     participant with no re-check at all."""
@@ -1090,7 +1091,7 @@ class TestInviteSchemaVersionRecheck:
         ).all()
         actions = [row.action for row in audit_rows]
         assert "denied.schema_version_mismatch" in actions
-        # Argus round 4: mirror start_conversation's equivalent assertion
+        # Mirror start_conversation's equivalent assertion
         # (TestSchemaVersionNegotiation) so the invite-path required_min/
         # available_max assignment is guarded against regression too, not
         # just the action string.
@@ -1132,7 +1133,7 @@ class TestInviteSchemaVersionRecheck:
     async def test_invite_raises_runtime_error_if_seq_one_message_missing(
         self, session: AsyncSession
     ) -> None:
-        """TECH-5160 (Argus round 3): _conversation_pinned_schema_version's
+        """_conversation_pinned_schema_version's
         internal-invariant guard. This state (a conversation with no seq-1
         message) should never occur via any public code path -- reproduced
         here only by deleting the row directly -- but if it ever did,
@@ -2280,7 +2281,7 @@ class TestPostMessageBoundaryCrossing:
         ``_enforce_boundary_crossing``'s SECOND ``except`` block (the loop
         over ``other_agent_ids``), distinct from the sender-lookup failure
         covered by ``test_note_from_single_owner_to_shared_crosses_denied``
-        and friends. Regression coverage for Argus round 6/7: this except
+        and friends. This except
         block must reset ``sender_owners`` back to empty before denying, or
         a `_deny` that failed to raise would fall through to
         ``is_boundary_crossing_safe`` with a non-empty ``sender_owners``
@@ -2309,7 +2310,7 @@ class TestPostMessageBoundaryCrossing:
     async def test_second_lookup_failure_fail_closed_even_if_deny_does_not_raise(
         self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Regression test for Argus round 6/7: if `_deny`'s `NoReturn`
+        """If `_deny`'s `NoReturn`
         contract were ever weakened so a single call failed to raise, the
         second ownership-lookup except block must still leave
         `sender_owners`/`other_owners` in a state that the function's own
@@ -2354,7 +2355,7 @@ class TestPostMessageBoundaryCrossing:
     async def test_first_lookup_failure_fail_closed_even_if_deny_does_not_raise(
         self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Symmetric regression test for Argus round 7: the `if
+        """Symmetric to the previous test: the `if
         sender_info:` guard that skips the second (other-participant)
         lookup entirely when the FIRST (sender) lookup already failed must
         still leave `sender_owners` in a state that the function's own
@@ -3297,7 +3298,7 @@ class TestRateLimits:
     async def test_sender_global_rate_limit_spans_many_conversations(
         self, session: AsyncSession
     ) -> None:
-        """TECH-5160: MAX_MESSAGES_PER_SENDER_PER_HOUR caps a sender's TOTAL
+        """MAX_MESSAGES_PER_SENDER_PER_HOUR caps a sender's TOTAL
         message volume across ALL conversations combined — defense-in-depth
         against a sender staying under MAX_MESSAGES_PER_CONVERSATION_PER_HOUR
         in each of many DIFFERENT conversations while flooding in aggregate.
@@ -3401,7 +3402,7 @@ class TestRateLimits:
     async def test_sender_global_rate_limit_also_blocks_start_conversation(
         self, session: AsyncSession
     ) -> None:
-        """TECH-5160 (Argus round 1): start_conversation inserts its seq-1
+        """start_conversation inserts its seq-1
         message via a separate code path from post_message (see the
         comment in service.start_conversation) -- this exercises that
         second call site directly, not just post_message's."""
@@ -3652,7 +3653,7 @@ class TestLookupAgentByEmail:
         # one owner run multiple board-active agents under one email.
         # bound_at is set explicitly (not relied on via real-time gaps
         # between the two _register calls, which could tie down to the
-        # microsecond -- Argus round 2) so the ordering this test asserts
+        # microsecond) so the ordering this test asserts
         # is deterministic regardless of wall-clock timing.
         old = await _register(session, "lae-old", owner_email="multi@example.com")
         new = await _register(session, "lae-new", owner_email="multi@example.com")
@@ -3666,7 +3667,7 @@ class TestLookupAgentByEmail:
     async def test_tie_break_falls_through_to_id_on_equal_bound_at_and_created_at(
         self, session: AsyncSession
     ) -> None:
-        # The documented equal-bound_at case (Argus round 3): two agents
+        # The documented equal-bound_at case: two agents
         # sharing bound_at AND created_at (both explicitly forced equal
         # here, not merely left to same-transaction chance) must still
         # resolve deterministically via the id tiebreaker, not arbitrarily.

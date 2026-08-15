@@ -189,7 +189,7 @@ async def _map_service_errors() -> AsyncIterator[None]:
     service's own fixed, public capability list, not per-caller secret
     state, so naming it is not the kind of enumeration DESIGN.md's
     anti-enumeration rule is about. ``SchemaVersionMismatchError``
-    (TECH-5160) is the same story for the wire-schema capability range
+    is the same story for the wire-schema capability range
     negotiated at ``comms_start_conversation`` — see exceptions.py.
 
     A bare ``ValueError`` is different: the service layer raises it for
@@ -266,7 +266,7 @@ async def whoami(agent_key: str | None = None) -> dict[str, Any]:
     (base_sub::agent_key) that will be used for agent lookups by other tools.
 
     If this identity has already called ``comms_register``, the response
-    also includes ``min_schema_version``/``max_schema_version`` (TECH-5160)
+    also includes ``min_schema_version``/``max_schema_version``
     reflecting this agent's currently-registered wire-schema capability
     range. Omitted entirely if the caller hasn't registered yet, or if the
     board database is unreachable — this tool doubles as an auth-only
@@ -316,7 +316,7 @@ async def whoami(agent_key: str | None = None) -> dict[str, Any]:
         # migration not yet applied) raises something OTHER than these
         # connection-level types and is deliberately left to propagate,
         # rather than being indistinguishable from an ordinary unregistered
-        # caller / DB outage (Argus round 1).
+        # caller / DB outage.
         logger.warning(
             "whoami: schema-version lookup failed (%s), omitting fields",
             type(exc).__name__,
@@ -352,7 +352,7 @@ async def register(
       ``needs_clarification``, ``note``, ``task_assign``, ``task_report``,
       ``task_complete``, ``task_decline``, ``task_cancel``.
       Each entry capped at 100 chars; list capped at 20 entries.
-    - ``min_schema_version``/``max_schema_version`` (TECH-5160): the range
+    - ``min_schema_version``/``max_schema_version``: the range
       of wire-schema versions this agent's own code can correctly
       interpret. Both default to ``1`` — the only version that exists
       today, so most callers can omit these entirely. When
@@ -432,7 +432,7 @@ async def register(
 
     # Shared with service.register_agent's own guard
     # (service.validate_schema_version_range) so tightening the rule in one
-    # place tightens it in both layers (Argus round 1) -- this tool-layer
+    # place tightens it in both layers -- this tool-layer
     # call exists only to surface a specific ToolError instead of the
     # generic bare-ValueError mapping _map_service_errors would otherwise
     # give it.
@@ -546,7 +546,7 @@ async def start_conversation(
     - ``initial_message``: payload dict for the opening message. Must match
       the schema for ``message_type`` (see ``comms_post_message``).
     - ``expires_at``: timezone-aware ISO 8601 datetime; omit for 7-day TTL.
-    - ``schema_version``: ADVISORY ONLY (TECH-5160 capability negotiation).
+    - ``schema_version``: ADVISORY ONLY (capability negotiation).
       The board computes the actual wire version to use as the highest
       version every participant (you + every named target) mutually
       supports, per each agent's ``comms_register``-time
@@ -595,7 +595,7 @@ async def start_conversation(
         "target_agent_ids": [str(t) for t in target_uuids],
         "expires_at": _iso(conversation.expires_at),
         "created_at": _iso(conversation.created_at),
-        # TECH-5160: the actually-negotiated version (see
+        # The actually-negotiated version (see
         # service.start_conversation's transient
         # `conversation.negotiated_schema_version` attribute), NOT
         # necessarily the caller-supplied `schema_version` above.

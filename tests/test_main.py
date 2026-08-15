@@ -454,7 +454,7 @@ class TestEndToEnd:
             _ENV_PATCH,
             patch("main.get_access_token", return_value=okta_token),
             patch("providers.comms.get_access_token", return_value=okta_token),
-            # TECH-5160: whoami's best-effort schema-version lookup calls
+            # whoami's best-effort schema-version lookup calls
             # the REAL db.get_session_factory() unless patched. This module
             # has no test database of its own (it tests server
             # composition/middleware, not comms domain logic), and — more
@@ -506,7 +506,7 @@ class TestEndToEnd:
             patch("main.get_access_token", return_value=bot_token),
             patch("providers.comms.get_access_token", return_value=bot_token),
             # See the sibling interactive-caller test above for why this is
-            # patched (TECH-5160 / db.py's module-level engine singleton).
+            # patched (db.py's module-level engine singleton).
             patch(
                 "providers.comms.get_session_factory",
                 side_effect=RuntimeError("no test database configured for this module"),

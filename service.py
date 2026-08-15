@@ -161,7 +161,7 @@ from state_machine import (
 # (CloudWatch, via the ECS log driver) instead of being silently discarded.
 logger = logging.getLogger(__name__)
 
-# Module-level invariant check (Argus round 5), not an in-function guard:
+# Module-level invariant check, not an in-function guard:
 # invite()'s schema-version-mismatch denial path (see the comment at its
 # _deny_schema_version_mismatch call) computes its audit-detail fields
 # ("required_min"/"available_max") correctly only for the direction
@@ -205,7 +205,7 @@ CONVERSATION_TTL: dict[str, timedelta] = {
 # directly (no Redis — DESIGN.md §5: "No Redis until it matters").
 MAX_MESSAGES_PER_CONVERSATION_PER_HOUR = 30
 MAX_CONVERSATION_STARTS_PER_HOUR = 10
-# Board-level, cross-conversation defense-in-depth (TECH-5160): the two
+# Board-level, cross-conversation defense-in-depth: the two
 # limits above are each scoped to a single conversation (or to opening new
 # ones), so a sender could still flood MANY DIFFERENT conversations, each
 # comfortably under MAX_MESSAGES_PER_CONVERSATION_PER_HOUR, and disclose or
@@ -335,8 +335,8 @@ async def _deny_schema_version_mismatch(
     """Audit + raise the schema-version-mismatch denial.
 
     ``required_min``/``available_max`` carry different underlying
-    computations at this function's two call sites (Argus round 2, audit
-    clarity) — ``start_conversation`` passes the negotiated-set's
+    computations at this function's two call sites —
+    ``start_conversation`` passes the negotiated-set's
     ``max(min_schema_version)``/clamped-``min(max_schema_version)``
     (see ``_negotiate_schema_version``), while ``invite`` passes a single
     new target's own ``min_schema_version``/the conversation's already-
@@ -349,9 +349,9 @@ async def _deny_schema_version_mismatch(
     checking which call site produced the row.
 
     The exact values are recorded in the audit detail (server-side only)
-    but deliberately NOT included in the raised message (Argus round 1,
-    security): unlike ``UnknownConversationTypeError``'s fixed
-    ``CONVERSATION_TYPES`` vocabulary, an agent's registered ``[min, max]``
+    but deliberately NOT included in the raised message: unlike
+    ``UnknownConversationTypeError``'s fixed ``CONVERSATION_TYPES`` vocabulary,
+    an agent's registered ``[min, max]``
     range is its own per-agent state -- an initiator could otherwise
     recover a target's exact range by varying its own declared range
     across repeated ``start_conversation``/``invite`` calls and bisecting
@@ -382,7 +382,7 @@ async def _negotiate_schema_version(
     """Compute the highest wire schema version every participant mutually
     supports, refusing to open the conversation if no such version exists.
 
-    TECH-5160 capability negotiation, evaluated once at ``start_conversation``
+    Schema-version capability negotiation, evaluated once at ``start_conversation``
     (a fresh participant set is only ever assembled here, not on every later
     message — a message's own per-message ``schema_version`` field is the
     sibling agent-local defense-in-depth layer's concern, not this one's).
@@ -395,7 +395,7 @@ async def _negotiate_schema_version(
     that both legitimately declare a ``max_schema_version`` above what the
     board supports would negotiate to a version nothing can validate
     payloads against, turning a board capability limit into a confusing
-    ``PayloadValidationError`` on the very next line (Argus round 1). If
+    ``PayloadValidationError`` on the very next line. If
     the clamped candidate is still >= every participant's declared
     ``min_schema_version`` (i.e. it falls inside every participant's
     ``[min, max]`` range), the conversation degrades to it. Otherwise there
@@ -512,8 +512,8 @@ async def _conversation_pinned_schema_version(
 ) -> int:
     """The wire schema version this conversation was negotiated/pinned to.
 
-    TECH-5160: rather than a separate persisted ``Conversation`` column
-    (Argus round 1's alternative), the pin is durably recoverable from the
+    Schema-version capability negotiation: rather than a separate persisted
+    ``Conversation`` column, the pin is durably recoverable from the
     conversation's own append-only seq-1 ``Message.schema_version`` —
     ``start_conversation`` always writes the negotiated version there (see
     its own docstring), and that row is never updated/deleted. Used by
@@ -527,7 +527,7 @@ async def _conversation_pinned_schema_version(
     missing — every conversation this function is ever called on already
     passed ``_load_participant_for_transition``, which requires the
     conversation to exist, and ``start_conversation`` always writes seq-1
-    atomically with the conversation row itself (Argus round 2: prefer
+    atomically with the conversation row itself. Prefer
     this explicit, diagnosable failure over ``scalar_one()``'s
     ``NoResultFound`` leaking out as an unmapped internal error).
     """
@@ -787,12 +787,12 @@ def _message_dict(message: Message, sender_sub: str) -> dict[str, Any]:
 
 
 def validate_schema_version_range(min_schema_version: int, max_schema_version: int) -> None:
-    """Shared TECH-5160 validation for a declared schema-version range.
+    """Shared schema-version-range validation for a declared range.
 
     Called from BOTH ``register_agent`` (below) and the ``comms_register``
     tool layer (``providers/comms.py``) so tightening this rule in one
     place tightens it everywhere, rather than the two independent guards
-    silently drifting apart (Argus round 1). Raises ``ValueError`` — a
+    silently drifting apart. Raises ``ValueError`` — a
     plain input-validation failure, not an authorization decision.
     """
     if min_schema_version < 1:
@@ -865,7 +865,7 @@ async def register_agent(
     instead raises ``UnknownConversationTypeError`` (exceptions.py) --
     specific and client-safe by design, unlike the cases above.
 
-    ``min_schema_version``/``max_schema_version`` (TECH-5160, both default
+    ``min_schema_version``/``max_schema_version`` (both default
     to ``1``, today's only version) declare the wire-schema version range
     this agent's own code can correctly interpret. ``start_conversation``
     negotiates down to the highest version every participant in a new
@@ -898,8 +898,8 @@ async def register_agent(
         raise ValueError("display_name must be non-empty")
     if len(display_name) > MAX_DISPLAY_NAME_LENGTH:
         raise ValueError(f"display_name exceeds {MAX_DISPLAY_NAME_LENGTH} characters")
-    # Cap check runs FIRST, before computing unknown_types (Argus round 1,
-    # security): the old order let a caller submit an arbitrarily large
+    # Cap check runs FIRST, before computing unknown_types -- for security:
+    # the old order let a caller submit an arbitrarily large
     # list of unknown-type strings and get every one of them echoed back
     # verbatim in the error message, silently bypassing the declared
     # MAX_ACCEPTED_TYPES cap for this input shape. Bounding the input size
@@ -910,13 +910,13 @@ async def register_agent(
     # Empty list is a distinct failure from "contains an unknown type" --
     # it's not client-safe/specific in the same way (there's no unknown
     # value to usefully enumerate), so it stays a bare ValueError rather
-    # than UnknownConversationTypeError. Splitting these (Argus round 1)
+    # than UnknownConversationTypeError. Splitting these
     # avoids the confusing prior message "... (got unknown: [])" for an
     # empty list, which named zero unknown values while still claiming
     # something was unknown.
     if not accepted_types:
         raise ValueError("accepted_types must be non-empty")
-    # Per-entry length cap (Argus round 2, security): the count cap above
+    # Per-entry length cap, for security: the count cap above
     # bounds how many entries there are, not how long any one entry is --
     # without this, 20 arbitrarily large strings would all pass the count
     # check, then get echoed back verbatim in UnknownConversationTypeError
@@ -997,8 +997,8 @@ async def register_agent(
         # post-registration. Freezing both at first registration closes
         # those paths; owner_email is NOT similarly frozen. Unlike
         # owner_sub, owner_email now does carry admission-decision weight
-        # (as of TECH-5159's lookup_agent_by_email, which resolves callers
-        # by this field), but it remains a caller-supplied, unverified
+        # (since lookup_agent_by_email resolves callers by this field),
+        # but it remains a caller-supplied, unverified
         # claim rather than a proven mailbox ownership fact -- see
         # lookup_agent_by_email's docstring for the resulting trust-model
         # gap this re-write permits.
@@ -1068,8 +1068,8 @@ async def lookup_agent_by_email(
     table rather than a separate store: ``owner_email``/``sub`` already
     carry exactly what a caller needs (which email, which board-wide
     identity), so there is nothing left to duplicate. Formerly its own
-    module (``registry/directory.py``, TECH-4945) inside the negotiation
-    library; folded in here per TECH-5159 once each EA agent started
+    module (``registry/directory.py``) inside the negotiation
+    library; folded in here once each EA agent started
     holding its own calendar and that library stopped needing a copy of
     this lookup for itself -- the comms board is the one place every agent
     can already reach, so this is where the lookup belongs. See
@@ -1078,13 +1078,13 @@ async def lookup_agent_by_email(
     Comparison is case-insensitive (``func.lower``) since OAuth-sourced
     email claims are not guaranteed to arrive in one canonical case, but
     does not attempt the fuller NFKC-normalization ``rh_maiea.canonical``
-    applies -- this service has no dependency on that library (by design,
-    per TECH-5158: the negotiation library and the comms board stay
+    applies -- this service has no dependency on that library (by design:
+    the negotiation library and the comms board stay
     decoupled) and plain case-folding covers the realistic input space for
     values sourced from Okta/Google identity claims. Python's ``str.lower()``
     (used on the input) and Postgres's ``lower()`` (used on the stored
     value) can disagree on case-folding for some non-ASCII characters under
-    a non-UTF-8 database collation (Argus round 4) -- not addressed here,
+    a non-UTF-8 database collation -- not addressed here,
     since real input is Okta/Google email claims, which are ASCII.
 
     Fail-closed by construction, matching the retired module's contract:
@@ -1094,7 +1094,7 @@ async def lookup_agent_by_email(
     ever match, and the dangerous failure mode here is a false positive
     (treating an unregistered counterparty as EA-represented), not a
     missed match. This validation intentionally lives here rather than at
-    the ``comms_lookup_agent_by_email`` tool boundary (Argus round 4): it
+    the ``comms_lookup_agent_by_email`` tool boundary: it
     mirrors the retired module's own contract, which lived on the type
     doing the lookup, not its caller.
 
@@ -1105,7 +1105,7 @@ async def lookup_agent_by_email(
     ``email``/``owner_email`` claim. An agent whose stored ``owner_email``
     has incidental leading/trailing whitespace, or came from that fallback
     path, will not be found here -- indistinguishable from "not
-    registered" (Argus round 4). Not fixed in this pass: normalizing at
+    registered". Not fixed in this pass: normalizing at
     write time is a broader change to ``register_agent`` than this lookup
     feature's scope.
 
@@ -1366,7 +1366,7 @@ async def _authorize_conversation_open(
     shared_bypass = conversation_type == "asymmetric" and is_shared_by_id.get(initiator.id, False)
     if shared_bypass:
         # Mirrors _enforce_boundary_crossing's agent.boundary_check_bypassed_shared
-        # audit: staged, not committed (Argus round 5), for consistency
+        # audit: staged, not committed, for consistency
         # with that sibling bypass-observability event -- both are
         # persisted by the caller's own enclosing commit along with the
         # rest of the operation, exactly like every other non-`_deny`
@@ -1433,7 +1433,7 @@ async def start_conversation(
     (uniform) if any target is unknown/inactive, or the participant set
     fails admission; ``RateLimitExceededError`` past the per-initiator
     conversation-start hourly cap OR the board-level per-sender-across-all-
-    conversations hourly cap (TECH-5160); ``SchemaVersionMismatchError`` if
+    conversations hourly cap; ``SchemaVersionMismatchError`` if
     no wire schema version falls inside every participant's declared
     ``[min_schema_version, max_schema_version]`` range;
     ``schemas.PayloadValidationError`` if ``initial_message`` fails schema
@@ -1469,13 +1469,13 @@ async def start_conversation(
         target_ids=target_ids,
     )
 
-    # TECH-5160 capability negotiation: the caller-supplied schema_version
+    # Schema-version capability negotiation: the caller-supplied schema_version
     # is NOT trusted as the actual wire version — it is overridden by the
     # highest version every participant (initiator + all targets) mutually
     # supports, refusing outright if no such version exists at all. See
     # _negotiate_schema_version's docstring for the combined refuse-vs-
-    # degrade rule. Deliberately checked BEFORE _authorize_conversation_open
-    # (Argus round 1): negotiation is pure in-memory computation over
+    # degrade rule. Deliberately checked BEFORE _authorize_conversation_open:
+    # negotiation is pure in-memory computation over
     # already-loaded Agent rows, while _authorize_conversation_open makes an
     # external ownership-service call for internal/asymmetric conversations
     # — running the cheap, purely local check first avoids that round-trip
@@ -1632,8 +1632,8 @@ async def start_conversation(
         )
 
     await session.commit()
-    # Not a mapped column (no migration/persistence for this, Argus round
-    # 1's alternative to a new Conversation column): the negotiated version
+    # Not a mapped column (no migration/persistence needed for this,
+    # unlike a new Conversation column): the negotiated version
     # is durably discoverable via this conversation's own seq-1
     # Message.schema_version (see _conversation_pinned_schema_version,
     # used by invite's re-check below), which already exists and is
@@ -1816,7 +1816,7 @@ async def invite(
     retroactively reconciled against prior messages when it would expand).
     ``open`` conversations have no ownership concept and skip this check.
 
-    TECH-5160: also re-checks the target's declared
+    Also re-checks the target's declared
     ``[min_schema_version, max_schema_version]`` range against the version
     this conversation was already pinned to at ``start_conversation`` time
     (``_conversation_pinned_schema_version``), raising
@@ -1858,15 +1858,14 @@ async def invite(
             conversation_id=conversation.id,
             detail={"target_agent_id": str(target_agent_id)},
         )
-    # TECH-5160: re-check the new target against the version this
+    # Re-check the new target against the version this
     # conversation was already pinned to at open time (see
     # _conversation_pinned_schema_version) -- without this, invite could
     # silently admit a participant whose own declared range excludes the
-    # version every message in this conversation is already written in
-    # (Argus round 1).
+    # version every message in this conversation is already written in.
     pinned_version = await _conversation_pinned_schema_version(session, conversation.id)
     if not (target.min_schema_version <= pinned_version <= target.max_schema_version):
-        # Audit field semantics note (Argus round 3): this "required_min/
+        # Audit field semantics note: this "required_min/
         # available_max" pairing is directionally accurate for the case
         # that's actually reachable today (pinned_version <
         # target.min_schema_version — the target requires newer than
@@ -1879,8 +1878,8 @@ async def invite(
         # max_schema_version >= 1), so this isn't fixed here — revisit
         # once a second schema version makes that direction reachable.
         # The invariant this comment depends on (MAX_REGISTERED_SCHEMA_VERSION
-        # == 1) is mechanically enforced at IMPORT time, not here (Argus
-        # round 5) — see the module-level check near this constant's
+        # == 1) is mechanically enforced at IMPORT time, not here —
+        # see the module-level check near this constant's
         # import above. An in-function check at this exact spot would fire
         # only inside this one denial branch, on this one authorization
         # path, writing no audit row and no log for what would be a
@@ -2007,7 +2006,7 @@ async def _enforce_message_rate_limit(
 async def _enforce_sender_global_rate_limit(
     session: AsyncSession, *, actor_sub: str, sender_agent_id: uuid.UUID
 ) -> None:
-    """Board-level defense-in-depth (TECH-5160): cap a sender's TOTAL
+    """Board-level defense-in-depth: cap a sender's TOTAL
     message volume across ALL conversations combined, not just within one.
 
     Additive to ``_enforce_message_rate_limit``, not a replacement — both
@@ -2113,7 +2112,7 @@ async def _enforce_boundary_crossing(
                 type(exc).__name__,
                 exc_info=True,
             )
-            # No `return` here (Argus round 5): unlike the deliberate
+            # No `return` here -- unlike the deliberate
             # early-return on a successful bypass below, returning after a
             # denial would fail OPEN if `_deny`'s NoReturn contract were
             # ever weakened -- falling through is fail-closed instead,
@@ -2129,10 +2128,10 @@ async def _enforce_boundary_crossing(
                 detail={"message_type": message_type},
             )
         if sender_info.get("is_shared"):
-            # Outside the ownership-lookup try/except (Argus round 3): staging
+            # Outside the ownership-lookup try/except: staging
             # this audit inside that block risked a session-state error being
             # mislabeled as `denied.ownership_unverified`. Staged, not
-            # committed (Argus round 4): the caller (post_message) holds a
+            # committed: the caller (post_message) holds a
             # SELECT ... FOR UPDATE lock on the Conversation row to
             # serialize seq assignment, and committing here would release
             # that lock mid-request, letting two concurrent shared senders
@@ -2148,7 +2147,7 @@ async def _enforce_boundary_crossing(
                 detail={"message_type": message_type},
             )
             return
-        # `if sender_info:` (Argus round 6), not just proceeding
+        # `if sender_info:`, not just proceeding
         # unconditionally: when the first lookup failed, `sender_info` is
         # still `{}` and `sender_owners` is still its empty default, so
         # there is nothing for this second lookup to add -- skipping it
@@ -2170,7 +2169,7 @@ async def _enforce_boundary_crossing(
                     type(exc).__name__,
                     exc_info=True,
                 )
-                # Force `sender_owners` back to empty (Argus round 6): it may
+                # Force `sender_owners` back to empty: it may
                 # already hold a real, non-empty value from the assignment
                 # above, computed before this loop raised. Left as-is, a
                 # `_deny` that failed to raise would fall through to the
@@ -2445,7 +2444,7 @@ async def post_message(
 
     Raises ``RateLimitExceededError`` past the per-sender-per-conversation
     hourly cap OR the board-level per-sender-across-all-conversations hourly
-    cap (``_enforce_sender_global_rate_limit``, TECH-5160 defense-in-depth
+    cap (``_enforce_sender_global_rate_limit``, board-level defense-in-depth
     against a sender spraying messages across many conversations to evade
     the per-conversation cap); ``InvalidConversationStateError`` if
     ``message_type`` is not legal in the conversation's current state

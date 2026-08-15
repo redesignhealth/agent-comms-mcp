@@ -20,8 +20,8 @@ an edit to this one.
 Every DROP in downgrade() below is guarded (if_exists, or raw `DROP ...
 IF EXISTS` SQL for drop_constraint()/drop_table(), neither of which has an
 if_exists kwarg) so re-running downgrade against a partially-applied state
-never aborts — belt-and-suspenders per Argus round 3/4's request, on top
-of the in-place-amendment rationale above. The CREATEs in upgrade() are
+never aborts — belt-and-suspenders on top of the in-place-amendment
+rationale above. The CREATEs in upgrade() are
 guarded for indexes (if_not_exists) and the one column add (raw `ADD
 COLUMN IF NOT EXISTS` SQL), but NOT for `create_table("tasks", ...)` or the
 two FK/CHECK constraint adds: Postgres has no `CREATE TABLE IF NOT EXISTS`

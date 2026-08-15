@@ -60,10 +60,10 @@ service/tools boundary:
   ``UnknownConversationTypeError``'s ``CONVERSATION_TYPES``, though, a
   specific agent's registered ``[min, max]`` range IS per-caller state, not
   a fixed public vocabulary — so ``str()`` of this exception deliberately
-  does NOT include the actual floor/ceiling values that were compared
-  (Argus round 1: an initiator who controls their own declared range could
+  does NOT include the actual floor/ceiling values that were compared:
+  an initiator who controls their own declared range could
   otherwise bisect a target's exact range by varying it across repeated
-  calls). The specific numbers are still recorded in the audit log's
+  calls. The specific numbers are still recorded in the audit log's
   ``detail`` (server-side only) via ``service._deny_schema_version_mismatch``.
 
 Payload/schema validation failures are NOT redefined here: they reuse
