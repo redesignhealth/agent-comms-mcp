@@ -335,6 +335,7 @@ async def register(
     min_schema_version: int = 1,
     max_schema_version: int = 1,
     agent_key: str | None = None,
+    is_shared: bool = False,
 ) -> dict[str, Any]:
     """Self-register or update this agent's board identity.
 
@@ -388,6 +389,21 @@ async def register(
       JWT issuer CLI accepts arbitrary ``--sub`` and extra claims),
       so ``email`` must never be trusted as an ``owner_email`` fallback for
       those tokens, regardless of which check is used to detect them.
+    - ``is_shared``: set ``True`` if this agent spans ownership boundaries
+      (e.g. a shared bot that serves multiple users). Frozen at first
+      registration — re-registering with a different value has no effect.
+      A shared agent is admitted into ``asymmetric`` conversations without
+      the usual pairwise ownership-overlap check, and its senders may post
+      non-``boundary_safe`` messages there without an ownership-boundary
+      check; neither bypass applies to ``internal`` conversations. Setting
+      ``is_shared=True`` on FIRST registration requires the caller's token
+      to carry the ``comms:admin`` scope (or be an interactive/Okta caller)
+      — it is an admission-decision input, so self-declaring it with only
+      the baseline ``comms:write`` scope would be a privilege escalation;
+      a caller without that scope gets the standard anti-enumeration
+      ``access_denied`` error (the specific reason,
+      ``denied.is_shared_requires_elevated_scope``, is recorded only in the
+      audit log — never returned to the caller).
 
     Calling again with the same caller identity AND the same ``agent_key``
     (both absent counts as the same) re-binds ``display_name``/
@@ -425,6 +441,15 @@ async def register(
     except ValueError as exc:
         raise ToolError(f"invalid_request: {exc}") from None
 
+    # `is_shared=True` is an admission-decision input (DESIGN.md §9): it
+    # lets its holder bypass the pairwise ownership check for `asymmetric`
+    # conversations. Interactive (Okta) callers already bypass scope checks
+    # entirely elsewhere in this module, so they're trusted here too;
+    # non-interactive callers need the elevated `comms:admin` scope.
+    # `register_agent` enforces this only on first registration (a no-op
+    # for the frozen re-registration path either way).
+    is_shared_authorized = is_interactive_token(token) or "comms:admin" in scopes_for_token(token)
+
     async with get_session_factory()() as session, _map_service_errors():
         agent = await service.register_agent(
             session,
@@ -435,6 +460,8 @@ async def register(
             accepted_types=accepted_types,
             min_schema_version=min_schema_version,
             max_schema_version=max_schema_version,
+            is_shared=is_shared,
+            is_shared_authorized=is_shared_authorized,
         )
 
     return {
@@ -444,6 +471,7 @@ async def register(
         "accepted_types": list(agent.accepted_types),
         "status": agent.status,
         "owner_email": agent.owner_email,
+        "is_shared": agent.is_shared,
         "min_schema_version": agent.min_schema_version,
         "max_schema_version": agent.max_schema_version,
     }

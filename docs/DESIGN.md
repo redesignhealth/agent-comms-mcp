@@ -82,12 +82,17 @@ an identical `agent_key` string without colliding, since the prefix differs. Thi
 explicitly a stopgap: the durable fix is for the platform to mint each agent its own
 distinct verified identity, at which point `agent_key` should be removed.
 
-**Permissions live in exactly two places:**
+**Permissions live in three places:**
 
 | Layer | Mechanism | Question it answers |
 |---|---|---|
 | Token scopes | fail-closed `TOOL_SCOPES` middleware (`comms:read`, `comms:write`) | may this token call this tool at all? |
+| Parameter-level scope gate | in-handler check (e.g. `comms:admin`, see §5/§7) | may this token set THIS privileged input on an otherwise-reachable tool? |
 | Conversation membership | `participants` rows, checked on every read and write | may this agent see/do anything in this conversation? |
+
+The parameter-level gate is narrower than `TOOL_SCOPES`: it doesn't decide whether the
+tool is reachable (that's still `TOOL_SCOPES`, fail-closed), only whether one specific
+input to an already-reachable tool is accepted. See `scopes.py`'s `:admin` verb comment.
 
 **Scope enforcement applies only to agent-jwt (headless agent) tokens.** Interactive
 callers authenticated via Okta bypass scope checks entirely. Scope enforcement is the
@@ -137,7 +142,9 @@ Five tables. `messages` and `audit_log` are append-only: no UPDATE/DELETE paths 
 ```
 agents id, sub UNIQUE, owner_sub, owner_email, display_name,
  accepted_types text[] (max 20 types, 100 chars each),
- status(active|suspended), min/max_schema_version (TECH-5160), bound_at, timestamps
+ status(active|suspended), min/max_schema_version (TECH-5160),
+ is_shared boolean (default false, frozen at first registration),
+ bound_at, timestamps
 conversations id, type, state(active|completed|canceled|expired),
  created_by, expires_at, owner_snapshot jsonb (nullable),
  timestamps
@@ -165,6 +172,18 @@ Design notes:
  is 7 days.
 - `bound_at` on agents tracks when each agent last registered (updated on every
  `comms_register` call, including re-registration).
+- `is_shared` marks an agent that spans ownership boundaries (e.g. a bot serving
+ multiple users). It is an admission-decision input — see §9 — so it is frozen
+ at first registration (re-registering with a different value has no effect)
+ and self-declaring `True` at first registration requires the caller's token
+ to carry an elevated `comms:admin` scope (or be an interactive/Okta caller);
+ without it, `comms_register` denies with `denied.is_shared_requires_elevated_scope`.
+ There is intentionally no conversion path from `is_shared=false` to `true` for an
+ existing agent (v1): the only way to become shared is `comms:admin`-authorized first
+ registration of a NEW agent identity. An existing agent that needs to become shared
+ has no supported upgrade; this is a deliberate scope-narrowing for v1, not an
+ oversight, consistent with `is_shared` being an admission-decision input that must
+ never change under an identity already in use.
 
 ## 6. Message schemas (two-axis model)
 
@@ -198,7 +217,7 @@ scroll-to-load-more use case.
 | Tool | Scope | Notes |
 |---|---|---|
 | `comms_whoami` | comms:read | caller identity/scopes; also returns this identity's registered min/max_schema_version (TECH-5160) via a best-effort DB lookup if already `comms_register`'d -- omitted if not yet registered or the DB is unreachable (this tool remains usable as an auth-only diagnostic either way) |
-| `comms_register` | comms:write | idempotent self-provisioning: display_name, accepted_types (max 20, 100 chars each), min/max_schema_version (default 1/1, TECH-5160 capability negotiation) |
+| `comms_register` | comms:write | idempotent self-provisioning: display_name, accepted_types (max 20, 100 chars each), min/max_schema_version (default 1/1, TECH-5160 capability negotiation); `is_shared=True` on first registration additionally requires comms:admin (see §5) |
 | `comms_list_agents` | comms:read | directory (internal domain, enumeration acceptable). Returns agent UUIDs used as target identifiers in other tools |
 | `comms_lookup_agent_by_email` | comms:read | directory lookup by owner email; `{"agent": ..., "found": bool}`. O(1) targeted equivalent of paginating `comms_list_agents` -- see §10's enumeration-posture note |
 | `comms_start_conversation` | comms:write | type + up to 50 target agent UUIDs (from `comms_list_agents`) + initial request payload |
@@ -243,8 +262,8 @@ mechanism. The append-only invariant on `messages` is untouched.
 | Type | Admission rule | Use case |
 |---|---|---|
 | `open` | any active agent (no ownership check) | scheduling negotiation across ownership boundaries |
-| `internal` | all participants share identical verified owner sets | same-owner multi-agent coordination (e.g. CoS ↔ EA) |
-| `asymmetric` | all pairwise owner-set intersections are non-empty | cross-owner task delegation where a shared agent bridges two users |
+| `internal` | all participants share identical verified owner sets (no exception — a shared initiator does not bypass this) | same-owner multi-agent coordination (e.g. CoS ↔ EA) |
+| `asymmetric` | all pairwise owner-set intersections are non-empty, **except**: a shared initiator (`agents.is_shared=True`) is admitted without the pairwise check | cross-owner task delegation where a shared agent bridges two users |
 
 Ownership is resolved via an injected `OwnershipClient` seam (never
 `agents.owner_sub` directly — a shared agent's row can't represent multiple
@@ -274,7 +293,9 @@ The flag gates legality within a conversation:
  invited-but-not-yet-accepted participant's owner set was already validated against
  the owner snapshot at invite time, so including them here keeps the boundary check
  consistent with that snapshot invariant rather than leaving a one-post gap until
- they accept).
+ they accept), **except**: a shared sender (`agents.is_shared=True`) may post
+ `boundary_safe=False` messages in `asymmetric` conversations unconditionally,
+ without the ownership-boundary check.
 
 Currently registered message types (all `boundary_safe=True` unless noted):
 

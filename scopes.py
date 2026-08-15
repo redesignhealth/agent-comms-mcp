@@ -33,6 +33,14 @@ from observability import log_auth_rejected
 #   :read   — pure reads / lookups / searches
 #   :write  — mutates state (create, update, delete)
 #   :run    — triggers a unit of work that may write derived data
+#   :admin  — gates a specific privileged PARAMETER within an already-scoped
+#             tool, not the tool call itself. Not listed in TOOL_SCOPES
+#             below (that table gates whether a tool is reachable at all;
+#             an in-handler check like this gates one input to a reachable
+#             tool). Currently: ``comms:admin``, required by
+#             ``providers.comms.register`` to accept ``is_shared=True`` on
+#             first registration (see that tool's docstring and
+#             ``service.register_agent``'s ``is_shared_authorized`` param).
 TOOL_SCOPES: dict[str, str] = {
     # --- comms (provider: providers/comms.py, namespace="comms") ---
     "comms_whoami": "comms:read",

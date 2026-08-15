@@ -201,6 +201,14 @@ async def _register(session: AsyncSession, sub: str, **overrides: Any) -> Agent:
         # capability gate (TestMessageTypeAccepted) don't need to opt in
         # per-type; those tests narrow this explicitly via overrides.
         "accepted_types": sorted(MESSAGE_TYPES),
+        # register_agent's own default is False (fail-closed) so a future
+        # caller that omits the kwarg doesn't silently grant shared-agent
+        # privileges (Argus round 2). This test helper is the one place
+        # that convenience default belongs instead -- most service-layer
+        # tests here call `_register(..., is_shared=True)` directly and
+        # aren't testing the scope gate itself (that's TestRegisterAgent's
+        # dedicated denial test), so they need this to keep working.
+        "is_shared_authorized": True,
     }
     kwargs.update(overrides)
     return await register_agent(session, **kwargs)
@@ -474,6 +482,98 @@ class TestRegisterAgent:
         second = await _register(session, "agent-schema-reset")
         assert second.min_schema_version == 1
         assert second.max_schema_version == 1
+
+    async def test_is_shared_frozen_on_reregister(self, session: AsyncSession) -> None:
+        """``is_shared`` is frozen at first registration — re-registering with
+        a different value must not overwrite it (same freeze semantics as
+        ``owner_sub``: both are admission-decision inputs)."""
+        first = await _register(session, "shared-freeze", is_shared=False)
+        assert first.is_shared is False
+
+        second = await _register(session, "shared-freeze", is_shared=True)
+        assert second.id == first.id
+        assert second.is_shared is False
+
+    async def test_is_shared_frozen_on_reregister_downgrade(self, session: AsyncSession) -> None:
+        """The freeze is bidirectional: a re-registration cannot downgrade
+        ``is_shared`` from ``True`` to ``False`` either -- the same
+        admission-decision-input rationale as the upgrade direction above
+        applies regardless of which way the requested value moves."""
+        first = await _register(session, "shared-freeze-downgrade", is_shared=True)
+        assert first.is_shared is True
+
+        second = await _register(session, "shared-freeze-downgrade", is_shared=False)
+        assert second.id == first.id
+        assert second.is_shared is True
+
+    async def test_is_shared_true_denied_without_authorization(self, session: AsyncSession) -> None:
+        """First registration with ``is_shared=True`` and
+        ``is_shared_authorized=False`` (the fail-closed default) is denied
+        with the specific audited reason, and no ``Agent`` row is created."""
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await register_agent(
+                session,
+                sub="shared-unauthorized",
+                owner_sub="owner-shared-unauthorized",
+                owner_email="shared-unauthorized@example.com",
+                display_name="Shared Unauthorized",
+                accepted_types=sorted(MESSAGE_TYPES),
+                is_shared=True,
+                is_shared_authorized=False,
+            )
+        assert exc_info.value.reason == "denied.is_shared_requires_elevated_scope"
+
+        no_row = (
+            await session.execute(select(Agent).where(Agent.sub == "shared-unauthorized"))
+        ).scalar_one_or_none()
+        assert no_row is None
+
+        actions = (
+            (
+                await session.execute(
+                    select(AuditLog.action).where(AuditLog.actor_sub == "shared-unauthorized")
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert "denied.is_shared_requires_elevated_scope" in actions
+
+    async def test_shared_sender_can_post_note_in_asymmetric(self, session: AsyncSession) -> None:
+        """A sender registered with ``is_shared=True`` bypasses the
+        boundary-crossing check for ``note`` in an ``asymmetric``
+        conversation — exercises the real ``AgentTableOwnershipClient``
+        rather than a fake, verifying the full stack: migration column →
+        ORM model → service freeze → ownership client → enforce path."""
+        shared = await _register(
+            session, "shared-note-sender", owner_sub="shared-owner", is_shared=True
+        )
+        solo = await _register(session, "solo-note-target", owner_sub="solo-owner", is_shared=False)
+        # Conversation open: asymmetric normally requires pairwise ownership
+        # overlap, but _authorize_conversation_open bypasses that check
+        # entirely for a shared initiator (`shared` here). The separate
+        # post-message bypass in _enforce_boundary_crossing (for the `note`
+        # send below) is exercised after the conversation is open.
+        conversation = await start_conversation(
+            session,
+            actor_sub=shared.sub,
+            initiator_agent_id=shared.id,
+            conversation_type="asymmetric",
+            target_agent_ids=[solo.id],
+            initial_message=_request_payload(),
+        )
+        await accept_invite(
+            session, actor_sub=solo.sub, agent_id=solo.id, conversation_id=conversation.id
+        )
+        message = await post_message(
+            session,
+            actor_sub=shared.sub,
+            sender_agent_id=shared.id,
+            conversation_id=conversation.id,
+            message_type="note",
+            payload={"text": "hello from shared bot"},
+        )
+        assert message.type == "note"
 
 
 # --- start_conversation --------------------------------------------------------
@@ -1012,6 +1112,34 @@ class TestConversationOwnershipAdmission:
         )
         assert "denied.not_same_owner" in actions
 
+    async def test_internal_shared_initiator_does_not_bypass_owner_equality(
+        self, session: AsyncSession
+    ) -> None:
+        """The shared-initiator bypass (DESIGN.md §9) applies only to
+        ``asymmetric`` conversations. A shared initiator must NOT be able to
+        open an ``internal`` conversation across disjoint owner sets --
+        ``internal``'s "every participant shares one owner set by
+        construction" invariant has no shared-initiator exception."""
+        owner = await _register(session, "int-owner-shared")
+        target = await _register(session, "int-target-disjoint")
+        client = _FakeOwnershipClient(
+            {
+                owner.id: {"is_shared": True, "owners": ["dan", "priya"]},
+                target.id: {"is_shared": False, "owners": ["priya"]},
+            }
+        )
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await start_conversation(
+                session,
+                actor_sub=owner.sub,
+                initiator_agent_id=owner.id,
+                conversation_type="internal",
+                target_agent_ids=[target.id],
+                initial_message=_request_payload(),
+                ownership_client=client,
+            )
+        assert exc_info.value.reason == "denied.not_same_owner"
+
     async def test_asymmetric_intersecting_owner_sets_admitted(self, session: AsyncSession) -> None:
         owner = await _register(session, "asym-owner-1")
         target = await _register(session, "asym-target-1")
@@ -1057,6 +1185,33 @@ class TestConversationOwnershipAdmission:
             .all()
         )
         assert "denied.no_owner_overlap" in actions
+
+    async def test_asymmetric_shared_target_does_not_bypass_for_nonshared_initiator(
+        self, session: AsyncSession
+    ) -> None:
+        """The shared-initiator bypass (DESIGN.md §9) keys off the
+        INITIATOR's ``is_shared`` flag only. A shared TARGET must not grant
+        the same free pass -- a non-shared initiator with disjoint owners
+        from a shared target is still denied the normal pairwise way."""
+        owner = await _register(session, "asym-owner-nonshared-initiator")
+        target = await _register(session, "asym-target-shared-not-initiator")
+        client = _FakeOwnershipClient(
+            {
+                owner.id: {"is_shared": False, "owners": ["dan"]},
+                target.id: {"is_shared": True, "owners": ["priya", "sam"]},
+            }
+        )
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await start_conversation(
+                session,
+                actor_sub=owner.sub,
+                initiator_agent_id=owner.id,
+                conversation_type="asymmetric",
+                target_agent_ids=[target.id],
+                initial_message=_request_payload(),
+                ownership_client=client,
+            )
+        assert exc_info.value.reason == "denied.no_owner_overlap"
 
     async def test_asymmetric_no_star_topology_exception(self, session: AsyncSession) -> None:
         """A(dan) - B(dan,priya) - C(priya): A-B and B-C each intersect, but
