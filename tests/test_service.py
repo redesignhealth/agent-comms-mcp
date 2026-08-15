@@ -506,6 +506,19 @@ class TestRegisterAgent:
         assert second.id == first.id
         assert second.is_shared is True
 
+        rows = (
+            await session.execute(
+                select(AuditLog.detail).where(
+                    AuditLog.actor_sub == "shared-freeze-downgrade",
+                    AuditLog.action == "agent.reregister_is_shared_ignored",
+                )
+            )
+        ).all()
+        assert len(rows) == 1
+        (detail,) = rows[0]
+        assert detail["is_shared_requested"] is False
+        assert detail["is_shared_effective"] is True
+
     async def test_reregister_is_shared_mismatch_is_audited(self, session: AsyncSession) -> None:
         """A re-registration that requests a different ``is_shared`` value
         than the frozen row has no effect on the row (see the freeze tests
@@ -535,6 +548,54 @@ class TestRegisterAgent:
         _, detail = rows[0]
         assert detail["is_shared_requested"] is True
         assert detail["is_shared_effective"] is False
+
+    async def test_register_audit_detail_is_shared_effective_vs_requested(
+        self, session: AsyncSession
+    ) -> None:
+        """The ``agent.register`` audit detail's ``is_shared`` key holds the
+        effective/persisted value, while ``is_shared_requested`` holds
+        whatever the caller passed -- these diverge on a re-registration
+        that requests a different value than what's already frozen."""
+        first = await _register(
+            session, "register-audit-detail", is_shared=True, is_shared_authorized=True
+        )
+        assert first.is_shared is True
+
+        rows = (
+            await session.execute(
+                select(AuditLog.detail).where(
+                    AuditLog.actor_sub == "register-audit-detail",
+                    AuditLog.action == "agent.register",
+                )
+            )
+        ).all()
+        assert len(rows) == 1
+        (first_detail,) = rows[0]
+        assert first_detail["created"] is True
+        assert first_detail["is_shared"] is True
+        assert first_detail["is_shared_requested"] is True
+
+        second = await _register(
+            session, "register-audit-detail", is_shared=False, is_shared_authorized=False
+        )
+        assert second.id == first.id
+        assert second.is_shared is True
+
+        rows = (
+            await session.execute(
+                select(AuditLog.detail)
+                .where(
+                    AuditLog.actor_sub == "register-audit-detail",
+                    AuditLog.action == "agent.register",
+                )
+                .order_by(AuditLog.id)
+            )
+        ).all()
+        assert len(rows) == 2
+        (second_detail,) = rows[1]
+        assert second_detail["created"] is False
+        assert second_detail["is_shared"] is True
+        assert second_detail["is_shared_requested"] is False
 
     async def test_is_shared_true_denied_without_authorization(self, session: AsyncSession) -> None:
         """First registration with ``is_shared=True`` and
@@ -604,6 +665,19 @@ class TestRegisterAgent:
             payload={"text": "hello from shared bot"},
         )
         assert message.type == "note"
+
+        rows = (
+            await session.execute(
+                select(AuditLog.agent_id, AuditLog.conversation_id, AuditLog.detail).where(
+                    AuditLog.action == "agent.boundary_check_bypassed_shared",
+                )
+            )
+        ).all()
+        assert len(rows) == 1
+        agent_id, conversation_id, detail = rows[0]
+        assert agent_id == shared.id
+        assert conversation_id == conversation.id
+        assert detail["message_type"] == "note"
 
 
 # --- start_conversation --------------------------------------------------------
@@ -1215,6 +1289,47 @@ class TestConversationOwnershipAdmission:
             .all()
         )
         assert "denied.no_owner_overlap" in actions
+
+    async def test_asymmetric_shared_initiator_bypass_is_audited(
+        self, session: AsyncSession
+    ) -> None:
+        """A shared initiator (``is_shared=True``) opening an ``asymmetric``
+        conversation with a disjoint-owner target skips the pairwise
+        ownership check via ``_authorize_conversation_open``'s
+        shared-initiator bypass -- and that bypass must emit an
+        ``agent.conversation_open_bypassed_shared`` audit row, mirroring
+        the analogous ``agent.boundary_check_bypassed_shared`` audit for
+        the post-message bypass in ``_enforce_boundary_crossing``."""
+        owner = await _register(session, "asym-owner-shared-bypass")
+        target = await _register(session, "asym-target-disjoint-bypass")
+        client = _FakeOwnershipClient(
+            {
+                owner.id: {"is_shared": True, "owners": ["dan"]},
+                target.id: {"is_shared": False, "owners": ["priya"]},
+            }
+        )
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="asymmetric",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            ownership_client=client,
+        )
+        assert conversation.state == "active"
+
+        rows = (
+            await session.execute(
+                select(AuditLog.agent_id, AuditLog.detail).where(
+                    AuditLog.action == "agent.conversation_open_bypassed_shared",
+                )
+            )
+        ).all()
+        assert len(rows) == 1
+        agent_id, detail = rows[0]
+        assert agent_id == owner.id
+        assert detail["conversation_type"] == "asymmetric"
 
     async def test_asymmetric_shared_target_does_not_bypass_for_nonshared_initiator(
         self, session: AsyncSession
