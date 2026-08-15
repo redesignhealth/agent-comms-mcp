@@ -331,40 +331,62 @@ jobs:
         # a false-green (or false-red) deploy result. So this captures a
         # timestamp immediately before dispatching, then polls specifically
         # for a workflow_dispatch run created at or after that timestamp,
-        # taking the EARLIEST such match (not just the newest run overall) --
-        # deterministic even if a second, later dispatch races in.
+        # taking the EARLIEST such match (not just the newest run overall).
+        # This is NOT a fully deterministic guarantee (Argus round 3,
+        # SUGGESTION): a concurrent dispatch of this same workflow by another
+        # actor in the window between our dispatch and GitHub indexing it
+        # could in principle be selected instead. Accepted as a real, small
+        # residual risk rather than adding a unique run-name/displayTitle
+        # correlation for what is, in practice, a workflow only this job and
+        # a human running a manual rollback ever dispatch.
+        #
         # timeout-minutes on this step (below) bounds a hung downstream run
         # so it can't hold the deploy concurrency slot and the production
-        # environment lock indefinitely; a timeout fails the step, which is
-        # the correct outcome here (see the note above: no green without a
-        # confirmed successful downstream run).
+        # environment lock indefinitely. A timeout here does NOT cancel the
+        # downstream rh-data-platform run -- Terraform apply/ECS
+        # stabilization keeps proceeding independently, so a timeout means
+        # "we stopped watching," not "the deploy failed." The trap below
+        # attempts a best-effort cancellation once $RUN_ID is known, so a
+        # timeout that fires after that point actually stops the downstream
+        # run rather than leaving it to finish unobserved; see
+        # docs/RELEASING.md for the operator-facing version of this caveat.
         timeout-minutes: 20
         env:
           GH_TOKEN: ${{ steps.rh-data-platform-token.outputs.token }}
           IMAGE_TAG: sha-${{ github.sha }}
         run: |
-          DISPATCH_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          # Small safety margin against the runner clock running ahead of
+          # GitHub's servers (Argus round 3, SUGGESTION): createdAt is
+          # server-assigned, so if the runner clock is even slightly fast,
+          # a >= comparison against the unadjusted dispatch time could never
+          # match our own run.
+          DISPATCH_TIME=$(date -u -d '-60 seconds' +%Y-%m-%dT%H:%M:%SZ)
           gh workflow run deploy-reclaw-comms.yml \
             --repo redesignhealth/rh-data-platform \
             --ref main \
             -f image_tag="$IMAGE_TAG"
 
           RUN_ID=""
-          for _ in $(seq 1 12); do
-            sleep 5
+          trap '[ -n "$RUN_ID" ] && gh run cancel "$RUN_ID" --repo redesignhealth/rh-data-platform 2>/dev/null; true' TERM
+          # 20 x 15s = 5 minutes -- GitHub's own docs note workflow_dispatch
+          # runs can take a while to appear in the run list under load
+          # (Argus round 3, SUGGESTION: the original 60s ceiling was too
+          # tight and risked a false-negative "run not found" failure).
+          for _ in $(seq 1 20); do
+            sleep 15
             RUN_ID=$(gh run list \
               --repo redesignhealth/rh-data-platform \
               --workflow deploy-reclaw-comms.yml \
               --event workflow_dispatch \
               --limit 10 \
-              --json databaseId,createdAt \
-              --jq --arg t "$DISPATCH_TIME" \
-                '[.[] | select(.createdAt >= $t)] | sort_by(.createdAt) | .[0].databaseId')
-            if [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ]; then
+              --json databaseId,createdAt | \
+              jq -r --arg t "$DISPATCH_TIME" \
+                '[.[] | select(.createdAt >= $t)] | sort_by(.createdAt) | .[0].databaseId // empty')
+            if [ -n "$RUN_ID" ]; then
               break
             fi
           done
-          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+          if [ -z "$RUN_ID" ]; then
             echo "ERROR: could not find a deploy-reclaw-comms.yml run created at or after $DISPATCH_TIME -- cannot confirm the deploy succeeded." >&2
             exit 1
           fi

@@ -26,9 +26,19 @@
     the "Generate rh-data-platform dispatch token" step fails immediately
     (bad/missing App credentials) -- the service is not deployed, not
     "deployed but drifted." If the secrets are present but the App lacks
-    `actions: write` on `rh-data-platform`, token generation succeeds but the
-    separate "Deploy via rh-data-platform's deploy-reclaw-comms.yml" step
-    fails instead, at the `gh workflow run` dispatch call.
+    `actions: write` on `rh-data-platform`, token generation ALSO fails at
+    that same step -- GitHub's installation-token API returns HTTP 422 when
+    the requested permission isn't granted to the App installation, with an
+    error like "Requested permissions are not available" rather than a bad
+    credentials error. The dispatch step is never reached either way.
+    The dispatch step has its own separate failure mode: a 20-minute
+    `timeout-minutes` ceiling on watching the downstream run. If
+    `deploy-reclaw-comms.yml` takes longer than that (dev+prod Terraform
+    apply plus ECS stabilization), this step fails even though the
+    downstream deploy is still proceeding -- a best-effort `trap` cancels
+    the downstream run in that case, but check rh-data-platform's Actions
+    tab to confirm actual ECS state before assuming a red run means nothing
+    deployed.
   - **Merge order**: [rh-data-platform#7796](https://github.com/redesignhealth/rh-data-platform/pull/7796)
     (or its successor, if already merged -- confirm the IAM role above has
     had its ECS/PassRole grants removed and `deploy-reclaw-comms.yml` exists)
