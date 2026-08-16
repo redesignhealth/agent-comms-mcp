@@ -345,6 +345,16 @@ jobs:
         # correlation for what is, in practice, a workflow only this job and
         # a human running a manual rollback ever dispatch.
         #
+        # Note the direction of that residual risk: taking the latest match
+        # (vs. the round-4 fix's predecessor, earliest) shifts the failure
+        # mode from false-red to false-green. If a second run lands in the
+        # window and succeeds, this step reports success even though this
+        # release's own image tag may never have reached ECS -- with no
+        # separate signal that the wrong run was watched. Accepted because
+        # this is the more common false-red risk actually causing incidents
+        # (round-4's BLOCKING finding), not because the false-green risk is
+        # zero.
+        #
         # timeout-minutes on this step (below) bounds a hung downstream run
         # so it can't hold the deploy concurrency slot and the production
         # environment lock indefinitely. A timeout here does NOT cancel the
@@ -361,6 +371,13 @@ jobs:
         # docs/RELEASING.md for the operator-facing version of this caveat,
         # including what to check if a timeout leaves rh-data-platform's
         # Terraform state locked mid-apply.
+        #
+        # Trap listens for INT too, not just TERM: canceling this job from
+        # the Actions UI sends SIGINT first, and this has the SAME blast
+        # radius as a timeout -- it will attempt to cancel the downstream
+        # rh-data-platform run and can leave its Terraform state locked if
+        # SIGKILL wins the race. There is no separate warning at cancel time;
+        # this comment and docs/RELEASING.md are it.
         timeout-minutes: 20
         env:
           GH_TOKEN: ${{ steps.rh-data-platform-token.outputs.token }}
@@ -381,7 +398,8 @@ jobs:
             -f image_tag="$IMAGE_TAG"
 
           RUN_ID=""
-          trap '[ -n "$RUN_ID" ] && (gh run cancel "$RUN_ID" --repo redesignhealth/rh-data-platform 2>/dev/null || true); exit 1' TERM
+          WATCH_PID=""
+          trap '[ -n "$RUN_ID" ] && (gh run cancel "$RUN_ID" --repo redesignhealth/rh-data-platform 2>/dev/null || true); [ -n "$WATCH_PID" ] && kill "$WATCH_PID" 2>/dev/null || true; exit 1' TERM INT
           # 20 x 15s = 5 minutes -- GitHub's own docs note workflow_dispatch
           # runs can take a while to appear in the run list under load
           # (Argus round 3, SUGGESTION: the original 60s ceiling was too

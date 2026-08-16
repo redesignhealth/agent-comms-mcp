@@ -32,22 +32,44 @@
     error like "Requested permissions are not available" rather than a bad
     credentials error. The dispatch step is never reached either way.
     The dispatch step has its own separate failure mode: `timeout-minutes: 20`
-    on the step overall, but up to 5 minutes of that is spent discovering the
-    dispatched run before watching even starts -- the effective downstream
-    watch budget is closer to ~15 minutes, not the full 20. If
+    on the step overall, and up to 5 minutes of that CAN be spent discovering
+    the dispatched run before watching even starts -- so ~15 minutes is the
+    worst-case watch *floor*, not the effective ceiling. In the normal path
+    the run is discovered within 15-30s and the watch gets nearly the full 20
+    minutes; the 5-minute discovery budget is only exhausted (and the step
+    fails without ever watching) if the run never appears in
+    `deploy-reclaw-comms.yml`'s run list at all. If
     `deploy-reclaw-comms.yml` (dev+prod Terraform apply plus ECS
-    stabilization) takes longer than that, this step fails even though the
-    downstream deploy may still be proceeding -- a best-effort `trap`
-    attempts to cancel the downstream run in that case (not guaranteed:
-    GitHub Actions can escalate to SIGKILL on the whole process tree before
-    the handler runs), but check rh-data-platform's Actions tab to confirm
-    actual ECS state before assuming a red run means nothing deployed.
+    stabilization) takes longer than the watch actually got, this step fails
+    even though the downstream deploy may still be proceeding -- a
+    best-effort `trap` (registered for both `SIGTERM` and `SIGINT` --
+    **manually canceling this release job from the Actions UI sends SIGINT
+    and has the same blast radius as a timeout**, with no separate warning
+    at cancel time) attempts to cancel the downstream run in that case (not
+    guaranteed: GitHub Actions can escalate to SIGKILL on the whole process
+    tree before the handler runs), but check rh-data-platform's Actions tab
+    to confirm actual ECS state before assuming a red run means nothing
+    deployed.
     **If the trap's cancellation lands mid-`terraform apply`**, it can leave
-    rh-data-platform's Terraform backend with a held state lock -- the next
-    deploy attempt (from any service, not just this one) fails immediately
-    on lock acquisition with no explanation. Check for a stuck lock and run
-    the equivalent of `terraform force-unlock` in rh-data-platform, or
-    escalate to whoever owns that repo's Terraform state, before re-releasing.
+    rh-data-platform's Terraform backend with a held state lock. Terraform's
+    lock error itself is not opaque -- it reports the lock ID, operation
+    type, holder identity, and creation timestamp -- but it does not
+    obviously connect back to the canceled GitHub Actions job, so an
+    operator can misread an informative error as unrelated noise. Before
+    running `terraform force-unlock <LockID>` in rh-data-platform:
+    1. Confirm the downstream `deploy-reclaw-comms.yml` run has actually
+       stopped (check rh-data-platform's Actions tab) -- the cancel is
+       best-effort and may not have landed, and force-unlocking a lock that
+       Terraform is still actively holding can corrupt the state file. If no
+       `RUN_ID` was ever discovered (the 5-minute discovery budget was
+       exhausted before dispatch was even found), no cancel fired and no
+       lock risk exists from this step -- but check for any in-flight
+       `deploy-reclaw-comms.yml` run dispatched around the release
+       timestamp regardless, since the deploy may still be proceeding
+       unmonitored.
+    2. Only once it's confirmed stopped, use the lock ID from Terraform's
+       own error with `terraform force-unlock`, or escalate to whoever owns
+       that repo's Terraform state, before re-releasing.
   - **Merge order**: [rh-data-platform#7796](https://github.com/redesignhealth/rh-data-platform/pull/7796)
     (or its successor, if already merged -- confirm the IAM role above has
     had its ECS/PassRole grants removed and `deploy-reclaw-comms.yml` exists)
