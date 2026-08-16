@@ -1,31 +1,55 @@
-# Build, push to dev ECR, and deploy to dev ECS on every full release.
-# Pre-releases (GitHub "pre-release" flag) skip this workflow entirely --
-# the `if: !prerelease` guard on deploy-dev prevents both jobs from running.
-# After dev is stable, deploy-prod promotes the same image to prod ECR and deploys.
+# Build and push reclaw-comms-mcp's image to dev ECR, then prod ECR, on every
+# full release. Pre-releases (GitHub "pre-release" flag) skip this workflow
+# entirely -- the `if: !prerelease` guard on deploy-dev prevents both jobs
+# from running.
 #
-# Four IAM roles are involved, two per environment:
-# - ECR push role (rh-platform{,-dev}-github-actions-ecr-push-role): org-wide
-#   trust (any redesignhealth/* repo's main branch), PLUS this repo's own
-#   tag-ref subject (dev) / environment:production subject (prod) added
-#   specifically because this workflow triggers on `release: published`, not
-#   main. Carries ECR push/pull permissions only -- nothing reclaw-comms-
-#   specific, since its trust is shared with every other org repo.
-# - ECS deploy role (rh-platform{,-dev}-github-actions-ecs-deploy-reclaw-comms-role):
-#   trusted ONLY by this repo's own OIDC subjects, immutable repo-ID form
-#   only (same tag-ref/environment split as above). Carries everything
-#   reclaw-comms-specific: ECS RegisterTaskDefinition/DescribeTaskDefinition/
-#   UpdateService/DescribeServices/TagResource, PassRole to the execution and
-#   task roles, and (prod only) read access to the dev ECR repo for image
-#   promotion -- see the inline comments on each configure-aws-credentials
-#   step below for the full detail, and rh-data-platform's iam.tf for the
-#   canonical action list.
-# The tag-ref and environment:production subjects are mutually exclusive per
-# role instance (dev role never trusts environment:production; prod role
-# never trusts the tag ref) -- see rh-data-platform's iam.tf for the
-# `local.is_prod` gating. deploy-prod switches between its two roles multiple
-# times in a single job -- see the inline comments on each
-# configure-aws-credentials step.
-name: Deploy to ECS
+# ACTUAL DEPLOYMENT TO ECS IS NOT DONE HERE -- two control planes that can
+# disagree will disagree (issue #7795, 2026-08-15 outage postmortem). This
+# workflow used to call ECS RegisterTaskDefinition/UpdateService directly, in
+# addition to rh-data-platform's Terraform separately declaring this
+# service's image tag and applying it via `deploy-reclaw-comms.yml` ->
+# `deploy-terraform.yml`. Terraform never learned what the direct path had
+# deployed, so its declared tag could drift from what was live -- which is
+# what caused the outage (a tag Terraform still referenced had aged out of
+# ECR's "keep last 10" lifecycle policy).
+#
+# Fix: remove the second path, don't sync it. deploy-prod's last step
+# dispatches rh-data-platform's deploy-reclaw-comms.yml with the tag just
+# pushed to both ECR repos -- that workflow's own deploy-terraform.yml calls
+# are the ONLY thing that ever calls RegisterTaskDefinition/UpdateService for
+# this service now, matching every other service on the shared `mcp-server`
+# Terraform module. No shared-module change was needed: Terraform already
+# owned the ECS resources and already had a workflow built to bump the tag
+# and apply it. The only other change was stripping the ECS/PassRole grants
+# this repo's role no longer uses (see rh-data-platform's iam.tf).
+#
+# Three IAM roles are involved:
+# - ECR push role, dev (rh-platform-dev-github-actions-ecr-push-role) and
+#   prod (rh-platform-github-actions-ecr-push-role): org-wide trust (any
+#   redesignhealth/* repo's main branch), PLUS this repo's own tag-ref
+#   subject (dev) / environment:production subject (prod) added specifically
+#   because this workflow triggers on `release: published`, not main. Carries
+#   ECR push/pull permissions only -- nothing reclaw-comms-specific, since
+#   its trust is shared with every other org repo.
+# - Dev-ECR-read role (rh-platform-github-actions-ecs-deploy-reclaw-comms-role,
+#   prod instance only -- deploy-dev no longer assumes this role at all now
+#   that it does nothing ECS-related): trusted only by this repo's own
+#   environment:production OIDC subject. Its ONLY remaining permission is
+#   read access to the dev ECR repo, so deploy-prod can pull the exact same
+#   image bytes dev already pushed and promote them to prod ECR without a
+#   second build. ("Validated" is the wrong word now -- dev ECS never runs
+#   this image before prod promotion; only ECR push/pull happens here.)
+#   See the inline comment on its configure-aws-credentials step below, and
+#   rh-data-platform's iam.tf for the canonical (now much shorter) action
+#   list -- every ECS/PassRole statement that used to live on this role has
+#   been deleted, not merely left unused.
+#
+# deploy-prod's last two steps are NOT one of those three roles: they use a
+# GitHub App token (RH_DATA_PLATFORM_DISPATCH_APP_ID/_PRIVATE_KEY secrets) to
+# dispatch rh-data-platform's own deploy-reclaw-comms.yml, which is what
+# actually deploys the image to both ECS services. See that step's inline
+# comment and github.com/redesignhealth/rh-data-platform/issues/7795 for why.
+name: Build and Release (deploys via rh-data-platform Terraform)
 
 on:
   release:
@@ -113,61 +137,9 @@ jobs:
           fi
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
 
-      - name: Configure AWS credentials (dev ECS deploy)
-        # ECS RegisterTaskDefinition/DescribeTaskDefinition/UpdateService/
-        # DescribeServices/TagResource + PassRole (to the execution and task
-        # roles) live on a dedicated role, not the ECR push role above -- that
-        # role's trust policy is org-wide (any redesignhealth/* repo's main
-        # branch), so ECS deploy + PassRole for reclaw-comms must not live in
-        # its inline policy. Unlike the ECR push role above (which trusts both
-        # the classic name-based subject and the immutable repo-ID subject),
-        # this higher-privilege role trusts ONLY the confirmed-immutable form
-        # (repo:redesignhealth@<org-id>/agent-comms-mcp@1333468277:ref:refs/
-        # tags/v*) -- see rh-data-platform's iam.tf for the exact trust policy
-        # and full action set.
-        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
-        with:
-          role-to-assume: arn:aws:iam::082533342824:role/rh-platform-dev-github-actions-ecs-deploy-reclaw-comms-role
-          role-session-name: agent-comms-dev-ecs-deploy
-          aws-region: us-east-1
-
-      - name: Download current dev task definition
-        run: |
-          aws ecs describe-task-definition \
-            --task-definition rh-reclaw-comms-dev \
-            --query taskDefinition \
-            --output json > /tmp/task-def-dev.json
-
-      - name: Update app container image in dev task definition
-        env:
-          # Use digest reference to pin the exact image pushed — tags are mutable.
-          IMAGE: 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform-dev/apps/reclaw-comms-mcp@${{ steps.push-dev.outputs.digest }}
-        run: |
-          python3 - <<'EOF'
-          import json, sys, os
-          IMAGE = os.environ['IMAGE']
-          with open('/tmp/task-def-dev.json') as f:
-              td = json.load(f)
-          if not any(c['name'] == 'app' for c in td['containerDefinitions']):
-              print("ERROR: no container named 'app' in dev task definition", file=sys.stderr)
-              sys.exit(1)
-          for c in td['containerDefinitions']:
-              if c['name'] == 'app':
-                  c['image'] = IMAGE
-          for field in ['taskDefinitionArn','revision','status','requiresAttributes',
-                        'compatibilities','registeredAt','registeredBy']:
-              td.pop(field, None)
-          with open('/tmp/task-def-dev.json', 'w') as f:
-              json.dump(td, f)
-          EOF
-
-      - name: Deploy to ECS (dev)
-        uses: aws-actions/amazon-ecs-deploy-task-definition@df9643053eda01f169e64a0e60233aacca83799a # v2.2.0
-        with:
-          task-definition: /tmp/task-def-dev.json
-          service: rh-reclaw-comms-dev
-          cluster: rh-platform-dev-cluster
-          wait-for-service-stability: true
+      # No ECS deploy here (issue #7795) -- dev ECS deployment happens via
+      # deploy-prod's dispatch of rh-data-platform's deploy-reclaw-comms.yml
+      # below, which applies both dev and prod through Terraform in one run.
 
   deploy-prod:
     name: Deploy (prod)
@@ -179,13 +151,15 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - name: Configure AWS credentials (prod ECS deploy — dev image read)
+      - name: Configure AWS credentials (dev image read for promotion)
         # ReadDevECRForPromotion (read-only access to the dev reclaw-comms-mcp
-        # ECR repo) lives on the dedicated deploy role, not the org-wide ECR
-        # push role — that role's trust is org-wide (any redesignhealth/*
-        # repo's main branch), so a reclaw-comms-specific grant has no reason
-        # to be reachable by every other repo's CI just because they also
-        # assume the shared push role.
+        # ECR repo) lives on this dedicated role, not the org-wide ECR push
+        # role — that role's trust is org-wide (any redesignhealth/* repo's
+        # main branch), so a reclaw-comms-specific grant has no reason to be
+        # reachable by every other repo's CI just because they also assume
+        # the shared push role. This role carries NO ECS permissions (issue
+        # #7795) -- its only remaining purpose is this read, for promoting
+        # the exact dev image to prod ECR below.
         uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
         with:
           role-to-assume: arn:aws:iam::082533342824:role/rh-platform-github-actions-ecs-deploy-reclaw-comms-role
@@ -261,7 +235,6 @@ jobs:
         uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
 
       - name: Push image to prod ECR
-        id: push-prod
         env:
           PROD_IMAGE: 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform/apps/reclaw-comms-mcp:sha-${{ github.sha }}
           GH_SHA: ${{ github.sha }}
@@ -276,57 +249,190 @@ jobs:
             exit 1
           fi
           echo "Prod ECR push confirmed: $PROD_DIGEST"
-          echo "prod-digest=$PROD_DIGEST" >> "$GITHUB_OUTPUT"
 
-      - name: Configure AWS credentials (prod ECS deploy)
-        # ECS RegisterTaskDefinition/DescribeTaskDefinition/UpdateService/
-        # DescribeServices/TagResource + PassRole (to the execution and task
-        # roles) live on the dedicated role, not the ECR push role above --
-        # that role's trust policy is org-wide (any redesignhealth/* repo's
-        # main branch), so ECS deploy + PassRole for reclaw-comms must not
-        # live in its inline policy. This role is trusted only by
-        # agent-comms-mcp's own OIDC subjects. Re-assumed here since the
-        # previous two steps switched to the ECR push role for the prod push.
-        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+      # rh-data-platform/issues/7795 (2026-08-15 dev+prod outage postmortem):
+      # this workflow used to deploy reclaw-comms-mcp to ECS directly here
+      # (RegisterTaskDefinition/UpdateService), completely out-of-band from
+      # rh-data-platform's Terraform, which separately declares this
+      # service's image tag in
+      # infrastructure/environments/{dev,prod}/terraform.tfvars
+      # (reclaw_comms_image_tag) and applies it via
+      # `.github/workflows/deploy-reclaw-comms.yml` +
+      # `terraform.yml` (dev auto-applies on every merge to rh-data-platform's
+      # main). Two independent control planes able to disagree is what caused
+      # the outage: the direct-ECS path deployed a tag Terraform never
+      # learned about, and the next dev auto-apply reverted the ECS service
+      # back to the stale tag still pinned in tfvars -- which had, by then,
+      # aged out of ECR's "keep last 10 sha-tagged images" lifecycle policy.
+      #
+      # Fix: the direct-ECS steps are REMOVED, not synced. This step below
+      # dispatches rh-data-platform's deploy-reclaw-comms.yml with the exact
+      # tag just pushed to both ECR repos above -- that workflow's
+      # deploy-terraform.yml calls are now the ONLY thing that ever calls
+      # RegisterTaskDefinition/UpdateService for this service, so there is
+      # exactly one deploy path and nothing left to drift. This needed no
+      # shared-module change (`infrastructure/modules/mcp-server`) at all --
+      # Terraform already owned the ECS resources and already had this exact
+      # workflow built to bump the tag and apply it; the only IAM change was
+      # deleting the ECS/PassRole grants the dev-ECR-read role no longer
+      # uses (see rh-data-platform's iam.tf). This intentionally does not
+      # touch IAM/OIDC trust otherwise: it reuses rh-data-platform's existing
+      # deploy-reclaw-comms.yml exactly as designed, via a plain
+      # `gh workflow run` dispatch, the same mechanism deploy-terraform.yml
+      # uses for its own cross-job GitHub App token.
+      #
+      # UNLIKE the old sync-only design, a failure here now means the
+      # service was NOT deployed -- this is the only deploy mechanism left,
+      # not a best-effort tfvars sync running after an already-completed ECS
+      # deploy. Don't read a red run here as "safe, just drifted"; the new
+      # image never reached ECS.
+      #
+      # deploy-reclaw-comms.yml's single dispatch covers BOTH dev and prod in
+      # one run (its deploy-dev and deploy-prod jobs both fire from this one
+      # workflow_dispatch, gated only on the image tag already existing in
+      # both ECR repos, which it does by the time this step runs) -- no
+      # separate dev-side dispatch is needed.
+      #
+      # Requires two repo secrets here (RH_DATA_PLATFORM_DISPATCH_APP_ID /
+      # RH_DATA_PLATFORM_DISPATCH_APP_PRIVATE_KEY) for a GitHub App
+      # installed on rh-data-platform with `actions: write` -- provisioning
+      # that app/installation and adding these secrets is a one-time,
+      # human/infra-owner action (see issue #7795 and docs/RELEASING.md's
+      # Prerequisites section); this step fails loudly, not silently, until
+      # that's done.
+      - name: Generate rh-data-platform dispatch token
+        id: rh-data-platform-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
         with:
-          role-to-assume: arn:aws:iam::082533342824:role/rh-platform-github-actions-ecs-deploy-reclaw-comms-role
-          role-session-name: agent-comms-prod-ecs-deploy
-          aws-region: us-east-1
+          app-id: ${{ secrets.RH_DATA_PLATFORM_DISPATCH_APP_ID }}
+          private-key: ${{ secrets.RH_DATA_PLATFORM_DISPATCH_APP_PRIVATE_KEY }}
+          owner: redesignhealth
+          repositories: rh-data-platform
+          # Downscope to exactly the permission this token is used for --
+          # without this it carries every permission the App installation
+          # has been granted on rh-data-platform, not just Actions.
+          permission-actions: write
 
-      - name: Download current prod task definition
-        run: |
-          aws ecs describe-task-definition \
-            --task-definition rh-reclaw-comms \
-            --query taskDefinition \
-            --output json > /tmp/task-def-prod.json
-
-      - name: Update app container image in prod task definition
+      - name: Deploy via rh-data-platform's deploy-reclaw-comms.yml
+        # `gh workflow run` only enqueues the dispatch -- it returns 0 the
+        # moment GitHub's API accepts the request, before the workflow even
+        # starts. A bare dispatch with no outcome check would report this
+        # job green even if deploy-reclaw-comms.yml then failed (bad image
+        # tag, tfvars merge conflict, a permissions problem) and the actual
+        # ECS deploy never happened -- silently recreating issue #7795 one
+        # hop downstream. So this step polls the dispatched run to
+        # completion and fails if it fails.
+        #
+        # `gh run list --limit 1` alone is not enough to identify OUR run: if
+        # GitHub hasn't indexed the new run by the time we list, or another
+        # dispatch of this same workflow lands in rh-data-platform in the
+        # same window, `--limit 1` can return a stale or unrelated run and
+        # `gh run watch` would then report that run's outcome, not ours --
+        # a false-green (or false-red) deploy result. So this captures a
+        # timestamp immediately before dispatching, then polls specifically
+        # for a workflow_dispatch run created at or after that timestamp,
+        # taking the LATEST such match. Argus round 4, BLOCKING: an earlier
+        # version took the EARLIEST match combined with a 60s clock-skew
+        # backdate -- that combination deterministically selects an OLDER
+        # concurrent run (e.g. an operator's manual rollback dispatched
+        # shortly before this release) over the one this step just fired.
+        # Our own dispatch is always the most recent eligible run once it's
+        # indexed, so "latest" is both the fix and the correct semantics --
+        # this is NOT a fully deterministic guarantee: a concurrent dispatch
+        # by another actor landing AFTER ours but before the poll captures
+        # it could still be selected instead. Accepted as a real, small
+        # residual risk rather than adding a unique run-name/displayTitle
+        # correlation for what is, in practice, a workflow only this job and
+        # a human running a manual rollback ever dispatch.
+        #
+        # Note the direction of that residual risk: taking the latest match
+        # (vs. the round-4 fix's predecessor, earliest) shifts the failure
+        # mode from false-red to false-green. If a second run lands in the
+        # window and succeeds, this step reports success even though this
+        # release's own image tag may never have reached ECS -- with no
+        # separate signal that the wrong run was watched. Accepted because
+        # this is the more common false-red risk actually causing incidents
+        # (round-4's BLOCKING finding), not because the false-green risk is
+        # zero.
+        #
+        # timeout-minutes on this step (below) bounds a hung downstream run
+        # so it can't hold the deploy concurrency slot and the production
+        # environment lock indefinitely. A timeout here does NOT cancel the
+        # downstream rh-data-platform run by default -- Terraform apply/ECS
+        # stabilization keeps proceeding independently, so a timeout means
+        # "we stopped watching," not "the deploy failed." The trap below
+        # makes a BEST-EFFORT attempt to cancel the downstream run once
+        # $RUN_ID is known, using background+wait (not a plain foreground
+        # `gh run watch`) specifically so bash actually delivers the signal
+        # promptly instead of deferring it until the foreground command
+        # exits on its own -- but GitHub Actions' own timeout enforcement
+        # can still escalate to SIGKILL on the whole process tree before the
+        # handler completes, so this is not a guarantee. See
+        # docs/RELEASING.md for the operator-facing version of this caveat,
+        # including what to check if a timeout leaves rh-data-platform's
+        # Terraform state locked mid-apply.
+        #
+        # Trap listens for INT too, not just TERM: canceling this job from
+        # the Actions UI sends SIGINT first, and this has the SAME blast
+        # radius as a timeout -- it will attempt to cancel the downstream
+        # rh-data-platform run and can leave its Terraform state locked if
+        # SIGKILL wins the race. There is no separate warning at cancel time;
+        # this comment and docs/RELEASING.md are it.
+        timeout-minutes: 20
         env:
-          # Use digest reference to pin the exact image pushed — tags are mutable.
-          IMAGE: 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform/apps/reclaw-comms-mcp@${{ steps.push-prod.outputs.prod-digest }}
+          GH_TOKEN: ${{ steps.rh-data-platform-token.outputs.token }}
+          IMAGE_TAG: sha-${{ github.sha }}
         run: |
-          python3 - <<'EOF'
-          import json, sys, os
-          IMAGE = os.environ['IMAGE']
-          with open('/tmp/task-def-prod.json') as f:
-              td = json.load(f)
-          if not any(c['name'] == 'app' for c in td['containerDefinitions']):
-              print("ERROR: no container named 'app' in prod task definition", file=sys.stderr)
-              sys.exit(1)
-          for c in td['containerDefinitions']:
-              if c['name'] == 'app':
-                  c['image'] = IMAGE
-          for field in ['taskDefinitionArn','revision','status','requiresAttributes',
-                        'compatibilities','registeredAt','registeredBy']:
-              td.pop(field, None)
-          with open('/tmp/task-def-prod.json', 'w') as f:
-              json.dump(td, f)
-          EOF
+          # Narrow safety margin (Argus round 4, BLOCKING follow-on: the
+          # prior 60s margin combined with earliest-match was what caused
+          # the rollback-collision bug above) against the runner clock
+          # running very slightly ahead of GitHub's servers -- createdAt is
+          # server-assigned, so if the runner clock is even slightly fast, a
+          # >= comparison against the unadjusted dispatch time could never
+          # match our own run. 10s comfortably covers realistic NTP drift
+          # without reopening the wide collision window 60s did.
+          DISPATCH_TIME=$(date -u -d '-10 seconds' +%Y-%m-%dT%H:%M:%SZ)
+          gh workflow run deploy-reclaw-comms.yml \
+            --repo redesignhealth/rh-data-platform \
+            --ref main \
+            -f image_tag="$IMAGE_TAG"
 
-      - name: Deploy to ECS (prod)
-        uses: aws-actions/amazon-ecs-deploy-task-definition@df9643053eda01f169e64a0e60233aacca83799a # v2.2.0
-        with:
-          task-definition: /tmp/task-def-prod.json
-          service: rh-reclaw-comms
-          cluster: rh-platform-cluster
-          wait-for-service-stability: true
+          RUN_ID=""
+          WATCH_PID=""
+          trap '[ -n "$RUN_ID" ] && (gh run cancel "$RUN_ID" --repo redesignhealth/rh-data-platform 2>/dev/null || true); [ -n "$WATCH_PID" ] && kill "$WATCH_PID" 2>/dev/null || true; exit 1' TERM INT
+          # 20 x 15s = 5 minutes -- GitHub's own docs note workflow_dispatch
+          # runs can take a while to appear in the run list under load
+          # (Argus round 3, SUGGESTION: the original 60s ceiling was too
+          # tight and risked a false-negative "run not found" failure). This
+          # discovery loop's own time is additional to the watch below, so
+          # the effective downstream-run budget is up to ~15 minutes
+          # watching, not the full 20 (see docs/RELEASING.md).
+          for _ in $(seq 1 20); do
+            sleep 15
+            RUN_ID=$(gh run list \
+              --repo redesignhealth/rh-data-platform \
+              --workflow deploy-reclaw-comms.yml \
+              --event workflow_dispatch \
+              --limit 10 \
+              --json databaseId,createdAt | \
+              jq -r --arg t "$DISPATCH_TIME" \
+                '[.[] | select(.createdAt >= $t)] | sort_by(.createdAt) | last | .databaseId // empty')
+            if [ -n "$RUN_ID" ]; then
+              break
+            fi
+          done
+          if [ -z "$RUN_ID" ]; then
+            echo "ERROR: could not find a deploy-reclaw-comms.yml run created at or after $DISPATCH_TIME -- cannot confirm the deploy succeeded." >&2
+            exit 1
+          fi
+          echo "Watching rh-data-platform run $RUN_ID (dispatched at $DISPATCH_TIME)..."
+          # Backgrounded + waited on, not a plain foreground call: bash
+          # defers a trapped signal until the foreground command exits on
+          # its own, which would defeat the whole point of the trap above on
+          # a hung/slow watch. Signals delivered to the shell while it's
+          # blocked in `wait` are handled immediately instead.
+          gh run watch "$RUN_ID" \
+            --repo redesignhealth/rh-data-platform \
+            --exit-status &
+          WATCH_PID=$!
+          wait "$WATCH_PID"
