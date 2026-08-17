@@ -2354,6 +2354,52 @@ class TestGetConversation:
         )
         assert continued["messages"][0]["seq"] == MAX_MESSAGES_PER_GET_CONVERSATION + 1
 
+    async def test_empty_page_past_the_cursor_does_not_advance_last_read_seq(
+        self, session: AsyncSession
+    ) -> None:
+        """Argus round-2 BLOCKING catch: page_max_seq defaults to since_seq
+        on an EMPTY page. If a caller passes since_seq ahead of its own
+        persisted cursor with no new messages actually returned, that
+        default must NOT drive the last_read_seq write -- otherwise it
+        would permanently hide any messages between the persisted cursor
+        and the passed-in since_seq from this caller's inbox (`HAVING
+        max(seq) > last_read_seq`)."""
+        _owner, target, conversation = await self._start(
+            session, "gc-empty-page-owner", "gc-empty-page-target"
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        # Only seq=1 exists (from start_conversation). last_read_seq is 0.
+        result = await get_conversation(
+            session,
+            actor_sub=target.sub,
+            caller_agent_id=target.id,
+            conversation_id=conversation.id,
+            # Ahead of the persisted cursor (0) AND ahead of the only real
+            # message (seq=1) -- the query returns zero rows.
+            since_seq=10,
+        )
+        assert result["messages"] == []
+        assert result["page_max_seq"] == 10  # the no-op-safe response value
+        # The DB write must NOT have advanced to 10 -- seq=1 was never
+        # actually delivered to this caller.
+        assert result["last_read_seq"] == 0
+
+        row = await session.get(Participant, (conversation.id, target.id))
+        assert row is not None
+        assert row.last_read_seq == 0
+
+        # The real message (seq=1) is still visible on a normal read.
+        follow_up = await get_conversation(
+            session,
+            actor_sub=target.sub,
+            caller_agent_id=target.id,
+            conversation_id=conversation.id,
+            since_seq=0,
+        )
+        assert [m["seq"] for m in follow_up["messages"]] == [1]
+
 
 # --- post_message --------------------------------------------------------------
 
@@ -4248,6 +4294,12 @@ class TestInbox:
         assert len(result["unread"]) == MAX_UNREAD_CONVERSATIONS_PER_INBOX
         assert result["unread_has_more"] is True
         assert result["pending_invites_has_more"] is False
+        # Argus round-2 SUGGESTION: this is the only assertion that
+        # actually distinguishes the round-1 true-COUNT(*) fix from the
+        # reverted len(unread)+len(pending) behavior -- every other
+        # total_count assertion in this file uses 0-2 rows, where both
+        # implementations agree.
+        assert result["total_count"] == extra
 
     async def test_pending_invites_list_is_capped_with_has_more(
         self, session: AsyncSession
@@ -4289,6 +4341,7 @@ class TestInbox:
         assert len(result["pending_invites"]) == MAX_PENDING_INVITES_PER_INBOX
         assert result["pending_invites_has_more"] is True
         assert result["unread_has_more"] is False
+        assert result["total_count"] == MAX_PENDING_INVITES_PER_INBOX + 5
 
 
 # --- accepted_types message-type vocabulary -----------------------------------
@@ -4433,6 +4486,25 @@ class TestPerTypeTTL:
             expires_at=already_expired,
         )
         assert abs((conv.expires_at - already_expired).total_seconds()) < 1
+
+    async def test_naive_expires_at_rejected_with_a_clear_error(
+        self, session: AsyncSession
+    ) -> None:
+        """Argus round-2 SUGGESTION: without this guard, a naive datetime
+        raises a raw TypeError from the ceiling arithmetic (offset-naive
+        minus offset-aware) instead of a clear validation error."""
+        creator = await _register(session, "ttl-naive-creator")
+        target = await _register(session, "ttl-naive-target")
+        with pytest.raises(ValueError, match="timezone-aware"):
+            await start_conversation(
+                session,
+                actor_sub=creator.sub,
+                initiator_agent_id=creator.id,
+                conversation_type="open",
+                target_agent_ids=[target.id],
+                initial_message=_request_payload(),
+                expires_at=datetime(2030, 1, 1),
+            )
 
 
 # --- list_conversations -------------------------------------------------------

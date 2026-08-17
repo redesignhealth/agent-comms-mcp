@@ -20,6 +20,13 @@ a ``CONCURRENTLY`` index build can't run inside that transaction anyway
 deployment step this migrations directory doesn't otherwise use.
 Revisit if ``participants`` ever grows large enough for a
 regular-build lock to matter in practice.
+
+Also drops ``idx_participants_agent_id_status`` (from ef8394b37c8d,
+initial schema): Argus round-2 SUGGESTION -- it's a strict left-prefix
+of the new 3-column index, so Postgres serves every query it covered
+via this one's own prefix. Keeping both would double index-maintenance
+cost on every ``participants`` INSERT/UPDATE/DELETE for zero query-plan
+benefit. Recreated in ``downgrade()`` to actually reverse this migration.
 """
 
 from __future__ import annotations
@@ -41,9 +48,20 @@ def upgrade() -> None:
         ["agent_id", "status", "invited_at"],
         if_not_exists=True,
     )
+    op.drop_index(
+        "idx_participants_agent_id_status",
+        table_name="participants",
+        if_exists=True,
+    )
 
 
 def downgrade() -> None:
+    op.create_index(
+        "idx_participants_agent_id_status",
+        "participants",
+        ["agent_id", "status"],
+        if_not_exists=True,
+    )
     op.drop_index(
         "idx_participants_agent_id_status_invited_at",
         table_name="participants",

@@ -1149,6 +1149,10 @@ class TestFullNegotiationFlow:
         assert "messages_returned" in b_view
         assert b_view["messages_returned"] == 1
         assert "total_count" not in b_view
+        # page_max_seq is the documented continuation token (Argus round-2
+        # SUGGESTION: untested at the tool boundary until now).
+        assert b_view["page_max_seq"] == 1
+        assert b_view["has_more"] is False
 
         # C never accepts — metadata-only, no message content.
         c_view = await _call(
@@ -1165,6 +1169,8 @@ class TestFullNegotiationFlow:
         # unlike the active-member path asserted above.
         assert "messages_returned" not in c_view
         assert "total_count" not in c_view
+        assert "invited_by" in c_view
+        assert c_view["has_more"] is False
 
         # B posts an availability_response.
         b_response = await _call(

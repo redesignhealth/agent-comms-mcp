@@ -2802,8 +2802,16 @@ async def get_conversation(
     page_max_seq = max((m.seq for m, _ in msg_rows), default=since_seq)
     # last_read_seq only ever advances forward, never regresses on an
     # older-history re-read (page_max_seq can be below the existing cursor
-    # in exactly that case).
-    if page_max_seq > participant.last_read_seq:
+    # in exactly that case). `msg_rows and` is load-bearing, not redundant
+    # (Argus round-2 BLOCKING catch): on an EMPTY page, page_max_seq falls
+    # back to since_seq -- if a caller passes a since_seq ahead of their
+    # own persisted cursor (e.g. since_seq=10, last_read_seq=3) with no
+    # messages actually returned, `10 > 3` would otherwise fire and commit
+    # last_read_seq=10, permanently hiding seqs 4-10 from inbox's `HAVING
+    # max(seq) > last_read_seq` for messages that were never delivered to
+    # this caller. The docstring's own contract ("only if any messages
+    # were returned") requires this guard.
+    if msg_rows and page_max_seq > participant.last_read_seq:
         participant.last_read_seq = page_max_seq
     await session.commit()
 
@@ -2889,16 +2897,26 @@ async def inbox(session: AsyncSession, *, caller_agent_id: uuid.UUID) -> dict[st
     # True unread-conversation count, unaffected by the page cap above --
     # same GROUP BY/HAVING as the paginated query, wrapped and counted
     # rather than limited (Argus round-1 BLOCKING catch).
-    unread_total_stmt = select(func.count()).select_from(
-        select(Conversation.id)
-        .join(Participant, Participant.conversation_id == Conversation.id)
-        .join(Message, Message.conversation_id == Conversation.id)
-        .where(Participant.agent_id == caller_agent_id, Participant.status == "active")
-        .group_by(Conversation.id, Participant.last_read_seq)
-        .having(func.max(Message.seq) > Participant.last_read_seq)
-        .subquery()
-    )
-    unread_total = (await session.execute(unread_total_stmt)).scalar_one()
+    # Only worth a second round trip when the page was actually truncated
+    # (Argus round-2 SUGGESTION): when it wasn't, the true count IS the
+    # returned list's length, and DESIGN.md §7 already treats "a second
+    # SELECT COUNT(*) replaying the same filter predicates" as a real cost
+    # worth avoiding elsewhere (why comms_list_conversations omits
+    # total_count entirely) -- inbox shouldn't pay it unconditionally on
+    # every call when it only matters in the truncated case.
+    if unread_has_more:
+        unread_total_stmt = select(func.count()).select_from(
+            select(Conversation.id)
+            .join(Participant, Participant.conversation_id == Conversation.id)
+            .join(Message, Message.conversation_id == Conversation.id)
+            .where(Participant.agent_id == caller_agent_id, Participant.status == "active")
+            .group_by(Conversation.id, Participant.last_read_seq)
+            .having(func.max(Message.seq) > Participant.last_read_seq)
+            .subquery()
+        )
+        unread_total = (await session.execute(unread_total_stmt)).scalar_one()
+    else:
+        unread_total = len(unread_rows)
 
     # Fetch every unread conversation's latest message + sender sub in a
     # single round trip (instead of one SELECT per conversation in a Python
@@ -2944,13 +2962,16 @@ async def inbox(session: AsyncSession, *, caller_agent_id: uuid.UUID) -> dict[st
     pending_has_more = len(pending_rows) > MAX_PENDING_INVITES_PER_INBOX
     pending_rows = pending_rows[:MAX_PENDING_INVITES_PER_INBOX]
 
-    pending_total = (
-        await session.execute(
-            select(func.count())
-            .select_from(Participant)
-            .where(Participant.agent_id == caller_agent_id, Participant.status == "invited")
-        )
-    ).scalar_one()
+    if pending_has_more:
+        pending_total = (
+            await session.execute(
+                select(func.count())
+                .select_from(Participant)
+                .where(Participant.agent_id == caller_agent_id, Participant.status == "invited")
+            )
+        ).scalar_one()
+    else:
+        pending_total = len(pending_rows)
 
     pending_invites = [
         {

@@ -751,8 +751,9 @@ async def get_conversation(
     """Combined read: conversation + participants + messages since ``since_seq``.
 
     Returns ``conversation``, ``participants``, ``messages``, ``invited``,
-    ``has_more``, and (only for a non-``invited`` caller) ``messages_returned``,
-    ``page_max_seq``, ``last_read_seq``.
+    ``has_more``, and either ``invited_by`` (only for an ``invited``
+    caller) or ``messages_returned``, ``page_max_seq``, ``last_read_seq``
+    (only for a non-``invited`` caller).
 
     An ``invited`` (not yet accepted) caller gets metadata only — no
     message content, ``since_seq`` is ignored, and ``has_more`` is always
