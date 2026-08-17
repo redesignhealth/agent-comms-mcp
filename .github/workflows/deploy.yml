@@ -110,7 +110,7 @@ jobs:
       - name: Configure AWS credentials (dev)
         uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
         with:
-          role-to-assume: arn:aws:iam::082533342824:role/rh-platform-dev-github-actions-ecr-push-role
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/rh-platform-dev-github-actions-ecr-push-role
           role-session-name: agent-comms-dev-ecr-push
           aws-region: us-east-1
 
@@ -120,7 +120,7 @@ jobs:
       - name: Build and push image (dev)
         id: push-dev
         env:
-          DEV_IMAGE: 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform-dev/apps/reclaw-comms-mcp:sha-${{ github.sha }}
+          DEV_IMAGE: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/rh-platform-dev/apps/reclaw-comms-mcp:sha-${{ github.sha }}
           GH_SHA: ${{ github.sha }}
         run: |
           docker build -t "$DEV_IMAGE" .
@@ -162,7 +162,7 @@ jobs:
         # the exact dev image to prod ECR below.
         uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
         with:
-          role-to-assume: arn:aws:iam::082533342824:role/rh-platform-github-actions-ecs-deploy-reclaw-comms-role
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/rh-platform-github-actions-ecs-deploy-reclaw-comms-role
           role-session-name: agent-comms-prod-ecs-deploy-dev-read
           aws-region: us-east-1
 
@@ -210,8 +210,8 @@ jobs:
 
       - name: Pull dev image (by digest)
         env:
-          DEV_IMAGE: 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform-dev/apps/reclaw-comms-mcp@${{ needs.deploy-dev.outputs.image-digest }}
-          PROD_IMAGE: 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform/apps/reclaw-comms-mcp:sha-${{ github.sha }}
+          DEV_IMAGE: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/rh-platform-dev/apps/reclaw-comms-mcp@${{ needs.deploy-dev.outputs.image-digest }}
+          PROD_IMAGE: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/rh-platform/apps/reclaw-comms-mcp:sha-${{ github.sha }}
         run: |
           docker pull "$DEV_IMAGE"
           docker tag "$DEV_IMAGE" "$PROD_IMAGE"
@@ -221,7 +221,7 @@ jobs:
         # ECR — the deploy role above has no write access to rh-platform/apps/*.
         uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
         with:
-          role-to-assume: arn:aws:iam::082533342824:role/rh-platform-github-actions-ecr-push-role
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/rh-platform-github-actions-ecr-push-role
           role-session-name: agent-comms-prod-ecr-push
           aws-region: us-east-1
 
@@ -236,7 +236,7 @@ jobs:
 
       - name: Push image to prod ECR
         env:
-          PROD_IMAGE: 082533342824.dkr.ecr.us-east-1.amazonaws.com/rh-platform/apps/reclaw-comms-mcp:sha-${{ github.sha }}
+          PROD_IMAGE: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/rh-platform/apps/reclaw-comms-mcp:sha-${{ github.sha }}
           GH_SHA: ${{ github.sha }}
         run: |
           docker push "$PROD_IMAGE"
