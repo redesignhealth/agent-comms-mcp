@@ -218,6 +218,19 @@ class Participant(Base):
         CheckConstraint(f"role IN {PARTICIPANT_ROLES!r}", name="ck_participants_role"),
         CheckConstraint(f"status IN {PARTICIPANT_STATUSES!r}", name="ck_participants_status"),
         Index("idx_participants_agent_id_status", "agent_id", "status"),
+        # Backs service.inbox's pending-invites query
+        # (WHERE agent_id = ... AND status = 'invited' ORDER BY invited_at
+        # DESC LIMIT ...), added alongside its read-side page cap
+        # (TECH-5377, Argus round-1 SUGGESTION): the index above covers the
+        # WHERE predicate but not the sort column, so Postgres had to sort
+        # every matching row before applying LIMIT -- no query-plan benefit
+        # from the cap for an agent with many pending invites.
+        Index(
+            "idx_participants_agent_id_status_invited_at",
+            "agent_id",
+            "status",
+            "invited_at",
+        ),
     )
 
     # The (conversation_id, agent_id) pair is the primary key, which also

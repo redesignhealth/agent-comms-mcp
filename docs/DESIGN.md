@@ -436,12 +436,15 @@ Conversation expiry is enforced lazily on access (`expires_at`, checked in
 | `internal` | 30 days | Same-owner coordination may span longer planning horizons |
 
 All three are overridable via the `expires_at` parameter at conversation creation,
-up to a `MAX_CONVERSATION_TTL` ceiling of ninety days from creation time (TECH-5377) —
-there is deliberately no floor: an already-past `expires_at` is valid test tooling
-for constructing pre-expired conversations without sleeping.
+up to a `MAX_CONVERSATION_TTL` ceiling of ninety days from the time the request is
+validated (TECH-5377; not from creation time -- several `await`s, admission checks
+and rate-limit queries, separate validation from the actual DB insert, so the check
+runs against an earlier timestamp than the row's own `created_at`). There is
+deliberately no floor: an already-past `expires_at` is valid test tooling for
+constructing pre-expired conversations without sleeping.
 A completed or canceled conversation's `expires_at` is not retroactively cleared:
 it simply becomes irrelevant once the conversation is terminal. See "Known gap:
-no retention/archival policy" below — this ceiling bounds how far `expires_at`
+no retention/archival policy" below -- this ceiling bounds how far `expires_at`
 itself can be pushed out, it does not give the board any actual data-retention
 policy once a conversation reaches that expiry.
 
@@ -529,14 +532,15 @@ of those touches the deeper gap: **there is no purge, archival, or deletion
 job anywhere in this codebase.** Every conversation and message row, active,
 completed, canceled, or expired, is retained forever. This is fine at
 today's volume; it is not a retention policy, and `conversations`/`messages`
-will grow monotonically with no bound until one exists. A future fix needs:
-a scheduled sweep that actively expires stale-but-untouched conversations
-(rather than relying purely on lazy access), and a real archival/deletion
-policy for terminal conversations past some retention window — plus a
-decision on whether "archival" means cold storage or outright deletion,
-which has audit-log implications (`audit_log` rows reference
-`conversation_id`/message-scoped fields that would need their own retention
-story, not just the `conversations`/`messages` tables).
+will grow monotonically with no bound until one exists. Tracked as
+TECH-5378. A future fix needs: a scheduled sweep that actively expires
+stale-but-untouched conversations (rather than relying purely on lazy
+access), and a real archival/deletion policy for terminal conversations
+past some retention window, plus a decision on whether "archival" means
+cold storage or outright deletion, which has audit-log implications
+(`audit_log` rows reference `conversation_id`/message-scoped fields that
+would need their own retention story, not just the
+`conversations`/`messages` tables).
 
 ### Known gap: rolling-deploy safety of the `tasks`-table-drop migration
 

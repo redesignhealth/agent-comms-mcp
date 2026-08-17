@@ -423,24 +423,35 @@ MESSAGE_SCHEMAS: dict[tuple[str, int], MessageSchema] = {
 # conversation admission type, so the vocabulary is message-type-scoped.
 MESSAGE_TYPES: frozenset[str] = frozenset(mt for mt, _ in MESSAGE_SCHEMAS)
 
-# Drift guard (TECH-5377): ``MessageType`` above is a hand-maintained
-# ``Literal`` -- nothing previously enforced that it actually lists the same
-# types as MESSAGE_SCHEMAS's keys (which MESSAGE_TYPES is mechanically
-# derived from). Adding a schema without updating the Literal, or vice
-# versa, would silently drift: the Literal is only a static-typing aid for
-# each schema's own `type` field, never consulted by validate_payload/
-# get_schema at runtime, so nothing would fail until a type-checker run (or
-# a confusing mismatch) caught it much later. Checked at import time via a
-# real exception, not a bare ``assert`` -- an assert is stripped entirely
-# under ``python -O``, which would silently disable this guard exactly
-# where "silent drift" is the failure mode being guarded against.
-_message_type_literal_values = frozenset(get_args(MessageType))
-if _message_type_literal_values != MESSAGE_TYPES:
-    raise RuntimeError(
-        "MessageType Literal and MESSAGE_SCHEMAS have drifted out of sync -- "
-        f"Literal-only: {_message_type_literal_values - MESSAGE_TYPES}, "
-        f"schemas-only: {MESSAGE_TYPES - _message_type_literal_values}"
-    )
+
+def _check_message_type_literal_matches_schemas() -> None:
+    """Drift guard (TECH-5377): ``MessageType`` above is a hand-maintained
+    ``Literal`` -- nothing previously enforced that it actually lists the
+    same types as MESSAGE_SCHEMAS's keys (which MESSAGE_TYPES is
+    mechanically derived from). Adding a schema without updating the
+    Literal, or vice versa, would silently drift: the Literal is only a
+    static-typing aid for each schema's own `type` field, never consulted
+    by validate_payload/get_schema at runtime, so nothing would fail until
+    a type-checker run (or a confusing mismatch) caught it much later.
+
+    Called at import time (module-level call right below), via a real
+    exception rather than a bare ``assert`` -- an assert is stripped
+    entirely under ``python -O``, which would silently disable this guard
+    exactly where "silent drift" is the failure mode being guarded
+    against. Wrapped in a function (Argus round-1 SUGGESTION) so the
+    comparison's intermediate set doesn't linger as a module attribute
+    after the check passes.
+    """
+    literal_values = frozenset(get_args(MessageType))
+    if literal_values != MESSAGE_TYPES:
+        raise RuntimeError(
+            "MessageType Literal and MESSAGE_SCHEMAS have drifted out of sync -- "
+            f"Literal-only: {literal_values - MESSAGE_TYPES}, "
+            f"schemas-only: {MESSAGE_TYPES - literal_values}"
+        )
+
+
+_check_message_type_literal_matches_schemas()
 
 # Highest schema_version this board's own code actually implements (today:
 # 1, for every message type above). start_conversation's capability

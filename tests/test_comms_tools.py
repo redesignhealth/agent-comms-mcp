@@ -1394,6 +1394,44 @@ class TestRateLimitAndSchemaErrors:
                 },
             )
 
+    async def test_expires_at_beyond_ceiling_gives_actionable_error(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Argus round-1 BLOCKING catch: a too-far-future ``expires_at``
+        must not fall through to the generic
+        ``_map_service_errors``-collapsed ``ValueError`` message -- an
+        agent gets no indication a ceiling exists at all otherwise. Fixed
+        with a proactive tool-layer check (same pattern as the
+        participant-count cap), mirroring TestRateLimitAndSchemaErrors'
+        other specific-not-uniform tests in this class."""
+        from datetime import UTC, datetime, timedelta
+
+        from service import MAX_CONVERSATION_TTL
+
+        await _register(main, test_session_factory, "ttl-ceiling-owner")
+        await _register(main, test_session_factory, "ttl-ceiling-target")
+        token_owner = _token("ttl-ceiling-owner")
+
+        list_result = await _call(main, test_session_factory, token_owner, "comms_list_agents")
+        target_id = next(
+            a["agent_id"] for a in list_result["agents"] if a["sub"] == "ttl-ceiling-target"
+        )
+        too_far = datetime.now(UTC) + MAX_CONVERSATION_TTL + timedelta(seconds=1)
+
+        with pytest.raises(ToolError, match="expires_at may not be more than"):
+            await _call(
+                main,
+                test_session_factory,
+                token_owner,
+                "comms_start_conversation",
+                {
+                    "conversation_type": "open",
+                    "target_agent_ids": [target_id],
+                    "initial_message": _availability_request(),
+                    "expires_at": too_far.isoformat(),
+                },
+            )
+
     async def test_negative_since_seq_rejected(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:

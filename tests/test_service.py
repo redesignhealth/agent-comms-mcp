@@ -2174,6 +2174,10 @@ class TestGetConversation:
         assert result["invited"] is True
         # Documented shape: an empty list, never omitted, never message content.
         assert result["messages"] == []
+        # has_more must be present (Argus round-1 BLOCKING catch) even on
+        # this early-return path, so a caller accessing result["has_more"]
+        # without first checking result["invited"] never hits a KeyError.
+        assert result["has_more"] is False
         assert "conversation" in result
         assert "participants" in result
 
@@ -2259,8 +2263,10 @@ class TestGetConversation:
             conversation_id=conversation.id,
         )
         assert len(result["messages"]) == MAX_MESSAGES_PER_GET_CONVERSATION
+        assert result["messages_in_page"] == MAX_MESSAGES_PER_GET_CONVERSATION
         assert result["has_more"] is True
         assert result["messages"][-1]["seq"] == MAX_MESSAGES_PER_GET_CONVERSATION
+        assert result["page_max_seq"] == MAX_MESSAGES_PER_GET_CONVERSATION
         # last_read_seq only advances to what was actually returned in THIS
         # page, never to a later seq that exists but wasn't sent back.
         assert result["last_read_seq"] == MAX_MESSAGES_PER_GET_CONVERSATION
@@ -2269,18 +2275,84 @@ class TestGetConversation:
         assert row is not None
         assert row.last_read_seq == MAX_MESSAGES_PER_GET_CONVERSATION
 
-        # Paging with since_seq=last_read_seq picks up the remainder.
+        # Continuation uses page_max_seq, not last_read_seq (Argus round-1
+        # BLOCKING catch -- see test below for the case where those two
+        # values actually diverge).
         next_page = await get_conversation(
             session,
             actor_sub=target.sub,
             caller_agent_id=target.id,
             conversation_id=conversation.id,
-            since_seq=result["last_read_seq"],
+            since_seq=result["page_max_seq"],
         )
         assert next_page["has_more"] is False
         # Total messages = seq 1 (from start_conversation) + `extra` more.
         assert len(next_page["messages"]) == 1 + extra - MAX_MESSAGES_PER_GET_CONVERSATION
         assert next_page["messages"][0]["seq"] == MAX_MESSAGES_PER_GET_CONVERSATION + 1
+
+    async def test_backfill_re_read_does_not_skip_messages(self, session: AsyncSession) -> None:
+        """Argus round-1 BLOCKING catch: a caller with a persisted
+        last_read_seq ahead of a page it just re-read (a deliberate
+        since_seq below its own cursor) must continue from THIS page's own
+        max seq, not the unrelated, already-larger persisted cursor --
+        continuing from the cursor would silently skip every message
+        between the page's actual end and that cursor."""
+        owner, target, conversation = await self._start(
+            session, "gc-backfill-owner", "gc-backfill-target"
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        total = MAX_MESSAGES_PER_GET_CONVERSATION + 100
+        session.add_all(
+            Message(
+                conversation_id=conversation.id,
+                seq=seq,
+                sender_id=owner.id,
+                type="note",
+                schema_version=1,
+                payload={"type": "note", "text": "x"},
+            )
+            for seq in range(2, total + 1)
+        )
+        await session.commit()
+
+        # Advance the persisted cursor to the very end by reading forward
+        # normally first.
+        caught_up = await get_conversation(
+            session,
+            actor_sub=target.sub,
+            caller_agent_id=target.id,
+            conversation_id=conversation.id,
+            since_seq=total - 1,
+        )
+        assert caught_up["last_read_seq"] == total
+
+        # Now re-read from the very beginning (since_seq=0) -- a legitimate
+        # history re-read below the persisted cursor. The page is capped
+        # well short of that cursor.
+        reread = await get_conversation(
+            session,
+            actor_sub=target.sub,
+            caller_agent_id=target.id,
+            conversation_id=conversation.id,
+            since_seq=0,
+        )
+        assert reread["page_max_seq"] == MAX_MESSAGES_PER_GET_CONVERSATION
+        # last_read_seq never regresses -- still reports the prior cursor.
+        assert reread["last_read_seq"] == total
+        assert reread["has_more"] is True
+
+        # Continuing with page_max_seq (not last_read_seq) picks up exactly
+        # where this re-read page left off, with no gap.
+        continued = await get_conversation(
+            session,
+            actor_sub=target.sub,
+            caller_agent_id=target.id,
+            conversation_id=conversation.id,
+            since_seq=reread["page_max_seq"],
+        )
+        assert continued["messages"][0]["seq"] == MAX_MESSAGES_PER_GET_CONVERSATION + 1
 
 
 # --- post_message --------------------------------------------------------------

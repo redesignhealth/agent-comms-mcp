@@ -1548,8 +1548,19 @@ async def start_conversation(
     # against a validation-time timestamp, not the later insert-time ``now``
     # below (several async calls -- admission, rate limits -- separate the
     # two; reusing this one there would understate the actual creation time).
-    if expires_at is not None and expires_at - _now() > MAX_CONVERSATION_TTL:
-        raise ValueError(f"expires_at may not be more than {MAX_CONVERSATION_TTL} from now")
+    if expires_at is not None:
+        # A naive datetime would otherwise raise a raw TypeError from the
+        # subtraction below (Argus round-1 SUGGESTION) -- a poor validation
+        # experience that leaks an internal arithmetic failure instead of a
+        # clear rejection. providers/comms.py's own _parse_expires_at
+        # already rejects a naive datetime at the tool layer, but this
+        # service function has other direct callers (tests, and any future
+        # non-MCP caller), so it needs its own guard rather than relying on
+        # that layer above it.
+        if expires_at.tzinfo is None:
+            raise ValueError("expires_at must be timezone-aware")
+        if expires_at - _now() > MAX_CONVERSATION_TTL:
+            raise ValueError(f"expires_at may not be more than {MAX_CONVERSATION_TTL} from now")
 
     await _enforce_start_rate_limit(session, actor_sub=actor_sub, initiator=initiator)
     # start_conversation inserts its seq-1 message directly (below), rather
@@ -2709,17 +2720,24 @@ async def get_conversation(
     """Combined read: conversation + participants + messages since ``since_seq``.
 
     An ``invited`` (not yet accepted) caller gets METADATA ONLY: the
-    returned dict has ``"invited": True`` and an empty ``"messages"`` list
-    — never any message content — and the caller's ``last_read_seq`` is
-    NOT advanced (there is nothing to mark read). An ``active`` caller gets
-    up to ``MAX_MESSAGES_PER_GET_CONVERSATION`` messages from ``since_seq``
-    onward (``"has_more"`` signals a truncated page; re-call with
-    ``since_seq=last_read_seq`` to continue) and their ``last_read_seq`` is
-    advanced to the max seq actually returned in THIS page (only if any
-    messages were returned) -- never to a later seq that exists but wasn't
-    returned. A caller who is not a participant, or who previously
-    left/declined, gets the uniform ``AccessDeniedError`` — identical to a
-    non-existent conversation (DESIGN.md §4/§8).
+    returned dict has ``"invited": True``, ``"has_more": False``, and an
+    empty ``"messages"`` list — never any message content — and the
+    caller's ``last_read_seq`` is NOT advanced (there is nothing to mark
+    read). An ``active`` caller gets up to
+    ``MAX_MESSAGES_PER_GET_CONVERSATION`` messages from ``since_seq``
+    onward. ``"has_more"`` signals a truncated page; continue with
+    ``since_seq=page_max_seq`` (the max seq actually IN this page), NOT
+    ``since_seq=last_read_seq`` (TECH-5377 follow-up) -- ``last_read_seq``
+    is the caller's persisted read cursor, which can already be ahead of
+    a page returned for a `since_seq` below it (e.g. a deliberate re-read
+    of older history): re-calling with the persisted cursor in that case
+    would skip everything between this page's actual end and that cursor.
+    ``last_read_seq`` itself is advanced to the max seq actually returned
+    in THIS page (only if any messages were returned, and only forward --
+    never regresses on an older-history re-read). A caller who is not a
+    participant, or who previously left/declined, gets the uniform
+    ``AccessDeniedError`` — identical to a non-existent conversation
+    (DESIGN.md §4/§8).
     """
     conversation, participant = await _load_participant_for_read(
         session,
@@ -2755,6 +2773,7 @@ async def get_conversation(
             "participants": participants_view,
             "messages": [],
             "invited": True,
+            "has_more": False,
             "invited_by": str(participant.invited_by) if participant.invited_by else None,
         }
 
@@ -2768,15 +2787,24 @@ async def get_conversation(
         )
     ).all()
     # Fetch one extra row to detect truncation, then trim -- same pattern as
-    # list_agents (TECH-5377). ``last_read_seq`` only advances to the max
-    # seq in the TRIMMED page, never a row beyond it that wasn't actually
-    # returned to the caller: a caller with more messages than fit in one
-    # page re-calls with since_seq=last_read_seq to continue.
+    # list_agents (TECH-5377).
     has_more = len(msg_rows) > MAX_MESSAGES_PER_GET_CONVERSATION
     msg_rows = msg_rows[:MAX_MESSAGES_PER_GET_CONVERSATION]
-    max_seq = max((m.seq for m, _ in msg_rows), default=None)
-    if max_seq is not None and max_seq > participant.last_read_seq:
-        participant.last_read_seq = max_seq
+    # The max seq actually IN this trimmed page -- distinct from
+    # last_read_seq below. Argus round-1 BLOCKING catch: `since_seq` can be
+    # below the caller's persisted cursor (a deliberate re-read of older
+    # history), in which case this page's own max seq is LESS than that
+    # cursor. Continuation must use THIS value, not last_read_seq, or a
+    # caller re-calling with the (unchanged, still-ahead) persisted cursor
+    # would silently skip every message between page_max_seq and that
+    # cursor. Falls back to `since_seq` itself on an empty page, so
+    # `since_seq=page_max_seq` is always a safe (no-op) re-call.
+    page_max_seq = max((m.seq for m, _ in msg_rows), default=since_seq)
+    # last_read_seq only ever advances forward, never regresses on an
+    # older-history re-read (page_max_seq can be below the existing cursor
+    # in exactly that case).
+    if page_max_seq > participant.last_read_seq:
+        participant.last_read_seq = page_max_seq
     await session.commit()
 
     return {
@@ -2784,8 +2812,14 @@ async def get_conversation(
         "participants": participants_view,
         "messages": [_message_dict(m, sender_sub) for m, sender_sub in msg_rows],
         "invited": False,
-        "total_count": len(msg_rows),
+        # Page-scoped, capped at MAX_MESSAGES_PER_GET_CONVERSATION -- NOT
+        # the conversation's true total message count (Argus round-1
+        # SUGGESTION: the prior name was misleading for direct service
+        # callers even though the tools layer already renamed it to
+        # `messages_returned`).
+        "messages_in_page": len(msg_rows),
         "has_more": has_more,
+        "page_max_seq": page_max_seq,
         "last_read_seq": participant.last_read_seq,
     }
 
@@ -2810,7 +2844,13 @@ async def inbox(session: AsyncSession, *, caller_agent_id: uuid.UUID) -> dict[st
     ``"*_has_more"`` flag -- previously unbounded, so an agent behind on
     many conversations at once had no ceiling on a single inbox response.
     ``unread`` is ordered by most-recent activity first, so truncation
-    drops the stalest conversations, not the freshest.
+    drops the stalest conversations, not the freshest. ``total_count`` is
+    a TRUE count across both lists via separate ``COUNT(*)`` queries
+    (Argus round-1 BLOCKING catch: computing it from the two, possibly
+    page-capped, list lengths would silently report page size instead of
+    the real backlog once either list is truncated -- the same
+    established pattern ``list_agents`` already uses for its own
+    ``total_count``).
 
     Read-only with no denial path for a valid ``caller_agent_id`` (no
     audit rows) — the write-through mutation side of lazy expiry
@@ -2845,6 +2885,20 @@ async def inbox(session: AsyncSession, *, caller_agent_id: uuid.UUID) -> dict[st
     ).all()
     unread_has_more = len(unread_rows) > MAX_UNREAD_CONVERSATIONS_PER_INBOX
     unread_rows = unread_rows[:MAX_UNREAD_CONVERSATIONS_PER_INBOX]
+
+    # True unread-conversation count, unaffected by the page cap above --
+    # same GROUP BY/HAVING as the paginated query, wrapped and counted
+    # rather than limited (Argus round-1 BLOCKING catch).
+    unread_total_stmt = select(func.count()).select_from(
+        select(Conversation.id)
+        .join(Participant, Participant.conversation_id == Conversation.id)
+        .join(Message, Message.conversation_id == Conversation.id)
+        .where(Participant.agent_id == caller_agent_id, Participant.status == "active")
+        .group_by(Conversation.id, Participant.last_read_seq)
+        .having(func.max(Message.seq) > Participant.last_read_seq)
+        .subquery()
+    )
+    unread_total = (await session.execute(unread_total_stmt)).scalar_one()
 
     # Fetch every unread conversation's latest message + sender sub in a
     # single round trip (instead of one SELECT per conversation in a Python
@@ -2889,6 +2943,15 @@ async def inbox(session: AsyncSession, *, caller_agent_id: uuid.UUID) -> dict[st
     ).all()
     pending_has_more = len(pending_rows) > MAX_PENDING_INVITES_PER_INBOX
     pending_rows = pending_rows[:MAX_PENDING_INVITES_PER_INBOX]
+
+    pending_total = (
+        await session.execute(
+            select(func.count())
+            .select_from(Participant)
+            .where(Participant.agent_id == caller_agent_id, Participant.status == "invited")
+        )
+    ).scalar_one()
+
     pending_invites = [
         {
             **_conversation_dict(conversation),
@@ -2903,7 +2966,7 @@ async def inbox(session: AsyncSession, *, caller_agent_id: uuid.UUID) -> dict[st
         "unread_has_more": unread_has_more,
         "pending_invites": pending_invites,
         "pending_invites_has_more": pending_has_more,
-        "total_count": len(unread) + len(pending_invites),
+        "total_count": unread_total + pending_total,
     }
 
 
