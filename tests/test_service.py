@@ -2190,6 +2190,35 @@ class TestGetConversation:
         assert row is not None
         assert row.last_read_seq == 0, "invited-only reads must not advance last_read_seq"
 
+    async def test_invited_by_comms_invite_names_the_actual_inviter(
+        self, session: AsyncSession
+    ) -> None:
+        """Argus round-4 SUGGESTION: the prior invited_by test only covered
+        the start_conversation path (invited_by=the conversation's
+        initiator); this covers the other documented path -- a participant
+        added later via comms_invite, where invited_by is that later
+        inviter, not necessarily the conversation's original owner."""
+        owner, _first_target, conversation = await self._start(
+            session, "gc-invite-owner", "gc-invite-first-target"
+        )
+        later_target = await _register(session, "gc-invite-later-target")
+        await invite(
+            session,
+            actor_sub=owner.sub,
+            inviter_agent_id=owner.id,
+            conversation_id=conversation.id,
+            target_agent_id=later_target.id,
+        )
+
+        result = await get_conversation(
+            session,
+            actor_sub=later_target.sub,
+            caller_agent_id=later_target.id,
+            conversation_id=conversation.id,
+        )
+        assert result["invited"] is True
+        assert result["invited_by"] == str(owner.id)
+
     async def test_active_caller_gets_full_history_and_advances_last_read_seq(
         self, session: AsyncSession
     ) -> None:

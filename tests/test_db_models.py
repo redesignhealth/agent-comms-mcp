@@ -384,7 +384,10 @@ class TestSchema:
         participant_indexes = await _indexes(engine, "participants")
         # idx_participants_agent_id_status (2-column) was dropped as a
         # redundant prefix of the 3-column index below (Argus round-2
-        # SUGGESTION, migration 4af015077bf8).
+        # SUGGESTION; the drop itself lives in migration 136265b3f22d, a
+        # separate later migration from the one that added the 3-column
+        # index (4af015077bf8) -- see 136265b3f22d's own docstring for why
+        # it's split out).
         assert "idx_participants_agent_id_status" not in participant_indexes
         assert "idx_participants_agent_id_status_invited_at" in participant_indexes
 

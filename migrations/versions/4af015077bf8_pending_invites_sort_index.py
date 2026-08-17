@@ -24,15 +24,18 @@ regular-build lock to matter in practice.
 The now-redundant ``idx_participants_agent_id_status`` (superseded by
 this migration's new index, a strict left-prefix of it) is dropped in
 136265b3f22d, a SEPARATE later migration -- not folded into this one
-(Argus round-3 BLOCKING catch): once a migration file is created and
-pushed, it must be treated as immutable. Editing this file's own
-``upgrade()`` in place to add that drop, as an earlier round of this
-same PR briefly did, would silently no-op in any environment where
-this exact revision had already been applied (alembic tracks
-completion by revision id, not file content, so it would never re-run
-to pick up the edit) -- the correct fix for "this migration should have
-done more" is always a new migration, never a mutation of an existing
-one.
+(Argus round-3 BLOCKING catch). This file went through two edits across
+this same PR before landing here: an earlier round briefly added the
+drop directly to this file's own ``upgrade()``/``downgrade()`` (since
+reverted), which is exactly the risk the split into 136265b3f22d avoids
+going forward -- neither this PR's branch nor this migration's revision
+id has been applied anywhere outside local/CI testing, so no real
+environment is actually stuck on that intermediate shape today, but
+``downgrade()`` below still defensively recreates
+``idx_participants_agent_id_status`` (guarded, a no-op if it's already
+there) specifically to stay correct even if some transient local/CI run
+during this PR's review did apply that intermediate revision and later
+needs to downgrade through it.
 """
 
 from __future__ import annotations
@@ -61,4 +64,18 @@ def downgrade() -> None:
         "idx_participants_agent_id_status_invited_at",
         table_name="participants",
         if_exists=True,
+    )
+    # Defensive recreate (Argus round-4 BLOCKING catch): a no-op if the
+    # index is already there (the normal case, since 136265b3f22d's own
+    # downgrade recreates it first when downgrading further than this
+    # revision), but restores it if this exact revision was ever stamped
+    # via this migration's briefly-mutated intermediate shape (see module
+    # docstring) without 136265b3f22d on top of it -- without this, a
+    # downgrade all the way to ef8394b37c8d would otherwise silently leave
+    # `participants` with neither index.
+    op.create_index(
+        "idx_participants_agent_id_status",
+        "participants",
+        ["agent_id", "status"],
+        if_not_exists=True,
     )
