@@ -435,9 +435,15 @@ Conversation expiry is enforced lazily on access (`expires_at`, checked in
 | `asymmetric` | 14 days | Task delegation across owners needs more runway than scheduling |
 | `internal` | 30 days | Same-owner coordination may span longer planning horizons |
 
-All three are overridable via the `expires_at` parameter at conversation creation.
+All three are overridable via the `expires_at` parameter at conversation creation,
+up to a `MAX_CONVERSATION_TTL` ceiling of ninety days from creation time (TECH-5377) —
+there is deliberately no floor: an already-past `expires_at` is valid test tooling
+for constructing pre-expired conversations without sleeping.
 A completed or canceled conversation's `expires_at` is not retroactively cleared:
-it simply becomes irrelevant once the conversation is terminal.
+it simply becomes irrelevant once the conversation is terminal. See "Known gap:
+no retention/archival policy" below — this ceiling bounds how far `expires_at`
+itself can be pushed out, it does not give the board any actual data-retention
+policy once a conversation reaches that expiry.
 
 ### Rate limits
 
@@ -508,6 +514,29 @@ ownership); production testing against real agents is not yet possible.
 The seam is already injected (`OwnershipClient` parameter on all functions that
 need it): swapping `AgentTableOwnershipClient` for a real HTTP client is the
 only change needed when the platform endpoint ships.
+
+### Known gap: no retention/archival policy for terminal or expired conversations
+
+Expiry is lazy-only: `_maybe_expire` flips `Conversation.state` to `"expired"`
+only when `get_conversation`/`post_message` next touches that row. A
+conversation nobody reads or posts to again after its `expires_at` passes
+stays stored as `"active"` indefinitely from the DB's own point of view (the
+read-only `_conversation_dict` projection reports it as `"expired"` on
+display, but nothing writes that back). TECH-5377 added a ceiling
+(`MAX_CONVERSATION_TTL`, ninety days) on how far in the future a caller can
+push `expires_at`, and page caps on `get_conversation`/`inbox`, but neither
+of those touches the deeper gap: **there is no purge, archival, or deletion
+job anywhere in this codebase.** Every conversation and message row, active,
+completed, canceled, or expired, is retained forever. This is fine at
+today's volume; it is not a retention policy, and `conversations`/`messages`
+will grow monotonically with no bound until one exists. A future fix needs:
+a scheduled sweep that actively expires stale-but-untouched conversations
+(rather than relying purely on lazy access), and a real archival/deletion
+policy for terminal conversations past some retention window — plus a
+decision on whether "archival" means cold storage or outright deletion,
+which has audit-log implications (`audit_log` rows reference
+`conversation_id`/message-scoped fields that would need their own retention
+story, not just the `conversations`/`messages` tables).
 
 ### Known gap: rolling-deploy safety of the `tasks`-table-drop migration
 

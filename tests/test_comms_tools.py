@@ -870,7 +870,13 @@ class TestAxiShapes:
     ) -> None:
         await _register(main, test_session_factory, "lonely-agent")
         result = await _call(main, test_session_factory, _token("lonely-agent"), "comms_inbox")
-        assert result == {"unread": [], "pending_invites": [], "total_count": 0}
+        assert result == {
+            "unread": [],
+            "unread_has_more": False,
+            "pending_invites": [],
+            "pending_invites_has_more": False,
+            "total_count": 0,
+        }
 
     async def test_list_agents_includes_total_count(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
