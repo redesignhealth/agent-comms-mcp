@@ -194,14 +194,21 @@ Design notes:
  (audit-log reason key only). This keeps the guarantee `is_shared` is meant to
  provide -- it cannot change as a side effect of the agent's own traffic --
  while giving an operator a deliberate, separately-audited (`agent.set_shared`)
- lever to fix a value an agent got wrong at registration. The flag is read
- live on every request (conversation-open admission and boundary-crossing
- checks both query the current row, not a value cached at conversation-open
- time), so flipping it takes effect retroactively on already-open
- conversations, not just future ones: correcting a wrongly-`False` agent to
- `True` immediately grants the boundary bypass on its existing conversations,
- and correcting a wrongly-`True` agent back to `False` immediately withdraws
- it, mid-conversation.
+ lever to fix a value an agent got wrong at registration. The per-message
+ `_enforce_boundary_crossing` check (§9 Axis 2) queries the current row on
+ every post, not a value cached at conversation-open time, so flipping
+ `is_shared` takes effect retroactively on already-open `asymmetric`
+ conversations for THAT check: correcting a wrongly-`False` agent to `True`
+ immediately grants the boundary bypass on its existing conversations, and
+ correcting a wrongly-`True` agent back to `False` immediately withdraws it,
+ mid-conversation. This retroactive effect is narrower than it may sound,
+ though: `_authorize_conversation_open`'s pairwise-ownership admission (§9
+ Axis 1) runs exactly once, at conversation creation, so flipping the flag
+ changes admission only for conversations opened AFTER the flip, never for
+ ones already open. The invite gate (`_enforce_invite_owner_boundary`) is
+ governed entirely by `Conversation.owner_snapshot`, frozen at open time with
+ no `is_shared` bypass of its own, so it is unaffected by the flag either
+ way, at any time.
 
 ## 6. Message schemas (two-axis model)
 

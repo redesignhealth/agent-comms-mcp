@@ -795,16 +795,21 @@ class TestSetAgentShared:
         row = (await session.execute(select(Agent).where(Agent.id == agent.id))).scalar_one()
         assert row.is_shared is False
 
-        actions = (
-            (
-                await session.execute(
-                    select(AuditLog.action).where(AuditLog.actor_sub == "unauthorized-operator")
+        rows = (
+            await session.execute(
+                select(AuditLog.action, AuditLog.agent_id, AuditLog.detail).where(
+                    AuditLog.actor_sub == "unauthorized-operator"
                 )
             )
-            .scalars()
-            .all()
-        )
-        assert "denied.set_shared_requires_elevated_scope" in actions
+        ).all()
+        assert len(rows) == 1
+        action, audited_agent_id, detail = rows[0]
+        assert action == "denied.set_shared_requires_elevated_scope"
+        # No agent lookup happens before this denial (see the auth-ordering
+        # regression test below) -- the audit row can't reference a row ID,
+        # but still preserves the attempted target for operator visibility.
+        assert audited_agent_id is None
+        assert detail == {"target_agent_id": str(agent.id), "requested_is_shared": True}
 
     async def test_denied_unknown_agent(self, session: AsyncSession) -> None:
         bogus_id = uuid.uuid4()
@@ -818,16 +823,18 @@ class TestSetAgentShared:
             )
         assert exc_info.value.reason == "denied.unknown_agent"
 
-        actions = (
-            (
-                await session.execute(
-                    select(AuditLog.action).where(AuditLog.actor_sub == "admin-operator")
+        rows = (
+            await session.execute(
+                select(AuditLog.action, AuditLog.agent_id, AuditLog.detail).where(
+                    AuditLog.actor_sub == "admin-operator"
                 )
             )
-            .scalars()
-            .all()
-        )
-        assert "denied.unknown_agent" in actions
+        ).all()
+        assert len(rows) == 1
+        action, audited_agent_id, detail = rows[0]
+        assert action == "denied.unknown_agent"
+        assert audited_agent_id is None
+        assert detail == {"target_agent_id": str(bogus_id)}
 
     async def test_denied_without_authorization_and_unknown_agent_reports_authorization_reason(
         self, session: AsyncSession
@@ -839,26 +846,94 @@ class TestSetAgentShared:
         the existence lookup so the audit trail reflects the actual reason
         access was denied, independent of whether ``agent_id`` happens to be
         valid."""
+        bogus_id = uuid.uuid4()
         with pytest.raises(AccessDeniedError) as exc_info:
             await set_agent_shared(
                 session,
                 actor_sub="unauthorized-operator-2",
-                agent_id=uuid.uuid4(),
+                agent_id=bogus_id,
                 is_shared=True,
                 is_shared_authorized=False,
             )
         assert exc_info.value.reason == "denied.set_shared_requires_elevated_scope"
 
-        actions = (
-            (
-                await session.execute(
-                    select(AuditLog.action).where(AuditLog.actor_sub == "unauthorized-operator-2")
+        rows = (
+            await session.execute(
+                select(AuditLog.action, AuditLog.agent_id, AuditLog.detail).where(
+                    AuditLog.actor_sub == "unauthorized-operator-2"
                 )
             )
-            .scalars()
-            .all()
+        ).all()
+        assert len(rows) == 1
+        action, audited_agent_id, detail = rows[0]
+        assert action == "denied.set_shared_requires_elevated_scope"
+        assert audited_agent_id is None
+        assert detail == {"target_agent_id": str(bogus_id), "requested_is_shared": True}
+
+    async def test_admin_correction_takes_effect_retroactively_on_open_conversation(
+        self, session: AsyncSession
+    ) -> None:
+        """Integration test locking in DESIGN.md's retroactive-effect claim
+        for the boundary-crossing check specifically (not conversation-open
+        admission or the invite gate, which this same DESIGN.md passage
+        explicitly scopes the guarantee away from): a sender wrongly
+        registered as ``is_shared=True`` is admitted into an asymmetric
+        conversation via the shared-initiator bypass and can post
+        non-``boundary_safe`` messages there. Correcting it back to
+        ``False`` via ``set_agent_shared`` -- with NO change to the
+        already-open conversation itself -- immediately makes the next such
+        post fail the ordinary ownership-boundary check, proving
+        ``_enforce_boundary_crossing`` reads the live row rather than a
+        value pinned at conversation-open time."""
+        wrongly_shared = await _register(
+            session, "wrongly-shared-retro", owner_sub="retro-owner-a", is_shared=True
         )
-        assert actions == ["denied.set_shared_requires_elevated_scope"]
+        target = await _register(
+            session, "retro-target", owner_sub="retro-owner-b", is_shared=False
+        )
+        conversation = await start_conversation(
+            session,
+            actor_sub=wrongly_shared.sub,
+            initiator_agent_id=wrongly_shared.id,
+            conversation_type="asymmetric",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+
+        # Bypass still applies: is_shared is still True at this point.
+        first_message = await post_message(
+            session,
+            actor_sub=wrongly_shared.sub,
+            sender_agent_id=wrongly_shared.id,
+            conversation_id=conversation.id,
+            message_type="note",
+            payload={"text": "before correction"},
+        )
+        assert first_message.type == "note"
+
+        await set_agent_shared(
+            session,
+            actor_sub="admin-operator-retro",
+            agent_id=wrongly_shared.id,
+            is_shared=False,
+            is_shared_authorized=True,
+        )
+
+        # Same open conversation, no re-opening or re-accepting -- the
+        # correction alone flips the outcome of the identical operation.
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await post_message(
+                session,
+                actor_sub=wrongly_shared.sub,
+                sender_agent_id=wrongly_shared.id,
+                conversation_id=conversation.id,
+                message_type="note",
+                payload={"text": "after correction"},
+            )
+        assert exc_info.value.reason == "denied.boundary_crossing"
 
 
 # --- start_conversation --------------------------------------------------------

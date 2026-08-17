@@ -1061,11 +1061,19 @@ async def set_agent_shared(
     """
     if not is_shared_authorized:
         await _deny(
-            session, actor_sub=actor_sub, action="denied.set_shared_requires_elevated_scope"
+            session,
+            actor_sub=actor_sub,
+            action="denied.set_shared_requires_elevated_scope",
+            detail={"target_agent_id": str(agent_id), "requested_is_shared": is_shared},
         )
     agent = await _find_agent_by_id(session, agent_id)
     if agent is None:
-        await _deny(session, actor_sub=actor_sub, action="denied.unknown_agent")
+        await _deny(
+            session,
+            actor_sub=actor_sub,
+            action="denied.unknown_agent",
+            detail={"target_agent_id": str(agent_id)},
+        )
     previous = agent.is_shared
     agent.is_shared = is_shared
     await session.flush()
