@@ -217,7 +217,22 @@ class Participant(Base):
     __table_args__ = (
         CheckConstraint(f"role IN {PARTICIPANT_ROLES!r}", name="ck_participants_role"),
         CheckConstraint(f"status IN {PARTICIPANT_STATUSES!r}", name="ck_participants_status"),
-        Index("idx_participants_agent_id_status", "agent_id", "status"),
+        # Covers both service.inbox's pending-invites query (WHERE agent_id
+        # = ... AND status = 'invited' ORDER BY invited_at DESC LIMIT ...,
+        # added alongside its read-side page cap, TECH-5377) and every
+        # other (agent_id, status)-only lookup this table previously used
+        # its own separate 2-column idx_participants_agent_id_status for.
+        # That 2-column index was dropped (Argus round-2 SUGGESTION): it
+        # was a strict left-prefix of this one, so Postgres serves every
+        # query it covered via this index's own prefix -- keeping both
+        # would double index-maintenance cost on every participants
+        # INSERT/UPDATE/DELETE for zero query-plan benefit.
+        Index(
+            "idx_participants_agent_id_status_invited_at",
+            "agent_id",
+            "status",
+            "invited_at",
+        ),
     )
 
     # The (conversation_id, agent_id) pair is the primary key, which also

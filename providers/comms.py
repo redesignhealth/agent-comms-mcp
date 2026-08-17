@@ -36,7 +36,7 @@ import logging
 import uuid
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from fastmcp import FastMCP
@@ -589,7 +589,11 @@ async def start_conversation(
       See ``comms_post_message`` for payload shapes per type.
     - ``initial_message``: payload dict for the opening message. Must match
       the schema for ``message_type`` (see ``comms_post_message``).
-    - ``expires_at``: timezone-aware ISO 8601 datetime; omit for 7-day TTL.
+    - ``expires_at``: timezone-aware ISO 8601 datetime; omit for the
+      per-``conversation_type`` default TTL (7/14/30 days). Capped at 90
+      days from now (``MAX_CONVERSATION_TTL``) -- a later value is
+      rejected. A PAST value is accepted (the conversation is immediately
+      expired).
     - ``schema_version``: ADVISORY ONLY (capability negotiation).
       The board computes the actual wire version to use as the highest
       version every participant (you + every named target) mutually
@@ -614,6 +618,21 @@ async def start_conversation(
         )
     target_uuids = _parse_uuids("target_agent_ids", target_agent_ids)
     expires_dt = _parse_expires_at(expires_at)
+    # Proactive tool-layer check, same pattern as the participant cap above
+    # (Argus round-1 BLOCKING catch): without this, a too-far-future
+    # expires_at fell through to service.start_conversation's ValueError,
+    # which _map_service_errors collapses into the generic
+    # "invalid_request: the request could not be processed" -- no
+    # indication a ceiling exists at all, let alone which field caused it.
+    # The service layer keeps its own check too (defense-in-depth for
+    # direct, non-MCP callers), so this duplicates the comparison but not
+    # the source of truth: service.MAX_CONVERSATION_TTL is read here, not
+    # redeclared.
+    if expires_dt is not None and expires_dt - datetime.now(UTC) > service.MAX_CONVERSATION_TTL:
+        raise ToolError(
+            "invalid_request: expires_at may not be more than "
+            f"{service.MAX_CONVERSATION_TTL} from now"
+        )
 
     async with get_session_factory()() as session:
         caller = await _resolve_caller_agent(session, sub)
@@ -731,16 +750,29 @@ async def get_conversation(
 ) -> dict[str, Any]:
     """Combined read: conversation + participants + messages since ``since_seq``.
 
+    Returns ``conversation``, ``participants``, ``messages``, ``invited``,
+    ``has_more``, and either ``invited_by`` (only for an ``invited``
+    caller) or ``messages_returned``, ``page_max_seq``, ``last_read_seq``
+    (only for a non-``invited`` caller).
+
     An ``invited`` (not yet accepted) caller gets metadata only — no
-    message content, and ``since_seq`` is ignored. An ``active`` caller
-    gets full history from ``since_seq`` onward, and their read cursor
-    advances. Non-members (and left/declined former members) get the
-    uniform denial, identical to a non-existent conversation. ``since_seq``
-    must be non-negative — a negative value would silently widen the
-    result window in an unintended way.
+    message content, ``since_seq`` is ignored, and ``has_more`` is always
+    ``False``. An ``active`` caller gets up to 500 messages
+    (``MAX_MESSAGES_PER_GET_CONVERSATION``) from ``since_seq`` onward, and
+    their read cursor advances. ``since_seq`` must be non-negative — a
+    negative value would silently widen the result window in an
+    unintended way.
+
+    **Pagination**: when ``has_more`` is ``True``, re-call with
+    ``since_seq=page_max_seq`` from THIS response — NOT
+    ``since_seq=last_read_seq``. ``last_read_seq`` is your persisted read
+    cursor across all calls, which can already be ahead of a page you're
+    re-reading (e.g. you deliberately pass a low ``since_seq`` to revisit
+    older history); re-calling with it instead of ``page_max_seq`` can
+    silently skip messages between this page's end and that cursor.
 
     The returned ``messages_returned`` count is the size of the returned
-    (post-``since_seq``-filter) slice, NOT the conversation's total
+    (post-``since_seq``-filter, capped) slice, NOT the conversation's total
     message count — deliberately not named ``total_count`` to avoid
     implying otherwise.
     """
@@ -763,8 +795,8 @@ async def get_conversation(
                 since_seq=since_seq,
             )
 
-    if "total_count" in result:
-        result["messages_returned"] = result.pop("total_count")
+    if "messages_in_page" in result:
+        result["messages_returned"] = result.pop("messages_in_page")
     return result
 
 
@@ -772,9 +804,31 @@ async def get_conversation(
 async def inbox(agent_key: str | None = None) -> dict[str, Any]:
     """Return the caller's unread active conversations plus pending invites.
 
-    Always returns the same three keys (``unread``, ``pending_invites``,
-    ``total_count``), even when both lists are empty — an explicit
-    "nothing needs your attention" rather than an ambiguous bare empty list.
+    Always returns the same five keys, even when both lists are empty --
+    an explicit "nothing needs your attention" rather than an ambiguous
+    bare empty list:
+
+    - ``unread``: up to 100 (``MAX_UNREAD_CONVERSATIONS_PER_INBOX``)
+      conversations with unread messages, most-recently-active first.
+    - ``unread_has_more``: ``True`` if more unread conversations exist
+      beyond that cap.
+    - ``pending_invites``: up to 100 (``MAX_PENDING_INVITES_PER_INBOX``)
+      pending invites, most-recently-invited first.
+    - ``pending_invites_has_more``: ``True`` if more pending invites exist
+      beyond that cap.
+    - ``total_count``: the TRUE total across both lists, unaffected by
+      either cap above (a real count, not a page size).
+
+    **No cursor/pagination for this tool**: if either ``*_has_more`` flag
+    is ``True``, there is no way to page through the remainder from
+    ``comms_inbox`` itself. ``comms_list_conversations`` pages through
+    every conversation you're a participant in (its own ``state`` filter
+    is the CONVERSATION's state -- active/completed/canceled/expired --
+    not your participant status), so it does NOT isolate just the
+    overflowed ``unread``/``pending_invites`` set either; it's a way to
+    browse your full conversation history, not a targeted fix for this
+    cap. There is currently no tool-level way to see unread conversations
+    or pending invites beyond these caps.
     """
     token = _require_token()
     base_sub = _require_identity(token)

@@ -870,7 +870,13 @@ class TestAxiShapes:
     ) -> None:
         await _register(main, test_session_factory, "lonely-agent")
         result = await _call(main, test_session_factory, _token("lonely-agent"), "comms_inbox")
-        assert result == {"unread": [], "pending_invites": [], "total_count": 0}
+        assert result == {
+            "unread": [],
+            "unread_has_more": False,
+            "pending_invites": [],
+            "pending_invites_has_more": False,
+            "total_count": 0,
+        }
 
     async def test_list_agents_includes_total_count(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
@@ -1143,6 +1149,10 @@ class TestFullNegotiationFlow:
         assert "messages_returned" in b_view
         assert b_view["messages_returned"] == 1
         assert "total_count" not in b_view
+        # page_max_seq is the documented continuation token (Argus round-2
+        # SUGGESTION: untested at the tool boundary until now).
+        assert b_view["page_max_seq"] == 1
+        assert b_view["has_more"] is False
 
         # C never accepts — metadata-only, no message content.
         c_view = await _call(
@@ -1159,6 +1169,8 @@ class TestFullNegotiationFlow:
         # unlike the active-member path asserted above.
         assert "messages_returned" not in c_view
         assert "total_count" not in c_view
+        assert "invited_by" in c_view
+        assert c_view["has_more"] is False
 
         # B posts an availability_response.
         b_response = await _call(
@@ -1385,6 +1397,44 @@ class TestRateLimitAndSchemaErrors:
                     "conversation_type": "bogus",
                     "target_agent_ids": [str(uuid.uuid4())],
                     "initial_message": _availability_request(),
+                },
+            )
+
+    async def test_expires_at_beyond_ceiling_gives_actionable_error(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Argus round-1 BLOCKING catch: a too-far-future ``expires_at``
+        must not fall through to the generic
+        ``_map_service_errors``-collapsed ``ValueError`` message -- an
+        agent gets no indication a ceiling exists at all otherwise. Fixed
+        with a proactive tool-layer check (same pattern as the
+        participant-count cap), mirroring TestRateLimitAndSchemaErrors'
+        other specific-not-uniform tests in this class."""
+        from datetime import UTC, datetime, timedelta
+
+        from service import MAX_CONVERSATION_TTL
+
+        await _register(main, test_session_factory, "ttl-ceiling-owner")
+        await _register(main, test_session_factory, "ttl-ceiling-target")
+        token_owner = _token("ttl-ceiling-owner")
+
+        list_result = await _call(main, test_session_factory, token_owner, "comms_list_agents")
+        target_id = next(
+            a["agent_id"] for a in list_result["agents"] if a["sub"] == "ttl-ceiling-target"
+        )
+        too_far = datetime.now(UTC) + MAX_CONVERSATION_TTL + timedelta(seconds=1)
+
+        with pytest.raises(ToolError, match="expires_at may not be more than"):
+            await _call(
+                main,
+                test_session_factory,
+                token_owner,
+                "comms_start_conversation",
+                {
+                    "conversation_type": "open",
+                    "target_agent_ids": [target_id],
+                    "initial_message": _availability_request(),
+                    "expires_at": too_far.isoformat(),
                 },
             )
 

@@ -42,7 +42,7 @@ from exceptions import (
     SchemaVersionMismatchError,
     UnknownConversationTypeError,
 )
-from models import Agent, AuditLog, Conversation, Participant
+from models import Agent, AuditLog, Conversation, Message, Participant
 from schemas import (
     MAX_ACCEPTED_TYPE_LENGTH,
     MAX_PAYLOAD_BYTES,
@@ -53,8 +53,12 @@ from schemas import (
 from service import (
     CONVERSATION_TTL,
     MAX_CONVERSATION_STARTS_PER_HOUR,
+    MAX_CONVERSATION_TTL,
     MAX_MESSAGES_PER_CONVERSATION_PER_HOUR,
+    MAX_MESSAGES_PER_GET_CONVERSATION,
     MAX_MESSAGES_PER_SENDER_PER_HOUR,
+    MAX_PENDING_INVITES_PER_INBOX,
+    MAX_UNREAD_CONVERSATIONS_PER_INBOX,
     AgentTableOwnershipClient,
     OwnershipClient,
     accept_invite,
@@ -2170,12 +2174,67 @@ class TestGetConversation:
         assert result["invited"] is True
         # Documented shape: an empty list, never omitted, never message content.
         assert result["messages"] == []
+        # has_more must be present (Argus round-1 BLOCKING catch) even on
+        # this early-return path, so a caller accessing result["has_more"]
+        # without first checking result["invited"] never hits a KeyError.
+        assert result["has_more"] is False
         assert "conversation" in result
         assert "participants" in result
+        # Argus round-3 SUGGESTION: invited_by is a documented key on this
+        # path (providers/comms.py's docstring); target was named directly
+        # in start_conversation's target_agent_ids, so it's the owner who
+        # invited them.
+        assert result["invited_by"] == str(conversation.created_by)
 
         row = await session.get(Participant, (conversation.id, target.id))
         assert row is not None
         assert row.last_read_seq == 0, "invited-only reads must not advance last_read_seq"
+
+    async def test_invited_by_comms_invite_names_the_actual_inviter(
+        self, session: AsyncSession
+    ) -> None:
+        """Argus round-4 SUGGESTION: the prior invited_by test only covered
+        the start_conversation path (invited_by=the conversation's
+        initiator); this covers the other documented path -- a participant
+        added later via comms_invite, where invited_by is that later
+        inviter, not necessarily the conversation's original owner.
+
+        Argus round-5 SUGGESTION: the first version of this test passed
+        the OWNER as the inviter, who is also conversation.created_by --
+        numerically identical to the existing start_conversation-path
+        test, so a bug that always returned created_by regardless of the
+        actual inviter would have passed unnoticed. first_target accepts
+        and does the inviting here instead, forcing the two IDs to
+        diverge and actually proving invited_by reflects the real
+        comms_invite caller."""
+        owner, first_target, conversation = await self._start(
+            session, "gc-invite-owner", "gc-invite-first-target"
+        )
+        await accept_invite(
+            session,
+            actor_sub=first_target.sub,
+            agent_id=first_target.id,
+            conversation_id=conversation.id,
+        )
+        later_target = await _register(session, "gc-invite-later-target")
+        await invite(
+            session,
+            actor_sub=first_target.sub,
+            inviter_agent_id=first_target.id,
+            conversation_id=conversation.id,
+            target_agent_id=later_target.id,
+        )
+
+        result = await get_conversation(
+            session,
+            actor_sub=later_target.sub,
+            caller_agent_id=later_target.id,
+            conversation_id=conversation.id,
+        )
+        assert result["invited"] is True
+        assert result["invited_by"] == str(first_target.id)
+        assert result["invited_by"] != str(conversation.created_by)
+        assert conversation.created_by == owner.id
 
     async def test_active_caller_gets_full_history_and_advances_last_read_seq(
         self, session: AsyncSession
@@ -2222,6 +2281,175 @@ class TestGetConversation:
                 conversation_id=conversation.id,
             )
         assert str(left_exc.value) == str(nonmember_exc.value)
+
+    async def test_messages_page_is_capped_with_has_more(self, session: AsyncSession) -> None:
+        """TECH-5377: get_conversation previously returned every message
+        since since_seq with no ceiling. Bulk-inserts Message rows directly
+        (bypassing post_message's rate limits, which real traffic would
+        never clear at this volume) purely to exercise the read-side cap."""
+        owner, target, conversation = await self._start(session, "gc-page-owner", "gc-page-target")
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        # Conversation already has seq=1 from start_conversation; add enough
+        # more that the total exceeds one page.
+        extra = MAX_MESSAGES_PER_GET_CONVERSATION + 10
+        session.add_all(
+            Message(
+                conversation_id=conversation.id,
+                seq=seq,
+                sender_id=owner.id,
+                type="note",
+                schema_version=1,
+                payload={"type": "note", "text": "x"},
+            )
+            for seq in range(2, extra + 2)
+        )
+        await session.commit()
+
+        result = await get_conversation(
+            session,
+            actor_sub=target.sub,
+            caller_agent_id=target.id,
+            conversation_id=conversation.id,
+        )
+        assert len(result["messages"]) == MAX_MESSAGES_PER_GET_CONVERSATION
+        assert result["messages_in_page"] == MAX_MESSAGES_PER_GET_CONVERSATION
+        assert result["has_more"] is True
+        assert result["messages"][-1]["seq"] == MAX_MESSAGES_PER_GET_CONVERSATION
+        assert result["page_max_seq"] == MAX_MESSAGES_PER_GET_CONVERSATION
+        # last_read_seq only advances to what was actually returned in THIS
+        # page, never to a later seq that exists but wasn't sent back.
+        assert result["last_read_seq"] == MAX_MESSAGES_PER_GET_CONVERSATION
+
+        row = await session.get(Participant, (conversation.id, target.id))
+        assert row is not None
+        assert row.last_read_seq == MAX_MESSAGES_PER_GET_CONVERSATION
+
+        # Continuation uses page_max_seq, not last_read_seq (Argus round-1
+        # BLOCKING catch -- see test below for the case where those two
+        # values actually diverge).
+        next_page = await get_conversation(
+            session,
+            actor_sub=target.sub,
+            caller_agent_id=target.id,
+            conversation_id=conversation.id,
+            since_seq=result["page_max_seq"],
+        )
+        assert next_page["has_more"] is False
+        # Total messages = seq 1 (from start_conversation) + `extra` more.
+        assert len(next_page["messages"]) == 1 + extra - MAX_MESSAGES_PER_GET_CONVERSATION
+        assert next_page["messages"][0]["seq"] == MAX_MESSAGES_PER_GET_CONVERSATION + 1
+
+    async def test_backfill_re_read_does_not_skip_messages(self, session: AsyncSession) -> None:
+        """Argus round-1 BLOCKING catch: a caller with a persisted
+        last_read_seq ahead of a page it just re-read (a deliberate
+        since_seq below its own cursor) must continue from THIS page's own
+        max seq, not the unrelated, already-larger persisted cursor --
+        continuing from the cursor would silently skip every message
+        between the page's actual end and that cursor."""
+        owner, target, conversation = await self._start(
+            session, "gc-backfill-owner", "gc-backfill-target"
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        total = MAX_MESSAGES_PER_GET_CONVERSATION + 100
+        session.add_all(
+            Message(
+                conversation_id=conversation.id,
+                seq=seq,
+                sender_id=owner.id,
+                type="note",
+                schema_version=1,
+                payload={"type": "note", "text": "x"},
+            )
+            for seq in range(2, total + 1)
+        )
+        await session.commit()
+
+        # Advance the persisted cursor to the very end by reading forward
+        # normally first.
+        caught_up = await get_conversation(
+            session,
+            actor_sub=target.sub,
+            caller_agent_id=target.id,
+            conversation_id=conversation.id,
+            since_seq=total - 1,
+        )
+        assert caught_up["last_read_seq"] == total
+
+        # Now re-read from the very beginning (since_seq=0) -- a legitimate
+        # history re-read below the persisted cursor. The page is capped
+        # well short of that cursor.
+        reread = await get_conversation(
+            session,
+            actor_sub=target.sub,
+            caller_agent_id=target.id,
+            conversation_id=conversation.id,
+            since_seq=0,
+        )
+        assert reread["page_max_seq"] == MAX_MESSAGES_PER_GET_CONVERSATION
+        # last_read_seq never regresses -- still reports the prior cursor.
+        assert reread["last_read_seq"] == total
+        assert reread["has_more"] is True
+
+        # Continuing with page_max_seq (not last_read_seq) picks up exactly
+        # where this re-read page left off, with no gap.
+        continued = await get_conversation(
+            session,
+            actor_sub=target.sub,
+            caller_agent_id=target.id,
+            conversation_id=conversation.id,
+            since_seq=reread["page_max_seq"],
+        )
+        assert continued["messages"][0]["seq"] == MAX_MESSAGES_PER_GET_CONVERSATION + 1
+
+    async def test_empty_page_past_the_cursor_does_not_advance_last_read_seq(
+        self, session: AsyncSession
+    ) -> None:
+        """Argus round-2 BLOCKING catch: page_max_seq defaults to since_seq
+        on an EMPTY page. If a caller passes since_seq ahead of its own
+        persisted cursor with no new messages actually returned, that
+        default must NOT drive the last_read_seq write -- otherwise it
+        would permanently hide any messages between the persisted cursor
+        and the passed-in since_seq from this caller's inbox (`HAVING
+        max(seq) > last_read_seq`)."""
+        _owner, target, conversation = await self._start(
+            session, "gc-empty-page-owner", "gc-empty-page-target"
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        # Only seq=1 exists (from start_conversation). last_read_seq is 0.
+        result = await get_conversation(
+            session,
+            actor_sub=target.sub,
+            caller_agent_id=target.id,
+            conversation_id=conversation.id,
+            # Ahead of the persisted cursor (0) AND ahead of the only real
+            # message (seq=1) -- the query returns zero rows.
+            since_seq=10,
+        )
+        assert result["messages"] == []
+        assert result["page_max_seq"] == 10  # the no-op-safe response value
+        # The DB write must NOT have advanced to 10 -- seq=1 was never
+        # actually delivered to this caller.
+        assert result["last_read_seq"] == 0
+
+        row = await session.get(Participant, (conversation.id, target.id))
+        assert row is not None
+        assert row.last_read_seq == 0
+
+        # The real message (seq=1) is still visible on a normal read.
+        follow_up = await get_conversation(
+            session,
+            actor_sub=target.sub,
+            caller_agent_id=target.id,
+            conversation_id=conversation.id,
+            since_seq=0,
+        )
+        assert [m["seq"] for m in follow_up["messages"]] == [1]
 
 
 # --- post_message --------------------------------------------------------------
@@ -3912,7 +4140,13 @@ class TestInbox:
     async def test_empty_state_shape(self, session: AsyncSession) -> None:
         agent = await _register(session, "inbox-empty-1")
         result = await inbox(session, caller_agent_id=agent.id)
-        assert result == {"unread": [], "pending_invites": [], "total_count": 0}
+        assert result == {
+            "unread": [],
+            "unread_has_more": False,
+            "pending_invites": [],
+            "pending_invites_has_more": False,
+            "total_count": 0,
+        }
 
     async def test_unread_across_multiple_conversations(self, session: AsyncSession) -> None:
         agent = await _register(session, "inbox-unread-1")
@@ -4052,6 +4286,114 @@ class TestInbox:
         assert result["pending_invites"][0]["conversation_id"] == str(pending_conversation.id)
         assert result["total_count"] == 2
 
+    async def _seed_unread_conversation(
+        self, session: AsyncSession, *, sender: Agent, agent: Agent, created_at: datetime
+    ) -> None:
+        """Bulk-creates one active conversation with one unread message,
+        bypassing start_conversation's per-hour rate limits -- real traffic
+        would never clear MAX_UNREAD_CONVERSATIONS_PER_INBOX conversations
+        in an hour, so this exists purely to exercise inbox()'s read-side
+        cap, not the write path."""
+        conversation = Conversation(
+            type="open",
+            state="active",
+            created_by=sender.id,
+            expires_at=datetime.now(UTC) + timedelta(days=7),
+        )
+        session.add(conversation)
+        await session.flush()
+        session.add_all(
+            [
+                Participant(
+                    conversation_id=conversation.id,
+                    agent_id=sender.id,
+                    role="owner",
+                    status="active",
+                    joined_at=created_at,
+                ),
+                Participant(
+                    conversation_id=conversation.id,
+                    agent_id=agent.id,
+                    role="member",
+                    status="active",
+                    joined_at=created_at,
+                ),
+                Message(
+                    conversation_id=conversation.id,
+                    seq=1,
+                    sender_id=sender.id,
+                    type="note",
+                    schema_version=1,
+                    payload={"type": "note", "text": "x"},
+                    created_at=created_at,
+                ),
+            ]
+        )
+
+    async def test_unread_list_is_capped_with_has_more(self, session: AsyncSession) -> None:
+        agent = await _register(session, "inbox-page-agent")
+        sender = await _register(session, "inbox-page-sender")
+        extra = MAX_UNREAD_CONVERSATIONS_PER_INBOX + 5
+        base = datetime.now(UTC)
+        for i in range(extra):
+            await self._seed_unread_conversation(
+                session, sender=sender, agent=agent, created_at=base - timedelta(seconds=i)
+            )
+        await session.commit()
+
+        result = await inbox(session, caller_agent_id=agent.id)
+        assert len(result["unread"]) == MAX_UNREAD_CONVERSATIONS_PER_INBOX
+        assert result["unread_has_more"] is True
+        assert result["pending_invites_has_more"] is False
+        # Argus round-2 SUGGESTION: this is the only assertion that
+        # actually distinguishes the round-1 true-COUNT(*) fix from the
+        # reverted len(unread)+len(pending) behavior -- every other
+        # total_count assertion in this file uses 0-2 rows, where both
+        # implementations agree.
+        assert result["total_count"] == extra
+
+    async def test_pending_invites_list_is_capped_with_has_more(
+        self, session: AsyncSession
+    ) -> None:
+        agent = await _register(session, "inbox-pending-page-agent")
+        senders = [
+            await _register(session, f"inbox-pending-page-sender-{i}")
+            for i in range(MAX_PENDING_INVITES_PER_INBOX + 5)
+        ]
+        for sender in senders:
+            conversation = Conversation(
+                type="open",
+                state="active",
+                created_by=sender.id,
+                expires_at=datetime.now(UTC) + timedelta(days=7),
+            )
+            session.add(conversation)
+            await session.flush()
+            session.add_all(
+                [
+                    Participant(
+                        conversation_id=conversation.id,
+                        agent_id=sender.id,
+                        role="owner",
+                        status="active",
+                        joined_at=datetime.now(UTC),
+                    ),
+                    Participant(
+                        conversation_id=conversation.id,
+                        agent_id=agent.id,
+                        role="member",
+                        status="invited",
+                    ),
+                ]
+            )
+        await session.commit()
+
+        result = await inbox(session, caller_agent_id=agent.id)
+        assert len(result["pending_invites"]) == MAX_PENDING_INVITES_PER_INBOX
+        assert result["pending_invites_has_more"] is True
+        assert result["unread_has_more"] is False
+        assert result["total_count"] == MAX_PENDING_INVITES_PER_INBOX + 5
+
 
 # --- accepted_types message-type vocabulary -----------------------------------
 
@@ -4147,6 +4489,73 @@ class TestPerTypeTTL:
             expires_at=custom,
         )
         assert abs((conv.expires_at - custom).total_seconds()) < 1
+
+    async def test_expires_at_beyond_max_ttl_is_rejected(self, session: AsyncSession) -> None:
+        creator = await _register(session, "ttl-ceiling-creator")
+        target = await _register(session, "ttl-ceiling-target")
+        too_far = datetime.now(UTC) + MAX_CONVERSATION_TTL + timedelta(seconds=1)
+        with pytest.raises(ValueError, match="expires_at"):
+            await start_conversation(
+                session,
+                actor_sub=creator.sub,
+                initiator_agent_id=creator.id,
+                conversation_type="open",
+                target_agent_ids=[target.id],
+                initial_message=_request_payload(),
+                expires_at=too_far,
+            )
+
+    async def test_expires_at_at_exactly_max_ttl_is_accepted(self, session: AsyncSession) -> None:
+        creator = await _register(session, "ttl-ceiling-ok-creator")
+        target = await _register(session, "ttl-ceiling-ok-target")
+        at_ceiling = datetime.now(UTC) + MAX_CONVERSATION_TTL
+        conv = await start_conversation(
+            session,
+            actor_sub=creator.sub,
+            initiator_agent_id=creator.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            expires_at=at_ceiling,
+        )
+        assert abs((conv.expires_at - at_ceiling).total_seconds()) < 1
+
+    async def test_already_expired_expires_at_still_accepted(self, session: AsyncSession) -> None:
+        """The ceiling is a max, deliberately not a min -- already-expired
+        overrides remain valid test tooling (see CONVERSATION_TTL's own
+        docstring), not something TECH-5377's ceiling should start rejecting."""
+        creator = await _register(session, "ttl-past-creator")
+        target = await _register(session, "ttl-past-target")
+        already_expired = datetime.now(UTC) - timedelta(seconds=1)
+        conv = await start_conversation(
+            session,
+            actor_sub=creator.sub,
+            initiator_agent_id=creator.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            expires_at=already_expired,
+        )
+        assert abs((conv.expires_at - already_expired).total_seconds()) < 1
+
+    async def test_naive_expires_at_rejected_with_a_clear_error(
+        self, session: AsyncSession
+    ) -> None:
+        """Argus round-2 SUGGESTION: without this guard, a naive datetime
+        raises a raw TypeError from the ceiling arithmetic (offset-naive
+        minus offset-aware) instead of a clear validation error."""
+        creator = await _register(session, "ttl-naive-creator")
+        target = await _register(session, "ttl-naive-target")
+        with pytest.raises(ValueError, match="timezone-aware"):
+            await start_conversation(
+                session,
+                actor_sub=creator.sub,
+                initiator_agent_id=creator.id,
+                conversation_type="open",
+                target_agent_ids=[target.id],
+                initial_message=_request_payload(),
+                expires_at=datetime(2030, 1, 1),
+            )
 
 
 # --- list_conversations -------------------------------------------------------

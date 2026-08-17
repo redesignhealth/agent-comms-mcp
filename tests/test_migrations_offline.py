@@ -104,3 +104,17 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
         "ALTER TABLE agents ADD COLUMN IF NOT EXISTS is_shared BOOLEAN DEFAULT false NOT NULL"
         in result.stdout
     )
+    # 4af015077bf8: sort-covering index for inbox's pending-invites query.
+    assert (
+        "CREATE INDEX IF NOT EXISTS idx_participants_agent_id_status_invited_at "
+        "ON participants (agent_id, status, invited_at)" in result.stdout
+    )
+    # 136265b3f22d: drop of the now-redundant 2-column index 4af015077bf8
+    # superseded (a separate later migration, not folded into 4af015077bf8
+    # itself -- Argus round-3 BLOCKING catch). Terminated with `;` so this
+    # doesn't also match as a prefix of the longer
+    # idx_participants_agent_id_status_invited_at DROP (Argus round-3
+    # SUGGESTION -- there isn't one here today, but a future migration
+    # dropping that longer index would otherwise satisfy this assertion
+    # too without actually proving the shorter one was dropped).
+    assert "DROP INDEX IF EXISTS idx_participants_agent_id_status;" in result.stdout

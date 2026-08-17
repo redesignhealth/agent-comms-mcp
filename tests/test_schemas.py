@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from pydantic import ValidationError
 
+import schemas
 from schemas import (
     MAX_ACCEPTED_TYPES,
     MESSAGE_TYPES,
@@ -535,3 +536,30 @@ class TestTaskCancelV1:
 
     def test_boundary_safe(self) -> None:
         assert is_boundary_safe("task_cancel", 1) is True
+
+
+class TestMessageTypeDriftGuard:
+    """TECH-5377 (Argus round-1 SUGGESTION): the guard itself is exercised
+    directly, monkeypatching only schemas.MESSAGE_TYPES rather than
+    reloading the module -- a reload would leave other already-imported
+    references to schemas.MessageType (e.g. state_machine.py's own import)
+    stale against the reloaded module, which is a real hazard this test
+    has no need to risk just to exercise one comparison."""
+
+    def test_passes_on_the_real_current_values(self) -> None:
+        schemas._check_message_type_literal_matches_schemas()
+
+    def test_raises_when_message_types_gains_an_unknown_entry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(schemas, "MESSAGE_TYPES", MESSAGE_TYPES | {"not_a_real_type"})
+        with pytest.raises(RuntimeError, match="drifted out of sync"):
+            schemas._check_message_type_literal_matches_schemas()
+
+    def test_raises_when_message_types_loses_an_entry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        missing = next(iter(MESSAGE_TYPES))
+        monkeypatch.setattr(schemas, "MESSAGE_TYPES", MESSAGE_TYPES - {missing})
+        with pytest.raises(RuntimeError, match="drifted out of sync"):
+            schemas._check_message_type_literal_matches_schemas()
