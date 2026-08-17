@@ -478,6 +478,50 @@ async def register(
 
 
 @comms_server.tool
+async def set_agent_shared(agent_id: str, is_shared: bool) -> dict[str, Any]:
+    """Admin override of an existing agent's ``is_shared`` value.
+
+    ``comms_register`` freezes ``is_shared`` at first registration on
+    purpose (DESIGN.md §5/§9): it is an admission-decision input, so letting
+    an agent silently escalate its own boundary-crossing privileges via
+    re-registration would defeat the freeze. This tool is the one
+    supported way to correct the value afterwards — for example, an agent
+    self-registered with ``is_shared=False`` but is actually a shared
+    bot spanning multiple owners, or the reverse.
+
+    Requires the caller's token to carry the ``comms:admin`` scope (or be
+    an interactive/Okta caller) — same gate as first-registration
+    ``is_shared=True``. A caller without it gets the standard
+    anti-enumeration ``access_denied`` error (the specific reason,
+    ``denied.set_shared_requires_elevated_scope``, is recorded only in the
+    audit log).
+
+    - ``agent_id``: UUID string from ``comms_list_agents``.
+    - ``is_shared``: the corrected value.
+    """
+    token = _require_token()
+    actor_sub = _require_identity(token)
+    is_shared_authorized = is_interactive_token(token) or "comms:admin" in scopes_for_token(token)
+    target_id = _parse_uuid("agent_id", agent_id)
+
+    async with get_session_factory()() as session, _map_service_errors():
+        agent = await service.set_agent_shared(
+            session,
+            actor_sub=actor_sub,
+            agent_id=target_id,
+            is_shared=is_shared,
+            is_shared_authorized=is_shared_authorized,
+        )
+
+    return {
+        "agent_id": str(agent.id),
+        "sub": agent.sub,
+        "display_name": agent.display_name,
+        "is_shared": agent.is_shared,
+    }
+
+
+@comms_server.tool
 async def list_agents(limit: int = 50, cursor: str | None = None) -> dict[str, Any]:
     """List the board directory (paginated, keyset on ``sub``).
 

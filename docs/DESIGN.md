@@ -146,7 +146,8 @@ Five tables. `messages` and `audit_log` are append-only: no UPDATE/DELETE paths 
 agents id, sub UNIQUE, owner_sub, owner_email, display_name,
  accepted_types text[] (max 20 types, 100 chars each),
  status(active|suspended), min/max_schema_version,
- is_shared boolean (default false, frozen at first registration),
+ is_shared boolean (default false, frozen against self-re-registration,
+ admin-mutable via comms_set_agent_shared),
  bound_at, timestamps
 conversations id, type, state(active|completed|canceled|expired),
  created_by, expires_at, owner_snapshot jsonb (nullable),
@@ -183,12 +184,31 @@ Design notes:
  Without it, `comms_register` denies with `denied.is_shared_requires_elevated_scope`
  (this is the audit-log reason key only: the caller receives the generic
  `access_denied` message).
- There is intentionally no conversion path from `is_shared=false` to `true` for an
- existing agent (v1): the only way to become shared is `comms:admin`-authorized first
- registration of a NEW agent identity. An existing agent that needs to become shared
- has no supported upgrade. This is a deliberate scope-narrowing for v1: the
- limitation is intentional, consistent with `is_shared` being an admission-decision
- input that must never change under an identity already in use.
+ `comms_register` itself never overwrites an existing agent's `is_shared` on
+ re-registration (a re-registration presenting a different value is a no-op,
+ audited as `agent.reregister_is_shared_ignored`) -- the freeze holds against
+ the agent's own self-reported claims. The only supported way to correct an
+ existing agent's `is_shared` is the separate `comms_set_agent_shared` admin
+ tool, gated on the same elevated `comms:admin` scope (or interactive/Okta
+ caller); a caller without it gets `denied.set_shared_requires_elevated_scope`
+ (audit-log reason key only). This keeps the guarantee `is_shared` is meant to
+ provide -- it cannot change as a side effect of the agent's own traffic --
+ while giving an operator a deliberate, separately-audited (`agent.set_shared`)
+ lever to fix a value an agent got wrong at registration. The per-message
+ `_enforce_boundary_crossing` check (§9 Axis 2) queries the current row on
+ every post, not a value cached at conversation-open time, so flipping
+ `is_shared` takes effect retroactively on already-open `asymmetric`
+ conversations for THAT check: correcting a wrongly-`False` agent to `True`
+ immediately grants the boundary bypass on its existing conversations, and
+ correcting a wrongly-`True` agent back to `False` immediately withdraws it,
+ mid-conversation. This retroactive effect is narrower than it may sound,
+ though: `_authorize_conversation_open`'s pairwise-ownership admission (§9
+ Axis 1) runs exactly once, at conversation creation, so flipping the flag
+ changes admission only for conversations opened AFTER the flip, never for
+ ones already open. The invite gate (`_enforce_invite_owner_boundary`) is
+ governed entirely by `Conversation.owner_snapshot`, frozen at open time with
+ no `is_shared` bypass of its own, so it is unaffected by the flag either
+ way, at any time.
 
 ## 6. Message schemas (two-axis model)
 
@@ -223,6 +243,7 @@ scroll-to-load-more use case.
 |---|---|---|
 | `comms_whoami` | comms:read | caller identity/scopes; also returns this identity's registered min/max_schema_version via a best-effort DB lookup if already `comms_register`'d -- omitted if not yet registered or the DB is unreachable (this tool remains usable as an auth-only diagnostic either way) |
 | `comms_register` | comms:write | idempotent self-provisioning: display_name, accepted_types (max 20, 100 chars each), min/max_schema_version (default 1/1, for schema-version capability negotiation); `is_shared=True` on first registration additionally requires comms:admin (see §5) |
+| `comms_set_agent_shared` | comms:write | admin override of an existing agent's `is_shared`, since `comms_register` freezes it against the agent's own re-registration; additionally requires comms:admin (see §5) |
 | `comms_list_agents` | comms:read | directory (internal domain, enumeration acceptable). Returns agent UUIDs used as target identifiers in other tools |
 | `comms_lookup_agent_by_email` | comms:read | directory lookup by owner email; `{"agent": ..., "found": bool}`. O(1) targeted equivalent of paginating `comms_list_agents` -- see §10's enumeration-posture note |
 | `comms_start_conversation` | comms:write | type + up to 50 target agent UUIDs (from `comms_list_agents`) + initial request payload |

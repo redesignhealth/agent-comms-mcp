@@ -100,7 +100,9 @@ an actual ownership-boundary crossing), ``denied.boundary_crossing``/
 trust boundary, so it applies universally, even to ``internal`` traffic
 that boundary-crossing itself always allows), and
 ``denied.is_shared_requires_elevated_scope`` (a caller without ``comms:admin``
-tried to self-declare ``is_shared=True`` at first registration).
+tried to self-declare ``is_shared=True`` at first registration), and
+``denied.set_shared_requires_elevated_scope`` (a caller without
+``comms:admin`` tried to use the ``set_agent_shared`` admin override).
 
 Bypass-observability actions are a third category, neither a mutation nor
 a denial: they record that a privileged code path was taken, not that
@@ -1021,6 +1023,66 @@ async def register_agent(
         # diverge on re-registration, since is_shared is frozen -- do not
         # conflate them.
         detail={"created": created, "is_shared": agent.is_shared, "is_shared_requested": is_shared},
+    )
+    await session.commit()
+    return agent
+
+
+async def set_agent_shared(
+    session: AsyncSession,
+    *,
+    actor_sub: str,
+    agent_id: uuid.UUID,
+    is_shared: bool,
+    is_shared_authorized: bool,
+) -> Agent:
+    """Admin override of an existing agent's ``is_shared`` value.
+
+    ``register_agent`` freezes ``is_shared`` at first registration on
+    purpose (see its docstring) — this function is the one supported way to
+    correct it afterwards, for the case where an agent self-declared the
+    wrong value at registration. Mirrors ``register_agent``'s
+    ``is_shared_authorized`` gate exactly: the caller (tools layer) MUST
+    compute this from the actor's own verified token (elevated
+    ``comms:admin`` scope, or an interactive/Okta caller) and pass ``True``
+    only when that check passes. Defaults are not provided (unlike
+    ``register_agent``'s fail-closed ``False`` default) since this
+    function's entire purpose is the privileged mutation — there is no
+    unprivileged call site for it to protect.
+
+    Raises ``AccessDeniedError`` with reason
+    ``denied.set_shared_requires_elevated_scope`` if ``is_shared_authorized``
+    is ``False`` (checked FIRST, before the existence lookup below, so an
+    unauthorized caller's audit trail always records the authorization
+    failure -- not ``denied.unknown_agent`` -- regardless of whether
+    ``agent_id`` happens to be valid), or ``denied.unknown_agent`` if
+    ``agent_id`` does not match any agent (uniform with every other
+    unknown-agent-id denial in this module).
+    """
+    if not is_shared_authorized:
+        await _deny(
+            session,
+            actor_sub=actor_sub,
+            action="denied.set_shared_requires_elevated_scope",
+            detail={"target_agent_id": str(agent_id), "requested_is_shared": is_shared},
+        )
+    agent = await _find_agent_by_id(session, agent_id)
+    if agent is None:
+        await _deny(
+            session,
+            actor_sub=actor_sub,
+            action="denied.unknown_agent",
+            detail={"target_agent_id": str(agent_id)},
+        )
+    previous = agent.is_shared
+    agent.is_shared = is_shared
+    await session.flush()
+    _audit(
+        session,
+        actor_sub=actor_sub,
+        action="agent.set_shared",
+        agent_id=agent.id,
+        detail={"is_shared": is_shared, "previous": previous},
     )
     await session.commit()
     return agent
@@ -2825,9 +2887,16 @@ class AgentTableOwnershipClient:
     endpoint ships.
 
     Wraps the existing ``agents`` columns: ``owner_sub`` as a
-    single-element owner set, and ``is_shared`` from the DB (frozen at
-    first registration). Safe to use as an authorization input because
-    both columns are frozen at first registration — see ``register_agent``.
+    single-element owner set, and ``is_shared`` from the DB. ``owner_sub``
+    is frozen at first registration (see ``register_agent``) and never
+    changes again. ``is_shared`` is frozen against an agent's own
+    re-registration for the same reason, but -- unlike ``owner_sub`` -- IS
+    mutable via the separate ``comms:admin``-gated ``set_agent_shared``
+    admin override (see that function's docstring). Both remain safe as
+    authorization inputs: ``owner_sub`` because it truly never changes, and
+    ``is_shared`` because its only mutation path is itself gated on the
+    same elevated scope required to escalate it at first registration --
+    there is no path by which an unprivileged caller can move this value.
     """
 
     def __init__(self, session: AsyncSession) -> None:
