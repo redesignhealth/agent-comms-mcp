@@ -3,19 +3,12 @@
 # entirely -- the `if: !prerelease` guard on deploy-dev prevents both jobs
 # from running.
 #
-# ACTUAL DEPLOYMENT TO ECS IS NOT DONE HERE -- this workflow only pushes
-# images. The Terraform apply that actually deploys them to ECS is a manual
-# step run by RH staff after this workflow's ECR pushes complete; see RH's
-# internal ops runbook (private) for the exact procedure. This used to call
-# ECS RegisterTaskDefinition/UpdateService directly here, which caused a 2026
-# outage when it drifted from Terraform's separately-declared image tag, and
-# a later revision attempted an automated cross-repo dispatch to trigger that
-# apply -- both approaches were rejected/removed as of 2026-08-17 (see git
-# history on this file for the retired mechanisms). Not automating this
-# dispatch is a deliberate choice, not a gap: it would otherwise require this
-# public repo's CI to hold a credential capable of triggering infrastructure
-# changes in RH's private infra, which was rejected as an unwanted trust
-# direction.
+# This repo builds and publishes container images only. Deployment to any
+# running environment happens outside this repository -- not automated from
+# here, and deliberately so: an earlier revision of this workflow called ECS
+# RegisterTaskDefinition/UpdateService directly, and a later one dispatched a
+# deploy workflow in another repo; both were rejected/removed as of
+# 2026-08-17 (see git history on this file for the retired mechanisms).
 #
 # Two IAM roles are involved, both external-app roles owned by RH's private
 # infra, trusting only this repo's own CI:

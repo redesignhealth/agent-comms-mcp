@@ -9,13 +9,9 @@
 - IAM roles configured on RH's private infra side, trusting only this repo's own
   CI (see `deploy.yml`'s header comment for the trust split) -- these are already
   set up; no action needed here.
-- **`deploy.yml` only builds and pushes images to ECR — it does not deploy to
-  ECS.** After both `deploy-dev` and `deploy-prod` succeed, the actual ECS
-  deployment is a **manual step performed by RH staff** against RH's private
-  infra (this is deliberate, not a gap — see `deploy.yml`'s header comment for
-  why an automated cross-repo dispatch from this public repo was rejected).
-  See RH's internal ops runbook for the exact procedure; ping an RH maintainer
-  if you don't have access to it.
+- **This repo builds and publishes container images only.** `deploy.yml` pushes
+  to ECR; it does not deploy anything to a running environment. Deployment
+  happens outside this repository (see step 7) — this is deliberate, not a gap.
 
 ## Steps
 
@@ -64,10 +60,10 @@
    pip index versions agent-comms-mcp
    ```
 
-7. **Deploy to ECS (RH staff only, manual, required):** once both ECR pushes above are
-   confirmed green, follow RH's internal ops runbook to actually roll the new image out to
-   ECS — this is a deliberate manual step, not an oversight (see `deploy.yml`'s header
-   comment). The release is **not** live in either environment until this step is done.
+7. **Deploy (manual, required, outside this repo):** once both ECR pushes above are
+   confirmed green, the new image still needs to be rolled out to its running
+   environment — this repo does not do that (see `deploy.yml`'s header comment).
+   The release is **not** live in either environment until that separate step is done.
 
 ## Pre-releases
 
