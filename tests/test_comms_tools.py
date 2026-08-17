@@ -775,6 +775,92 @@ class TestRegister:
         assert result["is_shared"] is True
 
 
+# --- Admin override of is_shared -------------------------------------------------
+
+
+class TestSetAgentShared:
+    async def test_admin_scope_can_correct_is_shared(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """An agent that self-registered with the wrong ``is_shared`` value
+        (frozen against its own re-registration, see ``TestRegister``'s
+        freeze tests) can be corrected via ``comms_set_agent_shared`` by a
+        ``comms:admin``-scoped caller."""
+        registered = await _register(main, test_session_factory, "wrongly-not-shared-mcp")
+        assert registered["is_shared"] is False
+
+        admin_token = _token(
+            "admin-operator-mcp", scopes=["comms:read", "comms:write", "comms:admin"]
+        )
+        result = await _call(
+            main,
+            test_session_factory,
+            admin_token,
+            "comms_set_agent_shared",
+            {"agent_id": registered["agent_id"], "is_shared": True},
+        )
+        assert result["is_shared"] is True
+        assert result["agent_id"] == registered["agent_id"]
+
+    async def test_requires_admin_scope(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        registered = await _register(main, test_session_factory, "override-unauthorized-mcp")
+
+        unauthorized_token = _token(
+            "unauthorized-operator-mcp", scopes=["comms:read", "comms:write"]
+        )
+        with pytest.raises(
+            ToolError, match=re.escape("access_denied: not authorized for this resource")
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                unauthorized_token,
+                "comms_set_agent_shared",
+                {"agent_id": registered["agent_id"], "is_shared": True},
+            )
+
+    async def test_unknown_agent_id_denied(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        admin_token = _token(
+            "admin-operator-mcp-2", scopes=["comms:read", "comms:write", "comms:admin"]
+        )
+        with pytest.raises(
+            ToolError, match=re.escape("access_denied: not authorized for this resource")
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                admin_token,
+                "comms_set_agent_shared",
+                {"agent_id": str(uuid.uuid4()), "is_shared": True},
+            )
+
+    async def test_interactive_caller_no_admin_scope_needed(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        registered = await _register(main, test_session_factory, "wrongly-not-shared-interactive")
+
+        interactive_token = MagicMock()
+        interactive_token.claims = {
+            "iss": "https://agent-comms.example/mcp",
+            "sub": "interactive-admin-operator",
+        }
+        interactive_token.scopes = []
+        interactive_token.client_id = "interactive-admin-operator"
+
+        result = await _call(
+            main,
+            test_session_factory,
+            interactive_token,
+            "comms_set_agent_shared",
+            {"agent_id": registered["agent_id"], "is_shared": True},
+        )
+        assert result["is_shared"] is True
+
+
 # --- AXI empty-state / shape spot checks --------------------------------------------
 
 
@@ -1888,6 +1974,7 @@ class TestScopesUnaffected:
         mounted = {t.name for t in tools}
         expected = {
             "comms_register",
+            "comms_set_agent_shared",
             "comms_list_agents",
             "comms_lookup_agent_by_email",
             "comms_list_conversations",

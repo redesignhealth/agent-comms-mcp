@@ -66,6 +66,7 @@ from service import (
     list_conversations,
     lookup_agent_by_email,
     register_agent,
+    set_agent_shared,
 )
 
 # Coverage for MESSAGE_TYPES fitting within MAX_ACCEPTED_TYPES (a precondition
@@ -713,6 +714,68 @@ class TestRegisterAgent:
         assert agent_id == shared.id
         assert conversation_id == conversation.id
         assert detail["message_type"] == "note"
+
+
+# --- set_agent_shared ----------------------------------------------------------
+
+
+class TestSetAgentShared:
+    async def test_admin_override_flips_is_shared(self, session: AsyncSession) -> None:
+        """An authorized caller can correct an agent's ``is_shared`` even
+        though ``register_agent`` itself freezes the field against the
+        agent's own re-registration."""
+        agent = await _register(session, "wrongly-not-shared", is_shared=False)
+
+        updated = await set_agent_shared(
+            session,
+            actor_sub="admin-operator",
+            agent_id=agent.id,
+            is_shared=True,
+            is_shared_authorized=True,
+        )
+
+        assert updated.is_shared is True
+        row = (await session.execute(select(Agent).where(Agent.id == agent.id))).scalar_one()
+        assert row.is_shared is True
+
+        rows = (
+            await session.execute(
+                select(AuditLog.agent_id, AuditLog.detail).where(
+                    AuditLog.action == "agent.set_shared"
+                )
+            )
+        ).all()
+        assert len(rows) == 1
+        audited_agent_id, detail = rows[0]
+        assert audited_agent_id == agent.id
+        assert detail == {"is_shared": True, "previous": False}
+
+    async def test_denied_without_authorization(self, session: AsyncSession) -> None:
+        agent = await _register(session, "override-unauthorized", is_shared=False)
+
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await set_agent_shared(
+                session,
+                actor_sub="unauthorized-operator",
+                agent_id=agent.id,
+                is_shared=True,
+                is_shared_authorized=False,
+            )
+        assert exc_info.value.reason == "denied.set_shared_requires_elevated_scope"
+
+        row = (await session.execute(select(Agent).where(Agent.id == agent.id))).scalar_one()
+        assert row.is_shared is False
+
+    async def test_denied_unknown_agent(self, session: AsyncSession) -> None:
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await set_agent_shared(
+                session,
+                actor_sub="admin-operator",
+                agent_id=uuid.uuid4(),
+                is_shared=True,
+                is_shared_authorized=True,
+            )
+        assert exc_info.value.reason == "denied.unknown_agent"
 
 
 # --- start_conversation --------------------------------------------------------

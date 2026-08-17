@@ -40,7 +40,10 @@ from observability import log_auth_rejected
 #             tool). Currently: ``comms:admin``, required by
 #             ``providers.comms.register`` to accept ``is_shared=True`` on
 #             first registration (see that tool's docstring and
-#             ``service.register_agent``'s ``is_shared_authorized`` param).
+#             ``service.register_agent``'s ``is_shared_authorized`` param),
+#             and by ``providers.comms.set_agent_shared`` to correct an
+#             existing agent's ``is_shared`` value after the fact (see
+#             ``service.set_agent_shared``'s ``is_shared_authorized`` param).
 TOOL_SCOPES: dict[str, str] = {
     # --- comms (provider: providers/comms.py, namespace="comms") ---
     "comms_whoami": "comms:read",
@@ -52,6 +55,7 @@ TOOL_SCOPES: dict[str, str] = {
     "comms_inbox": "comms:read",
     # Writes (mutate board/agent/conversation state)
     "comms_register": "comms:write",
+    "comms_set_agent_shared": "comms:write",
     "comms_start_conversation": "comms:write",
     "comms_post_message": "comms:write",
     "comms_accept": "comms:write",
