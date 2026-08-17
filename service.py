@@ -746,6 +746,7 @@ def _agent_public(agent: Agent) -> dict[str, Any]:
         "owner_email": agent.owner_email,
         "accepted_types": list(agent.accepted_types),
         "status": agent.status,
+        "is_shared": agent.is_shared,
     }
 
 
