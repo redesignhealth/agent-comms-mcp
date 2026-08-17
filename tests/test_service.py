@@ -2197,15 +2197,30 @@ class TestGetConversation:
         the start_conversation path (invited_by=the conversation's
         initiator); this covers the other documented path -- a participant
         added later via comms_invite, where invited_by is that later
-        inviter, not necessarily the conversation's original owner."""
-        owner, _first_target, conversation = await self._start(
+        inviter, not necessarily the conversation's original owner.
+
+        Argus round-5 SUGGESTION: the first version of this test passed
+        the OWNER as the inviter, who is also conversation.created_by --
+        numerically identical to the existing start_conversation-path
+        test, so a bug that always returned created_by regardless of the
+        actual inviter would have passed unnoticed. first_target accepts
+        and does the inviting here instead, forcing the two IDs to
+        diverge and actually proving invited_by reflects the real
+        comms_invite caller."""
+        owner, first_target, conversation = await self._start(
             session, "gc-invite-owner", "gc-invite-first-target"
+        )
+        await accept_invite(
+            session,
+            actor_sub=first_target.sub,
+            agent_id=first_target.id,
+            conversation_id=conversation.id,
         )
         later_target = await _register(session, "gc-invite-later-target")
         await invite(
             session,
-            actor_sub=owner.sub,
-            inviter_agent_id=owner.id,
+            actor_sub=first_target.sub,
+            inviter_agent_id=first_target.id,
             conversation_id=conversation.id,
             target_agent_id=later_target.id,
         )
@@ -2217,7 +2232,9 @@ class TestGetConversation:
             conversation_id=conversation.id,
         )
         assert result["invited"] is True
-        assert result["invited_by"] == str(owner.id)
+        assert result["invited_by"] == str(first_target.id)
+        assert result["invited_by"] != str(conversation.created_by)
+        assert conversation.created_by == owner.id
 
     async def test_active_caller_gets_full_history_and_advances_last_read_seq(
         self, session: AsyncSession

@@ -24,18 +24,21 @@ regular-build lock to matter in practice.
 The now-redundant ``idx_participants_agent_id_status`` (superseded by
 this migration's new index, a strict left-prefix of it) is dropped in
 136265b3f22d, a SEPARATE later migration -- not folded into this one
-(Argus round-3 BLOCKING catch). This file went through two edits across
-this same PR before landing here: an earlier round briefly added the
-drop directly to this file's own ``upgrade()``/``downgrade()`` (since
-reverted), which is exactly the risk the split into 136265b3f22d avoids
-going forward -- neither this PR's branch nor this migration's revision
-id has been applied anywhere outside local/CI testing, so no real
-environment is actually stuck on that intermediate shape today, but
-``downgrade()`` below still defensively recreates
-``idx_participants_agent_id_status`` (guarded, a no-op if it's already
-there) specifically to stay correct even if some transient local/CI run
-during this PR's review did apply that intermediate revision and later
-needs to downgrade through it.
+(Argus round-3 BLOCKING catch): once a migration file is created and
+pushed, it must be treated as immutable. An earlier round of this same
+PR briefly violated that by editing this file's own
+``upgrade()``/``downgrade()`` directly (since reverted) -- and a later
+round briefly over-corrected by adding a "defensive" recreate of
+``idx_participants_agent_id_status`` back into THIS file's
+``downgrade()`` (also since removed, per Argus round-5 SUGGESTION): that
+recreate was itself dead code in every reachable stamping history, since
+downgrading through this revision always means 136265b3f22d's own
+``downgrade()`` already ran first and recreated the index -- the
+``if_not_exists=True`` guard would silently no-op every time, making the
+code's own justifying comment factually false for any history that
+could actually reach it. The lesson holding across all of this: a gap
+in an already-pushed migration gets fixed by a new migration, never by
+editing the existing one, even in the name of a defensive safety net.
 """
 
 from __future__ import annotations
@@ -64,18 +67,4 @@ def downgrade() -> None:
         "idx_participants_agent_id_status_invited_at",
         table_name="participants",
         if_exists=True,
-    )
-    # Defensive recreate (Argus round-4 BLOCKING catch): a no-op if the
-    # index is already there (the normal case, since 136265b3f22d's own
-    # downgrade recreates it first when downgrading further than this
-    # revision), but restores it if this exact revision was ever stamped
-    # via this migration's briefly-mutated intermediate shape (see module
-    # docstring) without 136265b3f22d on top of it -- without this, a
-    # downgrade all the way to ef8394b37c8d would otherwise silently leave
-    # `participants` with neither index.
-    op.create_index(
-        "idx_participants_agent_id_status",
-        "participants",
-        ["agent_id", "status"],
-        if_not_exists=True,
     )
