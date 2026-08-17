@@ -796,6 +796,33 @@ class TestAxiShapes:
         assert result["has_more"] is False
         assert {a["sub"] for a in result["agents"]} == {"dir-agent-1", "dir-agent-2"}
 
+    async def test_list_agents_surfaces_is_shared(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Regression pin: `_agent_public`'s directory projection must
+        include `is_shared` -- it was dropped silently (only `agent_id`,
+        `sub`, `display_name`, `owner_email`, `accepted_types`, `status`
+        were emitted), so an agent deciding how much to disclose to a peer
+        on the board had no field to consult before answering."""
+        await _register(main, test_session_factory, "dir-agent-plain")
+        await _call(
+            main,
+            test_session_factory,
+            _token("dir-agent-shared", scopes=["comms:read", "comms:write", "comms:admin"]),
+            "comms_register",
+            {
+                "display_name": "dir-agent-shared",
+                "accepted_types": sorted(MESSAGE_TYPES),
+                "is_shared": True,
+            },
+        )
+        result = await _call(
+            main, test_session_factory, _token("dir-agent-plain"), "comms_list_agents"
+        )
+        by_sub = {a["sub"]: a for a in result["agents"]}
+        assert by_sub["dir-agent-plain"]["is_shared"] is False
+        assert by_sub["dir-agent-shared"]["is_shared"] is True
+
     async def test_lookup_agent_by_email_finds_registered_agent(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
@@ -810,6 +837,7 @@ class TestAxiShapes:
         assert result["found"] is True
         assert result["agent"]["sub"] == "ea-dan"
         assert result["agent"]["owner_email"] == "Dan@Example.com"
+        assert result["agent"]["is_shared"] is False
 
     async def test_lookup_agent_by_email_unknown_email_returns_none(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
