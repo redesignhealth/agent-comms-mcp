@@ -2180,6 +2180,11 @@ class TestGetConversation:
         assert result["has_more"] is False
         assert "conversation" in result
         assert "participants" in result
+        # Argus round-3 SUGGESTION: invited_by is a documented key on this
+        # path (providers/comms.py's docstring); target was named directly
+        # in start_conversation's target_agent_ids, so it's the owner who
+        # invited them.
+        assert result["invited_by"] == str(conversation.created_by)
 
         row = await session.get(Participant, (conversation.id, target.id))
         assert row is not None

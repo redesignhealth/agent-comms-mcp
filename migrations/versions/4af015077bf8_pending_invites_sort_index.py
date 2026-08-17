@@ -21,12 +21,18 @@ deployment step this migrations directory doesn't otherwise use.
 Revisit if ``participants`` ever grows large enough for a
 regular-build lock to matter in practice.
 
-Also drops ``idx_participants_agent_id_status`` (from ef8394b37c8d,
-initial schema): Argus round-2 SUGGESTION -- it's a strict left-prefix
-of the new 3-column index, so Postgres serves every query it covered
-via this one's own prefix. Keeping both would double index-maintenance
-cost on every ``participants`` INSERT/UPDATE/DELETE for zero query-plan
-benefit. Recreated in ``downgrade()`` to actually reverse this migration.
+The now-redundant ``idx_participants_agent_id_status`` (superseded by
+this migration's new index, a strict left-prefix of it) is dropped in
+136265b3f22d, a SEPARATE later migration -- not folded into this one
+(Argus round-3 BLOCKING catch): once a migration file is created and
+pushed, it must be treated as immutable. Editing this file's own
+``upgrade()`` in place to add that drop, as an earlier round of this
+same PR briefly did, would silently no-op in any environment where
+this exact revision had already been applied (alembic tracks
+completion by revision id, not file content, so it would never re-run
+to pick up the edit) -- the correct fix for "this migration should have
+done more" is always a new migration, never a mutation of an existing
+one.
 """
 
 from __future__ import annotations
@@ -48,20 +54,9 @@ def upgrade() -> None:
         ["agent_id", "status", "invited_at"],
         if_not_exists=True,
     )
-    op.drop_index(
-        "idx_participants_agent_id_status",
-        table_name="participants",
-        if_exists=True,
-    )
 
 
 def downgrade() -> None:
-    op.create_index(
-        "idx_participants_agent_id_status",
-        "participants",
-        ["agent_id", "status"],
-        if_not_exists=True,
-    )
     op.drop_index(
         "idx_participants_agent_id_status_invited_at",
         table_name="participants",

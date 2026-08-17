@@ -2853,12 +2853,16 @@ async def inbox(session: AsyncSession, *, caller_agent_id: uuid.UUID) -> dict[st
     many conversations at once had no ceiling on a single inbox response.
     ``unread`` is ordered by most-recent activity first, so truncation
     drops the stalest conversations, not the freshest. ``total_count`` is
-    a TRUE count across both lists via separate ``COUNT(*)`` queries
+    always a TRUE count across both lists, never a page-capped length
     (Argus round-1 BLOCKING catch: computing it from the two, possibly
     page-capped, list lengths would silently report page size instead of
     the real backlog once either list is truncated -- the same
     established pattern ``list_agents`` already uses for its own
-    ``total_count``).
+    ``total_count``). Each half is only a real ``COUNT(*)`` query when
+    its own list was actually truncated (``*_has_more``); otherwise the
+    list's own length already IS the true count, and a second round trip
+    would return the same number for a real cost (Argus round-2
+    SUGGESTION).
 
     Read-only with no denial path for a valid ``caller_agent_id`` (no
     audit rows) — the write-through mutation side of lazy expiry
