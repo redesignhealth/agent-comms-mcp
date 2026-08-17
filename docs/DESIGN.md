@@ -146,7 +146,8 @@ Five tables. `messages` and `audit_log` are append-only: no UPDATE/DELETE paths 
 agents id, sub UNIQUE, owner_sub, owner_email, display_name,
  accepted_types text[] (max 20 types, 100 chars each),
  status(active|suspended), min/max_schema_version,
- is_shared boolean (default false, frozen at first registration),
+ is_shared boolean (default false, frozen against self-re-registration,
+ admin-mutable via comms_set_agent_shared),
  bound_at, timestamps
 conversations id, type, state(active|completed|canceled|expired),
  created_by, expires_at, owner_snapshot jsonb (nullable),
@@ -185,15 +186,22 @@ Design notes:
  `access_denied` message).
  `comms_register` itself never overwrites an existing agent's `is_shared` on
  re-registration (a re-registration presenting a different value is a no-op,
- audited as `agent.reregister_is_shared_ignored`) — the freeze holds against
+ audited as `agent.reregister_is_shared_ignored`) -- the freeze holds against
  the agent's own self-reported claims. The only supported way to correct an
  existing agent's `is_shared` is the separate `comms_set_agent_shared` admin
  tool, gated on the same elevated `comms:admin` scope (or interactive/Okta
  caller); a caller without it gets `denied.set_shared_requires_elevated_scope`
  (audit-log reason key only). This keeps the guarantee `is_shared` is meant to
- provide — it cannot change as a side effect of the agent's own traffic — while
- giving an operator a deliberate, separately-audited (`agent.set_shared`) lever
- to fix a value an agent got wrong at registration.
+ provide -- it cannot change as a side effect of the agent's own traffic --
+ while giving an operator a deliberate, separately-audited (`agent.set_shared`)
+ lever to fix a value an agent got wrong at registration. The flag is read
+ live on every request (conversation-open admission and boundary-crossing
+ checks both query the current row, not a value cached at conversation-open
+ time), so flipping it takes effect retroactively on already-open
+ conversations, not just future ones: correcting a wrongly-`False` agent to
+ `True` immediately grants the boundary bypass on its existing conversations,
+ and correcting a wrongly-`True` agent back to `False` immediately withdraws
+ it, mid-conversation.
 
 ## 6. Message schemas (two-axis model)
 

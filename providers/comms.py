@@ -500,13 +500,14 @@ async def set_agent_shared(agent_id: str, is_shared: bool) -> dict[str, Any]:
     - ``is_shared``: the corrected value.
     """
     token = _require_token()
+    actor_sub = _require_identity(token)
     is_shared_authorized = is_interactive_token(token) or "comms:admin" in scopes_for_token(token)
     target_id = _parse_uuid("agent_id", agent_id)
 
     async with get_session_factory()() as session, _map_service_errors():
         agent = await service.set_agent_shared(
             session,
-            actor_sub=_require_identity(token),
+            actor_sub=actor_sub,
             agent_id=target_id,
             is_shared=is_shared,
             is_shared_authorized=is_shared_authorized,

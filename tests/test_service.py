@@ -750,6 +750,35 @@ class TestSetAgentShared:
         assert audited_agent_id == agent.id
         assert detail == {"is_shared": True, "previous": False}
 
+    async def test_admin_override_flips_true_to_false(self, session: AsyncSession) -> None:
+        """The reverse direction of the correction: an agent wrongly
+        registered as shared can be corrected back to not-shared."""
+        agent = await _register(session, "wrongly-shared", is_shared=True)
+
+        updated = await set_agent_shared(
+            session,
+            actor_sub="admin-operator",
+            agent_id=agent.id,
+            is_shared=False,
+            is_shared_authorized=True,
+        )
+
+        assert updated.is_shared is False
+        row = (await session.execute(select(Agent).where(Agent.id == agent.id))).scalar_one()
+        assert row.is_shared is False
+
+        rows = (
+            await session.execute(
+                select(AuditLog.agent_id, AuditLog.detail).where(
+                    AuditLog.action == "agent.set_shared"
+                )
+            )
+        ).all()
+        assert len(rows) == 1
+        audited_agent_id, detail = rows[0]
+        assert audited_agent_id == agent.id
+        assert detail == {"is_shared": False, "previous": True}
+
     async def test_denied_without_authorization(self, session: AsyncSession) -> None:
         agent = await _register(session, "override-unauthorized", is_shared=False)
 
@@ -766,16 +795,70 @@ class TestSetAgentShared:
         row = (await session.execute(select(Agent).where(Agent.id == agent.id))).scalar_one()
         assert row.is_shared is False
 
+        actions = (
+            (
+                await session.execute(
+                    select(AuditLog.action).where(AuditLog.actor_sub == "unauthorized-operator")
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert "denied.set_shared_requires_elevated_scope" in actions
+
     async def test_denied_unknown_agent(self, session: AsyncSession) -> None:
+        bogus_id = uuid.uuid4()
         with pytest.raises(AccessDeniedError) as exc_info:
             await set_agent_shared(
                 session,
                 actor_sub="admin-operator",
-                agent_id=uuid.uuid4(),
+                agent_id=bogus_id,
                 is_shared=True,
                 is_shared_authorized=True,
             )
         assert exc_info.value.reason == "denied.unknown_agent"
+
+        actions = (
+            (
+                await session.execute(
+                    select(AuditLog.action).where(AuditLog.actor_sub == "admin-operator")
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert "denied.unknown_agent" in actions
+
+    async def test_denied_without_authorization_and_unknown_agent_reports_authorization_reason(
+        self, session: AsyncSession
+    ) -> None:
+        """Regression for the auth-check ordering: an unauthorized caller
+        targeting a non-existent agent must be audited as the authorization
+        failure (``denied.set_shared_requires_elevated_scope``), not
+        ``denied.unknown_agent`` -- the authorization check must run before
+        the existence lookup so the audit trail reflects the actual reason
+        access was denied, independent of whether ``agent_id`` happens to be
+        valid."""
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await set_agent_shared(
+                session,
+                actor_sub="unauthorized-operator-2",
+                agent_id=uuid.uuid4(),
+                is_shared=True,
+                is_shared_authorized=False,
+            )
+        assert exc_info.value.reason == "denied.set_shared_requires_elevated_scope"
+
+        actions = (
+            (
+                await session.execute(
+                    select(AuditLog.action).where(AuditLog.actor_sub == "unauthorized-operator-2")
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert actions == ["denied.set_shared_requires_elevated_scope"]
 
 
 # --- start_conversation --------------------------------------------------------
