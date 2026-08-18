@@ -799,6 +799,18 @@ Residuals, stated:
   not built here.
 - Exact-string match retained (former Finding 2): a case mismatch yields an
   un-approvable hold, not a security hole.
+- **`is_shared` does NOT exempt an agent from needing an `owner_sub` (ratified).**
+  `is_shared` (frozen at registration, `models.py:166`) and `owner_sub` are independent
+  axes: `is_shared` tells the risk scorer this agent legitimately spans multiple
+  owners (the shared-sender bypass), `owner_sub` says whose approval a hold needs. The
+  bypass only fires in `asymmetric` conversations — in `open`, any `note` is high-risk
+  unconditionally regardless of `is_shared`, so a shared agent posting free text into an
+  `open` conversation hits the hold pipeline exactly as often as any other agent; the
+  bypass reduces hold frequency only for the `asymmetric` case it actually covers. Either
+  way, a shared agent still records exactly one accountable human `owner_sub` — no
+  exemption, no multi-owner concept. This is also the zero-added-complexity path: exempting
+  shared agents would require new branching in the hold/snapshot/decide logic; requiring
+  `owner_sub` uniformly needs none.
 
 ### 15.5 Ticket split
 
