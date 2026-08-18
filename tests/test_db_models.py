@@ -581,7 +581,7 @@ class TestApprovalHoldsSchema:
                         "expires_at) "
                         "VALUES (:conversation_id, :sender_agent_id, 'test-hold-owner', "
                         "'note', 1, "
-                        "'{\"type\": \"note\", \"text\": \"hi\"}'::jsonb, 'boundary_crossing', "
+                        '\'{"type": "note", "text": "hi"}\'::jsonb, \'boundary_crossing\', '
                         "'boundary_v1', 'pending_human', now() + interval '7 days') "
                         "RETURNING id, status, decision_reason, message_id"
                     ),

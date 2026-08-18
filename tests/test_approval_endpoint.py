@@ -396,15 +396,12 @@ class TestDecideEndpoint:
         assert "message_id" not in body
 
         actions = (
-            (
-                await session.execute(
-                    select(AuditLog.action, AuditLog.actor_sub).where(
-                        AuditLog.conversation_id == hold.conversation_id
-                    )
+            await session.execute(
+                select(AuditLog.action, AuditLog.actor_sub).where(
+                    AuditLog.conversation_id == hold.conversation_id
                 )
             )
-            .all()
-        )
+        ).all()
         assert any(
             action == "approval.reject" and actor_sub == "owner-reject@example.com"
             for action, actor_sub in actions

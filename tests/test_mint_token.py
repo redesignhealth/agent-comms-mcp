@@ -133,9 +133,7 @@ class TestMalformedInput:
                 ["--sub", "agent-x", "--scopes", "not:a:real:scope", "--self-owned"],
             )
 
-    @pytest.mark.parametrize(
-        "expires", [0, -1, mint_token._MAX_EXPIRES_SECONDS + 1]
-    )
+    @pytest.mark.parametrize("expires", [0, -1, mint_token._MAX_EXPIRES_SECONDS + 1])
     def test_out_of_bounds_expires_rejected(
         self, monkeypatch: pytest.MonkeyPatch, expires: int
     ) -> None:

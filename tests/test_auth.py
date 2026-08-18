@@ -707,9 +707,7 @@ class TestNormalizingVerifierContract:
         exists for (e.g. ``nbf == iat`` on a host whose clock runs slightly
         ahead of this one)."""
         now = time.time()
-        token = _access_token(
-            iss="agent-jwt", sub="good-agent", scopes=["comms:read"], nbf=now + 5
-        )
+        token = _access_token(iss="agent-jwt", sub="good-agent", scopes=["comms:read"], nbf=now + 5)
         verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
 
         assert await verifier.verify_token("whatever") is token

@@ -150,9 +150,7 @@ class TestGetRiskScorerAndValidateConfiguration:
 
 class TestAutoApproverRegistry:
     def test_default_registry_contains_escalate_all(self) -> None:
-        assert (
-            plugins.AUTO_APPROVERS[plugins.DEFAULT_AUTO_APPROVER] is EscalateAllAutoApprover
-        )
+        assert plugins.AUTO_APPROVERS[plugins.DEFAULT_AUTO_APPROVER] is EscalateAllAutoApprover
 
     async def test_escalate_all_never_clears(self) -> None:
         approver = EscalateAllAutoApprover()

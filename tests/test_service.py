@@ -1091,22 +1091,30 @@ class TestStartConversation:
         assert rows[0].payload == {"type": "conversation_opened", "reason": "pending_approval"}
 
         message_post_rows = (
-            await session.execute(
-                select(AuditLog.detail).where(
-                    AuditLog.action == "message.post",
-                    AuditLog.conversation_id == conversation.id,
+            (
+                await session.execute(
+                    select(AuditLog.detail).where(
+                        AuditLog.action == "message.post",
+                        AuditLog.conversation_id == conversation.id,
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert any(
             d.get("system_synthesized") is True and d.get("hold_id") == str(hold.id)
             for d in message_post_rows
         )
         hold_actions = (
-            await session.execute(
-                select(AuditLog.action).where(AuditLog.conversation_id == conversation.id)
+            (
+                await session.execute(
+                    select(AuditLog.action).where(AuditLog.conversation_id == conversation.id)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert "approval.hold" in hold_actions
         assert "approval.escalate" in hold_actions
         assert "denied.boundary_crossing" not in hold_actions
@@ -2900,9 +2908,7 @@ class TestPostMessageBoundaryCrossing:
         )
         assert message.type == "counter_proposal"
 
-    async def test_open_note_diverted_to_hold_unconditionally(
-        self, session: AsyncSession
-    ) -> None:
+    async def test_open_note_diverted_to_hold_unconditionally(self, session: AsyncSession) -> None:
         owner, _target, conversation = await self._active_pair_open(
             session, "bc-open-owner", "bc-open-target"
         )
@@ -3960,9 +3966,7 @@ class TestRateLimits:
         )
         assert len(holds) == MAX_APPROVAL_HOLDS_PER_HOUR
 
-    async def test_approval_hold_rate_limit_over_limit_denied(
-        self, session: AsyncSession
-    ) -> None:
+    async def test_approval_hold_rate_limit_over_limit_denied(self, session: AsyncSession) -> None:
         owner = await _register(session, "rl-hold-owner-2")
         target = await _register(session, "rl-hold-target-2")
         conversation = await start_conversation(
@@ -3998,11 +4002,7 @@ class TestRateLimits:
         # counts approval_holds across all of the sender's conversations,
         # not one) -- query by agent_id, not conversation_id, to see it.
         agent_actions = (
-            (
-                await session.execute(
-                    select(AuditLog.action).where(AuditLog.agent_id == owner.id)
-                )
-            )
+            (await session.execute(select(AuditLog.action).where(AuditLog.agent_id == owner.id)))
             .scalars()
             .all()
         )

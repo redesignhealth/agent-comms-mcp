@@ -384,9 +384,7 @@ async def _authenticate_approval_caller(request: Request) -> tuple[str | None, i
         return None, 401
     rejected_sub = try_resolve_email(agent_checked_token) or "unknown"
     async with get_session_factory()() as session:
-        await service.audit_denied_approval_requires_interactive(
-            session, actor_sub=rejected_sub
-        )
+        await service.audit_denied_approval_requires_interactive(session, actor_sub=rejected_sub)
     return None, 403
 
 
@@ -452,9 +450,7 @@ async def decide_approval(request: Request) -> Response:
         except HoldAwaitingAutoReviewError:
             return JSONResponse({"error": "awaiting_auto_review"}, status_code=409)
         except HoldAlreadyDecidedError as exc:
-            return JSONResponse(
-                {"error": "already_decided", "status": exc.status}, status_code=409
-            )
+            return JSONResponse({"error": "already_decided", "status": exc.status}, status_code=409)
         except InvalidConversationStateError:
             return JSONResponse({"error": "conversation_not_active"}, status_code=409)
         except RuntimeError:

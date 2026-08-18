@@ -109,9 +109,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index(
-        "idx_approval_holds_conversation_id", table_name="approval_holds", if_exists=True
-    )
+    op.drop_index("idx_approval_holds_conversation_id", table_name="approval_holds", if_exists=True)
     op.drop_index(
         "idx_approval_holds_owner_sub_status_created_at",
         table_name="approval_holds",

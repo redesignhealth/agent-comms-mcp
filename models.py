@@ -352,9 +352,7 @@ class ApprovalHold(Base):
 
     __tablename__ = "approval_holds"
     __table_args__ = (
-        CheckConstraint(
-            f"status IN {APPROVAL_HOLD_STATUSES!r}", name="ck_approval_holds_status"
-        ),
+        CheckConstraint(f"status IN {APPROVAL_HOLD_STATUSES!r}", name="ck_approval_holds_status"),
         CheckConstraint(
             f"auto_decision IS NULL OR auto_decision IN {APPROVAL_HOLD_AUTO_DECISIONS!r}",
             name="ck_approval_holds_auto_decision",
