@@ -649,6 +649,8 @@ async def start_conversation(
             f"{service.MAX_CONVERSATION_TTL} from now"
         )
 
+    owner_sub_claim = token.claims.get("owner_sub")
+
     async with get_session_factory()() as session:
         caller = await _resolve_caller_agent(session, sub)
         async with _map_service_errors():
@@ -666,6 +668,7 @@ async def start_conversation(
                 message_type=message_type,
                 expires_at=expires_dt,
                 schema_version=schema_version,
+                owner_sub_claim=owner_sub_claim,
             )
 
     result: dict[str, Any] = {
@@ -769,6 +772,8 @@ async def post_message(
     sub = _compose_sub(base_sub, agent_key)
     conv_id = _parse_uuid("conversation_id", conversation_id)
 
+    owner_sub_claim = token.claims.get("owner_sub")
+
     async with get_session_factory()() as session:
         caller = await _resolve_caller_agent(session, sub)
         async with _map_service_errors():
@@ -784,6 +789,7 @@ async def post_message(
                 auto_approver=plugins.get_auto_approver(),
                 notifier=plugins.get_approval_notifier(),
                 schema_version=schema_version,
+                owner_sub_claim=owner_sub_claim,
             )
 
     if isinstance(result, ApprovalHold):

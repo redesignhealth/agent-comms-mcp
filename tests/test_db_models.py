@@ -428,6 +428,7 @@ class TestApprovalHoldsSchema:
             "id",
             "conversation_id",
             "sender_agent_id",
+            "owner_sub",
             "message_type",
             "schema_version",
             "payload",
@@ -447,6 +448,19 @@ class TestApprovalHoldsSchema:
         ):
             assert expected in cols, f"approval_holds.{expected} missing"
         assert cols["payload"] == "jsonb"
+
+    async def test_owner_sub_not_nullable(self, engine: AsyncEngine) -> None:
+        async with engine.connect() as conn:
+            nullable = (
+                await conn.execute(
+                    text(
+                        "SELECT is_nullable FROM information_schema.columns "
+                        "WHERE table_schema = 'public' AND table_name = 'approval_holds' "
+                        "AND column_name = 'owner_sub'"
+                    )
+                )
+            ).scalar_one_or_none()
+        assert nullable == "NO"
 
     async def test_decision_reason_nullable(self, engine: AsyncEngine) -> None:
         async with engine.connect() as conn:
@@ -561,9 +575,11 @@ class TestApprovalHoldsSchema:
                 await conn.execute(
                     text(
                         "INSERT INTO approval_holds "
-                        "(conversation_id, sender_agent_id, message_type, schema_version, "
-                        "payload, risk_reason, risk_scorer, status, expires_at) "
-                        "VALUES (:conversation_id, :sender_agent_id, 'note', 1, "
+                        "(conversation_id, sender_agent_id, owner_sub, message_type, "
+                        "schema_version, payload, risk_reason, risk_scorer, status, "
+                        "expires_at) "
+                        "VALUES (:conversation_id, :sender_agent_id, 'test-hold-owner', "
+                        "'note', 1, "
                         "'{\"type\": \"note\", \"text\": \"hi\"}'::jsonb, 'boundary_crossing', "
                         "'boundary_v1', 'pending_human', now() + interval '7 days') "
                         "RETURNING id, status, decision_reason, message_id"

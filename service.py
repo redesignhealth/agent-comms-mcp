@@ -1656,6 +1656,7 @@ async def start_conversation(
     message_type: str = "availability_request",
     schema_version: int = 1,
     expires_at: datetime | None = None,
+    owner_sub_claim: str | None = None,
 ) -> Conversation:
     """Open a conversation with N other agents; post the seq-1 message.
 
@@ -1888,6 +1889,8 @@ async def start_conversation(
             actor_sub=actor_sub,
             conversation=conversation,
             sender_agent_id=initiator.id,
+            owner_sub_claim=owner_sub_claim,
+            owner_sub_fallback=initiator.owner_sub,
             message_type=message_type,
             schema_version=schema_version,
             payload=payload,
@@ -2730,6 +2733,8 @@ async def _divert_high_risk_message(
     actor_sub: str,
     conversation: Conversation,
     sender_agent_id: uuid.UUID,
+    owner_sub_claim: str | None,
+    owner_sub_fallback: str,
     message_type: str,
     schema_version: int,
     payload: dict[str, Any],
@@ -2756,9 +2761,15 @@ async def _divert_high_risk_message(
     """
     now = _now()
     scorer_name = _risk_scorer_name(risk_scorer)
+    # Snapshot, not a live join: owner_sub_claim is the sender's verified
+    # claim from the request that created this hold; owner_sub_fallback is
+    # the (currently-frozen) agents.owner_sub, used only when the claim is
+    # absent. See ApprovalHold's docstring / plan doc §15.4.
+    hold_owner_sub = owner_sub_claim or owner_sub_fallback
     hold = ApprovalHold(
         conversation_id=conversation.id,
         sender_agent_id=sender_agent_id,
+        owner_sub=hold_owner_sub,
         message_type=message_type,
         schema_version=schema_version,
         payload=payload,
@@ -2790,7 +2801,7 @@ async def _divert_high_risk_message(
         conversation_id=conversation.id,
         conversation_type=conversation.type,
         sender_agent_id=sender_agent_id,
-        owner_sub=actor_sub,
+        owner_sub=hold_owner_sub,
         message_type=message_type,
         schema_version=schema_version,
         payload=payload,
@@ -2865,7 +2876,7 @@ async def _fire_approval_notifier(
         conversation_type=conversation.type,
         sender_agent_id=str(sender.id),
         sender_display_name=sender.display_name,
-        owner_sub=sender.owner_sub,
+        owner_sub=hold.owner_sub,
         owner_email=sender.owner_email,
         message_type=hold.message_type,
         risk_reason=hold.risk_reason,
@@ -2957,8 +2968,9 @@ async def list_pending_approval_holds(
     session: AsyncSession, *, owner_sub: str, limit: int = 50
 ) -> dict[str, Any]:
     """``GET /approvals/pending`` (main.py, non-MCP, interactive+owner-gated):
-    every ``pending_human`` hold whose sender agent's ``owner_sub`` matches
-    the caller, oldest first, INCLUDING the held payload -- this is the one
+    every ``pending_human`` hold whose OWN ``owner_sub`` snapshot (§15.4 --
+    NOT a live join to the sender agent's ``agents`` row) matches the
+    caller, oldest first, INCLUDING the held payload -- this is the one
     place a human reads the actual held text (the notifier deliberately
     carries only a pointer; see ``plugins.ApprovalNotification``).
     """
@@ -2966,7 +2978,7 @@ async def list_pending_approval_holds(
     stmt = (
         select(ApprovalHold, Agent)
         .join(Agent, Agent.id == ApprovalHold.sender_agent_id)
-        .where(Agent.owner_sub == owner_sub, ApprovalHold.status == "pending_human")
+        .where(ApprovalHold.owner_sub == owner_sub, ApprovalHold.status == "pending_human")
         .order_by(ApprovalHold.created_at.asc())
         .limit(limit + 1)
     )
@@ -3001,7 +3013,8 @@ async def decide_hold(
 
     Raises ``AccessDeniedError`` (uniform, ``denied.unknown_hold`` /
     ``denied.hold_not_owner``) if the hold doesn't exist or the caller's
-    verified sub doesn't match the sender agent's frozen ``owner_sub``;
+    verified sub doesn't match the hold's own ``owner_sub`` snapshot
+    (§15.4 -- NOT a live join to the sender agent's ``agents`` row);
     ``HoldExpiredError`` if lazy expiry fires on this touch;
     ``HoldAwaitingAutoReviewError`` if the hold is still ``pending_auto``
     (unreachable in v1, specified for a future async auto-approver);
@@ -3025,8 +3038,7 @@ async def decide_hold(
             action="denied.unknown_hold",
             detail={"attempted_hold_id": str(hold_id)},
         )
-    sender = await _find_agent_by_id(session, hold.sender_agent_id)
-    if sender is None or sender.owner_sub != approver_sub:
+    if hold.owner_sub != approver_sub:
         await _deny(
             session,
             actor_sub=approver_sub,
@@ -3148,6 +3160,7 @@ async def post_message(
     auto_approver: AutoApprover,
     notifier: ApprovalNotifier,
     schema_version: int = 1,
+    owner_sub_claim: str | None = None,
 ) -> Message | ApprovalHold:
     """Append a schema-validated message; apply state-machine side effects.
 
@@ -3279,6 +3292,8 @@ async def post_message(
             actor_sub=actor_sub,
             conversation=conversation,
             sender_agent_id=sender_agent_id,
+            owner_sub_claim=owner_sub_claim,
+            owner_sub_fallback=sender.owner_sub,
             message_type=message_type,
             schema_version=schema_version,
             payload=validated,

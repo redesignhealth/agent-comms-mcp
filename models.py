@@ -338,10 +338,16 @@ class ApprovalHold(Base):
 
     No ``high_risk`` boolean: a hold exists ONLY because the risk scorer's
     verdict was high-risk, so ``risk_reason``/``risk_scorer`` alone carry
-    the verdict. No ``owner_sub`` snapshot either: ``agents.owner_sub`` is
-    frozen at first registration (``service.register_agent``), so the
-    decide-time join against the live ``agents`` row reads the identical
-    value a snapshot would have captured.
+    the verdict.
+
+    ``owner_sub`` IS snapshotted at hold-creation time (from the sender's
+    verified ``owner_sub`` claim, falling back to ``agents.owner_sub`` when
+    absent) rather than read live from the ``agents`` row at decide time.
+    Once agent-token verification becomes pluggable (a separate companion
+    ticket, TECH-5396), a live-resolving verifier could change what
+    ``agents.owner_sub`` means between hold-creation and decide-time, so a
+    decide-time join to the frozen row is no longer equivalent to a
+    snapshot -- see ``docs/TECH-5389-APPROVAL-PIPELINE.md`` §15.4.
     """
 
     __tablename__ = "approval_holds"
@@ -364,6 +370,14 @@ class ApprovalHold(Base):
             "status",
             "created_at",
         ),
+        # Backs GET /approvals/pending's owner-filtered pending_human listing
+        # against the hold's own owner_sub snapshot, not a join to `agents`.
+        Index(
+            "idx_approval_holds_owner_sub_status_created_at",
+            "owner_sub",
+            "status",
+            "created_at",
+        ),
         Index("idx_approval_holds_conversation_id", "conversation_id"),
     )
 
@@ -372,6 +386,10 @@ class ApprovalHold(Base):
         ForeignKey("conversations.id"), nullable=False
     )
     sender_agent_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agents.id"), nullable=False)
+    # Snapshotted from the sender's verified owner_sub claim at hold-creation
+    # time (fallback: agents.owner_sub) -- see the class docstring and
+    # docs/TECH-5389-APPROVAL-PIPELINE.md §15.4. Never the frozen agents row.
+    owner_sub: Mapped[str] = mapped_column(Text, nullable=False)
     # The ORIGINAL message type (e.g. "note") -- posts as itself on approval.
     message_type: Mapped[str] = mapped_column(Text, nullable=False)
     schema_version: Mapped[int] = mapped_column(Integer, nullable=False)

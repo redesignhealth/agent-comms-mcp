@@ -136,6 +136,10 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
         "ON approval_holds (sender_agent_id, status, created_at)" in result.stdout
     )
     assert (
+        "CREATE INDEX IF NOT EXISTS idx_approval_holds_owner_sub_status_created_at "
+        "ON approval_holds (owner_sub, status, created_at)" in result.stdout
+    )
+    assert (
         "CREATE INDEX IF NOT EXISTS idx_approval_holds_conversation_id "
         "ON approval_holds (conversation_id)" in result.stdout
     )

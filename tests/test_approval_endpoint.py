@@ -151,14 +151,37 @@ class _FakeAccessToken:
         self.claims = claims
 
 
+class _FakeInteractiveOnlyProvider:
+    """Stands in for ``main._auth_provider.server`` (the real Okta
+    ``OktaOIDCProxy``): looks up the SAME token dict as the outer fake (so
+    tests keep using one ``_interactive_token``/``_agent_jwt_token``-
+    populated map), but -- matching real Okta behavior, which could never
+    successfully verify an agent-jwt-shaped token -- returns ``None`` for
+    anything that isn't interactive-shaped."""
+
+    def __init__(self, outer: _FakeAuthProvider) -> None:
+        self._outer = outer
+
+    async def verify_token(self, token: str) -> _FakeAccessToken | None:
+        found = self._outer.tokens.get(token)
+        if found is None or found.claims.get("iss") == "agent-jwt":
+            return None
+        return found
+
+
 class _FakeAuthProvider:
     """Stands in for ``main._auth_provider`` (a real ``MultiAuth``): maps a
     bearer-token STRING to a canned ``AccessToken``, so these tests can
     control exactly what ``main._authenticate_approval_caller`` sees
-    without a real Okta/agent-jwt signing round trip."""
+    without a real Okta/agent-jwt signing round trip. ``.server`` stands in
+    for ``main._okta_provider`` (the structural interactive-only gate,
+    TECH-5389 pluggable-auth revision) -- patched in separately below since
+    production code reads it as its own module attribute, not through this
+    object."""
 
     def __init__(self) -> None:
         self.tokens: dict[str, _FakeAccessToken] = {}
+        self.server = _FakeInteractiveOnlyProvider(self)
 
     async def verify_token(self, token: str) -> _FakeAccessToken | None:
         return self.tokens.get(token)
@@ -202,6 +225,7 @@ async def client(
         _OIDC_PATCH,
         _ENV_PATCH,
         patch.object(main, "_auth_provider", fake_provider),
+        patch.object(main, "_okta_provider", fake_provider.server),
         patch("main.get_session_factory", return_value=test_session_factory),
     ):
         transport = httpx.ASGITransport(app=app)
@@ -235,6 +259,7 @@ async def _make_hold(
     hold = ApprovalHold(
         conversation_id=conversation.id,
         sender_agent_id=sender.id,
+        owner_sub=sender_owner_sub,
         message_type="note",
         schema_version=1,
         payload={"type": "note", "text": "the actual held content"},
@@ -406,6 +431,46 @@ class TestDecideEndpoint:
         assert message.type == "note"
         assert message.payload == hold.payload
         assert message.sender_id == sender.id
+
+    async def test_decide_uses_hold_snapshot_not_live_agents_row(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        """TECH-5389 pluggable-auth revision (plan doc §15.4): the hold's
+        own ``owner_sub`` snapshot is authoritative at decide time, not a
+        live join to ``agents.owner_sub``. Mutate the sender's registered
+        owner AFTER the hold exists and confirm decide still matches
+        against the ORIGINAL owner (the snapshot), not the mutated one."""
+        http_client, provider = client
+        sender, hold = await _make_hold(session, sender_owner_sub="owner-original@example.com")
+
+        from models import Agent
+
+        sender_row = (
+            await session.execute(select(Agent).where(Agent.id == sender.id))
+        ).scalar_one()
+        sender_row.owner_sub = "owner-mutated@example.com"
+        await session.commit()
+
+        # The mutated (current agents-row) owner must NOT be able to decide.
+        provider.tokens["mutated-owner-token"] = _interactive_token("owner-mutated@example.com")
+        resp = await http_client.post(
+            f"/approvals/{hold.id}/decide",
+            headers={"Authorization": "Bearer mutated-owner-token"},
+            json={"decision": "approve"},
+        )
+        assert resp.status_code == 404
+
+        # The original (snapshotted) owner still can.
+        provider.tokens["original-owner-token"] = _interactive_token("owner-original@example.com")
+        resp = await http_client.post(
+            f"/approvals/{hold.id}/decide",
+            headers={"Authorization": "Bearer original-owner-token"},
+            json={"decision": "approve"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "approved"
 
     async def test_already_decided_returns_409(
         self,

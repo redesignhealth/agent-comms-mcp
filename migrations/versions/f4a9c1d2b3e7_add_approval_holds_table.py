@@ -43,6 +43,7 @@ def upgrade() -> None:
         sa.Column("id", sa.UUID(), server_default=sa.text("gen_random_uuid()"), nullable=False),
         sa.Column("conversation_id", sa.UUID(), nullable=False),
         sa.Column("sender_agent_id", sa.UUID(), nullable=False),
+        sa.Column("owner_sub", sa.Text(), nullable=False),
         sa.Column("message_type", sa.Text(), nullable=False),
         sa.Column("schema_version", sa.Integer(), nullable=False),
         sa.Column("payload", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
@@ -92,6 +93,13 @@ def upgrade() -> None:
         if_not_exists=True,
     )
     op.create_index(
+        "idx_approval_holds_owner_sub_status_created_at",
+        "approval_holds",
+        ["owner_sub", "status", "created_at"],
+        unique=False,
+        if_not_exists=True,
+    )
+    op.create_index(
         "idx_approval_holds_conversation_id",
         "approval_holds",
         ["conversation_id"],
@@ -103,6 +111,11 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.drop_index(
         "idx_approval_holds_conversation_id", table_name="approval_holds", if_exists=True
+    )
+    op.drop_index(
+        "idx_approval_holds_owner_sub_status_created_at",
+        table_name="approval_holds",
+        if_exists=True,
     )
     op.drop_index(
         "idx_approval_holds_sender_agent_id_status_created_at",

@@ -250,6 +250,20 @@ class ObservabilityMiddleware(Middleware):
 # uses for /mcp, rather than a second, independently-configured one.
 _auth_provider = build_auth_provider()
 
+# The interactive-only gate below (TECH-5389 pluggable-auth-verification
+# revision, plan doc §9/§15) must be structural by WHICH PROVIDER verified
+# the token, not by inspecting claims on a token that was verified through
+# the combined agent+interactive chain: MultiAuth.verify_token tries
+# _auth_provider's sources -- the Okta server, then each agent-token
+# verifier -- in order and returns the first success, so verifying against
+# `_auth_provider.server` directly (bypassing MultiAuth's verifier chain
+# entirely) means no agent-token verifier, default or a future TECH-5396
+# plugin, is EVER consulted for authorization on this surface. `.server` is
+# the exact same OktaOIDCProxy instance MultiAuth itself uses as its first
+# source -- not a second, independently-constructed one.
+assert _auth_provider.server is not None, "build_auth_provider() always sets server=Okta"
+_okta_provider = _auth_provider.server
+
 mcp: FastMCP[Any] = FastMCP(
     "agent-comms-mcp",
     instructions=(
@@ -321,15 +335,24 @@ async def _authenticate_approval_caller(request: Request) -> tuple[str | None, i
     ``comms:admin``, must get 403, never 401, to prove the gate actually
     inspected and rejected it rather than merely failing to authenticate).
 
-    Structural gate, deliberately with NO scope escape hatch: an agent-jwt
-    token is rejected outright regardless of any scope it carries --
-    unlike ``providers/comms.py``'s ``is_interactive_token(token) or
-    "comms:admin" in scopes_for_token(token)`` pattern, which exists
-    precisely so an agent CAN self-approve certain admin actions. This
-    gate is what makes agent self-approval of its own high-risk content
-    structurally impossible, not merely scope-gated. Every interactive-
-    gate rejection is audited ``denied.approval_requires_interactive`` (a
-    plain missing/malformed header or a token that fails verification
+    Structural gate, deliberately with NO scope escape hatch, and now
+    structural by VERIFICATION PATH, not claim inspection (plan doc §9/§15):
+    the token is verified against ``_okta_provider`` ONLY -- the agent-token
+    verifier chain (``_auth_provider``'s non-Okta sources; today just the
+    default ``JWTVerifier``, in the future possibly a TECH-5396 plugin) is
+    NEVER consulted for authorization here, so no agent credential of any
+    format can pass this gate regardless of any scope it carries, even
+    under a misconfigured or malicious agent-verifier plugin. This is
+    stronger than the claim-inspection pattern in ``providers/comms.py``'s
+    ``is_interactive_token(token) or "comms:admin" in scopes_for_token(token)``
+    (which exists precisely so an agent CAN self-approve certain admin
+    actions) -- this gate is what makes agent self-approval of its own
+    high-risk content structurally impossible, not merely scope-gated.
+    ``is_interactive_token`` is still asserted below as a belt-and-braces
+    check on the Okta-verified result. The agent chain is consulted ONLY on
+    the failure path, solely to attribute the ``denied.approval_requires_
+    interactive`` audit row to whatever identity an agent token carries (a
+    plain missing/malformed header, or a token that fails BOTH chains,
     never reaches the DB at all, since there is no caller identity yet to
     attribute the audit row to).
     """
@@ -339,20 +362,26 @@ async def _authenticate_approval_caller(request: Request) -> tuple[str | None, i
     token_str = header[len("Bearer ") :].strip()
     if not token_str:
         return None, 401
-    access_token = await _auth_provider.verify_token(token_str)
-    if access_token is None:
+    access_token = await _okta_provider.verify_token(token_str)
+    if access_token is not None and is_interactive_token(access_token):
+        caller_sub = try_resolve_email(access_token)
+        if caller_sub is None:
+            return None, 401
+        return caller_sub, 200
+
+    # Interactive verification failed (or, defensively, succeeded but
+    # somehow didn't look interactive) -- fall back to the full agent+
+    # interactive chain SOLELY to attribute the denial audit row; this
+    # result is never used for authorization.
+    agent_checked_token = await _auth_provider.verify_token(token_str)
+    if agent_checked_token is None:
         return None, 401
-    if not is_interactive_token(access_token):
-        rejected_sub = try_resolve_email(access_token) or "unknown"
-        async with get_session_factory()() as session:
-            await service.audit_denied_approval_requires_interactive(
-                session, actor_sub=rejected_sub
-            )
-        return None, 403
-    caller_sub = try_resolve_email(access_token)
-    if caller_sub is None:
-        return None, 401
-    return caller_sub, 200
+    rejected_sub = try_resolve_email(agent_checked_token) or "unknown"
+    async with get_session_factory()() as session:
+        await service.audit_denied_approval_requires_interactive(
+            session, actor_sub=rejected_sub
+        )
+    return None, 403
 
 
 @mcp.custom_route("/approvals/{hold_id}/decide", methods=["POST"])
