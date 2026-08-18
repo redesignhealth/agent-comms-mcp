@@ -27,10 +27,10 @@ single source of truth for every message type in the system, keyed by
 ``(message_type, schema_version)`` — deliberately independent of
 ``conversations.type`` (DESIGN.md §9's "two axes, not a new conversation
 type per scenario"): which message types a conversation may legally carry
-is a function of ``conversations.type`` and ``boundary_safe`` (see
-``MessageSchema`` below and ``state_machine.py``), not of the registry key.
-Adding a message type or a new ``schema_version`` is a code change here
-plus (nothing else) — old versions stay registered so historical payloads
+is a function of ``conversations.type`` and the message type's own risk
+(``plugins.BoundaryCrossingScorer``), not of the registry key. Adding a
+message type or a new ``schema_version`` is a code change here plus
+(nothing else) — old versions stay registered so historical payloads
 remain validatable.
 
 Design note — ``availability_response``'s either/or shape (DESIGN.md §6:
@@ -51,7 +51,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
-from typing import Any, Literal, NamedTuple, get_args
+from typing import Any, Literal, get_args
 from uuid import UUID
 
 from pydantic import (
@@ -101,10 +101,10 @@ MAX_PAYLOAD_BYTES = 65536
 MAX_AGENT_KEY_LENGTH = 100
 
 # Message types known to the board. Mirrors the DB CHECK-free, code-owned
-# open vocabulary described in models.py's module docstring. Each type's
-# ``boundary_safe`` flag (see MessageSchema/MESSAGE_SCHEMAS below) governs
-# whether it may cross an ownership boundary under an ``asymmetric``
-# conversation, and whether it's legal at all under ``open``.
+# open vocabulary described in models.py's module docstring. Whether a
+# given type may cross an ownership boundary under an ``asymmetric``
+# conversation, or is legal at all under ``open``, is now scorer-private
+# policy (``plugins.BARRIER_SENSITIVE_TYPES``), not a field here.
 MessageType = Literal[
     "availability_request",
     "availability_response",
@@ -261,17 +261,19 @@ class NeedsClarificationV1(_StrictModel):
 
 
 class NoteV1(_StrictModel):
-    """note / v1 — free text, ``boundary_safe=False``.
+    """note / v1 — free text, barrier-sensitive
+    (``plugins.BARRIER_SENSITIVE_TYPES``).
 
     The one deliberate exception to "no free text" (DESIGN.md §8 invariant
     3 is a leakage control under this model, not an injection control —
-    see DESIGN.md §9): legal only where ``boundary_safe=False`` is allowed
-    to travel (``internal`` always; ``asymmetric`` only when the post does
-    not cross an ownership boundary for the sender; never under ``open``).
-    ``text`` is stored verbatim — this is provisional pending the
-    quarantine/review pipeline DESIGN.md §10 defers ("raw text stored for
-    audit/human display but never enters a privileged agent's context");
-    nothing in this schema enforces that downstream handling today.
+    see DESIGN.md §9): legal only where the risk scorer decides it doesn't
+    cross an ownership boundary (``internal`` always; ``asymmetric`` only
+    when the post does not cross an ownership boundary for the sender;
+    never under ``open``). ``text`` is stored verbatim — this is
+    provisional pending the quarantine/review pipeline DESIGN.md §10
+    defers ("raw text stored for audit/human display but never enters a
+    privileged agent's context"); nothing in this schema enforces that
+    downstream handling today.
     """
 
     type: Literal["note"] = "note"
@@ -379,41 +381,26 @@ class TaskCancelV1(_StrictModel):
     reason: _TASK_CLOSE_REASONS
 
 
-class MessageSchema(NamedTuple):
-    """A registered message type's validation model plus its boundary policy.
-
-    ``boundary_safe`` (DESIGN.md §9 Axis 2) governs whether this message
-    type may cross an ownership boundary: required unconditionally under
-    ``open``; free under ``internal``; under ``asymmetric`` only when the
-    specific post doesn't cross for the sender (see
-    ``state_machine.is_boundary_crossing_safe``). It is a property of the
-    message type, independent of which conversation type carries it.
-    """
-
-    model: type[BaseModel]
-    boundary_safe: bool
-
-
-# Registry: (message_type, schema_version) -> MessageSchema. Deliberately
-# independent of conversation type — legality of
-# a given message type under a given conversation type is decided by
-# state_machine.py from ``boundary_safe`` + conversation type, not baked
-# into this key. Every ``model`` is a concrete BaseModel subclass (never a
-# Union/TypeAdapter), so callers can uniformly do
-# ``get_schema(...).model_validate(payload)``.
-MESSAGE_SCHEMAS: dict[tuple[str, int], MessageSchema] = {
-    ("availability_request", 1): MessageSchema(AvailabilityRequestV1, boundary_safe=True),
-    ("availability_response", 1): MessageSchema(AvailabilityResponseV1, boundary_safe=True),
-    ("counter_proposal", 1): MessageSchema(CounterProposalV1, boundary_safe=True),
-    ("confirm", 1): MessageSchema(ConfirmV1, boundary_safe=True),
-    ("decline", 1): MessageSchema(DeclineV1, boundary_safe=True),
-    ("needs_clarification", 1): MessageSchema(NeedsClarificationV1, boundary_safe=True),
-    ("note", 1): MessageSchema(NoteV1, boundary_safe=False),
-    ("task_assign", 1): MessageSchema(TaskAssignV1, boundary_safe=True),
-    ("task_report", 1): MessageSchema(TaskReportV1, boundary_safe=True),
-    ("task_complete", 1): MessageSchema(TaskCompleteV1, boundary_safe=True),
-    ("task_decline", 1): MessageSchema(TaskDeclineV1, boundary_safe=True),
-    ("task_cancel", 1): MessageSchema(TaskCancelV1, boundary_safe=True),
+# Registry: (message_type, schema_version) -> validation model. Deliberately
+# independent of conversation type — legality of a given message type under
+# a given conversation type is decided by the risk scorer
+# (``plugins.BoundaryCrossingScorer``) from its own
+# ``BARRIER_SENSITIVE_TYPES`` + conversation type, not baked into this key.
+# Every value is a concrete BaseModel subclass (never a Union/TypeAdapter),
+# so callers can uniformly do ``get_schema(...).model_validate(payload)``.
+MESSAGE_SCHEMAS: dict[tuple[str, int], type[BaseModel]] = {
+    ("availability_request", 1): AvailabilityRequestV1,
+    ("availability_response", 1): AvailabilityResponseV1,
+    ("counter_proposal", 1): CounterProposalV1,
+    ("confirm", 1): ConfirmV1,
+    ("decline", 1): DeclineV1,
+    ("needs_clarification", 1): NeedsClarificationV1,
+    ("note", 1): NoteV1,
+    ("task_assign", 1): TaskAssignV1,
+    ("task_report", 1): TaskReportV1,
+    ("task_complete", 1): TaskCompleteV1,
+    ("task_decline", 1): TaskDeclineV1,
+    ("task_cancel", 1): TaskCancelV1,
 }
 
 
@@ -493,23 +480,7 @@ def get_schema(message_type: str, schema_version: int) -> type[BaseModel]:
             f"unknown message schema: type '{message_type}' schema_version "
             f"{schema_version} is not registered"
         )
-    return entry.model
-
-
-def is_boundary_safe(message_type: str, schema_version: int) -> bool:
-    """Whether this message type/version may cross an ownership boundary
-    unconditionally (see ``MessageSchema.boundary_safe``).
-
-    Raises ``PayloadValidationError`` for an unknown coordinate, same as
-    ``get_schema``, so callers don't need a separate not-found path.
-    """
-    entry = MESSAGE_SCHEMAS.get((message_type, schema_version))
-    if entry is None:
-        raise PayloadValidationError(
-            f"unknown message schema: type '{message_type}' schema_version "
-            f"{schema_version} is not registered"
-        )
-    return entry.boundary_safe
+    return entry
 
 
 def validate_payload(
@@ -568,7 +539,6 @@ __all__ = [
     "ConfirmV1",
     "CounterProposalV1",
     "DeclineV1",
-    "MessageSchema",
     "MessageType",
     "NeedsClarificationV1",
     "NoteV1",
@@ -581,6 +551,5 @@ __all__ = [
     "TaskReportV1",
     "TimeWindow",
     "get_schema",
-    "is_boundary_safe",
     "validate_payload",
 ]

@@ -136,6 +136,7 @@ from exceptions import (
     UnknownConversationTypeError,
 )
 from models import Agent, AuditLog, Conversation, Message, Participant
+from plugins import MessageRiskContext, RiskScorer, RiskScoringInfraError
 from schemas import (
     CONVERSATION_TYPES,
     MAX_ACCEPTED_TYPE_LENGTH,
@@ -144,11 +145,9 @@ from schemas import (
     MAX_REGISTERED_SCHEMA_VERSION,
     MESSAGE_TYPES,
     PayloadValidationError,
-    is_boundary_safe,
     validate_payload,
 )
 from state_machine import (
-    is_boundary_crossing_safe,
     is_message_legal,
     resulting_conversation_state,
 )
@@ -857,8 +856,9 @@ async def register_agent(
     registration only (a re-registration can never change the already-frozen
     ``is_shared`` value, so the gate is a no-op there). ``is_shared`` is an
     admission-decision input — it lets its holder skip the pairwise
-    ownership-boundary check in ``_authorize_conversation_open`` and
-    ``_enforce_boundary_crossing`` — so self-declaring it at registration
+    ownership-boundary check in ``_authorize_conversation_open`` and the
+    risk scorer's ownership lookups (``_score_message_risk``) — so
+    self-declaring it at registration
     with only the baseline write scope would be a privilege escalation.
     Callers MUST compute this from the caller's own verified token (e.g. an
     elevated ``comms:admin`` scope or platform-provisioning identity) and
@@ -1455,7 +1455,7 @@ async def _authorize_conversation_open(
     # across disjoint owners, defeating the type's invariant entirely.
     shared_bypass = conversation_type == "asymmetric" and is_shared_by_id.get(initiator.id, False)
     if shared_bypass:
-        # Mirrors _enforce_boundary_crossing's agent.boundary_check_bypassed_shared
+        # Mirrors _score_message_risk's agent.boundary_check_bypassed_shared
         # audit: staged, not committed, for consistency
         # with that sibling bypass-observability event -- both are
         # persisted by the caller's own enclosing commit along with the
@@ -1497,6 +1497,7 @@ async def start_conversation(
     target_agent_ids: list[uuid.UUID],
     initial_message: dict[str, Any],
     ownership_client: OwnershipClient,
+    risk_scorer: RiskScorer,
     message_type: str = "availability_request",
     schema_version: int = 1,
     expires_at: datetime | None = None,
@@ -1639,7 +1640,7 @@ async def start_conversation(
         other_agents=[(t.id, t.accepted_types) for t in targets],
         message_type=message_type,
     )
-    await _enforce_boundary_crossing(
+    await _score_message_risk(
         session,
         actor_sub=actor_sub,
         sender_agent_id=initiator.id,
@@ -1649,6 +1650,7 @@ async def start_conversation(
         message_type=message_type,
         schema_version=schema_version,
         ownership_client=ownership_client,
+        risk_scorer=risk_scorer,
     )
 
     now = _now()
@@ -1878,7 +1880,7 @@ async def _authorize_invite_owner_freeze(
         )
     if not target_owners:
         # Fail closed, same posture as _authorize_conversation_open and
-        # _enforce_boundary_crossing: an empty owner set (a soft-failing
+        # the risk scorer's ownership lookups: an empty owner set (a soft-failing
         # client returning {"owners": []} instead of raising) must not be
         # treated as "subset of everything" and silently admitted.
         await _deny(
@@ -2173,7 +2175,7 @@ async def _all_non_owners_declined(session: AsyncSession, conversation_id: uuid.
     return bool(member_statuses) and all(status == "declined" for status in member_statuses)
 
 
-async def _enforce_boundary_crossing(
+async def _score_message_risk(
     session: AsyncSession,
     *,
     actor_sub: str,
@@ -2184,136 +2186,49 @@ async def _enforce_boundary_crossing(
     message_type: str,
     schema_version: int,
     ownership_client: OwnershipClient,
+    risk_scorer: RiskScorer,
 ) -> None:
-    """Enforce DESIGN.md §9 Axis 2's boundary-crossing rule for this message.
+    """Run the configured ``plugins.RiskScorer`` for this message and
+    enforce its verdict (DESIGN.md §9 Axis 2).
 
-    ``other_agent_ids`` is supplied by the caller rather than queried here —
-    ``_check_boundary_crossing`` (below) queries current participants for
-    ``post_message``; ``start_conversation`` already has its target list in
-    memory and calls this directly with no conversation row required to
-    exist yet.
+    TECH-5389 PR1 (behavior-preserving seam refactor): replaces the former
+    ``_enforce_boundary_crossing``'s inline ownership-boundary logic with a
+    call through the pluggable scorer seam (``plugins.py``), relocating
+    ``state_machine.is_boundary_crossing_safe``'s predicate into the v1
+    ``BoundaryCrossingScorer`` — but this function still maps every
+    outcome to the SAME denial its predecessor produced; diverting a
+    high-risk verdict to an approval hold instead of denying it lands in a
+    later PR. ``other_agent_ids`` is supplied by the caller rather than
+    queried here — ``_check_boundary_crossing`` (below) queries current
+    participants for ``post_message``; ``start_conversation`` already has
+    its target list in memory and calls this directly with no conversation
+    row required to exist yet.
 
-    Only ``asymmetric`` conversations posting a non-``boundary_safe``
-    message need an actual ownership lookup (``open``/``internal``, and any
-    ``boundary_safe`` message, are decided by
-    ``state_machine.is_boundary_crossing_safe`` from the conversation type
-    alone) — avoids the external ownership-client round trip on the common
-    path. Fails closed (``denied.ownership_unverified``) on any lookup
-    error, or on an empty owner set for the sender or any other participant
-    (an ownership_client that soft-fails to ``{"owners": []}`` instead of
-    raising must not silently admit a boundary crossing).
+    A scorer-raised ``RiskScoringInfraError`` fails closed via the
+    pre-existing infrastructure-failure denials, keyed by ``exc.cause``:
+    ``denied.unknown_conversation_type`` for a conversation_type row this
+    process doesn't recognize (e.g. a legacy pre-rename row), or
+    ``denied.ownership_unverified`` for every other cause (a lookup error
+    or an empty owner set). A ``high_risk=True`` verdict denies via the
+    pre-existing ``denied.boundary_crossing``. A verdict whose
+    ``detail`` marks a shared-sender bypass still emits the pre-existing
+    ``agent.boundary_check_bypassed_shared`` bypass-observability audit
+    row.
     """
-    boundary_safe = is_boundary_safe(message_type, schema_version)
-    sender_info: dict[str, Any] = {}
-    sender_owners: frozenset[str] = frozenset()
-    other_owners: frozenset[str] = frozenset()
-    other_owner_sets: list[frozenset[str]] = []
-    if conversation_type == "asymmetric" and not boundary_safe:
-        # Sequential, not asyncio.gather: AgentTableOwnershipClient's
-        # get_agent_owners shares this call's AsyncSession, which
-        # SQLAlchemy's AsyncSession does not support across concurrent
-        # coroutines.
-        try:
-            sender_info = await ownership_client.get_agent_owners(sender_agent_id)
-        except Exception as exc:
-            logger.warning(
-                "ownership lookup failed checking boundary crossing: %s",
-                type(exc).__name__,
-                exc_info=True,
-            )
-            # No `return` here -- unlike the deliberate
-            # early-return on a successful bypass below, returning after a
-            # denial would fail OPEN if `_deny`'s NoReturn contract were
-            # ever weakened -- falling through is fail-closed instead,
-            # since `sender_info` is pre-initialized to `{}` above (so
-            # `.get("is_shared")` below is falsy) and the next ownership
-            # check re-denies on the still-empty `sender_owners` default.
-            await _deny(
-                session,
-                actor_sub=actor_sub,
-                action="denied.ownership_unverified",
-                agent_id=sender_agent_id,
-                conversation_id=conversation_id,
-                detail={"message_type": message_type},
-            )
-        if sender_info.get("is_shared"):
-            # Outside the ownership-lookup try/except: staging
-            # this audit inside that block risked a session-state error being
-            # mislabeled as `denied.ownership_unverified`. Staged, not
-            # committed: the caller (post_message) holds a
-            # SELECT ... FOR UPDATE lock on the Conversation row to
-            # serialize seq assignment, and committing here would release
-            # that lock mid-request, letting two concurrent shared senders
-            # race on seq. This audit row is persisted by the caller's own
-            # enclosing commit along with the rest of the operation, exactly
-            # like every other non-`_deny` audit call in this module.
-            _audit(
-                session,
-                actor_sub=actor_sub,
-                action="agent.boundary_check_bypassed_shared",
-                agent_id=sender_agent_id,
-                conversation_id=conversation_id,
-                detail={"message_type": message_type},
-            )
-            return
-        # `if sender_info:`, not just proceeding
-        # unconditionally: when the first lookup failed, `sender_info` is
-        # still `{}` and `sender_owners` is still its empty default, so
-        # there is nothing for this second lookup to add -- skipping it
-        # avoids both a wasted round trip and a second
-        # `denied.ownership_unverified` audit row for the same underlying
-        # failure if `_deny`'s NoReturn contract were ever weakened.
-        if sender_info:
-            try:
-                sender_owners = frozenset(sender_info.get("owners") or [])
-                for pid in other_agent_ids:
-                    info = await ownership_client.get_agent_owners(pid)
-                    other_owner_sets.append(frozenset(info.get("owners") or []))
-                other_owners = (
-                    frozenset().union(*other_owner_sets) if other_owner_sets else frozenset()
-                )
-            except Exception as exc:
-                logger.warning(
-                    "ownership lookup failed checking boundary crossing: %s",
-                    type(exc).__name__,
-                    exc_info=True,
-                )
-                # Force `sender_owners` back to empty: it may
-                # already hold a real, non-empty value from the assignment
-                # above, computed before this loop raised. Left as-is, a
-                # `_deny` that failed to raise would fall through to the
-                # `not sender_owners` check below with a *non-empty*
-                # `sender_owners` and an *empty* `other_owners` (never
-                # reached its assignment) -- and an empty `other_owners` is
-                # a subset of any `sender_owners`, so
-                # `is_boundary_crossing_safe` would admit the message.
-                # Resetting here keeps this except block fail-closed the
-                # same way the first one already is.
-                sender_owners = frozenset()
-                await _deny(
-                    session,
-                    actor_sub=actor_sub,
-                    action="denied.ownership_unverified",
-                    agent_id=sender_agent_id,
-                    conversation_id=conversation_id,
-                    detail={"message_type": message_type},
-                )
-        if not sender_owners or any(not owners for owners in other_owner_sets):
-            await _deny(
-                session,
-                actor_sub=actor_sub,
-                action="denied.ownership_unverified",
-                agent_id=sender_agent_id,
-                conversation_id=conversation_id,
-                detail={"message_type": message_type},
-            )
-    if not is_boundary_crossing_safe(conversation_type, boundary_safe, sender_owners, other_owners):
-        # Distinct label for an unrecognized conversation_type (e.g. a
-        # legacy pre-rename row) hitting is_boundary_crossing_safe's
-        # default-deny path — this is a migration/data-integrity gap, not
-        # an actual ownership-boundary crossing, and debugging it as the
-        # latter would be misleading.
-        if conversation_type not in CONVERSATION_TYPES:
+    ctx = MessageRiskContext(
+        conversation_type=conversation_type,
+        conversation_id=conversation_id,
+        sender_agent_id=sender_agent_id,
+        other_agent_ids=other_agent_ids,
+        message_type=message_type,
+        schema_version=schema_version,
+        ownership_client=ownership_client,
+    )
+    try:
+        verdict = await risk_scorer.score(ctx)
+    except RiskScoringInfraError as exc:
+        logger.warning("risk scorer infrastructure failure: %s", exc.cause, exc_info=True)
+        if exc.cause == "unknown_conversation_type":
             await _deny(
                 session,
                 actor_sub=actor_sub,
@@ -2323,22 +2238,44 @@ async def _enforce_boundary_crossing(
                 detail={"message_type": message_type, "conversation_type": conversation_type},
             )
         else:
-            # Explicit else, not relying on _deny's NoReturn to make the
-            # two branches mutually exclusive -- a future refactor that
-            # weakens _deny's contract must not silently start emitting
-            # both audit rows for the same denial.
             await _deny(
                 session,
                 actor_sub=actor_sub,
-                action="denied.boundary_crossing",
+                action="denied.ownership_unverified",
                 agent_id=sender_agent_id,
                 conversation_id=conversation_id,
-                detail={
-                    "message_type": message_type,
-                    "sender_multi_owner": len(sender_owners) > 1,
-                    "other_owners_outside_sender": bool(other_owners - sender_owners),
-                },
+                detail={"message_type": message_type},
             )
+
+    if verdict.detail and verdict.detail.get("bypass") == "shared_sender":
+        # Outside any try/except: staging this audit inside one risked a
+        # session-state error being mislabeled as an infrastructure
+        # failure. Staged, not committed: the caller (post_message) holds
+        # a SELECT ... FOR UPDATE lock on the Conversation row to
+        # serialize seq assignment, and committing here would release that
+        # lock mid-request, letting two concurrent shared senders race on
+        # seq. This audit row is persisted by the caller's own enclosing
+        # commit along with the rest of the operation, exactly like every
+        # other non-`_deny` audit call in this module.
+        _audit(
+            session,
+            actor_sub=actor_sub,
+            action="agent.boundary_check_bypassed_shared",
+            agent_id=sender_agent_id,
+            conversation_id=conversation_id,
+            detail={"message_type": message_type},
+        )
+        return
+
+    if verdict.high_risk:
+        await _deny(
+            session,
+            actor_sub=actor_sub,
+            action="denied.boundary_crossing",
+            agent_id=sender_agent_id,
+            conversation_id=conversation_id,
+            detail={"message_type": message_type},
+        )
 
 
 async def _enforce_message_type_accepted(
@@ -2356,7 +2293,7 @@ async def _enforce_message_type_accepted(
     This is a capability gate, not a trust boundary: whether a given
     agent's own implementation actually handles a message type is a fact
     about that specific running agent, unrelated to who sent it — so
-    unlike ``_enforce_boundary_crossing``, this check is universal and
+    unlike ``_score_message_risk``, this check is universal and
     applies even to ``internal`` same-owner traffic. Checked per-recipient
     (each of ``other_agents`` individually), not aggregated, since
     ``accepted_types`` is a per-agent fact, not a per-owner one.
@@ -2404,14 +2341,15 @@ async def _check_boundary_crossing(
     message_type: str,
     schema_version: int,
     ownership_client: OwnershipClient,
+    risk_scorer: RiskScorer,
 ) -> None:
-    """``_enforce_boundary_crossing`` (+ the universal ``accepted_types``
+    """``_score_message_risk`` (+ the universal ``accepted_types``
     capability gate) for an existing conversation row — queries current
     (``active``/``invited``) participants for the other side rather than
     requiring the caller to already know them.
 
     Single join query (participants + agents), not two separate
-    round-trips: covers both ``_enforce_boundary_crossing``'s
+    round-trips: covers both ``_score_message_risk``'s
     active-or-invited "other" set (queried unconditionally now, unlike the
     old asymmetric-and-unsafe-only gating this replaced — boundary
     crossing itself only needs an ownership lookup for the narrower case,
@@ -2461,7 +2399,7 @@ async def _check_boundary_crossing(
         other_agents=capability_others,
         message_type=message_type,
     )
-    await _enforce_boundary_crossing(
+    await _score_message_risk(
         session,
         actor_sub=actor_sub,
         sender_agent_id=sender_agent_id,
@@ -2471,6 +2409,7 @@ async def _check_boundary_crossing(
         message_type=message_type,
         schema_version=schema_version,
         ownership_client=ownership_client,
+        risk_scorer=risk_scorer,
     )
 
 
@@ -2519,6 +2458,7 @@ async def post_message(
     message_type: str,
     payload: dict[str, Any],
     ownership_client: OwnershipClient,
+    risk_scorer: RiskScorer,
     schema_version: int = 1,
 ) -> Message:
     """Append a schema-validated message; apply state-machine side effects.
@@ -2533,14 +2473,13 @@ async def post_message(
     row (acquired while loading the participant), so concurrent posters to
     the same conversation serialize and every seq is gapless and race-safe.
 
-    Boundary-crossing (DESIGN.md §9 Axis 2, ``_check_boundary_crossing``) is
-    checked right after payload validation (which must run first here --
-    ``is_boundary_safe`` itself raises ``PayloadValidationError`` for an
-    unregistered schema coordinate, and that has to go through
-    ``_deny_bad_schema``'s audit trail, not escape uncaught): an
-    ``asymmetric`` conversation rejects a non-``boundary_safe`` message
-    that would cross an ownership boundary for the sender, audited as
-    ``denied.boundary_crossing``.
+    Boundary-crossing (DESIGN.md §9 Axis 2, ``_check_boundary_crossing``,
+    scored by the injected ``risk_scorer``) is checked right after payload
+    validation, so an unregistered ``(message_type, schema_version)`` pair
+    is denied via ``_deny_bad_schema``'s audit trail first, rather than
+    scored at all: an ``asymmetric`` conversation rejects a barrier-
+    sensitive message (e.g. ``note``) that would cross an ownership
+    boundary for the sender, audited as ``denied.boundary_crossing``.
 
     Side effects: ``confirm``/``task_complete`` transition the conversation
     to ``completed``; ``decline`` sets the sender's OWN participant status
@@ -2612,11 +2551,10 @@ async def post_message(
             exc=exc,
         )
 
-    # Validated above, not after: is_boundary_safe (inside
-    # _check_boundary_crossing) raises PayloadValidationError itself for an
-    # unregistered (message_type, schema_version) pair -- letting that
-    # escape uncaught here (rather than through _deny_bad_schema) would
-    # violate DESIGN.md §8's "every denial is audited" invariant.
+    # Validated above, not after: an unregistered (message_type,
+    # schema_version) pair must go through _deny_bad_schema's audit trail
+    # above, not reach the risk scorer at all -- DESIGN.md §8's "every
+    # denial is audited" invariant.
     await _check_boundary_crossing(
         session,
         actor_sub=actor_sub,
@@ -2625,6 +2563,7 @@ async def post_message(
         message_type=message_type,
         schema_version=schema_version,
         ownership_client=ownership_client,
+        risk_scorer=risk_scorer,
     )
 
     next_seq = (

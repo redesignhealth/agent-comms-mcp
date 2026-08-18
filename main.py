@@ -30,6 +30,7 @@ from observability import (
     log_tool_call,
     log_user_active,
 )
+from plugins import validate_configuration as validate_plugin_configuration
 from providers.comms import comms_server
 from scopes import (
     is_interactive_token,
@@ -238,7 +239,7 @@ mcp: FastMCP[Any] = FastMCP(
         "Supports EA-style agents negotiating availability "
         "and coordinating tasks across users via scoped, structured "
         "messages — no free text except the provisional 'note' type "
-        "(boundary_safe=False; pre-quarantine pipeline, subject to change) "
+        "(info-barrier sensitive; pre-quarantine pipeline, subject to change) "
         "type. Register with comms_register, then use "
         "comms_start_conversation with conversation_type 'internal' (same "
         "verified owner, invite/accept same as the other types — the "
@@ -293,6 +294,10 @@ def _cli() -> None:
     # freely). This does not open a connection — it only validates the URL
     # is present and well-formed via db.database_url()'s require_env check.
     database_url()
+    # Same fail-fast posture for the pluggable risk-scorer seam
+    # (plugins.py): an unknown RISK_SCORER name or a bad import path must
+    # crash at boot, not lazily on the first high-risk message.
+    validate_plugin_configuration()
 
     # Bind loopback by default; docker-compose overrides MCP_HOST=0.0.0.0
     # to reach the port mapping from the host.

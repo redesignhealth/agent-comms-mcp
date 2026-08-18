@@ -45,6 +45,7 @@ from fastmcp.server.auth import AccessToken
 from fastmcp.server.dependencies import get_access_token
 from sqlalchemy.exc import InterfaceError, OperationalError
 
+import plugins
 import service
 from db import get_session_factory
 from exceptions import (
@@ -645,6 +646,7 @@ async def start_conversation(
                 target_agent_ids=target_uuids,
                 initial_message=initial_message,
                 ownership_client=service.AgentTableOwnershipClient(session),
+                risk_scorer=plugins.get_risk_scorer(),
                 message_type=message_type,
                 expires_at=expires_dt,
                 schema_version=schema_version,
@@ -731,6 +733,7 @@ async def post_message(
                 message_type=message_type,
                 payload=payload,
                 ownership_client=service.AgentTableOwnershipClient(session),
+                risk_scorer=plugins.get_risk_scorer(),
                 schema_version=schema_version,
             )
 
