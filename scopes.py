@@ -53,6 +53,7 @@ TOOL_SCOPES: dict[str, str] = {
     "comms_list_conversations": "comms:read",
     "comms_get_conversation": "comms:read",
     "comms_inbox": "comms:read",
+    "comms_get_hold_status": "comms:read",
     # Writes (mutate board/agent/conversation state)
     "comms_register": "comms:write",
     "comms_set_agent_shared": "comms:write",

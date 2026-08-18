@@ -108,6 +108,7 @@ MAX_AGENT_KEY_LENGTH = 100
 MessageType = Literal[
     "availability_request",
     "availability_response",
+    "conversation_opened",
     "counter_proposal",
     "confirm",
     "decline",
@@ -266,18 +267,38 @@ class NoteV1(_StrictModel):
 
     The one deliberate exception to "no free text" (DESIGN.md §8 invariant
     3 is a leakage control under this model, not an injection control —
-    see DESIGN.md §9): legal only where the risk scorer decides it doesn't
-    cross an ownership boundary (``internal`` always; ``asymmetric`` only
-    when the post does not cross an ownership boundary for the sender;
-    never under ``open``). ``text`` is stored verbatim — this is
-    provisional pending the quarantine/review pipeline DESIGN.md §10
-    defers ("raw text stored for audit/human display but never enters a
-    privileged agent's context"); nothing in this schema enforces that
-    downstream handling today.
+    see DESIGN.md §9): posts immediately where the risk scorer decides it
+    doesn't cross an ownership boundary (``internal`` always; ``asymmetric``
+    only when the post does not cross an ownership boundary for the
+    sender). Where it WOULD cross a boundary (including unconditionally
+    under ``open``), it is no longer denied — it is diverted to a human-
+    approval hold (TECH-5389) and posts, verbatim, only once a human
+    explicitly approves it. ``text`` is stored verbatim either way; the
+    human-approval step is the injection control for this schema now
+    (DESIGN.md §10), not a deferred quarantine pipeline.
     """
 
     type: Literal["note"] = "note"
     text: str = Field(min_length=1, max_length=4000)
+
+
+class ConversationOpenedV1(_StrictModel):
+    """conversation_opened / v1 — minimal system-synthesized marker
+    (TECH-5389 PR2).
+
+    Posted by the SERVICE (never an agent — ``service.post_message``/
+    ``service.start_conversation`` deny a caller-supplied
+    ``message_type == "conversation_opened"``, audited
+    ``denied.system_message_type``) as the seq-1 message of a conversation
+    whose real opening content scored high-risk. Fully enum-coded and
+    deliberately content-blind: it reveals that a hold exists, nothing
+    about what it holds. Exempt from the ``accepted_types`` capability gate
+    (``service._SYSTEM_MESSAGE_TYPES``) — no agent authored it, and
+    "ignore this marker" requires no declared handling capability.
+    """
+
+    type: Literal["conversation_opened"] = "conversation_opened"
+    reason: Literal["pending_approval"] = "pending_approval"
 
 
 _TASK_ACTIONS_REQUIRING_WINDOW_AND_DURATION = frozenset(
@@ -391,6 +412,7 @@ class TaskCancelV1(_StrictModel):
 MESSAGE_SCHEMAS: dict[tuple[str, int], type[BaseModel]] = {
     ("availability_request", 1): AvailabilityRequestV1,
     ("availability_response", 1): AvailabilityResponseV1,
+    ("conversation_opened", 1): ConversationOpenedV1,
     ("counter_proposal", 1): CounterProposalV1,
     ("confirm", 1): ConfirmV1,
     ("decline", 1): DeclineV1,
@@ -537,6 +559,7 @@ __all__ = [
     "AvailabilityRequestV1",
     "AvailabilityResponseV1",
     "ConfirmV1",
+    "ConversationOpenedV1",
     "CounterProposalV1",
     "DeclineV1",
     "MessageType",

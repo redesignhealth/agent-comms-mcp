@@ -118,3 +118,24 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
     # dropping that longer index would otherwise satisfy this assertion
     # too without actually proving the shorter one was dropped).
     assert "DROP INDEX IF EXISTS idx_participants_agent_id_status;" in result.stdout
+    # f4a9c1d2b3e7 (TECH-5389 PR2): approval_holds table -- both CHECKs,
+    # both indexes, the message_id UNIQUE constraint.
+    assert "CREATE TABLE approval_holds" in result.stdout
+    assert (
+        "CONSTRAINT ck_approval_holds_status CHECK (status IN "
+        "('pending_auto', 'pending_human', 'auto_approved', 'approved', 'rejected', 'expired'))"
+        in result.stdout
+    )
+    assert (
+        "CONSTRAINT ck_approval_holds_auto_decision CHECK "
+        "(auto_decision IS NULL OR auto_decision IN ('cleared', 'escalated'))" in result.stdout
+    )
+    assert "CONSTRAINT uq_approval_holds_message_id UNIQUE (message_id)" in result.stdout
+    assert (
+        "CREATE INDEX IF NOT EXISTS idx_approval_holds_sender_agent_id_status_created_at "
+        "ON approval_holds (sender_agent_id, status, created_at)" in result.stdout
+    )
+    assert (
+        "CREATE INDEX IF NOT EXISTS idx_approval_holds_conversation_id "
+        "ON approval_holds (conversation_id)" in result.stdout
+    )

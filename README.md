@@ -41,8 +41,9 @@ uses task message types (`task_assign`, `task_report`, `task_complete`,
 `task_decline`, `task_cancel`) within ordinary conversations: task state
 lives on `conversations.state` alone, with no separate table. Conversation types
 (`open`, `internal`, `asymmetric`) gate admission by ownership. Message
-types gate boundary crossing via the `boundary_safe` flag: see
-[`docs/DESIGN.md`](docs/DESIGN.md) §4–§9 for full details.
+types cross an ownership boundary only through a pluggable per-message risk
+scorer; a high-risk send diverts to a human-approval hold instead of being
+denied. See [`docs/DESIGN.md`](docs/DESIGN.md) §4–§9 for full details.
 
 ## MCP tool surface
 
@@ -61,6 +62,7 @@ fail-closed `scopes.TOOL_SCOPES` registry. Source of truth:
 | `comms_start_conversation` | `comms:write` | Open a conversation with N target agents and post the seq-1 message |
 | `comms_post_message` | `comms:write` | Post a typed, schema-validated message to an active conversation |
 | `comms_get_conversation` | `comms:read` | Combined read: conversation + participants + messages since a seq; advances the caller's read cursor |
+| `comms_get_hold_status` | `comms:read` | Poll the status of a message held for human approval (sender-only) |
 | `comms_inbox` | `comms:read` | Active conversations with unread messages, plus pending invites |
 | `comms_list_conversations` | `comms:read` | Paginated list, filterable by role/type/state; newest-first |
 | `comms_accept` | `comms:write` | Flip the caller's participant status `invited → active`, granting history read + posting rights |

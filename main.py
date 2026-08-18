@@ -7,9 +7,11 @@ auth, with fail-closed per-tool scope enforcement.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
+import uuid
 from typing import Any, NoReturn
 
 import mcp.types as mt
@@ -19,10 +21,18 @@ from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.tools import ToolResult
 from starlette.requests import Request
-from starlette.responses import PlainTextResponse
+from starlette.responses import JSONResponse, PlainTextResponse, Response
 
+import service
 from auth import build_auth_provider
-from db import database_url
+from db import database_url, get_session_factory
+from exceptions import (
+    AccessDeniedError,
+    HoldAlreadyDecidedError,
+    HoldAwaitingAutoReviewError,
+    HoldExpiredError,
+    InvalidConversationStateError,
+)
 from identity import AGENT_JWT_ISSUER, try_resolve_email
 from observability import (
     configure_logging,
@@ -232,15 +242,25 @@ class ObservabilityMiddleware(Middleware):
                 log_user_active(email)
 
 
+# Built once and reused by the non-MCP approval HTTP routes below (TECH-5389
+# PR2): mcp.custom_route registers plain Starlette routes OUTSIDE MultiAuth
+# (verified against this server's own /health route, which self-documents
+# that fact) -- so /approvals/{hold_id}/decide and /approvals/pending must
+# self-verify their bearer token against the SAME provider instance FastMCP
+# uses for /mcp, rather than a second, independently-configured one.
+_auth_provider = build_auth_provider()
+
 mcp: FastMCP[Any] = FastMCP(
     "agent-comms-mcp",
     instructions=(
         "Permissioned, structured agent-to-agent communications layer. "
         "Supports EA-style agents negotiating availability "
         "and coordinating tasks across users via scoped, structured "
-        "messages — no free text except the provisional 'note' type "
-        "(info-barrier sensitive; pre-quarantine pipeline, subject to change) "
-        "type. Register with comms_register, then use "
+        "messages — no free text except the 'note' type (info-barrier "
+        "sensitive: posts immediately unless it would cross an ownership "
+        "boundary, in which case it is held for human approval rather than "
+        "denied — see comms_post_message and comms_get_hold_status). "
+        "Register with comms_register, then use "
         "comms_start_conversation with conversation_type 'internal' (same "
         "verified owner, invite/accept same as the other types — the "
         "distinction is the ownership check, not the invite flow), "
@@ -255,14 +275,15 @@ mcp: FastMCP[Any] = FastMCP(
         "manage membership. comms_whoami returns the authenticated caller's "
         "identity and scopes; comms_list_agents lists the board directory; "
         "comms_lookup_agent_by_email finds a board-active agent by owner "
-        "email ({'agent': ..., 'found': bool}). "
+        "email ({'agent': ..., 'found': bool}). comms_get_hold_status polls "
+        "the status of a message held for human approval (sender-only). "
         "accepted_types in comms_register declares which message types an "
         "agent accepts (e.g. 'task_assign', 'availability_request') and is "
         "enforced: a message of a type you haven't declared is denied on "
         "the sender's call, with no direct feedback to you, so declare "
         "every type you actually handle."
     ),
-    auth=build_auth_provider(),
+    auth=_auth_provider,
 )
 
 mcp.add_middleware(ObservabilityMiddleware())
@@ -284,6 +305,149 @@ async def health(request: Request) -> PlainTextResponse:
     return anything sensitive.
     """
     return PlainTextResponse("ok")
+
+
+_MAX_DECISION_REASON_LENGTH = 2000
+_UNIFORM_HOLD_NOT_FOUND = {"error": "not_found"}
+
+
+async def _authenticate_approval_caller(request: Request) -> tuple[str | None, int]:
+    """Self-verify the bearer token for a non-MCP approval route
+    (``mcp.custom_route`` runs outside MultiAuth). Returns
+    ``(approver_sub, 200)`` on success, or ``(None, 401 | 403)`` on
+    failure — 401 for a missing/malformed/unverifiable token, 403 for a
+    token that verifies fine but fails the interactive-only gate (this is
+    the load-bearing distinction: an agent-jwt token, even one carrying
+    ``comms:admin``, must get 403, never 401, to prove the gate actually
+    inspected and rejected it rather than merely failing to authenticate).
+
+    Structural gate, deliberately with NO scope escape hatch: an agent-jwt
+    token is rejected outright regardless of any scope it carries --
+    unlike ``providers/comms.py``'s ``is_interactive_token(token) or
+    "comms:admin" in scopes_for_token(token)`` pattern, which exists
+    precisely so an agent CAN self-approve certain admin actions. This
+    gate is what makes agent self-approval of its own high-risk content
+    structurally impossible, not merely scope-gated. Every interactive-
+    gate rejection is audited ``denied.approval_requires_interactive`` (a
+    plain missing/malformed header or a token that fails verification
+    never reaches the DB at all, since there is no caller identity yet to
+    attribute the audit row to).
+    """
+    header = request.headers.get("authorization", "")
+    if not header.lower().startswith("bearer "):
+        return None, 401
+    token_str = header[len("Bearer ") :].strip()
+    if not token_str:
+        return None, 401
+    access_token = await _auth_provider.verify_token(token_str)
+    if access_token is None:
+        return None, 401
+    if not is_interactive_token(access_token):
+        rejected_sub = try_resolve_email(access_token) or "unknown"
+        async with get_session_factory()() as session:
+            await service.audit_denied_approval_requires_interactive(
+                session, actor_sub=rejected_sub
+            )
+        return None, 403
+    caller_sub = try_resolve_email(access_token)
+    if caller_sub is None:
+        return None, 401
+    return caller_sub, 200
+
+
+@mcp.custom_route("/approvals/{hold_id}/decide", methods=["POST"])
+async def decide_approval(request: Request) -> Response:
+    """Human decide endpoint for a held message (TECH-5389 PR2 §9).
+
+    Body: ``{"decision": "approve" | "reject", "reason": "<optional, max
+    2000 chars>"}``. Hard interactive-token gate (no agent-jwt escape
+    hatch, see ``_authenticate_approval_caller``); the caller's verified
+    sub must equal the held message's sender agent's frozen ``owner_sub``.
+    Unknown-hold and not-your-hold are a UNIFORM 404 (anti-enumeration,
+    matching the MCP tools' uniform ``AccessDeniedError`` posture).
+    """
+    approver_sub, status = await _authenticate_approval_caller(request)
+    if approver_sub is None:
+        return JSONResponse({"error": "unauthorized"}, status_code=status)
+
+    hold_id_str = request.path_params["hold_id"]
+    try:
+        hold_id = uuid.UUID(hold_id_str)
+    except ValueError:
+        return JSONResponse(_UNIFORM_HOLD_NOT_FOUND, status_code=404)
+
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "invalid_json"}, status_code=422)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "invalid_body"}, status_code=422)
+    decision = body.get("decision")
+    if decision not in ("approve", "reject"):
+        return JSONResponse(
+            {"error": "invalid_decision", "detail": "decision must be 'approve' or 'reject'"},
+            status_code=422,
+        )
+    reason = body.get("reason")
+    if reason is not None:
+        if not isinstance(reason, str):
+            return JSONResponse({"error": "invalid_reason"}, status_code=422)
+        if len(reason) > _MAX_DECISION_REASON_LENGTH:
+            return JSONResponse(
+                {
+                    "error": "invalid_reason",
+                    "detail": f"reason exceeds {_MAX_DECISION_REASON_LENGTH} characters",
+                },
+                status_code=422,
+            )
+
+    async with get_session_factory()() as session:
+        try:
+            result = await service.decide_hold(
+                session,
+                approver_sub=approver_sub,
+                hold_id=hold_id,
+                decision=decision,
+                reason=reason,
+            )
+        except AccessDeniedError:
+            return JSONResponse(_UNIFORM_HOLD_NOT_FOUND, status_code=404)
+        except HoldExpiredError:
+            return JSONResponse({"error": "expired"}, status_code=410)
+        except HoldAwaitingAutoReviewError:
+            return JSONResponse({"error": "awaiting_auto_review"}, status_code=409)
+        except HoldAlreadyDecidedError as exc:
+            return JSONResponse(
+                {"error": "already_decided", "status": exc.status}, status_code=409
+            )
+        except InvalidConversationStateError:
+            return JSONResponse({"error": "conversation_not_active"}, status_code=409)
+
+    return JSONResponse(result, status_code=200)
+
+
+@mcp.custom_route("/approvals/pending", methods=["GET"])
+async def list_pending_approvals(request: Request) -> Response:
+    """List the caller's pending approval holds, INCLUDING the held text
+    (TECH-5389 PR2 §10) -- same auth gate as the decide endpoint. Owner-
+    filtered implicitly: only holds whose sender agent's ``owner_sub``
+    matches the caller's verified sub are ever returned.
+    """
+    owner_sub, status = await _authenticate_approval_caller(request)
+    if owner_sub is None:
+        return JSONResponse({"error": "unauthorized"}, status_code=status)
+
+    limit_str = request.query_params.get("limit")
+    try:
+        limit = int(limit_str) if limit_str is not None else 50
+    except ValueError:
+        return JSONResponse({"error": "invalid_limit"}, status_code=422)
+
+    async with get_session_factory()() as session:
+        result = await service.list_pending_approval_holds(
+            session, owner_sub=owner_sub, limit=limit
+        )
+    return JSONResponse(result, status_code=200)
 
 
 def _cli() -> None:

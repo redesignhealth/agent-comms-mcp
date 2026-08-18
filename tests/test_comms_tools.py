@@ -2370,3 +2370,239 @@ class TestListConversationsTool:
                 "comms_list_conversations",
                 {field: value},
             )
+
+
+# --- Approval pipeline (TECH-5389 PR2) ---------------------------------------
+
+
+class TestApprovalPipeline:
+    """End-to-end coverage of the divert-not-deny pipeline at the MCP tool
+    boundary: a high-risk ``comms_post_message``/``comms_start_conversation``
+    call returns the distinct held-for-approval shape (not an error), and
+    ``comms_get_hold_status`` lets the sender poll the outcome."""
+
+    async def test_note_into_open_conversation_returns_held_shape(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        await _register(main, test_session_factory, "hold-e2e-initiator")
+        target = await _register(main, test_session_factory, "hold-e2e-target")
+        initiator_token = _token("hold-e2e-initiator")
+        target_token = _token("hold-e2e-target")
+
+        started = await _call(
+            main,
+            test_session_factory,
+            initiator_token,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [target["agent_id"]],
+                "initial_message": _availability_request(),
+                "message_type": "availability_request",
+            },
+        )
+        await _call(
+            main,
+            test_session_factory,
+            target_token,
+            "comms_accept",
+            {"conversation_id": started["conversation_id"]},
+        )
+
+        result = await _call(
+            main,
+            test_session_factory,
+            initiator_token,
+            "comms_post_message",
+            {
+                "conversation_id": started["conversation_id"],
+                "message_type": "note",
+                "payload": {"text": "secret cross-boundary note"},
+            },
+        )
+        assert result["held_for_approval"] is True
+        assert result["status"] == "pending_human"
+        assert result["risk_reason"] == "boundary_crossing"
+        assert "hold_id" in result
+        assert "seq" not in result
+
+        status = await _call(
+            main,
+            test_session_factory,
+            initiator_token,
+            "comms_get_hold_status",
+            {"hold_id": result["hold_id"]},
+        )
+        assert status["hold_id"] == result["hold_id"]
+        assert status["status"] == "pending_human"
+        assert status["risk_reason"] == "boundary_crossing"
+        assert "message_seq" not in status
+
+        # The held content never became a visible message.
+        conversation_view = await _call(
+            main,
+            test_session_factory,
+            initiator_token,
+            "comms_get_conversation",
+            {"conversation_id": started["conversation_id"]},
+        )
+        assert all(m["type"] != "note" for m in conversation_view["messages"])
+
+    async def test_get_hold_status_uniform_denial_for_non_sender(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        await _register(main, test_session_factory, "hold-e2e-owner")
+        target = await _register(main, test_session_factory, "hold-e2e-other-target")
+        await _register(main, test_session_factory, "hold-e2e-nosy")
+        initiator_token = _token("hold-e2e-owner")
+        target_token = _token("hold-e2e-other-target")
+        other_token = _token("hold-e2e-nosy")
+
+        started = await _call(
+            main,
+            test_session_factory,
+            initiator_token,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [target["agent_id"]],
+                "initial_message": _availability_request(),
+                "message_type": "availability_request",
+            },
+        )
+        await _call(
+            main,
+            test_session_factory,
+            target_token,
+            "comms_accept",
+            {"conversation_id": started["conversation_id"]},
+        )
+        held = await _call(
+            main,
+            test_session_factory,
+            initiator_token,
+            "comms_post_message",
+            {
+                "conversation_id": started["conversation_id"],
+                "message_type": "note",
+                "payload": {"text": "not for you"},
+            },
+        )
+
+        with pytest.raises(
+            ToolError, match=re.escape("access_denied: not authorized for this resource")
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                other_token,
+                "comms_get_hold_status",
+                {"hold_id": held["hold_id"]},
+            )
+
+    async def test_get_hold_status_uniform_denial_for_unknown_hold(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        await _register(main, test_session_factory, "hold-e2e-unknown-caller")
+        token = _token("hold-e2e-unknown-caller")
+
+        with pytest.raises(
+            ToolError, match=re.escape("access_denied: not authorized for this resource")
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                token,
+                "comms_get_hold_status",
+                {"hold_id": str(uuid.uuid4())},
+            )
+
+    async def test_seq1_diverted_opener_response_shape(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """A high-risk seq-1 opener (TECH-5389 PR2 §6): the conversation is
+        created with a service-synthesized ``conversation_opened`` marker,
+        and the response carries the held-for-approval block alongside the
+        normal conversation-created shape."""
+        await _register(main, test_session_factory, "hold-e2e-opener-initiator")
+        target = await _register(main, test_session_factory, "hold-e2e-opener-target")
+        initiator_token = _token("hold-e2e-opener-initiator")
+        target_token = _token("hold-e2e-opener-target")
+
+        started = await _call(
+            main,
+            test_session_factory,
+            initiator_token,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [target["agent_id"]],
+                "initial_message": {"text": "secret opener"},
+                "message_type": "note",
+            },
+        )
+        assert started["held_for_approval"] is True
+        assert started["hold_status"] == "pending_human"
+        assert started["risk_reason"] == "boundary_crossing"
+        assert "hold_id" in started
+
+        await _call(
+            main,
+            test_session_factory,
+            target_token,
+            "comms_accept",
+            {"conversation_id": started["conversation_id"]},
+        )
+        conversation_view = await _call(
+            main,
+            test_session_factory,
+            initiator_token,
+            "comms_get_conversation",
+            {"conversation_id": started["conversation_id"]},
+        )
+        assert len(conversation_view["messages"]) == 1
+        assert conversation_view["messages"][0]["type"] == "conversation_opened"
+        assert conversation_view["messages"][0]["seq"] == 1
+
+    async def test_direct_post_of_system_message_type_denied(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        await _register(main, test_session_factory, "hold-e2e-forge-initiator")
+        target = await _register(main, test_session_factory, "hold-e2e-forge-target")
+        initiator_token = _token("hold-e2e-forge-initiator")
+        target_token = _token("hold-e2e-forge-target")
+
+        started = await _call(
+            main,
+            test_session_factory,
+            initiator_token,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [target["agent_id"]],
+                "initial_message": _availability_request(),
+                "message_type": "availability_request",
+            },
+        )
+        await _call(
+            main,
+            test_session_factory,
+            target_token,
+            "comms_accept",
+            {"conversation_id": started["conversation_id"]},
+        )
+
+        with pytest.raises(
+            ToolError, match=re.escape("access_denied: not authorized for this resource")
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                initiator_token,
+                "comms_post_message",
+                {
+                    "conversation_id": started["conversation_id"],
+                    "message_type": "conversation_opened",
+                    "payload": {"reason": "pending_approval"},
+                },
+            )

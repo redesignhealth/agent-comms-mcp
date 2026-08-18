@@ -108,6 +108,32 @@ class RateLimitExceededError(Exception):
         self.reason = reason
 
 
+class HoldAlreadyDecidedError(Exception):
+    """The decide endpoint (``POST /approvals/{hold_id}/decide``, main.py)
+    targeted a hold no longer ``pending_human`` (already ``approved``/
+    ``rejected``/``auto_approved``/``expired``). Maps to HTTP 409. Carries
+    the hold's current ``status`` for the response body — this is a
+    non-MCP HTTP surface, gated on interactive-token + owner_sub match
+    (already narrow), so the specific status is not the kind of
+    enumeration risk ``AccessDeniedError`` guards against."""
+
+    def __init__(self, status: str) -> None:
+        self.status = status
+        super().__init__(f"hold is no longer decidable (status={status!r})")
+
+
+class HoldAwaitingAutoReviewError(Exception):
+    """The decide endpoint targeted a hold still ``pending_auto`` —
+    unreachable in v1 (``EscalateAllAutoApprover`` always transitions
+    inline within the same transaction), specified now for a future async
+    auto-approver. Maps to HTTP 409 ``{"error": "awaiting_auto_review"}``."""
+
+
+class HoldExpiredError(Exception):
+    """The decide endpoint targeted a hold that lazily expired on this
+    touch. Maps to HTTP 410."""
+
+
 class UnknownConversationTypeError(Exception):
     """``accepted_types``/``conversation_type`` named a value outside
     ``schemas.CONVERSATION_TYPES``. Message is specific by design — see the
@@ -125,6 +151,9 @@ class SchemaVersionMismatchError(Exception):
 
 __all__ = [
     "AccessDeniedError",
+    "HoldAlreadyDecidedError",
+    "HoldAwaitingAutoReviewError",
+    "HoldExpiredError",
     "InvalidConversationStateError",
     "RateLimitExceededError",
     "SchemaVersionMismatchError",

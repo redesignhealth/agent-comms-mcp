@@ -86,33 +86,55 @@ zombie-invite case, distinguishable in the trail even though the client
 sees one uniform message), ``denied.unknown_agent``,
 ``denied.already_participant``, ``denied.bad_state`` (state-machine
 violation), ``denied.bad_schema`` (payload validation),
-``denied.rate_limited``, ``denied.ownership_unverified`` (an ownership
-lookup failed — fail closed), ``denied.not_same_owner``/
+``denied.rate_limited`` (limit names: ``conversation_starts_per_hour``,
+``messages_per_conversation_per_hour``, ``messages_per_sender_per_hour``,
+and — TECH-5389 PR2 — ``approval_holds_per_hour``),
+``denied.ownership_unverified`` (Axis 1 admission — conversation open,
+invite owner-freeze — lookup failed; fail closed), ``denied.not_same_owner``/
 ``denied.no_owner_overlap`` (conversation-open admission failed for
 ``internal``/``asymmetric``), ``denied.owner_set_frozen`` (an invite would
-expand a frozen owner set), ``denied.unknown_conversation_type`` (a
-conversation row's ``type`` isn't in ``schemas.CONVERSATION_TYPES`` — a
-migration/data-integrity gap, e.g. a legacy pre-rename row — distinct from
-an actual ownership-boundary crossing), ``denied.boundary_crossing``/
-``denied.wrong_sender_role`` (DESIGN.md §9 Axis 2's per-message checks),
-``denied.message_type_not_accepted`` (a recipient hasn't declared
-``message_type`` in their own ``accepted_types`` — a capability gate, not a
-trust boundary, so it applies universally, even to ``internal`` traffic
-that boundary-crossing itself always allows), and
-``denied.is_shared_requires_elevated_scope`` (a caller without ``comms:admin``
-tried to self-declare ``is_shared=True`` at first registration), and
-``denied.set_shared_requires_elevated_scope`` (a caller without
-``comms:admin`` tried to use the ``set_agent_shared`` admin override).
+expand a frozen owner set), ``denied.wrong_sender_role`` (DESIGN.md §9
+Axis 2's per-message sender-role check), ``denied.message_type_not_accepted``
+(a recipient hasn't declared ``message_type`` in their own
+``accepted_types`` — a capability gate, not a trust boundary, so it applies
+universally, even to ``internal`` traffic that Axis 2 itself always
+allows), ``denied.is_shared_requires_elevated_scope`` (a caller without
+``comms:admin`` tried to self-declare ``is_shared=True`` at first
+registration), and ``denied.set_shared_requires_elevated_scope`` (a caller
+without ``comms:admin`` tried to use the ``set_agent_shared`` admin
+override).
 
-Bypass-observability actions are a third category, neither a mutation nor
-a denial: they record that a privileged code path was taken, not that
-anything was created or refused. ``agent.boundary_check_bypassed_shared``/
-``agent.conversation_open_bypassed_shared`` (a ``comms:admin``-authorized
-shared sender/initiator skipped the ownership-boundary check for a
-message/conversation-open respectively -- DESIGN.md §9) and
-``agent.reregister_is_shared_ignored`` (a re-registration's requested
-``is_shared`` value diverged from the already-frozen row value and was
-silently ignored, per ``is_shared``'s freeze-at-first-registration rule).
+TECH-5389 PR2's approval-holds pipeline (DESIGN.md §9 Axis 2) retired the
+per-message ``denied.boundary_crossing`` denial: a genuine high-risk
+verdict now DIVERTS to an ``approval_holds`` row instead of denying (see
+``approval.*`` below), and only a scorer INFRASTRUCTURE failure still
+denies -- via ``denied.risk_unscored``, folding the former per-message
+``denied.ownership_unverified``/``denied.unknown_conversation_type`` causes
+into one action, keyed by ``exc.cause`` in the audit detail. New PR2
+denials: ``denied.system_message_type`` (an agent tried to post the
+service-synthesized ``conversation_opened`` marker directly);
+``denied.unknown_hold``/``denied.hold_not_sender`` (uniform,
+``comms_get_hold_status``); ``denied.hold_not_owner`` (uniform, the decide
+endpoint).
+
+New PR2 mutation actions: ``approval.hold`` (a high-risk verdict created a
+hold), ``approval.escalate``/``approval.auto_approve`` (the auto-approver's
+inline decision), ``approval.approve``/``approval.reject`` (a human's
+decide-endpoint decision), ``approval.expire`` (lazy TTL expiry on touch).
+
+Bypass/best-effort-observability actions are a third category, neither a
+mutation nor a denial: they record that a privileged or fire-and-forget
+code path was taken, not that anything was created or refused.
+``risk.shared_sender_bypass`` (renamed from PR1's still-unrenamed
+``agent.boundary_check_bypassed_shared`` — no backwards compatibility,
+ratified)/``agent.conversation_open_bypassed_shared`` (a
+``comms:admin``-authorized shared sender/initiator skipped the
+ownership-boundary check for a message/conversation-open respectively --
+DESIGN.md §9), ``agent.reregister_is_shared_ignored`` (a re-registration's
+requested ``is_shared`` value diverged from the already-frozen row value
+and was silently ignored, per ``is_shared``'s freeze-at-first-registration
+rule), and ``approval.notify_failed`` (the post-commit approval notifier
+raised — logged, never fails the triggering call).
 """
 
 from __future__ import annotations
@@ -130,13 +152,33 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from exceptions import (
     AccessDeniedError,
+    HoldAlreadyDecidedError,
+    HoldAwaitingAutoReviewError,
+    HoldExpiredError,
     InvalidConversationStateError,
     RateLimitExceededError,
     SchemaVersionMismatchError,
     UnknownConversationTypeError,
 )
-from models import Agent, AuditLog, Conversation, Message, Participant
-from plugins import MessageRiskContext, RiskScorer, RiskScoringInfraError
+from models import Agent, ApprovalHold, AuditLog, Conversation, Message, Participant
+from plugins import (
+    ApprovalNotification,
+    ApprovalNotifier,
+    AutoApprover,
+    HoldContext,
+    MessageRiskContext,
+    RiskScorer,
+    RiskScoringInfraError,
+)
+from plugins import (
+    auto_approver_name as _auto_approver_name,
+)
+from plugins import (
+    notifier_name as _notifier_name,
+)
+from plugins import (
+    risk_scorer_name as _risk_scorer_name,
+)
 from schemas import (
     CONVERSATION_TYPES,
     MAX_ACCEPTED_TYPE_LENGTH,
@@ -246,6 +288,20 @@ MAX_MESSAGES_PER_SENDER_PER_HOUR = 120
 MAX_MESSAGES_PER_GET_CONVERSATION = 500
 MAX_UNREAD_CONVERSATIONS_PER_INBOX = 100
 MAX_PENDING_INVITES_PER_INBOX = 100
+
+# Approval-holds pipeline (TECH-5389 PR2). TTL/rate-limit values confirmed
+# in the plan doc §5. The rate limit is counted from approval_holds.created_at
+# per sender -- same table-count pattern as every other rate limit in this
+# module (no Redis).
+APPROVAL_HOLD_TTL = timedelta(days=7)
+MAX_APPROVAL_HOLDS_PER_HOUR = 10
+
+# The one message type the SERVICE itself synthesizes (the seq-1 marker for
+# a diverted conversation opener, schemas.ConversationOpenedV1) -- never
+# legal as a caller-supplied message_type (denied.system_message_type,
+# below) and exempt from the accepted_types capability gate by construction
+# (no code path ever calls _enforce_message_type_accepted against it).
+_SYSTEM_MESSAGE_TYPES: frozenset[str] = frozenset({"conversation_opened"})
 
 
 def _now() -> datetime:
@@ -470,6 +526,61 @@ async def _deny_bad_schema(
     raise exc
 
 
+async def _deny_if_system_message_type(
+    session: AsyncSession,
+    *,
+    actor_sub: str,
+    agent_id: uuid.UUID,
+    conversation_id: uuid.UUID | None,
+    message_type: str,
+) -> None:
+    """Deny a caller-supplied ``message_type`` that is service-synthesized-only.
+
+    Without this, an agent could forge the board's own
+    ``conversation_opened`` "opened pending approval" marker (TECH-5389
+    PR2 §6) -- a deliberately tiny resurrection of an earlier plan's
+    mint-gate mechanic, scoped to this one system marker type.
+    """
+    if message_type in _SYSTEM_MESSAGE_TYPES:
+        await _deny(
+            session,
+            actor_sub=actor_sub,
+            action="denied.system_message_type",
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            detail={"message_type": message_type},
+        )
+
+
+async def _deny_rate_limited_holds(
+    session: AsyncSession, *, actor_sub: str, sender_agent_id: uuid.UUID
+) -> None:
+    """Hold-creation rate limit (TECH-5389 PR2) -- distinct from every
+    other rate limit in this module: it counts ``approval_holds`` rows, not
+    ``messages``/``conversations`` rows. Never part of the divert-don't-deny
+    reversal -- a sender flooding the human approval queue is still capped."""
+    one_hour_ago = _now() - timedelta(hours=1)
+    count = (
+        await session.execute(
+            select(func.count())
+            .select_from(ApprovalHold)
+            .where(
+                ApprovalHold.sender_agent_id == sender_agent_id,
+                ApprovalHold.created_at > one_hour_ago,
+            )
+        )
+    ).scalar_one()
+    if count >= MAX_APPROVAL_HOLDS_PER_HOUR:
+        await _deny_rate_limited(
+            session,
+            actor_sub=actor_sub,
+            agent_id=sender_agent_id,
+            conversation_id=None,
+            limit_name="approval_holds_per_hour",
+            message=f"rate_limited: at most {MAX_APPROVAL_HOLDS_PER_HOUR} approval holds per hour",
+        )
+
+
 # --- Lookups -------------------------------------------------------------------
 
 
@@ -587,6 +698,48 @@ def _maybe_expire(session: AsyncSession, actor_sub: str, conversation: Conversat
             action="conversation.expire",
             conversation_id=conversation.id,
         )
+
+
+async def _find_hold(session: AsyncSession, hold_id: uuid.UUID) -> ApprovalHold | None:
+    return (
+        await session.execute(select(ApprovalHold).where(ApprovalHold.id == hold_id))
+    ).scalar_one_or_none()
+
+
+def _maybe_expire_hold(session: AsyncSession, actor_sub: str, hold: ApprovalHold) -> None:
+    """Lazily flip an over-TTL ``pending_auto``/``pending_human`` hold to
+    ``expired`` on next touch (``comms_get_hold_status``, the decide
+    endpoint, or ``GET /approvals/pending`` -- mirrors
+    ``_maybe_expire``'s conversation-level lazy-expiry pattern). No
+    scheduler/sweep exists in this codebase (TECH-5378) -- expiry is only
+    ever observed by whichever caller happens to touch the row next."""
+    if hold.status in ("pending_auto", "pending_human") and hold.expires_at <= _now():
+        hold.status = "expired"
+        _audit(
+            session,
+            actor_sub=actor_sub,
+            action="approval.expire",
+            conversation_id=hold.conversation_id,
+            detail={"hold_id": str(hold.id)},
+        )
+
+
+def _hold_dict(hold: ApprovalHold) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "hold_id": str(hold.id),
+        "conversation_id": str(hold.conversation_id),
+        "status": hold.status,
+        "risk_reason": hold.risk_reason,
+        "created_at": _iso(hold.created_at),
+        "expires_at": _iso(hold.expires_at),
+    }
+    if hold.decided_at is not None:
+        result["decided_at"] = _iso(hold.decided_at)
+    if hold.decision_reason is not None:
+        result["decision_reason"] = hold.decision_reason
+    if hold.message_id is not None:
+        result["message_id"] = str(hold.message_id)
+    return result
 
 
 async def _require_active_agent(
@@ -1498,6 +1651,8 @@ async def start_conversation(
     initial_message: dict[str, Any],
     ownership_client: OwnershipClient,
     risk_scorer: RiskScorer,
+    auto_approver: AutoApprover,
+    notifier: ApprovalNotifier,
     message_type: str = "availability_request",
     schema_version: int = 1,
     expires_at: datetime | None = None,
@@ -1532,6 +1687,16 @@ async def start_conversation(
     """
     initiator = await _require_active_agent(
         session, actor_sub=actor_sub, agent_id=initiator_agent_id
+    )
+    # An agent may never post the service-synthesized marker type directly
+    # as its own opener (TECH-5389 PR2 §6) -- checked early, before rate
+    # limits, so forging an attempt doesn't consume rate-limit budget.
+    await _deny_if_system_message_type(
+        session,
+        actor_sub=actor_sub,
+        agent_id=initiator.id,
+        conversation_id=None,
+        message_type=message_type,
     )
     if len(conversation_type) > MAX_ACCEPTED_TYPE_LENGTH:
         raise ValueError(f"conversation_type exceeds {MAX_ACCEPTED_TYPE_LENGTH} characters")
@@ -1640,7 +1805,7 @@ async def start_conversation(
         other_agents=[(t.id, t.accepted_types) for t in targets],
         message_type=message_type,
     )
-    await _score_message_risk(
+    risk_reason = await _score_message_risk(
         session,
         actor_sub=actor_sub,
         sender_agent_id=initiator.id,
@@ -1686,6 +1851,87 @@ async def start_conversation(
             )
         )
     await session.flush()
+
+    if risk_reason is not None:
+        # Diverted opener (TECH-5389 PR2 §6, ratified decision 1): the
+        # conversation is created anyway, with a service-synthesized safe
+        # seq-1 marker (`conversation_opened`) taking the opener's slot;
+        # the caller's actual content is diverted into a hold exactly like
+        # any other high-risk post -- no denial. Hold rate limit is
+        # checked before anything else is inserted.
+        await _deny_rate_limited_holds(session, actor_sub=actor_sub, sender_agent_id=initiator.id)
+        marker_payload = validate_payload("conversation_opened", schema_version, {})
+        marker = Message(
+            conversation_id=conversation.id,
+            seq=1,
+            sender_id=initiator.id,
+            type="conversation_opened",
+            schema_version=schema_version,
+            payload=marker_payload,
+        )
+        session.add(marker)
+        await session.flush()
+        _audit(
+            session,
+            actor_sub=actor_sub,
+            action="conversation.start",
+            agent_id=initiator.id,
+            conversation_id=conversation.id,
+            detail={
+                "type": conversation_type,
+                "target_agent_ids": [str(t) for t in target_ids],
+                "owner_snapshot": owner_snapshot,
+            },
+        )
+        result = await _divert_high_risk_message(
+            session,
+            actor_sub=actor_sub,
+            conversation=conversation,
+            sender_agent_id=initiator.id,
+            message_type=message_type,
+            schema_version=schema_version,
+            payload=payload,
+            risk_reason=risk_reason,
+            risk_scorer=risk_scorer,
+            auto_approver=auto_approver,
+        )
+        _audit(
+            session,
+            actor_sub=actor_sub,
+            action="message.post",
+            agent_id=initiator.id,
+            conversation_id=conversation.id,
+            message_id=marker.id,
+            detail={
+                "seq": 1,
+                "message_type": "conversation_opened",
+                "system_synthesized": True,
+                "hold_id": str(result.id) if isinstance(result, ApprovalHold) else None,
+            },
+        )
+        if isinstance(result, Message):
+            # Cleared inline: the real content posts as seq 2 in the SAME
+            # transaction -- apply the same terminal-type state transition
+            # post_message would apply for any other message insert.
+            new_state = resulting_conversation_state(message_type)
+            if new_state is not None:
+                conversation.state = new_state
+                _audit(
+                    session,
+                    actor_sub=actor_sub,
+                    action="conversation.close",
+                    agent_id=initiator.id,
+                    conversation_id=conversation.id,
+                    detail={"new_state": new_state, "via": message_type},
+                )
+        await session.commit()
+        if isinstance(result, ApprovalHold):
+            await _fire_approval_notifier(
+                session, hold=result, conversation=conversation, sender=initiator, notifier=notifier
+            )
+        conversation.negotiated_schema_version = schema_version  # type: ignore[attr-defined]
+        conversation.pending_hold = result if isinstance(result, ApprovalHold) else None  # type: ignore[attr-defined]
+        return conversation
 
     message = Message(
         conversation_id=conversation.id,
@@ -1754,6 +2000,7 @@ async def start_conversation(
     # in the common case — it does not survive a fresh fetch of this
     # conversation from a later call.
     conversation.negotiated_schema_version = schema_version  # type: ignore[attr-defined]
+    conversation.pending_hold = None  # type: ignore[attr-defined]
     return conversation
 
 
@@ -2187,33 +2434,35 @@ async def _score_message_risk(
     schema_version: int,
     ownership_client: OwnershipClient,
     risk_scorer: RiskScorer,
-) -> None:
+) -> str | None:
     """Run the configured ``plugins.RiskScorer`` for this message and
-    enforce its verdict (DESIGN.md §9 Axis 2).
+    return its verdict (DESIGN.md §9 Axis 2) as a ``risk_reason`` string, or
+    ``None`` if the message is not high-risk (including a shared-sender
+    bypass, which is audited but treated as low-risk).
 
-    TECH-5389 PR1 (behavior-preserving seam refactor): replaces the former
-    ``_enforce_boundary_crossing``'s inline ownership-boundary logic with a
-    call through the pluggable scorer seam (``plugins.py``), relocating
-    ``state_machine.is_boundary_crossing_safe``'s predicate into the v1
-    ``BoundaryCrossingScorer`` — but this function still maps every
-    outcome to the SAME denial its predecessor produced; diverting a
-    high-risk verdict to an approval hold instead of denying it lands in a
-    later PR. ``other_agent_ids`` is supplied by the caller rather than
-    queried here — ``_check_boundary_crossing`` (below) queries current
-    participants for ``post_message``; ``start_conversation`` already has
-    its target list in memory and calls this directly with no conversation
-    row required to exist yet.
+    TECH-5389 PR2 (the pipeline): a ``high_risk=True`` verdict no longer
+    denies -- it is returned to the caller (``post_message``/
+    ``start_conversation``), which diverts the message to an
+    ``approval_holds`` row instead of a ``denied.boundary_crossing`` denial
+    (PR1's behavior). ``other_agent_ids`` is supplied by the caller rather
+    than queried here — ``_check_boundary_crossing`` (below) queries
+    current participants for ``post_message``; ``start_conversation``
+    already has its target list in memory and calls this directly with no
+    conversation row required to exist yet.
 
-    A scorer-raised ``RiskScoringInfraError`` fails closed via the
-    pre-existing infrastructure-failure denials, keyed by ``exc.cause``:
-    ``denied.unknown_conversation_type`` for a conversation_type row this
-    process doesn't recognize (e.g. a legacy pre-rename row), or
-    ``denied.ownership_unverified`` for every other cause (a lookup error
-    or an empty owner set). A ``high_risk=True`` verdict denies via the
-    pre-existing ``denied.boundary_crossing``. A verdict whose
-    ``detail`` marks a shared-sender bypass still emits the pre-existing
-    ``agent.boundary_check_bypassed_shared`` bypass-observability audit
-    row.
+    A scorer-raised ``RiskScoringInfraError`` still fails CLOSED via a hard
+    denial: ``denied.risk_unscored``, with ``exc.cause`` (e.g.
+    ``"unknown_conversation_type"``, ``"ownership_unverified"``,
+    ``"empty_owner_set"``) carried in the audit detail -- one action for
+    every scorer infrastructure failure, ratified (PR1 kept two separate
+    actions here). Rationale (owner, ratified): an ownership-service outage
+    must not flood the human approval queue with unscorable holds -- only a
+    GENUINE crossing verdict diverts; an unscorable one still denies. A
+    verdict whose
+    ``detail`` marks a shared-sender bypass emits the ``risk.shared_sender_bypass``
+    bypass-observability audit row (renamed from PR1's still-unrenamed
+    ``agent.boundary_check_bypassed_shared`` -- no backwards compatibility,
+    ratified, see the module docstring's audit contract).
     """
     ctx = MessageRiskContext(
         conversation_type=conversation_type,
@@ -2228,24 +2477,23 @@ async def _score_message_risk(
         verdict = await risk_scorer.score(ctx)
     except RiskScoringInfraError as exc:
         logger.warning("risk scorer infrastructure failure: %s", exc.cause, exc_info=True)
-        if exc.cause == "unknown_conversation_type":
-            await _deny(
-                session,
-                actor_sub=actor_sub,
-                action="denied.unknown_conversation_type",
-                agent_id=sender_agent_id,
-                conversation_id=conversation_id,
-                detail={"message_type": message_type, "conversation_type": conversation_type},
-            )
-        else:
-            await _deny(
-                session,
-                actor_sub=actor_sub,
-                action="denied.ownership_unverified",
-                agent_id=sender_agent_id,
-                conversation_id=conversation_id,
-                detail={"message_type": message_type},
-            )
+        # TECH-5389 PR2 (ratified): every scorer infrastructure failure --
+        # an unrecognized conversation_type, a lookup error, or an empty
+        # owner set -- folds into ONE action, denied.risk_unscored, with
+        # exc.cause in the detail distinguishing the specific failure. PR1
+        # kept two separate actions here (denied.unknown_conversation_type /
+        # denied.ownership_unverified); this PR unifies them so a genuine
+        # high-risk verdict (which now diverts, never denies) can't be
+        # confused with an unscorable one (which still hard-denies) by
+        # anyone reading only the audited action name.
+        await _deny(
+            session,
+            actor_sub=actor_sub,
+            action="denied.risk_unscored",
+            agent_id=sender_agent_id,
+            conversation_id=conversation_id,
+            detail={"message_type": message_type, "cause": exc.cause},
+        )
 
     if verdict.detail and verdict.detail.get("bypass") == "shared_sender":
         # Outside any try/except: staging this audit inside one risked a
@@ -2260,22 +2508,16 @@ async def _score_message_risk(
         _audit(
             session,
             actor_sub=actor_sub,
-            action="agent.boundary_check_bypassed_shared",
+            action="risk.shared_sender_bypass",
             agent_id=sender_agent_id,
             conversation_id=conversation_id,
             detail={"message_type": message_type},
         )
-        return
+        return None
 
     if verdict.high_risk:
-        await _deny(
-            session,
-            actor_sub=actor_sub,
-            action="denied.boundary_crossing",
-            agent_id=sender_agent_id,
-            conversation_id=conversation_id,
-            detail={"message_type": message_type},
-        )
+        return verdict.reason
+    return None
 
 
 async def _enforce_message_type_accepted(
@@ -2342,7 +2584,7 @@ async def _check_boundary_crossing(
     schema_version: int,
     ownership_client: OwnershipClient,
     risk_scorer: RiskScorer,
-) -> None:
+) -> str | None:
     """``_score_message_risk`` (+ the universal ``accepted_types``
     capability gate) for an existing conversation row — queries current
     (``active``/``invited``) participants for the other side rather than
@@ -2399,7 +2641,7 @@ async def _check_boundary_crossing(
         other_agents=capability_others,
         message_type=message_type,
     )
-    await _score_message_risk(
+    return await _score_message_risk(
         session,
         actor_sub=actor_sub,
         sender_agent_id=sender_agent_id,
@@ -2449,6 +2691,450 @@ async def _require_message_sender_role(
         )
 
 
+# --- Approval-holds pipeline (TECH-5389 PR2) ------------------------------------
+
+
+async def _insert_message_for_hold(
+    session: AsyncSession, *, conversation: Conversation, hold: ApprovalHold
+) -> tuple[Message, int]:
+    """Insert ``hold``'s pinned type/schema_version/payload as the next
+    message in ``conversation``, assigning ``seq`` under the caller's
+    already-held conversation lock. Shared by the inline auto-clear path
+    (``_divert_high_risk_message``) and the human decide-endpoint's
+    approve path (``main.py``) — "approve and post atomically" is one
+    reusable function, per the plan doc §3."""
+    next_seq = (
+        await session.execute(
+            select(func.coalesce(func.max(Message.seq), 0)).where(
+                Message.conversation_id == conversation.id
+            )
+        )
+    ).scalar_one() + 1
+    message = Message(
+        conversation_id=conversation.id,
+        seq=next_seq,
+        sender_id=hold.sender_agent_id,
+        type=hold.message_type,
+        schema_version=hold.schema_version,
+        payload=hold.payload,
+    )
+    session.add(message)
+    await session.flush()
+    hold.message_id = message.id
+    return message, next_seq
+
+
+async def _divert_high_risk_message(
+    session: AsyncSession,
+    *,
+    actor_sub: str,
+    conversation: Conversation,
+    sender_agent_id: uuid.UUID,
+    message_type: str,
+    schema_version: int,
+    payload: dict[str, Any],
+    risk_reason: str,
+    risk_scorer: RiskScorer,
+    auto_approver: AutoApprover,
+) -> Message | ApprovalHold:
+    """Create the ``approval_holds`` row for a high-risk verdict, run the
+    injected ``AutoApprover`` inline, and either post the message
+    atomically (cleared) or escalate to ``pending_human`` (v1's
+    ``EscalateAllAutoApprover``: always).
+
+    Caller MUST have already run every other gate (membership, state,
+    sender role, payload validation, capability gate, hold rate limit) and
+    hold the conversation's row lock (``post_message``'s
+    ``SELECT ... FOR UPDATE``, or ``start_conversation``'s not-yet-committed
+    insert transaction) so seq assignment on the cleared path is race-safe.
+    Returns the inserted ``Message`` (cleared; carries a transient
+    ``auto_approved_hold_id`` attribute for the tools layer, mirroring
+    ``start_conversation``'s existing ``negotiated_schema_version``
+    transient-attribute convention) or the ``ApprovalHold`` itself
+    (escalated — the caller commits and then fires the notifier
+    post-commit, per ``_fire_approval_notifier``'s docstring).
+    """
+    now = _now()
+    scorer_name = _risk_scorer_name(risk_scorer)
+    hold = ApprovalHold(
+        conversation_id=conversation.id,
+        sender_agent_id=sender_agent_id,
+        message_type=message_type,
+        schema_version=schema_version,
+        payload=payload,
+        risk_reason=risk_reason,
+        risk_scorer=scorer_name,
+        status="pending_auto",
+        expires_at=now + APPROVAL_HOLD_TTL,
+    )
+    session.add(hold)
+    await session.flush()
+    _audit(
+        session,
+        actor_sub=actor_sub,
+        action="approval.hold",
+        agent_id=sender_agent_id,
+        conversation_id=conversation.id,
+        detail={
+            "hold_id": str(hold.id),
+            "risk_reason": risk_reason,
+            "risk_scorer": scorer_name,
+            "message_type": message_type,
+        },
+    )
+
+    approver_name = _auto_approver_name(auto_approver)
+    hold.auto_approver = approver_name
+    ctx = HoldContext(
+        hold_id=hold.id,
+        conversation_id=conversation.id,
+        conversation_type=conversation.type,
+        sender_agent_id=sender_agent_id,
+        owner_sub=actor_sub,
+        message_type=message_type,
+        schema_version=schema_version,
+        payload=payload,
+        risk_reason=risk_reason,
+    )
+    decision = await auto_approver.review(ctx)
+    if decision.cleared:
+        message, next_seq = await _insert_message_for_hold(
+            session, conversation=conversation, hold=hold
+        )
+        hold.status = "auto_approved"
+        hold.auto_decision = "cleared"
+        hold.auto_decided_at = _now()
+        system_actor = f"system:auto_approver/{approver_name}"
+        _audit(
+            session,
+            actor_sub=system_actor,
+            action="approval.auto_approve",
+            agent_id=sender_agent_id,
+            conversation_id=conversation.id,
+            message_id=message.id,
+            detail={"hold_id": str(hold.id)},
+        )
+        _audit(
+            session,
+            actor_sub=system_actor,
+            action="message.post",
+            agent_id=sender_agent_id,
+            conversation_id=conversation.id,
+            message_id=message.id,
+            detail={"seq": next_seq, "message_type": message_type, "hold_id": str(hold.id)},
+        )
+        message.auto_approved_hold_id = hold.id  # type: ignore[attr-defined]
+        return message
+
+    hold.status = "pending_human"
+    hold.auto_decision = "escalated"
+    hold.auto_decided_at = _now()
+    _audit(
+        session,
+        actor_sub=actor_sub,
+        action="approval.escalate",
+        agent_id=sender_agent_id,
+        conversation_id=conversation.id,
+        detail={"hold_id": str(hold.id), "auto_approver": approver_name},
+    )
+    return hold
+
+
+async def _fire_approval_notifier(
+    session: AsyncSession,
+    *,
+    hold: ApprovalHold,
+    conversation: Conversation,
+    sender: Agent,
+    notifier: ApprovalNotifier,
+) -> None:
+    """Best-effort, post-commit notification that ``hold`` entered
+    ``pending_human`` (DESIGN.md/plan doc §4). Caller MUST have already
+    committed the transaction that created/escalated ``hold`` — this
+    function starts a FRESH short transaction of its own for the
+    ``approval.notify_failed`` audit row on failure, since the main
+    commit already succeeded and must not be affected by a notifier
+    outage. Never raises: a notifier failure must never fail, roll back,
+    or delay the agent's already-returned held response --
+    ``GET /approvals/pending`` is the source of truth; notification is an
+    accelerant only.
+    """
+    notification = ApprovalNotification(
+        hold_id=str(hold.id),
+        conversation_id=str(conversation.id),
+        conversation_type=conversation.type,
+        sender_agent_id=str(sender.id),
+        sender_display_name=sender.display_name,
+        owner_sub=sender.owner_sub,
+        owner_email=sender.owner_email,
+        message_type=hold.message_type,
+        risk_reason=hold.risk_reason,
+        expires_at=_iso(hold.expires_at) or "",
+        created_at=_iso(hold.created_at) or "",
+    )
+    try:
+        await notifier.notify_escalated(notification)
+    except Exception as exc:
+        logger.warning(
+            "approval notifier failed for hold %s: %s", hold.id, type(exc).__name__, exc_info=True
+        )
+        _audit(
+            session,
+            actor_sub=sender.sub,
+            action="approval.notify_failed",
+            agent_id=sender.id,
+            conversation_id=conversation.id,
+            detail={
+                "hold_id": str(hold.id),
+                "notifier": _notifier_name(notifier),
+                "error_type": type(exc).__name__,
+            },
+        )
+        await session.commit()
+
+
+async def audit_denied_approval_requires_interactive(
+    session: AsyncSession, *, actor_sub: str
+) -> None:
+    """Audit + commit ``denied.approval_requires_interactive`` -- the hard
+    interactive-token-only gate on ``main.py``'s decide/list-pending HTTP
+    endpoints. Unlike every other denial in this module, the caller here
+    (``main.py``, a non-MCP ``mcp.custom_route`` handler) has no board
+    ``Agent``/conversation context at all -- there is nothing to raise
+    (the HTTP handler decides its own 403 response), only an audit row to
+    persist so the denial is still recorded per this module's "every
+    denial is audited" invariant.
+    """
+    _audit(session, actor_sub=actor_sub, action="denied.approval_requires_interactive")
+    await session.commit()
+
+
+async def get_hold_status(
+    session: AsyncSession,
+    *,
+    actor_sub: str,
+    caller_agent_id: uuid.UUID,
+    hold_id: uuid.UUID,
+) -> dict[str, Any]:
+    """Sender-only read of one hold's status (``comms_get_hold_status``).
+
+    The caller's resolved agent must equal the hold's ``sender_agent_id``;
+    an unknown ``hold_id`` and someone-else's hold raise the identical
+    uniform ``AccessDeniedError`` (audit distinguishes ``denied.unknown_hold``
+    / ``denied.hold_not_sender``). Applies lazy TTL expiry on touch.
+    """
+    hold = await _find_hold(session, hold_id)
+    if hold is None:
+        await _deny(
+            session,
+            actor_sub=actor_sub,
+            action="denied.unknown_hold",
+            agent_id=await _fk_safe_agent_id(session, caller_agent_id),
+            detail={"attempted_hold_id": str(hold_id)},
+        )
+    if hold.sender_agent_id != caller_agent_id:
+        await _deny(
+            session,
+            actor_sub=actor_sub,
+            action="denied.hold_not_sender",
+            agent_id=caller_agent_id,
+            conversation_id=hold.conversation_id,
+            detail={"attempted_hold_id": str(hold_id)},
+        )
+    _maybe_expire_hold(session, actor_sub, hold)
+    result = _hold_dict(hold)
+    if hold.message_id is not None:
+        seq = (
+            await session.execute(select(Message.seq).where(Message.id == hold.message_id))
+        ).scalar_one_or_none()
+        if seq is not None:
+            result["message_seq"] = seq
+    await session.commit()
+    return result
+
+
+async def list_pending_approval_holds(
+    session: AsyncSession, *, owner_sub: str, limit: int = 50
+) -> dict[str, Any]:
+    """``GET /approvals/pending`` (main.py, non-MCP, interactive+owner-gated):
+    every ``pending_human`` hold whose sender agent's ``owner_sub`` matches
+    the caller, oldest first, INCLUDING the held payload -- this is the one
+    place a human reads the actual held text (the notifier deliberately
+    carries only a pointer; see ``plugins.ApprovalNotification``).
+    """
+    limit = max(1, min(limit, 200))
+    stmt = (
+        select(ApprovalHold, Agent)
+        .join(Agent, Agent.id == ApprovalHold.sender_agent_id)
+        .where(Agent.owner_sub == owner_sub, ApprovalHold.status == "pending_human")
+        .order_by(ApprovalHold.created_at.asc())
+        .limit(limit + 1)
+    )
+    rows = (await session.execute(stmt)).all()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    holds: list[dict[str, Any]] = []
+    for hold, sender in rows:
+        _maybe_expire_hold(session, owner_sub, hold)
+        if hold.status != "pending_human":
+            continue
+        entry = _hold_dict(hold)
+        entry["sender_agent_id"] = str(sender.id)
+        entry["sender_display_name"] = sender.display_name
+        entry["message_type"] = hold.message_type
+        entry["payload"] = hold.payload
+        holds.append(entry)
+    await session.commit()
+    return {"holds": holds, "has_more": has_more}
+
+
+async def decide_hold(
+    session: AsyncSession,
+    *,
+    approver_sub: str,
+    hold_id: uuid.UUID,
+    decision: str,
+    reason: str | None,
+) -> dict[str, Any]:
+    """``POST /approvals/{hold_id}/decide`` (main.py, non-MCP,
+    interactive+owner-gated). ``decision`` is ``"approve"`` or ``"reject"``.
+
+    Raises ``AccessDeniedError`` (uniform, ``denied.unknown_hold`` /
+    ``denied.hold_not_owner``) if the hold doesn't exist or the caller's
+    verified sub doesn't match the sender agent's frozen ``owner_sub``;
+    ``HoldExpiredError`` if lazy expiry fires on this touch;
+    ``HoldAwaitingAutoReviewError`` if the hold is still ``pending_auto``
+    (unreachable in v1, specified for a future async auto-approver);
+    ``HoldAlreadyDecidedError`` if it's already ``approved``/``rejected``/
+    ``auto_approved``. Approve additionally raises
+    ``InvalidConversationStateError`` (audited ``denied.bad_state``) if the
+    conversation is no longer ``active`` -- the hold stays ``pending_human``
+    in that case (the human can still reject with a reason).
+
+    The risk scorer is deliberately NOT re-run here — the human decision
+    IS the override. Approve DOES re-run the ``accepted_types`` capability
+    gate against currently-active participants (closing the gap where a
+    participant added after the hold was created never had a chance to
+    reject the type).
+    """
+    hold = await _find_hold(session, hold_id)
+    if hold is None:
+        await _deny(
+            session,
+            actor_sub=approver_sub,
+            action="denied.unknown_hold",
+            detail={"attempted_hold_id": str(hold_id)},
+        )
+    sender = await _find_agent_by_id(session, hold.sender_agent_id)
+    if sender is None or sender.owner_sub != approver_sub:
+        await _deny(
+            session,
+            actor_sub=approver_sub,
+            action="denied.hold_not_owner",
+            conversation_id=hold.conversation_id,
+            detail={"attempted_hold_id": str(hold_id)},
+        )
+    _maybe_expire_hold(session, approver_sub, hold)
+    if hold.status == "expired":
+        await session.commit()
+        raise HoldExpiredError
+    if hold.status == "pending_auto":
+        await session.commit()
+        raise HoldAwaitingAutoReviewError
+    if hold.status != "pending_human":
+        await session.commit()
+        raise HoldAlreadyDecidedError(hold.status)
+
+    if decision == "reject":
+        hold.status = "rejected"
+        hold.decided_by_sub = approver_sub
+        hold.decided_at = _now()
+        hold.decision_reason = reason
+        _audit(
+            session,
+            actor_sub=approver_sub,
+            action="approval.reject",
+            agent_id=hold.sender_agent_id,
+            conversation_id=hold.conversation_id,
+            detail={"hold_id": str(hold_id), "has_reason": reason is not None},
+        )
+        await session.commit()
+        return _hold_dict(hold)
+
+    conversation = await _find_conversation(session, hold.conversation_id, for_update=True)
+    if conversation is None:
+        raise RuntimeError(f"invariant violation: hold {hold_id} references a missing conversation")
+    _maybe_expire(session, approver_sub, conversation)
+    if conversation.state != "active":
+        await _deny_bad_state(
+            session,
+            actor_sub=approver_sub,
+            agent_id=hold.sender_agent_id,
+            conversation_id=conversation.id,
+            current_state=conversation.state,
+            message_type=hold.message_type,
+        )
+
+    rows = (
+        await session.execute(
+            select(Participant.agent_id, Agent.accepted_types)
+            .join(Agent, Agent.id == Participant.agent_id)
+            .where(
+                Participant.conversation_id == conversation.id,
+                Participant.agent_id != hold.sender_agent_id,
+                Participant.status == "active",
+            )
+        )
+    ).all()
+    await _enforce_message_type_accepted(
+        session,
+        actor_sub=approver_sub,
+        sender_agent_id=hold.sender_agent_id,
+        conversation_id=conversation.id,
+        other_agents=[(agent_id, accepted) for agent_id, accepted in rows],
+        message_type=hold.message_type,
+    )
+
+    message, next_seq = await _insert_message_for_hold(
+        session, conversation=conversation, hold=hold
+    )
+    hold.status = "approved"
+    hold.decided_by_sub = approver_sub
+    hold.decided_at = _now()
+    hold.decision_reason = reason
+    _audit(
+        session,
+        actor_sub=approver_sub,
+        action="approval.approve",
+        agent_id=hold.sender_agent_id,
+        conversation_id=conversation.id,
+        message_id=message.id,
+        detail={"hold_id": str(hold_id), "has_reason": reason is not None},
+    )
+    _audit(
+        session,
+        actor_sub=approver_sub,
+        action="message.post",
+        agent_id=hold.sender_agent_id,
+        conversation_id=conversation.id,
+        message_id=message.id,
+        detail={"seq": next_seq, "message_type": hold.message_type, "hold_id": str(hold_id)},
+    )
+    new_state = resulting_conversation_state(hold.message_type)
+    if new_state is not None:
+        conversation.state = new_state
+        _audit(
+            session,
+            actor_sub=approver_sub,
+            action="conversation.close",
+            agent_id=hold.sender_agent_id,
+            conversation_id=conversation.id,
+            detail={"new_state": new_state, "via": hold.message_type},
+        )
+    await session.commit()
+    return _hold_dict(hold)
+
+
 async def post_message(
     session: AsyncSession,
     *,
@@ -2459,8 +3145,10 @@ async def post_message(
     payload: dict[str, Any],
     ownership_client: OwnershipClient,
     risk_scorer: RiskScorer,
+    auto_approver: AutoApprover,
+    notifier: ApprovalNotifier,
     schema_version: int = 1,
-) -> Message:
+) -> Message | ApprovalHold:
     """Append a schema-validated message; apply state-machine side effects.
 
     Requires ``sender_agent_id`` to be a board-active agent (uniform denial
@@ -2503,7 +3191,7 @@ async def post_message(
     validation, or if a ``needs_clarification``'s ``about_seq`` does not
     reference an existing prior message.
     """
-    await _require_active_agent(session, actor_sub=actor_sub, agent_id=sender_agent_id)
+    sender = await _require_active_agent(session, actor_sub=actor_sub, agent_id=sender_agent_id)
     conversation, participant = await _load_participant_for_transition(
         session,
         actor_sub=actor_sub,
@@ -2511,6 +3199,17 @@ async def post_message(
         conversation_id=conversation_id,
         required_status="active",
         for_update=True,
+    )
+
+    # An agent may never post the service-synthesized marker type directly
+    # (TECH-5389 PR2 §6) -- checked early, before rate limits, so forging
+    # an attempt doesn't consume rate-limit budget.
+    await _deny_if_system_message_type(
+        session,
+        actor_sub=actor_sub,
+        agent_id=sender_agent_id,
+        conversation_id=conversation.id,
+        message_type=message_type,
     )
 
     await _enforce_message_rate_limit(
@@ -2555,7 +3254,7 @@ async def post_message(
     # schema_version) pair must go through _deny_bad_schema's audit trail
     # above, not reach the risk scorer at all -- DESIGN.md §8's "every
     # denial is audited" invariant.
-    await _check_boundary_crossing(
+    risk_reason = await _check_boundary_crossing(
         session,
         actor_sub=actor_sub,
         sender_agent_id=sender_agent_id,
@@ -2565,6 +3264,34 @@ async def post_message(
         ownership_client=ownership_client,
         risk_scorer=risk_scorer,
     )
+
+    if risk_reason is not None:
+        # Divert-not-deny (TECH-5389 PR2): a genuine high-risk verdict no
+        # longer denies -- it is held for approval instead. The hold-
+        # creation rate limit was never part of the divert-don't-deny
+        # reversal, so it's still enforced here, before the hold itself
+        # is created.
+        await _deny_rate_limited_holds(
+            session, actor_sub=actor_sub, sender_agent_id=sender_agent_id
+        )
+        result = await _divert_high_risk_message(
+            session,
+            actor_sub=actor_sub,
+            conversation=conversation,
+            sender_agent_id=sender_agent_id,
+            message_type=message_type,
+            schema_version=schema_version,
+            payload=validated,
+            risk_reason=risk_reason,
+            risk_scorer=risk_scorer,
+            auto_approver=auto_approver,
+        )
+        await session.commit()
+        if isinstance(result, ApprovalHold):
+            await _fire_approval_notifier(
+                session, hold=result, conversation=conversation, sender=sender, notifier=notifier
+            )
+        return result
 
     next_seq = (
         await session.execute(
@@ -3017,21 +3744,27 @@ def may_assign(creator_owners: AbstractSet[str], assignee_owners: AbstractSet[st
 
 
 __all__ = [
+    "APPROVAL_HOLD_TTL",
     "CONVERSATION_TTL",
+    "MAX_APPROVAL_HOLDS_PER_HOUR",
     "MAX_CONVERSATION_STARTS_PER_HOUR",
     "MAX_LOOKUP_EMAIL_LENGTH",
     "MAX_MESSAGES_PER_CONVERSATION_PER_HOUR",
     "AgentTableOwnershipClient",
     "OwnershipClient",
     "accept_invite",
+    "audit_denied_approval_requires_interactive",
+    "decide_hold",
     "decline_invite",
     "get_agent_by_sub",
     "get_conversation",
+    "get_hold_status",
     "inbox",
     "invite",
     "leave",
     "list_agents",
     "list_conversations",
+    "list_pending_approval_holds",
     "lookup_agent_by_email",
     "may_assign",
     "may_invite",

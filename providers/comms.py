@@ -56,7 +56,7 @@ from exceptions import (
     UnknownConversationTypeError,
 )
 from identity import try_resolve_email
-from models import CONVERSATION_STATES, PARTICIPANT_ROLES, Agent
+from models import CONVERSATION_STATES, PARTICIPANT_ROLES, Agent, ApprovalHold
 from schemas import (
     CONVERSATION_TYPES,
     MAX_AGENT_KEY_LENGTH,
@@ -611,6 +611,16 @@ async def start_conversation(
       supported range, the call is refused entirely (no
       conversation/message is created). ``comms_invite`` re-checks any
       later-added participant against this same pinned version.
+
+    If the opening ``message_type``/``initial_message`` would cross an
+    ownership boundary (e.g. a ``note`` under ``open``), the conversation is
+    still created — with a service-synthesized ``conversation_opened``
+    marker as its seq-1 message — and your actual content is held for
+    human approval instead of denied. The response then additionally has
+    ``held_for_approval: true``, ``hold_id``, ``hold_status``,
+    ``risk_reason``, ``hold_expires_at``, ``hold_created_at``; poll
+    ``comms_get_hold_status`` with ``hold_id`` for the outcome. Once
+    approved, your content posts as seq 2 under its original type.
     """
     token = _require_token()
     base_sub = _require_identity(token)
@@ -651,12 +661,14 @@ async def start_conversation(
                 initial_message=initial_message,
                 ownership_client=service.AgentTableOwnershipClient(session),
                 risk_scorer=plugins.get_risk_scorer(),
+                auto_approver=plugins.get_auto_approver(),
+                notifier=plugins.get_approval_notifier(),
                 message_type=message_type,
                 expires_at=expires_dt,
                 schema_version=schema_version,
             )
 
-    return {
+    result: dict[str, Any] = {
         "conversation_id": str(conversation.id),
         "type": conversation.type,
         "state": conversation.state,
@@ -670,6 +682,20 @@ async def start_conversation(
         # necessarily the caller-supplied `schema_version` above.
         "schema_version": conversation.negotiated_schema_version,  # type: ignore[attr-defined]
     }
+    # Diverted opener (TECH-5389 PR2 §6): the conversation was created with
+    # a `conversation_opened` seq-1 marker in the initiator's place, and the
+    # actual opening content is held for approval -- see
+    # `service.start_conversation`'s transient `conversation.pending_hold`
+    # attribute (mirrors `negotiated_schema_version`'s own convention).
+    pending_hold = conversation.pending_hold  # type: ignore[attr-defined]
+    if pending_hold is not None:
+        result["held_for_approval"] = True
+        result["hold_id"] = str(pending_hold.id)
+        result["hold_status"] = pending_hold.status
+        result["risk_reason"] = pending_hold.risk_reason
+        result["hold_expires_at"] = _iso(pending_hold.expires_at)
+        result["hold_created_at"] = _iso(pending_hold.created_at)
+    return result
 
 
 @comms_server.tool
@@ -700,9 +726,13 @@ async def post_message(
       May cancel the conversation if all members have declined.
     - ``needs_clarification``: ``about_seq`` (int ≥ 1, references a prior
       message seq).
-    - ``note``: ``text`` (str 1-4000 chars). Boundary-restricted: allowed
-      only in ``internal`` conversations, or in ``asymmetric`` conversations
-      where the sender owns the conversation. Never allowed under ``open``.
+    - ``note``: ``text`` (str 1-4000 chars). Boundary-sensitive: posts
+      immediately in ``internal`` conversations, or in ``asymmetric``
+      conversations where it doesn't cross an ownership boundary for the
+      sender. Where it WOULD cross a boundary (including always under
+      ``open``), it is held for human approval instead of denied — the
+      response has ``held_for_approval: true`` (no ``seq``); poll
+      ``comms_get_hold_status`` with the returned ``hold_id``.
     - ``task_assign``: ``action`` enum:
       gather_availability/schedule_meeting/reschedule_meeting/cancel_meeting/
       confirm_slot/report_status. ``gather_availability``,
@@ -719,6 +749,19 @@ async def post_message(
       (no_longer_needed/unable_to_complete/expired/other).
 
     ``schema_version``: only ``1`` exists today.
+
+    Two response shapes (check ``held_for_approval`` — this is a distinct
+    shape, not an error):
+
+    - Not high-risk (the common case): posted-message shape, unchanged --
+      ``conversation_id``, ``seq``, ``type``, ``schema_version``,
+      ``payload``, ``created_at``. If a (test-injected or future)
+      auto-approver cleared a high-risk post inline, this same shape gains
+      ``auto_approved: true`` and ``hold_id``.
+    - High-risk, escalated (v1's default outcome for a crossing ``note``):
+      ``{"held_for_approval": true, "hold_id", "conversation_id",
+      "status", "risk_reason", "expires_at", "created_at"}`` — no ``seq``,
+      keep ``hold_id`` and poll ``comms_get_hold_status``.
     """
     token = _require_token()
     base_sub = _require_identity(token)
@@ -729,7 +772,7 @@ async def post_message(
     async with get_session_factory()() as session:
         caller = await _resolve_caller_agent(session, sub)
         async with _map_service_errors():
-            message = await service.post_message(
+            result = await service.post_message(
                 session,
                 actor_sub=sub,
                 sender_agent_id=caller.id,
@@ -738,10 +781,23 @@ async def post_message(
                 payload=payload,
                 ownership_client=service.AgentTableOwnershipClient(session),
                 risk_scorer=plugins.get_risk_scorer(),
+                auto_approver=plugins.get_auto_approver(),
+                notifier=plugins.get_approval_notifier(),
                 schema_version=schema_version,
             )
 
-    return {
+    if isinstance(result, ApprovalHold):
+        return {
+            "held_for_approval": True,
+            "hold_id": str(result.id),
+            "conversation_id": conversation_id,
+            "status": result.status,
+            "risk_reason": result.risk_reason,
+            "expires_at": _iso(result.expires_at),
+            "created_at": _iso(result.created_at),
+        }
+    message = result
+    response: dict[str, Any] = {
         "conversation_id": conversation_id,
         "seq": message.seq,
         "type": message.type,
@@ -749,6 +805,48 @@ async def post_message(
         "payload": message.payload,
         "created_at": _iso(message.created_at),
     }
+    auto_approved_hold_id = getattr(message, "auto_approved_hold_id", None)
+    if auto_approved_hold_id is not None:
+        response["auto_approved"] = True
+        response["hold_id"] = str(auto_approved_hold_id)
+    return response
+
+
+@comms_server.tool
+async def get_hold_status(hold_id: str, agent_key: str | None = None) -> dict[str, Any]:
+    """Poll the status of a message held for human approval.
+
+    Sender-only: the caller's resolved agent must equal the hold's own
+    sender. An unknown ``hold_id`` and someone else's hold both raise the
+    identical uniform ``access_denied`` error (the audit trail alone
+    distinguishes the two causes).
+
+    Returns ``{hold_id, conversation_id, status, risk_reason, created_at,
+    expires_at}`` plus, once decided: ``decided_at``/``decision_reason``
+    (the human's optional free-text why — present on either approval or
+    rejection) and, once posted (``approved``/``auto_approved``),
+    ``message_id``/``message_seq`` so you can correlate with
+    ``comms_get_conversation``. ``status`` is one of ``pending_auto``,
+    ``pending_human``, ``auto_approved``, ``approved``, ``rejected``,
+    ``expired``. There is no push notification for a decision — poll this
+    tool with the ``hold_id`` from a held ``comms_post_message``/
+    ``comms_start_conversation`` response.
+    """
+    token = _require_token()
+    base_sub = _require_identity(token)
+    agent_key = _validate_agent_key(agent_key)
+    sub = _compose_sub(base_sub, agent_key)
+    hold_uuid = _parse_uuid("hold_id", hold_id)
+
+    async with get_session_factory()() as session:
+        caller = await _resolve_caller_agent(session, sub)
+        async with _map_service_errors():
+            return await service.get_hold_status(
+                session,
+                actor_sub=sub,
+                caller_agent_id=caller.id,
+                hold_id=hold_uuid,
+            )
 
 
 @comms_server.tool
