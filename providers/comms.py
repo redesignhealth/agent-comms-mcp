@@ -661,7 +661,7 @@ async def start_conversation(
                 conversation_type=conversation_type,
                 target_agent_ids=target_uuids,
                 initial_message=initial_message,
-                ownership_client=service.AgentTableOwnershipClient(session),
+                ownership_client=service.get_ownership_client_factory()(session),
                 risk_scorer=plugins.get_risk_scorer(),
                 auto_approver=plugins.get_auto_approver(),
                 notifier=plugins.get_approval_notifier(),
@@ -789,7 +789,7 @@ async def post_message(
                 conversation_id=conv_id,
                 message_type=message_type,
                 payload=payload,
-                ownership_client=service.AgentTableOwnershipClient(session),
+                ownership_client=service.get_ownership_client_factory()(session),
                 risk_scorer=plugins.get_risk_scorer(),
                 auto_approver=plugins.get_auto_approver(),
                 notifier=plugins.get_approval_notifier(),
@@ -1094,7 +1094,7 @@ async def invite(
                 inviter_agent_id=caller.id,
                 conversation_id=conv_id,
                 target_agent_id=target_id,
-                ownership_client=service.AgentTableOwnershipClient(session),
+                ownership_client=service.get_ownership_client_factory()(session),
             )
 
     return {

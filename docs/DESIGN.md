@@ -537,6 +537,26 @@ every other startup-time configuration knob in this codebase.
 `approval_holds_per_hour` rate limit (10, per sender) are code constants, not
 env-configurable, matching every other rate limit/TTL in this codebase.
 
+**A fourth seam, `OWNERSHIP_CLIENT`** (default `agent_table`), resolves the same way
+but lives in `service.py`, not `plugins.py` (its registry needs `service.py`'s own
+`AgentTableOwnershipClient`/`OwnershipClient` types, and `plugins.py` must stay
+import-free of `service.py` to avoid a cycle) — validated separately at boot via
+`service.validate_ownership_client_configuration()`, called from `main._cli()`
+alongside `plugins.validate_configuration()`. Structurally different from the other
+three: `OwnershipClient` implementations need the CURRENT request's session (the
+default reads the same-transaction `agents` row), so this seam resolves a *factory*
+(`Callable[[AsyncSession], OwnershipClient]`) once at startup, then calls it fresh
+with the current session on every use — rather than resolving one reusable instance
+like the other three seams do. A live-resolving plugin (e.g. TECH-5397's ownership
+registry) ignores the session argument and returns its own already-constructed
+instance. Pointing this at the same source an `AGENT_TOKEN_VERIFIERS` plugin already
+resolves `owner_sub` from closes the gap where a re-minted/reassigned owner fixes
+approval *routing* immediately (the hold's `owner_sub` snapshot reads the live claim)
+but boundary *scoring* keeps reading the frozen `agents.owner_sub` column until this
+seam is configured to match — see the `owner_sub` provenance discussion below and
+`docs/TECH-5389-APPROVAL-PIPELINE.md` §15.4-adjacent discussion of TECH-5396 open
+question 1.
+
 **`owner_sub` provenance — accepted risk, partially resolved by the
 snapshot design.** Every high-risk post now depends on the decide
 endpoint's `owner_sub` match, so this pre-existing trust-model gap matters

@@ -496,6 +496,10 @@ def _cli() -> None:
     # (plugins.py): an unknown RISK_SCORER name or a bad import path must
     # crash at boot, not lazily on the first high-risk message.
     validate_plugin_configuration()
+    # Same posture for the OwnershipClient seam (TECH-5396 open question 1) --
+    # lives in service.py, not plugins.py, since AgentTableOwnershipClient's
+    # registry entry needs service.py's own types.
+    service.validate_ownership_client_configuration()
 
     # Bind loopback by default; docker-compose overrides MCP_HOST=0.0.0.0
     # to reach the port mapping from the host.

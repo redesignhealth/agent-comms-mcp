@@ -143,7 +143,7 @@ import asyncio
 import itertools
 import logging
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from collections.abc import Set as AbstractSet
 from datetime import UTC, datetime, timedelta
 from typing import Any, NoReturn, Protocol
@@ -170,6 +170,7 @@ from plugins import (
     MessageRiskContext,
     RiskScorer,
     RiskScoringInfraError,
+    resolve_plugin,
 )
 from plugins import (
     auto_approver_name as _auto_approver_name,
@@ -3785,6 +3786,64 @@ class AgentTableOwnershipClient:
         if agent is None:
             raise LookupError(f"unknown agent {agent_id}")
         return {"is_shared": agent.is_shared, "owners": [agent.owner_sub]}
+
+
+# --- Ownership client seam (TECH-5396 open question 1) ------------------------
+
+OWNERSHIP_CLIENT_ENV_VAR = "OWNERSHIP_CLIENT"
+DEFAULT_OWNERSHIP_CLIENT = "agent_table"
+
+# A factory takes the CURRENT request's session and returns an OwnershipClient --
+# unlike plugins.py's other three seams (RiskScorer/AutoApprover/ApprovalNotifier),
+# which are stateless and resolved once for the process's lifetime, the default
+# OwnershipClient implementation needs a same-transaction DB read on every call (see
+# AgentTableOwnershipClient's own docstring on why session lifetime matters). A
+# live-resolving plugin (e.g. an HTTP-backed registry client) simply ignores the
+# session argument and returns its own already-constructed, reusable instance.
+OwnershipClientFactory = Callable[[AsyncSession], "OwnershipClient"]
+
+
+def _agent_table_ownership_client_factory() -> OwnershipClientFactory:
+    return AgentTableOwnershipClient
+
+
+OWNERSHIP_CLIENTS: dict[str, Callable[[], OwnershipClientFactory]] = {
+    DEFAULT_OWNERSHIP_CLIENT: _agent_table_ownership_client_factory,
+}
+
+_ownership_client_factory: OwnershipClientFactory | None = None
+
+
+def get_ownership_client_factory() -> OwnershipClientFactory:
+    """Return the process-wide configured ``OwnershipClientFactory``, resolving it
+    on first use (mirrors ``plugins.get_risk_scorer``'s lazy-singleton pattern). A
+    resolution failure is not cached -- the next call retries against the same
+    (still-broken) configuration.
+
+    Call the returned factory with the current request's session on every use:
+    ``get_ownership_client_factory()(session)``. Resolved via ``OWNERSHIP_CLIENT``
+    (registry name or ``pkg.module:factory`` import path, same convention as every
+    other pluggable seam), default ``agent_table`` (``AgentTableOwnershipClient``,
+    reading the frozen ``agents.owner_sub`` column). A live-resolving consumer (e.g.
+    TECH-5397's ownership registry) can point this at the SAME source its
+    ``AGENT_TOKEN_VERIFIERS`` plugin already resolves ``owner_sub`` from, closing the
+    gap where a re-minted/reassigned owner fixes approval *routing* immediately but
+    boundary *scoring* keeps reading the frozen column until this seam is configured.
+    """
+    global _ownership_client_factory
+    if _ownership_client_factory is None:
+        _ownership_client_factory = resolve_plugin(
+            OWNERSHIP_CLIENT_ENV_VAR, OWNERSHIP_CLIENTS, DEFAULT_OWNERSHIP_CLIENT
+        )
+    return _ownership_client_factory
+
+
+def validate_ownership_client_configuration() -> None:
+    """Fail fast at process start if ``OWNERSHIP_CLIENT`` doesn't resolve -- same
+    posture as ``plugins.validate_configuration``'s three seams, called separately
+    from ``main._cli()`` because this seam's registry lives here, not in
+    ``plugins.py`` (which must stay import-free of ``service.py``)."""
+    get_ownership_client_factory()
 
 
 def may_assign(creator_owners: AbstractSet[str], assignee_owners: AbstractSet[str]) -> bool:

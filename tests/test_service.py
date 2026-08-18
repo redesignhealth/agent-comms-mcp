@@ -4949,3 +4949,82 @@ class TestListConversations:
 
         all_ids = {c["conversation_id"] for c in page1["conversations"] + page2["conversations"]}
         assert len(all_ids) == 3
+
+
+# --- OwnershipClient pluggable seam (TECH-5396 open question 1) -------------------
+
+
+class _FakeLiveOwnershipClient:
+    """Stand-in for a live-resolving OwnershipClient plugin (e.g. TECH-5397's
+    ownership registry) -- stateless and reusable, ignores any session
+    argument, matching the shape a real HTTP-backed implementation would have."""
+
+    async def get_agent_owners(self, agent_id: uuid.UUID) -> dict[str, Any]:
+        return {"is_shared": False, "owners": ["live-resolved@example.com"]}
+
+
+def _fake_live_ownership_client_factory() -> _service.OwnershipClientFactory:
+    instance = _FakeLiveOwnershipClient()
+    return lambda session: instance
+
+
+class TestOwnershipClientRegistry:
+    def test_default_registry_contains_agent_table(self) -> None:
+        assert (
+            _service.OWNERSHIP_CLIENTS[_service.DEFAULT_OWNERSHIP_CLIENT]
+            is _service._agent_table_ownership_client_factory
+        )
+
+
+class TestGetOwnershipClientFactoryAndValidateConfiguration:
+    def setup_method(self) -> None:
+        _service._ownership_client_factory = None
+
+    def teardown_method(self) -> None:
+        _service._ownership_client_factory = None
+
+    def test_defaults_to_agent_table_ownership_client(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(_service.OWNERSHIP_CLIENT_ENV_VAR, raising=False)
+        factory = _service.get_ownership_client_factory()
+        assert factory is AgentTableOwnershipClient
+
+    def test_caches_the_resolved_factory(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv(_service.OWNERSHIP_CLIENT_ENV_VAR, raising=False)
+        first = _service.get_ownership_client_factory()
+        second = _service.get_ownership_client_factory()
+        assert first is second
+
+    def test_validate_configuration_passes_for_the_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(_service.OWNERSHIP_CLIENT_ENV_VAR, raising=False)
+        _service.validate_ownership_client_configuration()  # must not raise
+
+    def test_validate_configuration_fails_fast_on_unknown_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(_service.OWNERSHIP_CLIENT_ENV_VAR, "not_a_real_client")
+        with pytest.raises(RuntimeError, match="unknown plugin"):
+            _service.validate_ownership_client_configuration()
+
+    def test_validate_configuration_fails_fast_on_bad_import_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(_service.OWNERSHIP_CLIENT_ENV_VAR, "not_a_real_module:Whatever")
+        with pytest.raises(RuntimeError, match="failed to import plugin"):
+            _service.validate_ownership_client_configuration()
+
+    async def test_import_path_plugin_resolves_and_is_used(
+        self, monkeypatch: pytest.MonkeyPatch, session: AsyncSession
+    ) -> None:
+        monkeypatch.setenv(
+            _service.OWNERSHIP_CLIENT_ENV_VAR,
+            "tests.test_service:_fake_live_ownership_client_factory",
+        )
+        factory = _service.get_ownership_client_factory()
+        client = factory(session)
+        owner = await _register(session, "live-ownership-agent")
+        result = await client.get_agent_owners(owner.id)
+        assert result == {"is_shared": False, "owners": ["live-resolved@example.com"]}
