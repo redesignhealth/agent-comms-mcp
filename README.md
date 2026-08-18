@@ -201,6 +201,27 @@ docker compose up --build
 `entrypoint.sh` runs `alembic upgrade head` automatically on every container
 start, so migrations apply before the server accepts traffic.
 
+### Minting agent-jwt tokens
+
+`agent-comms-mcp-mint-token` (installed alongside the other console
+scripts) mints agent-jwt Bearer tokens against `AGENT_JWT_SECRET`:
+
+```bash
+# Human-owned agent
+agent-comms-mcp-mint-token --sub ea-agent-svc --scopes "comms:read comms:write" \
+  --owner-email alice@example.com
+
+# Self-owned agent (no human principal)
+agent-comms-mcp-mint-token --sub notifier-bot --scopes comms:write --self-owned
+```
+
+`--owner-email`/`--self-owned` are mutually exclusive and one is required:
+skipping this choice is exactly how an agent silently becomes self-owned
+instead of human-owned, which later makes anything requiring that human's
+approval permanently unsatisfiable. See
+[docs/TECH-5389-APPROVAL-PIPELINE.md](docs/TECH-5389-APPROVAL-PIPELINE.md)
+§15 for the full rationale.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

@@ -425,12 +425,14 @@ class TestRegister:
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
         """An agent-jwt (agent) token's ``email`` claim is caller-supplied and
-        unverified (the JWT issuer CLI accepts arbitrary extra
-        claims) — it must never be trusted as ``owner_email``, even when
-        present. This is the negative case the existing "no email claim at
-        all" tests don't cover: here the token DOES carry an ``email``
-        claim, and it must still be ignored in favor of the sub-derived
-        self-owned fallback."""
+        unverified — it must never be trusted as ``owner_email``, even when
+        present. ``mint_token``'s CLI never sets an ``email`` claim (it only
+        ever sets ``owner_sub``, deliberately, via ``--owner-email``), so
+        this scenario models a hand-crafted token bypassing that CLI. This
+        is the negative case the existing "no email claim at all" tests
+        don't cover: here the token DOES carry an ``email`` claim, and it
+        must still be ignored in favor of the sub-derived self-owned
+        fallback."""
         token = _token("agent-forged-email")
         token.claims["email"] = "forged@attacker.com"
 

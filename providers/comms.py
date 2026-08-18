@@ -386,10 +386,14 @@ async def register(
       identity to ``sub`` and never trusts ``email``/``preferred_username``).
       Do not "harmonize" these two checks into one shared helper on the
       assumption that they encode the same rule — an agent-jwt (agent)
-      token's extra claims are caller-supplied and unverified (the
-      JWT issuer CLI accepts arbitrary ``--sub`` and extra claims),
-      so ``email`` must never be trusted as an ``owner_email`` fallback for
-      those tokens, regardless of which check is used to detect them.
+      token's claims are caller-supplied and unverified from this server's
+      point of view (``mint_token``'s CLI, console script
+      ``agent-comms-mcp-mint-token``, only ever sets ``owner_sub``
+      deliberately via its ``--owner-email``/``--self-owned`` choice, and
+      never touches ``email``, but a hand-crafted token bypassing that CLI
+      could still carry one), so ``email`` must never be trusted as an
+      ``owner_email`` fallback for those tokens, regardless of which check
+      is used to detect them.
     - ``is_shared``: set ``True`` if this agent spans ownership boundaries
       (e.g. a shared bot that serves multiple users). Frozen at first
       registration — re-registering with a different value has no effect.
