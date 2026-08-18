@@ -126,6 +126,49 @@ class TestMalformedInput:
                 ],
             )
 
+    def test_unknown_scope_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        with pytest.raises(SystemExit):
+            _run_cli(
+                monkeypatch,
+                ["--sub", "agent-x", "--scopes", "not:a:real:scope", "--self-owned"],
+            )
+
+    @pytest.mark.parametrize("expires", [0, -1, 90 * 24 * 60 * 60 + 1])
+    def test_out_of_bounds_expires_rejected(
+        self, monkeypatch: pytest.MonkeyPatch, expires: int
+    ) -> None:
+        with pytest.raises(SystemExit):
+            _run_cli(
+                monkeypatch,
+                [
+                    "--sub",
+                    "agent-x",
+                    "--scopes",
+                    "comms:read",
+                    "--self-owned",
+                    "--expires",
+                    str(expires),
+                ],
+            )
+
+    def test_max_expires_is_accepted(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _run_cli(
+            monkeypatch,
+            [
+                "--sub",
+                "agent-x",
+                "--scopes",
+                "comms:read",
+                "--self-owned",
+                "--expires",
+                str(90 * 24 * 60 * 60),
+            ],
+        )
+        token = capsys.readouterr().out.strip()
+        assert "\n" not in token
+
 
 class TestMissingSecret:
     def test_agent_jwt_secret_unset_fails_fast(self, monkeypatch: pytest.MonkeyPatch) -> None:

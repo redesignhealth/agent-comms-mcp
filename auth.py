@@ -50,6 +50,7 @@ import hashlib
 import json
 import logging
 import os
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -368,14 +369,45 @@ def _normalized_claims_violation(claims: dict[str, Any]) -> str | None:
     if claims.get("iss") != AGENT_JWT_ISSUER:
         return "iss"
     sub = claims.get("sub")
-    if sub is None or not str(sub).strip():
+    if sub is None or not isinstance(sub, str) or not sub.strip():
         return "sub_missing"
     try:
         validate_sub_shape(claims)
     except ToolError:
         return "sub_shape"
-    if not isinstance(claims.get("scopes"), list):
+    scopes = claims.get("scopes")
+    if not isinstance(scopes, list) or not all(isinstance(s, str) for s in scopes):
         return "scopes"
+    return None
+
+
+def _expiry_violation(expires_at: int | None, claims: dict[str, Any]) -> str | None:
+    """Return a short violation message if the token is expired or not yet
+    valid, else ``None``.
+
+    Neither ``AccessToken.expires_at`` nor an ``exp``/``nbf`` claim is
+    required to be present (an honest verifier may rely on a different
+    revocation mechanism) -- but WHEN present, this adapter enforces it
+    independently rather than trusting a configured plugin verifier to have
+    checked it correctly. Bounds an honest-but-buggy plugin the same way
+    ``_normalized_claims_violation`` bounds one that returns a malformed
+    ``iss``/``sub``/``scopes`` shape.
+    """
+    now = time.time()
+    if expires_at is not None and expires_at <= now:
+        return f"expires_at={expires_at} is in the past"
+    for claim_name, past_is_bad in (("exp", True), ("nbf", False)):
+        value = claims.get(claim_name)
+        if value is None:
+            continue
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return f"{claim_name} claim is not a valid timestamp"
+        if past_is_bad and value <= now:
+            return f"{claim_name} claim {value} is in the past"
+        if not past_is_bad and value > now:
+            return f"{claim_name} claim {value} is in the future"
     return None
 
 
@@ -412,13 +444,22 @@ class _NormalizingVerifier(TokenVerifier):
         result = await self._inner.verify_token(token)
         if result is None:
             return None
-        violation = _normalized_claims_violation(result.claims or {})
+        claims = result.claims or {}
+        violation = _normalized_claims_violation(claims)
         if violation is not None:
             logger.warning(
                 "Rejecting token from agent-token verifier %r: claims violate "
                 "the normalized-claims contract (%s)",
                 self._plugin_name,
                 violation,
+            )
+            return None
+        expiry_violation = _expiry_violation(result.expires_at, claims)
+        if expiry_violation is not None:
+            logger.warning(
+                "Rejecting token from agent-token verifier %r: %s",
+                self._plugin_name,
+                expiry_violation,
             )
             return None
         return result

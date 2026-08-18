@@ -4020,6 +4020,62 @@ class TestRateLimits:
         assert len(holds) == MAX_APPROVAL_HOLDS_PER_HOUR
 
 
+# --- list_pending_approval_holds ---------------------------------------------------
+
+
+class TestListPendingApprovalHolds:
+    async def test_all_expired_page_reports_has_more_false(self, session: AsyncSession) -> None:
+        """Argus round-1 BLOCKING catch, regression coverage (round-2 SUGGESTION):
+        has_more is computed from the raw fetched-row count BEFORE lazy expiry runs.
+        If every fetched row expires during that pass, the naive count would leave
+        {"holds": [], "has_more": True} -- and this API has no cursor/offset, so
+        that combination would trap a polling client into retrying forever for a
+        "next page" that doesn't exist."""
+        owner = await _register(session, "lp-owner-1")
+        target = await _register(session, "lp-target-1")
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        # Two holds, then fetch with limit=1 so the raw query overfetches
+        # (limit + 1 = 2 rows) exactly like the real has_more computation does.
+        for _ in range(2):
+            await post_message(
+                session,
+                actor_sub=owner.sub,
+                sender_agent_id=owner.id,
+                conversation_id=conversation.id,
+                message_type="note",
+                payload={"text": "hello"},
+            )
+        holds = (
+            (
+                await session.execute(
+                    select(ApprovalHold).where(ApprovalHold.sender_agent_id == owner.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(holds) == 2
+        for hold in holds:
+            hold.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+
+        result = await _service.list_pending_approval_holds(
+            session, owner_sub=owner.owner_sub, limit=1
+        )
+
+        assert result == {"holds": [], "has_more": False}
+
+
 # --- expiry -----------------------------------------------------------------------
 
 

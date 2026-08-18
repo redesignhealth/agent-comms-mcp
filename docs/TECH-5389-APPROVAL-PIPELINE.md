@@ -6,14 +6,22 @@ interactive-only decide gate), and the companion agent-token-verification seam
 (TECH-5396) have all landed on this branch (PR #14). Only the items in §17 remain
 genuinely open. DESIGN.md's §13-listed changes have been applied.
 
-Revision (2026-08-17, later — pluggable auth verification): PR 1 (the risk-scorer seam in
-`plugins.py`) and the `mint_token.py` CLI have since landed on this branch. §15 is
-rewritten from an accepted risk into a resolved design: agent-token *verification*
-becomes a pluggable auth-layer seam (same mechanism as §1, tracked as a **companion
-ticket**, not TECH-5389), and the decide surface gains two verifier-agnostic hardenings
-that DO land in TECH-5389 PR 2 — an `owner_sub` hold-time snapshot and a structurally
-interactive-only decide gate. Sections touched by this revision: §1, §4, §5, §7,
-§9–§14, §15 (rewritten), §16. Later sections override earlier ones where they conflict.
+Revision history (each entry describes the state AT THE TIME it was written — the
+Status line above is the current, final state; an entry below that describes something
+as "not yet landed" is a superseded historical snapshot, not a live status claim):
+
+- 2026-08-17, pluggable auth verification: at this point only PR 1 (the risk-scorer seam
+  in `plugins.py`) and the `mint_token.py` CLI had landed. §15 was rewritten from an
+  accepted risk into a resolved design: agent-token *verification* becomes a pluggable
+  auth-layer seam (same mechanism as §1, tracked as a **companion ticket**, not
+  TECH-5389), and the decide surface was designed to gain two verifier-agnostic
+  hardenings in TECH-5389 PR 2 — an `owner_sub` hold-time snapshot and a structurally
+  interactive-only decide gate. Sections touched by this revision: §1, §4, §5, §7,
+  §9–§14, §15 (rewritten), §16.
+- 2026-08-17, later: PR 2 and the companion ticket (TECH-5396) both landed too — see the
+  Status line above, which supersedes this entry's "tracked as a companion ticket, not
+  TECH-5389" framing insofar as that companion ticket is now ALSO done, just not as part
+  of TECH-5389's own PR sequence.
 
 Verified against the current worktree:
 

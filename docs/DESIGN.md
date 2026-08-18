@@ -514,7 +514,22 @@ this repo. All three are validated at process start
 existing `DATABASE_URL` fail-fast check): an unknown name, a bad import path,
 or (for `APPROVAL_NOTIFIER=webhook`) a missing `APPROVAL_WEBHOOK_URL`/
 `APPROVAL_WEBHOOK_SECRET` pair crashes at boot, never lazily on the first
-high-risk message. `APPROVAL_HOLD_TTL` (7 days) and the
+high-risk message.
+
+**Trust model for `pkg.module:factory` import paths (deliberate, not a
+vulnerability):** `resolve_plugin_name` calls `importlib.import_module` on a
+string taken from an environment variable, which is process-startup
+deployment configuration set by whoever operates this service — the same
+trust level as `DATABASE_URL`, `PYTHONPATH`, or the choice of which packages
+to `pip install` in the first place. It is never derived from request input,
+a database row, or any other value an unprivileged caller can influence. An
+operator who can set this service's environment variables can already run
+arbitrary code in this process by other means (editing `PYTHONPATH`,
+replacing an installed package, etc.), so treating an import-path env var as
+a code-execution primitive worth guarding against would be inconsistent with
+every other startup-time configuration knob in this codebase.
+
+`APPROVAL_HOLD_TTL` (7 days) and the
 `approval_holds_per_hour` rate limit (10, per sender) are code constants, not
 env-configurable, matching every other rate limit/TTL in this codebase.
 

@@ -445,6 +445,9 @@ def _access_token(
     sub: object = "test-agent",
     scopes: object = ("comms:read",),
     owner_sub: str | None = None,
+    exp: object = None,
+    nbf: object = None,
+    expires_at: int | None = None,
 ) -> AccessToken:
     """Build an ``AccessToken`` with the given claims (``iss``/``sub`` may be
     omitted entirely by passing ``None`` explicitly for that argument)."""
@@ -457,7 +460,13 @@ def _access_token(
         claims["scopes"] = list(scopes) if isinstance(scopes, (list, tuple)) else scopes
     if owner_sub is not None:
         claims["owner_sub"] = owner_sub
-    return AccessToken(token="tok", client_id="test-agent", scopes=[], claims=claims)
+    if exp is not None:
+        claims["exp"] = exp
+    if nbf is not None:
+        claims["nbf"] = nbf
+    return AccessToken(
+        token="tok", client_id="test-agent", scopes=[], claims=claims, expires_at=expires_at
+    )
 
 
 class _FakeVerifier(TokenVerifier):
@@ -605,6 +614,55 @@ class TestNormalizingVerifierContract:
         verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
 
         assert await verifier.verify_token("whatever") is None
+
+    async def test_rejects_non_string_sub(self) -> None:
+        token = _access_token(iss="agent-jwt", sub=12345, scopes=["comms:read"])
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
+
+        assert await verifier.verify_token("whatever") is None
+
+    async def test_rejects_non_string_scopes_elements(self) -> None:
+        token = _access_token(iss="agent-jwt", sub="good-agent", scopes=[1, 2])
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
+
+        assert await verifier.verify_token("whatever") is None
+
+    async def test_rejects_expired_via_access_token_expires_at(self) -> None:
+        token = _access_token(
+            iss="agent-jwt", sub="good-agent", scopes=["comms:read"], expires_at=1
+        )
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
+
+        assert await verifier.verify_token("whatever") is None
+
+    async def test_rejects_expired_via_exp_claim(self) -> None:
+        token = _access_token(iss="agent-jwt", sub="good-agent", scopes=["comms:read"], exp=1)
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
+
+        assert await verifier.verify_token("whatever") is None
+
+    async def test_rejects_not_yet_valid_via_nbf_claim(self) -> None:
+        far_future = 9999999999
+        token = _access_token(
+            iss="agent-jwt", sub="good-agent", scopes=["comms:read"], nbf=far_future
+        )
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
+
+        assert await verifier.verify_token("whatever") is None
+
+    async def test_accepts_future_exp_and_past_nbf(self) -> None:
+        far_future = 9999999999
+        token = _access_token(
+            iss="agent-jwt",
+            sub="good-agent",
+            scopes=["comms:read"],
+            exp=far_future,
+            nbf=1,
+            expires_at=far_future,
+        )
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
+
+        assert await verifier.verify_token("whatever") is token
 
 
 class TestPluginVerifiedTokenMatchesDefaultDownstream:
