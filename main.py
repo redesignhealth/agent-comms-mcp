@@ -261,8 +261,14 @@ _auth_provider = build_auth_provider()
 # plugin, is EVER consulted for authorization on this surface. `.server` is
 # the exact same OktaOIDCProxy instance MultiAuth itself uses as its first
 # source -- not a second, independently-constructed one.
-assert _auth_provider.server is not None, "build_auth_provider() always sets server=Okta"
-_okta_provider = _auth_provider.server
+_okta_server = _auth_provider.server
+if _okta_server is None:
+    # Not an `assert` (Argus round-1 BLOCKING catch): assertions are
+    # stripped under `python -O`/`-OO`, which would silently boot with
+    # `_okta_provider` unset and fail every approval request at runtime
+    # instead of failing here at startup.
+    raise RuntimeError("build_auth_provider() always sets server=Okta")
+_okta_provider = _okta_server
 
 mcp: FastMCP[Any] = FastMCP(
     "agent-comms-mcp",
@@ -451,6 +457,9 @@ async def decide_approval(request: Request) -> Response:
             )
         except InvalidConversationStateError:
             return JSONResponse({"error": "conversation_not_active"}, status_code=409)
+        except RuntimeError:
+            logger.exception("decide_hold invariant violation for hold_id=%s", hold_id)
+            return JSONResponse({"error": "internal_error"}, status_code=500)
 
     return JSONResponse(result, status_code=200)
 

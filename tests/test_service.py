@@ -53,6 +53,7 @@ from schemas import (
 )
 from service import (
     CONVERSATION_TTL,
+    MAX_APPROVAL_HOLDS_PER_HOUR,
     MAX_CONVERSATION_STARTS_PER_HOUR,
     MAX_CONVERSATION_TTL,
     MAX_MESSAGES_PER_CONVERSATION_PER_HOUR,
@@ -3916,6 +3917,107 @@ class TestRateLimits:
             .all()
         )
         assert conversation_rows == []
+
+    async def test_approval_hold_rate_limit_under_limit_creates_holds(
+        self, session: AsyncSession
+    ) -> None:
+        """MAX_APPROVAL_HOLDS_PER_HOUR (Argus round-1: no coverage existed
+        for this rate limit at all). Every `note` posted into an `open`
+        conversation diverts unconditionally (boundary_crossing), so each
+        call below creates one more approval_holds row for the same
+        sender."""
+        owner = await _register(session, "rl-hold-owner-1")
+        target = await _register(session, "rl-hold-target-1")
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        for _ in range(MAX_APPROVAL_HOLDS_PER_HOUR):
+            result = await post_message(
+                session,
+                actor_sub=owner.sub,
+                sender_agent_id=owner.id,
+                conversation_id=conversation.id,
+                message_type="note",
+                payload={"text": "hello"},
+            )
+            assert isinstance(result, ApprovalHold)
+        holds = (
+            (
+                await session.execute(
+                    select(ApprovalHold).where(ApprovalHold.sender_agent_id == owner.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(holds) == MAX_APPROVAL_HOLDS_PER_HOUR
+
+    async def test_approval_hold_rate_limit_over_limit_denied(
+        self, session: AsyncSession
+    ) -> None:
+        owner = await _register(session, "rl-hold-owner-2")
+        target = await _register(session, "rl-hold-target-2")
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        for _ in range(MAX_APPROVAL_HOLDS_PER_HOUR):
+            await post_message(
+                session,
+                actor_sub=owner.sub,
+                sender_agent_id=owner.id,
+                conversation_id=conversation.id,
+                message_type="note",
+                payload={"text": "hello"},
+            )
+        with pytest.raises(RateLimitExceededError):
+            await post_message(
+                session,
+                actor_sub=owner.sub,
+                sender_agent_id=owner.id,
+                conversation_id=conversation.id,
+                message_type="note",
+                payload={"text": "one too many"},
+            )
+        # The hold-rate-limit denial audits with conversation_id=None (it
+        # counts approval_holds across all of the sender's conversations,
+        # not one) -- query by agent_id, not conversation_id, to see it.
+        agent_actions = (
+            (
+                await session.execute(
+                    select(AuditLog.action).where(AuditLog.agent_id == owner.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert "denied.rate_limited" in agent_actions
+        holds = (
+            (
+                await session.execute(
+                    select(ApprovalHold).where(ApprovalHold.sender_agent_id == owner.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        # The refused call must not have created an (MAX_APPROVAL_HOLDS_PER_HOUR + 1)th hold.
+        assert len(holds) == MAX_APPROVAL_HOLDS_PER_HOUR
 
 
 # --- expiry -----------------------------------------------------------------------

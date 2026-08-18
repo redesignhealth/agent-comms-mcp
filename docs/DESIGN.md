@@ -175,17 +175,21 @@ messages id, conversation_id, seq (UNIQUE per conversation, server-assigned,
 audit_log id (bigint), at, actor_sub, action,
  agent_id/conversation_id/message_id, detail jsonb
  -- every mutation AND every denial
-approval_holds id, conversation_id, sender_agent_id, message_type, schema_version,
- payload jsonb (the held content -- validated, insert-ready),
+approval_holds id, conversation_id, sender_agent_id, owner_sub, message_type,
+ schema_version, payload jsonb (the held content -- validated, insert-ready),
  risk_reason, risk_scorer, status(pending_auto|pending_human|auto_approved|
  approved|rejected|expired), auto_approver, auto_decision(cleared|escalated),
  auto_decided_at, decided_by_sub, decided_at, decision_reason (free text --
  see §9's trust argument), message_id UNIQUE (nullable FK to the resulting
  messages row, either approval kind), expires_at, timestamps
  -- MUTABLE (status flips); a hold exists ONLY because the risk verdict was
- high-risk, so there is no separate `high_risk` boolean, and no `owner_sub`
- snapshot (agents.owner_sub is frozen at first registration, so the live
- join reads the same value a snapshot would)
+ high-risk, so there is no separate `high_risk` boolean. `owner_sub` IS a
+ snapshot -- taken from the sender's verified `owner_sub` claim at hold-
+ creation time (falling back to `agents.owner_sub` when the claim is
+ absent), NOT a live join to the `agents` row: once agent-token
+ verification becomes pluggable, a live-resolving verifier can change what
+ `agents.owner_sub` means between hold-creation and decide-time, so the
+ decide/list paths match against the hold's own snapshot (see §9)
 ```
 
 Design notes:
@@ -309,8 +313,8 @@ scroll-to-load-more use case.
  The decide/list-pending HTTP endpoints (§9) extend this with a hard,
  structural interactive-token-only gate (no agent-jwt scope escape hatch —
  an agent can never approve its own content) plus an exact match against
- the sender agent's frozen `owner_sub`; unknown-hold and not-your-hold are
- a uniform 404, matching this invariant's posture at the HTTP layer.
+ the hold's own `owner_sub` snapshot (§5); unknown-hold and not-your-hold
+ are a uniform 404, matching this invariant's posture at the HTTP layer.
 5. Append-only messages and audit. Every mutation and every denial is audited.
  A third category, bypass/best-effort-observability, also audits privileged
  or fire-and-forget paths that are neither mutations nor denials:
@@ -435,21 +439,30 @@ config, no accidental egress) and `webhook` (HMAC-SHA256-signed POST,
 (e.g. Slack DM + an aggregation UI) is an import-path plugin outside this
 repo. A notifier failure is logged plus an `approval.notify_failed` audit row
 (its own fresh transaction — the main commit already succeeded) and never
-fails, rolls back, or delays the agent's already-returned held response.
+fails or rolls back the request. It IS awaited inline before the tool
+response returns, so it may add up to the webhook timeout (5s) of latency
+to a high-risk send — never a failure, but not latency-free either.
 
 **The decide endpoint — non-MCP, human-only, deliberately with no MCP
 counterpart.** `POST /approvals/{hold_id}/decide` and
 `GET /approvals/pending` are plain Starlette routes (`mcp.custom_route`,
-outside FastMCP's `MultiAuth`, so they self-verify the bearer token against
-the same provider instance) with a hard, structural gate:
-`is_interactive_token(token)` required, with **no scope escape hatch** —
-an agent-jwt token is rejected outright regardless of any scope it carries
+outside FastMCP's `MultiAuth`, so they self-verify the bearer token) with a
+hard, structural gate: the token is verified against `_auth_provider.server`
+(the Okta provider) directly, NOT the combined agent+interactive `MultiAuth`
+chain — the agent-token verifier chain (today's default `JWTVerifier`, or a
+future pluggable verifier) is never consulted for authorization on this
+surface at all, only to attribute the denial audit row on the failure path.
+This is a stronger gate than claim-inspection (`is_interactive_token`, still
+asserted as a belt-and-braces check) with **no scope escape hatch** — an
+agent-jwt token is rejected outright regardless of any scope it carries
 (unlike `providers/comms.py`'s `is_interactive_token(...) or "comms:admin" in
-scopes`), and the approver's verified sub must equal the sender agent's
-frozen `owner_sub`. This structural gate is what makes agent self-approval of
-its own content impossible — not a scope an agent could theoretically be
-granted. Unknown-hold and not-your-hold are a uniform 404 (matching invariant
-4's anti-enumeration posture at the HTTP layer). **The risk scorer is
+scopes`), and the approver's verified sub must equal the hold's own
+`owner_sub` snapshot (§5) — not a live join to the sender agent's `agents`
+row. This structural gate is what makes agent self-approval of its own
+content impossible — not a scope an agent could theoretically be granted, and
+not a claim a misconfigured agent-token verifier could spoof its way past.
+Unknown-hold and not-your-hold are a uniform 404 (matching invariant 4's
+anti-enumeration posture at the HTTP layer). **The risk scorer is
 deliberately NOT re-run at approval** — the human decision IS the override.
 Approve DOES re-run the `accepted_types` capability gate against currently-
 active participants (closing the gap where a participant added after the
@@ -505,18 +518,24 @@ high-risk message. `APPROVAL_HOLD_TTL` (7 days) and the
 `approval_holds_per_hour` rate limit (10, per sender) are code constants, not
 env-configurable, matching every other rate limit/TTL in this codebase.
 
-**`owner_sub` provenance — accepted risk.** Every high-risk post now depends
-on the decide endpoint's `owner_sub` match, so this pre-existing trust-model
-gap matters more than it used to: an agent-jwt-registered agent's
-`owner_sub` is a caller-supplied, unverified extra claim at mint time
-(frozen at first registration, so it can't be re-registered onto a victim
-later, but never independently verified against a real identity provider).
-An agent-jwt agent whose `owner_sub` was minted without that claim falls back
-to the agent-jwt `sub` itself, which `identity.validate_sub_shape` forbids
-from containing `@` — such an agent is **permanently un-approvable** by any
-email-identified Okta human; its high-risk posts hold and then expire. The
-platform-side fix (mint `owner_sub` = the owner's Okta-resolved email) is
-outside this repo's control; accepted per the ticket owner.
+**`owner_sub` provenance — accepted risk, partially resolved by the
+snapshot design.** Every high-risk post now depends on the decide
+endpoint's `owner_sub` match, so this pre-existing trust-model gap matters
+more than it used to: under the default `agent_jwt_hs256` verifier, an
+agent-jwt-registered agent's `owner_sub` claim is caller-supplied and
+unverified at mint time (protected only by possession of `AGENT_JWT_SECRET`
+— the same trust boundary as minting the agent's identity itself). Because
+`approval_holds.owner_sub` is snapshotted from the claim on the request
+that created each hold (§5), rather than frozen once at registration,
+re-minting an agent's token with the correct `--owner-email` fixes routing
+for all **future** holds — the un-approvable state is mint-fixable, not
+permanent. An agent-jwt agent whose token carries no `owner_sub` claim at
+all falls back to the agent-jwt `sub` itself, which `identity.validate_sub_shape`
+forbids from containing `@` — such an agent remains un-approvable by any
+email-identified Okta human until re-minted with an explicit owner. A
+consumer running a live-resolving `AGENT_TOKEN_VERIFIERS` plugin (TECH-5396)
+sidesteps mint-time provenance entirely — see that section above and
+`docs/TECH-5389-APPROVAL-PIPELINE.md` §15 for the full design.
 
 ### Configuration: pluggable agent-token verification (`AGENT_TOKEN_VERIFIERS`) [TECH-5396]
 

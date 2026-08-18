@@ -9,8 +9,9 @@ The owner-identity choice (``--owner-email`` vs ``--self-owned``) is
 mandatory and mutually exclusive: skipping it is exactly how an agent that's
 supposed to be human-owned silently becomes self-owned instead (see
 ``providers.comms.register``'s ``owner_sub`` fallback), which later makes
-anything requiring that human's approval permanently unsatisfiable. Forcing
-an explicit choice here catches the mistake at mint time instead.
+anything requiring that human's approval unsatisfiable until re-minted with
+the correct owner. Forcing an explicit choice here catches the mistake at
+mint time instead.
 
 Prints ONLY the token to stdout (so this composes in shell pipelines); a
 human-readable confirmation goes to stderr.
@@ -27,16 +28,36 @@ import jwt
 
 from auth import require_env
 from identity import AGENT_JWT_ISSUER, validate_sub_shape
+from scopes import TOOL_SCOPES
 
 # Matches DESIGN.md's MAX_CONVERSATION_TTL ceiling (ninety days) — no other
 # token-lifetime precedent exists in this repo, and reusing that number
 # keeps this service's two "how long is too long" defaults aligned.
 _DEFAULT_EXPIRES_SECONDS = 90 * 24 * 60 * 60
 
+# Same ceiling as the default: a longer-lived token than the default is a
+# deliberate choice a caller can still make, but there is no legitimate use
+# case for a token that outlives this service's own longest-lived state.
+_MAX_EXPIRES_SECONDS = 90 * 24 * 60 * 60
+
+# comms:admin gates providers.comms.register/set_agent_shared directly (see
+# scopes.py) but never appears as a TOOL_SCOPES value since it isn't itself
+# a per-tool requirement — union it in explicitly so it remains mintable.
+_VALID_SCOPES = set(TOOL_SCOPES.values()) | {"comms:admin"}
+
 
 def _parse_scopes(raw: str) -> list[str]:
     """Split on commas or whitespace — either reads naturally on a CLI."""
     return [s for s in raw.replace(",", " ").split() if s]
+
+
+def _validate_scopes(scopes: list[str]) -> list[str]:
+    unknown = [s for s in scopes if s not in _VALID_SCOPES]
+    if unknown:
+        raise ValueError(
+            f"unknown scope(s) {unknown!r}: valid scopes are {sorted(_VALID_SCOPES)!r}"
+        )
+    return scopes
 
 
 def _validate_sub(sub: str) -> str:
@@ -81,7 +102,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--expires",
         type=int,
         default=_DEFAULT_EXPIRES_SECONDS,
-        help=f"Token lifetime in seconds (default: {_DEFAULT_EXPIRES_SECONDS}, i.e. 90 days).",
+        help=(
+            f"Token lifetime in seconds (default: {_DEFAULT_EXPIRES_SECONDS}, i.e. 90 "
+            f"days; must be > 0 and <= {_MAX_EXPIRES_SECONDS})."
+        ),
     )
     parser.add_argument(
         "--owner-email",
@@ -113,6 +137,13 @@ def _cli() -> None:
     except Exception as exc:
         _die(parser, f"invalid --sub: {exc}")
 
+    if not (0 < args.expires <= _MAX_EXPIRES_SECONDS):
+        _die(
+            parser,
+            f"invalid --expires {args.expires!r}: must be > 0 and <= "
+            f"{_MAX_EXPIRES_SECONDS} seconds",
+        )
+
     owner_email = None
     if args.owner_email:
         try:
@@ -120,7 +151,10 @@ def _cli() -> None:
         except ValueError as exc:
             _die(parser, str(exc))
 
-    scopes = _parse_scopes(args.scopes)
+    try:
+        scopes = _validate_scopes(_parse_scopes(args.scopes))
+    except ValueError as exc:
+        _die(parser, f"invalid --scopes: {exc}")
     secret = require_env("AGENT_JWT_SECRET")
 
     now = int(time.time())

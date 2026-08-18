@@ -360,10 +360,18 @@ class ApprovalHold(Base):
             name="ck_approval_holds_auto_decision",
         ),
         UniqueConstraint("message_id", name="uq_approval_holds_message_id"),
-        # Backs the hold-rate-limit count, comms_get_hold_status's
-        # sender-only lookup, and GET /approvals/pending's owner-filtered
-        # pending_human listing -- all three key off (sender_agent_id,
-        # status) with created_at as the sort/window column.
+        # Backs comms_get_hold_status's sender-only lookup and
+        # GET /approvals/pending's owner-filtered pending_human listing,
+        # both of which filter on (sender_agent_id, status) with
+        # created_at as the sort column. The hold-rate-limit count
+        # (_deny_rate_limited_holds) deliberately does NOT filter on
+        # status -- it counts every hold created in the window regardless
+        # of outcome, since a submission-spam control must count attempts,
+        # not just currently-pending ones -- so this index only partially
+        # serves that query (sender_agent_id + created_at range, scanning
+        # across status values rather than a clean prefix match). Argus
+        # round-1 caught this comment overclaiming full coverage; not
+        # worth a dedicated index at current scale.
         Index(
             "idx_approval_holds_sender_agent_id_status_created_at",
             "sender_agent_id",

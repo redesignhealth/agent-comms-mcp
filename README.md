@@ -220,7 +220,8 @@ agent-comms-mcp-mint-token --sub notifier-bot --scopes comms:write --self-owned
 `--owner-email`/`--self-owned` are mutually exclusive and one is required:
 skipping this choice is exactly how an agent silently becomes self-owned
 instead of human-owned, which later makes anything requiring that human's
-approval permanently unsatisfiable. See
+approval unsatisfiable until the agent is re-minted with the correct
+owner. See
 [docs/TECH-5389-APPROVAL-PIPELINE.md](docs/TECH-5389-APPROVAL-PIPELINE.md)
 §15 for the full rationale.
 

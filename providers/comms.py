@@ -694,6 +694,11 @@ async def start_conversation(
     if pending_hold is not None:
         result["held_for_approval"] = True
         result["hold_id"] = str(pending_hold.id)
+        # Prefixed (unlike post_message's/comms_get_hold_status's bare
+        # `status`/`expires_at`/`created_at`) because this response already
+        # has unprefixed top-level fields of those exact names for the
+        # CONVERSATION (see above) -- the hold's own values would silently
+        # collide and overwrite them otherwise.
         result["hold_status"] = pending_hold.status
         result["risk_reason"] = pending_hold.risk_reason
         result["hold_expires_at"] = _iso(pending_hold.expires_at)

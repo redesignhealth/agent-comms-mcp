@@ -1,9 +1,10 @@
 # TECH-5389 — Final Plan: Pluggable Risk Scoring + Approval Pipeline
 
-Status: **final implementation plan** (2026-08-17). All owner decisions ratified; only the
-items in §17 remain genuinely open. This document is the planning deliverable — no code
-or existing files have been modified. DESIGN.md changes are *listed* in §13 as planned
-edits, not applied.
+Status: **implemented** (2026-08-17). All owner decisions ratified; PR 1 (risk-scorer seam),
+PR 2 (approval pipeline, including the `owner_sub` hold-time snapshot and the structurally
+interactive-only decide gate), and the companion agent-token-verification seam
+(TECH-5396) have all landed on this branch (PR #14). Only the items in §17 remain
+genuinely open. DESIGN.md's §13-listed changes have been applied.
 
 Revision (2026-08-17, later — pluggable auth verification): PR 1 (the risk-scorer seam in
 `plugins.py`) and the `mint_token.py` CLI have since landed on this branch. §15 is
@@ -16,7 +17,7 @@ interactive-only decide gate. Sections touched by this revision: §1, §4, §5, 
 
 Verified against the current worktree:
 
-- Migration head: `136265b3f22d` (`drop_redundant_participants_index`).
+- Migration head: `f4a9c1d2b3e7` (post-implementation; was `136265b3f22d` at planning time).
 - `boundary_safe` blast radius (grep-verified): `schemas.py`, `state_machine.py`,
   `service.py`, `providers/comms.py`, `main.py`, plus `tests/test_schemas.py` (20
   mentions), `tests/test_state_machine.py` (27), `tests/test_service.py` (44),
@@ -616,7 +617,7 @@ docstring says so). Offline-SQL assertions added to `test_migrations_offline.py`
   import-path plugins, startup fail-fast, webhook env vars, and the `owner_sub`
   provenance statement (§15 — resolved-by-design under a live-resolving verifier;
   static-claim `mint_token.py` path as the OSS default). The `AGENT_TOKEN_VERIFIERS`
-  seam itself is documented in DESIGN.md by its companion ticket, not TECH-5389's pass.
+  seam itself is documented in DESIGN.md by its companion ticket (TECH-5396), not TECH-5389's pass.
 - `main.py` `instructions` string and affected tool docstrings updated in the same PR.
 
 ## 14. Test plan
@@ -795,8 +796,8 @@ Residuals, stated:
   `AgentTableOwnershipClient`, so a re-minted owner changes approval **routing** but
   not boundary **scoring**. Making `OwnershipClient` env-pluggable (it is already the
   same Protocol shape — §1's code-comment note) so live-ownership consumers get
-  consistent scoring + routing is an explicit open question on the companion ticket,
-  not built here.
+  consistent scoring + routing is an explicit open question on the companion ticket
+  (TECH-5396), not built here.
 - Exact-string match retained (former Finding 2): a case mismatch yields an
   un-approvable hold, not a security hole.
 - **`is_shared` does NOT exempt an agent from needing an `owner_sub` (ratified).**
@@ -819,8 +820,8 @@ surface even with only the default verifier configured: the `approval_holds.owne
 snapshot column + fallback + changed read points (§4/§5/§9/§10), and §9's
 interactive-provider-only structural gate. The **seam itself** —
 `AGENT_TOKEN_VERIFIERS`, the `auth.py` registry, the normalization-enforcing adapter,
-conditional `AGENT_JWT_SECRET` — is a separate companion ticket: additive at the auth
-layer, no approval-pipeline coupling, independently shippable before or after PR 2.
+conditional `AGENT_JWT_SECRET` — is a separate companion ticket (TECH-5396): additive at
+the auth layer, no approval-pipeline coupling, independently shippable before or after PR 2.
 
 ## 16. PR sequencing
 
@@ -843,7 +844,7 @@ audit actions; DESIGN.md edits; all remaining tests. Verify: suite +
 `alembic upgrade head --sql` review.
 
 **Not in either PR:** the pluggable agent-token-verifier seam itself (§15.2–§15.3) is
-a companion ticket at the auth layer — PR 2 is designed so that ticket is purely
+a companion ticket (TECH-5396) at the auth layer — PR 2 is designed so that ticket is purely
 additive (the snapshot and the structural decide gate are verifier-agnostic and land
 here regardless).
 
@@ -861,3 +862,13 @@ All three closed by the ticket owner (2026-08-17):
 3. **Reader-visible provenance** — not built in v1 (no `messages.approval_hold_id`
    column, no `via_approval` flag); provenance stays recoverable via
    `approval_holds.message_id` and audit detail. Trivially additive later if wanted.
+
+## 18. Argus review dispositions (deferred)
+
+- **Unbounded 403-audit writes** (Argus round 1, S9): a caller that repeatedly hits a
+  denial path can generate unbounded `_deny`-audited rows since there's no rate limit
+  on denials themselves (unlike the approval-hold creation rate limit, §5). Deferred,
+  not fixed in this pass: this is a pre-existing posture shared by every other denial
+  path in the service (predates TECH-5389), not something this pipeline introduced, and
+  addressing it (e.g. a per-agent denial rate limit) is a broader hardening question than
+  this ticket's scope.

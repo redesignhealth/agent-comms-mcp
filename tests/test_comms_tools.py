@@ -2038,6 +2038,7 @@ class TestScopesUnaffected:
             "comms_decline_invite",
             "comms_invite",
             "comms_leave",
+            "comms_get_hold_status",
         }
         assert expected <= mounted
         assert expected <= set(TOOL_SCOPES)

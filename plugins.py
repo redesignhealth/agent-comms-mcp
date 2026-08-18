@@ -434,7 +434,12 @@ class LogOnlyNotifier:
     egress to a half-configured URL: safe in a bare deployment."""
 
     async def notify_escalated(self, notification: ApprovalNotification) -> None:
-        _notify_log.info("approval_escalated", **asdict(notification))
+        # Omit owner_email (PII) from the log record -- the log-only path has
+        # no authenticated audience the way the webhook path's HTTPS
+        # destination does, so it shouldn't carry the same PII by default.
+        fields = asdict(notification)
+        del fields["owner_email"]
+        _notify_log.info("approval_escalated", **fields)
 
 
 class WebhookNotifier:
@@ -458,13 +463,29 @@ class WebhookNotifier:
                 f"{APPROVAL_WEBHOOK_URL_ENV_VAR} and {APPROVAL_WEBHOOK_SECRET_ENV_VAR} "
                 "to be set"
             )
+        if not url.startswith("https://"):
+            # Argus round-1 BLOCKING catch: the notification payload
+            # carries owner_email/owner_sub (PII). Plain http:// leaks it
+            # in cleartext; an unscheme-restricted URL is also an SSRF
+            # vector (e.g. a cloud metadata address). Fail fast at
+            # construction, same fail-closed posture as the missing-env
+            # check above.
+            raise RuntimeError(
+                f"{APPROVAL_WEBHOOK_URL_ENV_VAR} must be an https:// URL, got {url!r}"
+            )
         self._url = url
         self._secret = secret.encode("utf-8")
 
     async def notify_escalated(self, notification: ApprovalNotification) -> None:
         body = json.dumps(asdict(notification)).encode("utf-8")
         signature = hmac.new(self._secret, body, hashlib.sha256).hexdigest()
-        async with httpx.AsyncClient(timeout=_WEBHOOK_TIMEOUT_SECONDS) as client:
+        # Pinned explicitly even though it matches httpx's own current
+        # default (False) -- an SSRF-via-redirect vector if a future httpx
+        # release ever flips that default. Do not change without
+        # re-reading the class docstring's SSRF note above.
+        async with httpx.AsyncClient(
+            timeout=_WEBHOOK_TIMEOUT_SECONDS, follow_redirects=False
+        ) as client:
             response = await client.post(
                 self._url,
                 content=body,

@@ -544,6 +544,7 @@ class TestApprovalHoldsSchema:
         indexes = await _indexes(engine, "approval_holds")
         assert "idx_approval_holds_sender_agent_id_status_created_at" in indexes
         assert "idx_approval_holds_conversation_id" in indexes
+        assert "idx_approval_holds_owner_sub_status_created_at" in indexes
 
     async def test_round_trip_insert_and_read(self, engine: AsyncEngine) -> None:
         """Full round-trip through raw SQL (this module never mocks the

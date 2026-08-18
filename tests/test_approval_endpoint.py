@@ -345,6 +345,19 @@ class TestDecideEndpoint:
         assert resp.status_code == 404
         assert resp.json() == {"error": "not_found"}
 
+    async def test_uniform_404_for_malformed_hold_id(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+        resp = await http_client.post(
+            "/approvals/not-a-uuid/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={"decision": "approve"},
+        )
+        assert resp.status_code == 404
+        assert resp.json() == {"error": "not_found"}
+
     async def test_uniform_404_for_not_your_hold(
         self,
         client: tuple[httpx.AsyncClient, _FakeAuthProvider],

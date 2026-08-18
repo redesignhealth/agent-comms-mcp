@@ -139,6 +139,7 @@ raised — logged, never fails the triggering call).
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import logging
 import uuid
@@ -700,10 +701,19 @@ def _maybe_expire(session: AsyncSession, actor_sub: str, conversation: Conversat
         )
 
 
-async def _find_hold(session: AsyncSession, hold_id: uuid.UUID) -> ApprovalHold | None:
-    return (
-        await session.execute(select(ApprovalHold).where(ApprovalHold.id == hold_id))
-    ).scalar_one_or_none()
+async def _find_hold(
+    session: AsyncSession, hold_id: uuid.UUID, *, for_update: bool = False
+) -> ApprovalHold | None:
+    stmt = select(ApprovalHold).where(ApprovalHold.id == hold_id)
+    if for_update:
+        # Argus round-1 BLOCKING catch (TOCTOU in decide_hold): without this
+        # lock, two concurrent decide requests for the same hold can both
+        # read status='pending_human' before either acquires the
+        # conversation lock further down, both pass the status guard, and
+        # both insert a message. Locking the hold row itself at fetch time
+        # serializes concurrent decisions on the SAME hold.
+        stmt = stmt.with_for_update()
+    return (await session.execute(stmt)).scalar_one_or_none()
 
 
 def _maybe_expire_hold(session: AsyncSession, actor_sub: str, hold: ApprovalHold) -> None:
@@ -1608,7 +1618,7 @@ async def _authorize_conversation_open(
     # across disjoint owners, defeating the type's invariant entirely.
     shared_bypass = conversation_type == "asymmetric" and is_shared_by_id.get(initiator.id, False)
     if shared_bypass:
-        # Mirrors _score_message_risk's agent.boundary_check_bypassed_shared
+        # Mirrors _score_message_risk's risk.shared_sender_bypass
         # audit: staged, not committed, for consistency
         # with that sibling bypass-observability event -- both are
         # persisted by the caller's own enclosing commit along with the
@@ -1819,6 +1829,14 @@ async def start_conversation(
         risk_scorer=risk_scorer,
     )
 
+    if risk_reason is not None:
+        # Checked BEFORE any insert/flush below (not just before the divert
+        # call) -- Argus round-1 BLOCKING catch: a rate-limit denial commits
+        # via `_deny_rate_limited`, which would otherwise permanently
+        # persist an orphaned Conversation+Participant rows (no message, no
+        # hold) if this ran after they were flushed.
+        await _deny_rate_limited_holds(session, actor_sub=actor_sub, sender_agent_id=initiator.id)
+
     now = _now()
     conversation = Conversation(
         type=conversation_type,
@@ -1858,9 +1876,9 @@ async def start_conversation(
         # conversation is created anyway, with a service-synthesized safe
         # seq-1 marker (`conversation_opened`) taking the opener's slot;
         # the caller's actual content is diverted into a hold exactly like
-        # any other high-risk post -- no denial. Hold rate limit is
-        # checked before anything else is inserted.
-        await _deny_rate_limited_holds(session, actor_sub=actor_sub, sender_agent_id=initiator.id)
+        # any other high-risk post -- no denial. Hold rate limit was
+        # already checked above, before the Conversation/Participant rows
+        # were inserted.
         marker_payload = validate_payload("conversation_opened", schema_version, {})
         marker = Message(
             conversation_id=conversation.id,
@@ -2765,7 +2783,10 @@ async def _divert_high_risk_message(
     # claim from the request that created this hold; owner_sub_fallback is
     # the (currently-frozen) agents.owner_sub, used only when the claim is
     # absent. See ApprovalHold's docstring / plan doc §15.4.
-    hold_owner_sub = owner_sub_claim or owner_sub_fallback
+    # `is not None`, not `or` (Argus round-1 BLOCKING catch): an explicit
+    # empty-string claim is present, not absent, and must not silently
+    # fall back to a different identity.
+    hold_owner_sub = owner_sub_claim if owner_sub_claim is not None else owner_sub_fallback
     hold = ApprovalHold(
         conversation_id=conversation.id,
         sender_agent_id=sender_agent_id,
@@ -2865,10 +2886,15 @@ async def _fire_approval_notifier(
     function starts a FRESH short transaction of its own for the
     ``approval.notify_failed`` audit row on failure, since the main
     commit already succeeded and must not be affected by a notifier
-    outage. Never raises: a notifier failure must never fail, roll back,
-    or delay the agent's already-returned held response --
-    ``GET /approvals/pending`` is the source of truth; notification is an
-    accelerant only.
+    outage. Never FAILS the request: a notifier failure never rolls back
+    or raises past this function. It IS awaited inline before the tool
+    response returns (Argus round-1 catch corrected the "never delays"
+    claim this docstring used to make), so ``APPROVAL_NOTIFIER=webhook``
+    can add up to ``_WEBHOOK_TIMEOUT_SECONDS`` of latency to a high-risk
+    send -- ``GET /approvals/pending`` is still the source of truth;
+    notification is an accelerant, not a guarantee, and delay is the
+    accepted cost of keeping this synchronous rather than a background
+    task with its own session-lifecycle concerns.
     """
     notification = ApprovalNotification(
         hold_id=str(hold.id),
@@ -2885,6 +2911,13 @@ async def _fire_approval_notifier(
     )
     try:
         await notifier.notify_escalated(notification)
+    except asyncio.CancelledError:
+        # BaseException, not Exception -- already excluded from the guard
+        # below under Python's actual exception hierarchy, but re-raised
+        # explicitly (Argus round-1 catch) so this stays correct even if
+        # the `except Exception` below is ever accidentally broadened to
+        # `except BaseException`.
+        raise
     except Exception as exc:
         logger.warning(
             "approval notifier failed for hold %s: %s", hold.id, type(exc).__name__, exc_info=True
@@ -2997,6 +3030,13 @@ async def list_pending_approval_holds(
         entry["payload"] = hold.payload
         holds.append(entry)
     await session.commit()
+    # Argus round-1 catch: `has_more` was computed from the raw row count
+    # before lazy expiry ran. If every fetched row expires during the loop
+    # above, that left {"holds": [], "has_more": True} -- and this API has
+    # no cursor/offset to actually page past this call, so that combination
+    # would trap a naive polling client into retrying forever for a "next
+    # page" that doesn't exist. An empty page is never followed by more.
+    has_more = has_more and len(holds) > 0
     return {"holds": holds, "has_more": has_more}
 
 
@@ -3030,7 +3070,7 @@ async def decide_hold(
     participant added after the hold was created never had a chance to
     reject the type).
     """
-    hold = await _find_hold(session, hold_id)
+    hold = await _find_hold(session, hold_id, for_update=True)
     if hold is None:
         await _deny(
             session,
@@ -3178,9 +3218,11 @@ async def post_message(
     scored by the injected ``risk_scorer``) is checked right after payload
     validation, so an unregistered ``(message_type, schema_version)`` pair
     is denied via ``_deny_bad_schema``'s audit trail first, rather than
-    scored at all: an ``asymmetric`` conversation rejects a barrier-
+    scored at all: an ``asymmetric`` conversation diverts a barrier-
     sensitive message (e.g. ``note``) that would cross an ownership
-    boundary for the sender, audited as ``denied.boundary_crossing``.
+    boundary for the sender into an ``approval_holds`` row, audited as
+    ``approval.hold`` (or, if the scorer itself fails, denied and audited
+    as ``denied.risk_unscored``).
 
     Side effects: ``confirm``/``task_complete`` transition the conversation
     to ``completed``; ``decline`` sets the sender's OWN participant status
