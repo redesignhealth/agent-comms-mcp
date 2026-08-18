@@ -517,9 +517,13 @@ or (for `APPROVAL_NOTIFIER=webhook`) a missing `APPROVAL_WEBHOOK_URL`/
 high-risk message.
 
 **Trust model for `pkg.module:factory` import paths (deliberate, not a
-vulnerability):** `resolve_plugin_name` calls `importlib.import_module` on a
-string taken from an environment variable, which is process-startup
-deployment configuration set by whoever operates this service — the same
+vulnerability):** every current call site into `resolve_plugin_name` (both
+`resolve_plugin` and `auth.py`'s `_resolve_agent_token_verifiers`) reads the
+name from `os.environ` before passing it in — `resolve_plugin_name` itself
+has no enforcement of this, it simply trusts its caller, the same way any
+internal helper trusts its call sites rather than re-validating provenance
+at every layer. That string is process-startup deployment configuration set
+by whoever operates this service — the same
 trust level as `DATABASE_URL`, `PYTHONPATH`, or the choice of which packages
 to `pip install` in the first place. It is never derived from request input,
 a database row, or any other value an unprivileged caller can influence. An
@@ -567,12 +571,16 @@ required only if `agent_jwt_hs256` is among the configured verifiers.
 
 Every configured verifier is wrapped in an OSS-owned adapter enforcing a
 **normalized-claims contract**: the `AccessToken` it returns must carry
-`iss == "agent-jwt"`, a non-empty `sub` passing `identity.validate_sub_shape`,
-and a `scopes` list — `owner_sub` is optional (a plugin may resolve it live
-from its own system of record instead of it being baked in at mint time). Any
-violation is treated as verification *failure*, fail-closed: `scopes.
-is_interactive_token` is a denylist keyed on `iss != "agent-jwt"`, so an
-un-normalized issuer would make a plugin's agent tokens look interactive
+`iss == "agent-jwt"`, a non-empty `str` `sub` passing
+`identity.validate_sub_shape`, and a `scopes` list whose elements are all
+`str` — `owner_sub` is optional (a plugin may resolve it live from its own
+system of record instead of it being baked in at mint time). If present,
+`exp`/`nbf`/`AccessToken.expires_at` are also independently re-checked (60s
+clock-skew leeway) rather than trusted from the inner verifier — none of the
+three is required, since a verifier may rely on live revocation instead of
+expiry. Any violation is treated as verification *failure*, fail-closed:
+`scopes.is_interactive_token` is a denylist keyed on `iss != "agent-jwt"`, so
+an un-normalized issuer would make a plugin's agent tokens look interactive
 (full scope-check bypass). This makes plugin-verified tokens indistinguishable
 downstream from default-verified ones. Full design and rationale:
 `docs/TECH-5389-APPROVAL-PIPELINE.md` §15.2–15.3.

@@ -719,6 +719,7 @@ claims:**
 | `sub` | the agent's identity string; non-empty, passes `identity.validate_sub_shape` (never email-shaped — the anti-impersonation rule) |
 | `scopes` | `list[str]` in `scopes.py`'s `TOOL_SCOPES` vocabulary |
 | `owner_sub` | OPTIONAL: the owning human's identity (their Okta-resolved email). **This is the live-resolution hook**: a consumer verifier may resolve it freshly from its own systems on every verification, instead of it being baked in at mint time |
+| `exp` / `nbf` / `AccessToken.expires_at` | OPTIONAL, but when present MUST NOT be expired (`exp`/`expires_at`) or not-yet-valid (`nbf`) — checked independently by the OSS-owned adapter (60s clock-skew leeway), not trusted from the inner verifier. A verifier with no expiry mechanism at all (relying instead on live revocation) is not required to set any of these |
 
 Why force `iss="agent-jwt"` rather than letting each verifier keep its own issuer:
 `scopes.is_interactive_token` (scopes.py:75–96) is a **denylist** — `iss !=

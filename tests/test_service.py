@@ -4075,6 +4075,63 @@ class TestListPendingApprovalHolds:
 
         assert result == {"holds": [], "has_more": False}
 
+    async def test_partial_expiry_transiently_suppresses_still_pending_hold(
+        self, session: AsyncSession
+    ) -> None:
+        """Argus round-3 SUGGESTION: the untested half of the has_more fix above.
+        With limit=1 and rows [expired, still-pending] (oldest first), the overfetch
+        sees 2 rows, slices to the first 1 (the expired one), that one hold expires
+        during the loop, `holds` ends up empty, and `has_more` is forced to False --
+        so the still-pending SECOND hold is transiently invisible to this call. This
+        self-heals on the next poll (it's not past the raw fetch's overfetch window
+        anymore once the expired hold is gone), but is a real, documented gap: a
+        one-shot caller can miss a genuinely pending hold on this page."""
+        owner = await _register(session, "lp-owner-2")
+        target = await _register(session, "lp-target-2")
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        for _ in range(2):
+            await post_message(
+                session,
+                actor_sub=owner.sub,
+                sender_agent_id=owner.id,
+                conversation_id=conversation.id,
+                message_type="note",
+                payload={"text": "hello"},
+            )
+        holds = (
+            (
+                await session.execute(
+                    select(ApprovalHold)
+                    .where(ApprovalHold.sender_agent_id == owner.id)
+                    .order_by(ApprovalHold.created_at.asc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(holds) == 2
+        oldest, newest = holds
+        oldest.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+
+        result = await _service.list_pending_approval_holds(
+            session, owner_sub=owner.owner_sub, limit=1
+        )
+
+        # The still-pending `newest` hold exists but is not surfaced this call.
+        assert result == {"holds": [], "has_more": False}
+        assert newest.status == "pending_human"
+
 
 # --- expiry -----------------------------------------------------------------------
 

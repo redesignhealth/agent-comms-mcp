@@ -218,6 +218,14 @@ def resolve_plugin_name(env_var: str, registry: dict[str, Callable[[], Any]], na
     ``AGENT_TOKEN_VERIFIERS``, which resolves a comma-separated LIST of
     names rather than a single env-var value) share this implementation
     instead of duplicating it.
+
+    ``name`` is expected to be operator-controlled deployment configuration
+    (an environment variable's value) at every current call site, never
+    request input or a database row -- this function itself does not
+    enforce that, it trusts its callers, so a hypothetical future caller
+    passing anything else would need its own justification for why that's
+    still safe (see DESIGN.md's "Trust model for `pkg.module:factory` import
+    paths").
     """
     if ":" in name:
         module_path, _, attr = name.partition(":")

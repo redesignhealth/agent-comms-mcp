@@ -3036,6 +3036,11 @@ async def list_pending_approval_holds(
     # no cursor/offset to actually page past this call, so that combination
     # would trap a naive polling client into retrying forever for a "next
     # page" that doesn't exist. An empty page is never followed by more.
+    # Known accepted residual (Argus round-3): if the OLDEST of the
+    # overfetched rows expires here but a NEWER one within the same
+    # overfetch window is still pending, this forces has_more=False and
+    # transiently hides that still-pending hold from this call -- it
+    # self-heals on the caller's next poll once the expired row is gone.
     has_more = has_more and len(holds) > 0
     return {"holds": holds, "has_more": has_more}
 

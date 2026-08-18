@@ -49,6 +49,7 @@ import base64
 import hashlib
 import json
 import logging
+import math
 import os
 import time
 from collections.abc import Callable
@@ -362,9 +363,11 @@ def _normalized_claims_violation(claims: dict[str, Any]) -> str | None:
     normalized-claims contract, else ``None``.
 
     Contract (docs/TECH-5389-APPROVAL-PIPELINE.md §15.3): ``iss`` must equal
-    ``identity.AGENT_JWT_ISSUER``; ``sub`` must be non-empty and pass
-    ``identity.validate_sub_shape``; ``scopes`` must be a ``list``.
-    ``owner_sub`` is optional and not checked here.
+    ``identity.AGENT_JWT_ISSUER``; ``sub`` must be a non-empty ``str``
+    instance and pass ``identity.validate_sub_shape``; ``scopes`` must be a
+    ``list`` whose elements are all ``str``. ``owner_sub`` is optional and
+    not checked here. Expiry (``exp``/``nbf``/``AccessToken.expires_at``) is
+    a separate concern, checked by ``_expiry_violation``, not here.
     """
     if claims.get("iss") != AGENT_JWT_ISSUER:
         return "iss"
@@ -381,6 +384,9 @@ def _normalized_claims_violation(claims: dict[str, Any]) -> str | None:
     return None
 
 
+_CLOCK_SKEW_LEEWAY_SECONDS = 60
+
+
 def _expiry_violation(expires_at: int | None, claims: dict[str, Any]) -> str | None:
     """Return a short violation message if the token is expired or not yet
     valid, else ``None``.
@@ -392,9 +398,21 @@ def _expiry_violation(expires_at: int | None, claims: dict[str, Any]) -> str | N
     checked it correctly. Bounds an honest-but-buggy plugin the same way
     ``_normalized_claims_violation`` bounds one that returns a malformed
     ``iss``/``sub``/``scopes`` shape.
+
+    ``_CLOCK_SKEW_LEEWAY_SECONDS`` absorbs ordinary wall-clock drift between
+    this host and whatever minted the token (e.g. an ``nbf`` equal to
+    ``iat`` failing for the token's first few seconds of life on a host
+    whose clock runs slightly ahead) -- this is the first wall-clock
+    boundary comparison in the auth path, so no prior leeway convention
+    exists to match.
+
+    ``math.isfinite`` rejects NaN/±inf explicitly: NaN satisfies neither
+    comparison below (all NaN comparisons are False under IEEE 754), and
+    +inf never compares as "in the past" -- both would otherwise silently
+    pass an honest-but-buggy plugin's malformed timestamp through as valid.
     """
     now = time.time()
-    if expires_at is not None and expires_at <= now:
+    if expires_at is not None and expires_at <= now - _CLOCK_SKEW_LEEWAY_SECONDS:
         return f"expires_at={expires_at} is in the past"
     for claim_name, past_is_bad in (("exp", True), ("nbf", False)):
         value = claims.get(claim_name)
@@ -404,9 +422,11 @@ def _expiry_violation(expires_at: int | None, claims: dict[str, Any]) -> str | N
             value = float(value)
         except (TypeError, ValueError):
             return f"{claim_name} claim is not a valid timestamp"
-        if past_is_bad and value <= now:
+        if not math.isfinite(value):
+            return f"{claim_name} claim is not a finite timestamp"
+        if past_is_bad and value <= now - _CLOCK_SKEW_LEEWAY_SECONDS:
             return f"{claim_name} claim {value} is in the past"
-        if not past_is_bad and value > now:
+        if not past_is_bad and value > now + _CLOCK_SKEW_LEEWAY_SECONDS:
             return f"{claim_name} claim {value} is in the future"
     return None
 
@@ -417,11 +437,12 @@ class _NormalizingVerifier(TokenVerifier):
 
     A configured verifier may accept any wire format it likes, but the
     ``AccessToken`` it returns must carry normalized claims — see
-    ``_normalized_claims_violation``. This adapter is what makes that
-    assumption hold regardless of what a plugin does: any violation is
-    treated as verification FAILURE (returns ``None``), never passed
-    through. Fail-closed matters here specifically because
-    ``scopes.is_interactive_token`` is a DENYLIST keyed on
+    ``_normalized_claims_violation`` (``iss``/``sub``/``scopes`` shape) and
+    ``_expiry_violation`` (``exp``/``nbf``/``expires_at``, when present).
+    This adapter is what makes that assumption hold regardless of what a
+    plugin does: any violation is treated as verification FAILURE (returns
+    ``None``), never passed through. Fail-closed matters here specifically
+    because ``scopes.is_interactive_token`` is a DENYLIST keyed on
     ``iss != "agent-jwt"`` — an un-normalized issuer would make a plugin's
     agent tokens look interactive (full scope-check bypass), which would
     also defeat the decide-endpoint's structural interactive-provider-only

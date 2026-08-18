@@ -650,6 +650,39 @@ class TestNormalizingVerifierContract:
 
         assert await verifier.verify_token("whatever") is None
 
+    async def test_rejects_non_numeric_exp_claim(self) -> None:
+        token = _access_token(
+            iss="agent-jwt", sub="good-agent", scopes=["comms:read"], exp="not-a-number"
+        )
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
+
+        assert await verifier.verify_token("whatever") is None
+
+    async def test_rejects_boolean_exp_claim_as_expired(self) -> None:
+        """``exp=True`` coerces to ``float(1.0)`` (1970-01-01), so it's
+        rejected as expired rather than as a type error -- correct outcome,
+        pinning the actual code path taken."""
+        token = _access_token(iss="agent-jwt", sub="good-agent", scopes=["comms:read"], exp=True)
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
+
+        assert await verifier.verify_token("whatever") is None
+
+    async def test_rejects_nan_exp_claim(self) -> None:
+        token = _access_token(
+            iss="agent-jwt", sub="good-agent", scopes=["comms:read"], exp=float("nan")
+        )
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
+
+        assert await verifier.verify_token("whatever") is None
+
+    async def test_rejects_infinite_exp_claim(self) -> None:
+        token = _access_token(
+            iss="agent-jwt", sub="good-agent", scopes=["comms:read"], exp=float("inf")
+        )
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
+
+        assert await verifier.verify_token("whatever") is None
+
     async def test_accepts_future_exp_and_past_nbf(self) -> None:
         far_future = 9999999999
         token = _access_token(

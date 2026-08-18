@@ -133,7 +133,9 @@ class TestMalformedInput:
                 ["--sub", "agent-x", "--scopes", "not:a:real:scope", "--self-owned"],
             )
 
-    @pytest.mark.parametrize("expires", [0, -1, 90 * 24 * 60 * 60 + 1])
+    @pytest.mark.parametrize(
+        "expires", [0, -1, mint_token._MAX_EXPIRES_SECONDS + 1]
+    )
     def test_out_of_bounds_expires_rejected(
         self, monkeypatch: pytest.MonkeyPatch, expires: int
     ) -> None:
@@ -154,6 +156,7 @@ class TestMalformedInput:
     def test_max_expires_is_accepted(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        before = int(time.time())
         _run_cli(
             monkeypatch,
             [
@@ -163,11 +166,17 @@ class TestMalformedInput:
                 "comms:read",
                 "--self-owned",
                 "--expires",
-                str(90 * 24 * 60 * 60),
+                str(mint_token._MAX_EXPIRES_SECONDS),
             ],
         )
         token = capsys.readouterr().out.strip()
-        assert "\n" not in token
+        claims = jwt.decode(
+            token,
+            "test-agent-jwt-secret-long-enough-for-hs256",
+            algorithms=["HS256"],
+            issuer=AGENT_JWT_ISSUER,
+        )
+        assert claims["exp"] - before == pytest.approx(mint_token._MAX_EXPIRES_SECONDS, abs=5)
 
 
 class TestMissingSecret:
