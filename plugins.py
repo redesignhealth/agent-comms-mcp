@@ -20,6 +20,14 @@ PR2 (TECH-5389) adds two more seams, same mechanism: the auto-approver
 approval-request notifier (``ApprovalNotifier``/``APPROVAL_NOTIFIERS``/
 ``APPROVAL_NOTIFIER_ENV_VAR``), both resolved via the same
 ``resolve_plugin`` helper the risk scorer already uses.
+
+``resolve_plugin``'s single-name resolution rule (registry lookup or
+``pkg.module:factory`` import path) is factored out into
+``resolve_plugin_name`` so a call site that needs to resolve MULTIPLE names
+(TECH-5396's ``AGENT_TOKEN_VERIFIERS``, a comma-separated list) can reuse it
+without duplicating the lookup/import logic. That seam's registry lives in
+``auth.py``, not here — ``service.py`` imports this module, and this module
+must stay fastmcp-free, so a ``TokenVerifier`` registry cannot live here.
 """
 
 from __future__ import annotations
@@ -195,17 +203,22 @@ RISK_SCORERS: dict[str, Callable[[], RiskScorer]] = {
 }
 
 
-def resolve_plugin(env_var: str, registry: dict[str, Callable[[], Any]], default: str) -> Any:
-    """Resolve ``env_var`` (defaulting to ``default``) to a constructed
-    plugin instance.
+def resolve_plugin_name(env_var: str, registry: dict[str, Callable[[], Any]], name: str) -> Any:
+    """Resolve a single plugin ``name`` to a constructed instance.
 
-    The value is looked up in ``registry`` by name; if it contains a
-    ``:`` it is instead treated as an import path
-    (``"pkg.module:factory"``), resolved via ``importlib`` and called with
-    no arguments. Raises ``RuntimeError`` for an unknown name or a failed
-    import — never returns a partially-broken plugin.
+    ``name`` is looked up in ``registry`` by name; if it contains a ``:`` it
+    is instead treated as an import path (``"pkg.module:factory"``),
+    resolved via ``importlib`` and called with no arguments. Raises
+    ``RuntimeError`` for an unknown name or a failed import — never returns
+    a partially-broken plugin. ``env_var`` is only used to make the error
+    message identify which knob was misconfigured.
+
+    Factored out of ``resolve_plugin`` so other call sites needing the same
+    registry-name-or-import-path resolution (e.g. ``auth.py``'s
+    ``AGENT_TOKEN_VERIFIERS``, which resolves a comma-separated LIST of
+    names rather than a single env-var value) share this implementation
+    instead of duplicating it.
     """
-    name = os.environ.get(env_var, default)
     if ":" in name:
         module_path, _, attr = name.partition(":")
         try:
@@ -218,6 +231,17 @@ def resolve_plugin(env_var: str, registry: dict[str, Callable[[], Any]], default
         if factory is None:
             raise RuntimeError(f"{env_var}: unknown plugin {name!r} (known: {sorted(registry)})")
     return factory()
+
+
+def resolve_plugin(env_var: str, registry: dict[str, Callable[[], Any]], default: str) -> Any:
+    """Resolve ``env_var`` (defaulting to ``default``) to a constructed
+    plugin instance.
+
+    See ``resolve_plugin_name`` for the actual name-to-instance resolution
+    rule (registry lookup or ``pkg.module:factory`` import path).
+    """
+    name = os.environ.get(env_var, default)
+    return resolve_plugin_name(env_var, registry, name)
 
 
 _risk_scorer: RiskScorer | None = None
@@ -503,6 +527,7 @@ __all__ = [
     "get_risk_scorer",
     "notifier_name",
     "resolve_plugin",
+    "resolve_plugin_name",
     "risk_scorer_name",
     "validate_configuration",
 ]

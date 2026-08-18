@@ -9,9 +9,18 @@ Interactive users (Claude Code, Claude Desktop, browser):
     to tools via ``get_access_token().claims``.
 
 Programmatic callers (agents, services, CI jobs):
-    agent-jwt HS256 Bearer token. FastMCP ``MultiAuth`` composes the Okta
-    OIDC provider with a ``JWTVerifier`` keyed to ``AGENT_JWT_SECRET``.
-    Both humans and machines POST to the same ``/mcp`` endpoint.
+    One or more agent-token verifiers, composed into the same FastMCP
+    ``MultiAuth`` alongside the Okta OIDC provider and selected by the
+    ``AGENT_TOKEN_VERIFIERS`` env var (``TOKEN_VERIFIERS`` registry name or
+    ``pkg.module:factory`` import path, comma-separated, ordered; default
+    ``agent_jwt_hs256`` — today's HS256 ``JWTVerifier`` keyed to
+    ``AGENT_JWT_SECRET``). Every configured verifier is wrapped in
+    ``_NormalizingVerifier``, which enforces the normalized-claims contract
+    (``iss``/``sub``/``scopes``, optional ``owner_sub`` — see that class's
+    docstring and ``docs/TECH-5389-APPROVAL-PIPELINE.md`` §15.3) so a
+    plugin verifier's tokens are indistinguishable downstream from
+    default-verified ones. Both humans and machines POST to the same
+    ``/mcp`` endpoint.
 
 Health check (``/health``):
     Unauthenticated — handled by FastMCP before auth middleware runs.
@@ -41,10 +50,12 @@ import hashlib
 import json
 import logging
 import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from fastmcp.server.auth import MultiAuth
+from fastmcp.exceptions import ToolError
+from fastmcp.server.auth import AccessToken, MultiAuth, TokenVerifier
 from fastmcp.server.auth.oidc_proxy import OIDCProxy
 from fastmcp.server.auth.providers.jwt import JWTVerifier
 from key_value.aio.protocols import AsyncKeyValue
@@ -56,8 +67,9 @@ from key_value.aio.stores.filetree import (
 from mcp.server.auth.provider import AuthorizationCode, RefreshToken
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
-from identity import AGENT_JWT_ISSUER
+from identity import AGENT_JWT_ISSUER, validate_sub_shape
 from observability import log_auth_flow
+from plugins import resolve_plugin_name
 
 logger = logging.getLogger(__name__)
 
@@ -309,26 +321,156 @@ def build_okta_provider() -> OktaOIDCProxy:
     )
 
 
+# --- Pluggable agent-token verification (AGENT_TOKEN_VERIFIERS) ------------
+#
+# See docs/TECH-5389-APPROVAL-PIPELINE.md §15.2-15.3 for the full design and
+# rationale. Summary: a consumer with its own credential system (opaque key
+# exchange, a private bot-identity service, ...) can compose its own
+# ``TokenVerifier`` alongside or instead of this repo's default agent-jwt
+# HS256 verifier, without forking this repo or importing consumer-private
+# auth code into it. The registry lives here (not in ``plugins.py``) because
+# ``service.py`` imports ``plugins`` and must stay fastmcp-free.
+
+AGENT_TOKEN_VERIFIERS_ENV_VAR = "AGENT_TOKEN_VERIFIERS"
+DEFAULT_AGENT_TOKEN_VERIFIER = "agent_jwt_hs256"
+
+
+def _build_agent_jwt_hs256_verifier() -> TokenVerifier:
+    """``agent_jwt_hs256`` — the OSS default: today's HS256 ``JWTVerifier``
+    construction, moved verbatim into a factory. ``AGENT_JWT_SECRET`` is
+    required only when this verifier is actually configured (the
+    ``require_env`` call lives inside the factory, not at import time), so a
+    consumer that fully replaces ``AGENT_TOKEN_VERIFIERS`` no longer needs to
+    set it."""
+    return JWTVerifier(
+        public_key=require_env("AGENT_JWT_SECRET"),
+        algorithm="HS256",
+        issuer=AGENT_JWT_ISSUER,
+    )
+
+
+# One in-tree entry. A consumer adds its own via a ``pkg.module:factory``
+# import path in ``AGENT_TOKEN_VERIFIERS`` — no registration API needed.
+TOKEN_VERIFIERS: dict[str, Callable[[], TokenVerifier]] = {
+    DEFAULT_AGENT_TOKEN_VERIFIER: _build_agent_jwt_hs256_verifier,
+}
+
+
+def _normalized_claims_violation(claims: dict[str, Any]) -> str | None:
+    """Return a short violation code if ``claims`` breaks the
+    normalized-claims contract, else ``None``.
+
+    Contract (docs/TECH-5389-APPROVAL-PIPELINE.md §15.3): ``iss`` must equal
+    ``identity.AGENT_JWT_ISSUER``; ``sub`` must be non-empty and pass
+    ``identity.validate_sub_shape``; ``scopes`` must be a ``list``.
+    ``owner_sub`` is optional and not checked here.
+    """
+    if claims.get("iss") != AGENT_JWT_ISSUER:
+        return "iss"
+    sub = claims.get("sub")
+    if sub is None or not str(sub).strip():
+        return "sub_missing"
+    try:
+        validate_sub_shape(claims)
+    except ToolError:
+        return "sub_shape"
+    if not isinstance(claims.get("scopes"), list):
+        return "scopes"
+    return None
+
+
+class _NormalizingVerifier(TokenVerifier):
+    """Wraps a configured agent-token verifier and enforces the
+    normalized-claims contract on every successful verification.
+
+    A configured verifier may accept any wire format it likes, but the
+    ``AccessToken`` it returns must carry normalized claims — see
+    ``_normalized_claims_violation``. This adapter is what makes that
+    assumption hold regardless of what a plugin does: any violation is
+    treated as verification FAILURE (returns ``None``), never passed
+    through. Fail-closed matters here specifically because
+    ``scopes.is_interactive_token`` is a DENYLIST keyed on
+    ``iss != "agent-jwt"`` — an un-normalized issuer would make a plugin's
+    agent tokens look interactive (full scope-check bypass), which would
+    also defeat the decide-endpoint's structural interactive-provider-only
+    gate's assumption that nothing reaching this verifier chain is
+    interactive. A malicious plugin is operator-trust-level (equivalent to
+    holding ``AGENT_JWT_SECRET``) and out of threat model; this adapter
+    bounds an honest-but-buggy one.
+    """
+
+    def __init__(self, inner: TokenVerifier, *, plugin_name: str) -> None:
+        super().__init__(
+            base_url=inner.base_url,
+            resource_base_url=inner.resource_base_url,
+            required_scopes=inner.required_scopes,
+        )
+        self._inner = inner
+        self._plugin_name = plugin_name
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        result = await self._inner.verify_token(token)
+        if result is None:
+            return None
+        violation = _normalized_claims_violation(result.claims or {})
+        if violation is not None:
+            logger.warning(
+                "Rejecting token from agent-token verifier %r: claims violate "
+                "the normalized-claims contract (%s)",
+                self._plugin_name,
+                violation,
+            )
+            return None
+        return result
+
+
+def _resolve_agent_token_verifiers() -> list[TokenVerifier]:
+    """Resolve ``AGENT_TOKEN_VERIFIERS`` (default ``agent_jwt_hs256``) into
+    an ordered list of normalized ``TokenVerifier`` instances.
+
+    Comma-separated, ordered — each element is a ``TOKEN_VERIFIERS``
+    registry name or a ``pkg.module:factory`` import path, resolved via
+    ``plugins.resolve_plugin_name`` (the same per-name convention
+    ``plugins.py``'s risk-scorer/auto-approver/notifier seams use). An empty
+    value is a startup ``RuntimeError`` — an interactive-only deployment
+    with zero agent verifiers is not supported.
+    """
+    raw = os.environ.get(AGENT_TOKEN_VERIFIERS_ENV_VAR, DEFAULT_AGENT_TOKEN_VERIFIER)
+    names = [name.strip() for name in raw.split(",")]
+    if not raw.strip() or any(not name for name in names):
+        raise RuntimeError(
+            f"{AGENT_TOKEN_VERIFIERS_ENV_VAR} must be a non-empty, comma-separated "
+            "list of registry names or pkg.module:factory import paths"
+        )
+    return [
+        _NormalizingVerifier(
+            resolve_plugin_name(AGENT_TOKEN_VERIFIERS_ENV_VAR, TOKEN_VERIFIERS, name),
+            plugin_name=name,
+        )
+        for name in names
+    ]
+
+
 def build_auth_provider() -> MultiAuth:
-    """Compose Okta OIDC + agent-jwt JWT verification via FastMCP MultiAuth.
+    """Compose Okta OIDC + pluggable agent-token verification via FastMCP
+    MultiAuth.
 
-    MultiAuth tries the Okta OIDCProxy first (interactive users), then the
-    JWTVerifier (programmatic agent-jwt tokens). The two paths are fully
-    independent.
+    MultiAuth tries the Okta OIDCProxy first (interactive users), then each
+    configured agent-token verifier in ``AGENT_TOKEN_VERIFIERS`` order. The
+    paths are fully independent.
 
-    Required environment variables:
-        AGENT_JWT_SECRET: Shared HS256 secret for verifying agent-jwt tokens.
+    Environment variables:
+        AGENT_TOKEN_VERIFIERS: Comma-separated, ordered list of
+            ``TOKEN_VERIFIERS`` registry names / ``pkg.module:factory``
+            import paths (default: ``agent_jwt_hs256``).
+        AGENT_JWT_SECRET: Shared HS256 secret for verifying agent-jwt
+            tokens. Required iff ``agent_jwt_hs256`` is configured (the
+            default).
         (Plus everything required by ``build_okta_provider``.)
     """
     return MultiAuth(
         server=build_okta_provider(),
-        verifiers=[
-            JWTVerifier(
-                public_key=require_env("AGENT_JWT_SECRET"),
-                algorithm="HS256",
-                issuer=AGENT_JWT_ISSUER,
-            ),
-        ],
+        verifiers=_resolve_agent_token_verifiers(),
         # CRITICAL: do NOT inherit the Okta provider's
         # required_scopes (["openid", "email", "profile", "offline_access"]).
         # MultiAuth's bearer middleware enforces required_scopes against

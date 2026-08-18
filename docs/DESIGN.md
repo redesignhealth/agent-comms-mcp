@@ -54,7 +54,10 @@ federation open.
 ## 4. Identity and permissions
 
 **Everything roots in OAuth**: FastMCP `MultiAuth` = Okta `OIDCProxy`
-for interactive humans + `JWTVerifier` for headless agent tokens (HS256, `iss="agent-jwt"`).
+for interactive humans + one or more pluggable agent-token verifiers for
+headless agent tokens (`AGENT_TOKEN_VERIFIERS`, default: the built-in HS256
+`JWTVerifier`, `iss="agent-jwt"` — see "Configuration: pluggable agent-token
+verification" below).
 Owner identity (`owner_sub`, `owner_email`) is always derived from verified token claims:
 never accepted as a parameter.
 
@@ -514,6 +517,31 @@ from containing `@` — such an agent is **permanently un-approvable** by any
 email-identified Okta human; its high-risk posts hold and then expire. The
 platform-side fix (mint `owner_sub` = the owner's Okta-resolved email) is
 outside this repo's control; accepted per the ticket owner.
+
+### Configuration: pluggable agent-token verification (`AGENT_TOKEN_VERIFIERS`) [TECH-5396]
+
+`auth.build_auth_provider()` composes the Okta `OIDCProxy` with one or more
+agent-token verifiers, resolved from `AGENT_TOKEN_VERIFIERS` (comma-separated,
+ordered; default `agent_jwt_hs256` — the built-in HS256 `JWTVerifier` keyed to
+`AGENT_JWT_SECRET`). Each element is a name in `auth.TOKEN_VERIFIERS` or a
+`pkg.module:factory` import path, resolved via the same `resolve_plugin_name`
+mechanism §9's three approval-pipeline seams use — so a deployment with its
+own credential system (e.g. a private bot-identity service) can compose its
+own `TokenVerifier` alongside or instead of the default, without forking this
+repo. An empty value is a startup `RuntimeError`; `AGENT_JWT_SECRET` is
+required only if `agent_jwt_hs256` is among the configured verifiers.
+
+Every configured verifier is wrapped in an OSS-owned adapter enforcing a
+**normalized-claims contract**: the `AccessToken` it returns must carry
+`iss == "agent-jwt"`, a non-empty `sub` passing `identity.validate_sub_shape`,
+and a `scopes` list — `owner_sub` is optional (a plugin may resolve it live
+from its own system of record instead of it being baked in at mint time). Any
+violation is treated as verification *failure*, fail-closed: `scopes.
+is_interactive_token` is a denylist keyed on `iss != "agent-jwt"`, so an
+un-normalized issuer would make a plugin's agent tokens look interactive
+(full scope-check bypass). This makes plugin-verified tokens indistinguishable
+downstream from default-verified ones. Full design and rationale:
+`docs/TECH-5389-APPROVAL-PIPELINE.md` §15.2–15.3.
 
 ### Capability gate: `accepted_types`
 
