@@ -5,6 +5,15 @@ items in §17 remain genuinely open. This document is the planning deliverable �
 or existing files have been modified. DESIGN.md changes are *listed* in §13 as planned
 edits, not applied.
 
+Revision (2026-08-17, later — pluggable auth verification): PR 1 (the risk-scorer seam in
+`plugins.py`) and the `mint_token.py` CLI have since landed on this branch. §15 is
+rewritten from an accepted risk into a resolved design: agent-token *verification*
+becomes a pluggable auth-layer seam (same mechanism as §1, tracked as a **companion
+ticket**, not TECH-5389), and the decide surface gains two verifier-agnostic hardenings
+that DO land in TECH-5389 PR 2 — an `owner_sub` hold-time snapshot and a structurally
+interactive-only decide gate. Sections touched by this revision: §1, §4, §5, §7,
+§9–§14, §15 (rewritten), §16. Later sections override earlier ones where they conflict.
+
 Verified against the current worktree:
 
 - Migration head: `136265b3f22d` (`drop_redundant_participants_index`).
@@ -59,6 +68,12 @@ seams like `OwnershipClient`, no plugin frameworks):
   `TYPE_CHECKING`-only import in `plugins.py` (both files already use
   `from __future__ import annotations`). No module moves. (Code-comment note:
   `OwnershipClient` is effectively a pre-existing fourth seam of the same shape.)
+- **A further pluggable seam of the same mechanism — the agent-token verifier — lives
+  at the auth layer, deliberately NOT in this list**: it is resolved in
+  `auth.build_auth_provider()` (not `providers/comms.py`), consumed by FastMCP's
+  `MultiAuth` (not `service.py`), and its registry lives in `auth.py` (`plugins.py`
+  must stay importable by the fastmcp-free `service.py`, so it cannot grow a fastmcp
+  dependency). Design, trust argument, and ticket split in §15.
 
 Tradeoff, stated: registry names give typo-safety for in-tree implementations; the
 import-path fallback lets company code plug in from a private package on `PYTHONPATH`
@@ -194,8 +209,8 @@ class ApprovalNotification:
     conversation_type: str
     sender_agent_id: str
     sender_display_name: str
-    owner_sub: str            # routing key: whose approval is needed
-    owner_email: str          # human-friendly routing (Slack lookup, email)
+    owner_sub: str            # routing key: whose approval is needed (the hold's §15.4 snapshot)
+    owner_email: str          # human-friendly routing (Slack lookup, email; still from the agents row)
     message_type: str
     risk_reason: str
     expires_at: str           # ISO 8601
@@ -260,6 +275,8 @@ approval_holds
   payload             JSONB NOT NULL     -- validated, normalized dump (insert-ready)
   risk_reason         TEXT NOT NULL      -- scorer verdict reason ('boundary_crossing', ...)
   risk_scorer         TEXT NOT NULL      -- which scorer produced the verdict (registry name / import path)
+  owner_sub           TEXT NOT NULL      -- approver routing key: the sender's verified owner identity,
+                                         -- snapshotted at hold-creation time (§15.4)
   status              TEXT NOT NULL CHECK IN
                         ('pending_auto','pending_human','auto_approved','approved','rejected','expired')
   auto_approver       TEXT NULL          -- which implementation reviewed it
@@ -272,15 +289,20 @@ approval_holds
   expires_at          TIMESTAMPTZ NOT NULL              -- created + APPROVAL_HOLD_TTL, lazy expiry
   created_at / updated_at
 
-  idx_approval_holds_sender_agent_id_status_created_at   -- hold rate limit + list-pending + get_hold_status
+  idx_approval_holds_sender_agent_id_status_created_at   -- hold rate limit + get_hold_status
+  idx_approval_holds_owner_sub_status_created_at         -- list-pending owner filter (§10)
   idx_approval_holds_conversation_id
 ```
 
 - **No `high_risk` boolean**: a hold exists *only because* the verdict was high-risk;
   `risk_reason`/`risk_scorer` carry the verdict.
-- No `owner_sub` snapshot: `agents.owner_sub` is frozen at first registration
-  (verified in `service.register_agent`), so the decide-time join reads the identical
-  value a snapshot would have captured.
+- **`owner_sub` IS snapshotted** (reverses this section's earlier "no snapshot"
+  position — the old rationale assumed the frozen `agents.owner_sub` and a hold-time
+  snapshot were always identical, which stops being true once verification is
+  pluggable, §15). Sourced from the sender's *verified* `owner_sub` claim on the
+  request that created the hold, falling back to `agents.owner_sub` when the claim is
+  absent; under the OSS default verifier the two normally coincide. Decide, list, and
+  the notifier read the hold's snapshot, never the agents row (§15.4).
 - `decision_reason` free text is acceptable here — see the trust argument in §8.
 - Mutable table (status flips), hence `updated_at` — the append-only invariant on
   `messages`/`audit_log` is untouched.
@@ -392,7 +414,10 @@ including the capability gate (all unchanged):
 3. `high_risk=True` →
    - Hold rate limit (`denied.rate_limited`, `limit="approval_holds_per_hour"` — rate
      limiting was never part of the divert-don't-deny reversal).
-   - Insert hold (`pending_auto`), audit `approval.hold`.
+   - Insert hold (`pending_auto`; `owner_sub` snapshotted from the sender's verified
+     claim per §15.4, passed down from the tools layer as a parameter — the existing
+     "identity derives from verified claims, never arguments" rule), audit
+     `approval.hold`.
    - Auto-approver inline. Cleared → `_approve_hold_and_post` in the same transaction
      (conversation lock already held via
      `_load_participant_for_transition(for_update=True)`, seq assigned race-safe),
@@ -467,16 +492,24 @@ minimal correct thing. An inbox integration can come later without breaking anyt
 
 ## 9. The decide endpoint (non-MCP HTTP) — carried over; deltas noted
 
-Everything structural from the prior revision survives: `POST
+Everything structural from the prior revision survives, with the interactive gate
+*strengthened* now that verification is pluggable (§15): `POST
 /approvals/{hold_id}/decide` via `mcp.custom_route` (handler self-verifies the bearer
-against the shared MultiAuth provider instance — exact verify-method name pinned down
-against the installed FastMCP version at implementation time); **hard interactive-token
-gate with NO agent-scope escape hatch** (`is_interactive_token(token)` required;
-agent-jwt rejected outright regardless of any scope including `comms:admin` —
-deliberately unlike the `is_interactive_token(token) or "comms:admin" in
-scopes_for_token(token)` pattern in `providers/comms.py`; this structural gate is what
-makes agent self-approval impossible); approver's verified sub
-(`identity.try_resolve_email`) must equal the sender agent's `owner_sub`;
+— exact verify-method name pinned down against the installed FastMCP version at
+implementation time); **hard interactive-token gate with NO agent-scope escape hatch,
+enforced by verification path, not claim inspection**: the handler verifies the bearer
+against the interactive (Okta OIDC) provider ONLY — the agent-verifier chain (§15) is
+never consulted for authorization here, so no agent credential of ANY format (OSS
+agent-jwt or a consumer plugin's tokens) can pass, regardless of any scope including
+`comms:admin` — deliberately unlike the `is_interactive_token(token) or "comms:admin"
+in scopes_for_token(token)` pattern in `providers/comms.py`. `is_interactive_token`
+is still asserted on the verified result as a belt-and-braces check, but the load-
+bearing gate is *which provider verified the token*: even a buggy or hostile plugin
+verifier (§15.3) cannot make an agent token decide a hold. A bearer that fails
+interactive verification is run through the agent chain solely to attribute the
+`denied.approval_requires_interactive` audit row, then rejected. Approver's verified
+sub (`identity.try_resolve_email`) must equal the hold's `owner_sub` snapshot
+(§15.4 — no longer the frozen `agents.owner_sub`);
 **uniform 404** for unknown-hold and not-your-hold (audit distinguishes
 `denied.unknown_hold` / `denied.hold_not_owner`); 409 already-decided
 (`denied.hold_wrong_state.<status>`); 410 lazily-expired (`approval.expire`); 422 bad
@@ -484,6 +517,10 @@ body; no endpoint rate limiting (interactive-human-only by construction).
 
 Deltas for the ratified design:
 
+- **Owner-match source changed (pluggable-verifier revision)**: decide reads
+  `approval_holds.owner_sub` — the hold-time snapshot — not the frozen
+  `agents.owner_sub` (§15.4 for the full rationale). Verifier-agnostic; lands in PR 2
+  regardless of whether the companion verifier-seam ticket has shipped.
 - Body now carries the optional `reason` (§8b); stored on the hold in the same
   transaction as the decision.
 - Human decide acts only on `pending_human` (`pending_auto` → 409
@@ -504,9 +541,9 @@ Deltas for the ratified design:
 
 ## 10. `GET /approvals/pending` — in scope (confirmed)
 
-Same non-MCP surface and identical auth gate as decide (interactive-only +
-owner-match). Returns full hold detail **including the held text** for holds whose
-sender agent's `owner_sub` == the caller's verified sub, `pending_human` only, ordered
+Same non-MCP surface and identical auth gate as decide (interactive-provider-only
+verification + owner-match, §9). Returns full hold detail **including the held text**
+for holds whose `owner_sub` snapshot (§15.4) == the caller's verified sub, `pending_human` only, ordered
 `created_at` ASC, simple `limit` + `has_more`. Load-bearing twice: the notifier
 deliberately carries a pointer (this is where the human reads the text), and it is the
 aggregation read-path any company approval UI (e.g. RH's Slack + list view) consumes.
@@ -525,7 +562,7 @@ aggregation read-path any company approval UI (e.g. RH's Slack + list view) cons
 | `denied.risk_unscored` | sender's sub | scorer infrastructure failure — hard deny (detail: cause) |
 | `denied.rate_limited` (`approval_holds_per_hour`) | sender's sub | hold spam cap |
 | `denied.system_message_type` | sender's sub | agent tried to post `conversation_opened` directly |
-| `denied.approval_requires_interactive` | endpoint caller identity | agent-jwt token hit a decide/list endpoint |
+| `denied.approval_requires_interactive` | endpoint caller identity | non-interactive (agent) token hit a decide/list endpoint — bearer failed interactive-provider verification; the agent chain is consulted for attribution only (§9) |
 | `denied.unknown_hold` / `denied.hold_not_owner` / `denied.hold_not_sender` | caller | uniform-denial pairs (endpoint 404s; tool uniform error) |
 | `denied.hold_wrong_state.<status>` | approver | already-decided hold |
 | `risk.shared_sender_bypass` (renames `agent.boundary_check_bypassed_shared`; no back-compat, ratified) | sender | shared-sender bypass verdict from the v1 scorer |
@@ -539,8 +576,9 @@ updated accordingly.
 ## 12. Migration
 
 Still **one additive Alembic revision**, `down_revision = "136265b3f22d"`: create
-`approval_holds` with the §5 columns **including `decision_reason`**, both CHECKs,
-both indexes, UNIQUE on `message_id`, `if_not_exists`/`if_exists` guards per repo
+`approval_holds` with the §5 columns **including `decision_reason` and the
+`owner_sub` snapshot**, both CHECKs, all three indexes, UNIQUE on `message_id`,
+`if_not_exists`/`if_exists` guards per repo
 style (`a1b2c3d4e5f6` precedent). `boundary_safe` never existed in the DB — its
 removal is code-only. Purely additive → normal rolling deploy is safe (deployment
 docstring says so). Offline-SQL assertions added to `test_migrations_offline.py`.
@@ -576,7 +614,9 @@ docstring says so). Offline-SQL assertions added to `test_migrations_offline.py`
   *does* enter counterpart agents' contexts — human judgment is the injection control.
 - New configuration subsection: `RISK_SCORER` / `AUTO_APPROVER` / `APPROVAL_NOTIFIER`,
   import-path plugins, startup fail-fast, webhook env vars, and the `owner_sub`
-  accepted-risk statement (§15).
+  provenance statement (§15 — resolved-by-design under a live-resolving verifier;
+  static-claim `mint_token.py` path as the OSS default). The `AGENT_TOKEN_VERIFIERS`
+  seam itself is documented in DESIGN.md by its companion ticket, not TECH-5389's pass.
 - `main.py` `instructions` string and affected tool docstrings updated in the same PR.
 
 ## 14. Test plan
@@ -586,29 +626,189 @@ docstring says so). Offline-SQL assertions added to `test_migrations_offline.py`
 | **New `tests/test_plugins.py`** | Scorer verdict matrix (type × conversation-type × ownership topology — absorbing `is_boundary_crossing_safe`'s cases from `test_state_machine.py`); shared-sender bypass verdict; scorer RAISES on lookup error / empty owners / unknown conversation type; registry + import-path resolution; startup fail-fast (unknown name, bad path, missing webhook env); `EscalateAllAutoApprover`; notifier payload excludes text; `LogOnlyNotifier`; `WebhookNotifier` HMAC + timeout |
 | `tests/test_state_machine.py` | Remove the 27 boundary mentions (moved); `conversation_opened` legal only in `active`, no state transition |
 | `tests/test_schemas.py` | Remove `boundary_safe`/`MessageSchema`/`is_boundary_safe` tests (20 mentions); `ConversationOpenedV1` validation; drift guard covers the new Literal entry |
-| `tests/test_service.py` | Diversion: high-risk post creates hold + **no** `messages` row + held return; non-high-risk path byte-for-byte unchanged; scorer exception → `denied.risk_unscored` hard denial (no hold row); inline auto-clear (fake approver) posts atomically; hold rate limit; notifier-failure isolation (`approval.notify_failed`, response still held); **seq-1 divert**: conversation created with `conversation_opened` seq 1 at the negotiated version, `invite`'s pin re-check still works, held content posts as seq 2 on approval, capability gate still hard-denies targets not accepting the ORIGINAL type, direct agent post of `conversation_opened` denied; decide flows (approve atomicity incl. forced-failure rollback, seq race vs. concurrent post, reject-no-message + `decision_reason` stored, owner mismatch ≡ unknown hold, already-decided, expired, conversation-went-terminal, capability re-check); `get_hold_status` service logic (sender-only uniform denial, lazy expiry, reason/seq surfacing); full audit-row assertions per §11; the 44 existing boundary-denial tests rewritten to expect holds (or `denied.risk_unscored` where the cause was infrastructure) |
+| `tests/test_service.py` | Diversion: high-risk post creates hold + **no** `messages` row + held return; non-high-risk path byte-for-byte unchanged; scorer exception → `denied.risk_unscored` hard denial (no hold row); inline auto-clear (fake approver) posts atomically; hold rate limit; notifier-failure isolation (`approval.notify_failed`, response still held); **seq-1 divert**: conversation created with `conversation_opened` seq 1 at the negotiated version, `invite`'s pin re-check still works, held content posts as seq 2 on approval, capability gate still hard-denies targets not accepting the ORIGINAL type, direct agent post of `conversation_opened` denied; decide flows (approve atomicity incl. forced-failure rollback, seq race vs. concurrent post, reject-no-message + `decision_reason` stored, owner mismatch ≡ unknown hold, already-decided, expired, conversation-went-terminal, capability re-check); **`owner_sub` snapshot**: hold captures the verified claim (falls back to `agents.owner_sub` when absent), decide/list match the snapshot not the agents row — a re-minted corrected owner routes *future* holds (§15.4); `get_hold_status` service logic (sender-only uniform denial, lazy expiry, reason/seq surfacing); full audit-row assertions per §11; the 44 existing boundary-denial tests rewritten to expect holds (or `denied.risk_unscored` where the cause was infrastructure) |
 | `tests/test_comms_tools.py` | End-to-end: `note` into an `open` conversation returns the held shape (rewrites the 15 boundary mentions); approved hold's message then visible via `comms_get_conversation` with original type; `comms_get_hold_status` happy path + rejected-with-reason + uniform denial; seq-1 divert response shape |
-| `tests/test_db_models.py` | `approval_holds` round-trip, both CHECKs, FKs, `message_id` uniqueness, `decision_reason` nullable |
+| `tests/test_db_models.py` | `approval_holds` round-trip, both CHECKs, FKs, `message_id` uniqueness, `decision_reason` nullable, `owner_sub` NOT NULL |
 | `tests/test_migrations_offline.py` | New revision DDL assertions |
-| **New `tests/test_approval_endpoint.py`** | 401/403 (incl. **agent-jwt + `comms:admin` → 403** — the load-bearing structural test), uniform 404 pair, decide flows over HTTP incl. `reason` persistence, `pending_human`-only, list-pending owner filtering + includes text, audit attribution to the approver's sub. Own file: needs the Postgres fixture block (mirrored from `test_comms_tools.py`), which `test_main.py` deliberately lacks |
+| **New `tests/test_approval_endpoint.py`** | 401/403 (incl. **agent-jwt + `comms:admin` → 403** — the load-bearing structural test, now asserting the bearer is verified against the interactive provider ONLY, with the agent chain consulted solely for denial attribution — §9/§15), uniform 404 pair, decide flows over HTTP incl. `reason` persistence, `pending_human`-only, list-pending owner filtering + includes text, audit attribution to the approver's sub. Own file: needs the Postgres fixture block (mirrored from `test_comms_tools.py`), which `test_main.py` deliberately lacks |
 | `tests/test_main.py` | `TestScopeRegistryParity` covers `comms_get_hold_status` enrollment mechanically |
 | `tests/test_scopes.py` | `comms_get_hold_status` → `comms:read` mapping |
 
-## 15. `owner_sub` provenance — accepted risk (carried verbatim)
+## 15. Pluggable agent-token verification; `owner_sub` provenance resolved
 
-- Okta-registered agents: `owner_sub` = verified email-resolved identity. Sound.
-- agent-jwt-registered agents: `owner_sub` = the **caller-supplied, unverified**
-  `owner_sub` extra claim (protected only by possession of `AGENT_JWT_SECRET` at mint
-  time), frozen at first registration so it cannot be re-registered onto a victim
-  later. **Accepted risk per ticket owner — documented, not open.**
-- Finding 1 (now more important, since *every* high-risk post depends on the match):
-  the no-claim fallback sets `owner_sub` to the agent-jwt `sub`, which
-  `identity.validate_sub_shape` forbids from containing `@` — such agents are
-  **permanently un-approvable** by any email-identified Okta human; their high-risk
-  posts will hold and then expire. The platform must mint `owner_sub` = the owner's
-  Okta-resolved email.
-- Finding 2: the decide/list/status match is exact-string. Exact match in v1 — a case
-  mismatch yields an un-approvable hold, not a security hole.
+*(Rewrites the former "`owner_sub` provenance — accepted risk". The risk is now
+resolvable by construction rather than merely accepted; the OSS static-claim path
+remains a complete, correct, standalone default. The seam itself is a **companion
+ticket**, not TECH-5389 scope — see §15.5 for the exact split.)*
+
+### 15.1 The correction
+
+The plan so far treated agent-token verification as fixed: `auth.build_auth_provider()`
+hardcodes one `JWTVerifier(public_key=require_env("AGENT_JWT_SECRET"),
+algorithm="HS256", issuer=AGENT_JWT_ISSUER)` into FastMCP's `MultiAuth` alongside the
+Okta `OIDCProxy` (auth.py:312–342). Under that assumption, an agent's human owner can
+only ever be a static `owner_sub` claim baked in at mint time (`mint_token.py`'s
+mandatory `--owner-email`/`--self-owned` choice), read once at first registration
+(providers/comms.py:431) and frozen into `agents.owner_sub` — hence this section's
+former accepted-risk framing. A consumer with its own credential system (e.g. an
+opaque-key-exchange service that hashes keys at rest and resolves ownership live from
+its own DB) had no way in short of forking, and importing any consumer-private auth
+package into this repo would break the open-source deployability story. The fix:
+the *verification* side becomes pluggable via the exact §1 mechanism; consumer-side
+verifiers live entirely in private packages that this repo is merely configured to
+trust.
+
+### 15.2 The seam (env var, registry, composition)
+
+**Placement call — deliberately NOT a fourth entry in §1's seam list.** The §1 seams
+are approval-pipeline policy: resolved in `providers/comms.py`, injected as parameters
+into `service.py`, exercised per message. This seam is auth-layer plumbing: resolved
+once inside `auth.build_auth_provider()` at process build, consumed by `MultiAuth`,
+never seen by `service.py`. Same *mechanism* (Protocol + registry + env-var/import-path
++ fail-fast), different layer, different trust argument — so it gets its own section
+here and its own ticket. Concretely, the registry cannot live in `plugins.py` anyway:
+`service.py` imports `plugins`, and the plan pins service as fastmcp-free, so
+`plugins.py` must not grow a fastmcp import; only `resolve_plugin`'s generic per-name
+resolution logic is shared (factored so both call sites use one implementation).
+
+- **Env var `AGENT_TOKEN_VERIFIERS`** (plural: comma-separated, ordered), default
+  `agent_jwt_hs256`. Each element is a registry name or a `pkg.module:factory` import
+  path — §1's resolution rule verbatim. `MultiAuth(verifiers=[...])` already takes a
+  list (auth.py's own docstring documents trial order: OIDCProxy first, then each
+  verifier), so **coexistence and replacement both fall out of the same knob**:
+  `AGENT_TOKEN_VERIFIERS=agent_jwt_hs256,rh_comms_plugins.auth:BotKeyVerifier` runs the
+  OSS default and a consumer verifier side by side (tried in that order); a lone import
+  path fully replaces the default. An empty value is a startup `RuntimeError`
+  (fail-fast; an interactive-only deployment is out of scope until someone needs it).
+- **Registry in `auth.py`**: `TOKEN_VERIFIERS: dict[str, Callable[[], TokenVerifier]]`
+  with one in-tree entry — `"agent_jwt_hs256"` → exactly today's `JWTVerifier(...)`
+  construction, moved verbatim into the factory. Consequence: `AGENT_JWT_SECRET`
+  becomes required *iff* `agent_jwt_hs256` is configured (the `require_env` call moves
+  inside the factory); a consumer that fully replaces the default no longer sets it.
+- **Protocol = FastMCP's own `TokenVerifier`** (`async verify_token(token: str) ->
+  AccessToken | None`) — no parallel Protocol invented; a plugin is anything MultiAuth
+  can already compose. (Exact class surface pinned against the installed FastMCP
+  version at implementation time, same caveat §9 already carries for the verify
+  method.)
+- **Fail-fast for free**: `build_auth_provider()` runs at process start, so an unknown
+  registry name or bad import path crashes at boot with no extra
+  `validate_configuration()` pass needed.
+
+### 15.3 The normalized-claims contract (what a verifier must expose)
+
+Everything downstream of verification keys on **one claim shape**, not on wire format:
+`scopes.is_interactive_token` / `scopes.scopes_for_token` / `scopes.safe_client_id`
+branch on `iss`; `identity.try_resolve_email` resolves agent identity from `sub`;
+registration reads `owner_sub`. So the contract is: **a plugin verifier may verify any
+wire format it likes (opaque key exchanged live against a private service, RS256 JWT
+from a private issuer, …), but the `AccessToken` it returns must carry normalized
+claims:**
+
+| claim | requirement |
+|---|---|
+| `iss` | MUST equal `"agent-jwt"` (`identity.AGENT_JWT_ISSUER`) — the normalized agent marker, regardless of what the wire token's own issuer was |
+| `sub` | the agent's identity string; non-empty, passes `identity.validate_sub_shape` (never email-shaped — the anti-impersonation rule) |
+| `scopes` | `list[str]` in `scopes.py`'s `TOOL_SCOPES` vocabulary |
+| `owner_sub` | OPTIONAL: the owning human's identity (their Okta-resolved email). **This is the live-resolution hook**: a consumer verifier may resolve it freshly from its own systems on every verification, instead of it being baked in at mint time |
+
+Why force `iss="agent-jwt"` rather than letting each verifier keep its own issuer:
+`scopes.is_interactive_token` (scopes.py:75–96) is a **denylist** — `iss !=
+"agent-jwt"` ⇒ interactive ⇒ full scope-check bypass. A plugin verifier surfacing
+`iss="acme"` would make its *agent* tokens look *interactive*: scope bypass everywhere
+and, absent §9's structural gate, admission to the decide surface — agent
+self-approval. Normalization makes the existing denylist safe by construction, and the
+whole identity stack (`try_resolve_email`'s sub-only path, `scopes_for_token`'s
+iss gate, `validate_sub_shape`) works on plugin-verified tokens unchanged.
+
+**Trust bound, stated.** A configured verifier is operator-trust-level by
+construction: whoever can set `AGENT_TOKEN_VERIFIERS` can set `AGENT_JWT_SECRET` and
+mint arbitrary tokens today, so a *malicious* plugin is a malicious operator — outside
+the threat model, exactly like a malicious `RISK_SCORER`. What does need bounding is
+the *honest-but-buggy* plugin (forgot to normalize, leaked a raw upstream claim set):
+
+1. **OSS-owned adapter**: `auth.py` wraps every configured verifier in a thin
+   normalization-enforcing adapter that post-checks the contract on each successful
+   verification and treats any violation as verification *failure* (return `None` +
+   structured log) — fail closed into 401, never fail open into "interactive."
+2. **The decide surface doesn't depend on any of it**: §9's gate verifies against the
+   interactive provider only; agent verifiers — default or plugin, correct or buggy —
+   are structurally incapable of admitting a token there.
+
+### 15.4 Where owner identity is read — the snapshot design
+
+Owner identity now has three read points, with a deliberate hold-time snapshot in the
+middle:
+
+1. **Registration (unchanged):** `register` reads the verified `owner_sub` claim,
+   frozen into `agents.owner_sub` at first registration — still the anti-forgery
+   freeze, still what `AgentTableOwnershipClient` feeds the risk scorer's owner sets.
+2. **Hold creation (new):** `post_message` / `start_conversation` snapshot the
+   sender's verified `owner_sub` claim *from the current request's token* into
+   `approval_holds.owner_sub`, falling back to `agents.owner_sub` when the claim is
+   absent (the column is NOT NULL either way). The tools layer passes the claim down
+   as a parameter — the existing "identity derives from verified claims, never
+   arguments" rule; `service.py` still never touches fastmcp.
+3. **Decide / list / notify (changed source):** the approver match (§9), the
+   `GET /approvals/pending` owner filter (§10), and `ApprovalNotification.owner_sub`
+   (§4) all read the hold's snapshot — stable for the life of the hold, and requiring
+   **no decide-time call into any consumer system**.
+
+Why a snapshot, rather than (a) keeping the frozen `agents.owner_sub` or (b) asking
+the plugin to resolve ownership live at decide time: (a) is precisely the old accepted
+risk — a mint-time or registration-time mistake is permanent, and it discards the
+live-verifier's freshness entirely; (b) would couple the human approval surface to a
+consumer service's availability, and there is nothing for a *token verifier* to verify
+at decide time anyway — the agent's credential is presented at *post* time, the
+human's at decide time. The snapshot captures the live-resolution benefit (owner as of
+the moment of the held post) at zero decide-time coupling, through a single
+verifier-agnostic mechanism the decide endpoint reads identically no matter which
+verifier produced the claim.
+
+What this resolves, per deployment class:
+
+- **Consumer with a live-resolving verifier (e.g. RH reusing its own bot-credential
+  service):** `owner_sub` is never baked at mint time at all — the wire credential can
+  be an opaque key with no claims; the verifier stamps the current owner from the
+  consumer's system of record on every verification, and every hold routes to the
+  owner as of post time. The former accepted-risk section is **moot** for this class.
+- **OSS default (static claim, `mint_token.py` as-is):** a complete, correct,
+  standalone path — nothing about it changes, and it stays the out-of-the-box default.
+  One strict improvement falls out: an agent minted with a wrong `--owner-email` (or
+  the pre-CLI no-claim fallback) is no longer *permanently* un-approvable — re-minting
+  with the correct `--owner-email` fixes routing for all **future** holds, because the
+  hold reads the claim, not the frozen row. (Former Finding 1, downgraded from
+  permanent to mint-fixable.)
+- **`--self-owned` / no-claim agents:** the fallback is the agent's own `sub`, which
+  `validate_sub_shape` guarantees is never email-shaped, so no email-identified Okta
+  human can match — un-approvable **by design**, unchanged, and since `mint_token.py`
+  landed it is an explicit mint-time choice rather than a silent default.
+
+Residuals, stated:
+
+- Trust root unchanged: the snapshot is exactly as trustworthy as the verifier that
+  attested the claim (OSS default: possession of `AGENT_JWT_SECRET` at mint time;
+  plugin: the consumer's credential system). Verifier-attested ≠ caller-suppliable —
+  the claim never arrives as a tool argument.
+- A hold's approver is fixed at hold time: an ownership change during the ≤7-day TTL
+  does not re-route in-flight holds. Accepted; they expire or the recorded owner acts.
+- The risk *scorer* still consumes the frozen `agents.owner_sub` via
+  `AgentTableOwnershipClient`, so a re-minted owner changes approval **routing** but
+  not boundary **scoring**. Making `OwnershipClient` env-pluggable (it is already the
+  same Protocol shape — §1's code-comment note) so live-ownership consumers get
+  consistent scoring + routing is an explicit open question on the companion ticket,
+  not built here.
+- Exact-string match retained (former Finding 2): a case mismatch yields an
+  un-approvable hold, not a security hole.
+
+### 15.5 Ticket split
+
+Verifier-**agnostic** pieces land in **TECH-5389 PR 2** — they harden the decide
+surface even with only the default verifier configured: the `approval_holds.owner_sub`
+snapshot column + fallback + changed read points (§4/§5/§9/§10), and §9's
+interactive-provider-only structural gate. The **seam itself** —
+`AGENT_TOKEN_VERIFIERS`, the `auth.py` registry, the normalization-enforcing adapter,
+conditional `AGENT_JWT_SECRET` — is a separate companion ticket: additive at the auth
+layer, no approval-pipeline coupling, independently shippable before or after PR 2.
 
 ## 16. PR sequencing
 
@@ -621,12 +821,19 @@ exceptions to the existing `denied.ownership_unverified`-equivalent denial. Test
 change. Verify: full suite.
 
 **PR 2 — the pipeline.** `approval_holds` model + migration (incl.
-`decision_reason`); auto-approver + notifier seams (defaults + webhook impl);
+`decision_reason` and the `owner_sub` snapshot column, §15.4); auto-approver +
+notifier seams (defaults + webhook impl);
 diversion flow + held response shape + hold rate limit; `denied.risk_unscored`
 finalized; seq-1 auto-opener (`conversation_opened` type + system-type gate/exemption);
-`comms_get_hold_status` + `TOOL_SCOPES` entry; decide + list-pending endpoints;
+`comms_get_hold_status` + `TOOL_SCOPES` entry; decide + list-pending endpoints
+(interactive-provider-only gate + snapshot-based owner match, §9);
 audit actions; DESIGN.md edits; all remaining tests. Verify: suite +
 `alembic upgrade head --sql` review.
+
+**Not in either PR:** the pluggable agent-token-verifier seam itself (§15.2–§15.3) is
+a companion ticket at the auth layer — PR 2 is designed so that ticket is purely
+additive (the snapshot and the structural decide gate are verifier-agnostic and land
+here regardless).
 
 The split is deliberate: PR 1 is a pure refactor reviewable for equivalence; PR 2 is
 where behavior changes, so the reversal-of-denial-posture diff is isolated and
