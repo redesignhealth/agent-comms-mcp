@@ -542,7 +542,11 @@ but lives in `service.py`, not `plugins.py` (its registry needs `service.py`'s o
 `AgentTableOwnershipClient`/`OwnershipClient` types, and `plugins.py` must stay
 import-free of `service.py` to avoid a cycle) -- validated separately at boot via
 `service.validate_ownership_client_configuration()`, called from `main._cli()`
-alongside `plugins.validate_configuration()`. Structurally different from the other
+alongside `plugins.validate_configuration()`. That boot check requires not just that
+`OWNERSHIP_CLIENT` resolves, but that the resolved value is itself callable: a custom
+plugin's configured factory must return a *second* callable
+(`Callable[[AsyncSession], OwnershipClient]`), not an `OwnershipClient` instance
+directly. Structurally different from the other
 three: `OwnershipClient` implementations need the CURRENT request's session (the
 default reads the same-transaction `agents` row), so this seam resolves a *factory*
 (`Callable[[AsyncSession], OwnershipClient]`) once at startup, then calls it fresh

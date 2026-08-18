@@ -4960,17 +4960,14 @@ class TestListConversations:
 
 
 class _FakeLiveOwnershipClient:
-    """Stand-in for a live-resolving OwnershipClient plugin (e.g. TECH-5397's
-    ownership registry) -- stateless and reusable, ignores any session
+    """Stand-in for a live-resolving OwnershipClient plugin (e.g. a consumer's
+    own ownership registry) -- stateless and reusable, ignores any session
     argument, matching the shape a real HTTP-backed implementation would have."""
-
-    def __init__(self, owners: dict[uuid.UUID, list[str]] | None = None) -> None:
-        self._owners = owners or {}
 
     async def get_agent_owners(self, agent_id: uuid.UUID) -> dict[str, Any]:
         return {
             "is_shared": False,
-            "owners": self._owners.get(agent_id, ["live-resolved@example.com"]),
+            "owners": ["live-resolved@example.com"],
         }
 
 

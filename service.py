@@ -3825,7 +3825,7 @@ def get_ownership_client_factory() -> OwnershipClientFactory:
     (registry name or ``pkg.module:factory`` import path, same convention as every
     other pluggable seam), default ``agent_table`` (``AgentTableOwnershipClient``,
     reading the frozen ``agents.owner_sub`` column). A live-resolving consumer (e.g.
-    TECH-5397's ownership registry) can point this at the SAME source its
+    a consumer's own ownership registry) can point this at the SAME source its
     ``AGENT_TOKEN_VERIFIERS`` plugin already resolves ``owner_sub`` from, closing the
     gap where a re-minted/reassigned owner fixes approval *routing* immediately but
     boundary *scoring* keeps reading the frozen column until this seam is configured.
@@ -3849,16 +3849,30 @@ def validate_ownership_client_configuration() -> None:
     value is a FACTORY-of-factories -- ``resolve_plugin`` returns whatever the
     configured factory function returns, which for this seam must be a second
     callable (``Callable[[AsyncSession], OwnershipClient]``), not an instance.
-    A misconfigured ``OWNERSHIP_CLIENT=pkg.module:MyOwnershipClient`` (a class,
-    not a factory-of-factories) would otherwise resolve "successfully" here
-    and only fail with ``TypeError: object is not callable`` on the first live
-    request -- defeating the fail-fast guarantee this function exists for.
+    This guards against a factory that constructs successfully but returns a
+    non-callable object (e.g. ``return object()``) -- that would otherwise
+    resolve "successfully" here and only fail with a bare ``TypeError`` on the
+    first live request. It does NOT catch every misconfiguration shape: e.g.
+    ``OWNERSHIP_CLIENT=pkg.module:MyOwnershipClient`` (a class expecting a
+    session, not a factory-of-factories) already fails inside
+    ``resolve_plugin_name`` with an unprefixed ``TypeError`` before this check
+    ever runs, and a callable with the wrong signature (e.g.
+    ``lambda session, extra: None``) passes this check and only fails at
+    request time.
     """
+    global _ownership_client_factory
     factory = get_ownership_client_factory()
     if not callable(factory):
+        # Undo the cache-on-resolve in get_ownership_client_factory() before
+        # raising: otherwise a caller that catches this RuntimeError (a test
+        # harness, a health-check wrapper) leaves the non-callable value
+        # cached, and every subsequent get_ownership_client_factory() call
+        # returns it without re-resolving -- silently subverting fail-fast.
+        _ownership_client_factory = None
         raise RuntimeError(
-            f"{OWNERSHIP_CLIENT_ENV_VAR}: resolved value {factory!r} is not callable -- "
-            "expected a factory of shape Callable[[AsyncSession], OwnershipClient]"
+            f"{OWNERSHIP_CLIENT_ENV_VAR}: resolved value of type "
+            f"{type(factory).__name__!r} is not callable -- expected a factory "
+            "of shape Callable[[AsyncSession], OwnershipClient]"
         )
 
 

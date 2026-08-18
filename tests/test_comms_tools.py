@@ -1627,6 +1627,64 @@ class TestOwnershipClientSeamIntegration:
         )
         assert started["state"] == "active"
 
+    async def test_asymmetric_open_deny_path_also_consults_the_configured_ownership_client(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import service
+
+        # Two agents with the SAME frozen owner_sub -- under the real
+        # AgentTableOwnershipClient, an asymmetric conversation between them
+        # would be ADMITTED (owners overlap). A fake plugin reporting them as
+        # having DISJOINT owner sets must instead deny it, proving the deny
+        # branch also routes through the configured seam rather than
+        # hardcoding AgentTableOwnershipClient (which the admit-path test
+        # above cannot distinguish from this branch on its own).
+        await _register(main, test_session_factory, "seam-owner-2", owner_sub="owner-shared")
+        await _register(main, test_session_factory, "seam-target-2", owner_sub="owner-shared")
+        token_owner = _token("seam-owner-2")
+
+        list_result = await _call(main, test_session_factory, token_owner, "comms_list_agents")
+        target_id = next(
+            a["agent_id"] for a in list_result["agents"] if a["sub"] == "seam-target-2"
+        )
+
+        class _FakeDisjointOwnerClient:
+            def __init__(self) -> None:
+                self._calls = 0
+
+            async def get_agent_owners(self, agent_id: Any) -> dict[str, Any]:
+                self._calls += 1
+                owner = f"disjoint-owner-{self._calls}@example.com"
+                return {"is_shared": False, "owners": [owner]}
+
+        fake_instance = _FakeDisjointOwnerClient()
+        monkeypatch.setenv(
+            service.OWNERSHIP_CLIENT_ENV_VAR,
+            "tests.test_comms_tools:_fake_shared_owner_client_factory",
+        )
+        monkeypatch.setattr(
+            "tests.test_comms_tools._fake_shared_owner_client_factory_instance", fake_instance
+        )
+        monkeypatch.setattr(service, "_ownership_client_factory", None)
+
+        with pytest.raises(
+            ToolError, match=re.escape("access_denied: not authorized for this resource")
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                token_owner,
+                "comms_start_conversation",
+                {
+                    "conversation_type": "asymmetric",
+                    "target_agent_ids": [target_id],
+                    "initial_message": _availability_request(),
+                },
+            )
+
 
 _fake_shared_owner_client_factory_instance: Any = None
 
