@@ -412,8 +412,11 @@ def _expiry_violation(expires_at: int | None, claims: dict[str, Any]) -> str | N
     pass an honest-but-buggy plugin's malformed timestamp through as valid.
     """
     now = time.time()
-    if expires_at is not None and expires_at <= now - _CLOCK_SKEW_LEEWAY_SECONDS:
-        return f"expires_at={expires_at} is in the past"
+    if expires_at is not None:
+        if not math.isfinite(expires_at):
+            return "expires_at is not a finite timestamp"
+        if expires_at <= now - _CLOCK_SKEW_LEEWAY_SECONDS:
+            return f"expires_at={expires_at} is in the past"
     for claim_name, past_is_bad in (("exp", True), ("nbf", False)):
         value = claims.get(claim_name)
         if value is None:

@@ -716,7 +716,7 @@ claims:**
 | claim | requirement |
 |---|---|
 | `iss` | MUST equal `"agent-jwt"` (`identity.AGENT_JWT_ISSUER`) — the normalized agent marker, regardless of what the wire token's own issuer was |
-| `sub` | the agent's identity string; non-empty, passes `identity.validate_sub_shape` (never email-shaped — the anti-impersonation rule) |
+| `sub` | the agent's identity string; a `str` instance, non-empty, passes `identity.validate_sub_shape` (never email-shaped — the anti-impersonation rule) |
 | `scopes` | `list[str]` in `scopes.py`'s `TOOL_SCOPES` vocabulary |
 | `owner_sub` | OPTIONAL: the owning human's identity (their Okta-resolved email). **This is the live-resolution hook**: a consumer verifier may resolve it freshly from its own systems on every verification, instead of it being baked in at mint time |
 | `exp` / `nbf` / `AccessToken.expires_at` | OPTIONAL, but when present MUST NOT be expired (`exp`/`expires_at`) or not-yet-valid (`nbf`) — checked independently by the OSS-owned adapter (60s clock-skew leeway), not trusted from the inner verifier. A verifier with no expiry mechanism at all (relying instead on live revocation) is not required to set any of these |

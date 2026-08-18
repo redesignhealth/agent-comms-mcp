@@ -14,6 +14,7 @@ import hashlib
 import itertools
 import json
 import os
+import time
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
@@ -26,6 +27,7 @@ from auth import (
     AGENT_TOKEN_VERIFIERS_ENV_VAR,
     TOKEN_VERIFIERS,
     OktaOIDCProxy,
+    _expiry_violation,
     _NormalizingVerifier,
     _resolve_agent_token_verifiers,
     build_okta_provider,
@@ -682,6 +684,45 @@ class TestNormalizingVerifierContract:
         verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
 
         assert await verifier.verify_token("whatever") is None
+
+    async def test_rejects_nan_nbf_claim(self) -> None:
+        token = _access_token(
+            iss="agent-jwt", sub="good-agent", scopes=["comms:read"], nbf=float("nan")
+        )
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
+
+        assert await verifier.verify_token("whatever") is None
+
+    async def test_rejects_infinite_nbf_claim(self) -> None:
+        token = _access_token(
+            iss="agent-jwt", sub="good-agent", scopes=["comms:read"], nbf=float("inf")
+        )
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
+
+        assert await verifier.verify_token("whatever") is None
+
+    async def test_accepts_nbf_within_clock_skew_leeway(self) -> None:
+        """An ``nbf`` a few seconds in the future (well under the 60s leeway) must
+        still pass -- this is exactly the ordinary-clock-drift case the leeway
+        exists for (e.g. ``nbf == iat`` on a host whose clock runs slightly
+        ahead of this one)."""
+        now = time.time()
+        token = _access_token(
+            iss="agent-jwt", sub="good-agent", scopes=["comms:read"], nbf=now + 5
+        )
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
+
+        assert await verifier.verify_token("whatever") is token
+
+    def test_expiry_violation_rejects_nonfinite_expires_at_directly(self) -> None:
+        """AccessToken.expires_at is a pydantic int field that rejects NaN/inf at
+        construction time via normal validation, so this path can't be exercised
+        through a real AccessToken -- test _expiry_violation directly instead, the
+        same way an honest-but-buggy plugin using model_construct() to skip
+        validation could still reach this code."""
+        assert _expiry_violation(float("nan"), {}) is not None
+        assert _expiry_violation(float("inf"), {}) is not None
+        assert _expiry_violation(int(time.time()) + 3600, {}) is None
 
     async def test_accepts_future_exp_and_past_nbf(self) -> None:
         far_future = 9999999999
