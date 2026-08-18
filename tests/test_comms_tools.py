@@ -1567,6 +1567,74 @@ class TestRateLimitAndSchemaErrors:
         assert started["schema_version"] == 1
 
 
+class TestOwnershipClientSeamIntegration:
+    """Regression coverage for the actual functional change wiring the pluggable
+    OwnershipClient seam (TECH-5396 open question 1) into providers/comms.py:
+    the three call sites there now go through service.get_ownership_client_factory()
+    instead of constructing AgentTableOwnershipClient directly. Exercise that
+    through a real comms_start_conversation call, not just the seam in isolation
+    (tests/test_plugins.py) or against service.py directly (bypasses providers/
+    comms.py entirely)."""
+
+    async def test_asymmetric_open_consults_the_configured_ownership_client(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import service
+
+        # Two agents with genuinely DIFFERENT frozen owner_sub values -- an
+        # asymmetric conversation between them would be denied
+        # (denied.no_owner_overlap) under the real AgentTableOwnershipClient.
+        # A fake plugin reporting them as sharing one owner set must admit it
+        # instead, proving providers/comms.py actually consulted the
+        # configured seam rather than constructing AgentTableOwnershipClient
+        # directly.
+        await _register(main, test_session_factory, "seam-owner-1", owner_sub="owner-a")
+        await _register(main, test_session_factory, "seam-target-1", owner_sub="owner-b")
+        token_owner = _token("seam-owner-1")
+
+        list_result = await _call(main, test_session_factory, token_owner, "comms_list_agents")
+        target_id = next(
+            a["agent_id"] for a in list_result["agents"] if a["sub"] == "seam-target-1"
+        )
+
+        class _FakeSharedOwnerClient:
+            async def get_agent_owners(self, agent_id: Any) -> dict[str, Any]:
+                return {"is_shared": False, "owners": ["same-owner-for-both@example.com"]}
+
+        fake_instance = _FakeSharedOwnerClient()
+        monkeypatch.setenv(
+            service.OWNERSHIP_CLIENT_ENV_VAR,
+            "tests.test_comms_tools:_fake_shared_owner_client_factory",
+        )
+        monkeypatch.setattr(
+            "tests.test_comms_tools._fake_shared_owner_client_factory_instance", fake_instance
+        )
+        monkeypatch.setattr(service, "_ownership_client_factory", None)
+
+        started = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_start_conversation",
+            {
+                "conversation_type": "asymmetric",
+                "target_agent_ids": [target_id],
+                "initial_message": _availability_request(),
+            },
+        )
+        assert started["state"] == "active"
+
+
+_fake_shared_owner_client_factory_instance: Any = None
+
+
+def _fake_shared_owner_client_factory() -> Any:
+    return lambda session: _fake_shared_owner_client_factory_instance
+
+
 # --- Membership mutation tools: invite / leave / decline_invite ---------------------
 
 

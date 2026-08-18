@@ -3842,8 +3842,24 @@ def validate_ownership_client_configuration() -> None:
     """Fail fast at process start if ``OWNERSHIP_CLIENT`` doesn't resolve -- same
     posture as ``plugins.validate_configuration``'s three seams, called separately
     from ``main._cli()`` because this seam's registry lives here, not in
-    ``plugins.py`` (which must stay import-free of ``service.py``)."""
-    get_ownership_client_factory()
+    ``plugins.py`` (which must stay import-free of ``service.py``).
+
+    Also checks the resolved value is itself callable: unlike the other three
+    seams (registry value = an implementation instance), this seam's registry
+    value is a FACTORY-of-factories -- ``resolve_plugin`` returns whatever the
+    configured factory function returns, which for this seam must be a second
+    callable (``Callable[[AsyncSession], OwnershipClient]``), not an instance.
+    A misconfigured ``OWNERSHIP_CLIENT=pkg.module:MyOwnershipClient`` (a class,
+    not a factory-of-factories) would otherwise resolve "successfully" here
+    and only fail with ``TypeError: object is not callable`` on the first live
+    request -- defeating the fail-fast guarantee this function exists for.
+    """
+    factory = get_ownership_client_factory()
+    if not callable(factory):
+        raise RuntimeError(
+            f"{OWNERSHIP_CLIENT_ENV_VAR}: resolved value {factory!r} is not callable -- "
+            "expected a factory of shape Callable[[AsyncSession], OwnershipClient]"
+        )
 
 
 def may_assign(creator_owners: AbstractSet[str], assignee_owners: AbstractSet[str]) -> bool:
@@ -3867,12 +3883,16 @@ def may_assign(creator_owners: AbstractSet[str], assignee_owners: AbstractSet[st
 __all__ = [
     "APPROVAL_HOLD_TTL",
     "CONVERSATION_TTL",
+    "DEFAULT_OWNERSHIP_CLIENT",
     "MAX_APPROVAL_HOLDS_PER_HOUR",
     "MAX_CONVERSATION_STARTS_PER_HOUR",
     "MAX_LOOKUP_EMAIL_LENGTH",
     "MAX_MESSAGES_PER_CONVERSATION_PER_HOUR",
+    "OWNERSHIP_CLIENTS",
+    "OWNERSHIP_CLIENT_ENV_VAR",
     "AgentTableOwnershipClient",
     "OwnershipClient",
+    "OwnershipClientFactory",
     "accept_invite",
     "audit_denied_approval_requires_interactive",
     "decide_hold",
@@ -3880,6 +3900,7 @@ __all__ = [
     "get_agent_by_sub",
     "get_conversation",
     "get_hold_status",
+    "get_ownership_client_factory",
     "inbox",
     "invite",
     "leave",
@@ -3892,4 +3913,5 @@ __all__ = [
     "post_message",
     "register_agent",
     "start_conversation",
+    "validate_ownership_client_configuration",
 ]

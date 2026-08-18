@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 import plugins
+import service
 from plugins import (
     ApprovalNotification,
     BoundaryCrossingScorer,
@@ -323,3 +324,95 @@ class TestPluginDisplayNames:
         name = plugins.risk_scorer_name(_AdHocScorer())  # type: ignore[arg-type]
         assert name.startswith("tests.test_plugins:")
         assert name.endswith("_AdHocScorer")
+
+
+# --- OwnershipClient pluggable seam (TECH-5396 open question 1) -------------------
+#
+# Lives here rather than in test_service.py: this seam's registry/resolution
+# is pure Python with no DB dependency, and test_service.py's module-scoped
+# autouse fixture skips everything when Postgres is unreachable. The one
+# genuinely DB-dependent test (a resolved import-path factory actually
+# constructing a working client against a real session) lives in
+# test_service.py's TestOwnershipClientSeamDbBacked instead.
+
+
+class TestOwnershipClientRegistry:
+    def test_default_registry_contains_agent_table(self) -> None:
+        assert (
+            service.OWNERSHIP_CLIENTS[service.DEFAULT_OWNERSHIP_CLIENT]
+            is service._agent_table_ownership_client_factory
+        )
+
+
+def _not_a_factory_ownership_client_factory() -> object:
+    """Import-path-resolvable factory returning something NOT callable as
+    Callable[[AsyncSession], OwnershipClient] -- pins the boot-validation
+    callable() check (an operator misconfiguring OWNERSHIP_CLIENT to point at
+    a plain implementation class/instance rather than a factory-of-factories)."""
+    return object()
+
+
+class TestGetOwnershipClientFactoryAndValidateConfiguration:
+    def setup_method(self) -> None:
+        service._ownership_client_factory = None
+
+    def teardown_method(self) -> None:
+        service._ownership_client_factory = None
+
+    def test_defaults_to_agent_table_ownership_client(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(service.OWNERSHIP_CLIENT_ENV_VAR, raising=False)
+        factory = service.get_ownership_client_factory()
+        assert factory is service.AgentTableOwnershipClient
+
+    def test_caches_the_resolved_factory(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv(service.OWNERSHIP_CLIENT_ENV_VAR, raising=False)
+        first = service.get_ownership_client_factory()
+        second = service.get_ownership_client_factory()
+        assert first is second
+
+    def test_resolution_failure_is_not_cached(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(service.OWNERSHIP_CLIENT_ENV_VAR, "not_a_real_client")
+        with pytest.raises(RuntimeError, match="unknown plugin"):
+            service.get_ownership_client_factory()
+        # A second call against the SAME (still-broken) config must retry,
+        # not return a stale/cached value from the failed attempt.
+        with pytest.raises(RuntimeError, match="unknown plugin"):
+            service.get_ownership_client_factory()
+
+    def test_non_default_registry_name_resolves(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        sentinel_factory = object()
+        monkeypatch.setitem(service.OWNERSHIP_CLIENTS, "sentinel", lambda: sentinel_factory)
+        monkeypatch.setenv(service.OWNERSHIP_CLIENT_ENV_VAR, "sentinel")
+        assert service.get_ownership_client_factory() is sentinel_factory
+
+    def test_validate_configuration_passes_for_the_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(service.OWNERSHIP_CLIENT_ENV_VAR, raising=False)
+        service.validate_ownership_client_configuration()  # must not raise
+
+    def test_validate_configuration_fails_fast_on_unknown_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(service.OWNERSHIP_CLIENT_ENV_VAR, "not_a_real_client")
+        with pytest.raises(RuntimeError, match="unknown plugin"):
+            service.validate_ownership_client_configuration()
+
+    def test_validate_configuration_fails_fast_on_bad_import_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(service.OWNERSHIP_CLIENT_ENV_VAR, "not_a_real_module:Whatever")
+        with pytest.raises(RuntimeError, match="failed to import plugin"):
+            service.validate_ownership_client_configuration()
+
+    def test_validate_configuration_fails_fast_on_non_callable_result(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(
+            service.OWNERSHIP_CLIENT_ENV_VAR,
+            "tests.test_plugins:_not_a_factory_ownership_client_factory",
+        )
+        with pytest.raises(RuntimeError, match="is not callable"):
+            service.validate_ownership_client_configuration()
