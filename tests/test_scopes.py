@@ -56,6 +56,11 @@ class TestToolScopesRegistry:
     def test_whoami_uses_comms_read(self) -> None:
         assert TOOL_SCOPES["comms_whoami"] == "comms:read"
 
+    def test_get_hold_status_uses_comms_read(self) -> None:
+        """TECH-5389 PR2: comms_get_hold_status is a pure read (sender-only
+        poll of a held message's status), same scope as every other read."""
+        assert TOOL_SCOPES["comms_get_hold_status"] == "comms:read"
+
 
 class TestRequiredScopeFor:
     def test_known_tool(self) -> None:

@@ -26,7 +26,6 @@ from schemas import (
     TaskDeclineV1,
     TaskReportV1,
     get_schema,
-    is_boundary_safe,
     validate_payload,
 )
 
@@ -330,19 +329,6 @@ class TestGetSchema:
             get_schema("confirm", 2)
 
 
-class TestIsBoundarySafe:
-    def test_scheduling_types_are_boundary_safe(self) -> None:
-        assert is_boundary_safe("confirm", 1) is True
-        assert is_boundary_safe("availability_request", 1) is True
-
-    def test_note_is_not_boundary_safe(self) -> None:
-        assert is_boundary_safe("note", 1) is False
-
-    def test_unknown_message_type_raises(self) -> None:
-        with pytest.raises(PayloadValidationError):
-            is_boundary_safe("not_a_type", 1)
-
-
 class TestValidatePayload:
     def test_normalizes_valid_payload(self) -> None:
         result = validate_payload("decline", 1, {"reason": "expired"})
@@ -454,9 +440,6 @@ class TestTaskAssignV1:
         assert result["type"] == "task_assign"
         assert isinstance(result["window"]["start"], str)
 
-    def test_boundary_safe(self) -> None:
-        assert is_boundary_safe("task_assign", 1) is True
-
 
 class TestTaskReportV1:
     def test_accepts_in_progress(self) -> None:
@@ -480,9 +463,6 @@ class TestTaskReportV1:
         with pytest.raises(ValidationError):
             TaskReportV1.model_validate({"status": "in_progress", "note": "almost done"})
 
-    def test_boundary_safe(self) -> None:
-        assert is_boundary_safe("task_report", 1) is True
-
 
 class TestTaskCompleteV1:
     def test_accepts_no_fields(self) -> None:
@@ -497,9 +477,6 @@ class TestTaskCompleteV1:
     def test_rejects_extra_field(self) -> None:
         with pytest.raises(ValidationError):
             TaskCompleteV1.model_validate({"summary": "all done"})
-
-    def test_boundary_safe(self) -> None:
-        assert is_boundary_safe("task_complete", 1) is True
 
 
 class TestTaskDeclineV1:
@@ -518,9 +495,6 @@ class TestTaskDeclineV1:
         with pytest.raises(ValidationError):
             TaskDeclineV1.model_validate({})
 
-    def test_boundary_safe(self) -> None:
-        assert is_boundary_safe("task_decline", 1) is True
-
 
 class TestTaskCancelV1:
     @pytest.mark.parametrize(
@@ -533,9 +507,6 @@ class TestTaskCancelV1:
     def test_rejects_missing_reason(self) -> None:
         with pytest.raises(ValidationError):
             TaskCancelV1.model_validate({})
-
-    def test_boundary_safe(self) -> None:
-        assert is_boundary_safe("task_cancel", 1) is True
 
 
 class TestMessageTypeDriftGuard:

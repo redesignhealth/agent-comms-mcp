@@ -54,7 +54,10 @@ federation open.
 ## 4. Identity and permissions
 
 **Everything roots in OAuth**: FastMCP `MultiAuth` = Okta `OIDCProxy`
-for interactive humans + `JWTVerifier` for headless agent tokens (HS256, `iss="agent-jwt"`).
+for interactive humans + one or more pluggable agent-token verifiers for
+headless agent tokens (`AGENT_TOKEN_VERIFIERS`, default: the built-in HS256
+`JWTVerifier`, `iss="agent-jwt"` — see "Configuration: pluggable agent-token
+verification" below).
 Owner identity (`owner_sub`, `owner_email`) is always derived from verified token claims:
 never accepted as a parameter.
 
@@ -95,6 +98,16 @@ point `agent_key` should be removed.
 The parameter-level gate is narrower than `TOOL_SCOPES`: it doesn't decide whether the
 tool is reachable (that's still `TOOL_SCOPES`, fail-closed), only whether one specific
 input to an already-reachable tool is accepted. See `scopes.py`'s `:admin` verb comment.
+
+**A fourth, orthogonal control plane (TECH-5389): the approval pipeline.**
+Whether a given SEND is admitted (the table above) is a separate question from
+whether its CONTENT is high-risk enough to need a human in the loop before it
+crosses an ownership boundary. That question is answered per-message by three
+pluggable seams (a risk scorer, an auto-approver, and a notifier — see §9's
+retitled Axis 2), never by scopes or membership: a fully-admitted, fully-scoped
+sender can still have a specific send diverted into an `approval_holds` row
+instead of posted immediately. This plane sits downstream of every check in the
+table above, not in place of any of them.
 
 **Scope enforcement applies only to agent-jwt (headless agent) tokens.** Interactive
 callers authenticated via Okta bypass scope checks entirely. Scope enforcement is the
@@ -140,7 +153,9 @@ agent-token access gate. It never gates human users.
 
 ## 5. Data model (Postgres)
 
-Five tables. `messages` and `audit_log` are append-only: no UPDATE/DELETE paths in code.
+Six tables. `messages` and `audit_log` are append-only: no UPDATE/DELETE paths in code.
+`approval_holds` (TECH-5389) is the one MUTABLE table besides `conversations`/
+`participants`/`agents`: a hold's `status` flips as it moves through its lifecycle.
 
 ```
 agents id, sub UNIQUE, owner_sub, owner_email, display_name,
@@ -160,6 +175,21 @@ messages id, conversation_id, seq (UNIQUE per conversation, server-assigned,
 audit_log id (bigint), at, actor_sub, action,
  agent_id/conversation_id/message_id, detail jsonb
  -- every mutation AND every denial
+approval_holds id, conversation_id, sender_agent_id, owner_sub, message_type,
+ schema_version, payload jsonb (the held content -- validated, insert-ready),
+ risk_reason, risk_scorer, status(pending_auto|pending_human|auto_approved|
+ approved|rejected|expired), auto_approver, auto_decision(cleared|escalated),
+ auto_decided_at, decided_by_sub, decided_at, decision_reason (free text --
+ see §9's trust argument), message_id UNIQUE (nullable FK to the resulting
+ messages row, either approval kind), expires_at, timestamps
+ -- MUTABLE (status flips); a hold exists ONLY because the risk verdict was
+ high-risk, so there is no separate `high_risk` boolean. `owner_sub` IS a
+ snapshot -- taken from the sender's verified `owner_sub` claim at hold-
+ creation time (falling back to `agents.owner_sub` when the claim is
+ absent), NOT a live join to the `agents` row: once agent-token
+ verification becomes pluggable, a live-resolving verifier can change what
+ `agents.owner_sub` means between hold-creation and decide-time, so the
+ decide/list paths match against the hold's own snapshot (see §9)
 ```
 
 Design notes:
@@ -213,22 +243,30 @@ Design notes:
 ## 6. Message schemas (two-axis model)
 
 Strict Pydantic (`extra='forbid'`), timezone-aware datetimes only, enum-coded reasons,
-**no free-text fields anywhere (except `note`, which is provisional/pre-quarantine pipeline)**. All types legal only in `state=active`.
+**no free-text fields anywhere except `note`**. All types legal only in `state=active`.
 
-| Type | `boundary_safe` | Payload | Semantics |
+The `boundary_safe` column (below) no longer exists as a schema field (TECH-5389):
+which types can cross an ownership boundary is now scorer-private policy
+(`plugins.BoundaryCrossingScorer.BARRIER_SENSITIVE_TYPES`), and a "sensitive" type
+crossing a boundary no longer denies the send — it diverts to a human-approval hold
+(§9's retitled Axis 2). The table's "sensitive?" column names what used to be
+`boundary_safe=False`.
+
+| Type | sensitive? | Payload | Semantics |
 |---|---|---|---|
-| `availability_request` | True | window {start,end}, duration_min, modality(video\|phone\|in_person), priority, constraints[] (enum-coded) | opens scheduling negotiation |
-| `availability_response` | True | slots[{start,end,preference 0..1}] max 10, or none_available+reason | **`preference` is the product**: judgment crosses the boundary, never calendar data |
-| `counter_proposal` | True | same slots shape | iterate on slots |
-| `confirm` | True | slot {start,end} | transitions conversation → `completed`. Booking itself is EA-side |
-| `decline` | True | reason (enum) | sets sender's participant status to `declined`. All non-owners declined → conversation `canceled` |
-| `needs_clarification` | True | about_seq | pause signal. A human/EA needs to weigh in |
-| `task_assign` | True | action (enum), scheduling params | opens task-coordination; structured spec, no free text |
-| `task_report` | True | progress (enum), optional note_ref | non-terminal status update from assignee |
-| `task_complete` | True | _(minimal)_ | transitions conversation → `completed` |
-| `task_decline` | True | reason (enum) | member-only; transitions conversation → `canceled` |
-| `task_cancel` | True | reason (enum) | owner-only; transitions conversation → `canceled` |
-| `note` | **False** | text (string) | free-text note; pre-quarantine — provisional |
+| `availability_request` | no | window {start,end}, duration_min, modality(video\|phone\|in_person), priority, constraints[] (enum-coded) | opens scheduling negotiation |
+| `availability_response` | no | slots[{start,end,preference 0..1}] max 10, or none_available+reason | **`preference` is the product**: judgment crosses the boundary, never calendar data |
+| `counter_proposal` | no | same slots shape | iterate on slots |
+| `confirm` | no | slot {start,end} | transitions conversation → `completed`. Booking itself is EA-side |
+| `decline` | no | reason (enum) | sets sender's participant status to `declined`. All non-owners declined → conversation `canceled` |
+| `needs_clarification` | no | about_seq | pause signal. A human/EA needs to weigh in |
+| `task_assign` | no | action (enum), scheduling params | opens task-coordination; structured spec, no free text |
+| `task_report` | no | progress (enum), optional note_ref | non-terminal status update from assignee |
+| `task_complete` | no | _(minimal)_ | transitions conversation → `completed` |
+| `task_decline` | no | reason (enum) | member-only; transitions conversation → `canceled` |
+| `task_cancel` | no | reason (enum) | owner-only; transitions conversation → `canceled` |
+| `note` | **yes** | text (string) | free-text note; posts immediately unless it would cross a boundary, in which case it is held for human approval (never denied for that reason alone — see §9) |
+| `conversation_opened` | no (exempt) | reason (enum, fixed `"pending_approval"`) | service-synthesized-only marker; never legal as a caller-supplied `message_type` (`denied.system_message_type`); the seq-1 message of a conversation whose real opener was diverted to a hold (§9) |
 
 ## 7. MCP tool surface
 
@@ -246,8 +284,9 @@ scroll-to-load-more use case.
 | `comms_set_agent_shared` | comms:write | admin override of an existing agent's `is_shared`, since `comms_register` freezes it against the agent's own re-registration; additionally requires comms:admin (see §5) |
 | `comms_list_agents` | comms:read | directory (internal domain, enumeration acceptable). Returns agent UUIDs used as target identifiers in other tools |
 | `comms_lookup_agent_by_email` | comms:read | directory lookup by owner email; `{"agent": ..., "found": bool}`. O(1) targeted equivalent of paginating `comms_list_agents` -- see §10's enumeration-posture note |
-| `comms_start_conversation` | comms:write | type + up to 50 target agent UUIDs (from `comms_list_agents`) + initial request payload |
-| `comms_post_message` | comms:write | typed, schema-validated, state-machine-checked |
+| `comms_start_conversation` | comms:write | type + up to 50 target agent UUIDs (from `comms_list_agents`) + initial request payload. **Two response shapes** (TECH-5389): the normal conversation-created shape, or (if the opener was high-risk) that same shape plus a `held_for_approval`/`hold_id`/`hold_status`/`risk_reason` block — the conversation is created anyway, opened with a service-synthesized `conversation_opened` marker at seq 1, and the real content is held (§9) |
+| `comms_post_message` | comms:write | typed, schema-validated, state-machine-checked. **Two response shapes**: the normal posted-message shape (unchanged; gains `auto_approved`/`hold_id` if a configured auto-approver cleared a high-risk send inline), or `{"held_for_approval": true, "hold_id", "conversation_id", "status", "risk_reason", "expires_at", "created_at"}` — not an error — when the send is diverted to a hold (§9) |
+| `comms_get_hold_status` | comms:read | poll a held message's approval status; sender-only (uniform `access_denied` otherwise). Returns status, risk_reason, timestamps, and (once decided) `decision_reason`/`message_id`/`message_seq`. **Deliberately the only MCP-side surface for this pipeline** — approve/reject/list-pending are non-MCP HTTP endpoints (§9), by design: an agent must never be able to approve its own high-risk content, so there is no MCP tool that could even attempt it |
 | `comms_get_conversation` | comms:read | combined read: conversation + participants + messages since seq, capped at `MAX_MESSAGES_PER_GET_CONVERSATION` (500) per call. Advances caller's `last_read_seq` when messages are returned and the page's own max seq exceeds the current cursor. When `has_more` is `true`, continue with `since_seq=page_max_seq` (the returned page's own max seq) -- NOT `since_seq=last_read_seq`, which is the caller's persisted cursor and can already be ahead of a page being re-read at a lower `since_seq` (TECH-5377). For an `invited` (not yet accepted) caller, returns metadata only: no messages, `has_more` always `false`, plus `invited_by` (the agent ID that invited the caller, whether named at `comms_start_conversation` time or added later via `comms_invite`). `participants.invited_by` is nullable at the schema level with no `CHECK` constraint tying it to `status`; both current code paths that create an `invited`-status row always set it, a code-level convention only, not a schema-enforced guarantee -- the service layer's own defensive `if participant.invited_by else None` reflects that (Argus round-5 SUGGESTION: an earlier version of this row overstated it as unreachable) |
 | `comms_inbox` | comms:read | active conversations with unread messages, **plus pending invites awaiting accept/decline**. Each list capped (`MAX_UNREAD_CONVERSATIONS_PER_INBOX`/`MAX_PENDING_INVITES_PER_INBOX`, both 100) with a `*_has_more` flag; `total_count` is always a true count, unaffected by either cap -- computed via a real `COUNT(*)` only when that half's own list was actually truncated, otherwise the (untruncated) list's own length already IS the true count. **Known gap**: no cursor -- if either cap is hit, there is currently no tool-level way to page through the remainder (`comms_list_conversations` filters by the CONVERSATION's state, not participant status, so it can't isolate just the overflowed set either) |
 | `comms_list_conversations` | comms:read | paginated conversation list, filterable by `role`, `type`, and `state`; both `invited` and `active` participant statuses included |
@@ -258,24 +297,41 @@ scroll-to-load-more use case.
 ## 8. Security invariants
 
 1. Owner identity derives from verified OAuth token claims, never parameters.
-2. Judgments cross the boundary, never raw data (schemas have no field for it).
-3. Typed, schema-validated payloads only. No free text except the
- provisional `note` type (`boundary_safe=False`, blocked in `open`
- conversations; pre-quarantine pipeline per §10).
+2. High-risk content crosses an ownership boundary only via an explicitly-approved
+ hold (human decision, or a configured auto-approver), atomically audited
+ (TECH-5389). It is never silently posted and never silently dropped: a
+ diversion always produces exactly one of `approved`/`auto_approved`
+ (content posts under its original type), `rejected`/`expired` (content
+ never posts), or `pending_human` (awaiting a decision).
+3. Typed, schema-validated payloads only. No free text except `note`,
+ which now posts immediately when it doesn't cross a boundary and is held
+ for human approval (never silently dropped, never denied for that reason
+ alone) when it would (§9). Scorer INFRASTRUCTURE failure (an unscorable
+ message) still hard-denies via `denied.risk_unscored` — it never floods
+ the human approval queue with unscorable holds, and it never fails open.
 4. Uniform denial messages. Existence of unauthorized resources is never revealed.
+ The decide/list-pending HTTP endpoints (§9) extend this with a hard,
+ structural interactive-token-only gate (no agent-jwt scope escape hatch —
+ an agent can never approve its own content) plus an exact match against
+ the hold's own `owner_sub` snapshot (§5); unknown-hold and not-your-hold
+ are a uniform 404, matching this invariant's posture at the HTTP layer.
 5. Append-only messages and audit. Every mutation and every denial is audited.
- A third category, bypass-observability, also audits privileged paths that are
- neither mutations nor denials: `agent.boundary_check_bypassed_shared`/`agent.conversation_open_bypassed_shared`
+ A third category, bypass/best-effort-observability, also audits privileged
+ or fire-and-forget paths that are neither mutations nor denials:
+ `risk.shared_sender_bypass`/`agent.conversation_open_bypassed_shared`
  (a `comms:admin`-authorized shared sender/initiator skipped the ownership-boundary
- check, §9) and `agent.reregister_is_shared_ignored` (a re-registration's requested
- `is_shared` diverged from the frozen row value and was ignored, §5). Unlike denial
- events (committed immediately by the denial helper), bypass-observability events
+ check, §9), `agent.reregister_is_shared_ignored` (a re-registration's requested
+ `is_shared` diverged from the frozen row value and was ignored, §5), and
+ `approval.notify_failed` (the post-commit approval notifier raised — logged,
+ never fails the triggering call, §9). Unlike denial
+ events (committed immediately by the denial helper), bypass events
  are staged within the request's own transaction and are only persisted if that
- transaction ultimately commits. This is a deliberate consistency tradeoff shared
- by both bypass events: it makes no separate durability guarantee.
+ transaction ultimately commits; `approval.notify_failed` is the one exception,
+ written in its own fresh transaction after the main commit already succeeded.
 6. Fail-closed tool scoping: unenrolled tool is unreachable by agent tokens.
-7. Rate limits per sender (30 messages/hour/conversation, 10 conversation-starts/hour),
- message size caps, participant cap (50 per conversation), and conversation expiry (7 days).
+7. Rate limits per sender (30 messages/hour/conversation, 10 conversation-starts/hour,
+ 10 approval holds/hour), message size caps, participant cap (50 per conversation),
+ and conversation expiry (7 days).
 
 ## 9. Two-axis model: conversation type (admission) × message type (boundary)
 
@@ -314,55 +370,256 @@ not use it). Subsequent invites are checked against this snapshot: an invite tha
 would expand the owner set is denied, preventing unilateral de-isolation of an
 `internal` conversation.
 
-### Axis 2: message type → schema + `boundary_safe`
+### Axis 2: per-message risk scoring (pluggable) [TECH-5389]
 
-Each message type declares `boundary_safe: bool` independent of conversation type.
-The flag gates legality within a conversation:
+Axis 1 (admission — the whole participant set at conversation-open time,
+above) is untouched by this section. Axis 2 used to be a single hard
+`boundary_safe` schema flag; it is now three pluggable seams evaluated on
+every send, sharing one resolution mechanism (env-var-configured, fail-fast
+at startup — see the Configuration subsection below): a **risk scorer**, an
+**auto-approver**, and an **approval notifier**. `plugins.py` holds all
+three `Protocol` interfaces, their registries, and the shared resolver
+(`resolve_plugin`), mirroring this codebase's existing `OwnershipClient` seam
+convention: injected by the caller, never looked up ad hoc inside
+`service.py`.
 
-- `open` conversations require `boundary_safe=True` (raw scheduling data must
- never cross an owner boundary: only judgments do).
-- `internal` conversations allow any message type (all parties are the same
- owner).
-- `asymmetric` conversations allow `boundary_safe=True` always. `boundary_safe=False`
- is allowed only when the message does not cross an ownership boundary (sender's
- owner set must be a superset of all other active-or-invited participants' owner
- sets: an invited-but-not-yet-accepted participant's owner set was already
- validated against the owner snapshot at invite time, so including them here
- keeps the boundary check consistent with that snapshot invariant and closes a
- one-post gap that would otherwise persist until they accept), **except**: a shared sender (`agents.is_shared=True`) may post
- `boundary_safe=False` messages in `asymmetric` conversations unconditionally,
- without the ownership-boundary check.
+**Seam 1 — the risk scorer** decides, per send, whether the message is
+high-risk (`RiskVerdict(high_risk, reason, detail)`). The v1 implementation,
+`boundary_v1` (`BoundaryCrossingScorer`), is the relocated former
+`boundary_safe` rule, now scorer-private policy data
+(`BARRIER_SENSITIVE_TYPES = {"note"}`) rather than a schema field:
 
-Currently registered message types (all `boundary_safe=True` unless noted):
+- A non-sensitive type is never high risk (no ownership lookup at all — the
+ cheap common path).
+- `internal`: never high risk (every participant shares one owner set by
+ construction).
+- `open`: a sensitive type is always high risk.
+- `asymmetric` + sensitive type: an ownership lookup decides (sender's owner
+ set must be a superset of every other active-or-invited participant's), with
+ the same shared-sender bypass as before (`agents.is_shared=True` skips the
+ lookup unconditionally, audited `risk.shared_sender_bypass`).
+- **Scorer infrastructure failure still hard-denies** (`denied.risk_unscored`,
+ detail carries the cause: `ownership_unverified`/`empty_owner_set`/
+ `unknown_conversation_type`) — an ownership-service outage must not flood
+ the human approval queue with unscorable holds. Only a GENUINE high-risk
+ VERDICT diverts; an unscorable message still denies, exactly as before.
 
-| Type | `boundary_safe` | Semantics |
-|---|---|---|
-| `availability_request` | True | opens scheduling negotiation |
-| `availability_response` | True | scored candidate slots (judgment, not calendar data) |
-| `counter_proposal` | True | iterate on slots |
-| `confirm` | True | transitions conversation → `completed` |
-| `decline` | True | sender's participant → `declined`; all non-owners declined → `canceled` |
-| `needs_clarification` | True | pause signal |
-| `task_assign` | True | opens a task-coordination conversation; structured spec (action enum + scheduling params) |
-| `task_report` | True | non-terminal status update from assignee |
-| `task_complete` | True | transitions conversation → `completed` |
-| `task_decline` | True | assignee-only; transitions conversation → `canceled` |
-| `task_cancel` | True | owner-only; transitions conversation → `canceled` |
-| `note` | **False** | free-text note (pre-quarantine pipeline; `internal` always; `asymmetric` only when no boundary crossed; blocked in `open`) |
+**High risk no longer denies — it diverts.** A `high_risk=True` verdict
+creates an `approval_holds` row (§5) instead of a `messages` row, runs the
+**auto-approver** (seam 2) inline, and returns a distinct "held for approval"
+response (not an error) to the caller. `comms_post_message`/
+`comms_start_conversation` document both response shapes (§7).
+
+**Seam 2 — the auto-approver** (`AutoApprover.review(HoldContext) ->
+AutoDecision`) gets the full payload, unlike the risk scorer (which is
+type/topology-based only) — the expensive judgment belongs here, where a
+future implementation can afford to make it. The v1 implementation,
+`escalate_all` (`EscalateAllAutoApprover`), always returns `cleared=False`:
+every high-risk send escalates to a human today, but the seam is exercised
+inline on every one, not dead code. The lifecycle
+(`pending_auto -> pending_human -> approved|rejected|expired`, or
+`pending_auto -> auto_approved`) already contains the pre-human `pending_auto`
+stage a future ASYNC auto-approver needs (commit at `pending_auto`, return the
+held response, have a worker call `review()` later) — v1's inline no-op means
+no committed row is ever OBSERVED at `pending_auto` (created and transitioned
+within one transaction), but the state and the decide-endpoint's handling of
+it (409 `awaiting_auto_review`) are already specified.
+
+**Seam 3 — the approval notifier** (`ApprovalNotifier.notify_escalated`)
+fires post-commit, best-effort, only on the transition into `pending_human`.
+Its payload (`ApprovalNotification`) is deliberately **pointer, not
+content**: hold id, conversation id/type, sender identity, risk reason,
+timestamps — never the held text. This is the one place approval data
+leaves the service's trust boundary (a webhook URL, eventually Slack); the
+human reads the actual text only through the authenticated, owner-matched
+`GET /approvals/pending` surface (below), the same posture DESIGN.md already
+takes for raw text elsewhere. `log_only` (the default — zero required
+config, no accidental egress) and `webhook` (HMAC-SHA256-signed POST,
+`X-Approval-Signature` header) ship in-tree; a company-specific notifier
+(e.g. Slack DM + an aggregation UI) is an import-path plugin outside this
+repo. A notifier failure is logged plus an `approval.notify_failed` audit row
+(its own fresh transaction — the main commit already succeeded) and never
+fails or rolls back the request. It IS awaited inline before the tool
+response returns, so it may add up to the webhook timeout (5s) of latency
+to a high-risk send — never a failure, but not latency-free either.
+
+**The decide endpoint — non-MCP, human-only, deliberately with no MCP
+counterpart.** `POST /approvals/{hold_id}/decide` and
+`GET /approvals/pending` are plain Starlette routes (`mcp.custom_route`,
+outside FastMCP's `MultiAuth`, so they self-verify the bearer token) with a
+hard, structural gate: the token is verified against `_auth_provider.server`
+(the Okta provider) directly, NOT the combined agent+interactive `MultiAuth`
+chain — the agent-token verifier chain (today's default `JWTVerifier`, or a
+future pluggable verifier) is never consulted for authorization on this
+surface at all, only to attribute the denial audit row on the failure path.
+This is a stronger gate than claim-inspection (`is_interactive_token`, still
+asserted as a belt-and-braces check) with **no scope escape hatch** — an
+agent-jwt token is rejected outright regardless of any scope it carries
+(unlike `providers/comms.py`'s `is_interactive_token(...) or "comms:admin" in
+scopes`), and the approver's verified sub must equal the hold's own
+`owner_sub` snapshot (§5) — not a live join to the sender agent's `agents`
+row. This structural gate is what makes agent self-approval of its own
+content impossible — not a scope an agent could theoretically be granted, and
+not a claim a misconfigured agent-token verifier could spoof its way past.
+Unknown-hold and not-your-hold are a uniform 404 (matching invariant 4's
+anti-enumeration posture at the HTTP layer). **The risk scorer is
+deliberately NOT re-run at approval** — the human decision IS the override.
+Approve DOES re-run the `accepted_types` capability gate against currently-
+active participants (closing the gap where a participant added after the
+hold was created never had a chance to reject the held type) and is one
+atomic transaction: conversation `SELECT ... FOR UPDATE`, insert the message
+under its ORIGINAL type/schema_version/payload, flip the hold, single commit.
+Reject stores the decision and posts no message.
+
+**The optional human `reason` and its trust argument.** The decide body may
+carry `{"reason": "<free text, max 2000 chars>"}` (either direction — approve
+or reject), stored in `approval_holds.decision_reason` and surfaced back only
+via `comms_get_hold_status` (sender-only) and the list-pending detail (owner-
+only). This is the one deliberate free-text field outside `note` itself: the
+board's no-free-text posture exists to keep unstructured text from crossing
+trust boundaries into OTHER owners' agents. `decision_reason` flows in
+exactly one direction — a human to the submitting agent, an agent that human
+OWNS — the same trust domain, no boundary crossed, so the enum-only stance
+governing inter-agent payloads does not apply to it.
+
+**Seq-1 high-risk opener: auto-post a safe system marker, never deny.** A
+high-risk `start_conversation` opener no longer refuses to open the
+conversation. It opens anyway, with a service-synthesized, content-blind
+`conversation_opened` message (§6) as seq 1 in the initiator's place, and
+diverts the real opening content into a hold exactly like any other
+high-risk post (the real message posts as seq 2 once approved/cleared).
+`conversation_opened` is exempt from the `accepted_types` capability gate (no
+agent declares it — the grandfather backfill is one-time and new types are
+never retroactively included — and "ignore this marker" needs no handling
+capability) and, symmetrically, an agent may never post it directly
+(`denied.system_message_type`, closing the forgery it would otherwise open).
+The held content's own type still passes the normal capability gate against
+the named targets BEFORE the scorer runs, exactly like today's admission
+order — a target that can't handle the original type still fails
+conversation creation outright, same as before this PR.
 
 **Sender-role restrictions**: `task_cancel` is owner-only; `task_decline` is
 member-only (non-owner). These map directly to `participants.role` and are checked
 before the state-machine transition.
 
+### Configuration: pluggable seams
+
+`RISK_SCORER` (default `boundary_v1`), `AUTO_APPROVER` (default
+`escalate_all`), `APPROVAL_NOTIFIER` (default `log_only`) each resolve a
+registry name or, if the value contains a `:`, an import path
+(`"pkg.module:factory"`) via `importlib` — letting a deployment plug in a
+private implementation from its own package on `PYTHONPATH` without forking
+this repo. All three are validated at process start
+(`plugins.validate_configuration()`, called from `main._cli()` beside the
+existing `DATABASE_URL` fail-fast check): an unknown name, a bad import path,
+or (for `APPROVAL_NOTIFIER=webhook`) a missing `APPROVAL_WEBHOOK_URL`/
+`APPROVAL_WEBHOOK_SECRET` pair crashes at boot, never lazily on the first
+high-risk message.
+
+**Trust model for `pkg.module:factory` import paths (deliberate, not a
+vulnerability):** every current call site into `resolve_plugin_name` (both
+`resolve_plugin` and `auth.py`'s `_resolve_agent_token_verifiers`) reads the
+name from `os.environ` before passing it in — `resolve_plugin_name` itself
+has no enforcement of this, it simply trusts its caller, the same way any
+internal helper trusts its call sites rather than re-validating provenance
+at every layer. That string is process-startup deployment configuration set
+by whoever operates this service — the same
+trust level as `DATABASE_URL`, `PYTHONPATH`, or the choice of which packages
+to `pip install` in the first place. It is never derived from request input,
+a database row, or any other value an unprivileged caller can influence. An
+operator who can set this service's environment variables can already run
+arbitrary code in this process by other means (editing `PYTHONPATH`,
+replacing an installed package, etc.), so treating an import-path env var as
+a code-execution primitive worth guarding against would be inconsistent with
+every other startup-time configuration knob in this codebase.
+
+`APPROVAL_HOLD_TTL` (7 days) and the
+`approval_holds_per_hour` rate limit (10, per sender) are code constants, not
+env-configurable, matching every other rate limit/TTL in this codebase.
+
+**A fourth seam, `OWNERSHIP_CLIENT`** (default `agent_table`), resolves the same way
+but lives in `service.py`, not `plugins.py` (its registry needs `service.py`'s own
+`AgentTableOwnershipClient`/`OwnershipClient` types, and `plugins.py` must stay
+import-free of `service.py` to avoid a cycle) -- validated separately at boot via
+`service.validate_ownership_client_configuration()`, called from `main._cli()`
+alongside `plugins.validate_configuration()`. That boot check requires not just that
+`OWNERSHIP_CLIENT` resolves, but that the resolved value is itself callable: a custom
+plugin's configured factory must return a *second* callable
+(`Callable[[AsyncSession], OwnershipClient]`), not an `OwnershipClient` instance
+directly. Structurally different from the other
+three: `OwnershipClient` implementations need the CURRENT request's session (the
+default reads the same-transaction `agents` row), so this seam resolves a *factory*
+(`Callable[[AsyncSession], OwnershipClient]`) once at startup, then calls it fresh
+with the current session on every use -- rather than resolving one reusable instance
+like the other three seams do. A live-resolving plugin (e.g. a consumer's own
+ownership registry) ignores the session argument and returns its own
+already-constructed instance. Pointing this at the same source an
+`AGENT_TOKEN_VERIFIERS` plugin already resolves `owner_sub` from closes the gap where
+a re-minted/reassigned owner fixes approval *routing* immediately (the hold's
+`owner_sub` snapshot reads the live claim) but boundary *scoring* keeps reading the
+frozen `agents.owner_sub` column until this seam is configured to match -- see the
+`owner_sub` provenance discussion immediately below.
+
+**`owner_sub` provenance — accepted risk, partially resolved by the
+snapshot design.** Every high-risk post now depends on the decide
+endpoint's `owner_sub` match, so this pre-existing trust-model gap matters
+more than it used to: under the default `agent_jwt_hs256` verifier, an
+agent-jwt-registered agent's `owner_sub` claim is caller-supplied and
+unverified at mint time (protected only by possession of `AGENT_JWT_SECRET`
+— the same trust boundary as minting the agent's identity itself). Because
+`approval_holds.owner_sub` is snapshotted from the claim on the request
+that created each hold (§5), rather than frozen once at registration,
+re-minting an agent's token with the correct `--owner-email` fixes routing
+for all **future** holds — the un-approvable state is mint-fixable, not
+permanent. An agent-jwt agent whose token carries no `owner_sub` claim at
+all falls back to the agent-jwt `sub` itself, which `identity.validate_sub_shape`
+forbids from containing `@` — such an agent remains un-approvable by any
+email-identified Okta human until re-minted with an explicit owner. A
+consumer running a live-resolving `AGENT_TOKEN_VERIFIERS` plugin (TECH-5396)
+sidesteps mint-time provenance entirely — see that section above and
+`docs/TECH-5389-APPROVAL-PIPELINE.md` §15 for the full design.
+
+### Configuration: pluggable agent-token verification (`AGENT_TOKEN_VERIFIERS`) [TECH-5396]
+
+`auth.build_auth_provider()` composes the Okta `OIDCProxy` with one or more
+agent-token verifiers, resolved from `AGENT_TOKEN_VERIFIERS` (comma-separated,
+ordered; default `agent_jwt_hs256` — the built-in HS256 `JWTVerifier` keyed to
+`AGENT_JWT_SECRET`). Each element is a name in `auth.TOKEN_VERIFIERS` or a
+`pkg.module:factory` import path, resolved via the same `resolve_plugin_name`
+mechanism §9's three approval-pipeline seams use — so a deployment with its
+own credential system (e.g. a private bot-identity service) can compose its
+own `TokenVerifier` alongside or instead of the default, without forking this
+repo. An empty value is a startup `RuntimeError`; `AGENT_JWT_SECRET` is
+required only if `agent_jwt_hs256` is among the configured verifiers.
+
+Every configured verifier is wrapped in an OSS-owned adapter enforcing a
+**normalized-claims contract**: the `AccessToken` it returns must carry
+`iss == "agent-jwt"`, a non-empty `str` `sub` passing
+`identity.validate_sub_shape`, and a `scopes` list whose elements are all
+`str` — `owner_sub` is optional (a plugin may resolve it live from its own
+system of record instead of it being baked in at mint time). If present,
+`exp`/`nbf`/`AccessToken.expires_at` are also independently re-checked (60s
+clock-skew leeway) rather than trusted from the inner verifier — none of the
+three is required, since a verifier may rely on live revocation instead of
+expiry. Any violation is treated as verification *failure*, fail-closed:
+`scopes.is_interactive_token` is a denylist keyed on `iss != "agent-jwt"`, so
+an un-normalized issuer would make a plugin's agent tokens look interactive
+(full scope-check bypass). This makes plugin-verified tokens indistinguishable
+downstream from default-verified ones. Full design and rationale:
+`docs/TECH-5389-APPROVAL-PIPELINE.md` §15.2–15.3.
+
 ### Capability gate: `accepted_types`
 
-Independent of, and checked alongside, the `boundary_safe` crossing rule above:
-every other **active** participant/target must have `message_type` in their
-own `agents.accepted_types`, or the send is denied
+Independent of, and checked alongside (and BEFORE — see the ordering note in
+Axis 2 above), the risk-scoring rule above: every other **active**
+participant/target must have `message_type` in their own
+`agents.accepted_types`, or the send is denied
 (`denied.message_type_not_accepted`, uniform `AccessDeniedError`, detail omits
 which recipient rejected it or their declared set: this keeps the denial shape
-consistent with `denied.boundary_crossing`. `accepted_types` itself carries no
-secrecy requirement; it is already public via `comms_list_agents`).
+consistent with every other uniform denial in this module. `accepted_types`
+itself carries no secrecy requirement; it is already public via
+`comms_list_agents`). This is a hard denial always — this capability question
+never diverts to a hold, only the risk-scoring question does.
 
 The "active" scoping means two different things depending on which call this
 runs from. Both call sites enforce the very same capability gate, never two
@@ -386,7 +643,7 @@ separate mechanisms:
  joins. That's an accepted consequence of scoping the live gate to active
  participants. It is not a gap in the gate itself.
 
-This is deliberately **universal**, unlike `boundary_safe`: `boundary_safe`
+This is deliberately **universal**, unlike the risk scorer: the risk scorer
 answers a trust question (is this payload shaped safely enough to cross an
 ownership boundary), which `internal` conversations are exempt from by
 construction (no boundary exists between same-owner participants).
@@ -399,7 +656,7 @@ exchange `task_report` messages, both must have declared `task_report` in
 their `accepted_types`, exactly as any other pair would.
 
 Checked per-recipient: each recipient's own `accepted_types` is evaluated
-independently, unlike `boundary_safe`'s owner-set check, which aggregates
+independently, unlike the risk scorer's owner-set check, which aggregates
 across the other side. `accepted_types` is a fact about one specific agent's
 deployment, never about an owner as a whole.
 
@@ -567,9 +824,15 @@ deployment-warning docstring.
  meaningfully different privacy surface than paginated enumeration. It may warrant
  earlier or stricter gating than `list_agents` gets; the "at that point" phrasing
  above should not be read as promising identical treatment.
-- **Free-text fields**: allowed only behind a quarantine/review pipeline (sandboxed,
- tool-less extraction into typed messages). Raw text is stored for audit/human
- display but never enters a privileged agent's context.
+- **Free-text fields**: shipped as human-approval diversion (`note`, TECH-5389) —
+ not the quarantine/sandboxed-extraction pipeline this bullet originally deferred
+ to. A high-risk `note` diverts to an `approval_holds` row; once a human
+ explicitly approves it, the text posts VERBATIM and does enter the counterpart
+ agents' contexts — human judgment is the injection control, not a tool-less
+ extraction step. A sandboxed tool-less-extraction scorer/auto-approver
+ implementation remains a possible future plugin (the pluggable seams this PR
+ introduces are exactly where it would land), but nothing in this codebase
+ builds one today.
 - **Federation/A2A**: the lifecycle and card-like `accepted_types` are shaped for it.
 - **Owner-only invites**: policy flip on the existing role field.
 

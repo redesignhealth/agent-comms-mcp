@@ -25,6 +25,7 @@ dependencies = [
     { name = "httpx" },
     { name = "py-key-value-aio", extra = ["filetree"] },
     { name = "pydantic" },
+    { name = "pyjwt" },
     { name = "sqlalchemy", extra = ["asyncio"] },
     { name = "structlog" },
 ]
@@ -46,6 +47,7 @@ requires-dist = [
     { name = "httpx", specifier = "==0.28.1" },
     { name = "py-key-value-aio", extras = ["filetree"], specifier = "==0.4.5" },
     { name = "pydantic", specifier = "==2.12.5" },
+    { name = "pyjwt", specifier = "==2.13.0" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = "==2.0.51" },
     { name = "structlog", specifier = "==25.5.0" },
 ]

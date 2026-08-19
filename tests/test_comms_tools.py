@@ -425,12 +425,14 @@ class TestRegister:
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
         """An agent-jwt (agent) token's ``email`` claim is caller-supplied and
-        unverified (the JWT issuer CLI accepts arbitrary extra
-        claims) — it must never be trusted as ``owner_email``, even when
-        present. This is the negative case the existing "no email claim at
-        all" tests don't cover: here the token DOES carry an ``email``
-        claim, and it must still be ignored in favor of the sub-derived
-        self-owned fallback."""
+        unverified — it must never be trusted as ``owner_email``, even when
+        present. ``mint_token``'s CLI never sets an ``email`` claim (it only
+        ever sets ``owner_sub``, deliberately, via ``--owner-email``), so
+        this scenario models a hand-crafted token bypassing that CLI. This
+        is the negative case the existing "no email claim at all" tests
+        don't cover: here the token DOES carry an ``email`` claim, and it
+        must still be ignored in favor of the sub-derived self-owned
+        fallback."""
         token = _token("agent-forged-email")
         token.claims["email"] = "forged@attacker.com"
 
@@ -1565,6 +1567,132 @@ class TestRateLimitAndSchemaErrors:
         assert started["schema_version"] == 1
 
 
+class TestOwnershipClientSeamIntegration:
+    """Regression coverage for the actual functional change wiring the pluggable
+    OwnershipClient seam (TECH-5396 open question 1) into providers/comms.py:
+    the three call sites there now go through service.get_ownership_client_factory()
+    instead of constructing AgentTableOwnershipClient directly. Exercise that
+    through a real comms_start_conversation call, not just the seam in isolation
+    (tests/test_plugins.py) or against service.py directly (bypasses providers/
+    comms.py entirely)."""
+
+    async def test_asymmetric_open_consults_the_configured_ownership_client(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import service
+
+        # Two agents with genuinely DIFFERENT frozen owner_sub values -- an
+        # asymmetric conversation between them would be denied
+        # (denied.no_owner_overlap) under the real AgentTableOwnershipClient.
+        # A fake plugin reporting them as sharing one owner set must admit it
+        # instead, proving providers/comms.py actually consulted the
+        # configured seam rather than constructing AgentTableOwnershipClient
+        # directly.
+        await _register(main, test_session_factory, "seam-owner-1", owner_sub="owner-a")
+        await _register(main, test_session_factory, "seam-target-1", owner_sub="owner-b")
+        token_owner = _token("seam-owner-1")
+
+        list_result = await _call(main, test_session_factory, token_owner, "comms_list_agents")
+        target_id = next(
+            a["agent_id"] for a in list_result["agents"] if a["sub"] == "seam-target-1"
+        )
+
+        class _FakeSharedOwnerClient:
+            async def get_agent_owners(self, agent_id: Any) -> dict[str, Any]:
+                return {"is_shared": False, "owners": ["same-owner-for-both@example.com"]}
+
+        fake_instance = _FakeSharedOwnerClient()
+        monkeypatch.setenv(
+            service.OWNERSHIP_CLIENT_ENV_VAR,
+            "tests.test_comms_tools:_fake_shared_owner_client_factory",
+        )
+        monkeypatch.setattr(
+            "tests.test_comms_tools._fake_shared_owner_client_factory_instance", fake_instance
+        )
+        monkeypatch.setattr(service, "_ownership_client_factory", None)
+
+        started = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_start_conversation",
+            {
+                "conversation_type": "asymmetric",
+                "target_agent_ids": [target_id],
+                "initial_message": _availability_request(),
+            },
+        )
+        assert started["state"] == "active"
+
+    async def test_asymmetric_open_deny_path_also_consults_the_configured_ownership_client(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import service
+
+        # Two agents with the SAME frozen owner_sub -- under the real
+        # AgentTableOwnershipClient, an asymmetric conversation between them
+        # would be ADMITTED (owners overlap). A fake plugin reporting them as
+        # having DISJOINT owner sets must instead deny it, proving the deny
+        # branch also routes through the configured seam rather than
+        # hardcoding AgentTableOwnershipClient (which the admit-path test
+        # above cannot distinguish from this branch on its own).
+        await _register(main, test_session_factory, "seam-owner-2", owner_sub="owner-shared")
+        await _register(main, test_session_factory, "seam-target-2", owner_sub="owner-shared")
+        token_owner = _token("seam-owner-2")
+
+        list_result = await _call(main, test_session_factory, token_owner, "comms_list_agents")
+        target_id = next(
+            a["agent_id"] for a in list_result["agents"] if a["sub"] == "seam-target-2"
+        )
+
+        class _FakeDisjointOwnerClient:
+            def __init__(self) -> None:
+                self._calls = 0
+
+            async def get_agent_owners(self, agent_id: Any) -> dict[str, Any]:
+                self._calls += 1
+                owner = f"disjoint-owner-{self._calls}@example.com"
+                return {"is_shared": False, "owners": [owner]}
+
+        fake_instance = _FakeDisjointOwnerClient()
+        monkeypatch.setenv(
+            service.OWNERSHIP_CLIENT_ENV_VAR,
+            "tests.test_comms_tools:_fake_shared_owner_client_factory",
+        )
+        monkeypatch.setattr(
+            "tests.test_comms_tools._fake_shared_owner_client_factory_instance", fake_instance
+        )
+        monkeypatch.setattr(service, "_ownership_client_factory", None)
+
+        with pytest.raises(
+            ToolError, match=re.escape("access_denied: not authorized for this resource")
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                token_owner,
+                "comms_start_conversation",
+                {
+                    "conversation_type": "asymmetric",
+                    "target_agent_ids": [target_id],
+                    "initial_message": _availability_request(),
+                },
+            )
+
+
+_fake_shared_owner_client_factory_instance: Any = None
+
+
+def _fake_shared_owner_client_factory() -> Any:
+    return lambda session: _fake_shared_owner_client_factory_instance
+
+
 # --- Membership mutation tools: invite / leave / decline_invite ---------------------
 
 
@@ -2036,6 +2164,7 @@ class TestScopesUnaffected:
             "comms_decline_invite",
             "comms_invite",
             "comms_leave",
+            "comms_get_hold_status",
         }
         assert expected <= mounted
         assert expected <= set(TOOL_SCOPES)
@@ -2367,4 +2496,240 @@ class TestListConversationsTool:
                 token,
                 "comms_list_conversations",
                 {field: value},
+            )
+
+
+# --- Approval pipeline (TECH-5389 PR2) ---------------------------------------
+
+
+class TestApprovalPipeline:
+    """End-to-end coverage of the divert-not-deny pipeline at the MCP tool
+    boundary: a high-risk ``comms_post_message``/``comms_start_conversation``
+    call returns the distinct held-for-approval shape (not an error), and
+    ``comms_get_hold_status`` lets the sender poll the outcome."""
+
+    async def test_note_into_open_conversation_returns_held_shape(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        await _register(main, test_session_factory, "hold-e2e-initiator")
+        target = await _register(main, test_session_factory, "hold-e2e-target")
+        initiator_token = _token("hold-e2e-initiator")
+        target_token = _token("hold-e2e-target")
+
+        started = await _call(
+            main,
+            test_session_factory,
+            initiator_token,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [target["agent_id"]],
+                "initial_message": _availability_request(),
+                "message_type": "availability_request",
+            },
+        )
+        await _call(
+            main,
+            test_session_factory,
+            target_token,
+            "comms_accept",
+            {"conversation_id": started["conversation_id"]},
+        )
+
+        result = await _call(
+            main,
+            test_session_factory,
+            initiator_token,
+            "comms_post_message",
+            {
+                "conversation_id": started["conversation_id"],
+                "message_type": "note",
+                "payload": {"text": "secret cross-boundary note"},
+            },
+        )
+        assert result["held_for_approval"] is True
+        assert result["status"] == "pending_human"
+        assert result["risk_reason"] == "boundary_crossing"
+        assert "hold_id" in result
+        assert "seq" not in result
+
+        status = await _call(
+            main,
+            test_session_factory,
+            initiator_token,
+            "comms_get_hold_status",
+            {"hold_id": result["hold_id"]},
+        )
+        assert status["hold_id"] == result["hold_id"]
+        assert status["status"] == "pending_human"
+        assert status["risk_reason"] == "boundary_crossing"
+        assert "message_seq" not in status
+
+        # The held content never became a visible message.
+        conversation_view = await _call(
+            main,
+            test_session_factory,
+            initiator_token,
+            "comms_get_conversation",
+            {"conversation_id": started["conversation_id"]},
+        )
+        assert all(m["type"] != "note" for m in conversation_view["messages"])
+
+    async def test_get_hold_status_uniform_denial_for_non_sender(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        await _register(main, test_session_factory, "hold-e2e-owner")
+        target = await _register(main, test_session_factory, "hold-e2e-other-target")
+        await _register(main, test_session_factory, "hold-e2e-nosy")
+        initiator_token = _token("hold-e2e-owner")
+        target_token = _token("hold-e2e-other-target")
+        other_token = _token("hold-e2e-nosy")
+
+        started = await _call(
+            main,
+            test_session_factory,
+            initiator_token,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [target["agent_id"]],
+                "initial_message": _availability_request(),
+                "message_type": "availability_request",
+            },
+        )
+        await _call(
+            main,
+            test_session_factory,
+            target_token,
+            "comms_accept",
+            {"conversation_id": started["conversation_id"]},
+        )
+        held = await _call(
+            main,
+            test_session_factory,
+            initiator_token,
+            "comms_post_message",
+            {
+                "conversation_id": started["conversation_id"],
+                "message_type": "note",
+                "payload": {"text": "not for you"},
+            },
+        )
+
+        with pytest.raises(
+            ToolError, match=re.escape("access_denied: not authorized for this resource")
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                other_token,
+                "comms_get_hold_status",
+                {"hold_id": held["hold_id"]},
+            )
+
+    async def test_get_hold_status_uniform_denial_for_unknown_hold(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        await _register(main, test_session_factory, "hold-e2e-unknown-caller")
+        token = _token("hold-e2e-unknown-caller")
+
+        with pytest.raises(
+            ToolError, match=re.escape("access_denied: not authorized for this resource")
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                token,
+                "comms_get_hold_status",
+                {"hold_id": str(uuid.uuid4())},
+            )
+
+    async def test_seq1_diverted_opener_response_shape(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """A high-risk seq-1 opener (TECH-5389 PR2 §6): the conversation is
+        created with a service-synthesized ``conversation_opened`` marker,
+        and the response carries the held-for-approval block alongside the
+        normal conversation-created shape."""
+        await _register(main, test_session_factory, "hold-e2e-opener-initiator")
+        target = await _register(main, test_session_factory, "hold-e2e-opener-target")
+        initiator_token = _token("hold-e2e-opener-initiator")
+        target_token = _token("hold-e2e-opener-target")
+
+        started = await _call(
+            main,
+            test_session_factory,
+            initiator_token,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [target["agent_id"]],
+                "initial_message": {"text": "secret opener"},
+                "message_type": "note",
+            },
+        )
+        assert started["held_for_approval"] is True
+        assert started["hold_status"] == "pending_human"
+        assert started["risk_reason"] == "boundary_crossing"
+        assert "hold_id" in started
+
+        await _call(
+            main,
+            test_session_factory,
+            target_token,
+            "comms_accept",
+            {"conversation_id": started["conversation_id"]},
+        )
+        conversation_view = await _call(
+            main,
+            test_session_factory,
+            initiator_token,
+            "comms_get_conversation",
+            {"conversation_id": started["conversation_id"]},
+        )
+        assert len(conversation_view["messages"]) == 1
+        assert conversation_view["messages"][0]["type"] == "conversation_opened"
+        assert conversation_view["messages"][0]["seq"] == 1
+
+    async def test_direct_post_of_system_message_type_denied(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        await _register(main, test_session_factory, "hold-e2e-forge-initiator")
+        target = await _register(main, test_session_factory, "hold-e2e-forge-target")
+        initiator_token = _token("hold-e2e-forge-initiator")
+        target_token = _token("hold-e2e-forge-target")
+
+        started = await _call(
+            main,
+            test_session_factory,
+            initiator_token,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [target["agent_id"]],
+                "initial_message": _availability_request(),
+                "message_type": "availability_request",
+            },
+        )
+        await _call(
+            main,
+            test_session_factory,
+            target_token,
+            "comms_accept",
+            {"conversation_id": started["conversation_id"]},
+        )
+
+        with pytest.raises(
+            ToolError, match=re.escape("access_denied: not authorized for this resource")
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                initiator_token,
+                "comms_post_message",
+                {
+                    "conversation_id": started["conversation_id"],
+                    "message_type": "conversation_opened",
+                    "payload": {"reason": "pending_approval"},
+                },
             )

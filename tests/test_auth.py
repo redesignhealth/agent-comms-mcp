@@ -14,12 +14,24 @@ import hashlib
 import itertools
 import json
 import os
+import time
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
+import pytest
+from fastmcp.server.auth import AccessToken, MultiAuth, TokenVerifier
 from mcp.server.auth.provider import RefreshToken
 from mcp.shared.auth import OAuthToken
 
-from auth import _ROTATION_MAX_HOPS, OktaOIDCProxy, build_okta_provider
+from auth import (
+    _ROTATION_MAX_HOPS,
+    AGENT_TOKEN_VERIFIERS_ENV_VAR,
+    TOKEN_VERIFIERS,
+    OktaOIDCProxy,
+    _expiry_violation,
+    _NormalizingVerifier,
+    _resolve_agent_token_verifiers,
+    build_okta_provider,
+)
 
 _MOCK_OIDC_CONFIG = MagicMock()
 _OIDC_PATCH = patch(
@@ -424,3 +436,328 @@ class TestRefreshTokenRotationGrace:
             key=hashlib.sha256(b"old-token-2").hexdigest(),
         )
         assert entry is None
+
+
+# --- AGENT_TOKEN_VERIFIERS: registry resolution + normalized-claims contract
+
+
+def _access_token(
+    *,
+    iss: str | object = "agent-jwt",
+    sub: object = "test-agent",
+    scopes: object = ("comms:read",),
+    owner_sub: str | None = None,
+    exp: object = None,
+    nbf: object = None,
+    expires_at: int | None = None,
+) -> AccessToken:
+    """Build an ``AccessToken`` with the given claims (``iss``/``sub`` may be
+    omitted entirely by passing ``None`` explicitly for that argument)."""
+    claims: dict[str, object] = {}
+    if iss is not None:
+        claims["iss"] = iss
+    if sub is not None:
+        claims["sub"] = sub
+    if scopes is not None:
+        claims["scopes"] = list(scopes) if isinstance(scopes, (list, tuple)) else scopes
+    if owner_sub is not None:
+        claims["owner_sub"] = owner_sub
+    if exp is not None:
+        claims["exp"] = exp
+    if nbf is not None:
+        claims["nbf"] = nbf
+    return AccessToken(
+        token="tok", client_id="test-agent", scopes=[], claims=claims, expires_at=expires_at
+    )
+
+
+class _FakeVerifier(TokenVerifier):
+    """Minimal ``TokenVerifier`` returning a fixed result -- a stand-in for
+    a consumer's own verifier, used to test the seam's resolution/adapter
+    logic without depending on a real JWT."""
+
+    def __init__(self, result: AccessToken | None) -> None:
+        super().__init__()
+        self._result = result
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        return self._result
+
+
+# Import-path-resolvable module-level factories (referenced by dotted path
+# in AGENT_TOKEN_VERIFIERS, mirroring test_plugins.py's
+# "tests.test_plugins:_FakeScorer" convention).
+def _fake_failing_verifier_factory() -> TokenVerifier:
+    return _FakeVerifier(None)
+
+
+def _fake_succeeding_verifier_factory() -> TokenVerifier:
+    return _FakeVerifier(_access_token(sub="ok-agent"))
+
+
+class TestResolveAgentTokenVerifiersRegistry:
+    def test_default_env_resolves_to_agent_jwt_hs256(self) -> None:
+        verifiers = _resolve_agent_token_verifiers()
+        assert len(verifiers) == 1
+        assert isinstance(verifiers[0], _NormalizingVerifier)
+
+    def test_registry_contains_agent_jwt_hs256(self) -> None:
+        assert "agent_jwt_hs256" in TOKEN_VERIFIERS
+
+    def test_empty_value_raises_runtime_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(AGENT_TOKEN_VERIFIERS_ENV_VAR, "")
+        with pytest.raises(RuntimeError, match=AGENT_TOKEN_VERIFIERS_ENV_VAR):
+            _resolve_agent_token_verifiers()
+
+    def test_unknown_registry_name_raises_runtime_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(AGENT_TOKEN_VERIFIERS_ENV_VAR, "not_a_registered_name")
+        with pytest.raises(RuntimeError, match="unknown plugin"):
+            _resolve_agent_token_verifiers()
+
+    def test_bad_import_path_raises_runtime_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(AGENT_TOKEN_VERIFIERS_ENV_VAR, "not_a_real_module:Whatever")
+        with pytest.raises(RuntimeError, match="failed to import plugin"):
+            _resolve_agent_token_verifiers()
+
+
+class TestAgentTokenVerifierCoexistenceAndReplacement:
+    async def test_coexistence_order_first_fails_second_succeeds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(
+            AGENT_TOKEN_VERIFIERS_ENV_VAR,
+            "tests.test_auth:_fake_failing_verifier_factory,"
+            "tests.test_auth:_fake_succeeding_verifier_factory",
+        )
+        verifiers = _resolve_agent_token_verifiers()
+        assert len(verifiers) == 2
+
+        multi = MultiAuth(verifiers=verifiers)
+        result = await multi.verify_token("whatever")
+
+        assert result is not None
+        assert result.claims is not None
+        assert result.claims["sub"] == "ok-agent"
+
+    def test_full_replacement_does_not_require_agent_jwt_secret(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A lone import path (no ``agent_jwt_hs256``) fully replaces the
+        default, so ``AGENT_JWT_SECRET`` must not be required."""
+        monkeypatch.setenv(
+            AGENT_TOKEN_VERIFIERS_ENV_VAR, "tests.test_auth:_fake_succeeding_verifier_factory"
+        )
+        monkeypatch.delenv("AGENT_JWT_SECRET", raising=False)
+
+        verifiers = _resolve_agent_token_verifiers()
+
+        assert len(verifiers) == 1
+
+
+class TestNormalizingVerifierContract:
+    """The adapter's normalized-claims contract: bad iss, invalid sub shape,
+    and non-list scopes must each be treated as verification FAILURE (None),
+    not passed through -- fail-closed, per auth.py's ``_NormalizingVerifier``
+    docstring."""
+
+    async def test_passes_through_a_valid_normalized_token(self) -> None:
+        token = _access_token(iss="agent-jwt", sub="good-agent", scopes=["comms:read"])
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
+
+        result = await verifier.verify_token("whatever")
+
+        assert result is token
+
+    async def test_passes_through_a_none_result_unchanged(self) -> None:
+        verifier = _NormalizingVerifier(_FakeVerifier(None), plugin_name="fake")
+
+        assert await verifier.verify_token("whatever") is None
+
+    async def test_optional_owner_sub_is_allowed(self) -> None:
+        token = _access_token(
+            iss="agent-jwt", sub="good-agent", scopes=[], owner_sub="human@example.com"
+        )
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
+
+        assert await verifier.verify_token("whatever") is token
+
+    async def test_rejects_wrong_issuer(self) -> None:
+        token = _access_token(iss="acme", sub="good-agent", scopes=["comms:read"])
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
+
+        with patch("auth.logger") as mock_logger:
+            result = await verifier.verify_token("whatever")
+
+        assert result is None
+        mock_logger.warning.assert_called_once()
+
+    async def test_rejects_email_shaped_sub(self) -> None:
+        token = _access_token(iss="agent-jwt", sub="alice@example.com", scopes=["comms:read"])
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
+
+        assert await verifier.verify_token("whatever") is None
+
+    async def test_rejects_missing_sub(self) -> None:
+        token = _access_token(iss="agent-jwt", sub=None, scopes=["comms:read"])
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
+
+        assert await verifier.verify_token("whatever") is None
+
+    async def test_rejects_empty_sub(self) -> None:
+        token = _access_token(iss="agent-jwt", sub="   ", scopes=["comms:read"])
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
+
+        assert await verifier.verify_token("whatever") is None
+
+    async def test_rejects_non_list_scopes(self) -> None:
+        token = _access_token(iss="agent-jwt", sub="good-agent", scopes="comms:read")
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
+
+        assert await verifier.verify_token("whatever") is None
+
+    async def test_rejects_non_string_sub(self) -> None:
+        token = _access_token(iss="agent-jwt", sub=12345, scopes=["comms:read"])
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
+
+        assert await verifier.verify_token("whatever") is None
+
+    async def test_rejects_non_string_scopes_elements(self) -> None:
+        token = _access_token(iss="agent-jwt", sub="good-agent", scopes=[1, 2])
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
+
+        assert await verifier.verify_token("whatever") is None
+
+    async def test_rejects_expired_via_access_token_expires_at(self) -> None:
+        token = _access_token(
+            iss="agent-jwt", sub="good-agent", scopes=["comms:read"], expires_at=1
+        )
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
+
+        assert await verifier.verify_token("whatever") is None
+
+    async def test_rejects_expired_via_exp_claim(self) -> None:
+        token = _access_token(iss="agent-jwt", sub="good-agent", scopes=["comms:read"], exp=1)
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
+
+        assert await verifier.verify_token("whatever") is None
+
+    async def test_rejects_not_yet_valid_via_nbf_claim(self) -> None:
+        far_future = 9999999999
+        token = _access_token(
+            iss="agent-jwt", sub="good-agent", scopes=["comms:read"], nbf=far_future
+        )
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
+
+        assert await verifier.verify_token("whatever") is None
+
+    async def test_rejects_non_numeric_exp_claim(self) -> None:
+        token = _access_token(
+            iss="agent-jwt", sub="good-agent", scopes=["comms:read"], exp="not-a-number"
+        )
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
+
+        assert await verifier.verify_token("whatever") is None
+
+    async def test_rejects_boolean_exp_claim_as_expired(self) -> None:
+        """``exp=True`` coerces to ``float(1.0)`` (1970-01-01), so it's
+        rejected as expired rather than as a type error -- correct outcome,
+        pinning the actual code path taken."""
+        token = _access_token(iss="agent-jwt", sub="good-agent", scopes=["comms:read"], exp=True)
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
+
+        assert await verifier.verify_token("whatever") is None
+
+    async def test_rejects_nan_exp_claim(self) -> None:
+        token = _access_token(
+            iss="agent-jwt", sub="good-agent", scopes=["comms:read"], exp=float("nan")
+        )
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
+
+        assert await verifier.verify_token("whatever") is None
+
+    async def test_rejects_infinite_exp_claim(self) -> None:
+        token = _access_token(
+            iss="agent-jwt", sub="good-agent", scopes=["comms:read"], exp=float("inf")
+        )
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
+
+        assert await verifier.verify_token("whatever") is None
+
+    async def test_rejects_nan_nbf_claim(self) -> None:
+        token = _access_token(
+            iss="agent-jwt", sub="good-agent", scopes=["comms:read"], nbf=float("nan")
+        )
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
+
+        assert await verifier.verify_token("whatever") is None
+
+    async def test_rejects_infinite_nbf_claim(self) -> None:
+        token = _access_token(
+            iss="agent-jwt", sub="good-agent", scopes=["comms:read"], nbf=float("inf")
+        )
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
+
+        assert await verifier.verify_token("whatever") is None
+
+    async def test_accepts_nbf_within_clock_skew_leeway(self) -> None:
+        """An ``nbf`` a few seconds in the future (well under the 60s leeway) must
+        still pass -- this is exactly the ordinary-clock-drift case the leeway
+        exists for (e.g. ``nbf == iat`` on a host whose clock runs slightly
+        ahead of this one)."""
+        now = time.time()
+        token = _access_token(iss="agent-jwt", sub="good-agent", scopes=["comms:read"], nbf=now + 5)
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
+
+        assert await verifier.verify_token("whatever") is token
+
+    def test_expiry_violation_rejects_nonfinite_expires_at_directly(self) -> None:
+        """AccessToken.expires_at is a pydantic int field that rejects NaN/inf at
+        construction time via normal validation, so this path can't be exercised
+        through a real AccessToken -- test _expiry_violation directly instead, the
+        same way an honest-but-buggy plugin using model_construct() to skip
+        validation could still reach this code."""
+        assert _expiry_violation(float("nan"), {}) is not None
+        assert _expiry_violation(float("inf"), {}) is not None
+        assert _expiry_violation(int(time.time()) + 3600, {}) is None
+
+    async def test_accepts_future_exp_and_past_nbf(self) -> None:
+        far_future = 9999999999
+        token = _access_token(
+            iss="agent-jwt",
+            sub="good-agent",
+            scopes=["comms:read"],
+            exp=far_future,
+            nbf=1,
+            expires_at=far_future,
+        )
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="fake")
+
+        assert await verifier.verify_token("whatever") is token
+
+
+class TestPluginVerifiedTokenMatchesDefaultDownstream:
+    """A normalized plugin-verified token must be indistinguishable from a
+    default-verified one to scopes.py/identity.py -- the whole point of the
+    contract."""
+
+    def test_scopes_for_token_reads_the_scopes_claim(self) -> None:
+        from scopes import scopes_for_token
+
+        token = _access_token(
+            iss="agent-jwt", sub="plugin-agent", scopes=["comms:read", "comms:write"]
+        )
+        assert scopes_for_token(token) == ["comms:read", "comms:write"]
+
+    def test_is_interactive_token_is_false(self) -> None:
+        from scopes import is_interactive_token
+
+        token = _access_token(iss="agent-jwt", sub="plugin-agent", scopes=["comms:read"])
+        assert is_interactive_token(token) is False
+
+    def test_try_resolve_email_resolves_via_sub(self) -> None:
+        from identity import try_resolve_email
+
+        token = _access_token(iss="agent-jwt", sub="plugin-agent", scopes=[])
+        assert try_resolve_email(token) == "plugin-agent"

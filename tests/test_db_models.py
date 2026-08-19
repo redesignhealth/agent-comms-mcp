@@ -417,3 +417,186 @@ class TestSchema:
             )
             unique_constraints = {row.conname for row in result}
         assert "uq_messages_conversation_id_seq" in unique_constraints
+
+
+class TestApprovalHoldsSchema:
+    """approval_holds table (TECH-5389 PR2, migration f4a9c1d2b3e7)."""
+
+    async def test_approval_holds_columns(self, engine: AsyncEngine) -> None:
+        cols = await _columns(engine, "approval_holds")
+        for expected in (
+            "id",
+            "conversation_id",
+            "sender_agent_id",
+            "owner_sub",
+            "message_type",
+            "schema_version",
+            "payload",
+            "risk_reason",
+            "risk_scorer",
+            "status",
+            "auto_approver",
+            "auto_decision",
+            "auto_decided_at",
+            "decided_by_sub",
+            "decided_at",
+            "decision_reason",
+            "message_id",
+            "expires_at",
+            "created_at",
+            "updated_at",
+        ):
+            assert expected in cols, f"approval_holds.{expected} missing"
+        assert cols["payload"] == "jsonb"
+
+    async def test_owner_sub_not_nullable(self, engine: AsyncEngine) -> None:
+        async with engine.connect() as conn:
+            nullable = (
+                await conn.execute(
+                    text(
+                        "SELECT is_nullable FROM information_schema.columns "
+                        "WHERE table_schema = 'public' AND table_name = 'approval_holds' "
+                        "AND column_name = 'owner_sub'"
+                    )
+                )
+            ).scalar_one_or_none()
+        assert nullable == "NO"
+
+    async def test_decision_reason_nullable(self, engine: AsyncEngine) -> None:
+        async with engine.connect() as conn:
+            nullable = (
+                await conn.execute(
+                    text(
+                        "SELECT is_nullable FROM information_schema.columns "
+                        "WHERE table_schema = 'public' AND table_name = 'approval_holds' "
+                        "AND column_name = 'decision_reason'"
+                    )
+                )
+            ).scalar_one_or_none()
+        assert nullable == "YES"
+
+    async def test_status_check_constraint(self, engine: AsyncEngine) -> None:
+        async with engine.connect() as conn:
+            constraint_def = (
+                await conn.execute(
+                    text(
+                        "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                        "WHERE conrelid = 'approval_holds'::regclass "
+                        "AND conname = 'ck_approval_holds_status'"
+                    )
+                )
+            ).scalar_one_or_none()
+        assert constraint_def is not None
+        for status in (
+            "pending_auto",
+            "pending_human",
+            "auto_approved",
+            "approved",
+            "rejected",
+            "expired",
+        ):
+            assert status in constraint_def
+
+    async def test_auto_decision_check_constraint(self, engine: AsyncEngine) -> None:
+        async with engine.connect() as conn:
+            constraint_def = (
+                await conn.execute(
+                    text(
+                        "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                        "WHERE conrelid = 'approval_holds'::regclass "
+                        "AND conname = 'ck_approval_holds_auto_decision'"
+                    )
+                )
+            ).scalar_one_or_none()
+        assert constraint_def is not None
+        assert "cleared" in constraint_def
+        assert "escalated" in constraint_def
+
+    async def test_message_id_unique_and_fks(self, engine: AsyncEngine) -> None:
+        async with engine.connect() as conn:
+            unique_constraints = {
+                row.conname
+                for row in (
+                    await conn.execute(
+                        text(
+                            "SELECT conname FROM pg_constraint "
+                            "WHERE conrelid = 'approval_holds'::regclass AND contype = 'u'"
+                        )
+                    )
+                )
+            }
+            fk_targets = {
+                row.confrelid_name
+                for row in (
+                    await conn.execute(
+                        text(
+                            "SELECT confrelid::regclass::text AS confrelid_name "
+                            "FROM pg_constraint "
+                            "WHERE conrelid = 'approval_holds'::regclass AND contype = 'f'"
+                        )
+                    )
+                )
+            }
+        assert "uq_approval_holds_message_id" in unique_constraints
+        assert fk_targets == {"conversations", "agents", "messages"}
+
+    async def test_indexes_exist(self, engine: AsyncEngine) -> None:
+        indexes = await _indexes(engine, "approval_holds")
+        assert "idx_approval_holds_sender_agent_id_status_created_at" in indexes
+        assert "idx_approval_holds_conversation_id" in indexes
+        assert "idx_approval_holds_owner_sub_status_created_at" in indexes
+
+    async def test_round_trip_insert_and_read(self, engine: AsyncEngine) -> None:
+        """Full round-trip through raw SQL (this module never mocks the
+        database): insert a minimal agent + conversation, then a hold
+        referencing both, and read it back."""
+        async with engine.begin() as conn:
+            agent_row = (
+                await conn.execute(
+                    text(
+                        "INSERT INTO agents "
+                        "(sub, owner_sub, owner_email, display_name, accepted_types, status) "
+                        "VALUES ('test-hold-sender', 'test-hold-owner', "
+                        "'test-hold-owner@example.com', 'test-hold-sender', ARRAY['note'], "
+                        "'active') RETURNING id"
+                    )
+                )
+            ).one()
+            conversation_row = (
+                await conn.execute(
+                    text(
+                        "INSERT INTO conversations (type, state, created_by, expires_at) "
+                        "VALUES ('open', 'active', :created_by, now() + interval '7 days') "
+                        "RETURNING id"
+                    ),
+                    {"created_by": agent_row.id},
+                )
+            ).one()
+            hold_row = (
+                await conn.execute(
+                    text(
+                        "INSERT INTO approval_holds "
+                        "(conversation_id, sender_agent_id, owner_sub, message_type, "
+                        "schema_version, payload, risk_reason, risk_scorer, status, "
+                        "expires_at) "
+                        "VALUES (:conversation_id, :sender_agent_id, 'test-hold-owner', "
+                        "'note', 1, "
+                        '\'{"type": "note", "text": "hi"}\'::jsonb, \'boundary_crossing\', '
+                        "'boundary_v1', 'pending_human', now() + interval '7 days') "
+                        "RETURNING id, status, decision_reason, message_id"
+                    ),
+                    {"conversation_id": conversation_row.id, "sender_agent_id": agent_row.id},
+                )
+            ).one()
+            assert hold_row.status == "pending_human"
+            assert hold_row.decision_reason is None
+            assert hold_row.message_id is None
+
+            # Cleanup: this module has no autouse table-truncation fixture.
+            await conn.execute(
+                text("DELETE FROM approval_holds WHERE id = :id"), {"id": hold_row.id}
+            )
+            await conn.execute(
+                text("DELETE FROM conversations WHERE id = :id"), {"id": conversation_row.id}
+            )
+            await conn.execute(text("DELETE FROM agents WHERE id = :id"), {"id": agent_row.id})

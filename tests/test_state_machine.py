@@ -1,11 +1,14 @@
-"""Tests for the pure conversation state-machine rules (state_machine.py)."""
+"""Tests for the pure conversation state-machine rules (state_machine.py).
+
+The ownership-boundary rule (formerly ``is_boundary_crossing_safe`` here)
+moved to ``plugins.BoundaryCrossingScorer`` (TECH-5389) -- see
+``tests/test_risk.py``."""
 
 from __future__ import annotations
 
 import pytest
 
 from state_machine import (
-    is_boundary_crossing_safe,
     is_message_legal,
     resulting_conversation_state,
 )
@@ -106,80 +109,3 @@ class TestResultingConversationState:
     def test_task_assign_does_not_transition(self) -> None:
         assert resulting_conversation_state("task_assign") is None
         assert resulting_conversation_state("task_assign", all_non_owners_declined=True) is None
-
-
-_A = frozenset({"a"})
-_B = frozenset({"b"})
-_SHARED = frozenset({"a", "b"})
-_EMPTY: frozenset[str] = frozenset()
-
-
-class TestIsBoundaryCrossingSafe:
-    def test_open_requires_boundary_safe(self) -> None:
-        assert is_boundary_crossing_safe("open", True, _EMPTY, _EMPTY) is True
-        assert is_boundary_crossing_safe("open", False, _EMPTY, _EMPTY) is False
-
-    def test_open_ignores_owner_sets(self) -> None:
-        # open has no ownership concept -- boundary_safe alone decides.
-        assert is_boundary_crossing_safe("open", True, _A, _B) is True
-        assert is_boundary_crossing_safe("open", False, _A, _A) is False
-
-    def test_internal_always_safe(self) -> None:
-        assert is_boundary_crossing_safe("internal", True, _A, _A) is True
-        assert is_boundary_crossing_safe("internal", False, _A, _B) is True
-        assert is_boundary_crossing_safe("internal", False, _EMPTY, _EMPTY) is True
-
-    def test_asymmetric_boundary_safe_always_legal(self) -> None:
-        assert is_boundary_crossing_safe("asymmetric", True, _A, _B) is True
-
-    def test_asymmetric_single_owner_to_shared_crosses(self) -> None:
-        # sender owns only {a}; other side (shared) has an owner {b}
-        # outside the sender's set -- crosses, illegal.
-        assert is_boundary_crossing_safe("asymmetric", False, _A, _SHARED) is False
-
-    def test_asymmetric_shared_to_single_owner_does_not_cross(self) -> None:
-        # sender is shared {a, b}; other side's owner {b} is already in the
-        # sender's own set -- does not cross, legal.
-        assert is_boundary_crossing_safe("asymmetric", False, _SHARED, _B) is True
-
-    def test_asymmetric_same_single_owner_does_not_cross(self) -> None:
-        assert is_boundary_crossing_safe("asymmetric", False, _A, _A) is True
-
-    def test_asymmetric_disjoint_owners_crosses(self) -> None:
-        assert is_boundary_crossing_safe("asymmetric", False, _A, _B) is False
-
-    def test_unrecognized_type_denied_even_when_boundary_safe(self) -> None:
-        # Default-deny for a type this function doesn't recognize (e.g. a
-        # legacy pre-rename row) -- must not fall through to asymmetric's
-        # more permissive handling.
-        assert is_boundary_crossing_safe("scheduling.availability", True, _EMPTY, _EMPTY) is False
-        assert is_boundary_crossing_safe("bogus", False, _A, _B) is False
-
-    def test_every_registered_conversation_type_is_explicitly_handled(self) -> None:
-        # state_machine.py already imports schemas.MessageType, but
-        # deliberately doesn't import schemas.CONVERSATION_TYPES specifically
-        # (is_boundary_crossing_safe's three branches are hardcoded, not
-        # derived from that set), so this cross-check lives here rather than
-        # as a runtime assertion inside is_boundary_crossing_safe itself --
-        # a future CONVERSATION_TYPES addition that is_boundary_crossing_safe
-        # doesn't yet special-case would otherwise silently fall through to
-        # the default-deny branch instead of getting real handling.
-        from schemas import CONVERSATION_TYPES
-
-        for conversation_type in CONVERSATION_TYPES:
-            assert conversation_type in ("open", "internal", "asymmetric"), (
-                f"{conversation_type!r} is in schemas.CONVERSATION_TYPES but "
-                "is_boundary_crossing_safe has no explicit branch for it"
-            )
-            # Also prove it's actually handled -- boundary_safe=True is
-            # sufficient for legality in all three types (for "internal"
-            # unconditionally, since the type itself decides there, not the
-            # flag; for "open" because its branch requires boundary_safe
-            # directly; for "asymmetric" via its own short-circuit, though
-            # with the _EMPTY owner sets used here the subset check would
-            # also pass boundary_safe=False -- test_asymmetric_boundary_safe_
-            # always_legal, with non-empty disjoint sets, is what actually
-            # pins the asymmetric short-circuit) -- not just membership in a
-            # hardcoded tuple this test could drift from the real function's
-            # own branches.
-            assert is_boundary_crossing_safe(conversation_type, True, _EMPTY, _EMPTY) is True

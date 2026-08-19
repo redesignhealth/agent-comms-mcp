@@ -47,6 +47,21 @@ AGENT_STATUSES = ("active", "suspended")
 CONVERSATION_STATES = ("active", "completed", "canceled", "expired")
 PARTICIPANT_ROLES = ("owner", "member")
 PARTICIPANT_STATUSES = ("invited", "active", "left", "declined")
+# approval_holds lifecycle (TECH-5389 PR2): pending_auto -> pending_human ->
+# approved|rejected|expired, or pending_auto -> auto_approved. v1's
+# EscalateAllAutoApprover means no committed row is ever OBSERVED at
+# pending_auto (created and transitioned within one transaction), but the
+# state exists in this CHECK from day one for a future async auto-approver
+# (see plugins.AutoApprover's docstring).
+APPROVAL_HOLD_STATUSES = (
+    "pending_auto",
+    "pending_human",
+    "auto_approved",
+    "approved",
+    "rejected",
+    "expired",
+)
+APPROVAL_HOLD_AUTO_DECISIONS = ("cleared", "escalated")
 
 
 class Base(DeclarativeBase):
@@ -313,12 +328,110 @@ class AuditLog(Base):
     detail: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
 
+class ApprovalHold(Base):
+    """A high-risk message diverted from ``messages`` pending approval
+    (TECH-5389 PR2, DESIGN.md §9 Axis 2).
+
+    Mutable (status flips as the hold moves through its lifecycle), unlike
+    ``messages``/``audit_log``'s append-only invariant — hence the
+    ``updated_at`` column every other mutable table in this file has.
+
+    No ``high_risk`` boolean: a hold exists ONLY because the risk scorer's
+    verdict was high-risk, so ``risk_reason``/``risk_scorer`` alone carry
+    the verdict.
+
+    ``owner_sub`` IS snapshotted at hold-creation time (from the sender's
+    verified ``owner_sub`` claim, falling back to ``agents.owner_sub`` when
+    absent) rather than read live from the ``agents`` row at decide time.
+    Once agent-token verification becomes pluggable (a separate companion
+    ticket, TECH-5396), a live-resolving verifier could change what
+    ``agents.owner_sub`` means between hold-creation and decide-time, so a
+    decide-time join to the frozen row is no longer equivalent to a
+    snapshot -- see ``docs/TECH-5389-APPROVAL-PIPELINE.md`` §15.4.
+    """
+
+    __tablename__ = "approval_holds"
+    __table_args__ = (
+        CheckConstraint(f"status IN {APPROVAL_HOLD_STATUSES!r}", name="ck_approval_holds_status"),
+        CheckConstraint(
+            f"auto_decision IS NULL OR auto_decision IN {APPROVAL_HOLD_AUTO_DECISIONS!r}",
+            name="ck_approval_holds_auto_decision",
+        ),
+        UniqueConstraint("message_id", name="uq_approval_holds_message_id"),
+        # Backs comms_get_hold_status's sender-only lookup and
+        # GET /approvals/pending's owner-filtered pending_human listing,
+        # both of which filter on (sender_agent_id, status) with
+        # created_at as the sort column. The hold-rate-limit count
+        # (_deny_rate_limited_holds) deliberately does NOT filter on
+        # status -- it counts every hold created in the window regardless
+        # of outcome, since a submission-spam control must count attempts,
+        # not just currently-pending ones -- so this index only partially
+        # serves that query (sender_agent_id + created_at range, scanning
+        # across status values rather than a clean prefix match). Argus
+        # round-1 caught this comment overclaiming full coverage; not
+        # worth a dedicated index at current scale.
+        Index(
+            "idx_approval_holds_sender_agent_id_status_created_at",
+            "sender_agent_id",
+            "status",
+            "created_at",
+        ),
+        # Backs GET /approvals/pending's owner-filtered pending_human listing
+        # against the hold's own owner_sub snapshot, not a join to `agents`.
+        Index(
+            "idx_approval_holds_owner_sub_status_created_at",
+            "owner_sub",
+            "status",
+            "created_at",
+        ),
+        Index("idx_approval_holds_conversation_id", "conversation_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id"), nullable=False
+    )
+    sender_agent_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agents.id"), nullable=False)
+    # Snapshotted from the sender's verified owner_sub claim at hold-creation
+    # time (fallback: agents.owner_sub) -- see the class docstring and
+    # docs/TECH-5389-APPROVAL-PIPELINE.md §15.4. Never the frozen agents row.
+    owner_sub: Mapped[str] = mapped_column(Text, nullable=False)
+    # The ORIGINAL message type (e.g. "note") -- posts as itself on approval.
+    message_type: Mapped[str] = mapped_column(Text, nullable=False)
+    schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Validated, normalized dump (insert-ready) -- schemas.validate_payload's
+    # output, exactly what would have gone into messages.payload had the
+    # verdict not been high-risk.
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    risk_reason: Mapped[str] = mapped_column(Text, nullable=False)
+    risk_scorer: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    auto_approver: Mapped[str | None] = mapped_column(Text, nullable=True)
+    auto_decision: Mapped[str | None] = mapped_column(Text, nullable=True)
+    auto_decided_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    decided_by_sub: Mapped[str | None] = mapped_column(Text, nullable=True)
+    decided_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    # Optional free-text human "why" (both directions -- approve or reject).
+    # The one deliberate free-text field outside `note`: it flows in exactly
+    # one direction, human -> the submitting agent's own owner, never
+    # crossing into another owner's trust domain (DESIGN.md §8/§9's
+    # no-free-text posture is about inter-agent payloads, not this).
+    decision_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    message_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("messages.id"), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(nullable=False)
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _updated_at()
+
+
 __all__ = [
     "AGENT_STATUSES",
+    "APPROVAL_HOLD_AUTO_DECISIONS",
+    "APPROVAL_HOLD_STATUSES",
     "CONVERSATION_STATES",
     "PARTICIPANT_ROLES",
     "PARTICIPANT_STATUSES",
     "Agent",
+    "ApprovalHold",
     "AuditLog",
     "Base",
     "Conversation",

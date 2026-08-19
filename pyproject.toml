@@ -19,6 +19,7 @@ dependencies = [
     "httpx==0.28.1",
     "py-key-value-aio[filetree]==0.4.5",
     "pydantic==2.12.5",
+    "pyjwt==2.13.0",
     "sqlalchemy[asyncio]==2.0.51",
     "structlog==25.5.0",
 ]
@@ -31,6 +32,7 @@ Issues = "https://github.com/redesignhealth/agent-comms-mcp/issues"
 [project.scripts]
 agent-comms-mcp = "main:_cli"
 agent-comms-mcp-migrate = "migrate:_cli"
+agent-comms-mcp-mint-token = "mint_token:_cli"
 
 [dependency-groups]
 dev = [
@@ -71,8 +73,8 @@ testpaths = ["tests"]
 
 [tool.setuptools]
 py-modules = [
-    "auth", "db", "exceptions", "identity", "main", "migrate",
-    "models", "observability", "scopes", "schemas",
+    "auth", "db", "exceptions", "identity", "main", "migrate", "mint_token",
+    "models", "observability", "plugins", "scopes", "schemas",
     "service", "state_machine",
 ]
 packages = ["providers", "migrations", "migrations.versions"]

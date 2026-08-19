@@ -34,6 +34,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+import plugins
 import service as _service
 from exceptions import (
     AccessDeniedError,
@@ -42,7 +43,7 @@ from exceptions import (
     SchemaVersionMismatchError,
     UnknownConversationTypeError,
 )
-from models import Agent, AuditLog, Conversation, Message, Participant
+from models import Agent, ApprovalHold, AuditLog, Conversation, Message, Participant
 from schemas import (
     MAX_ACCEPTED_TYPE_LENGTH,
     MAX_PAYLOAD_BYTES,
@@ -52,6 +53,7 @@ from schemas import (
 )
 from service import (
     CONVERSATION_TTL,
+    MAX_APPROVAL_HOLDS_PER_HOUR,
     MAX_CONVERSATION_STARTS_PER_HOUR,
     MAX_CONVERSATION_TTL,
     MAX_MESSAGES_PER_CONVERSATION_PER_HOUR,
@@ -79,13 +81,25 @@ from service import (
 
 
 async def start_conversation(
-    session: AsyncSession, *, ownership_client: OwnershipClient | None = None, **kwargs: Any
+    session: AsyncSession,
+    *,
+    ownership_client: OwnershipClient | None = None,
+    risk_scorer: plugins.RiskScorer | None = None,
+    auto_approver: plugins.AutoApprover | None = None,
+    notifier: plugins.ApprovalNotifier | None = None,
+    **kwargs: Any,
 ) -> Any:
-    """Thin wrapper defaulting ``ownership_client`` so every pre-existing
-    call site in this file keeps working unchanged — tests that care about
-    ownership behavior pass their own fake client explicitly."""
+    """Thin wrapper defaulting ``ownership_client``/``risk_scorer``/
+    ``auto_approver``/``notifier`` so every pre-existing call site in this
+    file keeps working unchanged — tests that care about
+    ownership/risk/approval behavior pass their own fake explicitly."""
     return await _service.start_conversation(
-        session, ownership_client=ownership_client or AgentTableOwnershipClient(session), **kwargs
+        session,
+        ownership_client=ownership_client or AgentTableOwnershipClient(session),
+        risk_scorer=risk_scorer or plugins.BoundaryCrossingScorer(),
+        auto_approver=auto_approver or plugins.EscalateAllAutoApprover(),
+        notifier=notifier or plugins.LogOnlyNotifier(),
+        **kwargs,
     )
 
 
@@ -98,10 +112,21 @@ async def invite(
 
 
 async def post_message(
-    session: AsyncSession, *, ownership_client: OwnershipClient | None = None, **kwargs: Any
+    session: AsyncSession,
+    *,
+    ownership_client: OwnershipClient | None = None,
+    risk_scorer: plugins.RiskScorer | None = None,
+    auto_approver: plugins.AutoApprover | None = None,
+    notifier: plugins.ApprovalNotifier | None = None,
+    **kwargs: Any,
 ) -> Any:
     return await _service.post_message(
-        session, ownership_client=ownership_client or AgentTableOwnershipClient(session), **kwargs
+        session,
+        ownership_client=ownership_client or AgentTableOwnershipClient(session),
+        risk_scorer=risk_scorer or plugins.BoundaryCrossingScorer(),
+        auto_approver=auto_approver or plugins.EscalateAllAutoApprover(),
+        notifier=notifier or plugins.LogOnlyNotifier(),
+        **kwargs,
     )
 
 
@@ -709,7 +734,7 @@ class TestRegisterAgent:
         rows = (
             await session.execute(
                 select(AuditLog.agent_id, AuditLog.conversation_id, AuditLog.detail).where(
-                    AuditLog.action == "agent.boundary_check_bypassed_shared",
+                    AuditLog.action == "risk.shared_sender_bypass",
                 )
             )
         ).all()
@@ -928,16 +953,19 @@ class TestSetAgentShared:
 
         # Same open conversation, no re-opening or re-accepting -- the
         # correction alone flips the outcome of the identical operation.
-        with pytest.raises(AccessDeniedError) as exc_info:
-            await post_message(
-                session,
-                actor_sub=wrongly_shared.sub,
-                sender_agent_id=wrongly_shared.id,
-                conversation_id=conversation.id,
-                message_type="note",
-                payload={"text": "after correction"},
-            )
-        assert exc_info.value.reason == "denied.boundary_crossing"
+        # TECH-5389 PR2: the ordinary ownership-boundary check no longer
+        # denies a genuine crossing -- it diverts to a hold instead.
+        result = await post_message(
+            session,
+            actor_sub=wrongly_shared.sub,
+            sender_agent_id=wrongly_shared.id,
+            conversation_id=conversation.id,
+            message_type="note",
+            payload={"text": "after correction"},
+        )
+        assert isinstance(result, ApprovalHold)
+        assert result.status == "pending_human"
+        assert result.risk_reason == "boundary_crossing"
 
 
 # --- start_conversation --------------------------------------------------------
@@ -1018,33 +1046,78 @@ class TestStartConversation:
         )
         assert "denied.unknown_agent" in actions
 
-    async def test_open_note_as_initial_message_denied(self, session: AsyncSession) -> None:
-        """DESIGN.md §9 Axis 2: ``open`` requires boundary_safe=True
-        unconditionally, and that must hold for the seq-1 message exactly
-        like every later one -- not just messages posted after accept."""
+    async def test_open_note_as_initial_message_diverted_to_hold(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-5389 PR2 §6 (ratified decision 1): a high-risk seq-1 opener
+        no longer denies -- the conversation is created anyway, with a
+        service-synthesized ``conversation_opened`` marker as its seq-1
+        message, and the real content is diverted into a hold exactly like
+        any other high-risk post."""
         owner = await _register(session, "owner-open-note")
         target = await _register(session, "target-open-note")
 
-        with pytest.raises(AccessDeniedError) as exc_info:
-            await start_conversation(
-                session,
-                actor_sub=owner.sub,
-                initiator_agent_id=owner.id,
-                conversation_type="open",
-                target_agent_ids=[target.id],
-                initial_message={"text": "hello"},
-                message_type="note",
-            )
-        assert exc_info.value.reason == "denied.boundary_crossing"
-        # The boundary check runs before any row is created -- a denial
-        # here must not leave an orphaned conversation/participant pair
-        # with no message (see _enforce_boundary_crossing's docstring).
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message={"text": "hello"},
+            message_type="note",
+        )
+        assert conversation.state == "active"
+        hold = conversation.pending_hold
+        assert isinstance(hold, ApprovalHold)
+        assert hold.status == "pending_human"
+        assert hold.risk_reason == "boundary_crossing"
+        assert hold.message_type == "note"
+        assert hold.payload == {"type": "note", "text": "hello"}
+
+        # The conversation's own seq-1 message is the synthesized marker,
+        # not the held note -- the real content has no seq yet.
         rows = (
-            (await session.execute(select(Conversation).where(Conversation.created_by == owner.id)))
+            (
+                await session.execute(
+                    select(Message).where(Message.conversation_id == conversation.id)
+                )
+            )
             .scalars()
             .all()
         )
-        assert rows == []
+        assert len(rows) == 1
+        assert rows[0].seq == 1
+        assert rows[0].type == "conversation_opened"
+        assert rows[0].payload == {"type": "conversation_opened", "reason": "pending_approval"}
+
+        message_post_rows = (
+            (
+                await session.execute(
+                    select(AuditLog.detail).where(
+                        AuditLog.action == "message.post",
+                        AuditLog.conversation_id == conversation.id,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert any(
+            d.get("system_synthesized") is True and d.get("hold_id") == str(hold.id)
+            for d in message_post_rows
+        )
+        hold_actions = (
+            (
+                await session.execute(
+                    select(AuditLog.action).where(AuditLog.conversation_id == conversation.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert "approval.hold" in hold_actions
+        assert "approval.escalate" in hold_actions
+        assert "denied.boundary_crossing" not in hold_actions
 
     async def test_task_decline_as_initial_message_denied(self, session: AsyncSession) -> None:
         """``task_decline`` is member-role-restricted, but the initiator's
@@ -2704,25 +2777,41 @@ class TestPostMessageBoundaryCrossing:
         )
         return owner, target, conversation, client
 
-    async def test_note_from_single_owner_to_shared_crosses_denied(
+    async def test_note_from_single_owner_to_shared_crosses_diverted_to_hold(
         self, session: AsyncSession
     ) -> None:
         owner, _target, conversation, client = await self._asymmetric_pair(
             session, ["dan"], ["dan", "priya"]
         )
-        with pytest.raises(AccessDeniedError) as exc_info:
-            await post_message(
-                session,
-                actor_sub=owner.sub,
-                sender_agent_id=owner.id,
-                conversation_id=conversation.id,
-                message_type="note",
-                payload={"text": "hello"},
-                ownership_client=client,
+        result = await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="note",
+            payload={"text": "hello"},
+            ownership_client=client,
+        )
+        assert isinstance(result, ApprovalHold)
+        assert result.status == "pending_human"
+        assert result.risk_reason == "boundary_crossing"
+        assert result.sender_agent_id == owner.id
+        assert result.conversation_id == conversation.id
+        # No messages row exists for the held content -- it has no seq.
+        msg_rows = (
+            (
+                await session.execute(
+                    select(Message).where(Message.conversation_id == conversation.id)
+                )
             )
-        assert exc_info.value.reason == "denied.boundary_crossing"
+            .scalars()
+            .all()
+        )
+        assert all(m.type != "note" for m in msg_rows)
         actions = await _audit_actions(session, conversation.id)
-        assert "denied.boundary_crossing" in actions
+        assert "approval.hold" in actions
+        assert "approval.escalate" in actions
+        assert "denied.boundary_crossing" not in actions
 
     async def test_second_lookup_failure_denied(self, session: AsyncSession) -> None:
         """The sender's own ownership lookup succeeds, but a later
@@ -2752,100 +2841,9 @@ class TestPostMessageBoundaryCrossing:
                 payload={"text": "hello"},
                 ownership_client=sender_only_client,
             )
-        assert exc_info.value.reason == "denied.ownership_unverified"
+        assert exc_info.value.reason == "denied.risk_unscored"
         actions = await _audit_actions(session, conversation.id)
-        assert "denied.ownership_unverified" in actions
-
-    async def test_second_lookup_failure_fail_closed_even_if_deny_does_not_raise(
-        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """If `_deny`'s `NoReturn`
-        contract were ever weakened so a single call failed to raise, the
-        second ownership-lookup except block must still leave
-        `sender_owners`/`other_owners` in a state that the function's own
-        final boundary-crossing check re-denies -- not silently admit the
-        message. Simulated by making `_deny` swallow (not raise on) only
-        its FIRST call, then behave normally on any later call: if the
-        fail-closed reset regressed and the function instead fell through
-        treating the crossing as safe, no second `_deny` call would ever
-        happen and this test would see no exception at all."""
-        owner, _target, conversation, _client = await self._asymmetric_pair(
-            session, ["dan"], ["dan", "priya"]
-        )
-        sender_only_client = _FakeOwnershipClient(
-            {owner.id: {"is_shared": False, "owners": ["dan"]}}
-        )
-
-        real_deny = _service._deny
-        call_count = 0
-
-        async def _deny_that_swallows_first_call(*args: Any, **kwargs: Any) -> None:
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                return
-            await real_deny(*args, **kwargs)
-
-        monkeypatch.setattr(_service, "_deny", _deny_that_swallows_first_call)
-
-        with pytest.raises(AccessDeniedError) as exc_info:
-            await post_message(
-                session,
-                actor_sub=owner.sub,
-                sender_agent_id=owner.id,
-                conversation_id=conversation.id,
-                message_type="note",
-                payload={"text": "hello"},
-                ownership_client=sender_only_client,
-            )
-        assert exc_info.value.reason == "denied.ownership_unverified"
-        assert call_count == 2
-
-    async def test_first_lookup_failure_fail_closed_even_if_deny_does_not_raise(
-        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Symmetric to the previous test: the `if
-        sender_info:` guard that skips the second (other-participant)
-        lookup entirely when the FIRST (sender) lookup already failed must
-        still leave `sender_owners` in a state that the function's own
-        final boundary-crossing check re-denies, even if `_deny`'s
-        `NoReturn` contract were ever weakened. Simulated the same way as
-        `test_second_lookup_failure_fail_closed_even_if_deny_does_not_raise`:
-        `_deny` swallows only its first call. If the guard regressed and
-        the code fell through into the second lookup anyway, `_deny` would
-        be called a third time (once for the sender-lookup failure, once
-        more for an other-agent lookup this test never populates data for,
-        and once for the final `not sender_owners` check) -- this asserts
-        exactly two calls, not three, proving the second lookup was never
-        attempted."""
-        owner, _target, conversation, _client = await self._asymmetric_pair(
-            session, ["dan"], ["dan", "priya"]
-        )
-
-        real_deny = _service._deny
-        call_count = 0
-
-        async def _deny_that_swallows_first_call(*args: Any, **kwargs: Any) -> None:
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                return
-            await real_deny(*args, **kwargs)
-
-        monkeypatch.setattr(_service, "_deny", _deny_that_swallows_first_call)
-
-        with pytest.raises(AccessDeniedError) as exc_info:
-            await post_message(
-                session,
-                actor_sub=owner.sub,
-                sender_agent_id=owner.id,
-                conversation_id=conversation.id,
-                message_type="note",
-                payload={"text": "hello"},
-                ownership_client=_FailingOwnershipClient(),
-            )
-        assert exc_info.value.reason == "denied.ownership_unverified"
-        assert call_count == 2
+        assert "denied.risk_unscored" in actions
 
     async def test_empty_owner_set_soft_fail_denied(self, session: AsyncSession) -> None:
         """A post-admission ownership_client that soft-fails to
@@ -2870,7 +2868,7 @@ class TestPostMessageBoundaryCrossing:
                 payload={"text": "hello"},
                 ownership_client=soft_failing_client,
             )
-        assert exc_info.value.reason == "denied.ownership_unverified"
+        assert exc_info.value.reason == "denied.risk_unscored"
 
     async def test_note_from_shared_to_single_owner_does_not_cross(
         self, session: AsyncSession
@@ -2910,21 +2908,25 @@ class TestPostMessageBoundaryCrossing:
         )
         assert message.type == "counter_proposal"
 
-    async def test_open_note_denied_unconditionally(self, session: AsyncSession) -> None:
+    async def test_open_note_diverted_to_hold_unconditionally(self, session: AsyncSession) -> None:
         owner, _target, conversation = await self._active_pair_open(
             session, "bc-open-owner", "bc-open-target"
         )
-        with pytest.raises(AccessDeniedError) as exc_info:
-            await post_message(
-                session,
-                actor_sub=owner.sub,
-                sender_agent_id=owner.id,
-                conversation_id=conversation.id,
-                message_type="note",
-                payload={"text": "hello"},
-                ownership_client=_FailingOwnershipClient(),
-            )
-        assert exc_info.value.reason == "denied.boundary_crossing"
+        result = await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="note",
+            payload={"text": "hello"},
+            # No ownership lookup for `open` -- a raising client here would
+            # never actually be invoked (proving that), so this test would
+            # pass for the wrong reason if the diversion changed that.
+            ownership_client=_FailingOwnershipClient(),
+        )
+        assert isinstance(result, ApprovalHold)
+        assert result.status == "pending_human"
+        assert result.risk_reason == "boundary_crossing"
 
     async def _active_pair_open(
         self, session: AsyncSession, owner_sub: str, target_sub: str
@@ -2983,11 +2985,11 @@ class TestPostMessageBoundaryCrossing:
     ) -> None:
         """A row with a conversation_type this process doesn't recognize
         (e.g. a legacy pre-rename row the backfill migration missed) must
-        be denied via its own denied.unknown_conversation_type action, not
-        the misleading denied.boundary_crossing label -- and even a
-        boundary_safe message is denied, since is_boundary_crossing_safe's
-        default-deny path doesn't special-case boundary_safe for unknown
-        types."""
+        hard-deny via denied.risk_unscored (detail.cause=
+        unknown_conversation_type), never divert to a hold -- an unscorable
+        message must not flood the human approval queue -- and even a
+        boundary-safe message is denied, since the scorer's default-deny
+        path for unknown types doesn't special-case it."""
         owner = await _register(session, "bc-legacy-owner")
         target = await _register(session, "bc-legacy-target")
         conversation = Conversation(
@@ -3034,18 +3036,20 @@ class TestPostMessageBoundaryCrossing:
                 # wrong reason.
                 ownership_client=_FakeOwnershipClient({}),
             )
-        assert exc_info.value.reason == "denied.unknown_conversation_type"
+        assert exc_info.value.reason == "denied.risk_unscored"
         actions = await _audit_actions(session, conversation.id)
-        assert "denied.unknown_conversation_type" in actions
+        assert "denied.risk_unscored" in actions
         assert "denied.boundary_crossing" not in actions
+        assert "approval.hold" not in actions
 
     async def test_asymmetric_ownership_lookup_failure_fails_closed(
         self, session: AsyncSession
     ) -> None:
         """The genuine exception path (not the soft-fail-to-empty-set one
         covered elsewhere): a raising ownership_client on an asymmetric
-        conversation's non-boundary_safe message denies with
-        denied.ownership_unverified, distinct from denied.boundary_crossing."""
+        conversation's non-boundary_safe message hard-denies with
+        denied.risk_unscored (an unscorable message never diverts to a
+        hold -- only a GENUINE crossing verdict does)."""
         owner, _target, conversation, _client = await self._asymmetric_pair(
             session, ["dan"], ["dan", "priya"]
         )
@@ -3059,10 +3063,11 @@ class TestPostMessageBoundaryCrossing:
                 payload={"text": "hello"},
                 ownership_client=_FailingOwnershipClient(),
             )
-        assert exc_info.value.reason == "denied.ownership_unverified"
+        assert exc_info.value.reason == "denied.risk_unscored"
         actions = await _audit_actions(session, conversation.id)
-        assert "denied.ownership_unverified" in actions
+        assert "denied.risk_unscored" in actions
         assert "denied.boundary_crossing" not in actions
+        assert "approval.hold" not in actions
 
 
 class TestMessageTypeAcceptedCapability:
@@ -3919,6 +3924,214 @@ class TestRateLimits:
         )
         assert conversation_rows == []
 
+    async def test_approval_hold_rate_limit_under_limit_creates_holds(
+        self, session: AsyncSession
+    ) -> None:
+        """MAX_APPROVAL_HOLDS_PER_HOUR (Argus round-1: no coverage existed
+        for this rate limit at all). Every `note` posted into an `open`
+        conversation diverts unconditionally (boundary_crossing), so each
+        call below creates one more approval_holds row for the same
+        sender."""
+        owner = await _register(session, "rl-hold-owner-1")
+        target = await _register(session, "rl-hold-target-1")
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        for _ in range(MAX_APPROVAL_HOLDS_PER_HOUR):
+            result = await post_message(
+                session,
+                actor_sub=owner.sub,
+                sender_agent_id=owner.id,
+                conversation_id=conversation.id,
+                message_type="note",
+                payload={"text": "hello"},
+            )
+            assert isinstance(result, ApprovalHold)
+        holds = (
+            (
+                await session.execute(
+                    select(ApprovalHold).where(ApprovalHold.sender_agent_id == owner.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(holds) == MAX_APPROVAL_HOLDS_PER_HOUR
+
+    async def test_approval_hold_rate_limit_over_limit_denied(self, session: AsyncSession) -> None:
+        owner = await _register(session, "rl-hold-owner-2")
+        target = await _register(session, "rl-hold-target-2")
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        for _ in range(MAX_APPROVAL_HOLDS_PER_HOUR):
+            await post_message(
+                session,
+                actor_sub=owner.sub,
+                sender_agent_id=owner.id,
+                conversation_id=conversation.id,
+                message_type="note",
+                payload={"text": "hello"},
+            )
+        with pytest.raises(RateLimitExceededError):
+            await post_message(
+                session,
+                actor_sub=owner.sub,
+                sender_agent_id=owner.id,
+                conversation_id=conversation.id,
+                message_type="note",
+                payload={"text": "one too many"},
+            )
+        # The hold-rate-limit denial audits with conversation_id=None (it
+        # counts approval_holds across all of the sender's conversations,
+        # not one) -- query by agent_id, not conversation_id, to see it.
+        agent_actions = (
+            (await session.execute(select(AuditLog.action).where(AuditLog.agent_id == owner.id)))
+            .scalars()
+            .all()
+        )
+        assert "denied.rate_limited" in agent_actions
+        holds = (
+            (
+                await session.execute(
+                    select(ApprovalHold).where(ApprovalHold.sender_agent_id == owner.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        # The refused call must not have created an (MAX_APPROVAL_HOLDS_PER_HOUR + 1)th hold.
+        assert len(holds) == MAX_APPROVAL_HOLDS_PER_HOUR
+
+
+# --- list_pending_approval_holds ---------------------------------------------------
+
+
+class TestListPendingApprovalHolds:
+    async def test_all_expired_page_reports_has_more_false(self, session: AsyncSession) -> None:
+        """Argus round-1 BLOCKING catch, regression coverage (round-2 SUGGESTION):
+        has_more is computed from the raw fetched-row count BEFORE lazy expiry runs.
+        If every fetched row expires during that pass, the naive count would leave
+        {"holds": [], "has_more": True} -- and this API has no cursor/offset, so
+        that combination would trap a polling client into retrying forever for a
+        "next page" that doesn't exist."""
+        owner = await _register(session, "lp-owner-1")
+        target = await _register(session, "lp-target-1")
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        # Two holds, then fetch with limit=1 so the raw query overfetches
+        # (limit + 1 = 2 rows) exactly like the real has_more computation does.
+        for _ in range(2):
+            await post_message(
+                session,
+                actor_sub=owner.sub,
+                sender_agent_id=owner.id,
+                conversation_id=conversation.id,
+                message_type="note",
+                payload={"text": "hello"},
+            )
+        holds = (
+            (
+                await session.execute(
+                    select(ApprovalHold).where(ApprovalHold.sender_agent_id == owner.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(holds) == 2
+        for hold in holds:
+            hold.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+
+        result = await _service.list_pending_approval_holds(
+            session, owner_sub=owner.owner_sub, limit=1
+        )
+
+        assert result == {"holds": [], "has_more": False}
+
+    async def test_partial_expiry_transiently_suppresses_still_pending_hold(
+        self, session: AsyncSession
+    ) -> None:
+        """Argus round-3 SUGGESTION: the untested half of the has_more fix above.
+        With limit=1 and rows [expired, still-pending] (oldest first), the overfetch
+        sees 2 rows, slices to the first 1 (the expired one), that one hold expires
+        during the loop, `holds` ends up empty, and `has_more` is forced to False --
+        so the still-pending SECOND hold is transiently invisible to this call. This
+        self-heals on the next poll (it's not past the raw fetch's overfetch window
+        anymore once the expired hold is gone), but is a real, documented gap: a
+        one-shot caller can miss a genuinely pending hold on this page."""
+        owner = await _register(session, "lp-owner-2")
+        target = await _register(session, "lp-target-2")
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        for _ in range(2):
+            await post_message(
+                session,
+                actor_sub=owner.sub,
+                sender_agent_id=owner.id,
+                conversation_id=conversation.id,
+                message_type="note",
+                payload={"text": "hello"},
+            )
+        holds = (
+            (
+                await session.execute(
+                    select(ApprovalHold)
+                    .where(ApprovalHold.sender_agent_id == owner.id)
+                    .order_by(ApprovalHold.created_at.asc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(holds) == 2
+        oldest, newest = holds
+        oldest.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+
+        result = await _service.list_pending_approval_holds(
+            session, owner_sub=owner.owner_sub, limit=1
+        )
+
+        # The still-pending `newest` hold exists but is not surfaced this call.
+        assert result == {"holds": [], "has_more": False}
+        assert newest.status == "pending_human"
+
 
 # --- expiry -----------------------------------------------------------------------
 
@@ -4736,3 +4949,55 @@ class TestListConversations:
 
         all_ids = {c["conversation_id"] for c in page1["conversations"] + page2["conversations"]}
         assert len(all_ids) == 3
+
+
+# --- OwnershipClient pluggable seam (TECH-5396 open question 1) -------------------
+#
+# Pure-Python resolution/validation tests (no DB dependency) live in
+# tests/test_plugins.py instead of here, since this module's autouse fixture
+# skips everything when Postgres is unreachable -- matching where the other
+# three seams' equivalent tests already live.
+
+
+class _FakeLiveOwnershipClient:
+    """Stand-in for a live-resolving OwnershipClient plugin (e.g. a consumer's
+    own ownership registry) -- stateless and reusable, ignores any session
+    argument, matching the shape a real HTTP-backed implementation would have."""
+
+    async def get_agent_owners(self, agent_id: uuid.UUID) -> dict[str, Any]:
+        return {
+            "is_shared": False,
+            "owners": ["live-resolved@example.com"],
+        }
+
+
+_fake_live_ownership_client_instance = _FakeLiveOwnershipClient()
+
+
+def _fake_live_ownership_client_factory() -> _service.OwnershipClientFactory:
+    return lambda session: _fake_live_ownership_client_instance
+
+
+class TestOwnershipClientSeamDbBacked:
+    """The one DB-dependent test for this seam -- everything else lives in
+    tests/test_plugins.py's TestOwnershipClientRegistry /
+    TestGetOwnershipClientFactoryAndValidateConfiguration."""
+
+    def setup_method(self) -> None:
+        _service._ownership_client_factory = None
+
+    def teardown_method(self) -> None:
+        _service._ownership_client_factory = None
+
+    async def test_import_path_plugin_resolves_and_is_used(
+        self, monkeypatch: pytest.MonkeyPatch, session: AsyncSession
+    ) -> None:
+        monkeypatch.setenv(
+            _service.OWNERSHIP_CLIENT_ENV_VAR,
+            "tests.test_service:_fake_live_ownership_client_factory",
+        )
+        factory = _service.get_ownership_client_factory()
+        client = factory(session)
+        owner = await _register(session, "live-ownership-agent")
+        result = await client.get_agent_owners(owner.id)
+        assert result == {"is_shared": False, "owners": ["live-resolved@example.com"]}
