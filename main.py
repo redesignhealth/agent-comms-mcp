@@ -331,6 +331,22 @@ _MAX_DECISION_REASON_LENGTH = 2000
 _UNIFORM_HOLD_NOT_FOUND = {"error": "not_found"}
 
 
+def _extract_bearer_token(request: Request) -> str | None:
+    """Pull the raw bearer token string out of ``Authorization``, or
+    ``None`` if the header is missing/malformed/empty.
+
+    Shared by every non-MCP ``mcp.custom_route`` handler that self-verifies
+    its own bearer token (``mcp.custom_route`` runs outside MultiAuth, so
+    each one must) -- previously duplicated inline in both
+    ``_authenticate_approval_caller`` and ``reconcile_ownership``.
+    """
+    header = request.headers.get("authorization", "")
+    if not header.lower().startswith("bearer "):
+        return None
+    token_str = header[len("Bearer ") :].strip()
+    return token_str or None
+
+
 async def _authenticate_approval_caller(request: Request) -> tuple[str | None, int]:
     """Self-verify the bearer token for a non-MCP approval route
     (``mcp.custom_route`` runs outside MultiAuth). Returns
@@ -362,11 +378,8 @@ async def _authenticate_approval_caller(request: Request) -> tuple[str | None, i
     never reaches the DB at all, since there is no caller identity yet to
     attribute the audit row to).
     """
-    header = request.headers.get("authorization", "")
-    if not header.lower().startswith("bearer "):
-        return None, 401
-    token_str = header[len("Bearer ") :].strip()
-    if not token_str:
+    token_str = _extract_bearer_token(request)
+    if token_str is None:
         return None, 401
     access_token = await _okta_provider.verify_token(token_str)
     if access_token is not None and is_interactive_token(access_token):
@@ -509,11 +522,8 @@ async def reconcile_ownership(request: Request) -> Response:
     ``OwnershipClient``, which an agent cannot direct toward a
     self-chosen outcome.
     """
-    header = request.headers.get("authorization", "")
-    if not header.lower().startswith("bearer "):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-    token_str = header[len("Bearer ") :].strip()
-    if not token_str:
+    token_str = _extract_bearer_token(request)
+    if token_str is None:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     access_token = await _auth_provider.verify_token(token_str)
     if access_token is None:
@@ -527,6 +537,14 @@ async def reconcile_ownership(request: Request) -> Response:
             int(limit_str) if limit_str is not None else service.DEFAULT_RECONCILIATION_BATCH_SIZE
         )
     except ValueError:
+        return JSONResponse({"error": "invalid_limit"}, status_code=422)
+    # Reject non-positive values here rather than relying solely on
+    # service.reconcile_agent_ownership's own internal clamp (Argus round-1
+    # BLOCKING catch): Postgres treats a negative SQL LIMIT as LIMIT ALL, so
+    # a value like -1 must surface as a clear 422 at this layer, not
+    # silently get clamped deep inside the service call with no feedback to
+    # the caller that their input was invalid.
+    if limit < 1:
         return JSONResponse({"error": "invalid_limit"}, status_code=422)
 
     async with get_session_factory()() as session:

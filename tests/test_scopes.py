@@ -227,7 +227,21 @@ class TestIsRegistryBackedAgentToken:
             {
                 "iss": "agent-jwt",
                 "sub": "some-agent",
-                AGENT_TOKEN_VERIFIER_CLAIM: "rh_comms_plugins.auth:build_rh_agent_verifier",
+                AGENT_TOKEN_VERIFIER_CLAIM: "some_consumer.auth:build_custom_verifier",
             }
         )
         assert is_registry_backed_agent_token(token) is True
+
+    def test_non_agent_jwt_issuer_returns_false_even_with_verifier_claim(self) -> None:
+        """An interactive/Okta token was never routed through
+        ``_NormalizingVerifier`` and so could not legitimately carry
+        ``AGENT_TOKEN_VERIFIER_CLAIM`` -- if one somehow does (a forged or
+        malformed claim), the ``iss`` guard must still fail closed rather
+        than trust it."""
+        token = _fake_access_token(
+            {
+                "iss": "https://agent-comms.example/mcp",
+                AGENT_TOKEN_VERIFIER_CLAIM: "some_consumer.auth:build_custom_verifier",
+            }
+        )
+        assert is_registry_backed_agent_token(token) is False

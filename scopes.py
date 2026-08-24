@@ -112,21 +112,27 @@ def is_registry_backed_agent_token(token: AccessToken | None) -> bool:
     repo has no way to confirm that -- it is an operator trust decision, the
     same one already implicit in choosing what goes in
     ``AGENT_TOKEN_VERIFIERS`` at all). This is the ONLY signal used to make
-    that distinction: both the default and a plugin verifier normalize
-    ``iss`` to the identical ``"agent-jwt"`` value (see
-    ``rh_comms_plugins.auth.RHAgentVerifier`` in a real deployment, which
-    intentionally reuses it), so ``iss`` cannot be used to tell them apart --
-    hence stamping the verifier's own registry name/import-path onto the
-    claims in ``auth._NormalizingVerifier`` instead.
+    that distinction: both the default and a consumer's own
+    ``AGENT_TOKEN_VERIFIERS`` plugin normalize ``iss`` to the identical
+    ``"agent-jwt"`` value BY DESIGN (the normalized-claims contract
+    ``auth._NormalizingVerifier`` enforces on every configured verifier),
+    so ``iss`` alone cannot be used to tell them apart -- hence stamping
+    the verifier's own registry name/import-path onto the claims in
+    ``auth._NormalizingVerifier`` instead.
 
-    A missing token, or one with no verifier-claim at all (i.e. not
-    produced by ``_NormalizingVerifier`` -- shouldn't happen for anything
-    that reaches a tool, but checked explicitly rather than assumed),
-    returns False -- fail closed, since this result gates whether
+    A missing token, one with no verifier-claim at all (i.e. not produced
+    by ``_NormalizingVerifier`` -- shouldn't happen for anything that
+    reaches a tool, but checked explicitly rather than assumed), or one
+    whose ``iss`` isn't the agent-jwt issuer at all (an interactive/Okta
+    token, which was never routed through ``_NormalizingVerifier`` in the
+    first place and so could not legitimately carry this claim) all return
+    False -- fail closed, since this result gates whether
     ``providers.comms`` writes a caller-supplied value into
     ``agents.owner_sub``/``owner_email``.
     """
     if token is None:
+        return False
+    if token.claims.get("iss") != AGENT_JWT_ISSUER:
         return False
     verifier_name = token.claims.get(AGENT_TOKEN_VERIFIER_CLAIM)
     return verifier_name is not None and verifier_name != DEFAULT_AGENT_TOKEN_VERIFIER

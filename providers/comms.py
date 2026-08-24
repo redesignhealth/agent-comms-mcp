@@ -185,15 +185,41 @@ async def _resolve_caller_agent(session: Any, sub: str, token: AccessToken | Non
             "not_registered: no board agent is bound to this caller yet — call comms_register first"
         )
     if token is not None and is_registry_backed_agent_token(token):
-        owner_sub_claim = token.claims.get("owner_sub")
-        owner_email_claim = token.claims.get("owner_email")
         await service.write_through_ownership(
             session,
             agent,
-            owner_sub=str(owner_sub_claim) if owner_sub_claim is not None else None,
-            owner_email=str(owner_email_claim) if owner_email_claim is not None else None,
+            owner_sub=_string_claim(token, "owner_sub"),
+            owner_email=_string_claim(token, "owner_email"),
         )
     return agent
+
+
+def _string_claim(token: AccessToken, key: str) -> str | None:
+    """Return ``token.claims[key]`` if present AND a ``str``, else ``None``.
+
+    A registry-backed verifier is trusted for ownership write-through
+    (``is_registry_backed_agent_token``), but that trust doesn't extend to
+    the CLAIM'S SHAPE being well-formed -- a malformed or misconfigured
+    plugin could still hand back a non-string ``owner_sub``/``owner_email``
+    (an int, a dict, a list, ...). Un-coerced, ``str(...)`` on a non-string
+    value would silently write that value's Python ``repr`` into
+    ``agents.owner_sub``/``owner_email`` with no error surfaced anywhere
+    (Argus round-1 BLOCKING catch) -- logging and treating it as absent
+    instead means a malformed claim leaves the cached row untouched (the
+    same no-op ``write_through_ownership`` already gives a genuinely
+    absent claim), not a garbage write.
+    """
+    value = token.claims.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        logger.warning(
+            "ignoring non-string %r claim on a registry-backed token (got %s)",
+            key,
+            type(value).__name__,
+        )
+        return None
+    return value
 
 
 @asynccontextmanager

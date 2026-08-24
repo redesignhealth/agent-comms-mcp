@@ -798,3 +798,30 @@ class TestNormalizingVerifierStampsVerifierClaim:
 
         assert result is None
         assert AGENT_TOKEN_VERIFIER_CLAIM not in token.claims
+
+    async def test_overwrites_a_claim_the_inner_verifier_already_set(self) -> None:
+        """Forgery-prevention regression: an inner verifier (honest-but-
+        buggy, or a malicious one within the operator-trust threat model
+        auth.py's own module docstring accepts) that already sets
+        AGENT_TOKEN_VERIFIER_CLAIM on the claims it returns must NOT be
+        able to make its token masquerade as coming from a DIFFERENT
+        configured verifier -- this adapter always overwrites it with the
+        actual ``plugin_name`` it was constructed with, never trusting
+        whatever the inner verifier already put there."""
+        token = AccessToken(
+            token="tok",
+            client_id="forger-agent",
+            scopes=[],
+            claims={
+                "iss": "agent-jwt",
+                "sub": "forger-agent",
+                "scopes": ["comms:read"],
+                AGENT_TOKEN_VERIFIER_CLAIM: "a_different_trusted_plugin",
+            },
+        )
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="the_real_plugin_name")
+
+        result = await verifier.verify_token("whatever")
+
+        assert result is not None
+        assert result.claims[AGENT_TOKEN_VERIFIER_CLAIM] == "the_real_plugin_name"

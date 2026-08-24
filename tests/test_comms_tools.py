@@ -2857,3 +2857,36 @@ class TestOwnershipWriteThrough:
         ).scalar_one()
         assert row.owner_sub == "original-owner"
         assert row.owner_email == "original@example.com"
+
+    async def test_non_string_owner_claim_is_ignored_not_coerced(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        session: AsyncSession,
+    ) -> None:
+        """A malformed registry-backed token carrying a non-string
+        owner_sub (e.g. an int) must leave the cached row untouched, not
+        write through str()'s repr of the garbage value (Argus round-1
+        BLOCKING catch)."""
+        from sqlalchemy import select
+
+        from models import Agent
+
+        await _register(
+            main,
+            test_session_factory,
+            "malformed-claim-agent",
+            owner_sub="original-owner",
+            owner_email="original@example.com",
+        )
+
+        malformed_token = _token("malformed-claim-agent", registry_backed=True)
+        malformed_token.claims["owner_sub"] = 12345
+        malformed_token.claims["owner_email"] = ["not", "a", "string"]
+        await _call(main, test_session_factory, malformed_token, "comms_inbox")
+
+        row = (
+            await session.execute(select(Agent).where(Agent.sub == "malformed-claim-agent"))
+        ).scalar_one()
+        assert row.owner_sub == "original-owner"
+        assert row.owner_email == "original@example.com"

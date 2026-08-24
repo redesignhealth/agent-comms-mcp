@@ -592,8 +592,18 @@ discussion above), so nothing short of a fresh mint would move it. Two
 mechanisms bound that staleness instead:
 
 1. **Per-request write-through** (`service.write_through_ownership`, called
-   from `providers.comms._resolve_caller_agent` on every tool call that
-   resolves the CALLER's own row — not just `comms_register`): if the
+   from `providers.comms._resolve_caller_agent`). Not every tool call goes
+   through this — `comms_whoami`, `comms_register`, `comms_set_agent_shared`,
+   `comms_list_agents`, and `comms_lookup_agent_by_email` never call
+   `_resolve_caller_agent` at all (registration establishes the row rather
+   than resolving an existing one; the others don't need the caller's own
+   row). It fires on the remaining ten tools that DO resolve the caller's
+   own row to do their work (`comms_start_conversation`, `comms_post_message`,
+   `comms_get_hold_status`, `comms_get_conversation`, `comms_inbox`,
+   `comms_list_conversations`, `comms_accept`, `comms_decline_invite`,
+   `comms_invite`, `comms_leave`) — so an agent that only ever calls
+   `comms_whoami` in between reconciliation runs would rely entirely on
+   mechanism 2 below, not this one. Where it does fire: if the
    caller's verified token carries `owner_sub`/`owner_email` claims that
    differ from the cached row, the row is updated in place and an
    `agent.ownership_write_through` audit row is written. Gated on
@@ -611,14 +621,25 @@ mechanisms bound that staleness instead:
 2. **Out-of-band reconciliation** (`service.reconcile_agent_ownership`, exposed
    as `POST /admin/agents/reconcile-ownership`) for agents that make no further
    verified request after registration, so write-through above never fires for
-   them. Iterates board-active, non-shared agents (oldest `bound_at` first, up
-   to a batch limit) against the configured `OWNERSHIP_CLIENT` seam, updating
-   `owner_sub` wherever it has drifted and auditing each change
+   them. Excludes `is_shared=True` agents AT THE SQL LEVEL (a shared agent's
+   owner SET doesn't map onto a single-valued cache column) and orders the
+   remaining board-active agents by `owner_reconciled_at` ascending, NULLS
+   FIRST, up to a batch limit (clamped server-side to
+   `[1, service.MAX_RECONCILIATION_BATCH_SIZE]` regardless of what's
+   requested) — NOT `bound_at`: `owner_reconciled_at` is a dedicated column
+   this function stamps with `now()` on EVERY agent it actually looks up
+   (whether or not `owner_sub` changed), specifically so a just-checked
+   agent sorts to the back of the queue and repeated calls make real
+   forward progress through the whole table instead of re-processing the
+   same oldest page forever. Updates `owner_sub` wherever it has drifted
+   from the configured `OWNERSHIP_CLIENT` seam and audits each change
    (`agent.ownership_reconciled`). Fails soft per-agent — one bad lookup is
-   counted in the result and skipped, never aborts the whole run. Only
+   counted in the result and skipped (its `owner_reconciled_at` is still
+   stamped, so a persistently-failing agent doesn't permanently block the
+   cursor at the front of the queue, at the cost of only retrying it once
+   per full sweep rather than every call), never aborts the whole run. Only
    reconciles `owner_sub` (`OwnershipClient` resolves identifiers, not email
-   addresses) and skips `is_shared=True` agents (a shared agent's owner SET
-   doesn't map onto a single-valued cache column). This repo has no
+   addresses). This repo has no
    in-process scheduler (see `_maybe_expire`'s TECH-5378 comment on the same
    gap for conversation expiry) — running this periodically is an operational
    decision, not something this endpoint makes for you. Auth: interactive

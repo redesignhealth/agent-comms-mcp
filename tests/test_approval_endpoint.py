@@ -710,3 +710,32 @@ class TestReconcileOwnershipEndpoint:
             headers={"Authorization": "Bearer human-token"},
         )
         assert resp.status_code == 422
+
+    async def test_negative_limit_returns_422_not_500(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        """Argus round-1 BLOCKING catch: Postgres treats a negative SQL
+        LIMIT as LIMIT ALL, so `?limit=-1` must be rejected with a clear
+        422 at this layer -- not silently clamped deep inside the service
+        call with no feedback, and not a 500 from an int() that parsed
+        fine but produced a value the query never validated."""
+        http_client, provider = client
+        provider.tokens["human-token"] = _interactive_token("human@example.com")
+
+        resp = await http_client.post(
+            "/admin/agents/reconcile-ownership?limit=-1",
+            headers={"Authorization": "Bearer human-token"},
+        )
+        assert resp.status_code == 422
+
+    async def test_zero_limit_returns_422(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["human-token"] = _interactive_token("human@example.com")
+
+        resp = await http_client.post(
+            "/admin/agents/reconcile-ownership?limit=0",
+            headers={"Authorization": "Bearer human-token"},
+        )
+        assert resp.status_code == 422

@@ -99,7 +99,13 @@ class Agent(Base):
 
     ``sub`` is the agent's agent-jwt JWT subject and the board-wide identity
     key. ``owner_sub``/``owner_email`` always come from verified token
-    claims at bind time — never from tool parameters.
+    claims at bind time — never from tool parameters. They are also kept
+    fresh (bounded-staleness cache, TECH-5593) after bind time by
+    ``service.write_through_ownership`` (from a later request's verified,
+    registry-backed token claims) and ``service.reconcile_agent_ownership``
+    (``owner_sub`` only, from the configured ``OwnershipClient`` seam,
+    out-of-band) — never from a caller-supplied, unverified claim either
+    way; see those functions' own docstrings for exactly what gates each.
     """
 
     __tablename__ = "agents"
@@ -155,6 +161,20 @@ class Agent(Base):
             column("bound_at").desc().nullslast(),
             postgresql_where=text("status = 'active'"),
         ),
+        # Backs service.reconcile_agent_ownership's keyset-ish "oldest
+        # never/least-recently-reconciled first" ordering (TECH-5593 item 4,
+        # Argus round-1 BLOCKING fix): NULLS FIRST so an agent that has
+        # never been reconciled sorts before one reconciled at any real
+        # timestamp, and the partial WHERE excludes both terminal (non-
+        # `active`) and `is_shared` agents -- the same predicate
+        # `reconcile_agent_ownership`'s own query filters on -- so shared
+        # agents never occupy a batch slot at all, not merely get skipped
+        # in Python after already consuming one.
+        Index(
+            "idx_agents_owner_reconciled_at",
+            column("owner_reconciled_at").asc().nullsfirst(),
+            postgresql_where=text("status = 'active' AND is_shared = false"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -186,6 +206,16 @@ class Agent(Base):
     # tool (§4) re-binds an existing agent row on every call, and needs a
     # timestamp for "last (re)registered" distinct from `created_at`.
     bound_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    # Last time service.reconcile_agent_ownership actually looked this agent
+    # up against the configured OwnershipClient (TECH-5593 item 4) --
+    # distinct from bound_at (last comms_register call) and updated_at (any
+    # column change, including this one). NULL means "never reconciled",
+    # which idx_agents_owner_reconciled_at sorts first so a fresh agent is
+    # reconciled at least once before the batch cursor moves on to agents
+    # already reconciled at least once -- this is what gives repeated
+    # reconciliation calls forward progress through the whole table instead
+    # of re-checking the same oldest-bound_at page forever.
+    owner_reconciled_at: Mapped[datetime | None] = mapped_column(nullable=True)
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _updated_at()
 
