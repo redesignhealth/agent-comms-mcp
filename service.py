@@ -1219,6 +1219,60 @@ async def register_agent(
     return agent
 
 
+async def write_through_ownership(
+    session: AsyncSession,
+    agent: Agent,
+    *,
+    owner_sub: str | None,
+    owner_email: str | None,
+) -> None:
+    """Bounded-staleness ownership write-through (TECH-5593).
+
+    ``agents.owner_sub``/``owner_email`` are a deliberately-kept cache of
+    the platform's real ownership registry (decision log #9 of the
+    cross-repo target-state plan): ``register_agent`` freezes ``owner_sub``
+    at first registration and never overwrites it on re-registration
+    (see that function's docstring) because agent-jwt ``owner_sub`` claims
+    are, in general, caller-supplied and unverified. This function is the
+    ONE sanctioned exception to that freeze, and it exists specifically to
+    bound the cache's staleness to whatever cache TTL the configured
+    agent-token verifier itself uses (e.g. an HTTP-backed registry client's
+    in-process TTL cache) instead of leaving it frozen forever.
+
+    SECURITY: the caller MUST have already confirmed ``owner_sub``/
+    ``owner_email`` came from a registry-backed verifier --
+    ``scopes.is_registry_backed_agent_token`` -- before calling this
+    function. This module deliberately stays free of any FastMCP/token
+    dependency (see the module docstring), so it cannot make that check
+    itself; it trusts its caller (``providers.comms._resolve_caller_agent``)
+    the same way every other function here trusts ``actor_sub``. Calling
+    this with a legacy agent-jwt token's self-asserted claims would reopen
+    exactly the forgery hole ``register_agent``'s freeze exists to close.
+
+    A no-op (no DB write, no audit row) when neither value differs from
+    the stored row, or when both are ``None`` (nothing to write through --
+    the configured verifier didn't supply an owner claim for this
+    request).
+    """
+    changed: dict[str, dict[str, str]] = {}
+    if owner_sub is not None and owner_sub != agent.owner_sub:
+        changed["owner_sub"] = {"old": agent.owner_sub, "new": owner_sub}
+        agent.owner_sub = owner_sub
+    if owner_email is not None and owner_email != agent.owner_email:
+        changed["owner_email"] = {"old": agent.owner_email, "new": owner_email}
+        agent.owner_email = owner_email
+    if not changed:
+        return
+    _audit(
+        session,
+        actor_sub=agent.sub,
+        action="agent.ownership_write_through",
+        agent_id=agent.id,
+        detail=changed,
+    )
+    await session.commit()
+
+
 async def set_agent_shared(
     session: AsyncSession,
     *,
@@ -3894,10 +3948,123 @@ def may_assign(creator_owners: AbstractSet[str], assignee_owners: AbstractSet[st
     return not creator_owners.isdisjoint(assignee_owners)
 
 
+# --- Ownership reconciliation (TECH-5593 item 4) -----------------------------
+
+DEFAULT_RECONCILIATION_BATCH_SIZE = 500
+
+
+async def reconcile_agent_ownership(
+    session: AsyncSession,
+    *,
+    ownership_client: OwnershipClient,
+    limit: int = DEFAULT_RECONCILIATION_BATCH_SIZE,
+) -> dict[str, int]:
+    """Bounded-staleness reconciliation for agents ``write_through_ownership``
+    never reaches (TECH-5593 item 4): an agent that makes no further
+    verified request after registration never fires the write-through path
+    in ``providers.comms._resolve_caller_agent``, so its cached
+    ``owner_sub`` can drift forever once its real owner is reassigned in
+    the registry. This function is the out-of-band backstop — call it
+    periodically (an in-process scheduled task, or an admin-triggered
+    endpoint; this repo has no scheduler today, see ``main.py``'s
+    ``_cli`` and the TECH-5378 comment on ``_maybe_expire`` for the same
+    "no scheduler exists" gap elsewhere) against the SAME ``OwnershipClient``
+    ``AGENT_TOKEN_VERIFIERS``-side registry verifiers resolve ``owner_sub``
+    from (``get_ownership_client_factory``'s own docstring already
+    recommends pointing this seam at that source).
+
+    Only reconciles ``owner_sub`` -- ``OwnershipClient`` resolves verified
+    owner IDENTIFIERS for the risk-scoring/task-admission seam
+    (``may_assign``), not email addresses, so it has no ``owner_email`` to
+    reconcile against. An idle agent's ``owner_email`` only converges the
+    next time it makes a verified request, via ``write_through_ownership``.
+
+    Skips ``is_shared=True`` agents entirely (counted in
+    ``skipped_shared``): ``OwnershipClient.get_agent_owners`` returns a SET
+    of owners for a shared agent by design (its docstring), which does not
+    map onto ``agents.owner_sub``'s single-valued column -- deciding which
+    of N owners a single cache column should hold is a design question
+    this function does not answer on its own.
+
+    Fails soft PER AGENT, not closed for the whole run (deliberately unlike
+    every admission-decision caller of ``OwnershipClient`` elsewhere in
+    this module, which fails closed by necessity -- a stale cache row here
+    is this function's whole reason for existing, not a security decision
+    made under uncertainty): one agent's lookup raising, timing out, or
+    resolving to zero/multiple owners is counted in ``errors`` and skipped,
+    so it cannot abort reconciling every other agent in the same run.
+    Processes at most ``limit`` board-active agents per call, oldest
+    ``bound_at`` first, so repeated calls make forward progress across the
+    whole table rather than always re-checking the same page.
+
+    Returns ``{"checked", "updated", "skipped_shared", "errors"}`` --
+    ``checked`` counts only non-shared agents actually looked up (i.e.
+    excludes ``skipped_shared``).
+    """
+    agents = (
+        (
+            await session.execute(
+                select(Agent)
+                .where(Agent.status == "active")
+                .order_by(Agent.bound_at.asc())
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    checked = 0
+    updated = 0
+    skipped_shared = 0
+    errors = 0
+    for agent in agents:
+        if agent.is_shared:
+            skipped_shared += 1
+            continue
+        checked += 1
+        try:
+            info = await ownership_client.get_agent_owners(agent.id)
+            owners = info.get("owners") or []
+        except Exception:
+            logger.warning("ownership reconciliation lookup failed for agent_id=%s", agent.id)
+            errors += 1
+            continue
+        if len(owners) != 1:
+            # Zero or multiple owners for a NON-shared agent is itself a
+            # registry/board data inconsistency worth flagging -- not
+            # something to guess an answer for.
+            logger.warning(
+                "ownership reconciliation got %d owners for non-shared agent_id=%s",
+                len(owners),
+                agent.id,
+            )
+            errors += 1
+            continue
+        current_owner_sub = owners[0]
+        if current_owner_sub != agent.owner_sub:
+            _audit(
+                session,
+                actor_sub=agent.sub,
+                action="agent.ownership_reconciled",
+                agent_id=agent.id,
+                detail={"owner_sub": {"old": agent.owner_sub, "new": current_owner_sub}},
+            )
+            agent.owner_sub = current_owner_sub
+            updated += 1
+    await session.commit()
+    return {
+        "checked": checked,
+        "updated": updated,
+        "skipped_shared": skipped_shared,
+        "errors": errors,
+    }
+
+
 __all__ = [
     "APPROVAL_HOLD_TTL",
     "CONVERSATION_TTL",
     "DEFAULT_OWNERSHIP_CLIENT",
+    "DEFAULT_RECONCILIATION_BATCH_SIZE",
     "MAX_APPROVAL_HOLDS_PER_HOUR",
     "MAX_CONVERSATION_STARTS_PER_HOUR",
     "MAX_LOOKUP_EMAIL_LENGTH",
@@ -3925,7 +4092,9 @@ __all__ = [
     "may_assign",
     "may_invite",
     "post_message",
+    "reconcile_agent_ownership",
     "register_agent",
     "start_conversation",
     "validate_ownership_client_configuration",
+    "write_through_ownership",
 ]

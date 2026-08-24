@@ -484,6 +484,60 @@ async def list_pending_approvals(request: Request) -> Response:
     return JSONResponse(result, status_code=200)
 
 
+@mcp.custom_route("/admin/agents/reconcile-ownership", methods=["POST"])
+async def reconcile_ownership(request: Request) -> Response:
+    """Admin-triggered run of TECH-5593 item 4's ownership reconciliation
+    backstop (``service.reconcile_agent_ownership``) -- for agents that
+    never make another verified tool call after registration, so the
+    per-request ownership write-through (``providers.comms._resolve_caller_agent``)
+    never fires for them and their cached ``owner_sub`` can drift forever.
+    This repo has no in-process scheduler (see that function's own
+    docstring), so wiring this to run periodically -- an external
+    scheduler hitting this endpoint, or an in-process one a future PR
+    adds -- is an operational decision, not something this route decides.
+
+    Auth: interactive (Okta) caller OR an agent-jwt token carrying
+    ``comms:admin`` -- same elevated-scope convention
+    ``providers.comms.register``/``set_agent_shared`` already use for
+    ``is_shared=True``, verified against the FULL ``_auth_provider`` chain
+    (unlike ``_authenticate_approval_caller``'s Okta-only verification for
+    hold decisions). That stricter, no-escape-hatch gate exists specifically
+    to make an agent's self-approval of its OWN high-risk content
+    structurally impossible; reconciliation has no analogous self-dealing
+    risk to guard against here -- it only triggers a read-then-
+    conditionally-write pass against the platform's own configured
+    ``OwnershipClient``, which an agent cannot direct toward a
+    self-chosen outcome.
+    """
+    header = request.headers.get("authorization", "")
+    if not header.lower().startswith("bearer "):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    token_str = header[len("Bearer ") :].strip()
+    if not token_str:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    access_token = await _auth_provider.verify_token(token_str)
+    if access_token is None:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    if not (is_interactive_token(access_token) or "comms:admin" in scopes_for_token(access_token)):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+
+    limit_str = request.query_params.get("limit")
+    try:
+        limit = (
+            int(limit_str) if limit_str is not None else service.DEFAULT_RECONCILIATION_BATCH_SIZE
+        )
+    except ValueError:
+        return JSONResponse({"error": "invalid_limit"}, status_code=422)
+
+    async with get_session_factory()() as session:
+        result = await service.reconcile_agent_ownership(
+            session,
+            ownership_client=service.get_ownership_client_factory()(session),
+            limit=limit,
+        )
+    return JSONResponse(result, status_code=200)
+
+
 def _cli() -> None:
     """Entry point for the ``agent-comms-mcp`` console script."""
     # Fail fast on a missing/malformed DATABASE_URL at process start rather

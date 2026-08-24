@@ -579,6 +579,56 @@ consumer running a live-resolving `AGENT_TOKEN_VERIFIERS` plugin (TECH-5396)
 sidesteps mint-time provenance entirely — see that section above and
 `docs/TECH-5389-APPROVAL-PIPELINE.md` §15 for the full design.
 
+**Bounded-staleness ownership write-through + reconciliation [TECH-5593].**
+`agents.owner_sub`/`owner_email` are kept as a deliberate CACHE of whatever a
+consumer's own ownership system of record says, not re-derived fresh on
+every read — the risk scorer and task-admission paths read them (via
+`AgentTableOwnershipClient`, or a live-resolving `OWNERSHIP_CLIENT` plugin)
+because a live external lookup on every message would be too slow/fragile
+for a hot path. Left alone, that cache would only ever update if an agent
+re-registers via `comms_register` — and even then, `register_agent`
+deliberately freezes `owner_sub` against re-registration (see the provenance
+discussion above), so nothing short of a fresh mint would move it. Two
+mechanisms bound that staleness instead:
+
+1. **Per-request write-through** (`service.write_through_ownership`, called
+   from `providers.comms._resolve_caller_agent` on every tool call that
+   resolves the CALLER's own row — not just `comms_register`): if the
+   caller's verified token carries `owner_sub`/`owner_email` claims that
+   differ from the cached row, the row is updated in place and an
+   `agent.ownership_write_through` audit row is written. Gated on
+   `scopes.is_registry_backed_agent_token`: only trusted when the claims
+   came from an operator-configured `AGENT_TOKEN_VERIFIERS` plugin OTHER
+   than the built-in default (`auth.DEFAULT_AGENT_TOKEN_VERIFIER`) — both
+   normalize `iss` to the identical `"agent-jwt"` value (see the normalized-
+   claims contract below), so `iss` alone cannot distinguish a plugin's
+   presumably-verified claim from the default verifier's caller-supplied,
+   unverified one. `auth._NormalizingVerifier` stamps which configured
+   verifier produced a token onto its claims (`auth.AGENT_TOKEN_VERIFIER_CLAIM`)
+   specifically so this gate has something to check. This is the one
+   sanctioned exception to `register_agent`'s freeze; it is never reachable
+   from an untrusted claim.
+2. **Out-of-band reconciliation** (`service.reconcile_agent_ownership`, exposed
+   as `POST /admin/agents/reconcile-ownership`) for agents that make no further
+   verified request after registration, so write-through above never fires for
+   them. Iterates board-active, non-shared agents (oldest `bound_at` first, up
+   to a batch limit) against the configured `OWNERSHIP_CLIENT` seam, updating
+   `owner_sub` wherever it has drifted and auditing each change
+   (`agent.ownership_reconciled`). Fails soft per-agent — one bad lookup is
+   counted in the result and skipped, never aborts the whole run. Only
+   reconciles `owner_sub` (`OwnershipClient` resolves identifiers, not email
+   addresses) and skips `is_shared=True` agents (a shared agent's owner SET
+   doesn't map onto a single-valued cache column). This repo has no
+   in-process scheduler (see `_maybe_expire`'s TECH-5378 comment on the same
+   gap for conversation expiry) — running this periodically is an operational
+   decision, not something this endpoint makes for you. Auth: interactive
+   (Okta) caller OR an agent-jwt token carrying `comms:admin` — intentionally
+   wider than the approval-decide/pending routes' hard interactive-only gate,
+   since this endpoint has no analogous self-dealing risk for an agent caller
+   to exploit (it only triggers a read-then-conditionally-write pass against
+   the platform's own configured ownership source, never a caller-chosen
+   outcome).
+
 ### Configuration: pluggable agent-token verification (`AGENT_TOKEN_VERIFIERS`) [TECH-5396]
 
 `auth.build_auth_provider()` composes the Okta `OIDCProxy` with one or more
