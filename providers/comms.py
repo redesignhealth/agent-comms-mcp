@@ -63,7 +63,7 @@ from schemas import (
     MAX_PARTICIPANTS_PER_CONVERSATION,
     PayloadValidationError,
 )
-from scopes import is_interactive_token, scopes_for_token
+from scopes import is_interactive_token, is_registry_backed_agent_token, scopes_for_token
 
 comms_server: FastMCP[Any] = FastMCP("comms")
 
@@ -158,20 +158,68 @@ def _require_identity(token: AccessToken) -> str:
     return identity
 
 
-async def _resolve_caller_agent(session: Any, sub: str) -> Agent:
+async def _resolve_caller_agent(session: Any, sub: str, token: AccessToken | None = None) -> Agent:
     """Look up the caller's board ``Agent`` row, or raise a clear, specific error.
 
     Distinct from ``AccessDeniedError`` on purpose: "you have a valid
     token/scope but never called comms_register" is a fact about the
     caller's own state, not an enumeration risk about someone else's
     conversation, so DESIGN.md's uniform-denial rule does not apply here.
+
+    ``token``, when given, feeds TECH-5593's ownership write-through: every
+    tool call that resolves the caller's OWN agent row is an opportunity to
+    refresh ``agents.owner_sub``/``owner_email`` from the request's verified
+    claims, bounding that cache's staleness to the configured agent-token
+    verifier's own TTL instead of leaving it frozen at registration time
+    forever. Gated on ``scopes.is_registry_backed_agent_token`` -- the
+    built-in default verifier's owner claims are caller-supplied and
+    unverified (same reasoning as ``service.register_agent``'s freeze), so
+    only a plugin-verified token's claims are trusted here. ``None`` (the
+    default) skips write-through entirely -- callers that don't have a
+    token handy, or that intentionally don't want this side effect, are
+    unaffected.
     """
     agent = await service.get_agent_by_sub(session, sub)
     if agent is None:
         raise ToolError(
             "not_registered: no board agent is bound to this caller yet — call comms_register first"
         )
+    if token is not None and is_registry_backed_agent_token(token):
+        await service.write_through_ownership(
+            session,
+            agent,
+            owner_sub=_string_claim(token, "owner_sub"),
+            owner_email=_string_claim(token, "owner_email"),
+        )
     return agent
+
+
+def _string_claim(token: AccessToken, key: str) -> str | None:
+    """Return ``token.claims[key]`` if present AND a ``str``, else ``None``.
+
+    A registry-backed verifier is trusted for ownership write-through
+    (``is_registry_backed_agent_token``), but that trust doesn't extend to
+    the CLAIM'S SHAPE being well-formed -- a malformed or misconfigured
+    plugin could still hand back a non-string ``owner_sub``/``owner_email``
+    (an int, a dict, a list, ...). Un-coerced, ``str(...)`` on a non-string
+    value would silently write that value's Python ``repr`` into
+    ``agents.owner_sub``/``owner_email`` with no error surfaced anywhere
+    (Argus round-1 BLOCKING catch) -- logging and treating it as absent
+    instead means a malformed claim leaves the cached row untouched (the
+    same no-op ``write_through_ownership`` already gives a genuinely
+    absent claim), not a garbage write.
+    """
+    value = token.claims.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        logger.warning(
+            "ignoring non-string %r claim on a registry-backed token (got %s)",
+            key,
+            type(value).__name__,
+        )
+        return None
+    return value
 
 
 @asynccontextmanager
@@ -652,7 +700,7 @@ async def start_conversation(
     owner_sub_claim = token.claims.get("owner_sub")
 
     async with get_session_factory()() as session:
-        caller = await _resolve_caller_agent(session, sub)
+        caller = await _resolve_caller_agent(session, sub, token)
         async with _map_service_errors():
             conversation = await service.start_conversation(
                 session,
@@ -780,7 +828,7 @@ async def post_message(
     owner_sub_claim = token.claims.get("owner_sub")
 
     async with get_session_factory()() as session:
-        caller = await _resolve_caller_agent(session, sub)
+        caller = await _resolve_caller_agent(session, sub, token)
         async with _map_service_errors():
             result = await service.post_message(
                 session,
@@ -850,7 +898,7 @@ async def get_hold_status(hold_id: str, agent_key: str | None = None) -> dict[st
     hold_uuid = _parse_uuid("hold_id", hold_id)
 
     async with get_session_factory()() as session:
-        caller = await _resolve_caller_agent(session, sub)
+        caller = await _resolve_caller_agent(session, sub, token)
         async with _map_service_errors():
             return await service.get_hold_status(
                 session,
@@ -901,7 +949,7 @@ async def get_conversation(
         raise ToolError("invalid_request: since_seq must be >= 0")
 
     async with get_session_factory()() as session:
-        caller = await _resolve_caller_agent(session, sub)
+        caller = await _resolve_caller_agent(session, sub, token)
         async with _map_service_errors():
             result = await service.get_conversation(
                 session,
@@ -952,7 +1000,7 @@ async def inbox(agent_key: str | None = None) -> dict[str, Any]:
     sub = _compose_sub(base_sub, agent_key)
 
     async with get_session_factory()() as session:
-        caller = await _resolve_caller_agent(session, sub)
+        caller = await _resolve_caller_agent(session, sub, token)
         return await service.inbox(session, caller_agent_id=caller.id)
 
 
@@ -991,7 +1039,7 @@ async def list_conversations(
         raise ToolError(f"invalid_request: state must be one of {sorted(CONVERSATION_STATES)}")
 
     async with get_session_factory()() as session:
-        caller = await _resolve_caller_agent(session, sub)
+        caller = await _resolve_caller_agent(session, sub, token)
         async with _map_service_errors():
             return await service.list_conversations(
                 session,
@@ -1019,7 +1067,7 @@ async def accept(conversation_id: str, agent_key: str | None = None) -> dict[str
     conv_id = _parse_uuid("conversation_id", conversation_id)
 
     async with get_session_factory()() as session:
-        caller = await _resolve_caller_agent(session, sub)
+        caller = await _resolve_caller_agent(session, sub, token)
         async with _map_service_errors():
             participant = await service.accept_invite(
                 session,
@@ -1053,7 +1101,7 @@ async def decline_invite(conversation_id: str, agent_key: str | None = None) -> 
     conv_id = _parse_uuid("conversation_id", conversation_id)
 
     async with get_session_factory()() as session:
-        caller = await _resolve_caller_agent(session, sub)
+        caller = await _resolve_caller_agent(session, sub, token)
         async with _map_service_errors():
             await service.decline_invite(
                 session,
@@ -1086,7 +1134,7 @@ async def invite(
     target_id = _parse_uuid("target_agent_id", target_agent_id)
 
     async with get_session_factory()() as session:
-        caller = await _resolve_caller_agent(session, sub)
+        caller = await _resolve_caller_agent(session, sub, token)
         async with _map_service_errors():
             participant = await service.invite(
                 session,
@@ -1120,7 +1168,7 @@ async def leave(conversation_id: str, agent_key: str | None = None) -> dict[str,
     conv_id = _parse_uuid("conversation_id", conversation_id)
 
     async with get_session_factory()() as session:
-        caller = await _resolve_caller_agent(session, sub)
+        caller = await _resolve_caller_agent(session, sub, token)
         async with _map_service_errors():
             await service.leave(
                 session,

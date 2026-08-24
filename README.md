@@ -89,6 +89,18 @@ Both humans and machines POST to the same `/mcp` endpoint; FastMCP
 When adding a tool, enroll its mounted name (`comms_<tool>`) in
 `TOOL_SCOPES` in the same PR: `tests/test_main.py` fails otherwise.
 
+`agents.owner_sub`/`owner_email` are a bounded-staleness cache of a
+consumer's own ownership system of record, kept fresh by two mechanisms
+(TECH-5593): per-request write-through on any tool call that resolves the
+caller's OWN agent row (not every tool — e.g. `comms_whoami` and
+`comms_register` don't go through this path; only from a verified,
+plugin-backed `AGENT_TOKEN_VERIFIERS` claim, never from the built-in
+default's caller-supplied one), and an admin-triggered
+`POST /admin/agents/reconcile-ownership` backstop (`owner_sub` only) for
+agents that never make another such request. See DESIGN.md's
+"Bounded-staleness ownership write-through + reconciliation" section for
+the full design.
+
 ## Local development
 
 Requires [uv](https://docs.astral.sh/uv/).

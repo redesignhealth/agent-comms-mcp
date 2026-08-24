@@ -24,6 +24,7 @@ from mcp.shared.auth import OAuthToken
 
 from auth import (
     _ROTATION_MAX_HOPS,
+    AGENT_TOKEN_VERIFIER_CLAIM,
     AGENT_TOKEN_VERIFIERS_ENV_VAR,
     TOKEN_VERIFIERS,
     OktaOIDCProxy,
@@ -761,3 +762,66 @@ class TestPluginVerifiedTokenMatchesDefaultDownstream:
 
         token = _access_token(iss="agent-jwt", sub="plugin-agent", scopes=[])
         assert try_resolve_email(token) == "plugin-agent"
+
+
+class TestNormalizingVerifierStampsVerifierClaim:
+    """TECH-5593: ``_NormalizingVerifier`` tags every token it passes
+    through with which configured verifier produced it, so
+    ``scopes.is_registry_backed_agent_token`` can tell a plugin's claims
+    apart from the built-in default's."""
+
+    async def test_stamps_plugin_name_on_success(self) -> None:
+        token = _access_token(iss="agent-jwt", sub="plugin-agent", scopes=["comms:read"])
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="my_plugin")
+
+        result = await verifier.verify_token("whatever")
+
+        assert result is token
+        assert result.claims[AGENT_TOKEN_VERIFIER_CLAIM] == "my_plugin"
+
+    async def test_stamps_default_verifier_name(self) -> None:
+        token = _access_token(iss="agent-jwt", sub="default-agent", scopes=["comms:read"])
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="agent_jwt_hs256")
+
+        result = await verifier.verify_token("whatever")
+
+        assert result.claims[AGENT_TOKEN_VERIFIER_CLAIM] == "agent_jwt_hs256"
+
+    async def test_rejected_token_is_not_stamped(self) -> None:
+        """A violation must still return None -- confirms the stamp is
+        applied strictly after both contract checks pass, never as a side
+        effect that could leak into a rejected token's claims dict."""
+        token = _access_token(iss="wrong-issuer", sub="plugin-agent", scopes=["comms:read"])
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="my_plugin")
+
+        result = await verifier.verify_token("whatever")
+
+        assert result is None
+        assert AGENT_TOKEN_VERIFIER_CLAIM not in token.claims
+
+    async def test_overwrites_a_claim_the_inner_verifier_already_set(self) -> None:
+        """Forgery-prevention regression: an inner verifier (honest-but-
+        buggy, or a malicious one within the operator-trust threat model
+        auth.py's own module docstring accepts) that already sets
+        AGENT_TOKEN_VERIFIER_CLAIM on the claims it returns must NOT be
+        able to make its token masquerade as coming from a DIFFERENT
+        configured verifier -- this adapter always overwrites it with the
+        actual ``plugin_name`` it was constructed with, never trusting
+        whatever the inner verifier already put there."""
+        token = AccessToken(
+            token="tok",
+            client_id="forger-agent",
+            scopes=[],
+            claims={
+                "iss": "agent-jwt",
+                "sub": "forger-agent",
+                "scopes": ["comms:read"],
+                AGENT_TOKEN_VERIFIER_CLAIM: "a_different_trusted_plugin",
+            },
+        )
+        verifier = _NormalizingVerifier(_FakeVerifier(token), plugin_name="the_real_plugin_name")
+
+        result = await verifier.verify_token("whatever")
+
+        assert result is not None
+        assert result.claims[AGENT_TOKEN_VERIFIER_CLAIM] == "the_real_plugin_name"

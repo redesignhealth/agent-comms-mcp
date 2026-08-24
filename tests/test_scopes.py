@@ -5,9 +5,11 @@ from __future__ import annotations
 import re
 from unittest.mock import MagicMock, patch
 
+from auth import AGENT_TOKEN_VERIFIER_CLAIM, DEFAULT_AGENT_TOKEN_VERIFIER
 from scopes import (
     TOOL_SCOPES,
     is_interactive_token,
+    is_registry_backed_agent_token,
     required_scope_for,
     required_scope_for_resource,
     safe_client_id,
@@ -196,3 +198,50 @@ class TestSafeClientId:
             result = safe_client_id(token)
         assert result == "0oa1234abc"
         mock_emit.assert_not_called()
+
+
+class TestIsRegistryBackedAgentToken:
+    """TECH-5593: whether ``owner_sub``/``owner_email`` claims are trusted
+    for ownership write-through -- gated on which ``AGENT_TOKEN_VERIFIERS``
+    plugin produced them, per ``auth.AGENT_TOKEN_VERIFIER_CLAIM``."""
+
+    def test_none_token_returns_false(self) -> None:
+        assert is_registry_backed_agent_token(None) is False
+
+    def test_missing_verifier_claim_returns_false(self) -> None:
+        token = _fake_access_token({"iss": "agent-jwt", "sub": "some-agent"})
+        assert is_registry_backed_agent_token(token) is False
+
+    def test_default_verifier_returns_false(self) -> None:
+        token = _fake_access_token(
+            {
+                "iss": "agent-jwt",
+                "sub": "some-agent",
+                AGENT_TOKEN_VERIFIER_CLAIM: DEFAULT_AGENT_TOKEN_VERIFIER,
+            }
+        )
+        assert is_registry_backed_agent_token(token) is False
+
+    def test_non_default_verifier_returns_true(self) -> None:
+        token = _fake_access_token(
+            {
+                "iss": "agent-jwt",
+                "sub": "some-agent",
+                AGENT_TOKEN_VERIFIER_CLAIM: "some_consumer.auth:build_custom_verifier",
+            }
+        )
+        assert is_registry_backed_agent_token(token) is True
+
+    def test_non_agent_jwt_issuer_returns_false_even_with_verifier_claim(self) -> None:
+        """An interactive/Okta token was never routed through
+        ``_NormalizingVerifier`` and so could not legitimately carry
+        ``AGENT_TOKEN_VERIFIER_CLAIM`` -- if one somehow does (a forged or
+        malformed claim), the ``iss`` guard must still fail closed rather
+        than trust it."""
+        token = _fake_access_token(
+            {
+                "iss": "https://agent-comms.example/mcp",
+                AGENT_TOKEN_VERIFIER_CLAIM: "some_consumer.auth:build_custom_verifier",
+            }
+        )
+        assert is_registry_backed_agent_token(token) is False

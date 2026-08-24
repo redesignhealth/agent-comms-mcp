@@ -336,6 +336,21 @@ def build_okta_provider() -> OktaOIDCProxy:
 AGENT_TOKEN_VERIFIERS_ENV_VAR = "AGENT_TOKEN_VERIFIERS"
 DEFAULT_AGENT_TOKEN_VERIFIER = "agent_jwt_hs256"
 
+# Claim key ``_NormalizingVerifier`` stamps onto every verified token with
+# the ``AGENT_TOKEN_VERIFIERS`` name/import-path that produced it (TECH-5593).
+# Underscore-prefixed, unlike the wire claims above it, to mark it as
+# server-internal bookkeeping rather than part of the normalized-claims wire
+# contract: no verifier is expected to set it itself (and one that does gets
+# silently overwritten below, by construction -- this module is always the
+# last thing to touch ``claims`` before an ``AccessToken`` leaves the
+# verifier chain). ``scopes.is_registry_backed_agent_token`` is the intended
+# reader: it lets code elsewhere (``providers/comms.py``'s ownership
+# write-through) tell an operator-configured, presumably-registry-backed
+# plugin verifier's owner claims apart from the built-in default's, which
+# are caller-supplied and unverified (see ``service.register_agent``'s own
+# docstring on why that distinction is load-bearing there too).
+AGENT_TOKEN_VERIFIER_CLAIM = "_agent_token_verifier"
+
 
 def _build_agent_jwt_hs256_verifier() -> TokenVerifier:
     """``agent_jwt_hs256`` — the OSS default: today's HS256 ``JWTVerifier``
@@ -453,6 +468,11 @@ class _NormalizingVerifier(TokenVerifier):
     interactive. A malicious plugin is operator-trust-level (equivalent to
     holding ``AGENT_JWT_SECRET``) and out of threat model; this adapter
     bounds an honest-but-buggy one.
+
+    Also stamps ``AGENT_TOKEN_VERIFIER_CLAIM`` onto every token this adapter
+    passes through, recording which configured verifier produced it
+    (TECH-5593) -- see that constant's own docstring for why, and
+    ``scopes.is_registry_backed_agent_token`` for the reader.
     """
 
     def __init__(self, inner: TokenVerifier, *, plugin_name: str) -> None:
@@ -486,6 +506,13 @@ class _NormalizingVerifier(TokenVerifier):
                 expiry_violation,
             )
             return None
+        # `claims` IS `result.claims` here (never a freshly-built {} --
+        # see _normalized_claims_violation's iss check above, which would
+        # have already rejected an empty dict), so mutating it in place
+        # also mutates the AccessToken this adapter returns, without
+        # constructing a new one -- preserves object identity for any
+        # caller (tests included) that compares by `is`.
+        claims[AGENT_TOKEN_VERIFIER_CLAIM] = self._plugin_name
         return result
 
 

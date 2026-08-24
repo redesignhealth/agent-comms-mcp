@@ -331,6 +331,22 @@ _MAX_DECISION_REASON_LENGTH = 2000
 _UNIFORM_HOLD_NOT_FOUND = {"error": "not_found"}
 
 
+def _extract_bearer_token(request: Request) -> str | None:
+    """Pull the raw bearer token string out of ``Authorization``, or
+    ``None`` if the header is missing/malformed/empty.
+
+    Shared by every non-MCP ``mcp.custom_route`` handler that self-verifies
+    its own bearer token (``mcp.custom_route`` runs outside MultiAuth, so
+    each one must) -- previously duplicated inline in both
+    ``_authenticate_approval_caller`` and ``reconcile_ownership``.
+    """
+    header = request.headers.get("authorization", "")
+    if not header.lower().startswith("bearer "):
+        return None
+    token_str = header[len("Bearer ") :].strip()
+    return token_str or None
+
+
 async def _authenticate_approval_caller(request: Request) -> tuple[str | None, int]:
     """Self-verify the bearer token for a non-MCP approval route
     (``mcp.custom_route`` runs outside MultiAuth). Returns
@@ -362,11 +378,8 @@ async def _authenticate_approval_caller(request: Request) -> tuple[str | None, i
     never reaches the DB at all, since there is no caller identity yet to
     attribute the audit row to).
     """
-    header = request.headers.get("authorization", "")
-    if not header.lower().startswith("bearer "):
-        return None, 401
-    token_str = header[len("Bearer ") :].strip()
-    if not token_str:
+    token_str = _extract_bearer_token(request)
+    if token_str is None:
         return None, 401
     access_token = await _okta_provider.verify_token(token_str)
     if access_token is not None and is_interactive_token(access_token):
@@ -480,6 +493,65 @@ async def list_pending_approvals(request: Request) -> Response:
     async with get_session_factory()() as session:
         result = await service.list_pending_approval_holds(
             session, owner_sub=owner_sub, limit=limit
+        )
+    return JSONResponse(result, status_code=200)
+
+
+@mcp.custom_route("/admin/agents/reconcile-ownership", methods=["POST"])
+async def reconcile_ownership(request: Request) -> Response:
+    """Admin-triggered run of TECH-5593 item 4's ownership reconciliation
+    backstop (``service.reconcile_agent_ownership``) -- for agents that
+    never make another verified tool call after registration, so the
+    per-request ownership write-through (``providers.comms._resolve_caller_agent``)
+    never fires for them and their cached ``owner_sub`` can drift forever.
+    This repo has no in-process scheduler (see that function's own
+    docstring), so wiring this to run periodically -- an external
+    scheduler hitting this endpoint, or an in-process one a future PR
+    adds -- is an operational decision, not something this route decides.
+
+    Auth: interactive (Okta) caller OR an agent-jwt token carrying
+    ``comms:admin`` -- same elevated-scope convention
+    ``providers.comms.register``/``set_agent_shared`` already use for
+    ``is_shared=True``, verified against the FULL ``_auth_provider`` chain
+    (unlike ``_authenticate_approval_caller``'s Okta-only verification for
+    hold decisions). That stricter, no-escape-hatch gate exists specifically
+    to make an agent's self-approval of its OWN high-risk content
+    structurally impossible; reconciliation has no analogous self-dealing
+    risk to guard against here -- it only triggers a read-then-
+    conditionally-write pass against the platform's own configured
+    ``OwnershipClient``, which an agent cannot direct toward a
+    self-chosen outcome.
+    """
+    token_str = _extract_bearer_token(request)
+    if token_str is None:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    access_token = await _auth_provider.verify_token(token_str)
+    if access_token is None:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    if not (is_interactive_token(access_token) or "comms:admin" in scopes_for_token(access_token)):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+
+    limit_str = request.query_params.get("limit")
+    try:
+        limit = (
+            int(limit_str) if limit_str is not None else service.DEFAULT_RECONCILIATION_BATCH_SIZE
+        )
+    except ValueError:
+        return JSONResponse({"error": "invalid_limit"}, status_code=422)
+    # Reject non-positive values here rather than relying solely on
+    # service.reconcile_agent_ownership's own internal clamp (Argus round-1
+    # BLOCKING catch): Postgres treats a negative SQL LIMIT as LIMIT ALL, so
+    # a value like -1 must surface as a clear 422 at this layer, not
+    # silently get clamped deep inside the service call with no feedback to
+    # the caller that their input was invalid.
+    if limit < 1:
+        return JSONResponse({"error": "invalid_limit"}, status_code=422)
+
+    async with get_session_factory()() as session:
+        result = await service.reconcile_agent_ownership(
+            session,
+            ownership_client=service.get_ownership_client_factory()(session),
+            limit=limit,
         )
     return JSONResponse(result, status_code=200)
 

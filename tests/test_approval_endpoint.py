@@ -219,6 +219,11 @@ async def client(
         routes=[
             Route("/approvals/{hold_id}/decide", main.decide_approval, methods=["POST"]),
             Route("/approvals/pending", main.list_pending_approvals, methods=["GET"]),
+            Route(
+                "/admin/agents/reconcile-ownership",
+                main.reconcile_ownership,
+                methods=["POST"],
+            ),
         ]
     )
     with (
@@ -613,3 +618,124 @@ class TestListPendingEndpoint:
         assert resp.status_code == 200
         hold_ids = {h["hold_id"] for h in resp.json()["holds"]}
         assert str(hold.id) not in hold_ids
+
+
+class TestReconcileOwnershipEndpoint:
+    """TECH-5593 item 4's admin-triggered endpoint,
+    ``POST /admin/agents/reconcile-ownership``. Auth-gate tests mirror
+    ``TestAuthGate`` above but with the DELIBERATELY WIDER gate this route
+    uses (interactive OR agent-jwt ``comms:admin`` -- unlike the
+    approval-decision routes' hard interactive-only gate)."""
+
+    async def test_missing_token_returns_401(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, _provider = client
+        resp = await http_client.post("/admin/agents/reconcile-ownership")
+        assert resp.status_code == 401
+
+    async def test_unverifiable_token_returns_401(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, _provider = client
+        resp = await http_client.post(
+            "/admin/agents/reconcile-ownership",
+            headers={"Authorization": "Bearer not-a-real-token"},
+        )
+        assert resp.status_code == 401
+
+    async def test_agent_jwt_without_admin_scope_returns_403(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["agent-token"] = _agent_jwt_token(
+            "some-agent-sub", scopes=["comms:read", "comms:write"]
+        )
+        resp = await http_client.post(
+            "/admin/agents/reconcile-ownership",
+            headers={"Authorization": "Bearer agent-token"},
+        )
+        assert resp.status_code == 403
+
+    async def test_agent_jwt_with_admin_scope_is_allowed(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        """Unlike the approval-decide/pending routes, this route DOES allow
+        an agent-jwt caller through, provided it carries ``comms:admin`` --
+        the wider gate documented on ``main.reconcile_ownership``."""
+        http_client, provider = client
+        provider.tokens["agent-token"] = _agent_jwt_token("admin-agent-sub", scopes=["comms:admin"])
+        resp = await http_client.post(
+            "/admin/agents/reconcile-ownership",
+            headers={"Authorization": "Bearer agent-token"},
+        )
+        assert resp.status_code == 200
+
+    async def test_interactive_caller_runs_reconciliation(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        http_client, provider = client
+        await register_agent(
+            session,
+            sub="reconcile-endpoint-agent",
+            owner_sub="owner-x@example.com",
+            owner_email="owner-x@example.com",
+            display_name="reconcile endpoint agent",
+            accepted_types=["note"],
+        )
+        provider.tokens["human-token"] = _interactive_token("human@example.com")
+
+        resp = await http_client.post(
+            "/admin/agents/reconcile-ownership",
+            headers={"Authorization": "Bearer human-token"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        # The default OwnershipClient (AgentTableOwnershipClient) reads the
+        # same agents.owner_sub column this endpoint is reconciling against
+        # -- so this asserts the endpoint actually ran (checked the agent
+        # just registered), not that anything drifted (nothing did).
+        assert body == {"checked": 1, "updated": 0, "skipped_shared": 0, "errors": 0}
+
+    async def test_invalid_limit_returns_422(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["human-token"] = _interactive_token("human@example.com")
+
+        resp = await http_client.post(
+            "/admin/agents/reconcile-ownership?limit=not-a-number",
+            headers={"Authorization": "Bearer human-token"},
+        )
+        assert resp.status_code == 422
+
+    async def test_negative_limit_returns_422_not_500(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        """Argus round-1 BLOCKING catch: Postgres treats a negative SQL
+        LIMIT as LIMIT ALL, so `?limit=-1` must be rejected with a clear
+        422 at this layer -- not silently clamped deep inside the service
+        call with no feedback, and not a 500 from an int() that parsed
+        fine but produced a value the query never validated."""
+        http_client, provider = client
+        provider.tokens["human-token"] = _interactive_token("human@example.com")
+
+        resp = await http_client.post(
+            "/admin/agents/reconcile-ownership?limit=-1",
+            headers={"Authorization": "Bearer human-token"},
+        )
+        assert resp.status_code == 422
+
+    async def test_zero_limit_returns_422(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["human-token"] = _interactive_token("human@example.com")
+
+        resp = await http_client.post(
+            "/admin/agents/reconcile-ownership?limit=0",
+            headers={"Authorization": "Bearer human-token"},
+        )
+        assert resp.status_code == 422

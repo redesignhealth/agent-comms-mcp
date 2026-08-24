@@ -26,7 +26,7 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -71,8 +71,10 @@ from service import (
     list_agents,
     list_conversations,
     lookup_agent_by_email,
+    reconcile_agent_ownership,
     register_agent,
     set_agent_shared,
+    write_through_ownership,
 )
 
 # Coverage for MESSAGE_TYPES fitting within MAX_ACCEPTED_TYPES (a precondition
@@ -5001,3 +5003,367 @@ class TestOwnershipClientSeamDbBacked:
         owner = await _register(session, "live-ownership-agent")
         result = await client.get_agent_owners(owner.id)
         assert result == {"is_shared": False, "owners": ["live-resolved@example.com"]}
+
+
+class TestWriteThroughOwnership:
+    """TECH-5593 item 1: bounded-staleness ownership write-through.
+
+    Trust-gating (``scopes.is_registry_backed_agent_token``) is the tools
+    layer's job, not this function's -- these tests call it directly, the
+    same way ``register_agent``'s freeze is tested at this layer, not by
+    round-tripping through an actual token."""
+
+    async def test_updates_owner_sub_and_owner_email_and_audits(
+        self, session: AsyncSession
+    ) -> None:
+        agent = await _register(session, "write-through-agent")
+
+        await write_through_ownership(
+            session, agent, owner_sub="new-owner-sub", owner_email="new@example.com"
+        )
+
+        assert agent.owner_sub == "new-owner-sub"
+        assert agent.owner_email == "new@example.com"
+        row = (
+            await session.execute(select(Agent).where(Agent.sub == "write-through-agent"))
+        ).scalar_one()
+        assert row.owner_sub == "new-owner-sub"
+        assert row.owner_email == "new@example.com"
+
+        detail = (
+            await session.execute(
+                select(AuditLog.detail).where(
+                    AuditLog.actor_sub == "write-through-agent",
+                    AuditLog.action == "agent.ownership_write_through",
+                )
+            )
+        ).scalar_one()
+        assert detail == {
+            "owner_sub": {"old": "owner-write-through-agent", "new": "new-owner-sub"},
+            "owner_email": {
+                "old": "write-through-agent@example.com",
+                "new": "new@example.com",
+            },
+        }
+
+    async def test_no_op_and_no_audit_row_when_values_unchanged(
+        self, session: AsyncSession
+    ) -> None:
+        agent = await _register(session, "write-through-noop")
+
+        await write_through_ownership(
+            session,
+            agent,
+            owner_sub=agent.owner_sub,
+            owner_email=agent.owner_email,
+        )
+
+        count = (
+            await session.execute(
+                select(func.count())
+                .select_from(AuditLog)
+                .where(
+                    AuditLog.actor_sub == "write-through-noop",
+                    AuditLog.action == "agent.ownership_write_through",
+                )
+            )
+        ).scalar_one()
+        assert count == 0
+
+    async def test_no_op_when_both_claims_are_none(self, session: AsyncSession) -> None:
+        agent = await _register(session, "write-through-none")
+        original_owner_sub = agent.owner_sub
+        original_owner_email = agent.owner_email
+
+        await write_through_ownership(session, agent, owner_sub=None, owner_email=None)
+
+        assert agent.owner_sub == original_owner_sub
+        assert agent.owner_email == original_owner_email
+
+    async def test_updates_only_owner_sub_when_owner_email_is_none(
+        self, session: AsyncSession
+    ) -> None:
+        agent = await _register(session, "write-through-partial")
+        original_owner_email = agent.owner_email
+
+        await write_through_ownership(session, agent, owner_sub="partial-new-sub", owner_email=None)
+
+        assert agent.owner_sub == "partial-new-sub"
+        assert agent.owner_email == original_owner_email
+
+    async def test_overwrites_owner_sub_unlike_register_agent_reregistration(
+        self, session: AsyncSession
+    ) -> None:
+        """The one place ``agents.owner_sub`` is allowed to change after
+        first registration -- proving this deliberately breaks
+        ``register_agent``'s own freeze, which is the entire point (that
+        freeze exists to block UNTRUSTED claims; this function is only
+        ever reached with claims the caller already confirmed are
+        trusted)."""
+        agent = await _register(session, "write-through-vs-freeze")
+        reregistered = await register_agent(
+            session,
+            sub="write-through-vs-freeze",
+            owner_sub="attempted-forged-owner",
+            owner_email="attempted-forged-owner@example.com",
+            display_name="write-through-vs-freeze",
+            accepted_types=sorted(MESSAGE_TYPES),
+            is_shared_authorized=True,
+        )
+        assert reregistered.owner_sub == agent.owner_sub  # frozen, as documented
+
+        await write_through_ownership(
+            session, reregistered, owner_sub="trusted-new-owner", owner_email=None
+        )
+
+        assert reregistered.owner_sub == "trusted-new-owner"
+
+
+class TestReconcileAgentOwnership:
+    """TECH-5593 item 4: out-of-band backstop for agents that never make a
+    further verified request after registration (so write-through above
+    never fires for them)."""
+
+    async def test_updates_drifted_owner_sub_and_audits(self, session: AsyncSession) -> None:
+        agent = await _register(session, "reconcile-drifted")
+        client = _FakeOwnershipClient({agent.id: {"is_shared": False, "owners": ["new-owner"]}})
+
+        result = await reconcile_agent_ownership(session, ownership_client=client)
+
+        assert result == {"checked": 1, "updated": 1, "skipped_shared": 0, "errors": 0}
+        row = (
+            await session.execute(select(Agent).where(Agent.sub == "reconcile-drifted"))
+        ).scalar_one()
+        assert row.owner_sub == "new-owner"
+
+        detail = (
+            await session.execute(
+                select(AuditLog.detail).where(
+                    AuditLog.actor_sub == "reconcile-drifted",
+                    AuditLog.action == "agent.ownership_reconciled",
+                )
+            )
+        ).scalar_one()
+        assert detail == {"owner_sub": {"old": "owner-reconcile-drifted", "new": "new-owner"}}
+
+    async def test_no_update_when_owner_sub_already_matches(self, session: AsyncSession) -> None:
+        agent = await _register(session, "reconcile-matching")
+        client = _FakeOwnershipClient({agent.id: {"is_shared": False, "owners": [agent.owner_sub]}})
+
+        result = await reconcile_agent_ownership(session, ownership_client=client)
+
+        assert result == {"checked": 1, "updated": 0, "skipped_shared": 0, "errors": 0}
+
+    async def test_skips_shared_agents(self, session: AsyncSession) -> None:
+        await _register(session, "reconcile-shared", is_shared=True, is_shared_authorized=True)
+        # A raising client here proves the shared agent is skipped BEFORE
+        # any lookup is attempted, not merely that its result is discarded.
+        result = await reconcile_agent_ownership(
+            session, ownership_client=_FailingOwnershipClient()
+        )
+
+        assert result == {"checked": 0, "updated": 0, "skipped_shared": 1, "errors": 0}
+
+    async def test_shared_agents_do_not_consume_batch_slots(self, session: AsyncSession) -> None:
+        """Argus round-1 BLOCKING fix: shared agents are excluded at the SQL
+        level, before LIMIT, not filtered out in Python after -- so a
+        shared agent sorting first (never reconciled) must not consume the
+        single available slot and starve the real, actionable agent behind
+        it. A raising client for the shared agent's id would fail this test
+        if it were ever looked up."""
+        shared = await _register(
+            session, "reconcile-shared-no-slot", is_shared=True, is_shared_authorized=True
+        )
+        real = await _register(session, "reconcile-real-agent")
+        client = _FakeOwnershipClient(
+            {
+                shared.id: {"is_shared": True, "owners": ["a", "b"]},
+                real.id: {"is_shared": False, "owners": ["new-owner"]},
+            }
+        )
+
+        result = await reconcile_agent_ownership(session, ownership_client=client, limit=1)
+
+        assert result == {"checked": 1, "updated": 1, "skipped_shared": 1, "errors": 0}
+        row = (
+            await session.execute(select(Agent).where(Agent.sub == "reconcile-real-agent"))
+        ).scalar_one()
+        assert row.owner_sub == "new-owner"
+
+    async def test_lookup_failure_counted_as_error_and_does_not_abort_run(
+        self, session: AsyncSession
+    ) -> None:
+        await _register(session, "reconcile-good")
+        # _register with a different sub than _FailingOwnershipClient covers
+        # -- use a mixed client: good agent resolves, bad agent raises.
+        bad = await _register(session, "reconcile-bad")
+
+        class _MixedClient:
+            async def get_agent_owners(self, agent_id: uuid.UUID) -> dict[str, Any]:
+                if agent_id == bad.id:
+                    raise RuntimeError("platform unreachable")
+                return {"is_shared": False, "owners": ["still-owner-reconcile-good"]}
+
+        result = await reconcile_agent_ownership(session, ownership_client=_MixedClient())
+
+        assert result == {"checked": 2, "updated": 1, "skipped_shared": 0, "errors": 1}
+        row = (
+            await session.execute(select(Agent).where(Agent.sub == "reconcile-bad"))
+        ).scalar_one()
+        assert row.owner_sub == "owner-reconcile-bad"  # untouched
+
+    async def test_multi_owner_result_for_non_shared_agent_counted_as_error(
+        self, session: AsyncSession
+    ) -> None:
+        agent = await _register(session, "reconcile-multi-owner")
+        client = _FakeOwnershipClient(
+            {agent.id: {"is_shared": False, "owners": ["owner-a", "owner-b"]}}
+        )
+
+        result = await reconcile_agent_ownership(session, ownership_client=client)
+
+        assert result == {"checked": 1, "updated": 0, "skipped_shared": 0, "errors": 1}
+        row = (
+            await session.execute(select(Agent).where(Agent.sub == "reconcile-multi-owner"))
+        ).scalar_one()
+        assert row.owner_sub == "owner-reconcile-multi-owner"  # untouched
+
+    async def test_zero_owner_result_for_non_shared_agent_counted_as_error(
+        self, session: AsyncSession
+    ) -> None:
+        agent = await _register(session, "reconcile-zero-owner")
+        client = _FakeOwnershipClient({agent.id: {"is_shared": False, "owners": []}})
+
+        result = await reconcile_agent_ownership(session, ownership_client=client)
+
+        assert result == {"checked": 1, "updated": 0, "skipped_shared": 0, "errors": 1}
+
+    async def test_never_reconciled_sorts_before_already_reconciled(
+        self, session: AsyncSession
+    ) -> None:
+        """Ordering is by ``owner_reconciled_at`` ASC NULLS FIRST, not
+        ``bound_at`` (Argus round-1 BLOCKING fix) -- an agent that has
+        never been reconciled must be picked over one already reconciled,
+        regardless of which registered first."""
+        already_reconciled = await _register(session, "reconcile-already-done")
+        never_reconciled = await _register(session, "reconcile-never-done")
+        already_reconciled.owner_reconciled_at = datetime.now(UTC)
+        await session.commit()
+        client = _FakeOwnershipClient(
+            {never_reconciled.id: {"is_shared": False, "owners": ["new-owner"]}}
+        )
+
+        result = await reconcile_agent_ownership(session, ownership_client=client, limit=1)
+
+        assert result == {"checked": 1, "updated": 1, "skipped_shared": 0, "errors": 0}
+        row = (
+            await session.execute(select(Agent).where(Agent.sub == "reconcile-never-done"))
+        ).scalar_one()
+        assert row.owner_sub == "new-owner"
+
+    async def test_repeated_calls_make_forward_progress_across_the_table(
+        self, session: AsyncSession
+    ) -> None:
+        """The bug this fixes: without a cursor that actually advances,
+        ``limit=1`` would re-process the SAME agent on every call forever.
+        Two calls with ``limit=1`` against two never-reconciled agents must
+        reach BOTH of them, not the same one twice."""
+        first_agent = await _register(session, "reconcile-progress-a")
+        second_agent = await _register(session, "reconcile-progress-b")
+        client = _FakeOwnershipClient(
+            {
+                first_agent.id: {"is_shared": False, "owners": ["owner-a-new"]},
+                second_agent.id: {"is_shared": False, "owners": ["owner-b-new"]},
+            }
+        )
+
+        first_result = await reconcile_agent_ownership(session, ownership_client=client, limit=1)
+        second_result = await reconcile_agent_ownership(session, ownership_client=client, limit=1)
+
+        assert first_result == {"checked": 1, "updated": 1, "skipped_shared": 0, "errors": 0}
+        assert second_result == {"checked": 1, "updated": 1, "skipped_shared": 0, "errors": 0}
+        rows = (
+            await session.execute(
+                select(Agent.sub, Agent.owner_sub).where(
+                    Agent.sub.in_(["reconcile-progress-a", "reconcile-progress-b"])
+                )
+            )
+        ).all()
+        assert dict(rows) == {
+            "reconcile-progress-a": "owner-a-new",
+            "reconcile-progress-b": "owner-b-new",
+        }
+
+    async def test_tied_owner_reconciled_at_breaks_ties_by_id_deterministically(
+        self, session: AsyncSession
+    ) -> None:
+        """Argus round-2 SUGGESTION, treated as load-bearing: every agent
+        processed within ONE call shares the identical stamped
+        ``owner_reconciled_at`` (read once per call, not once per row).
+        With three agents tied at the same timestamp and a batch size
+        smaller than the tie group, repeated ``limit=2`` calls must return
+        a DETERMINISTIC subset each time (ordered by ``id``) -- not an
+        arbitrary one that could silently skip an agent in the tied group
+        forever, which is exactly the starvation bug this whole cursor
+        column exists to prevent."""
+        tied_at = datetime.now(UTC)
+        agents = [await _register(session, f"reconcile-tied-{i}") for i in range(3)]
+        for agent in agents:
+            agent.owner_reconciled_at = tied_at
+        await session.commit()
+        by_id = sorted(agents, key=lambda a: a.id)
+        client = _FakeOwnershipClient(
+            {agent.id: {"is_shared": False, "owners": [agent.owner_sub]} for agent in agents}
+        )
+
+        first_result = await reconcile_agent_ownership(session, ownership_client=client, limit=2)
+
+        assert first_result["checked"] == 2
+        # Re-read owner_reconciled_at to see which two agents advanced past
+        # `tied_at` on this one call -- must be the two LOWEST ids in the
+        # tied group, deterministically, not an arbitrary pair.
+        refreshed = (
+            await session.execute(
+                select(Agent.sub, Agent.owner_reconciled_at).where(
+                    Agent.id.in_([a.id for a in agents])
+                )
+            )
+        ).all()
+        advanced = {sub for sub, ts in refreshed if ts > tied_at}
+        assert advanced == {by_id[0].sub, by_id[1].sub}
+
+    async def test_owner_reconciled_at_is_stamped_even_when_lookup_fails(
+        self, session: AsyncSession
+    ) -> None:
+        """A failing lookup still advances the cursor for that agent (at
+        the cost of only retrying it once per full sweep rather than every
+        call, per the function's own docstring) -- otherwise a single
+        persistently-broken agent would permanently block the front of the
+        queue and no other agent could ever be reached."""
+        agent = await _register(session, "reconcile-cursor-on-error")
+
+        result = await reconcile_agent_ownership(
+            session, ownership_client=_FailingOwnershipClient(), limit=1
+        )
+
+        assert result == {"checked": 1, "updated": 0, "skipped_shared": 0, "errors": 1}
+        await session.refresh(agent)
+        assert agent.owner_reconciled_at is not None
+
+    async def test_limit_is_clamped_to_at_least_one(self, session: AsyncSession) -> None:
+        agent = await _register(session, "reconcile-clamped-low")
+        client = _FakeOwnershipClient({agent.id: {"is_shared": False, "owners": ["new-owner"]}})
+
+        result = await reconcile_agent_ownership(session, ownership_client=client, limit=0)
+
+        assert result == {"checked": 1, "updated": 1, "skipped_shared": 0, "errors": 0}
+
+    async def test_limit_is_clamped_to_the_max_batch_size(self, session: AsyncSession) -> None:
+        agent = await _register(session, "reconcile-clamped-high")
+        client = _FakeOwnershipClient({agent.id: {"is_shared": False, "owners": ["new-owner"]}})
+
+        result = await reconcile_agent_ownership(
+            session, ownership_client=client, limit=_service.MAX_RECONCILIATION_BATCH_SIZE + 1000
+        )
+
+        assert result == {"checked": 1, "updated": 1, "skipped_shared": 0, "errors": 0}

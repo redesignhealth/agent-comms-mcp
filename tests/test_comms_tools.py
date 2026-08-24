@@ -163,8 +163,21 @@ def _token(
     scopes: list[str] | None = None,
     owner_sub: str | None = None,
     owner_email: str | None = None,
+    registry_backed: bool = False,
 ) -> MagicMock:
-    """A minimal agent-jwt-shaped ``AccessToken`` stand-in for ``sub``."""
+    """A minimal agent-jwt-shaped ``AccessToken`` stand-in for ``sub``.
+
+    ``registry_backed=True`` stamps ``auth.AGENT_TOKEN_VERIFIER_CLAIM`` with
+    a non-default plugin name, simulating a token that went through an
+    operator-configured ``AGENT_TOKEN_VERIFIERS`` plugin rather than the
+    built-in default -- the trust signal TECH-5593's ownership
+    write-through (``providers.comms._resolve_caller_agent``) gates on via
+    ``scopes.is_registry_backed_agent_token``. The real
+    ``_NormalizingVerifier`` stamps this on every verified token
+    (tests/test_auth.py covers that in isolation); this fixture simulates
+    its effect directly since these tests bypass verification entirely via
+    the ``get_access_token`` patch.
+    """
     claims: dict[str, Any] = {
         "iss": "agent-jwt",
         "sub": sub,
@@ -174,6 +187,10 @@ def _token(
         claims["owner_sub"] = owner_sub
     if owner_email is not None:
         claims["owner_email"] = owner_email
+    if registry_backed:
+        from auth import AGENT_TOKEN_VERIFIER_CLAIM
+
+        claims[AGENT_TOKEN_VERIFIER_CLAIM] = "tests.test_comms_tools:_fake_registry_verifier"
     token = MagicMock()
     token.claims = claims
     token.scopes = []
@@ -2733,3 +2750,143 @@ class TestApprovalPipeline:
                     "payload": {"reason": "pending_approval"},
                 },
             )
+
+
+class TestOwnershipWriteThrough:
+    """TECH-5593 item 1, end-to-end through the real tool surface: a
+    registry-backed token's owner claims write through to ``agents``
+    on any subsequent tool call that resolves the caller's own row; a
+    default (legacy) token's claims never do."""
+
+    async def test_registry_backed_token_writes_through_on_next_call(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        session: AsyncSession,
+    ) -> None:
+        from sqlalchemy import select
+
+        from models import Agent
+
+        await _register(
+            main,
+            test_session_factory,
+            "write-through-agent",
+            owner_sub="original-owner",
+            owner_email="original@example.com",
+        )
+
+        registry_token = _token(
+            "write-through-agent",
+            owner_sub="reassigned-owner",
+            owner_email="reassigned@example.com",
+            registry_backed=True,
+        )
+        await _call(main, test_session_factory, registry_token, "comms_inbox")
+
+        row = (
+            await session.execute(select(Agent).where(Agent.sub == "write-through-agent"))
+        ).scalar_one()
+        assert row.owner_sub == "reassigned-owner"
+        assert row.owner_email == "reassigned@example.com"
+
+    async def test_default_verifier_token_never_writes_through(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        session: AsyncSession,
+    ) -> None:
+        """The trust gate: a caller-supplied owner claim on a token NOT
+        stamped as registry-backed (the default agent_jwt_hs256 shape) must
+        never overwrite the cached owner_sub/owner_email -- otherwise this
+        would reopen the exact forgery hole register_agent's freeze on
+        re-registration exists to close."""
+        from sqlalchemy import select
+
+        from models import Agent
+
+        await _register(
+            main,
+            test_session_factory,
+            "no-write-through-agent",
+            owner_sub="original-owner",
+            owner_email="original@example.com",
+        )
+
+        legacy_token = _token(
+            "no-write-through-agent",
+            owner_sub="attempted-forged-owner",
+            owner_email="attempted-forged@example.com",
+            registry_backed=False,
+        )
+        await _call(main, test_session_factory, legacy_token, "comms_inbox")
+
+        row = (
+            await session.execute(select(Agent).where(Agent.sub == "no-write-through-agent"))
+        ).scalar_one()
+        assert row.owner_sub == "original-owner"
+        assert row.owner_email == "original@example.com"
+
+    async def test_registry_backed_token_with_no_owner_claims_is_a_no_op(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        session: AsyncSession,
+    ) -> None:
+        """A registry-backed token that simply doesn't carry owner_sub/
+        owner_email claims (e.g. a plugin that only resolves ownership for
+        some subs) must leave the cached row untouched, not write through
+        ``None``."""
+        from sqlalchemy import select
+
+        from models import Agent
+
+        await _register(
+            main,
+            test_session_factory,
+            "no-claims-agent",
+            owner_sub="original-owner",
+            owner_email="original@example.com",
+        )
+
+        registry_token_no_claims = _token("no-claims-agent", registry_backed=True)
+        await _call(main, test_session_factory, registry_token_no_claims, "comms_inbox")
+
+        row = (
+            await session.execute(select(Agent).where(Agent.sub == "no-claims-agent"))
+        ).scalar_one()
+        assert row.owner_sub == "original-owner"
+        assert row.owner_email == "original@example.com"
+
+    async def test_non_string_owner_claim_is_ignored_not_coerced(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        session: AsyncSession,
+    ) -> None:
+        """A malformed registry-backed token carrying a non-string
+        owner_sub (e.g. an int) must leave the cached row untouched, not
+        write through str()'s repr of the garbage value (Argus round-1
+        BLOCKING catch)."""
+        from sqlalchemy import select
+
+        from models import Agent
+
+        await _register(
+            main,
+            test_session_factory,
+            "malformed-claim-agent",
+            owner_sub="original-owner",
+            owner_email="original@example.com",
+        )
+
+        malformed_token = _token("malformed-claim-agent", registry_backed=True)
+        malformed_token.claims["owner_sub"] = 12345
+        malformed_token.claims["owner_email"] = ["not", "a", "string"]
+        await _call(main, test_session_factory, malformed_token, "comms_inbox")
+
+        row = (
+            await session.execute(select(Agent).where(Agent.sub == "malformed-claim-agent"))
+        ).scalar_one()
+        assert row.owner_sub == "original-owner"
+        assert row.owner_email == "original@example.com"
