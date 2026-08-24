@@ -5294,6 +5294,44 @@ class TestReconcileAgentOwnership:
             "reconcile-progress-b": "owner-b-new",
         }
 
+    async def test_tied_owner_reconciled_at_breaks_ties_by_id_deterministically(
+        self, session: AsyncSession
+    ) -> None:
+        """Argus round-2 SUGGESTION, treated as load-bearing: every agent
+        processed within ONE call shares the identical stamped
+        ``owner_reconciled_at`` (read once per call, not once per row).
+        With three agents tied at the same timestamp and a batch size
+        smaller than the tie group, repeated ``limit=2`` calls must return
+        a DETERMINISTIC subset each time (ordered by ``id``) -- not an
+        arbitrary one that could silently skip an agent in the tied group
+        forever, which is exactly the starvation bug this whole cursor
+        column exists to prevent."""
+        tied_at = datetime.now(UTC)
+        agents = [await _register(session, f"reconcile-tied-{i}") for i in range(3)]
+        for agent in agents:
+            agent.owner_reconciled_at = tied_at
+        await session.commit()
+        by_id = sorted(agents, key=lambda a: a.id)
+        client = _FakeOwnershipClient(
+            {agent.id: {"is_shared": False, "owners": [agent.owner_sub]} for agent in agents}
+        )
+
+        first_result = await reconcile_agent_ownership(session, ownership_client=client, limit=2)
+
+        assert first_result["checked"] == 2
+        # Re-read owner_reconciled_at to see which two agents advanced past
+        # `tied_at` on this one call -- must be the two LOWEST ids in the
+        # tied group, deterministically, not an arbitrary pair.
+        refreshed = (
+            await session.execute(
+                select(Agent.sub, Agent.owner_reconciled_at).where(
+                    Agent.id.in_([a.id for a in agents])
+                )
+            )
+        ).all()
+        advanced = {sub for sub, ts in refreshed if ts > tied_at}
+        assert advanced == {by_id[0].sub, by_id[1].sub}
+
     async def test_owner_reconciled_at_is_stamped_even_when_lookup_fails(
         self, session: AsyncSession
     ) -> None:

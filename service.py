@@ -4025,17 +4025,36 @@ async def reconcile_agent_ownership(
     Processes at most ``limit`` board-active, non-shared agents per call
     (clamped to ``[1, MAX_RECONCILIATION_BATCH_SIZE]`` regardless of what
     the caller passes), ordered by ``owner_reconciled_at`` ascending (NULLS
-    FIRST) rather than ``bound_at`` -- and stamps ``owner_reconciled_at =
-    now()`` on EVERY agent actually looked up, whether or not its
-    ``owner_sub`` changed (Argus round-1 BLOCKING catch: ordering by
-    ``bound_at`` alone, a value this function never writes, meant every
-    call re-processed the identical oldest-N rows forever and any agent
-    past the first page was never reconciled at all). A just-checked agent
-    sorts to the back of the queue on the next call, so repeated calls
-    make real forward progress through the whole table.
+    FIRST), THEN ``id`` ascending, rather than ``bound_at`` -- and stamps
+    ``owner_reconciled_at = now()`` on EVERY agent actually looked up,
+    whether or not its ``owner_sub`` changed (Argus round-1 BLOCKING catch:
+    ordering by ``bound_at`` alone, a value this function never writes,
+    meant every call re-processed the identical oldest-N rows forever and
+    any agent past the first page was never reconciled at all). A
+    just-checked agent sorts to the back of the queue on the next call, so
+    repeated calls make real forward progress through the whole table.
+
+    ``id`` (Argus round-2 SUGGESTION, treated as load-bearing): every agent
+    processed in ONE call shares the identical ``now`` value stamped below
+    (read once per call, not once per row), so once a tie group on
+    ``owner_reconciled_at`` grows past ``limit``, ordering by that column
+    alone has no defined tiebreak -- Postgres could return a different
+    arbitrary subset of the SAME tied group on each subsequent call,
+    silently reintroducing this cursor's own starvation problem for
+    exactly the rows that already share a timestamp. ``id`` carries no
+    semantic meaning; it only needs to be a stable, total order, which a
+    primary key already is.
 
     Returns ``{"checked", "updated", "skipped_shared", "errors"}`` --
-    ``checked`` counts only non-shared agents actually looked up.
+    ``checked`` counts only non-shared agents actually looked up THIS CALL
+    (bounded by ``limit``). ``skipped_shared`` is deliberately NOT
+    batch-scoped the same way: it's the total count of board-active
+    ``is_shared=True`` agents in the WHOLE table at call time, independent
+    of ``limit`` -- a per-batch count would always read ``0`` now that
+    shared agents are excluded before ``LIMIT`` (see above) and would
+    convey nothing useful; this field's purpose is now purely "how many
+    shared agents exist that this function structurally cannot reconcile,"
+    not "how many did this call skip."
     """
     limit = max(1, min(limit, MAX_RECONCILIATION_BATCH_SIZE))
     skipped_shared = (
@@ -4050,7 +4069,7 @@ async def reconcile_agent_ownership(
             await session.execute(
                 select(Agent)
                 .where(Agent.status == "active", Agent.is_shared.is_(False))
-                .order_by(Agent.owner_reconciled_at.asc().nulls_first())
+                .order_by(Agent.owner_reconciled_at.asc().nulls_first(), Agent.id.asc())
                 .limit(limit)
             )
         )

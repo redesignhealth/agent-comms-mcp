@@ -169,10 +169,23 @@ class Agent(Base):
         # `active`) and `is_shared` agents -- the same predicate
         # `reconcile_agent_ownership`'s own query filters on -- so shared
         # agents never occupy a batch slot at all, not merely get skipped
-        # in Python after already consuming one.
+        # in Python after already consuming one. `id` is a secondary sort
+        # key (Argus round-2 SUGGESTION, treated as load-bearing rather
+        # than cosmetic): every agent processed within one reconciliation
+        # batch is stamped with the SAME `now()` value (`reconcile_agent_
+        # ownership`'s own `now = _now()`, read once per call, not once per
+        # row), so once a tie group's size exceeds `limit`, an
+        # `owner_reconciled_at`-only ORDER BY has no defined tiebreak and
+        # Postgres is free to return a different arbitrary subset of that
+        # tied group on each call -- silently reintroducing this same
+        # cursor's own starvation failure mode for exactly the rows that
+        # already share a reconciliation timestamp. `id` has no semantic
+        # meaning here; it only needs to be stable and total, which a
+        # primary key already is.
         Index(
             "idx_agents_owner_reconciled_at",
             column("owner_reconciled_at").asc().nullsfirst(),
+            column("id").asc(),
             postgresql_where=text("status = 'active' AND is_shared = false"),
         ),
     )
