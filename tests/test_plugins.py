@@ -374,6 +374,14 @@ class TestGetActiveCheckerAndValidateConfiguration:
     def test_validate_configuration_fails_fast_on_bad_import_path(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # Isolate the earlier seams: an invalid RISK_SCORER/AUTO_APPROVER/
+        # APPROVAL_NOTIFIER env var would make validate_configuration() raise
+        # at that earlier seam instead, and this test's pytest.raises would
+        # pass for the wrong reason (message wouldn't be "failed to import
+        # plugin").
+        monkeypatch.delenv(plugins.RISK_SCORER_ENV_VAR, raising=False)
+        monkeypatch.delenv(plugins.AUTO_APPROVER_ENV_VAR, raising=False)
+        monkeypatch.delenv(plugins.APPROVAL_NOTIFIER_ENV_VAR, raising=False)
         monkeypatch.setenv(plugins.ACTIVE_CHECKER_ENV_VAR, "not_a_real_module:Whatever")
         with pytest.raises(RuntimeError, match="failed to import plugin"):
             plugins.validate_configuration()

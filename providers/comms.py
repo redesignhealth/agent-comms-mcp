@@ -658,7 +658,10 @@ async def start_conversation(
       Caller becomes ``owner``; each target starts as ``invited`` (invisible
       until they call ``comms_accept``). A target whose registry reports it
       retired (TECH-5703) raises a specific "agent retired" error instead
-      of the uniform unknown-agent denial.
+      of the uniform unknown-agent denial. If the retirement check itself
+      fails (e.g. registry timeout), the board fails open -- the target is
+      treated as active, so a registry outage never blocks conversation
+      admission, only temporarily suspends retirement enforcement.
     - ``message_type``: type of the opening message. Default:
       ``availability_request``. All valid types: ``availability_request``,
       ``availability_response``, ``counter_proposal``, ``confirm``,
@@ -1152,7 +1155,10 @@ async def invite(
       For ``internal``/``asymmetric`` conversations, target must share the
       conversation's owner set. If the target's registry reports it
       retired (TECH-5703), this raises a specific "agent retired" error
-      rather than the uniform unknown-agent denial.
+      rather than the uniform unknown-agent denial. If the retirement check
+      itself fails (e.g. registry timeout), the board fails open -- the
+      target is treated as active, so a registry outage never blocks the
+      invite, only temporarily suspends retirement enforcement.
     """
     token = _require_token()
     base_sub = _require_identity(token)

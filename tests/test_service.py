@@ -283,6 +283,15 @@ class _FakeActiveChecker:
         return sub not in self._inactive_subs
 
 
+class _RaisingActiveChecker:
+    """TECH-5703 test double: simulates a registry-backed checker that
+    fails (timeout, 5xx, auth error) -- exercises ``service._is_active_safe``'s
+    fail-open contract at each of the four call sites."""
+
+    async def is_active(self, sub: str) -> bool:
+        raise RuntimeError("simulated registry failure")
+
+
 def _request_payload(**overrides: Any) -> dict[str, Any]:
     now = datetime.now(UTC)
     payload: dict[str, Any] = {
@@ -1110,6 +1119,62 @@ class TestStartConversation:
             .all()
         )
         assert "denied.target_agent_retired" in actions
+
+    async def test_active_checker_failure_fails_open_admits_the_conversation(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-5703: a checker that raises must not block conversation
+        admission -- service._is_active_safe fails open."""
+        owner = await _register(session, "owner-checker-raises")
+        target = await _register(session, "target-checker-raises")
+
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            active_checker=_RaisingActiveChecker(),
+        )
+        assert conversation.id is not None
+
+    async def test_unknown_target_wins_over_retired_target_regardless_of_ordering(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-5703: _resolve_targets' two-pass design closes a side
+        channel -- a caller cannot learn whether an unknown target_id is
+        "unknown" vs. "retired" by choosing where to place it relative to a
+        target of known status. Both orderings of [unknown, retired] must
+        raise the uniform AccessDeniedError, never AgentRetiredError."""
+        owner = await _register(session, "owner-side-channel")
+        retired = await _register(session, "target-side-channel-retired")
+        bogus_id = uuid.uuid4()
+        checker = _FakeActiveChecker(inactive_subs={retired.sub})
+
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await start_conversation(
+                session,
+                actor_sub=owner.sub,
+                initiator_agent_id=owner.id,
+                conversation_type="open",
+                target_agent_ids=[bogus_id, retired.id],
+                initial_message=_request_payload(),
+                active_checker=checker,
+            )
+        assert exc_info.value.reason == "denied.unknown_agent"
+
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await start_conversation(
+                session,
+                actor_sub=owner.sub,
+                initiator_agent_id=owner.id,
+                conversation_type="open",
+                target_agent_ids=[retired.id, bogus_id],
+                initial_message=_request_payload(),
+                active_checker=checker,
+            )
+        assert exc_info.value.reason == "denied.unknown_agent"
 
     async def test_open_note_as_initial_message_diverted_to_hold(
         self, session: AsyncSession
@@ -2126,6 +2191,26 @@ class TestInvite:
         assert exc_info.value.reason == "denied.target_agent_retired"
         actions = await _audit_actions(session, conversation.id)
         assert "denied.target_agent_retired" in actions
+
+    async def test_active_checker_failure_fails_open_admits_the_invite(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-5703: a checker that raises must not block the invite --
+        service._is_active_safe fails open."""
+        owner, _target, conversation = await self._active_owner_and_conversation(
+            session, "inv-owner-checker-raises", "inv-target-checker-raises"
+        )
+        new_agent = await _register(session, "inv-new-checker-raises")
+
+        participant = await invite(
+            session,
+            actor_sub=owner.sub,
+            inviter_agent_id=owner.id,
+            conversation_id=conversation.id,
+            target_agent_id=new_agent.id,
+            active_checker=_RaisingActiveChecker(),
+        )
+        assert participant.status == "invited"
 
     async def test_denied_unknown_agent(self, session: AsyncSession) -> None:
         owner, _target, conversation = await self._active_owner_and_conversation(
@@ -4404,6 +4489,35 @@ class TestListAgents:
         assert [a["sub"] for a in second_page["agents"]] == ["lp-agent-02"]
         assert second_page["has_more"] is False
 
+    async def test_all_agents_on_page_retired_yields_empty_page_with_has_more_true(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-5703: the pagination contract documented on list_agents
+        allows an entirely-empty ``agents`` array while ``has_more`` is
+        still ``true`` -- callers must page on ``has_more``, never stop
+        just because a page came back empty."""
+        for i in range(3):
+            await _register(session, f"lar-agent-{i:02d}")
+
+        checker = _FakeActiveChecker(inactive_subs={"lar-agent-00", "lar-agent-01"})
+        page = await list_agents(session, limit=2, active_checker=checker)
+        assert page["agents"] == []
+        assert page["has_more"] is True
+        assert page["next_cursor"] == "lar-agent-01"
+
+        next_page = await list_agents(
+            session, limit=2, cursor=page["next_cursor"], active_checker=checker
+        )
+        assert [a["sub"] for a in next_page["agents"]] == ["lar-agent-02"]
+        assert next_page["has_more"] is False
+
+    async def test_active_checker_failure_fails_open(self, session: AsyncSession) -> None:
+        """TECH-5703: a checker that raises must not suppress directory
+        results -- service._is_active_safe fails open."""
+        await _register(session, "la-checker-raises")
+        page = await list_agents(session, active_checker=_RaisingActiveChecker())
+        assert {a["sub"] for a in page["agents"]} == {"la-checker-raises"}
+
 
 class TestLookupAgentByEmail:
     async def test_found(self, session: AsyncSession) -> None:
@@ -4449,6 +4563,15 @@ class TestLookupAgentByEmail:
             active_checker=_FakeActiveChecker(inactive_subs={"lae-retired"}),
         )
         assert result is None
+
+    async def test_active_checker_failure_fails_open(self, session: AsyncSession) -> None:
+        """TECH-5703: a checker that raises must not suppress a real match."""
+        await _register(session, "lae-checker-raises", owner_email="raises@example.com")
+        result = await lookup_agent_by_email(
+            session, owner_email="raises@example.com", active_checker=_RaisingActiveChecker()
+        )
+        assert result is not None
+        assert result["sub"] == "lae-checker-raises"
 
     async def test_tie_break_prefers_most_recently_bound(self, session: AsyncSession) -> None:
         # Same owner_email, two distinct subs -- an anticipated state (see

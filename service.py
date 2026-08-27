@@ -405,6 +405,8 @@ async def _is_active_safe(active_checker: ActiveChecker, sub: str) -> bool:
     worst case is a briefly-visible retired agent, not an outage."""
     try:
         return await active_checker.is_active(sub)
+    except asyncio.CancelledError:
+        raise
     except Exception:
         logger.warning(
             "active_checker.is_active raised for sub=%r; failing open", sub, exc_info=True
@@ -1697,10 +1699,16 @@ async def _resolve_targets(
     """
     rows = (await session.execute(select(Agent).where(Agent.id.in_(target_ids)))).scalars().all()
     by_id = {a.id: a for a in rows}
-    # Two passes, not one: existence/board-active for every target is fully
-    # resolved before any retirement check runs, so a caller cannot use
-    # target_ids ordering as a side channel to learn "is X retired" vs
-    # "is X unknown" by placing X before/after a target of known status.
+    # Two passes, not one -- closes a side channel: if this loop denied AND
+    # retirement-checked each target_id in the same pass, a caller with one
+    # known-retired target Z could place an unknown target X before/after Z
+    # in the list to learn whether X is unknown vs. retired, purely from
+    # which exception came back. `_deny()` is `-> NoReturn`, so if we reach
+    # pass 2 at all, every target_id already passed the existence/board-active
+    # check in pass 1 -- pass 1 raises on the FIRST bad target_id it finds
+    # (it does not scan the rest), but that's fine: no retirement check has
+    # run yet at that point, so there is nothing for the raise's shape to
+    # reveal about any other target_id in the list.
     for target_id in target_ids:
         target = by_id.get(target_id)
         if target is None or target.status != "active":
@@ -1712,6 +1720,9 @@ async def _resolve_targets(
                 detail={"target_agent_id": str(target_id)},
             )
     for target_id in target_ids:
+        # Safe unguarded lookup: pass 1 above raises (NoReturn) for any
+        # target_id not in by_id, so every target_id reaching this line is
+        # guaranteed present.
         target = by_id[target_id]
         if not await _is_active_safe(active_checker, target.sub):
             await _deny_agent_retired(

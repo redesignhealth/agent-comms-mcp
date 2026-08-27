@@ -505,8 +505,9 @@ before the state-machine transition.
 ### Configuration: pluggable seams
 
 `RISK_SCORER` (default `boundary_v1`), `AUTO_APPROVER` (default
-`escalate_all`), `APPROVAL_NOTIFIER` (default `log_only`) each resolve a
-registry name or, if the value contains a `:`, an import path
+`escalate_all`), `APPROVAL_NOTIFIER` (default `log_only`), `ACTIVE_CHECKER`
+(default `always_active`, TECH-5703 — see "A fifth seam" below) each
+resolve a registry name or, if the value contains a `:`, an import path
 (`"pkg.module:factory"`) via `importlib` — letting a deployment plug in a
 private implementation from its own package on `PYTHONPATH` without forking
 this repo. All four are validated at process start
@@ -585,7 +586,17 @@ for this seam's slightly different question. This intentionally does NOT touch t
 board's own `agents.status` column (`"active"`/`"suspended"`) — that column already has
 its own dormant future-proofing (§5's note on `lookup_agent_by_email`'s filter being
 inert today) and is a separate, board-local concept from an external registry's opinion
-of a sub; this seam layers on top of it rather than driving it.
+of a sub; this seam layers on top of it rather than driving it. Fail-open
+contract: if `is_active()` raises (timeout, 5xx, bad auth against the
+registry-backed implementation), the seam treats the target as active
+rather than propagating the error (`service._is_active_safe`, logged at
+`WARNING`) — a registry outage will not block directory reads or
+conversation admission, it will only temporarily suspend retirement
+enforcement (a retired agent may stay briefly visible/reachable). `list_agents`
+also fans its per-row `is_active()` calls out concurrently via `asyncio.gather`
+(up to `limit`, capped at 200, concurrent calls per page) rather than
+sequentially — a real implementation must be safe under that burst width
+(e.g. connection-pool-bounded), not built assuming one call at a time.
 
 **`owner_sub` provenance — accepted risk, partially resolved by the
 snapshot design.** Every high-risk post now depends on the decide
@@ -939,11 +950,11 @@ deployment-warning docstring.
  authorized to converse with a target today receives the specific `AgentRetiredError`
  rather than the uniform `AccessDeniedError` it would get once a grants/consent layer
  exists. Within the current internal-domain perimeter this is inert (directory
- enumeration is already acceptable, so the ordering leaks nothing new) — but this is
+ enumeration is already acceptable, so the ordering leaks nothing new) -- but this is
  exactly the kind of ordering dependency the grants-layer bullet above needs to
  revisit: once an authorization gate that MUST stay uniform is introduced, either move
  the retirement check to run after it, or fold retirement into the uniform denial for
- that gate specifically. `invite` does not have this issue — its retirement check
+ that gate specifically. `invite` does not have this issue -- its retirement check
  already runs after participant/state gating.
 
 ## 11. Deployment

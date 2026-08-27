@@ -303,7 +303,10 @@ def notifier_name(notifier: ApprovalNotifier) -> str:
 
 
 def validate_configuration() -> None:
-    """Fail fast at process start if any of the four seams don't resolve.
+    """Fail fast at process start if any of the four seams in THIS MODULE
+    don't resolve. ``OWNERSHIP_CLIENT`` is a fifth, board-wide seam that
+    lives in ``service.py`` and is validated separately, by
+    ``service.validate_ownership_client_configuration()``.
 
     Called from ``main._cli()`` beside the existing ``db.database_url()``
     fail-fast call — an unknown registry name, a bad import path, or (for
@@ -566,7 +569,16 @@ class ActiveChecker(Protocol):
         registry-availability failure should fail OPEN here (worst case: a
         retired agent stays briefly visible/reachable), not closed (which
         would make a registry outage silently hide or block healthy
-        agents board-wide)."""
+        agents board-wide). ``service._is_active_safe`` enforces the
+        fail-open contract at the call site too (catches, logs, returns
+        True) as a backstop for an implementation that raises anyway --
+        implementors should still treat "never raise" as the real contract,
+        not rely on that backstop. ``comms_list_agents`` calls this
+        concurrently across an entire page via ``asyncio.gather`` (up to
+        ``limit``, capped at 200, calls in flight at once) -- a
+        registry-backed implementation must be safe under that burst width
+        (e.g. connection-pool-bounded), not written assuming one call at a
+        time."""
         ...
 
 
