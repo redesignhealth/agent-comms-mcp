@@ -91,18 +91,20 @@ class TestRiskScorerRegistry:
 
 class TestGetRiskScorerAndValidateConfiguration:
     def setup_method(self) -> None:
-        # get_risk_scorer/get_auto_approver/get_approval_notifier each cache
-        # a process-wide singleton -- reset all three so each test starts
-        # from a clean slate regardless of run order (validate_configuration
-        # now resolves all three).
+        # get_risk_scorer/get_auto_approver/get_approval_notifier/
+        # get_active_checker each cache a process-wide singleton -- reset
+        # all four so each test starts from a clean slate regardless of run
+        # order (validate_configuration now resolves all four).
         plugins._risk_scorer = None
         plugins._auto_approver = None
         plugins._approval_notifier = None
+        plugins._active_checker = None
 
     def teardown_method(self) -> None:
         plugins._risk_scorer = None
         plugins._auto_approver = None
         plugins._approval_notifier = None
+        plugins._active_checker = None
 
     def test_get_risk_scorer_defaults_to_boundary_v1(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(plugins.RISK_SCORER_ENV_VAR, raising=False)
@@ -301,6 +303,88 @@ class TestGetApprovalNotifier:
     def test_defaults_to_log_only(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(plugins.APPROVAL_NOTIFIER_ENV_VAR, raising=False)
         assert isinstance(plugins.get_approval_notifier(), LogOnlyNotifier)
+
+
+# --- Seam 4: the active checker (TECH-5703) -----------------------------------
+
+
+class TestActiveCheckerRegistry:
+    def test_default_registry_contains_always_active(self) -> None:
+        assert (
+            plugins.ACTIVE_CHECKERS[plugins.DEFAULT_ACTIVE_CHECKER] is plugins.AlwaysActiveChecker
+        )
+
+    def test_always_active_checker_satisfies_protocol(self) -> None:
+        checker: plugins.ActiveChecker = plugins.AlwaysActiveChecker()
+        assert hasattr(checker, "is_active")
+
+    @pytest.mark.asyncio
+    async def test_always_active_checker_reports_every_sub_active(self) -> None:
+        checker = plugins.AlwaysActiveChecker()
+        assert await checker.is_active("literally-anything") is True
+
+
+class TestGetActiveCheckerAndValidateConfiguration:
+    def setup_method(self) -> None:
+        plugins._risk_scorer = None
+        plugins._auto_approver = None
+        plugins._approval_notifier = None
+        plugins._active_checker = None
+
+    def teardown_method(self) -> None:
+        plugins._risk_scorer = None
+        plugins._auto_approver = None
+        plugins._approval_notifier = None
+        plugins._active_checker = None
+
+    def test_get_active_checker_defaults_to_always_active(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(plugins.ACTIVE_CHECKER_ENV_VAR, raising=False)
+        assert isinstance(plugins.get_active_checker(), plugins.AlwaysActiveChecker)
+
+    def test_get_active_checker_caches_the_instance(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv(plugins.ACTIVE_CHECKER_ENV_VAR, raising=False)
+        first = plugins.get_active_checker()
+        second = plugins.get_active_checker()
+        assert first is second
+
+    def test_validate_configuration_passes_for_the_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(plugins.ACTIVE_CHECKER_ENV_VAR, raising=False)
+        plugins.validate_configuration()  # must not raise
+
+    def test_validate_configuration_fails_fast_on_unknown_checker(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(plugins.ACTIVE_CHECKER_ENV_VAR, "not_a_real_checker")
+        with pytest.raises(RuntimeError, match="unknown plugin"):
+            plugins.validate_configuration()
+
+    def test_non_default_registry_name_resolves(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class _AllInactiveChecker:
+            async def is_active(self, sub: str) -> bool:
+                return False
+
+        monkeypatch.setitem(plugins.ACTIVE_CHECKERS, "sentinel", _AllInactiveChecker)
+        monkeypatch.setenv(plugins.ACTIVE_CHECKER_ENV_VAR, "sentinel")
+        assert isinstance(plugins.get_active_checker(), _AllInactiveChecker)
+
+    def test_validate_configuration_fails_fast_on_bad_import_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Isolate the earlier seams: an invalid RISK_SCORER/AUTO_APPROVER/
+        # APPROVAL_NOTIFIER env var would make validate_configuration() raise
+        # at that earlier seam instead, and this test's pytest.raises would
+        # pass for the wrong reason (message wouldn't be "failed to import
+        # plugin").
+        monkeypatch.delenv(plugins.RISK_SCORER_ENV_VAR, raising=False)
+        monkeypatch.delenv(plugins.AUTO_APPROVER_ENV_VAR, raising=False)
+        monkeypatch.delenv(plugins.APPROVAL_NOTIFIER_ENV_VAR, raising=False)
+        monkeypatch.setenv(plugins.ACTIVE_CHECKER_ENV_VAR, "not_a_real_module:Whatever")
+        with pytest.raises(RuntimeError, match="failed to import plugin"):
+            plugins.validate_configuration()
 
 
 # --- Plugin name resolution (audit-readable names) ---------------------------

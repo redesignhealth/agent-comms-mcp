@@ -39,6 +39,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+import plugins
 from schemas import MESSAGE_TYPES
 
 # Coverage for MESSAGE_TYPES fitting within MAX_ACCEPTED_TYPES (a precondition
@@ -1855,6 +1856,97 @@ class TestMembershipTools:
             "schema_version_mismatch: no wire schema version is supported by "
             "every participant in this conversation"
         )
+        assert message != "access_denied: not authorized for this resource"
+
+    async def test_start_conversation_retired_target_surfaces_as_specific_tool_error(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """TECH-5703: exceptions.AgentRetiredError has service-layer
+        coverage (TestStartConversation in test_service.py) but this
+        exercises the actual _map_service_errors integration through the
+        real mounted tool -- confirms the class stays in the "pass through
+        unwrapped" branch rather than collapsing into the generic
+        access_denied string."""
+        await _register(main, test_session_factory, "sc-ret-owner")
+        await _register(main, test_session_factory, "sc-ret-target")
+
+        token_owner = _token("sc-ret-owner")
+        list_result = await _call(main, test_session_factory, token_owner, "comms_list_agents")
+        ids = {a["sub"]: a["agent_id"] for a in list_result["agents"]}
+
+        class _RetireOne:
+            async def is_active(self, sub: str) -> bool:
+                return sub != "sc-ret-target"
+
+        monkeypatch.setattr(plugins, "_active_checker", _RetireOne())
+
+        with pytest.raises(ToolError) as exc_info:
+            await _call(
+                main,
+                test_session_factory,
+                token_owner,
+                "comms_start_conversation",
+                {
+                    "conversation_type": "open",
+                    "target_agent_ids": [ids["sc-ret-target"]],
+                    "initial_message": _availability_request(),
+                },
+            )
+        message = str(exc_info.value)
+        assert message == ("agent retired: this agent has been retired and is no longer reachable")
+        assert message != "access_denied: not authorized for this resource"
+
+    async def test_invite_retired_target_surfaces_as_specific_tool_error(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """TECH-5703 sibling of the start_conversation test above, for
+        comms_invite's own AgentRetiredError check."""
+        await _register(main, test_session_factory, "inv-ret-owner")
+        await _register(main, test_session_factory, "inv-ret-member")
+        await _register(main, test_session_factory, "inv-ret-target")
+
+        token_owner = _token("inv-ret-owner")
+        list_result = await _call(main, test_session_factory, token_owner, "comms_list_agents")
+        ids = {a["sub"]: a["agent_id"] for a in list_result["agents"]}
+
+        started = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [ids["inv-ret-member"]],
+                "initial_message": _availability_request(),
+            },
+        )
+        conversation_id = started["conversation_id"]
+
+        class _RetireOne:
+            async def is_active(self, sub: str) -> bool:
+                return sub != "inv-ret-target"
+
+        monkeypatch.setattr(plugins, "_active_checker", _RetireOne())
+
+        with pytest.raises(ToolError) as exc_info:
+            await _call(
+                main,
+                test_session_factory,
+                token_owner,
+                "comms_invite",
+                {
+                    "conversation_id": conversation_id,
+                    "target_agent_id": ids["inv-ret-target"],
+                },
+            )
+        message = str(exc_info.value)
+        assert message == ("agent retired: this agent has been retired and is no longer reachable")
         assert message != "access_denied: not authorized for this resource"
 
     async def test_invite_runtime_error_surfaces_as_generic_tool_error(

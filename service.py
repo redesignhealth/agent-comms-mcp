@@ -104,6 +104,12 @@ registration), and ``denied.set_shared_requires_elevated_scope`` (a caller
 without ``comms:admin`` tried to use the ``set_agent_shared`` admin
 override).
 
+TECH-5703's ``denied.target_agent_retired`` is the one denial that is
+audited under ``_deny_agent_retired`` rather than the uniform ``_deny``
+above -- it raises the specific, client-visible ``AgentRetiredError``
+instead of ``AccessDeniedError`` (see that exception's own docstring for
+why this one case gets a specific message).
+
 TECH-5389 PR2's approval-holds pipeline (DESIGN.md §9 Axis 2) retired the
 per-message ``denied.boundary_crossing`` denial: a genuine high-risk
 verdict now DIVERTS to an ``approval_holds`` row instead of denying (see
@@ -153,6 +159,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from exceptions import (
     AccessDeniedError,
+    AgentRetiredError,
     HoldAlreadyDecidedError,
     HoldAwaitingAutoReviewError,
     HoldExpiredError,
@@ -163,6 +170,7 @@ from exceptions import (
 )
 from models import Agent, ApprovalHold, AuditLog, Conversation, Message, Participant
 from plugins import (
+    ActiveChecker,
     ApprovalNotification,
     ApprovalNotifier,
     AutoApprover,
@@ -361,6 +369,49 @@ async def _deny(
     )
     await session.commit()
     raise AccessDeniedError(reason=action)
+
+
+_DENIED_TARGET_AGENT_RETIRED = "denied.target_agent_retired"
+
+
+async def _deny_agent_retired(
+    session: AsyncSession,
+    *,
+    actor_sub: str,
+    agent_id: uuid.UUID,
+    conversation_id: uuid.UUID | None,
+    target_agent_id: uuid.UUID,
+) -> NoReturn:
+    """Same audit/commit shape as ``_deny``, but for the one case
+    (TECH-5703) that gets its own specific, non-uniform error --
+    see ``exceptions.AgentRetiredError``'s docstring for why."""
+    _audit(
+        session,
+        actor_sub=actor_sub,
+        action=_DENIED_TARGET_AGENT_RETIRED,
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+        detail={"target_agent_id": str(target_agent_id)},
+    )
+    await session.commit()
+    raise AgentRetiredError(reason=_DENIED_TARGET_AGENT_RETIRED)
+
+
+async def _is_active_safe(active_checker: ActiveChecker, sub: str) -> bool:
+    """Enforce ``ActiveChecker``'s documented fail-open contract at the seam,
+    since the ``Protocol`` itself cannot enforce "must never raise" on
+    implementors. A registry-backed checker that raises (timeout, 5xx, bad
+    auth) must not take down directory reads or conversation admission --
+    worst case is a briefly-visible retired agent, not an outage."""
+    try:
+        return await active_checker.is_active(sub)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning(
+            "active_checker.is_active raised for sub=%r; failing open", sub, exc_info=True
+        )
+        return True
 
 
 async def _deny_bad_state(
@@ -1352,6 +1403,7 @@ async def set_agent_shared(
 async def list_agents(
     session: AsyncSession,
     *,
+    active_checker: ActiveChecker,
     limit: int = 50,
     cursor: str | None = None,
 ) -> dict[str, Any]:
@@ -1362,6 +1414,21 @@ async def list_agents(
     layer (internal trust domain, DESIGN.md §10 flags directory enumeration
     as acceptable today and as the seam that tightens once external
     counterparties exist) — no denial paths, so no audit rows.
+
+    TECH-5703: a registry-retired agent (``active_checker.is_active`` false)
+    is dropped from ``agents`` -- filtered AFTER pagination/cursor
+    computation, which are still based on the raw DB rows, so a retired
+    agent's ``sub`` still occupies its position in keyset order and paging
+    never skips the row immediately after it. ``total_count`` deliberately
+    still counts every row regardless of retirement (it reflects the table,
+    not this listing's visibility -- the agent row itself is never deleted,
+    per this ticket's audit-trail requirement). Callers MUST page until
+    ``has_more`` is false, not until ``agents`` is empty -- a page can
+    return fewer than ``limit`` agents (including zero) while ``has_more``
+    is still true, when every row on that page happens to be retired.
+    ``active_checker.is_active`` failures fail open (see
+    ``_is_active_safe``): worst case a retired agent stays briefly visible,
+    never a directory outage.
     """
     limit = max(1, min(limit, 200))
     stmt = select(Agent).order_by(Agent.sub).limit(limit + 1)
@@ -1371,8 +1438,12 @@ async def list_agents(
     has_more = len(rows) > limit
     rows = rows[:limit]
     total_count = (await session.execute(select(func.count()).select_from(Agent))).scalar_one()
+    active_flags = await asyncio.gather(*(_is_active_safe(active_checker, a.sub) for a in rows))
+    visible_agents = [
+        _agent_public(a) for a, is_active in zip(rows, active_flags, strict=True) if is_active
+    ]
     return {
-        "agents": [_agent_public(a) for a in rows],
+        "agents": visible_agents,
         "total_count": total_count,
         "has_more": has_more,
         "next_cursor": rows[-1].sub if has_more and rows else None,
@@ -1383,7 +1454,7 @@ MAX_LOOKUP_EMAIL_LENGTH = 254  # RFC 5321 4.5.3.1.3 total-address cap
 
 
 async def lookup_agent_by_email(
-    session: AsyncSession, *, owner_email: str
+    session: AsyncSession, *, owner_email: str, active_checker: ActiveChecker
 ) -> dict[str, Any] | None:
     """Directory lookup: is ``owner_email`` bound to a board-active agent?
 
@@ -1464,7 +1535,11 @@ async def lookup_agent_by_email(
     never returned": nothing in this codebase currently transitions an
     agent to ``"suspended"`` (the only other value ``AGENT_STATUSES``
     allows), so today that filter is inert, future-proofing for
-    deregistration rather than an enforced guarantee.
+    deregistration rather than an enforced guarantee. TECH-5703's
+    ``active_checker`` filter below is the actual enforcement mechanism for
+    retirement today -- a registry-retired agent is excluded here the same
+    way an unregistered email is (``None``, not a distinguishable error),
+    matching this lookup's existing anti-enumeration posture.
     """
     if not isinstance(owner_email, str):
         return None
@@ -1479,6 +1554,8 @@ async def lookup_agent_by_email(
     )
     agent = (await session.execute(stmt)).scalar_one_or_none()
     if agent is None:
+        return None
+    if not await _is_active_safe(active_checker, agent.sub):
         return None
     return _agent_public(agent)
 
@@ -1606,16 +1683,32 @@ async def _resolve_targets(
     actor_sub: str,
     initiator: Agent,
     target_ids: list[uuid.UUID],
+    active_checker: ActiveChecker,
 ) -> list[Agent]:
     """Resolve every named target, requiring it to exist and be board-active.
 
     Ownership/ownership-boundary admission across the WHOLE participant
     set (initiator + targets) is a separate step (``_authorize_conversation_open``)
     — this function only rules out missing/inactive targets, uniformly
-    denied as ``denied.unknown_agent``.
+    denied as ``denied.unknown_agent``. TECH-5703: a target that DOES exist
+    and is board-active, but whose registry reports it retired, gets the
+    specific ``AgentRetiredError`` instead (see that exception's docstring
+    for why this one case is deliberately not folded into the uniform
+    denial above) -- checked only after the existence/board-active gate, so
+    a genuinely unknown target still gets the uniform denial first.
     """
     rows = (await session.execute(select(Agent).where(Agent.id.in_(target_ids)))).scalars().all()
     by_id = {a.id: a for a in rows}
+    # Two passes, not one -- closes a side channel: if this loop denied AND
+    # retirement-checked each target_id in the same pass, a caller with one
+    # known-retired target Z could place an unknown target X before/after Z
+    # in the list to learn whether X is unknown vs. retired, purely from
+    # which exception came back. `_deny()` is `-> NoReturn`, so if we reach
+    # pass 2 at all, every target_id already passed the existence/board-active
+    # check in pass 1 -- pass 1 raises on the FIRST bad target_id it finds
+    # (it does not scan the rest), but that's fine: no retirement check has
+    # run yet at that point, so there is nothing for the raise's shape to
+    # reveal about any other target_id in the list.
     for target_id in target_ids:
         target = by_id.get(target_id)
         if target is None or target.status != "active":
@@ -1625,6 +1718,19 @@ async def _resolve_targets(
                 action="denied.unknown_agent",
                 agent_id=initiator.id,
                 detail={"target_agent_id": str(target_id)},
+            )
+    for target_id in target_ids:
+        # Safe unguarded lookup: pass 1 above raises (NoReturn) for any
+        # target_id not in by_id, so every target_id reaching this line is
+        # guaranteed present.
+        target = by_id[target_id]
+        if not await _is_active_safe(active_checker, target.sub):
+            await _deny_agent_retired(
+                session,
+                actor_sub=actor_sub,
+                agent_id=initiator.id,
+                conversation_id=None,
+                target_agent_id=target_id,
             )
     return [by_id[target_id] for target_id in target_ids]
 
@@ -1734,6 +1840,7 @@ async def start_conversation(
     risk_scorer: RiskScorer,
     auto_approver: AutoApprover,
     notifier: ApprovalNotifier,
+    active_checker: ActiveChecker,
     message_type: str = "availability_request",
     schema_version: int = 1,
     expires_at: datetime | None = None,
@@ -1759,7 +1866,10 @@ async def start_conversation(
     Raises ``ValueError`` for a malformed ``conversation_type`` or an empty
     target list (input-validation, not authorization); ``AccessDeniedError``
     (uniform) if any target is unknown/inactive, or the participant set
-    fails admission; ``RateLimitExceededError`` past the per-initiator
+    fails admission; ``AgentRetiredError`` (TECH-5703, specific -- not
+    folded into the uniform denial above) if a target exists and is
+    board-active but its registry reports it retired;
+    ``RateLimitExceededError`` past the per-initiator
     conversation-start hourly cap OR the board-level per-sender-across-all-
     conversations hourly cap; ``SchemaVersionMismatchError`` if
     no wire schema version falls inside every participant's declared
@@ -1824,6 +1934,7 @@ async def start_conversation(
         actor_sub=actor_sub,
         initiator=initiator,
         target_ids=target_ids,
+        active_checker=active_checker,
     )
 
     # Schema-version capability negotiation: the caller-supplied schema_version
@@ -2250,6 +2361,7 @@ async def invite(
     conversation_id: uuid.UUID,
     target_agent_id: uuid.UUID,
     ownership_client: OwnershipClient,
+    active_checker: ActiveChecker,
 ) -> Participant:
     """Add ``target_agent_id`` to a conversation as a new ``invited`` row.
 
@@ -2307,6 +2419,16 @@ async def invite(
             agent_id=inviter_agent_id,
             conversation_id=conversation.id,
             detail={"target_agent_id": str(target_agent_id)},
+        )
+    if not await _is_active_safe(active_checker, target.sub):
+        # TECH-5703: specific, not folded into the uniform denial above --
+        # see AgentRetiredError's docstring.
+        await _deny_agent_retired(
+            session,
+            actor_sub=actor_sub,
+            agent_id=inviter_agent_id,
+            conversation_id=conversation.id,
+            target_agent_id=target_agent_id,
         )
     # Re-check the new target against the version this
     # conversation was already pinned to at open time (see
