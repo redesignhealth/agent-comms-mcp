@@ -282,7 +282,7 @@ scroll-to-load-more use case.
 | `comms_whoami` | comms:read | caller identity/scopes; also returns this identity's registered min/max_schema_version via a best-effort DB lookup if already `comms_register`'d -- omitted if not yet registered or the DB is unreachable (this tool remains usable as an auth-only diagnostic either way) |
 | `comms_register` | comms:write | idempotent self-provisioning: display_name, accepted_types (max 20, 100 chars each), min/max_schema_version (default 1/1, for schema-version capability negotiation); `is_shared=True` on first registration additionally requires comms:admin (see §5) |
 | `comms_set_agent_shared` | comms:write | admin override of an existing agent's `is_shared`, since `comms_register` freezes it against the agent's own re-registration; additionally requires comms:admin (see §5) |
-| `comms_list_agents` | comms:read | directory (internal domain, enumeration acceptable). Returns agent UUIDs used as target identifiers in other tools. A registry-retired agent (`ACTIVE_CHECKER` seam, TECH-5703, §"Configuration: pluggable seams") is excluded from results, though its row is never deleted |
+| `comms_list_agents` | comms:read | directory (internal domain, enumeration acceptable). Returns agent UUIDs used as target identifiers in other tools. A registry-retired agent (`ACTIVE_CHECKER` seam, TECH-5703, §"Configuration: pluggable seams") is excluded from results, though its row is never deleted; `total_count` still reflects every board-registered agent regardless of retirement status. Retirement is filtered AFTER pagination is computed from the raw rows, so a page can return fewer than `limit` agents (including zero) while `has_more` is still `true` -- callers must page until `has_more` is `false`, not until `agents` is empty |
 | `comms_lookup_agent_by_email` | comms:read | directory lookup by owner email; `{"agent": ..., "found": bool}`. O(1) targeted equivalent of paginating `comms_list_agents` -- see §10's enumeration-posture note. A registry-retired agent resolves to the same not-found shape as an unregistered email (TECH-5703) |
 | `comms_start_conversation` | comms:write | type + up to 50 target agent UUIDs (from `comms_list_agents`) + initial request payload. **Two response shapes** (TECH-5389): the normal conversation-created shape, or (if the opener was high-risk) that same shape plus a `held_for_approval`/`hold_id`/`hold_status`/`risk_reason` block — the conversation is created anyway, opened with a service-synthesized `conversation_opened` marker at seq 1, and the real content is held (§9). A registry-retired target (TECH-5703) raises a specific "agent retired" error instead of the uniform unknown-agent denial |
 | `comms_post_message` | comms:write | typed, schema-validated, state-machine-checked. **Two response shapes**: the normal posted-message shape (unchanged; gains `auto_approved`/`hold_id` if a configured auto-approver cleared a high-risk send inline), or `{"held_for_approval": true, "hold_id", "conversation_id", "status", "risk_reason", "expires_at", "created_at"}` — not an error — when the send is diverted to a hold (§9) |
@@ -509,7 +509,7 @@ before the state-machine transition.
 registry name or, if the value contains a `:`, an import path
 (`"pkg.module:factory"`) via `importlib` — letting a deployment plug in a
 private implementation from its own package on `PYTHONPATH` without forking
-this repo. All three are validated at process start
+this repo. All four are validated at process start
 (`plugins.validate_configuration()`, called from `main._cli()` beside the
 existing `DATABASE_URL` fail-fast check): an unknown name, a bad import path,
 or (for `APPROVAL_NOTIFIER=webhook`) a missing `APPROVAL_WEBHOOK_URL`/
@@ -933,6 +933,18 @@ deployment-warning docstring.
  builds one today.
 - **Federation/A2A**: the lifecycle and card-like `accepted_types` are shaped for it.
 - **Owner-only invites**: policy flip on the existing role field.
+- **`ACTIVE_CHECKER` ordering vs. the authorization gate**: in `start_conversation`,
+ `_resolve_targets`'s retirement check (TECH-5703) runs BEFORE
+ `_authorize_conversation_open`'s ownership-boundary admission check, so a caller not
+ authorized to converse with a target today receives the specific `AgentRetiredError`
+ rather than the uniform `AccessDeniedError` it would get once a grants/consent layer
+ exists. Within the current internal-domain perimeter this is inert (directory
+ enumeration is already acceptable, so the ordering leaks nothing new) — but this is
+ exactly the kind of ordering dependency the grants-layer bullet above needs to
+ revisit: once an authorization gate that MUST stay uniform is introduced, either move
+ the retirement check to run after it, or fold retirement into the uniform denial for
+ that gate specifically. `invite` does not have this issue — its retirement check
+ already runs after participant/state gating.
 
 ## 11. Deployment
 

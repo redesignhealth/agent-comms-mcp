@@ -157,7 +157,7 @@ class SchemaVersionMismatchError(Exception):
 
 class AgentRetiredError(Exception):
     """A ``start_conversation``/``invite`` target is a board-active agent
-    whose owning registry has reported it retired (TECH-5703) — deliberately
+    whose owning registry has reported it retired (TECH-5703) -- deliberately
     NOT folded into the uniform ``AccessDeniedError`` shape despite the
     module docstring's general anti-enumeration stance on unknown/inactive
     targets. Retirement is not the same category of fact as "does this
@@ -177,6 +177,7 @@ class AgentRetiredError(Exception):
 
 __all__ = [
     "AccessDeniedError",
+    "AgentRetiredError",
     "HoldAlreadyDecidedError",
     "HoldAwaitingAutoReviewError",
     "HoldExpiredError",

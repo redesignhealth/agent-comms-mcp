@@ -525,7 +525,8 @@ def get_approval_notifier() -> ApprovalNotifier:
     return _approval_notifier
 
 
-# --- Seam 4: the active checker (TECH-5703) ----------------------------------
+# --- Seam 4 of this module (fifth board-wide seam; OWNERSHIP_CLIENT lives in
+# service.py) -- the active checker (TECH-5703) ------------------------------
 #
 # Answers "is this board agent's owning registry still active?" for
 # comms_list_agents/comms_lookup_agent_by_email filtering and for refusing

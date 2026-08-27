@@ -240,9 +240,9 @@ async def _map_service_errors() -> AsyncIterator[None]:
     state, so naming it is not the kind of enumeration DESIGN.md's
     anti-enumeration rule is about. ``SchemaVersionMismatchError``
     is the same story for the wire-schema capability range
-    negotiated at ``comms_start_conversation`` — see exceptions.py.
+    negotiated at ``comms_start_conversation`` -- see exceptions.py.
     ``AgentRetiredError`` (TECH-5703) is deliberately specific rather than
-    folded into ``AccessDeniedError`` — see its own docstring.
+    folded into ``AccessDeniedError`` -- see its own docstring.
 
     A bare ``ValueError`` is different: the service layer raises it for
     internal parameter-shape problems (e.g. an empty ``display_name`` or
@@ -587,7 +587,12 @@ async def list_agents(limit: int = 50, cursor: str | None = None) -> dict[str, A
 
     TECH-5703: a registry-retired agent is dropped from ``agents`` (its row
     still exists -- retirement never deletes conversation history -- it's
-    just excluded from this listing). See ``plugins.ActiveChecker``.
+    just excluded from this listing). ``total_count`` still reflects every
+    board-registered agent regardless of retirement status. Retirement is
+    filtered AFTER pagination is computed from the raw rows, so a page can
+    return fewer than ``limit`` agents (including zero) while ``has_more``
+    is still ``true`` -- page until ``has_more`` is ``false``, not until
+    ``agents`` is empty. See ``plugins.ActiveChecker``.
     """
     _require_token()
     async with get_session_factory()() as session:

@@ -371,6 +371,13 @@ class TestGetActiveCheckerAndValidateConfiguration:
         monkeypatch.setenv(plugins.ACTIVE_CHECKER_ENV_VAR, "sentinel")
         assert isinstance(plugins.get_active_checker(), _AllInactiveChecker)
 
+    def test_validate_configuration_fails_fast_on_bad_import_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(plugins.ACTIVE_CHECKER_ENV_VAR, "not_a_real_module:Whatever")
+        with pytest.raises(RuntimeError, match="failed to import plugin"):
+            plugins.validate_configuration()
+
 
 # --- Plugin name resolution (audit-readable names) ---------------------------
 

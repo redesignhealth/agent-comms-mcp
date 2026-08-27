@@ -397,6 +397,21 @@ async def _deny_agent_retired(
     raise AgentRetiredError(reason=_DENIED_TARGET_AGENT_RETIRED)
 
 
+async def _is_active_safe(active_checker: ActiveChecker, sub: str) -> bool:
+    """Enforce ``ActiveChecker``'s documented fail-open contract at the seam,
+    since the ``Protocol`` itself cannot enforce "must never raise" on
+    implementors. A registry-backed checker that raises (timeout, 5xx, bad
+    auth) must not take down directory reads or conversation admission --
+    worst case is a briefly-visible retired agent, not an outage."""
+    try:
+        return await active_checker.is_active(sub)
+    except Exception:
+        logger.warning(
+            "active_checker.is_active raised for sub=%r; failing open", sub, exc_info=True
+        )
+        return True
+
+
 async def _deny_bad_state(
     session: AsyncSession,
     *,
@@ -1405,7 +1420,13 @@ async def list_agents(
     never skips the row immediately after it. ``total_count`` deliberately
     still counts every row regardless of retirement (it reflects the table,
     not this listing's visibility -- the agent row itself is never deleted,
-    per this ticket's audit-trail requirement).
+    per this ticket's audit-trail requirement). Callers MUST page until
+    ``has_more`` is false, not until ``agents`` is empty -- a page can
+    return fewer than ``limit`` agents (including zero) while ``has_more``
+    is still true, when every row on that page happens to be retired.
+    ``active_checker.is_active`` failures fail open (see
+    ``_is_active_safe``): worst case a retired agent stays briefly visible,
+    never a directory outage.
     """
     limit = max(1, min(limit, 200))
     stmt = select(Agent).order_by(Agent.sub).limit(limit + 1)
@@ -1415,7 +1436,10 @@ async def list_agents(
     has_more = len(rows) > limit
     rows = rows[:limit]
     total_count = (await session.execute(select(func.count()).select_from(Agent))).scalar_one()
-    visible_agents = [_agent_public(a) for a in rows if await active_checker.is_active(a.sub)]
+    active_flags = await asyncio.gather(*(_is_active_safe(active_checker, a.sub) for a in rows))
+    visible_agents = [
+        _agent_public(a) for a, is_active in zip(rows, active_flags, strict=True) if is_active
+    ]
     return {
         "agents": visible_agents,
         "total_count": total_count,
@@ -1529,7 +1553,7 @@ async def lookup_agent_by_email(
     agent = (await session.execute(stmt)).scalar_one_or_none()
     if agent is None:
         return None
-    if not await active_checker.is_active(agent.sub):
+    if not await _is_active_safe(active_checker, agent.sub):
         return None
     return _agent_public(agent)
 
@@ -1673,6 +1697,10 @@ async def _resolve_targets(
     """
     rows = (await session.execute(select(Agent).where(Agent.id.in_(target_ids)))).scalars().all()
     by_id = {a.id: a for a in rows}
+    # Two passes, not one: existence/board-active for every target is fully
+    # resolved before any retirement check runs, so a caller cannot use
+    # target_ids ordering as a side channel to learn "is X retired" vs
+    # "is X unknown" by placing X before/after a target of known status.
     for target_id in target_ids:
         target = by_id.get(target_id)
         if target is None or target.status != "active":
@@ -1683,7 +1711,9 @@ async def _resolve_targets(
                 agent_id=initiator.id,
                 detail={"target_agent_id": str(target_id)},
             )
-        if not await active_checker.is_active(target.sub):
+    for target_id in target_ids:
+        target = by_id[target_id]
+        if not await _is_active_safe(active_checker, target.sub):
             await _deny_agent_retired(
                 session,
                 actor_sub=actor_sub,
@@ -2379,7 +2409,7 @@ async def invite(
             conversation_id=conversation.id,
             detail={"target_agent_id": str(target_agent_id)},
         )
-    if not await active_checker.is_active(target.sub):
+    if not await _is_active_safe(active_checker, target.sub):
         # TECH-5703: specific, not folded into the uniform denial above --
         # see AgentRetiredError's docstring.
         await _deny_agent_retired(

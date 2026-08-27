@@ -2124,6 +2124,8 @@ class TestInvite:
                 active_checker=_FakeActiveChecker(inactive_subs={new_agent.sub}),
             )
         assert exc_info.value.reason == "denied.target_agent_retired"
+        actions = await _audit_actions(session, conversation.id)
+        assert "denied.target_agent_retired" in actions
 
     async def test_denied_unknown_agent(self, session: AsyncSession) -> None:
         owner, _target, conversation = await self._active_owner_and_conversation(
