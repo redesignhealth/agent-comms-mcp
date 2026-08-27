@@ -946,16 +946,16 @@ deployment-warning docstring.
 - **Owner-only invites**: policy flip on the existing role field.
 - **`ACTIVE_CHECKER` ordering vs. the authorization gate**: in `start_conversation`,
  `_resolve_targets`'s retirement check (TECH-5703) runs BEFORE
- `_authorize_conversation_open`'s ownership-boundary admission check, so a caller not
- authorized to converse with a target today receives the specific `AgentRetiredError`
- rather than the uniform `AccessDeniedError` it would get once a grants/consent layer
- exists. Within the current internal-domain perimeter this is inert (directory
- enumeration is already acceptable, so the ordering leaks nothing new) -- but this is
- exactly the kind of ordering dependency the grants-layer bullet above needs to
- revisit: once an authorization gate that MUST stay uniform is introduced, either move
- the retirement check to run after it, or fold retirement into the uniform denial for
- that gate specifically. `invite` does not have this issue -- its retirement check
- already runs after participant/state gating.
+ `_authorize_conversation_open`'s ownership-boundary admission check; in `invite`, the
+ retirement check likewise runs BEFORE `_authorize_invite_owner_freeze`. Either way, a
+ caller not authorized to converse with/invite a target today receives the specific
+ `AgentRetiredError` rather than the uniform `AccessDeniedError` it would get once a
+ grants/consent layer exists. Within the current internal-domain perimeter this is
+ inert (directory enumeration is already acceptable, so the ordering leaks nothing
+ new) -- but this is exactly the kind of ordering dependency the grants-layer bullet
+ above needs to revisit: once an authorization gate that MUST stay uniform is
+ introduced, either move the retirement check (in both functions) to run after it, or
+ fold retirement into the uniform denial for that gate specifically.
 
 ## 11. Deployment
 
