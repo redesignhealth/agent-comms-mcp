@@ -1,7 +1,7 @@
 """Exceptions raised by the comms service layer (``service.py``).
 
 Stage 3 (the not-yet-built MCP tools layer) catches these and maps them to
-``fastmcp.exceptions.ToolError`` messages. Only three shapes ever cross the
+``fastmcp.exceptions.ToolError`` messages. These shapes cross the
 service/tools boundary:
 
 - ``AccessDeniedError``: the uniform "not authorized for this resource"
@@ -25,6 +25,12 @@ service/tools boundary:
   board agent at all is exactly the kind of fact an internal-trust-domain
   service should not need to confirm to a caller who guesses at it, and
   unifying costs nothing (the caller already knows which agents it named).
+
+- ``AgentRetiredError`` (TECH-5703): a ``start_conversation``/``invite``
+  target IS a real, board-active agent, but its owning registry reports it
+  retired. Deliberately carved OUT of the uniform ``AccessDeniedError``
+  shape above -- see that class's own docstring for why this one case gets
+  a specific, actionable message instead.
 
 - ``InvalidConversationStateError``: a message type is not legal given the
   conversation's current state (state-machine violation — posting after
@@ -147,6 +153,26 @@ class SchemaVersionMismatchError(Exception):
     ``comms_start_conversation`` or ``comms_invite``). The fact of a
     mismatch is client-visible by design, but the message deliberately
     omits the actual range values compared — see the module docstring."""
+
+
+class AgentRetiredError(Exception):
+    """A ``start_conversation``/``invite`` target is a board-active agent
+    whose owning registry has reported it retired (TECH-5703) — deliberately
+    NOT folded into the uniform ``AccessDeniedError`` shape despite the
+    module docstring's general anti-enumeration stance on unknown/inactive
+    targets. Retirement is not the same category of fact as "does this
+    agent_id exist": the caller already possesses a real, previously-valid
+    agent_id (from a prior ``comms_list_agents``/conversation, not a guess),
+    so confirming it belonged to a now-retired agent leaks nothing new about
+    agent existence — it just tells the caller their invite target is gone,
+    which is the specific, actionable signal this ticket calls for
+    ("a clear 'agent retired' error"). Contrast the STILL-uniform case of an
+    unknown/board-suspended target, which stays folded into
+    ``AccessDeniedError`` exactly as before."""
+
+    def __init__(self, *, reason: str) -> None:
+        super().__init__("agent retired: this agent has been retired and is no longer reachable")
+        self.reason = reason
 
 
 __all__ = [

@@ -303,7 +303,7 @@ def notifier_name(notifier: ApprovalNotifier) -> str:
 
 
 def validate_configuration() -> None:
-    """Fail fast at process start if any of the three seams don't resolve.
+    """Fail fast at process start if any of the four seams don't resolve.
 
     Called from ``main._cli()`` beside the existing ``db.database_url()``
     fail-fast call — an unknown registry name, a bad import path, or (for
@@ -313,6 +313,7 @@ def validate_configuration() -> None:
     get_risk_scorer()
     get_auto_approver()
     get_approval_notifier()
+    get_active_checker()
 
 
 # --- Seam 2: the auto-approver (TECH-5389 PR2) -------------------------------
@@ -524,7 +525,78 @@ def get_approval_notifier() -> ApprovalNotifier:
     return _approval_notifier
 
 
+# --- Seam 4: the active checker (TECH-5703) ----------------------------------
+#
+# Answers "is this board agent's owning registry still active?" for
+# comms_list_agents/comms_lookup_agent_by_email filtering and for refusing
+# new start_conversation/invite targets. Stateless, same shape as
+# RiskScorer/AutoApprover/ApprovalNotifier above (not session-scoped like
+# OwnershipClient) -- a real implementation talks to an external registry
+# over HTTP and caches results in-process across requests, so it must
+# outlive any single request's AsyncSession, exactly like WebhookNotifier
+# above does for its own HTTP calls.
+#
+# The default, `always_active`, exactly preserves this board's behavior
+# before this seam existed: no filtering, no invite refusal, until a
+# deployment configures a real one via ACTIVE_CHECKER. This board has no
+# registry of its own to consult by default -- a real, registry-backed
+# implementation is expected to be supplied by whichever consumer deploys
+# this board alongside an actual agent-ownership registry, via the same
+# `pkg.module:factory` import-path mechanism AGENT_TOKEN_VERIFIERS/
+# OWNERSHIP_CLIENT already use. Design note (TECH-5703 ticket): such an
+# implementation should reuse whatever TTL/stale-serve cache its registry
+# lookup already needs for auth-time resolution, not stand up a second,
+# differently-tuned cache for this seam's slightly different question
+# ("active or not" vs. "who owns this").
+
+ACTIVE_CHECKER_ENV_VAR = "ACTIVE_CHECKER"
+DEFAULT_ACTIVE_CHECKER = "always_active"
+
+
+class ActiveChecker(Protocol):
+    async def is_active(self, sub: str) -> bool:
+        """True if ``sub`` is active, or unknown to whatever this checker
+        consults (fail-open -- matches this board's own behavior before
+        this seam existed, and matches an OAuth-registered/registry-less
+        sub having no registry entry at all to report inactive). False
+        ONLY for a sub this checker's backing registry has affirmatively
+        reported inactive/retired. Must never raise for "don't know" --
+        that case returns True, same as "no checker configured" does; a
+        registry-availability failure should fail OPEN here (worst case: a
+        retired agent stays briefly visible/reachable), not closed (which
+        would make a registry outage silently hide or block healthy
+        agents board-wide)."""
+        ...
+
+
+class AlwaysActiveChecker:
+    """``always_active`` -- the default. Every sub is active."""
+
+    async def is_active(self, sub: str) -> bool:
+        return True
+
+
+ACTIVE_CHECKERS: dict[str, Callable[[], ActiveChecker]] = {
+    DEFAULT_ACTIVE_CHECKER: AlwaysActiveChecker,
+}
+
+_active_checker: ActiveChecker | None = None
+
+
+def get_active_checker() -> ActiveChecker:
+    """Return the process-wide configured ``ActiveChecker`` (lazy
+    singleton, mirrors ``get_risk_scorer``)."""
+    global _active_checker
+    if _active_checker is None:
+        _active_checker = resolve_plugin(
+            ACTIVE_CHECKER_ENV_VAR, ACTIVE_CHECKERS, DEFAULT_ACTIVE_CHECKER
+        )
+    return _active_checker
+
+
 __all__ = [
+    "ACTIVE_CHECKERS",
+    "ACTIVE_CHECKER_ENV_VAR",
     "APPROVAL_NOTIFIERS",
     "APPROVAL_NOTIFIER_ENV_VAR",
     "APPROVAL_WEBHOOK_SECRET_ENV_VAR",
@@ -532,11 +604,14 @@ __all__ = [
     "AUTO_APPROVERS",
     "AUTO_APPROVER_ENV_VAR",
     "BARRIER_SENSITIVE_TYPES",
+    "DEFAULT_ACTIVE_CHECKER",
     "DEFAULT_APPROVAL_NOTIFIER",
     "DEFAULT_AUTO_APPROVER",
     "DEFAULT_RISK_SCORER",
     "RISK_SCORERS",
     "RISK_SCORER_ENV_VAR",
+    "ActiveChecker",
+    "AlwaysActiveChecker",
     "ApprovalNotification",
     "ApprovalNotifier",
     "AutoApprover",
@@ -551,6 +626,7 @@ __all__ = [
     "RiskVerdict",
     "WebhookNotifier",
     "auto_approver_name",
+    "get_active_checker",
     "get_approval_notifier",
     "get_auto_approver",
     "get_risk_scorer",

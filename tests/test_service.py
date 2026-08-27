@@ -38,6 +38,7 @@ import plugins
 import service as _service
 from exceptions import (
     AccessDeniedError,
+    AgentRetiredError,
     InvalidConversationStateError,
     RateLimitExceededError,
     SchemaVersionMismatchError,
@@ -68,9 +69,7 @@ from service import (
     get_conversation,
     inbox,
     leave,
-    list_agents,
     list_conversations,
-    lookup_agent_by_email,
     reconcile_agent_ownership,
     register_agent,
     set_agent_shared,
@@ -89,27 +88,53 @@ async def start_conversation(
     risk_scorer: plugins.RiskScorer | None = None,
     auto_approver: plugins.AutoApprover | None = None,
     notifier: plugins.ApprovalNotifier | None = None,
+    active_checker: plugins.ActiveChecker | None = None,
     **kwargs: Any,
 ) -> Any:
     """Thin wrapper defaulting ``ownership_client``/``risk_scorer``/
-    ``auto_approver``/``notifier`` so every pre-existing call site in this
-    file keeps working unchanged — tests that care about
-    ownership/risk/approval behavior pass their own fake explicitly."""
+    ``auto_approver``/``notifier``/``active_checker`` so every pre-existing
+    call site in this file keeps working unchanged — tests that care about
+    ownership/risk/approval/retirement behavior pass their own fake
+    explicitly."""
     return await _service.start_conversation(
         session,
         ownership_client=ownership_client or AgentTableOwnershipClient(session),
         risk_scorer=risk_scorer or plugins.BoundaryCrossingScorer(),
         auto_approver=auto_approver or plugins.EscalateAllAutoApprover(),
         notifier=notifier or plugins.LogOnlyNotifier(),
+        active_checker=active_checker or plugins.AlwaysActiveChecker(),
         **kwargs,
     )
 
 
 async def invite(
-    session: AsyncSession, *, ownership_client: OwnershipClient | None = None, **kwargs: Any
+    session: AsyncSession,
+    *,
+    ownership_client: OwnershipClient | None = None,
+    active_checker: plugins.ActiveChecker | None = None,
+    **kwargs: Any,
 ) -> Any:
     return await _service.invite(
-        session, ownership_client=ownership_client or AgentTableOwnershipClient(session), **kwargs
+        session,
+        ownership_client=ownership_client or AgentTableOwnershipClient(session),
+        active_checker=active_checker or plugins.AlwaysActiveChecker(),
+        **kwargs,
+    )
+
+
+async def list_agents(
+    session: AsyncSession, *, active_checker: plugins.ActiveChecker | None = None, **kwargs: Any
+) -> Any:
+    return await _service.list_agents(
+        session, active_checker=active_checker or plugins.AlwaysActiveChecker(), **kwargs
+    )
+
+
+async def lookup_agent_by_email(
+    session: AsyncSession, *, active_checker: plugins.ActiveChecker | None = None, **kwargs: Any
+) -> Any:
+    return await _service.lookup_agent_by_email(
+        session, active_checker=active_checker or plugins.AlwaysActiveChecker(), **kwargs
     )
 
 
@@ -244,6 +269,18 @@ async def _register(session: AsyncSession, sub: str, **overrides: Any) -> Agent:
     }
     kwargs.update(overrides)
     return await register_agent(session, **kwargs)
+
+
+class _FakeActiveChecker:
+    """TECH-5703 test double: reports every sub in ``inactive_subs`` as
+    retired, everything else active -- the shape a real registry-backed
+    ``ActiveChecker`` would report for a confirmed deactivation."""
+
+    def __init__(self, inactive_subs: set[str]) -> None:
+        self._inactive_subs = inactive_subs
+
+    async def is_active(self, sub: str) -> bool:
+        return sub not in self._inactive_subs
 
 
 def _request_payload(**overrides: Any) -> dict[str, Any]:
@@ -1047,6 +1084,32 @@ class TestStartConversation:
             .all()
         )
         assert "denied.unknown_agent" in actions
+
+    async def test_registry_retired_target_gets_specific_error(self, session: AsyncSession) -> None:
+        """TECH-5703: a target that EXISTS and is board-active, but whose
+        registry reports it retired, gets the specific AgentRetiredError --
+        deliberately not folded into the uniform denial above."""
+        owner = await _register(session, "owner-retired-target")
+        target = await _register(session, "target-retired")
+
+        with pytest.raises(AgentRetiredError) as exc_info:
+            await start_conversation(
+                session,
+                actor_sub=owner.sub,
+                initiator_agent_id=owner.id,
+                conversation_type="open",
+                target_agent_ids=[target.id],
+                initial_message=_request_payload(),
+                active_checker=_FakeActiveChecker(inactive_subs={target.sub}),
+            )
+        assert exc_info.value.reason == "denied.target_agent_retired"
+
+        actions = (
+            (await session.execute(select(AuditLog.action).where(AuditLog.agent_id == owner.id)))
+            .scalars()
+            .all()
+        )
+        assert "denied.target_agent_retired" in actions
 
     async def test_open_note_as_initial_message_diverted_to_hold(
         self, session: AsyncSession
@@ -2042,6 +2105,25 @@ class TestInvite:
         row = await session.get(Participant, (conversation.id, target.id))
         assert row is not None
         assert row.status == "declined"
+
+    async def test_registry_retired_target_gets_specific_error(self, session: AsyncSession) -> None:
+        """TECH-5703: same specific error as start_conversation's target
+        check -- see that test's docstring."""
+        owner, _target, conversation = await self._active_owner_and_conversation(
+            session, "inv-owner-retired", "inv-target-retired"
+        )
+        new_agent = await _register(session, "inv-new-retired")
+
+        with pytest.raises(AgentRetiredError) as exc_info:
+            await invite(
+                session,
+                actor_sub=owner.sub,
+                inviter_agent_id=owner.id,
+                conversation_id=conversation.id,
+                target_agent_id=new_agent.id,
+                active_checker=_FakeActiveChecker(inactive_subs={new_agent.sub}),
+            )
+        assert exc_info.value.reason == "denied.target_agent_retired"
 
     async def test_denied_unknown_agent(self, session: AsyncSession) -> None:
         owner, _target, conversation = await self._active_owner_and_conversation(
@@ -4279,6 +4361,47 @@ class TestListAgents:
         assert len(page["agents"]) == 1
         assert page["total_count"] == 3
 
+    async def test_registry_retired_agent_excluded_but_still_counted(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-5703: a registry-retired agent's row still exists (no
+        history/audit is destroyed) but is dropped from the listing --
+        total_count still reflects the raw table, since that's the DB's
+        actual row count, not this listing's visibility."""
+        await _register(session, "la-active")
+        await _register(session, "la-retired")
+
+        page = await list_agents(
+            session, active_checker=_FakeActiveChecker(inactive_subs={"la-retired"})
+        )
+        assert {a["sub"] for a in page["agents"]} == {"la-active"}
+        assert page["total_count"] == 2
+
+    async def test_registry_retirement_does_not_disturb_cursor_pagination(
+        self, session: AsyncSession
+    ) -> None:
+        """The has_more/next_cursor computation is based on the raw DB
+        rows, not the post-filter visible list -- a retired agent sitting
+        in the middle of keyset order must not cause the next page to
+        skip (or re-return) its neighbor."""
+        for i in range(3):
+            await _register(session, f"lp-agent-{i:02d}")
+
+        checker = _FakeActiveChecker(inactive_subs={"lp-agent-01"})
+        first_page = await list_agents(session, limit=2, active_checker=checker)
+        # DB fetched agent-00 and agent-01 for this page; agent-01 is
+        # filtered, so only agent-00 is visible, but next_cursor must still
+        # be agent-01's sub (the last DB row actually examined).
+        assert [a["sub"] for a in first_page["agents"]] == ["lp-agent-00"]
+        assert first_page["has_more"] is True
+        assert first_page["next_cursor"] == "lp-agent-01"
+
+        second_page = await list_agents(
+            session, limit=2, cursor=first_page["next_cursor"], active_checker=checker
+        )
+        assert [a["sub"] for a in second_page["agents"]] == ["lp-agent-02"]
+        assert second_page["has_more"] is False
+
 
 class TestLookupAgentByEmail:
     async def test_found(self, session: AsyncSession) -> None:
@@ -4310,6 +4433,20 @@ class TestLookupAgentByEmail:
         await session.flush()
         await session.commit()
         assert await lookup_agent_by_email(session, owner_email="suspend@example.com") is None
+
+    async def test_registry_retired_agent_resolves_to_not_found(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-5703: a registry-retired agent resolves to the SAME
+        not-found shape as an unregistered email -- no distinguishable
+        signal, matching this lookup's existing anti-enumeration posture."""
+        await _register(session, "lae-retired", owner_email="retired@example.com")
+        result = await lookup_agent_by_email(
+            session,
+            owner_email="retired@example.com",
+            active_checker=_FakeActiveChecker(inactive_subs={"lae-retired"}),
+        )
+        assert result is None
 
     async def test_tie_break_prefers_most_recently_bound(self, session: AsyncSession) -> None:
         # Same owner_email, two distinct subs -- an anticipated state (see

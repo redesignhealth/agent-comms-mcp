@@ -50,6 +50,7 @@ import service
 from db import get_session_factory
 from exceptions import (
     AccessDeniedError,
+    AgentRetiredError,
     InvalidConversationStateError,
     RateLimitExceededError,
     SchemaVersionMismatchError,
@@ -229,7 +230,7 @@ async def _map_service_errors() -> AsyncIterator[None]:
     ``AccessDeniedError``'s message is the fixed, uniform, anti-enumeration
     string (exceptions.py) and is passed through verbatim — no prefix, no
     detail, nothing that could distinguish denial causes to the caller.
-    The next four shapes are already client-safe/specific by design
+    The next shapes are already client-safe/specific by design
     (state-machine violations, rate limits, payload validation, and
     unknown-conversation-type are not enumeration risks — see
     exceptions.py's module docstring), so their messages pass through
@@ -240,6 +241,8 @@ async def _map_service_errors() -> AsyncIterator[None]:
     anti-enumeration rule is about. ``SchemaVersionMismatchError``
     is the same story for the wire-schema capability range
     negotiated at ``comms_start_conversation`` — see exceptions.py.
+    ``AgentRetiredError`` (TECH-5703) is deliberately specific rather than
+    folded into ``AccessDeniedError`` — see its own docstring.
 
     A bare ``ValueError`` is different: the service layer raises it for
     internal parameter-shape problems (e.g. an empty ``display_name`` or
@@ -260,6 +263,7 @@ async def _map_service_errors() -> AsyncIterator[None]:
         PayloadValidationError,
         UnknownConversationTypeError,
         SchemaVersionMismatchError,
+        AgentRetiredError,
     ) as exc:
         raise ToolError(str(exc)) from None
     except (ValueError, RuntimeError):
@@ -580,10 +584,19 @@ async def list_agents(limit: int = 50, cursor: str | None = None) -> dict[str, A
 
     Internal domain — enumeration is acceptable per DESIGN.md §10. Pass the
     returned ``next_cursor`` back as ``cursor`` to page forward.
+
+    TECH-5703: a registry-retired agent is dropped from ``agents`` (its row
+    still exists -- retirement never deletes conversation history -- it's
+    just excluded from this listing). See ``plugins.ActiveChecker``.
     """
     _require_token()
     async with get_session_factory()() as session:
-        return await service.list_agents(session, limit=limit, cursor=cursor)
+        return await service.list_agents(
+            session,
+            limit=limit,
+            cursor=cursor,
+            active_checker=plugins.get_active_checker(),
+        )
 
 
 @comms_server.tool
@@ -606,10 +619,15 @@ async def lookup_agent_by_email(owner_email: str) -> dict[str, Any]:
     is a caller-supplied, unverified registration claim (see
     ``service.lookup_agent_by_email``). Treat this as "who currently
     claims this email", not "who is proven to own it".
+
+    TECH-5703: a registry-retired agent resolves to the same not-found
+    shape as an unregistered email -- see ``service.lookup_agent_by_email``.
     """
     _require_token()
     async with get_session_factory()() as session:
-        agent = await service.lookup_agent_by_email(session, owner_email=owner_email)
+        agent = await service.lookup_agent_by_email(
+            session, owner_email=owner_email, active_checker=plugins.get_active_checker()
+        )
     return {"agent": agent, "found": agent is not None}
 
 
@@ -633,7 +651,9 @@ async def start_conversation(
     - ``conversation_type``: one of ``internal``, ``asymmetric``, ``open``.
     - ``target_agent_ids``: UUID strings from ``comms_list_agents``; max 50.
       Caller becomes ``owner``; each target starts as ``invited`` (invisible
-      until they call ``comms_accept``).
+      until they call ``comms_accept``). A target whose registry reports it
+      retired (TECH-5703) raises a specific "agent retired" error instead
+      of the uniform unknown-agent denial.
     - ``message_type``: type of the opening message. Default:
       ``availability_request``. All valid types: ``availability_request``,
       ``availability_response``, ``counter_proposal``, ``confirm``,
@@ -713,6 +733,7 @@ async def start_conversation(
                 risk_scorer=plugins.get_risk_scorer(),
                 auto_approver=plugins.get_auto_approver(),
                 notifier=plugins.get_approval_notifier(),
+                active_checker=plugins.get_active_checker(),
                 message_type=message_type,
                 expires_at=expires_dt,
                 schema_version=schema_version,
@@ -1124,7 +1145,9 @@ async def invite(
     - ``target_agent_id``: UUID string from ``comms_list_agents``. Target
       must be board-active and have no existing participant row (any status).
       For ``internal``/``asymmetric`` conversations, target must share the
-      conversation's owner set.
+      conversation's owner set. If the target's registry reports it
+      retired (TECH-5703), this raises a specific "agent retired" error
+      rather than the uniform unknown-agent denial.
     """
     token = _require_token()
     base_sub = _require_identity(token)
@@ -1143,6 +1166,7 @@ async def invite(
                 conversation_id=conv_id,
                 target_agent_id=target_id,
                 ownership_client=service.get_ownership_client_factory()(session),
+                active_checker=plugins.get_active_checker(),
             )
 
     return {
