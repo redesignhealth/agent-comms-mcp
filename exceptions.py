@@ -175,14 +175,81 @@ class AgentRetiredError(Exception):
         self.reason = reason
 
 
+class SiblingIdentityExistsError(Exception):
+    """``register_agent`` would create a NEW row for a ``base_sub`` that
+    already has at least one board identity under a DIFFERENT
+    ``agent_key`` (TECH-5736) -- the silent-identity-fork failure mode a
+    live incident actually hit: a caller that omits or typos
+    ``agent_key`` on a later call does not re-bind an existing identity,
+    it creates an entirely separate one, invisibly to the caller (the
+    board is working exactly as documented -- "absent" is a distinct key
+    from any named one -- which is precisely what makes this dangerous).
+
+    Specific and client-safe by design, unlike ``AccessDeniedError``: this
+    only ever describes the CALLING ``base_sub``'s own other
+    registrations, never another caller's data -- similar non-enumeration
+    reasoning to ``UnknownConversationTypeError``'s fixed public
+    vocabulary (module docstring above), just scoped to one caller's own
+    history instead of a global fixed list.
+
+    Not fail-closed in the security sense -- ``register_agent`` accepts an
+    explicit ``confirm_new_identity=True`` to proceed anyway, since a
+    caller legitimately running multiple agents under one token (the
+    documented purpose of ``agent_key``) must still be able to register a
+    genuinely new sibling identity on purpose.
+    """
+
+    def __init__(self, *, base_sub: str, existing_agent_keys: list[str | None]) -> None:
+        rendered = ", ".join(repr(k) for k in existing_agent_keys)
+        super().__init__(
+            f"identity_fork_detected: {base_sub!r} already has a registered agent under "
+            f"agent_key {rendered} -- pass confirm_new_identity=True to register a "
+            "genuinely separate identity, or pass the matching agent_key to re-bind "
+            "the existing one instead"
+        )
+        self.base_sub = base_sub
+        self.existing_agent_keys = existing_agent_keys
+
+
+class DisplayNameCollisionError(Exception):
+    """``register_agent`` would create a NEW row whose ``display_name``
+    matches an already board-``active`` agent's ``display_name``
+    (TECH-5736). ``display_name`` is not a board-enforced identity key --
+    ``sub`` is -- but a live incident showed downstream consumers (a site
+    agent's message whitelist) treat it as one in practice, so two
+    simultaneously-active, identically-named agents is a real hazard
+    worth rejecting at creation time rather than silently allowing.
+
+    Specific and client-safe: ``display_name`` is already public via
+    ``comms_list_agents``, so naming which ``sub`` already holds it is not
+    a new disclosure -- the caller could already learn the same fact by
+    listing the directory.
+
+    Only checked on FIRST registration (a new row being created), not on
+    every re-registration of an existing row -- see ``register_agent``'s
+    own docstring for why re-registration is deliberately exempt.
+    """
+
+    def __init__(self, *, display_name: str, existing_subs: list[str]) -> None:
+        rendered = ", ".join(repr(s) for s in existing_subs)
+        super().__init__(
+            f"display_name_collision: {display_name!r} is already used by an active "
+            f"agent ({rendered}) -- choose a distinct display_name"
+        )
+        self.display_name = display_name
+        self.existing_subs = existing_subs
+
+
 __all__ = [
     "AccessDeniedError",
     "AgentRetiredError",
+    "DisplayNameCollisionError",
     "HoldAlreadyDecidedError",
     "HoldAwaitingAutoReviewError",
     "HoldExpiredError",
     "InvalidConversationStateError",
     "RateLimitExceededError",
     "SchemaVersionMismatchError",
+    "SiblingIdentityExistsError",
     "UnknownConversationTypeError",
 ]

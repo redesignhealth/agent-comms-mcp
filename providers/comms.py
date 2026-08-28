@@ -51,9 +51,11 @@ from db import get_session_factory
 from exceptions import (
     AccessDeniedError,
     AgentRetiredError,
+    DisplayNameCollisionError,
     InvalidConversationStateError,
     RateLimitExceededError,
     SchemaVersionMismatchError,
+    SiblingIdentityExistsError,
     UnknownConversationTypeError,
 )
 from identity import try_resolve_email
@@ -243,6 +245,11 @@ async def _map_service_errors() -> AsyncIterator[None]:
     negotiated at ``comms_start_conversation`` -- see exceptions.py.
     ``AgentRetiredError`` (TECH-5703) is deliberately specific rather than
     folded into ``AccessDeniedError`` -- see its own docstring.
+    ``SiblingIdentityExistsError``/``DisplayNameCollisionError``
+    (TECH-5736) are the same story: both describe only the calling
+    identity's own registration state (or a fact already public via
+    ``comms_list_agents``), never another caller's secret data -- see
+    their own docstrings in exceptions.py.
 
     A bare ``ValueError`` is different: the service layer raises it for
     internal parameter-shape problems (e.g. an empty ``display_name`` or
@@ -264,6 +271,8 @@ async def _map_service_errors() -> AsyncIterator[None]:
         UnknownConversationTypeError,
         SchemaVersionMismatchError,
         AgentRetiredError,
+        SiblingIdentityExistsError,
+        DisplayNameCollisionError,
     ) as exc:
         raise ToolError(str(exc)) from None
     except (ValueError, RuntimeError):
@@ -389,6 +398,7 @@ async def register(
     max_schema_version: int = 1,
     agent_key: str | None = None,
     is_shared: bool = False,
+    confirm_new_identity: bool = False,
 ) -> dict[str, Any]:
     """Self-register or update this agent's board identity.
 
@@ -421,9 +431,21 @@ async def register(
     - ``agent_key``: stopgap for running multiple agents under
       one token. Appended to the token's verified sub
       (``"{base_sub}::{agent_key}"``) to produce a distinct board row.
-      Omit if only one agent shares this token. A different ``agent_key``
-      registers a separate row; the same ``agent_key`` rebinds the
-      existing one.
+      Technically optional (``None``/absent is itself a valid, distinct
+      key — the "bare base sub" identity), but treat it as REQUIRED in
+      practice for any deployment where more than one agent might ever
+      share a token or a base identity: a live incident (TECH-5736)
+      happened because a caller omitted it on a later call, which is NOT
+      a no-op — it doesn't re-bind the caller's existing identity, it
+      silently registers an entirely SEPARATE one on the bare base sub.
+      Always pass the SAME ``agent_key`` on every call for a given agent,
+      from the very first registration onward. A different ``agent_key``
+      registers a distinct row; the same ``agent_key`` rebinds the
+      existing one. If this call would otherwise create a new row for a
+      ``base_sub`` that already has one or more OTHER registered
+      identities, it is rejected with ``identity_fork_detected`` (listing
+      the existing sibling ``agent_key`` values) unless
+      ``confirm_new_identity=True`` is passed — see that parameter below.
 
       The ``email`` claim fallback is gated on ``is_interactive_token``
       (``scopes.py``). For a token with no ``iss`` at all, that check and
@@ -461,11 +483,31 @@ async def register(
       ``access_denied`` error (the specific reason,
       ``denied.is_shared_requires_elevated_scope``, is recorded only in the
       audit log — never returned to the caller).
+    - ``confirm_new_identity``: acknowledges "yes, I intend to register a
+      GENUINELY SEPARATE identity for this base_sub" (TECH-5736). Only
+      relevant when this call would otherwise create a new row for a
+      ``base_sub`` that already has at least one other registered
+      identity under a different ``agent_key`` — the default (``False``)
+      rejects that with ``identity_fork_detected`` instead of silently
+      creating it. Legitimate for the documented multi-agent-per-token
+      use of ``agent_key``; almost always a mistake (an omitted/typoed
+      ``agent_key``) otherwise — pass it deliberately, per new identity,
+      never as a blanket default.
+
+    Registering a NEW identity (this call's ``base_sub`` + ``agent_key``
+    combination has no existing row) also fails with
+    ``display_name_collision`` if ``display_name`` matches an already
+    board-active agent's, case-insensitively — regardless of whose
+    identity that is. Not gated by ``confirm_new_identity``: that flag
+    only concerns identity forking, not two unrelated agents ending up
+    indistinguishable by name to anything (like a whitelist) that keys on
+    it. Choose a different ``display_name`` instead.
 
     Calling again with the same caller identity AND the same ``agent_key``
     (both absent counts as the same) re-binds ``display_name``/
     ``accepted_types`` in place (see ``service.register_agent``); a
-    different ``agent_key`` registers a distinct row instead.
+    different ``agent_key`` registers a distinct row instead (subject to
+    the collision guards above).
 
     ``accepted_types`` is enforced, not just declarative (DESIGN.md §9's
     capability gate): a message type omitted here causes any message of
@@ -511,6 +553,7 @@ async def register(
         agent = await service.register_agent(
             session,
             sub=sub,
+            base_sub=base_sub,
             owner_sub=owner_sub,
             owner_email=owner_email,
             display_name=display_name,
@@ -519,6 +562,7 @@ async def register(
             max_schema_version=max_schema_version,
             is_shared=is_shared,
             is_shared_authorized=is_shared_authorized,
+            confirm_new_identity=confirm_new_identity,
         )
 
     return {
@@ -575,6 +619,52 @@ async def set_agent_shared(agent_id: str, is_shared: bool) -> dict[str, Any]:
         "sub": agent.sub,
         "display_name": agent.display_name,
         "is_shared": agent.is_shared,
+    }
+
+
+@comms_server.tool
+async def deregister_agent(agent_id: str) -> dict[str, Any]:
+    """Admin-gated deregistration: transitions an agent's ``status`` to
+    ``"suspended"`` (TECH-5736).
+
+    Closes a gap the schema always supported (``AGENT_STATUSES`` has
+    included ``"suspended"`` since the initial schema) but nothing ever
+    exercised until now — a stray, mis-registered row (e.g. one created by
+    a caller omitting ``agent_key`` on ``comms_register`` -- see that
+    tool's docstring) previously had NO way to be retired.
+
+    Requires the caller's token to carry the ``comms:admin`` scope (or be
+    an interactive/Okta caller) — same gate as ``comms_set_agent_shared``.
+    A caller without it gets the standard anti-enumeration
+    ``access_denied`` error (the specific reason,
+    ``denied.deregister_requires_elevated_scope``, is recorded only in the
+    audit log).
+
+    Idempotent: deregistering an already-``suspended`` agent succeeds
+    again rather than erroring.
+
+    One-directional (suspend only) — there is no reactivate tool today.
+
+    - ``agent_id``: UUID string from ``comms_list_agents``.
+    """
+    token = _require_token()
+    actor_sub = _require_identity(token)
+    deregister_authorized = is_interactive_token(token) or "comms:admin" in scopes_for_token(token)
+    target_id = _parse_uuid("agent_id", agent_id)
+
+    async with get_session_factory()() as session, _map_service_errors():
+        agent = await service.deregister_agent(
+            session,
+            actor_sub=actor_sub,
+            agent_id=target_id,
+            deregister_authorized=deregister_authorized,
+        )
+
+    return {
+        "agent_id": str(agent.id),
+        "sub": agent.sub,
+        "display_name": agent.display_name,
+        "status": agent.status,
     }
 
 

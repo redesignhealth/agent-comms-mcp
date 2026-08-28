@@ -251,12 +251,14 @@ async def _make_hold(
     status: str = "pending_human",
     expires_at: datetime | None = None,
 ) -> tuple[Any, ApprovalHold]:
+    sender_sub = f"hold-sender-{uuid.uuid4()}"
     sender = await register_agent(
         session,
-        sub=f"hold-sender-{uuid.uuid4()}",
+        sub=sender_sub,
+        base_sub=sender_sub,
         owner_sub=sender_owner_sub,
         owner_email=sender_owner_sub,
-        display_name="hold sender",
+        display_name=sender_sub,
         accepted_types=["note"],
     )
     conversation = Conversation(
@@ -720,6 +722,7 @@ class TestReconcileOwnershipEndpoint:
         await register_agent(
             session,
             sub="reconcile-endpoint-agent",
+            base_sub="reconcile-endpoint-agent",
             owner_sub="owner-x@example.com",
             owner_email="owner-x@example.com",
             display_name="reconcile endpoint agent",

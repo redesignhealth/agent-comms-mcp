@@ -66,7 +66,9 @@ admission: token issuance is the permissioned ceremony, and it happens upstream 
 service. Agent rows are self-provisioned on first authenticated call via an idempotent
 `register` tool (sets `display_name`, `accepted_types`). The `status` column
 (`active`/`suspended`) is an ops kill-switch. It carries no permission
-semantics: no authorization decision reads it.
+semantics: no authorization decision reads it. It is set to `suspended` by the
+comms:admin-gated `comms_deregister_agent` tool (TECH-5736) — the only write path
+onto it; there is no reactivate tool, by design (see §5).
 
 **`agent_key`: stopgap for one-token-per-many-agents.** The board's
 `sub` is keyed on the caller's verified token identity, which today is one Okta sub
@@ -86,6 +88,22 @@ on verified ownership. Two different owners can pass an identical `agent_key` st
 without colliding, since the prefix differs. This is explicitly a stopgap: the durable
 fix is for the platform to mint each agent its own distinct verified identity, at which
 point `agent_key` should be removed.
+
+**Identity-fork and display-name collision guards (TECH-5736).** Because `agent_key`
+is caller-chosen and easy to omit by accident, a caller who forgets it on a later call
+would otherwise silently create a brand-new sibling row under the bare base identity
+instead of erroring or re-binding the one they meant — this is exactly the "Pepper
+Pots overwrote Bond 007" failure mode inverted (a stray row instead of a clobber).
+`register_agent` now refuses to create a new row when the caller's base identity
+already owns at least one row under a *different* `agent_key` (including no key at
+all), raising `identity_fork_detected` and listing the existing sibling `sub`s, unless
+the caller passes `confirm_new_identity=True` to say explicitly "yes, this is a
+deliberate additional identity." Independently — and NOT bypassable by
+`confirm_new_identity`, since it guards a different invariant — a new row whose
+`display_name` collides (case-insensitively) with an existing ACTIVE row's
+`display_name` is rejected with `display_name_collision`. Both checks fire only when
+a genuinely new row is about to be created, never on idempotent re-registration of an
+existing `sub`.
 
 **Permissions live in three places:**
 
@@ -255,6 +273,16 @@ Design notes:
  `False` to `True` after a conversation already opened does retroactively
  block that agent from being invited into it later, even though it does
  nothing to participants already admitted before the correction.
+- `agents.status` (`active`/`suspended`) has always been part of the schema but,
+ before TECH-5736, no code path ever wrote `"suspended"` — `comms_deregister_agent`
+ closes that gap. It follows the identical admin-gate shape as `comms_set_agent_shared`:
+ gated on the caller's `comms:admin` scope (or interactive/Okta caller), a caller
+ without it gets `denied.deregister_requires_elevated_scope` (audit-log reason key
+ only), and a successful transition is audited as `agent.deregistered` with the
+ previous status in the detail. Idempotent (deregistering an already-suspended agent
+ is a no-op write, still audited) and deliberately one-directional: there is no
+ reactivate tool. `status` still carries no permission semantics of its own (see §2)
+ — it is a manual ops kill-switch, not read by any `may_assign`/admission check.
 
 ## 6. Message schemas (two-axis model)
 
@@ -296,8 +324,9 @@ scroll-to-load-more use case.
 | Tool | Scope | Notes |
 |---|---|---|
 | `comms_whoami` | comms:read | caller identity/scopes; also returns this identity's registered min/max_schema_version via a best-effort DB lookup if already `comms_register`'d -- omitted if not yet registered or the DB is unreachable (this tool remains usable as an auth-only diagnostic either way) |
-| `comms_register` | comms:write | idempotent self-provisioning: display_name, accepted_types (max 20, 100 chars each), min/max_schema_version (default 1/1, for schema-version capability negotiation); `is_shared=True` on first registration additionally requires comms:admin (see §5) |
+| `comms_register` | comms:write | idempotent self-provisioning: display_name, accepted_types (max 20, 100 chars each), min/max_schema_version (default 1/1, for schema-version capability negotiation); `is_shared=True` on first registration additionally requires comms:admin (see §5); rejects a new sibling row under the same base identity (`identity_fork_detected`) unless `confirm_new_identity=True`, and rejects a new row whose `display_name` collides with an existing active agent's (`display_name_collision`, not bypassable) -- see §5 |
 | `comms_set_agent_shared` | comms:write | admin override of an existing agent's `is_shared`, since `comms_register` freezes it against the agent's own re-registration; additionally requires comms:admin (see §5) |
+| `comms_deregister_agent` | comms:write | sets an existing agent's `status="suspended"`; additionally requires comms:admin (see §5); one-directional by design -- no reactivate tool |
 | `comms_list_agents` | comms:read | directory (internal domain, enumeration acceptable). Returns agent UUIDs used as target identifiers in other tools. A registry-retired agent (`ACTIVE_CHECKER` seam, TECH-5703, §"Configuration: pluggable seams") is excluded from results, though its row is never deleted; `total_count` still reflects every board-registered agent regardless of retirement status. Retirement is filtered AFTER pagination is computed from the raw rows, so a page can return fewer than `limit` agents (including zero) while `has_more` is still `true` -- callers must page until `has_more` is `false`, not until `agents` is empty |
 | `comms_lookup_agent_by_email` | comms:read | directory lookup by owner email; `{"agent": ..., "found": bool}`. O(1) targeted equivalent of paginating `comms_list_agents` -- see §10's enumeration-posture note. A registry-retired agent resolves to the same not-found shape as an unregistered email (TECH-5703) |
 | `comms_start_conversation` | comms:write | type + up to 50 target agent UUIDs (from `comms_list_agents`) + initial request payload. **Two response shapes** (TECH-5389): the normal conversation-created shape, or (if the opener was high-risk) that same shape plus a `held_for_approval`/`hold_id`/`hold_status`/`risk_reason` block — the conversation is created anyway, opened with a service-synthesized `conversation_opened` marker at seq 1, and the real content is held (§9). A registry-retired target (TECH-5703) raises a specific "agent retired" error instead of the uniform unknown-agent denial |

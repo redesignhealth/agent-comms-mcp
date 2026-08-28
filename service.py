@@ -165,12 +165,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from exceptions import (
     AccessDeniedError,
     AgentRetiredError,
+    DisplayNameCollisionError,
     HoldAlreadyDecidedError,
     HoldAwaitingAutoReviewError,
     HoldExpiredError,
     InvalidConversationStateError,
     RateLimitExceededError,
     SchemaVersionMismatchError,
+    SiblingIdentityExistsError,
     UnknownConversationTypeError,
 )
 from models import Agent, ApprovalHold, AuditLog, Conversation, Message, Participant
@@ -1082,10 +1084,27 @@ def validate_schema_version_range(min_schema_version: int, max_schema_version: i
         raise ValueError("min_schema_version must be <= max_schema_version")
 
 
+def _agent_key_from_sub(sub: str, base_sub: str) -> str | None:
+    """Recover the ``agent_key`` half of a composed board identity.
+
+    Inverse of ``providers.comms._compose_sub``: ``sub`` is either exactly
+    ``base_sub`` (no ``agent_key`` was given) or ``f"{base_sub}::{agent_key}"``
+    -- both ``base_sub`` and ``agent_key`` are validated elsewhere to never
+    contain ``"::"`` themselves, so this split is unambiguous. Used only to
+    render existing sibling identities back into a human-readable error
+    (``SiblingIdentityExistsError``) -- never for any authorization
+    decision.
+    """
+    if sub == base_sub:
+        return None
+    return sub[len(base_sub) + 2 :]
+
+
 async def register_agent(
     session: AsyncSession,
     *,
     sub: str,
+    base_sub: str,
     owner_sub: str,
     owner_email: str,
     display_name: str,
@@ -1094,8 +1113,31 @@ async def register_agent(
     max_schema_version: int = 1,
     is_shared: bool = False,
     is_shared_authorized: bool = False,
+    confirm_new_identity: bool = False,
 ) -> Agent:
     """Idempotently create or re-bind the board ``Agent`` row for ``sub``.
+
+    ``base_sub`` (TECH-5736) is the caller's verified identity BEFORE
+    ``agent_key`` composition (``providers.comms._require_identity``'s
+    result) -- ``sub`` is ``base_sub`` alone or ``f"{base_sub}::{agent_key}"``.
+    Passed separately, not re-derived from ``sub``, so this function can
+    check for SIBLING identities under the same ``base_sub`` without
+    guessing where a ``"::"`` in ``sub`` came from. Raises
+    ``SiblingIdentityExistsError`` on FIRST registration (a brand new
+    ``sub``) if ``base_sub`` already has at least one OTHER registered row
+    and ``confirm_new_identity`` is not ``True`` -- this is the actual
+    incident this check exists to prevent: a caller that omits or typos
+    ``agent_key`` on a later call doesn't re-bind its existing identity,
+    it silently forks a new one, and nothing before this check ever
+    surfaced that as an error. Re-registration of an ALREADY-existing
+    ``sub`` never triggers this (idempotent re-binding is exactly the
+    safe, intended path) -- it only guards the moment a genuinely new row
+    is about to be created.
+
+    Also raises ``DisplayNameCollisionError`` on first registration if
+    ``display_name`` (case-insensitively) matches an existing board-
+    ``active`` agent's -- see that exception's own docstring for why this
+    is checked only on creation, not on every re-registration.
 
     SECURITY: ``owner_sub``/``owner_email`` MUST be sourced by the caller
     (the MCP tools layer) from verified OAuth token claims — DESIGN.md §4:
@@ -1224,6 +1266,60 @@ async def register_agent(
     existing = (await session.execute(select(Agent).where(Agent.sub == sub))).scalar_one_or_none()
     now = _now()
     created = existing is None
+    if created and not confirm_new_identity:
+        # TECH-5736: about to create a brand-new row for `sub` -- check
+        # whether `base_sub` already has ANY other registered identity
+        # first. This is the actual incident this check exists to catch:
+        # omitting/typoing `agent_key` on a later call doesn't re-bind an
+        # existing row (that path never reaches here -- `existing` would
+        # be non-None), it silently creates a new one. `Agent.sub != sub`
+        # is redundant given `existing is None` already means no row
+        # equals `sub`, but kept explicit so this query's own intent (find
+        # OTHER identities under this base_sub) doesn't depend on that
+        # invariant holding.
+        sibling_subs = (
+            (
+                await session.execute(
+                    select(Agent.sub).where(
+                        Agent.sub != sub,
+                        or_(
+                            Agent.sub == base_sub,
+                            Agent.sub.startswith(f"{base_sub}::", autoescape=True),
+                        ),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if sibling_subs:
+            raise SiblingIdentityExistsError(
+                base_sub=base_sub,
+                existing_agent_keys=[_agent_key_from_sub(s, base_sub) for s in sibling_subs],
+            )
+    if created:
+        # TECH-5736: same "about to create a new row" moment, but this
+        # check is NOT gated on `confirm_new_identity` -- that flag means
+        # "I intend to register a genuinely separate identity," not "I
+        # intend to collide with another active agent's display_name."
+        # See DisplayNameCollisionError's docstring for why this only
+        # fires on creation, not on every re-registration.
+        colliding_subs = (
+            (
+                await session.execute(
+                    select(Agent.sub).where(
+                        func.lower(Agent.display_name) == display_name.lower(),
+                        Agent.status == "active",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if colliding_subs:
+            raise DisplayNameCollisionError(
+                display_name=display_name, existing_subs=list(colliding_subs)
+            )
     if created and is_shared and not is_shared_authorized:
         # First-registration self-escalation: `is_shared` is frozen after
         # this point (see the re-registration branch below), so this is the
@@ -1432,6 +1528,78 @@ async def set_agent_shared(
         action="agent.set_shared",
         agent_id=agent.id,
         detail={"is_shared": is_shared, "previous": previous},
+    )
+    await session.commit()
+    return agent
+
+
+async def deregister_agent(
+    session: AsyncSession,
+    *,
+    actor_sub: str,
+    agent_id: uuid.UUID,
+    deregister_authorized: bool,
+) -> Agent:
+    """Admin-gated deregistration: transitions ``agent.status`` to
+    ``"suspended"`` (TECH-5736).
+
+    Closes a gap the schema has always supported but nothing ever
+    exercised: ``models.AGENT_STATUSES`` has included ``"suspended"``
+    since the initial schema, but before this function NOTHING in this
+    codebase ever wrote it -- ``lookup_agent_by_email``'s own docstring
+    used to describe the ``status == "active"`` filter as "inert,
+    future-proofing for deregistration rather than an enforced guarantee."
+    A live incident needed exactly this (a stray, mis-registered row with
+    no way to retire it) and found it didn't exist.
+
+    Mirrors ``set_agent_shared``'s admin-gate shape exactly:
+    ``deregister_authorized`` MUST be computed by the caller (the tools
+    layer) from the actor's own verified token (``comms:admin`` scope, or
+    an interactive/Okta caller) -- no default is provided, since this
+    function's entire purpose is the privileged mutation and there is no
+    unprivileged call site to protect with a fail-closed default.
+
+    Idempotent: deregistering an already-``suspended`` agent is a no-op
+    write (still audited) rather than an error -- safe to retry.
+
+    Raises ``AccessDeniedError`` with reason
+    ``denied.deregister_requires_elevated_scope`` if
+    ``deregister_authorized`` is ``False`` (checked FIRST, before the
+    existence lookup, so an unauthorized caller's audit trail always
+    records the authorization failure, not ``denied.unknown_agent``,
+    regardless of whether ``agent_id`` happens to be valid), or
+    ``denied.unknown_agent`` if ``agent_id`` does not match any agent
+    (uniform with every other unknown-agent-id denial in this module).
+
+    Deliberately one-directional (suspend only, no reactivate path) --
+    this repo has no reactivation use case yet; add one as its own
+    change, with its own authorization gate, if that need arises rather
+    than overloading this function with a ``status`` parameter now.
+    """
+    if not deregister_authorized:
+        await _deny(
+            session,
+            actor_sub=actor_sub,
+            action="denied.deregister_requires_elevated_scope",
+            detail={"target_agent_id": str(agent_id)},
+        )
+    agent = await _find_agent_by_id(session, agent_id)
+    if agent is None:
+        await _deny(
+            session,
+            actor_sub=actor_sub,
+            action="denied.unknown_agent",
+            detail={"target_agent_id": str(agent_id)},
+        )
+    previous = agent.status
+    agent.status = "suspended"
+    await session.flush()
+    _audit(
+        session,
+        actor_sub=actor_sub,
+        action="agent.deregistered",
+        agent_id=agent.id,
+        detail={"previous_status": previous},
     )
     await session.commit()
     return agent
@@ -4864,6 +5032,7 @@ __all__ = [
     "audit_denied_approval_requires_interactive",
     "decide_hold",
     "decline_invite",
+    "deregister_agent",
     "get_agent_by_sub",
     "get_conversation",
     "get_hold_status",

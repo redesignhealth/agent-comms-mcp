@@ -44,7 +44,10 @@ from observability import log_auth_rejected
 #             ``service.register_agent``'s ``is_shared_authorized`` param),
 #             and by ``providers.comms.set_agent_shared`` to correct an
 #             existing agent's ``is_shared`` value after the fact (see
-#             ``service.set_agent_shared``'s ``is_shared_authorized`` param).
+#             ``service.set_agent_shared``'s ``is_shared_authorized`` param),
+#             and by ``providers.comms.deregister_agent`` (TECH-5736) to
+#             transition an agent to ``status="suspended"`` (see
+#             ``service.deregister_agent``'s ``deregister_authorized`` param).
 TOOL_SCOPES: dict[str, str] = {
     # --- comms (provider: providers/comms.py, namespace="comms") ---
     "comms_whoami": "comms:read",
@@ -58,6 +61,7 @@ TOOL_SCOPES: dict[str, str] = {
     # Writes (mutate board/agent/conversation state)
     "comms_register": "comms:write",
     "comms_set_agent_shared": "comms:write",
+    "comms_deregister_agent": "comms:write",
     "comms_start_conversation": "comms:write",
     "comms_post_message": "comms:write",
     "comms_accept": "comms:write",
