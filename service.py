@@ -89,8 +89,13 @@ violation), ``denied.bad_schema`` (payload validation),
 ``denied.rate_limited`` (limit names: ``conversation_starts_per_hour``,
 ``messages_per_conversation_per_hour``, ``messages_per_sender_per_hour``,
 and — TECH-5389 PR2 — ``approval_holds_per_hour``),
-``denied.ownership_unverified`` (Axis 1 admission — conversation open,
-invite owner-freeze — lookup failed; fail closed), ``denied.not_same_owner``/
+``denied.ownership_unverified`` (Axis 1 admission — conversation open, or
+invite owner-freeze's empty-owner-set case — fail closed) /
+``denied.ownership_lookup_failed`` (invite owner-freeze ONLY, when the
+lookup itself raised rather than returning an empty set — TECH-5735
+distinguishes the two so ``decide_hold``'s invite re-validation can tell a
+transient registry outage apart from a permanently-orphaned target),
+``denied.not_same_owner``/
 ``denied.no_owner_overlap`` (conversation-open admission failed for
 ``internal``/``asymmetric``), ``denied.owner_set_frozen`` (an invite would
 expand a frozen owner set), ``denied.wrong_sender_role`` (DESIGN.md §9
@@ -306,6 +311,16 @@ MAX_PENDING_INVITES_PER_INBOX = 100
 APPROVAL_HOLD_TTL = timedelta(days=7)
 MAX_APPROVAL_HOLDS_PER_HOUR = 10
 
+# TECH-5735: invite-holds (ApprovalHold.kind="invite") use fixed sentinel
+# values in place of a real message-schema/risk-scorer identifier, since no
+# RiskScorer plugin is invoked and there is no real schemas.MessageType for
+# "someone is being invited" — see ApprovalHold's class docstring and
+# _divert_invite_for_approval.
+INVITE_HOLD_MESSAGE_TYPE = "invite"
+INVITE_HOLD_SCHEMA_VERSION = 1
+INVITE_HOLD_RISK_REASON = "note_history_requires_approval"
+INVITE_HOLD_RISK_SCORER_LABEL = "invite_note_history_v1"
+
 # The one message type the SERVICE itself synthesizes (the seq-1 marker for
 # a diverted conversation opener, schemas.ConversationOpenedV1) -- never
 # legal as a caller-supplied message_type (denied.system_message_type,
@@ -372,6 +387,15 @@ async def _deny(
 
 
 _DENIED_TARGET_AGENT_RETIRED = "denied.target_agent_retired"
+# Argus round-4: distinct from `denied.ownership_unverified` (an empty
+# owner set from a SUCCESSFUL lookup -- deterministic, will never resolve
+# itself) specifically so decide_hold's invite re-validation can tell a
+# transient registry outage apart from a permanently-orphaned target. Only
+# `_authorize_invite_owner_freeze`'s lookup-EXCEPTION branch uses this;
+# `_authorize_conversation_open`'s analogous branch does not, since that
+# caller (start_conversation) has no stranded-hold concern to guard
+# against -- the whole open attempt just fails and the caller retries.
+_DENIED_OWNERSHIP_LOOKUP_FAILED = "denied.ownership_lookup_failed"
 
 
 async def _deny_agent_retired(
@@ -765,6 +789,16 @@ async def _find_hold(
         # both insert a message. Locking the hold row itself at fetch time
         # serializes concurrent decisions on the SAME hold.
         stmt = stmt.with_for_update()
+        # Argus round-4 BLOCKING catch: this session factory sets
+        # expire_on_commit=False (db.py), so re-calling this with the SAME
+        # hold_id already in the identity map (e.g. decide_hold's
+        # concurrent-resolution re-acquire, after an intervening commit)
+        # would otherwise hand back the cached Python object UNCHANGED --
+        # the `FOR UPDATE` still executes and blocks at the DB level, but
+        # the row's ACTUAL current column values never make it back into
+        # the object, silently defeating any "is it still pending_human"
+        # check a caller does against the returned row.
+        stmt = stmt.execution_options(populate_existing=True)
     return (await session.execute(stmt)).scalar_one_or_none()
 
 
@@ -790,6 +824,7 @@ def _hold_dict(hold: ApprovalHold) -> dict[str, Any]:
     result: dict[str, Any] = {
         "hold_id": str(hold.id),
         "conversation_id": str(hold.conversation_id),
+        "kind": hold.kind,
         "status": hold.status,
         "risk_reason": hold.risk_reason,
         "created_at": _iso(hold.created_at),
@@ -801,6 +836,8 @@ def _hold_dict(hold: ApprovalHold) -> dict[str, Any]:
         result["decision_reason"] = hold.decision_reason
     if hold.message_id is not None:
         result["message_id"] = str(hold.message_id)
+    if hold.target_agent_id is not None:
+        result["target_agent_id"] = str(hold.target_agent_id)
     return result
 
 
@@ -1788,6 +1825,31 @@ async def _authorize_conversation_open(
             agent_id=initiator.id,
             detail={"conversation_type": conversation_type},
         )
+    # TECH-5735: no `is_shared` participant may EVER be admitted to
+    # `internal`, full stop -- not "admitted if its roster happens to be a
+    # single owner right now." A shared agent's owner set is a roster that
+    # can change (a member added/removed) after this conversation opens,
+    # and `internal`'s whole risk model (BoundaryCrossingScorer treats
+    # `internal` as never high risk, unconditionally, forever) depends on
+    # open-time equality staying true for the conversation's entire life.
+    # Re-checking live on every message send does NOT fix this: the
+    # exposure isn't per-message, it's per-invite -- `comms_accept` grants
+    # full conversation history to whoever is invited, so the moment a
+    # participant is admitted it must already be treated as though it will
+    # read every message that exists or ever will. A live per-send check
+    # only gates the one `note` send it runs on; it does nothing about the
+    # participant's standing ability to read everything else. Excluding
+    # `is_shared` here (and at invite time, below) removes the only way
+    # this invariant could ever become false post-admission, which is what
+    # actually makes "never high risk by construction" true again.
+    if conversation_type == "internal" and any(is_shared_by_id.values()):
+        await _deny(
+            session,
+            actor_sub=actor_sub,
+            action="denied.shared_agent_not_allowed_internal",
+            agent_id=initiator.id,
+            detail={"conversation_type": conversation_type},
+        )
     # The shared-initiator bypass only applies to `asymmetric` — the type
     # `is_shared` exists to bridge (DESIGN.md §9). `internal` requires every
     # participant to share one owner set BY CONSTRUCTION; letting a shared
@@ -2305,15 +2367,35 @@ async def _authorize_invite_owner_freeze(
     """Reject an invite that would expand an ``internal``/``asymmetric``
     conversation's frozen owner set. No-op for ``open``.
 
-    Fails closed (``denied.ownership_unverified``) on any lookup error,
-    same posture as conversation-open admission.
+    TECH-5735: an ``is_shared`` target may never be invited into an
+    ``internal`` conversation, full stop -- the same admission-time
+    exclusion ``_authorize_conversation_open`` enforces at open. A shared
+    agent's owner set is a roster that can change later, which would
+    silently break `internal`'s "one owner, by construction" invariant
+    for a conversation that already trusted it; excluding shared agents
+    here closes the same hole at the other admission point.
+
+    The admitted-vs-frozen-snapshot predicate matches each type's own
+    admission rule (TECH-5735): ``internal`` requires the target's owner
+    set to EQUAL the snapshot (mirroring ``_pairwise_admitted``'s
+    equality check — the snapshot is a union of already-equal sets, so
+    equality to it is equality to every existing participant); a bare
+    subset let a strict-subset target into an `internal` conversation
+    without ever satisfying the equality invariant `internal` is supposed
+    to guarantee. ``asymmetric`` keeps the original subset check.
+
+    Fails closed on any lookup error -- ``denied.ownership_lookup_failed``
+    for a raised exception (transient: registry timeout/5xx), distinct
+    from ``denied.ownership_unverified`` below for a successful lookup
+    that returns an empty owner set (deterministic: an orphaned agent that
+    will never resolve itself). ``decide_hold``'s invite re-validation path
+    relies on this distinction to decide whether a denial here should
+    strand-resolve the hold or leave it retriable.
     """
     if conversation.type == "open":
         return
     try:
-        target_owners = frozenset(
-            (await ownership_client.get_agent_owners(target.id)).get("owners") or []
-        )
+        target_info = await ownership_client.get_agent_owners(target.id)
     except Exception as exc:
         logger.warning(
             "ownership lookup failed authorizing an invite: %s",
@@ -2323,11 +2405,12 @@ async def _authorize_invite_owner_freeze(
         await _deny(
             session,
             actor_sub=actor_sub,
-            action="denied.ownership_unverified",
+            action=_DENIED_OWNERSHIP_LOOKUP_FAILED,
             agent_id=inviter_agent_id,
             conversation_id=conversation.id,
             detail={"target_agent_id": str(target.id)},
         )
+    target_owners = frozenset(target_info.get("owners") or [])
     if not target_owners:
         # Fail closed, same posture as _authorize_conversation_open and
         # the risk scorer's ownership lookups: an empty owner set (a soft-failing
@@ -2341,8 +2424,30 @@ async def _authorize_invite_owner_freeze(
             conversation_id=conversation.id,
             detail={"target_agent_id": str(target.id)},
         )
+    if conversation.type == "internal" and target_info.get("is_shared"):
+        await _deny(
+            session,
+            actor_sub=actor_sub,
+            action="denied.shared_agent_not_allowed_internal",
+            agent_id=inviter_agent_id,
+            conversation_id=conversation.id,
+            detail={"target_agent_id": str(target.id)},
+        )
     snapshot_owners = frozenset((conversation.owner_snapshot or {}).get("owners") or [])
-    if not target_owners <= snapshot_owners:
+    # No legacy-data migration needed for this equality predicate:
+    # `_pairwise_admitted` has required exact owner-set equality for every
+    # pair of `internal` participants at OPEN time since `internal` was
+    # introduced, not just as of this ticket. This invite-time check is
+    # just applying that same, already-true-at-open invariant to a NEW
+    # target -- there is no earlier era where a strict-subset target could
+    # have opened an `internal` conversation for this check to now
+    # retroactively conflict with.
+    admitted = (
+        target_owners == snapshot_owners
+        if conversation.type == "internal"
+        else target_owners <= snapshot_owners
+    )
+    if not admitted:
         await _deny(
             session,
             actor_sub=actor_sub,
@@ -2351,6 +2456,26 @@ async def _authorize_invite_owner_freeze(
             conversation_id=conversation.id,
             detail={"target_agent_id": str(target.id)},
         )
+
+
+async def _conversation_has_note_history(session: AsyncSession, conversation_id: uuid.UUID) -> bool:
+    """Has any ``note`` (free-text) message ever been posted to this
+    conversation? Used by ``invite`` (TECH-5735) to decide whether
+    admitting a new participant requires human approval first —
+    ``comms_accept`` grants full retroactive history read the moment a
+    participant is admitted, and free text can't be structurally
+    guaranteed safe the way ownership equality can (see
+    ``_authorize_conversation_open``'s ``is_shared`` exclusion), so the
+    check has to run at invite time, treating the invitee as though it
+    will read every ``note`` that already exists.
+    """
+    return (
+        await session.execute(
+            select(Message.id)
+            .where(Message.conversation_id == conversation_id, Message.type == "note")
+            .limit(1)
+        )
+    ).first() is not None
 
 
 async def invite(
@@ -2362,8 +2487,16 @@ async def invite(
     target_agent_id: uuid.UUID,
     ownership_client: OwnershipClient,
     active_checker: ActiveChecker,
-) -> Participant:
-    """Add ``target_agent_id`` to a conversation as a new ``invited`` row.
+    auto_approver: AutoApprover,
+    notifier: ApprovalNotifier,
+    owner_sub_claim: str | None = None,
+) -> Participant | ApprovalHold:
+    """Add ``target_agent_id`` to a conversation as a new ``invited`` row —
+    or, if the conversation already has free-text (``note``) history,
+    divert to an ``approval_holds`` row instead (TECH-5735; see
+    ``_divert_invite_for_approval``). Check ``held_for_approval``-shaped
+    callers via ``isinstance(result, ApprovalHold)``, same convention as
+    ``post_message``/``start_conversation``.
 
     ``inviter_agent_id`` must currently be an ``active`` participant
     (``may_invite`` — v1: any active member, tightenable to owner-only
@@ -2392,6 +2525,15 @@ async def invite(
         agent_id=inviter_agent_id,
         conversation_id=conversation_id,
         required_status="active",
+        # TECH-5735: locks the CONVERSATION row (not the participant row --
+        # `_load_participant_for_transition` only ever applies `for_update`
+        # to its `_find_conversation` call) for the duration of this call,
+        # so a concurrent `post_message` can't insert a `note` between the
+        # `_conversation_has_note_history` check below and this invite's
+        # commit -- without the lock, two concurrent invites (or an invite
+        # racing a note post) could both observe "no note history yet" and
+        # admit the target immediately, bypassing the approval hold.
+        for_update=True,
     )
     if not may_invite(inviter_participant.status):  # pragma: no cover — v1 always True here
         await _deny(
@@ -2486,6 +2628,40 @@ async def invite(
             conversation_id=conversation.id,
             detail={"target_agent_id": str(target_agent_id), "current_status": existing.status},
         )
+
+    # TECH-5735: admitting `target` grants it full retroactive history read
+    # the moment it later calls comms_accept -- if any note (free-text)
+    # message already exists in this conversation, treat the invite itself
+    # as though target will read it, and require human approval first.
+    if await _conversation_has_note_history(session, conversation.id):
+        # Same submission-spam control post_message/start_conversation use
+        # (_deny_rate_limited_holds) -- an inviter flooding the human
+        # approval queue with invite-holds is still capped, same as one
+        # flooding it with high-risk messages.
+        await _deny_rate_limited_holds(
+            session, actor_sub=actor_sub, sender_agent_id=inviter_agent_id
+        )
+        inviter = await _require_active_agent(
+            session, actor_sub=actor_sub, agent_id=inviter_agent_id
+        )
+        result = await _divert_invite_for_approval(
+            session,
+            actor_sub=actor_sub,
+            conversation=conversation,
+            inviter_agent_id=inviter_agent_id,
+            target_agent_id=target.id,
+            target_display_name=target.display_name,
+            owner_sub_claim=owner_sub_claim,
+            owner_sub_fallback=inviter.owner_sub,
+            auto_approver=auto_approver,
+        )
+        await session.commit()
+        if isinstance(result, ApprovalHold):
+            await _fire_approval_notifier(
+                session, hold=result, conversation=conversation, sender=inviter, notifier=notifier
+            )
+        return result
+
     participant = Participant(
         conversation_id=conversation.id,
         agent_id=target.id,
@@ -2983,6 +3159,7 @@ async def _divert_high_risk_message(
     hold = ApprovalHold(
         conversation_id=conversation.id,
         sender_agent_id=sender_agent_id,
+        kind="message",
         owner_sub=hold_owner_sub,
         message_type=message_type,
         schema_version=schema_version,
@@ -3059,6 +3236,131 @@ async def _divert_high_risk_message(
         actor_sub=actor_sub,
         action="approval.escalate",
         agent_id=sender_agent_id,
+        conversation_id=conversation.id,
+        detail={"hold_id": str(hold.id), "auto_approver": approver_name},
+    )
+    return hold
+
+
+async def _divert_invite_for_approval(
+    session: AsyncSession,
+    *,
+    actor_sub: str,
+    conversation: Conversation,
+    inviter_agent_id: uuid.UUID,
+    target_agent_id: uuid.UUID,
+    target_display_name: str,
+    owner_sub_claim: str | None,
+    owner_sub_fallback: str,
+    auto_approver: AutoApprover,
+) -> Participant | ApprovalHold:
+    """TECH-5735: create a ``kind="invite"`` ``approval_holds`` row, run the
+    injected ``AutoApprover`` inline, and either create the ``Participant``
+    row atomically (cleared) or escalate to ``pending_human`` (v1's
+    ``EscalateAllAutoApprover``: always). Mirrors
+    ``_divert_high_risk_message``'s shape exactly, but for an invite rather
+    than a message — see ``ApprovalHold``'s class docstring for the field
+    mapping (``sender_agent_id`` is the INVITER here, not a message sender).
+
+    Caller MUST have already run every other invite gate (membership,
+    state, target validity, retirement check, schema-version recheck,
+    owner-freeze, already-participant check) — this function performs no
+    authorization of its own, only the hold/participant bookkeeping.
+    Returns the inserted ``Participant`` (cleared) or the ``ApprovalHold``
+    itself (escalated — caller commits and then fires the notifier
+    post-commit, per ``_fire_approval_notifier``'s docstring).
+    """
+    now = _now()
+    hold_owner_sub = owner_sub_claim if owner_sub_claim is not None else owner_sub_fallback
+    hold = ApprovalHold(
+        conversation_id=conversation.id,
+        sender_agent_id=inviter_agent_id,
+        target_agent_id=target_agent_id,
+        kind="invite",
+        owner_sub=hold_owner_sub,
+        message_type=INVITE_HOLD_MESSAGE_TYPE,
+        schema_version=INVITE_HOLD_SCHEMA_VERSION,
+        payload={
+            "target_agent_id": str(target_agent_id),
+            "target_display_name": target_display_name,
+        },
+        risk_reason=INVITE_HOLD_RISK_REASON,
+        risk_scorer=INVITE_HOLD_RISK_SCORER_LABEL,
+        status="pending_auto",
+        expires_at=now + APPROVAL_HOLD_TTL,
+    )
+    session.add(hold)
+    await session.flush()
+    _audit(
+        session,
+        actor_sub=actor_sub,
+        action="approval.hold",
+        agent_id=inviter_agent_id,
+        conversation_id=conversation.id,
+        detail={
+            "hold_id": str(hold.id),
+            "risk_reason": INVITE_HOLD_RISK_REASON,
+            "kind": "invite",
+            "target_agent_id": str(target_agent_id),
+        },
+    )
+
+    approver_name = _auto_approver_name(auto_approver)
+    hold.auto_approver = approver_name
+    ctx = HoldContext(
+        hold_id=hold.id,
+        conversation_id=conversation.id,
+        conversation_type=conversation.type,
+        sender_agent_id=inviter_agent_id,
+        owner_sub=hold_owner_sub,
+        message_type=INVITE_HOLD_MESSAGE_TYPE,
+        schema_version=INVITE_HOLD_SCHEMA_VERSION,
+        payload=hold.payload,
+        risk_reason=INVITE_HOLD_RISK_REASON,
+    )
+    decision = await auto_approver.review(ctx)
+    if decision.cleared:
+        participant = Participant(
+            conversation_id=conversation.id,
+            agent_id=target_agent_id,
+            role="member",
+            status="invited",
+            invited_by=inviter_agent_id,
+            joined_at=None,
+        )
+        session.add(participant)
+        await session.flush()
+        hold.status = "auto_approved"
+        hold.auto_decision = "cleared"
+        hold.auto_decided_at = _now()
+        system_actor = f"system:auto_approver/{approver_name}"
+        _audit(
+            session,
+            actor_sub=system_actor,
+            action="approval.auto_approve",
+            agent_id=inviter_agent_id,
+            conversation_id=conversation.id,
+            detail={"hold_id": str(hold.id)},
+        )
+        _audit(
+            session,
+            actor_sub=system_actor,
+            action="participant.invite",
+            agent_id=target_agent_id,
+            conversation_id=conversation.id,
+            detail={"invited_by_agent_id": str(inviter_agent_id), "hold_id": str(hold.id)},
+        )
+        participant.auto_approved_hold_id = hold.id  # type: ignore[attr-defined]
+        return participant
+
+    hold.status = "pending_human"
+    hold.auto_decision = "escalated"
+    hold.auto_decided_at = _now()
+    _audit(
+        session,
+        actor_sub=actor_sub,
+        action="approval.escalate",
+        agent_id=inviter_agent_id,
         conversation_id=conversation.id,
         detail={"hold_id": str(hold.id), "auto_approver": approver_name},
     )
@@ -3186,6 +3488,19 @@ async def get_hold_status(
         ).scalar_one_or_none()
         if seq is not None:
             result["message_seq"] = seq
+    if hold.kind == "invite" and hold.target_agent_id is not None:
+        # Mirrors message_seq above -- once decided, surface the outcome
+        # this hold actually produced (a Participant row, not a Message).
+        participant_status = (
+            await session.execute(
+                select(Participant.status).where(
+                    Participant.conversation_id == hold.conversation_id,
+                    Participant.agent_id == hold.target_agent_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if participant_status is not None:
+            result["participant_status"] = participant_status
     await session.commit()
     return result
 
@@ -3245,9 +3560,29 @@ async def decide_hold(
     hold_id: uuid.UUID,
     decision: str,
     reason: str | None,
+    ownership_client: OwnershipClient,
+    active_checker: ActiveChecker,
 ) -> dict[str, Any]:
     """``POST /approvals/{hold_id}/decide`` (main.py, non-MCP,
     interactive+owner-gated). ``decision`` is ``"approve"`` or ``"reject"``.
+
+    ``ownership_client``/``active_checker`` are used ONLY by the
+    ``kind="invite"`` approval path (below) -- a hold can sit
+    ``pending_human`` for up to ``APPROVAL_HOLD_TTL`` (7 days), during
+    which the target could be retired, have its ``is_shared`` flag
+    flipped, or have its owner set change. Approval re-runs the target
+    status/retirement check and ``_authorize_invite_owner_freeze`` --
+    the two gates whose drift this ticket (TECH-5735) is specifically
+    about -- so none of THAT drift can slip a target into an ``internal``
+    conversation it would no longer qualify for. It does NOT re-run
+    ``invite()``'s schema-version pin check (an agent could re-register
+    with a narrower ``[min_schema_version, max_schema_version]`` range
+    during the pending window) or re-verify that ``hold.sender_agent_id``
+    is still an active participant (the inviter could have left or been
+    declined in the interim) -- both accepted as out of scope for this
+    ticket's fix, not silently overlooked. The ``kind="message"`` path
+    takes neither parameter — it only re-runs ``accepted_types`` (see
+    below), which needs neither seam.
 
     Raises ``AccessDeniedError`` (uniform, ``denied.unknown_hold`` /
     ``denied.hold_not_owner``) if the hold doesn't exist or the caller's
@@ -3324,6 +3659,165 @@ async def decide_hold(
             current_state=conversation.state,
             message_type=hold.message_type,
         )
+
+    if hold.kind == "invite":
+        # TECH-5735: approving an invite-hold creates the Participant row
+        # this hold diverted, not a Message -- see ApprovalHold's class
+        # docstring. hold.sender_agent_id is the INVITER here.
+        if hold.target_agent_id is None:
+            raise RuntimeError(f"invariant violation: invite hold {hold_id} has no target_agent_id")
+        existing = await _find_participant(session, conversation.id, hold.target_agent_id)
+        if existing is not None:
+            # Someone else already admitted this target through a
+            # different path while this hold sat pending_human. Unlike
+            # `invite`'s own identical check, this hold is a resolvable
+            # entity in its own right -- leaving it `pending_human` after
+            # this race (via the uniform `_deny`, which raises
+            # AccessDeniedError -> maps to a uniform 404) would strand it
+            # forever with no way for a human to close it out. Resolve it
+            # as rejected instead, with a reason that explains why, and
+            # raise the same 409 `decide_hold` already raises for any other
+            # already-decided hold.
+            hold.status = "rejected"
+            hold.decided_by_sub = approver_sub
+            hold.decided_at = _now()
+            hold.decision_reason = "target already admitted via a different path"
+            _audit(
+                session,
+                actor_sub=approver_sub,
+                action="approval.reject",
+                agent_id=hold.sender_agent_id,
+                conversation_id=conversation.id,
+                detail={
+                    "hold_id": str(hold_id),
+                    "target_agent_id": str(hold.target_agent_id),
+                    "current_status": existing.status,
+                    "reason": "already_participant",
+                },
+            )
+            await session.commit()
+            raise HoldAlreadyDecidedError(hold.status)
+        try:
+            target = await _find_agent_by_id(session, hold.target_agent_id)
+            if target is None or target.status != "active":
+                await _deny(
+                    session,
+                    actor_sub=approver_sub,
+                    action="denied.unknown_agent",
+                    agent_id=hold.sender_agent_id,
+                    conversation_id=conversation.id,
+                    detail={"target_agent_id": str(hold.target_agent_id)},
+                )
+            if not await _is_active_safe(active_checker, target.sub):
+                # TECH-5703: specific, not folded into the uniform denial above --
+                # see AgentRetiredError's docstring.
+                await _deny_agent_retired(
+                    session,
+                    actor_sub=approver_sub,
+                    agent_id=hold.sender_agent_id,
+                    conversation_id=conversation.id,
+                    target_agent_id=hold.target_agent_id,
+                )
+            # Re-run the exact gate `invite()` itself ran at hold-creation
+            # time. A hold can sit `pending_human` for up to
+            # APPROVAL_HOLD_TTL (7 days) -- during that window the target's
+            # `is_shared` flag, owner set, or retirement status can drift.
+            # Re-checking here (rather than trusting whatever was true when
+            # the hold was created) is what actually closes the gap;
+            # skipping it would let a target that no longer qualifies slip
+            # into an `internal` conversation anyway, via the approval path
+            # instead of `invite()`'s own checks.
+            await _authorize_invite_owner_freeze(
+                session,
+                actor_sub=approver_sub,
+                inviter_agent_id=hold.sender_agent_id,
+                conversation=conversation,
+                target=target,
+                ownership_client=ownership_client,
+            )
+        except (AccessDeniedError, AgentRetiredError) as exc:
+            if isinstance(exc, AccessDeniedError) and exc.reason == _DENIED_OWNERSHIP_LOOKUP_FAILED:
+                # A transient ownership-lookup infra failure (registry
+                # timeout, 5xx), not genuine target drift -- distinguished
+                # from the deterministic empty-owner-set case
+                # (denied.ownership_unverified, which DOES fall through to
+                # the stranded-hold resolution below: an orphaned agent's
+                # empty owner set won't fix itself, so leaving the hold
+                # pending_human for it would recreate the exact stranding
+                # this code exists to prevent), from the other
+                # AccessDeniedError reasons (denied.unknown_agent /
+                # denied.shared_agent_not_allowed_internal /
+                # denied.owner_set_frozen), and from AgentRetiredError.
+                # Leave the hold `pending_human` so a human can retry the
+                # approval once the lookup succeeds again -- auto-resolving
+                # it here would destroy a still-valid invite over what may
+                # be a momentary outage, not a real reason to reject it.
+                raise
+            # Same stranded-hold concern as the already-participant branch
+            # above: any of the three re-validation checks genuinely
+            # failing means the target drifted out of eligibility during
+            # this hold's pending_human window. `_deny`/`_deny_agent_retired`
+            # already audited and committed the specific denial reason and
+            # raised -- that commit released this hold row's own
+            # `FOR UPDATE` lock (acquired above), opening a window for a
+            # concurrent `decide_hold` call on the SAME hold to resolve it
+            # first. Re-acquire the lock and only mutate if it's still
+            # `pending_human`; if a concurrent call already resolved it,
+            # leave that resolution alone (whatever it is) and just
+            # propagate this exception without a second, conflicting
+            # commit.
+            refreshed = await _find_hold(session, hold_id, for_update=True)
+            if refreshed is not None and refreshed.status == "pending_human":
+                refreshed.status = "rejected"
+                refreshed.decided_by_sub = approver_sub
+                refreshed.decided_at = _now()
+                refreshed.decision_reason = (
+                    "target no longer eligible for admission on re-validation"
+                )
+                _audit(
+                    session,
+                    actor_sub=approver_sub,
+                    action="approval.reject",
+                    agent_id=refreshed.sender_agent_id,
+                    conversation_id=conversation.id,
+                    detail={"hold_id": str(hold_id), "reason": "revalidation_failed"},
+                )
+                await session.commit()
+            raise
+        participant = Participant(
+            conversation_id=conversation.id,
+            agent_id=hold.target_agent_id,
+            role="member",
+            status="invited",
+            invited_by=hold.sender_agent_id,
+            joined_at=None,
+        )
+        session.add(participant)
+        await session.flush()
+        hold.status = "approved"
+        hold.decided_by_sub = approver_sub
+        hold.decided_at = _now()
+        hold.decision_reason = reason
+        _audit(
+            session,
+            actor_sub=approver_sub,
+            action="approval.approve",
+            agent_id=hold.sender_agent_id,
+            conversation_id=conversation.id,
+            detail={"hold_id": str(hold_id), "has_reason": reason is not None},
+        )
+        _audit(
+            session,
+            actor_sub=approver_sub,
+            action="participant.invite",
+            agent_id=hold.target_agent_id,
+            conversation_id=conversation.id,
+            detail={"invited_by_agent_id": str(hold.sender_agent_id), "hold_id": str(hold_id)},
+        )
+        await session.commit()
+        result = _hold_dict(hold)
+        result["participant_status"] = participant.status
+        return result
 
     rows = (
         await session.execute(
@@ -3948,7 +4442,10 @@ class OwnershipClient(Protocol):
         """Return ``{"is_shared": bool, "owners": list[str]}`` for ``agent_id``.
 
         Raise on any lookup failure/timeout/empty result — the caller
-        treats every exception as fail-closed (``denied.ownership_unverified``).
+        treats every exception as fail-closed (``denied.ownership_unverified``
+        at conversation-open admission; ``denied.ownership_lookup_failed``
+        at invite owner-freeze, TECH-5735 — see that denial's own comment
+        for why the two call sites use different reason strings).
         """
         ...
 
@@ -3958,16 +4455,36 @@ class AgentTableOwnershipClient:
     endpoint ships.
 
     Wraps the existing ``agents`` columns: ``owner_sub`` as a
-    single-element owner set, and ``is_shared`` from the DB. ``owner_sub``
-    is frozen at first registration (see ``register_agent``) and never
-    changes again. ``is_shared`` is frozen against an agent's own
-    re-registration for the same reason, but -- unlike ``owner_sub`` -- IS
+    single-element owner set, and ``is_shared`` from the DB.
+    ``register_agent`` freezes ``owner_sub`` at first registration and
+    never overwrites it on re-registration (self-asserted claims are
+    untrusted) -- but ``owner_sub`` is NOT immutable for the lifetime of
+    the row: ``write_through_ownership`` (TECH-5593) updates it on every
+    verified request from a registry-backed agent-token verifier, and
+    ``reconcile_agent_ownership`` is the periodic backstop for agents that
+    make no further requests. Both are the ONE sanctioned exception to the
+    freeze (see ``write_through_ownership``'s own docstring) -- an earlier
+    version of this docstring claimed ``owner_sub`` "truly never changes";
+    that stopped being true once those two functions shipped. TECH-5735
+    does NOT address this by re-checking live on every send (an earlier,
+    abandoned design did; see git history for commit c644780 on this
+    ticket's branch, superseded by 8c8b318) -- it closes the ``is_shared``
+    dimension of this problem STRUCTURALLY instead, by excluding any
+    ``is_shared`` agent from ``internal`` at admission and invite time
+    (``_authorize_conversation_open``/``_authorize_invite_owner_freeze``),
+    so a shared agent's mutable roster can never be the thing that breaks
+    an already-equal owner set. The narrower ``owner_sub``-reassignment
+    case above (two ALREADY non-shared, already-admitted participants,
+    reassigned independently after open) is a deliberately accepted
+    residual gap, not one this docstring's callers close -- see
+    ``docs/DESIGN.md`` §9's "Accepted residual gap (TECH-5735)" note.
+    ``is_shared`` IS still frozen
+    against an agent's own re-registration, but -- unlike ``owner_sub`` --
     mutable via the separate ``comms:admin``-gated ``set_agent_shared``
-    admin override (see that function's docstring). Both remain safe as
-    authorization inputs: ``owner_sub`` because it truly never changes, and
-    ``is_shared`` because its only mutation path is itself gated on the
-    same elevated scope required to escalate it at first registration --
-    there is no path by which an unprivileged caller can move this value.
+    admin override (see that function's docstring); its only mutation path
+    is itself gated on the same elevated scope required to escalate it at
+    first registration, so there is no path by which an unprivileged
+    caller can move it.
     """
 
     def __init__(self, session: AsyncSession) -> None:

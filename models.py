@@ -62,6 +62,10 @@ APPROVAL_HOLD_STATUSES = (
     "expired",
 )
 APPROVAL_HOLD_AUTO_DECISIONS = ("cleared", "escalated")
+# TECH-5735: discriminates a hold's shape -- see ApprovalHold's class
+# docstring. "message" is the original TECH-5389 PR2 shape (default, for
+# every pre-existing row); "invite" is new.
+APPROVAL_HOLD_KINDS = ("message", "invite")
 
 
 class Base(DeclarativeBase):
@@ -336,6 +340,18 @@ class Message(Base):
         # migration" convention as every other migration-created index in
         # this file.
         Index("idx_messages_sender_id_created_at", "sender_id", "created_at"),
+        # Backs service._conversation_has_note_history's
+        # WHERE conversation_id = ... AND type = 'note' LIMIT 1 query
+        # (TECH-5735) -- without this, Postgres uses the composite index
+        # above (conversation_id-leading) and scans every message in the
+        # conversation until it finds a note or exhausts the set. Partial
+        # (WHERE type = 'note') since every other message type never
+        # participates in this lookup.
+        Index(
+            "idx_messages_conversation_id_note",
+            "conversation_id",
+            postgresql_where=text("type = 'note'"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -372,25 +388,43 @@ class AuditLog(Base):
 
 
 class ApprovalHold(Base):
-    """A high-risk message diverted from ``messages`` pending approval
-    (TECH-5389 PR2, DESIGN.md §9 Axis 2).
+    """A high-risk message, OR an invite requiring approval, held pending
+    a human decision (TECH-5389 PR2, DESIGN.md §9 Axis 2; invite holds:
+    TECH-5735).
 
     Mutable (status flips as the hold moves through its lifecycle), unlike
     ``messages``/``audit_log``'s append-only invariant — hence the
     ``updated_at`` column every other mutable table in this file has.
 
-    No ``high_risk`` boolean: a hold exists ONLY because the risk scorer's
-    verdict was high-risk, so ``risk_reason``/``risk_scorer`` alone carry
-    the verdict.
+    ``kind`` discriminates the two shapes this row can take:
+
+    - ``"message"`` (the original, TECH-5389 PR2): a high-risk message
+      diverted from ``messages``. No ``high_risk`` boolean — a hold exists
+      ONLY because the risk scorer's verdict was high-risk, so
+      ``risk_reason``/``risk_scorer`` alone carry the verdict.
+      ``sender_agent_id`` is the message's actual sender;
+      ``target_agent_id`` is NULL; ``message_type``/``schema_version``/
+      ``payload`` are the real held message content, inserted as-is into
+      ``messages`` on approval.
+    - ``"invite"`` (TECH-5735): an invite into a conversation that already
+      has free-text (``note``) history — held because ``comms_accept``
+      grants full retroactive history read the moment a participant is
+      admitted, and that exposure can't be caught by any later per-message
+      check. ``sender_agent_id`` is the INVITER's agent id (not a message
+      sender); ``target_agent_id`` is the agent being invited;
+      ``message_type``/``schema_version``/``payload`` carry placeholder/
+      contextual values only (see ``service._divert_invite_for_approval``)
+      — approval creates a ``Participant`` row, not a ``Message`` row.
 
     ``owner_sub`` IS snapshotted at hold-creation time (from the sender's
-    verified ``owner_sub`` claim, falling back to ``agents.owner_sub`` when
-    absent) rather than read live from the ``agents`` row at decide time.
-    Once agent-token verification becomes pluggable (a separate companion
-    ticket, TECH-5396), a live-resolving verifier could change what
-    ``agents.owner_sub`` means between hold-creation and decide-time, so a
-    decide-time join to the frozen row is no longer equivalent to a
-    snapshot -- see ``docs/TECH-5389-APPROVAL-PIPELINE.md`` §15.4.
+    — or for an invite hold, the inviter's — verified ``owner_sub`` claim,
+    falling back to ``agents.owner_sub`` when absent) rather than read live
+    from the ``agents`` row at decide time. Once agent-token verification
+    becomes pluggable (a separate companion ticket, TECH-5396), a
+    live-resolving verifier could change what ``agents.owner_sub`` means
+    between hold-creation and decide-time, so a decide-time join to the
+    frozen row is no longer equivalent to a snapshot -- see
+    ``docs/TECH-5389-APPROVAL-PIPELINE.md`` §15.4.
     """
 
     __tablename__ = "approval_holds"
@@ -399,6 +433,11 @@ class ApprovalHold(Base):
         CheckConstraint(
             f"auto_decision IS NULL OR auto_decision IN {APPROVAL_HOLD_AUTO_DECISIONS!r}",
             name="ck_approval_holds_auto_decision",
+        ),
+        CheckConstraint(f"kind IN {APPROVAL_HOLD_KINDS!r}", name="ck_approval_holds_kind"),
+        CheckConstraint(
+            "kind != 'invite' OR target_agent_id IS NOT NULL",
+            name="ck_approval_holds_invite_target_agent_id",
         ),
         UniqueConstraint("message_id", name="uq_approval_holds_message_id"),
         # Backs comms_get_hold_status's sender-only lookup and
@@ -434,19 +473,43 @@ class ApprovalHold(Base):
     conversation_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("conversations.id"), nullable=False
     )
+    # For kind="message": the message's real sender. For kind="invite":
+    # the INVITER (not a message sender at all) -- see class docstring.
     sender_agent_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agents.id"), nullable=False)
-    # Snapshotted from the sender's verified owner_sub claim at hold-creation
-    # time (fallback: agents.owner_sub) -- see the class docstring and
+    # kind="invite" only: the agent being invited. NULL for kind="message".
+    # Named explicitly (matching the migration's pinned
+    # `approval_holds_target_agent_id_fkey` -- see that migration's own
+    # comment) so this can never diverge from the DB constraint's real
+    # name if a `naming_convention` is later added to `Base.metadata`.
+    target_agent_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("agents.id", name="approval_holds_target_agent_id_fkey"), nullable=True
+    )
+    kind: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'message'"))
+    # Snapshotted from the sender's (or, for kind="invite", the inviter's)
+    # verified owner_sub claim at hold-creation time (fallback:
+    # agents.owner_sub) -- see the class docstring and
     # docs/TECH-5389-APPROVAL-PIPELINE.md §15.4. Never the frozen agents row.
     owner_sub: Mapped[str] = mapped_column(Text, nullable=False)
-    # The ORIGINAL message type (e.g. "note") -- posts as itself on approval.
+    # kind="message": the ORIGINAL message type (e.g. "note") -- posts as
+    # itself on approval. kind="invite": a fixed sentinel, not a real
+    # schemas.MessageType (see service._divert_invite_for_approval).
     message_type: Mapped[str] = mapped_column(Text, nullable=False)
+    # kind="invite" only: fixed at 1 (there is no real schema-version
+    # concept for an invite; see service._divert_invite_for_approval).
     schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
-    # Validated, normalized dump (insert-ready) -- schemas.validate_payload's
-    # output, exactly what would have gone into messages.payload had the
-    # verdict not been high-risk.
+    # kind="message": validated, normalized dump (insert-ready) --
+    # schemas.validate_payload's output, exactly what would have gone into
+    # messages.payload had the verdict not been high-risk. kind="invite":
+    # contextual info for the human reviewer (target_agent_id is already
+    # its own column; this also carries e.g. target_display_name) --
+    # already surfaced generically by list_pending_approval_holds.
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    # kind="message": the risk scorer's verdict reason (e.g.
+    # "boundary_crossing"). kind="invite": always
+    # "note_history_requires_approval" (see service.INVITE_HOLD_RISK_REASON).
     risk_reason: Mapped[str] = mapped_column(Text, nullable=False)
+    # kind="invite" only: a fixed label, not a real plugins.RISK_SCORERS
+    # name -- no RiskScorer plugin is invoked for an invite hold.
     risk_scorer: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False)
     auto_approver: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -469,6 +532,7 @@ class ApprovalHold(Base):
 __all__ = [
     "AGENT_STATUSES",
     "APPROVAL_HOLD_AUTO_DECISIONS",
+    "APPROVAL_HOLD_KINDS",
     "APPROVAL_HOLD_STATUSES",
     "CONVERSATION_STATES",
     "PARTICIPANT_ROLES",

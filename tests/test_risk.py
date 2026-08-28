@@ -116,6 +116,11 @@ class TestOpenConversationType:
 
 
 class TestInternalConversationType:
+    """TECH-5735: `internal` stays "never high risk" -- but now that
+    invariant is guaranteed BY CONSTRUCTION (no `is_shared` agent can ever
+    be admitted to `internal` -- see test_service.py), not merely assumed,
+    so no ownership lookup is needed here at all."""
+
     async def test_sensitive_type_never_high_risk(self) -> None:
         ctx = _ctx(
             conversation_type="internal",

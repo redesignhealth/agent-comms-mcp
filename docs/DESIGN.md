@@ -175,21 +175,29 @@ messages id, conversation_id, seq (UNIQUE per conversation, server-assigned,
 audit_log id (bigint), at, actor_sub, action,
  agent_id/conversation_id/message_id, detail jsonb
  -- every mutation AND every denial
-approval_holds id, conversation_id, sender_agent_id, owner_sub, message_type,
- schema_version, payload jsonb (the held content -- validated, insert-ready),
- risk_reason, risk_scorer, status(pending_auto|pending_human|auto_approved|
- approved|rejected|expired), auto_approver, auto_decision(cleared|escalated),
- auto_decided_at, decided_by_sub, decided_at, decision_reason (free text --
- see §9's trust argument), message_id UNIQUE (nullable FK to the resulting
- messages row, either approval kind), expires_at, timestamps
- -- MUTABLE (status flips); a hold exists ONLY because the risk verdict was
- high-risk, so there is no separate `high_risk` boolean. `owner_sub` IS a
- snapshot -- taken from the sender's verified `owner_sub` claim at hold-
- creation time (falling back to `agents.owner_sub` when the claim is
- absent), NOT a live join to the `agents` row: once agent-token
- verification becomes pluggable, a live-resolving verifier can change what
- `agents.owner_sub` means between hold-creation and decide-time, so the
- decide/list paths match against the hold's own snapshot (see §9)
+approval_holds id, conversation_id, sender_agent_id, target_agent_id (nullable
+ FK to agents), kind(message|invite) (TECH-5735), owner_sub, message_type,
+ schema_version, payload jsonb (the held content -- validated, insert-ready
+ for `kind=message`; contextual info for the human reviewer for
+ `kind=invite`), risk_reason, risk_scorer, status(pending_auto|pending_human|
+ auto_approved|approved|rejected|expired), auto_approver,
+ auto_decision(cleared|escalated), auto_decided_at, decided_by_sub, decided_at,
+ decision_reason (free text -- see §9's trust argument), message_id UNIQUE
+ (nullable FK to the resulting messages row -- `kind=message` only),
+ expires_at, timestamps
+ -- MUTABLE (status flips); a `kind=message` hold exists ONLY because the
+ risk verdict was high-risk, so there is no separate `high_risk` boolean.
+ `owner_sub` IS a snapshot -- taken from the sender's (or, for
+ `kind=invite`, the INVITER's) verified `owner_sub` claim at hold-creation
+ time (falling back to `agents.owner_sub` when the claim is absent), NOT a
+ live join to the `agents` row: once agent-token verification becomes
+ pluggable, a live-resolving verifier can change what `agents.owner_sub`
+ means between hold-creation and decide-time, so the decide/list paths
+ match against the hold's own snapshot (see §9). For `kind=invite`,
+ `sender_agent_id` is the INVITER (not a message sender) and
+ `target_agent_id` is the agent being invited; approval creates a
+ `participants` row instead of a `messages` row (see §9 Axis 1's free-text
+ invite-approval rule and models.ApprovalHold's class docstring)
 ```
 
 Design notes:
@@ -225,20 +233,28 @@ Design notes:
  provide -- it cannot change as a side effect of the agent's own traffic --
  while giving an operator a deliberate, separately-audited (`agent.set_shared`)
  lever to fix a value an agent got wrong at registration. The per-message
- `_enforce_boundary_crossing` check (§9 Axis 2) queries the current row on
- every post, not a value cached at conversation-open time, so flipping
- `is_shared` takes effect retroactively on already-open `asymmetric`
- conversations for THAT check: correcting a wrongly-`False` agent to `True`
- immediately grants the boundary bypass on its existing conversations, and
- correcting a wrongly-`True` agent back to `False` immediately withdraws it,
- mid-conversation. This retroactive effect is narrower than it may sound,
- though: `_authorize_conversation_open`'s pairwise-ownership admission (§9
- Axis 1) runs exactly once, at conversation creation, so flipping the flag
- changes admission only for conversations opened AFTER the flip, never for
- ones already open. The invite gate (`_enforce_invite_owner_boundary`) is
- governed entirely by `Conversation.owner_snapshot`, frozen at open time with
- no `is_shared` bypass of its own, so it is unaffected by the flag either
- way, at any time.
+ risk scorer (`plugins.BoundaryCrossingScorer.score`, via `_score_message_risk`
+ — §9 Axis 2) queries the current row on every post, not a value cached at
+ conversation-open time, so flipping `is_shared` takes effect retroactively on
+ already-open `asymmetric` conversations for THAT check ONLY (`internal` never
+ gets this bypass, so it is unaffected either way): correcting a
+ wrongly-`False` agent to `True` immediately grants the boundary bypass on its
+ existing `asymmetric` conversations, and correcting a wrongly-`True` agent
+ back to `False` immediately withdraws it, mid-conversation. This retroactive
+ effect is narrower than it may sound, though: `_authorize_conversation_open`'s
+ pairwise-ownership admission (§9 Axis 1) — including its `internal`
+ `is_shared` exclusion (TECH-5735) — runs exactly once, at conversation
+ creation, so flipping the flag changes OPEN-time admission only for
+ conversations opened AFTER the flip, never for ones already open. The invite
+ gate (`_authorize_invite_owner_freeze`) is different: its owner-set
+ equality/subset check is governed entirely by `Conversation.owner_snapshot`,
+ frozen at open time, so THAT part is unaffected by the flag at any time — but
+ its `is_shared` exclusion (TECH-5735, same rule as Axis 1) reads the
+ TARGET's current `is_shared` value live, at invite time, not a value frozen
+ at conversation-open. So correcting a target agent's `is_shared` from
+ `False` to `True` after a conversation already opened does retroactively
+ block that agent from being invited into it later, even though it does
+ nothing to participants already admitted before the correction.
 
 ## 6. Message schemas (two-axis model)
 
@@ -286,13 +302,14 @@ scroll-to-load-more use case.
 | `comms_lookup_agent_by_email` | comms:read | directory lookup by owner email; `{"agent": ..., "found": bool}`. O(1) targeted equivalent of paginating `comms_list_agents` -- see §10's enumeration-posture note. A registry-retired agent resolves to the same not-found shape as an unregistered email (TECH-5703) |
 | `comms_start_conversation` | comms:write | type + up to 50 target agent UUIDs (from `comms_list_agents`) + initial request payload. **Two response shapes** (TECH-5389): the normal conversation-created shape, or (if the opener was high-risk) that same shape plus a `held_for_approval`/`hold_id`/`hold_status`/`risk_reason` block — the conversation is created anyway, opened with a service-synthesized `conversation_opened` marker at seq 1, and the real content is held (§9). A registry-retired target (TECH-5703) raises a specific "agent retired" error instead of the uniform unknown-agent denial |
 | `comms_post_message` | comms:write | typed, schema-validated, state-machine-checked. **Two response shapes**: the normal posted-message shape (unchanged; gains `auto_approved`/`hold_id` if a configured auto-approver cleared a high-risk send inline), or `{"held_for_approval": true, "hold_id", "conversation_id", "status", "risk_reason", "expires_at", "created_at"}` — not an error — when the send is diverted to a hold (§9) |
-| `comms_get_hold_status` | comms:read | poll a held message's approval status; sender-only (uniform `access_denied` otherwise). Returns status, risk_reason, timestamps, and (once decided) `decision_reason`/`message_id`/`message_seq`. **Deliberately the only MCP-side surface for this pipeline** — approve/reject/list-pending are non-MCP HTTP endpoints (§9), by design: an agent must never be able to approve its own high-risk content, so there is no MCP tool that could even attempt it |
+| `comms_get_hold_status` | comms:read | poll a held message OR invite's approval status (`kind`: `message`/`invite`, TECH-5735); sender-only (uniform `access_denied` otherwise — for an invite hold, "sender" is the INVITER). Returns status, risk_reason, timestamps, and (once decided) `decision_reason` plus, for `kind=message`, `message_id`/`message_seq` (present whenever `message_id` is set on the hold row -- only ever set at message-creation time on the approve/auto_approve path, never on reject/expiry), or for `kind=invite`, `target_agent_id` (always present, not gated on decision) and `participant_status` (present whenever a `Participant` row exists for the target, including a `rejected` hold whose target was admitted via a different path — not gated on this hold's own decision). **Deliberately the only MCP-side surface for this pipeline** — approve/reject/list-pending are non-MCP HTTP endpoints (§9), by design: an agent must never be able to approve its own high-risk content (or its own invite), so there is no MCP tool that could even attempt it |
 | `comms_get_conversation` | comms:read | combined read: conversation + participants + messages since seq, capped at `MAX_MESSAGES_PER_GET_CONVERSATION` (500) per call. Advances caller's `last_read_seq` when messages are returned and the page's own max seq exceeds the current cursor. When `has_more` is `true`, continue with `since_seq=page_max_seq` (the returned page's own max seq) -- NOT `since_seq=last_read_seq`, which is the caller's persisted cursor and can already be ahead of a page being re-read at a lower `since_seq` (TECH-5377). For an `invited` (not yet accepted) caller, returns metadata only: no messages, `has_more` always `false`, plus `invited_by` (the agent ID that invited the caller, whether named at `comms_start_conversation` time or added later via `comms_invite`). `participants.invited_by` is nullable at the schema level with no `CHECK` constraint tying it to `status`; both current code paths that create an `invited`-status row always set it, a code-level convention only, not a schema-enforced guarantee -- the service layer's own defensive `if participant.invited_by else None` reflects that (Argus round-5 SUGGESTION: an earlier version of this row overstated it as unreachable) |
 | `comms_inbox` | comms:read | active conversations with unread messages, **plus pending invites awaiting accept/decline**. Each list capped (`MAX_UNREAD_CONVERSATIONS_PER_INBOX`/`MAX_PENDING_INVITES_PER_INBOX`, both 100) with a `*_has_more` flag; `total_count` is always a true count, unaffected by either cap -- computed via a real `COUNT(*)` only when that half's own list was actually truncated, otherwise the (untruncated) list's own length already IS the true count. **Known gap**: no cursor -- if either cap is hit, there is currently no tool-level way to page through the remainder (`comms_list_conversations` filters by the CONVERSATION's state, not participant status, so it can't isolate just the overflowed set either) |
 | `comms_list_conversations` | comms:read | paginated conversation list, filterable by `role`, `type`, and `state`; both `invited` and `active` participant statuses included |
 | `comms_accept` | comms:write | flips caller's participant status `invited → active`. Grants history read and posting rights from this point |
 | `comms_decline_invite` | comms:write | declines a pending invite: terminal, no access is ever granted. Requires caller to currently be `invited`. Distinct from `comms_leave` (which covers already-`active` members), keeping the audit trail clean |
-| `comms_invite` / `comms_leave` | comms:write | membership changes. `invite` adds a target as `invited` (not `active`); a registry-retired target (TECH-5703) raises the same specific "agent retired" error `comms_start_conversation` does. `leave` covers already-active members |
+| `comms_invite` | comms:write | adds a target as `invited` (not `active`); a registry-retired target (TECH-5703) raises the same specific "agent retired" error `comms_start_conversation` does. `internal` additionally never admits an `is_shared` target (TECH-5735, §9 Axis 1). **Two response shapes**, same convention as `comms_post_message`: the normal invited-participant shape (`conversation_id`, `target_agent_id`, `status`, `invited_by`, plus `auto_approved: true` + `hold_id` when an `AutoApprover` cleared an invite hold inline rather than this being the ordinary no-hold path), or — if the conversation already has any `note` (free-text) history — `{"held_for_approval": true, "hold_id", "conversation_id", "status", "risk_reason", "expires_at", "created_at"}` (§9 Axis 1's free-text invite-approval rule; TECH-5735) — admitting a new participant grants it full retroactive history read the moment it accepts, so that requires human approval first, same as a high-risk message does |
+| `comms_leave` | comms:write | leave: covers already-active members |
 
 ## 8. Security invariants
 
@@ -302,7 +319,13 @@ scroll-to-load-more use case.
  (TECH-5389). It is never silently posted and never silently dropped: a
  diversion always produces exactly one of `approved`/`auto_approved`
  (content posts under its original type), `rejected`/`expired` (content
- never posts), or `pending_human` (awaiting a decision).
+ never posts), or `pending_human` (awaiting a decision). The same
+ pipeline gates a second kind of hold, `kind=invite` (TECH-5735): a new
+ participant is never admitted into a conversation with existing free-text
+ (`note`) history without the identical explicit approval — never
+ silently invited, never silently dropped, and approval creates the
+ `participants` row (not a `messages` row) under the same three-outcome
+ contract.
 3. Typed, schema-validated payloads only. No free text except `note`,
  which now posts immediately when it doesn't cross a boundary and is held
  for human approval (never silently dropped, never denied for that reason
@@ -354,21 +377,63 @@ is untouched.
 | Type | Admission rule | Use case |
 |---|---|---|
 | `open` | any active agent (no ownership check) | scheduling negotiation across ownership boundaries |
-| `internal` | all participants share identical verified owner sets (no exception — a shared initiator does not bypass this) | same-owner multi-agent coordination (e.g. CoS ↔ EA) |
+| `internal` | all participants share identical verified owner sets, AND no participant is `is_shared` (TECH-5735 — see below; no exception either way — a shared initiator does not bypass this) | same-owner multi-agent coordination (e.g. CoS ↔ EA) |
 | `asymmetric` | all pairwise owner-set intersections are non-empty, **except**: a shared initiator (`agents.is_shared=True`) is admitted without the pairwise check | cross-owner task delegation where a shared agent bridges two users |
 
 Ownership is resolved via an injected `OwnershipClient` seam. It is never read
 from `agents.owner_sub` directly, since a shared agent's row can't represent
-multiple owners. Fails closed (`denied.ownership_unverified`) on any lookup
-error. The interim `AgentTableOwnershipClient` wraps `agents.owner_sub` as a
+multiple owners. Fails closed on any lookup error -- `denied.ownership_unverified`
+at conversation-open admission (both the lookup-exception and empty-owner-set
+cases); at invite owner-freeze, TECH-5735 splits the same two cases into
+`denied.ownership_lookup_failed` (exception -- transient) vs.
+`denied.ownership_unverified` (empty owner set -- deterministic), so
+`decide_hold`'s invite re-validation can tell a retriable registry outage
+apart from a target that will never resolve on its own. The interim
+`AgentTableOwnershipClient` wraps `agents.owner_sub` as a
 single-element set: correct for every agent registered today. Swap it for the
 real platform endpoint once shared agents exist.
 
+**`internal` never admits an `is_shared` agent (TECH-5735).** `internal`'s
+entire risk model (Axis 2, below) depends on "every participant shares one
+owner set" staying true for the conversation's ENTIRE life, checked only once,
+at open — there is no per-message re-verification. A shared agent's owner set
+is a roster that can gain or lose members later; admitting one into `internal`
+would let an equality check that was true at open time silently become false
+afterward, with nothing left to catch it (`_authorize_conversation_open`
+enforces this — `denied.shared_agent_not_allowed_internal` — and
+`_authorize_invite_owner_freeze` enforces the identical exclusion at invite
+time, so it can't be back-doored in after open). Re-checking ownership live on
+every send was considered and rejected: it doesn't close the actual exposure,
+which is at INVITE time (see the free-text rule immediately below), not at
+each subsequent send.
+
 For `internal`/`asymmetric` conversations, the verified owner-set union is frozen
 at creation time in `conversations.owner_snapshot` (JSONB, nullable: `open` does
-not use it). Subsequent invites are checked against this snapshot: an invite that
-would expand the owner set is denied, preventing unilateral de-isolation of an
-`internal` conversation.
+not use it). Subsequent invites are checked against this snapshot, with the
+predicate matched to the type's own admission rule (TECH-5735): `internal`
+requires the target's owner set to EQUAL the snapshot (the snapshot is a union
+of already-equal sets, so equality to it is equality to every existing
+participant); `asymmetric` requires only a subset. An invite that fails its
+predicate is denied, preventing unilateral de-isolation of an `internal`
+conversation or a boundary-violating expansion of an `asymmetric` one.
+
+**Any invite into a conversation with existing free-text (`note`) history
+requires human approval (TECH-5735), regardless of conversation type.**
+`comms_accept` grants a new participant full retroactive read access to every
+existing message the moment it accepts — including any `note`, whose content
+is unstructured and can't be risk-scored the way ownership sets can. A
+per-message check can never catch this, because the exposure isn't "a new
+risky message was sent" — it's "someone new can now read messages that were
+already fine to send at the time." So `invite` itself checks whether the
+target conversation has ANY `note` message and, if so, diverts to an
+`approval_holds` row (`kind="invite"`) instead of creating the `Participant`
+row directly — same `held_for_approval`/`hold_id` shape `comms_post_message`
+already uses, reusing the same `AutoApprover` seam (v1: always escalates) and
+the same per-sender hold-creation rate limit. Approving creates the
+`Participant` row (`status="invited"`); rejecting creates nothing. See
+`ApprovalHold`'s class docstring (models.py) for the two hold shapes this
+produces, and Axis 2 below for the (separate, message-shaped) hold pipeline
+this reuses.
 
 ### Axis 2: per-message risk scoring (pluggable) [TECH-5389]
 
@@ -391,13 +456,22 @@ high-risk (`RiskVerdict(high_risk, reason, detail)`). The v1 implementation,
 
 - A non-sensitive type is never high risk (no ownership lookup at all — the
  cheap common path).
-- `internal`: never high risk (every participant shares one owner set by
- construction).
-- `open`: a sensitive type is always high risk.
+- `internal`: never high risk (no ownership lookup — TECH-5735 made this
+ actually TRUE "by construction" rather than merely assumed: `internal`
+ structurally excludes any `is_shared` participant at admission AND invite
+ time — Axis 1, above — so the "one owner, forever" invariant this fast path
+ relies on can no longer become false after open. An earlier design re-checked
+ ownership live on every `internal` send instead; that was rejected as the
+ wrong fix, because the actual exposure is at invite time, not at each
+ subsequent send — see Axis 1's free-text invite-approval rule).
+- `open`: a sensitive type is always high risk (no ownership lookup — `open`
+ has no ownership concept).
 - `asymmetric` + sensitive type: an ownership lookup decides (sender's owner
  set must be a superset of every other active-or-invited participant's), with
  the same shared-sender bypass as before (`agents.is_shared=True` skips the
- lookup unconditionally, audited `risk.shared_sender_bypass`).
+ lookup unconditionally, audited `risk.shared_sender_bypass`) —
+ `asymmetric`-only, since `internal` admission never lets a shared initiator
+ bypass its own pairwise check either.
 - **Scorer infrastructure failure still hard-denies** (`denied.risk_unscored`,
  detail carries the cause: `ownership_unverified`/`empty_owner_set`/
  `unknown_conversation_type`) — an ownership-service outage must not flood
@@ -755,8 +829,12 @@ separate mechanisms:
 This is deliberately **universal**, unlike the risk scorer: the risk scorer
 answers a trust question (is this payload shaped safely enough to cross an
 ownership boundary), which `internal` conversations are exempt from by
-construction (no boundary exists between same-owner participants).
-`accepted_types` answers a capability question (does this specific running
+construction (no boundary exists between same-owner participants — TECH-5735
+made this an actual structural guarantee, by excluding any `is_shared`
+participant from `internal` at admission and invite time, rather than an
+open-time assumption an already-admitted shared agent's roster could later
+break — see §9 Axis 1/2). `accepted_types` answers a
+different, capability question (does this specific running
 agent's own implementation know what to do with this message type at all),
 which has nothing to do with trust: a missing handler is a missing handler
 whether the sender is a stranger or your own other agent. So this check
@@ -883,6 +961,50 @@ ownership); production testing against real agents is not yet possible.
 The seam is already injected (`OwnershipClient` parameter on all functions that
 need it): swapping `AgentTableOwnershipClient` for a real HTTP client is the
 only change needed when the platform endpoint ships.
+
+Note that "single-owner" is not the same as "static," even in v1:
+`write_through_ownership`/`reconcile_agent_ownership` (TECH-5593) already
+update a registry-backed agent's cached `owner_sub` over its lifetime — the
+element itself can change even though the set stays single-valued.
+
+**Accepted residual gap (TECH-5735):** `internal` closes the multi-member
+roster-drift case by excluding `is_shared` agents outright (Axis 1/2, above)
+— but it does NOT re-verify equality if two ALREADY-admitted, both
+NON-shared participants' `owner_sub`s are independently reassigned by
+`write_through_ownership`/`reconcile_agent_ownership` after the conversation
+already opened. That would silently break the equality invariant with
+nothing to catch it, same as before TECH-5735, for this one narrower case.
+Deliberately accepted rather than fixed by re-checking live on every send:
+that was the design this ticket explicitly rejected (the real exposure is at
+invite time, not at each subsequent send — see Axis 1's free-text
+invite-approval rule — and a registry-driven owner reassignment of an
+already-admitted, non-shared agent is treated as a rare administrative event,
+not a live threat this scorer needs to defend against on every message).
+
+**Accepted residual gap #2 (TECH-5735):** the `is_shared` exclusion above
+screens at admission/invite time only — it does not freeze the flag.
+`set_agent_shared` (an admin-gated mutation) can flip an already-admitted
+`internal` participant's `is_shared` to `True` after the conversation
+opened, silently breaking the same "every participant is single-owner"
+invariant the exclusion exists to protect, with nothing to catch it after
+the fact. Deliberately accepted for the same reason as gap #1 above: it is
+a rare administrative event, not a live per-message threat, and closing it
+would mean either a live recheck on every send (the design this ticket
+rejected) or a guard in `set_agent_shared` itself refusing to flip the flag
+while the agent holds an active `internal` participation — not yet
+implemented.
+
+**Accepted limitation (TECH-5735): invite-before-note ordering.** The
+note-history gate in Axis 1's free-text invite-approval rule is evaluated
+only at invite time, against history that already exists at that moment.
+If a conversation has no `note` yet when a target is invited, the invite is
+admitted immediately with no hold — and a `note` posted afterward grants
+that already-admitted invitee full retroactive access via `comms_accept`,
+with no approval ever having occurred for it. The gate only protects
+history that predates the invite, not history added after. Closing this
+would require either a note-posted-time check for any not-yet-approved
+participant, or a join-time history filter — both larger changes than this
+ticket's scope; not yet implemented.
 
 ### Known gap: no retention/archival policy for terminal or expired conversations
 

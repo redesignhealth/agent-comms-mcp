@@ -119,10 +119,20 @@ info-barrier logic, relocated verbatim in substance:
   former `boundary_safe=False` set, now scorer-private policy data.
 - Non-sensitive type → `high_risk=False` immediately (no ownership lookup — preserves
   today's cheap common path). `conversation_opened` (§6) is never sensitive.
-- Sensitive type: `internal` → not high risk; `open` → high risk
-  (`boundary_crossing`); `asymmetric` → ownership lookups (sequential — same
-  shared-`AsyncSession` constraint documented in `service._owner_sets_for`),
-  shared-sender bypass preserved (`high_risk=False`,
+- Sensitive type: `internal` → not high risk, no ownership lookup at all — TECH-5735
+  made this an actual structural guarantee rather than an open-time assumption:
+  admission (`_authorize_conversation_open`) and the invite gate
+  (`_authorize_invite_owner_freeze`) both refuse to ever admit an `is_shared`
+  participant into `internal`, so the "one owner, forever" invariant this fast
+  path relies on can't become false after open — there is nothing left to
+  recheck. (Re-checking live on every `internal` send was considered and
+  rejected: the actual exposure TECH-5735 closes is at INVITE time —
+  `comms_accept` grants full retroactive history read the moment a participant
+  is admitted — not at each subsequent send; see `_divert_invite_for_approval`.)
+  `open` → high risk (`boundary_crossing`, no lookup — `open` has no ownership
+  concept); `asymmetric` → ownership lookups (sequential — same
+  shared-`AsyncSession` constraint documented in `service._owner_sets_for`).
+  `asymmetric`'s shared-sender bypass is preserved (`high_risk=False`,
   `detail={"bypass": "shared_sender"}` so the service emits a bypass-observability
   audit event — renamed to the scorer-neutral `risk.shared_sender_bypass`, replacing
   `agent.boundary_check_bypassed_shared`; backwards compatibility deliberately not
@@ -158,8 +168,11 @@ info-barrier logic, relocated verbatim in substance:
   and maps scorer exceptions to `denied.risk_unscored`. The per-message
   `denied.boundary_crossing` denial path is retired. Module docstring / audit-contract
   text updated. The Axis 1 admission checks (`_authorize_conversation_open`, invite
-  owner-freeze) are **untouched** and keep their hard `denied.ownership_unverified`
-  denials — only the per-message Axis 2 check is subsumed.
+  owner-freeze) were untouched BY THIS (TECH-5389 PR2) change and kept their hard
+  `denied.ownership_unverified` denials — only the per-message Axis 2 check is
+  subsumed. (A later ticket, TECH-5735, does split invite owner-freeze's denial
+  into two reason strings for its own re-validation needs — see DESIGN.md's
+  ownership-admission section for the current state.)
 - `providers/comms.py` `post_message` docstring (the `note` bullet) and `main.py`
   `instructions` string rewritten: `note` is no longer "never allowed under open" —
   it is *held for human approval* when it would cross a boundary.
@@ -474,8 +487,12 @@ unless and until approved.
   `approval.expire`).
 - Returns: `{hold_id, conversation_id, status, risk_reason, created_at, expires_at,
   decided_at?, decision_reason?, message_seq?, message_id?}` — `decision_reason` on
-  rejected (and approved, if the human left a note); `message_seq`/`message_id` on
-  approved/auto_approved so the agent can correlate with `get_conversation`.
+  rejected (and approved, if the human left a note); `message_seq`/`message_id`
+  present whenever `message_id` is set on the hold row (only ever set at
+  message-creation time, on the approve/auto_approve path — TECH-5735 tightened
+  this doc's earlier "on approved/auto_approved" phrasing to describe the actual
+  implementation gate, see DESIGN.md's `comms_get_hold_status` row) so the agent
+  can correlate with `get_conversation`.
 
 **(b) Human's free-text why.** The decide endpoint's body becomes
 `{"decision": "approve" | "reject", "reason": "<optional free text, max 2000 chars>"}`.

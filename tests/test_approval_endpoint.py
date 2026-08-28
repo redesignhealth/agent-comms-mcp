@@ -24,7 +24,7 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -39,6 +39,7 @@ from sqlalchemy.ext.asyncio import (
 from starlette.applications import Starlette
 from starlette.routing import Route
 
+from exceptions import AgentRetiredError
 from models import ApprovalHold, AuditLog, Conversation
 from service import register_agent
 
@@ -264,6 +265,7 @@ async def _make_hold(
     hold = ApprovalHold(
         conversation_id=conversation.id,
         sender_agent_id=sender.id,
+        kind="message",
         owner_sub=sender_owner_sub,
         message_type="note",
         schema_version=1,
@@ -526,6 +528,39 @@ class TestDecideEndpoint:
             json={"decision": "approve"},
         )
         assert resp.status_code == 410
+
+    async def test_agent_retired_returns_409(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        main: Any,
+        session: AsyncSession,
+    ) -> None:
+        """TECH-5735: decide_hold's invite-branch re-validation can raise
+        AgentRetiredError (the target was retired during the hold's
+        pending window) -- newly reachable via this endpoint since this
+        PR. Patches service.decide_hold directly (mirroring Argus's own
+        suggested approach) rather than driving a real invite-hold
+        through the registry seam, since main.py performs no pre-check of
+        its own before calling into the service layer."""
+        http_client, provider = client
+        _sender, hold = await _make_hold(session, sender_owner_sub="owner-retired@example.com")
+        provider.tokens["human-token"] = _interactive_token("owner-retired@example.com")
+
+        with patch.object(
+            main.service,
+            "decide_hold",
+            AsyncMock(side_effect=AgentRetiredError(reason="denied.target_agent_retired")),
+        ):
+            resp = await http_client.post(
+                f"/approvals/{hold.id}/decide",
+                headers={"Authorization": "Bearer human-token"},
+                json={"decision": "approve"},
+            )
+        assert resp.status_code == 409
+        assert resp.json() == {
+            "error": "agent_retired",
+            "detail": "agent retired: this agent has been retired and is no longer reachable",
+        }
 
     async def test_awaiting_auto_review_returns_409(
         self,

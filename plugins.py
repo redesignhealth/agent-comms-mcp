@@ -144,18 +144,36 @@ class BoundaryCrossingScorer:
       pre-existing default-deny posture this scorer replaces (a
       boundary-safe message posted into an unrecognized conversation type
       was denied too, not just a sensitive one).
-    - ``internal``: never high risk (every participant shares one owner
-      set by construction).
+    - ``internal``: never high risk. This is safe BY CONSTRUCTION, not by
+      runtime recheck (TECH-5735): admission (``_authorize_conversation_open``)
+      and the invite gate (``_authorize_invite_owner_freeze``) both refuse
+      to ever admit an ``is_shared`` agent into an `internal` conversation
+      — the one thing that could make an already-equal owner set drift
+      after open for that dimension, so there is nothing here to recheck
+      for it. (A per-message runtime check would not have helped anyway:
+      the exposure this ticket closes is at INVITE time — ``comms_accept``
+      grants full conversation history the moment a participant is
+      admitted — not at each subsequent message send.) This does NOT mean
+      equality is unconditionally frozen forever: two accepted residual
+      gaps remain outside this scorer's reach — (1) two already-admitted,
+      already-non-shared participants' ``owner_sub``s can independently
+      drift apart via ``write_through_ownership``/``reconcile_agent_ownership``,
+      and (2) ``set_agent_shared`` can flip an already-admitted
+      participant's ``is_shared`` to ``True`` after the conversation
+      opened. Neither is checked here or anywhere else at send time — see
+      ``docs/DESIGN.md`` §9's "Accepted residual gap (TECH-5735)" notes.
     - ``open``: high risk iff the message type is sensitive.
-    - ``asymmetric`` + sensitive type: an ownership lookup decides. A
-      shared sender (``is_shared``) bypasses the check
-      (``detail={"bypass": "shared_sender"}``); otherwise high risk iff any
-      other participant's owner falls outside the sender's own owner set.
-      A lookup failure, or an empty owner set for the sender or any other
-      participant, raises ``RiskScoringInfraError`` rather than resolving
-      the crossing question at all — an ownership-service outage must fail
-      closed, not be silently treated as safe OR flood the approval queue
-      (deferred to PR2) with unscorable holds.
+    - ``asymmetric`` + sensitive type: an ownership lookup decides (sender's
+      owner set must be a superset of every other participant's). A shared
+      sender (``is_shared``) bypasses the check
+      (``detail={"bypass": "shared_sender"}``) — `asymmetric`-only, since
+      `internal` admission never lets a shared initiator bypass its own
+      pairwise check either. A lookup failure, or an empty owner set for
+      the sender or any other participant, raises
+      ``RiskScoringInfraError`` rather than resolving the crossing question
+      at all — an ownership-service outage must fail closed, not be
+      silently treated as safe OR flood the approval queue (deferred to
+      PR2) with unscorable holds.
     """
 
     async def score(self, ctx: MessageRiskContext) -> RiskVerdict:
