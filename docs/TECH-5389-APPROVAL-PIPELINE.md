@@ -168,8 +168,11 @@ info-barrier logic, relocated verbatim in substance:
   and maps scorer exceptions to `denied.risk_unscored`. The per-message
   `denied.boundary_crossing` denial path is retired. Module docstring / audit-contract
   text updated. The Axis 1 admission checks (`_authorize_conversation_open`, invite
-  owner-freeze) are **untouched** and keep their hard `denied.ownership_unverified`
-  denials — only the per-message Axis 2 check is subsumed.
+  owner-freeze) were untouched BY THIS (TECH-5389 PR2) change and kept their hard
+  `denied.ownership_unverified` denials — only the per-message Axis 2 check is
+  subsumed. (A later ticket, TECH-5735, does split invite owner-freeze's denial
+  into two reason strings for its own re-validation needs — see DESIGN.md's
+  ownership-admission section for the current state.)
 - `providers/comms.py` `post_message` docstring (the `note` bullet) and `main.py`
   `instructions` string rewritten: `note` is no longer "never allowed under open" —
   it is *held for human approval* when it would cross a boundary.
@@ -484,8 +487,12 @@ unless and until approved.
   `approval.expire`).
 - Returns: `{hold_id, conversation_id, status, risk_reason, created_at, expires_at,
   decided_at?, decision_reason?, message_seq?, message_id?}` — `decision_reason` on
-  rejected (and approved, if the human left a note); `message_seq`/`message_id` on
-  approved/auto_approved so the agent can correlate with `get_conversation`.
+  rejected (and approved, if the human left a note); `message_seq`/`message_id`
+  present whenever `message_id` is set on the hold row (only ever set at
+  message-creation time, on the approve/auto_approve path — TECH-5735 tightened
+  this doc's earlier "on approved/auto_approved" phrasing to describe the actual
+  implementation gate, see DESIGN.md's `comms_get_hold_status` row) so the agent
+  can correlate with `get_conversation`.
 
 **(b) Human's free-text why.** The decide endpoint's body becomes
 `{"decision": "approve" | "reject", "reason": "<optional free text, max 2000 chars>"}`.

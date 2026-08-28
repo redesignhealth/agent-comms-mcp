@@ -37,9 +37,15 @@ Rollback: dropping both columns is safe -- no other table references
 revision itself introduces.
 
 NOTE on in-place amendment (same convention bb1ea7d2a0cf/18f2d7735523
-established): the FK-name fix (explicit name -> unnamed/auto-named,
-matching this table's other 3 FKs) and the ``ck_approval_holds_invite_target_agent_id``
-CHECK were both added to THIS revision, in place, rather than as a new one
+established): the FK-name fix (explicit name -> pinned to
+``approval_holds_target_agent_id_fkey``, the exact name Postgres's own
+default naming convention would have auto-generated anyway, matching
+this table's other 3 unnamed FKs -- pinned explicitly rather than left to
+auto-naming so ``upgrade()``/``downgrade()`` can't diverge if a
+``naming_convention`` is later added to ``Base.metadata``; ``models.py``'s
+ORM ``ForeignKey`` mirrors this same explicit name) and the
+``ck_approval_holds_invite_target_agent_id`` CHECK were both added to THIS
+revision, in place, rather than as a new one
 -- safe for the same reason those precedents give: this revision was
 authored and iterated on entirely within this single unmerged PR, was
 never on ``main``, and every local Postgres this PR's review testing ran

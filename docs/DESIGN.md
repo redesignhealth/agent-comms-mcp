@@ -382,8 +382,14 @@ is untouched.
 
 Ownership is resolved via an injected `OwnershipClient` seam. It is never read
 from `agents.owner_sub` directly, since a shared agent's row can't represent
-multiple owners. Fails closed (`denied.ownership_unverified`) on any lookup
-error. The interim `AgentTableOwnershipClient` wraps `agents.owner_sub` as a
+multiple owners. Fails closed on any lookup error -- `denied.ownership_unverified`
+at conversation-open admission (both the lookup-exception and empty-owner-set
+cases); at invite owner-freeze, TECH-5735 splits the same two cases into
+`denied.ownership_lookup_failed` (exception -- transient) vs.
+`denied.ownership_unverified` (empty owner set -- deterministic), so
+`decide_hold`'s invite re-validation can tell a retriable registry outage
+apart from a target that will never resolve on its own. The interim
+`AgentTableOwnershipClient` wraps `agents.owner_sub` as a
 single-element set: correct for every agent registered today. Swap it for the
 real platform endpoint once shared agents exist.
 

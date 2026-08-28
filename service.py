@@ -89,8 +89,13 @@ violation), ``denied.bad_schema`` (payload validation),
 ``denied.rate_limited`` (limit names: ``conversation_starts_per_hour``,
 ``messages_per_conversation_per_hour``, ``messages_per_sender_per_hour``,
 and — TECH-5389 PR2 — ``approval_holds_per_hour``),
-``denied.ownership_unverified`` (Axis 1 admission — conversation open,
-invite owner-freeze — lookup failed; fail closed), ``denied.not_same_owner``/
+``denied.ownership_unverified`` (Axis 1 admission — conversation open, or
+invite owner-freeze's empty-owner-set case — fail closed) /
+``denied.ownership_lookup_failed`` (invite owner-freeze ONLY, when the
+lookup itself raised rather than returning an empty set — TECH-5735
+distinguishes the two so ``decide_hold``'s invite re-validation can tell a
+transient registry outage apart from a permanently-orphaned target),
+``denied.not_same_owner``/
 ``denied.no_owner_overlap`` (conversation-open admission failed for
 ``internal``/``asymmetric``), ``denied.owner_set_frozen`` (an invite would
 expand a frozen owner set), ``denied.wrong_sender_role`` (DESIGN.md §9
@@ -4437,7 +4442,10 @@ class OwnershipClient(Protocol):
         """Return ``{"is_shared": bool, "owners": list[str]}`` for ``agent_id``.
 
         Raise on any lookup failure/timeout/empty result — the caller
-        treats every exception as fail-closed (``denied.ownership_unverified``).
+        treats every exception as fail-closed (``denied.ownership_unverified``
+        at conversation-open admission; ``denied.ownership_lookup_failed``
+        at invite owner-freeze, TECH-5735 — see that denial's own comment
+        for why the two call sites use different reason strings).
         """
         ...
 
