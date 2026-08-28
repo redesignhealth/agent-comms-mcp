@@ -2305,6 +2305,15 @@ async def _authorize_invite_owner_freeze(
     """Reject an invite that would expand an ``internal``/``asymmetric``
     conversation's frozen owner set. No-op for ``open``.
 
+    The admitted-vs-frozen-snapshot predicate matches each type's own
+    admission rule (TECH-5735): ``internal`` requires the target's owner
+    set to EQUAL the snapshot (mirroring ``_pairwise_admitted``'s
+    equality check — the snapshot is a union of already-equal sets, so
+    equality to it is equality to every existing participant); a bare
+    subset let a strict-subset target into an `internal` conversation
+    without ever satisfying the equality invariant `internal` is supposed
+    to guarantee. ``asymmetric`` keeps the original subset check.
+
     Fails closed (``denied.ownership_unverified``) on any lookup error,
     same posture as conversation-open admission.
     """
@@ -2342,7 +2351,12 @@ async def _authorize_invite_owner_freeze(
             detail={"target_agent_id": str(target.id)},
         )
     snapshot_owners = frozenset((conversation.owner_snapshot or {}).get("owners") or [])
-    if not target_owners <= snapshot_owners:
+    admitted = (
+        target_owners == snapshot_owners
+        if conversation.type == "internal"
+        else target_owners <= snapshot_owners
+    )
+    if not admitted:
         await _deny(
             session,
             actor_sub=actor_sub,
@@ -3958,16 +3972,27 @@ class AgentTableOwnershipClient:
     endpoint ships.
 
     Wraps the existing ``agents`` columns: ``owner_sub`` as a
-    single-element owner set, and ``is_shared`` from the DB. ``owner_sub``
-    is frozen at first registration (see ``register_agent``) and never
-    changes again. ``is_shared`` is frozen against an agent's own
-    re-registration for the same reason, but -- unlike ``owner_sub`` -- IS
+    single-element owner set, and ``is_shared`` from the DB.
+    ``register_agent`` freezes ``owner_sub`` at first registration and
+    never overwrites it on re-registration (self-asserted claims are
+    untrusted) -- but ``owner_sub`` is NOT immutable for the lifetime of
+    the row: ``write_through_ownership`` (TECH-5593) updates it on every
+    verified request from a registry-backed agent-token verifier, and
+    ``reconcile_agent_ownership`` is the periodic backstop for agents that
+    make no further requests. Both are the ONE sanctioned exception to the
+    freeze (see ``write_through_ownership``'s own docstring) -- an earlier
+    version of this docstring claimed ``owner_sub`` "truly never changes";
+    that stopped being true once those two functions shipped, and this
+    scorer/gate must not assume open-time equality/intersection stays
+    valid for the life of a conversation as a result (TECH-5735 makes the
+    per-message risk scorer re-check live rather than trust the
+    conversation-open snapshot forever). ``is_shared`` IS still frozen
+    against an agent's own re-registration, but -- unlike ``owner_sub`` --
     mutable via the separate ``comms:admin``-gated ``set_agent_shared``
-    admin override (see that function's docstring). Both remain safe as
-    authorization inputs: ``owner_sub`` because it truly never changes, and
-    ``is_shared`` because its only mutation path is itself gated on the
-    same elevated scope required to escalate it at first registration --
-    there is no path by which an unprivileged caller can move this value.
+    admin override (see that function's docstring); its only mutation path
+    is itself gated on the same elevated scope required to escalate it at
+    first registration, so there is no path by which an unprivileged
+    caller can move it.
     """
 
     def __init__(self, session: AsyncSession) -> None:

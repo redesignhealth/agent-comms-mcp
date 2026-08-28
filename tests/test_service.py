@@ -2357,6 +2357,79 @@ class TestInviteOwnerFreeze:
         assert refreshed is not None
         assert refreshed.owner_snapshot == {"owners": ["dan"]}
 
+    async def test_internal_invite_strict_subset_of_snapshot_denied(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-5735: `internal` admission requires EQUALITY, not subset --
+        a target owned by only part of the (multi-member) snapshot must be
+        denied, not silently admitted via a bare subset check."""
+        owner = await _register(session, "freeze-int-eq-owner")
+        target = await _register(session, "freeze-int-eq-target")
+        client = _FakeOwnershipClient(
+            {
+                owner.id: {"is_shared": True, "owners": ["dan", "priya"]},
+                target.id: {"is_shared": True, "owners": ["dan", "priya"]},
+            }
+        )
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="internal",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            ownership_client=client,
+        )
+        assert conversation.owner_snapshot == {"owners": ["dan", "priya"]}
+        subset_agent = await _register(session, "freeze-int-eq-subset")
+        client._owners_by_agent_id[subset_agent.id] = {"is_shared": False, "owners": ["dan"]}
+
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await invite(
+                session,
+                actor_sub=owner.sub,
+                inviter_agent_id=owner.id,
+                conversation_id=conversation.id,
+                target_agent_id=subset_agent.id,
+                ownership_client=client,
+            )
+        assert exc_info.value.reason == "denied.owner_set_frozen"
+
+    async def test_asymmetric_invite_strict_subset_of_snapshot_admitted(
+        self, session: AsyncSession
+    ) -> None:
+        """`asymmetric` keeps the subset check -- a target owned by only
+        part of the snapshot is fine, unlike `internal`."""
+        owner = await _register(session, "freeze-asym-sub-owner")
+        target = await _register(session, "freeze-asym-sub-target")
+        client = _FakeOwnershipClient(
+            {
+                owner.id: {"is_shared": True, "owners": ["dan", "priya"]},
+                target.id: {"is_shared": False, "owners": ["dan"]},
+            }
+        )
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="asymmetric",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            ownership_client=client,
+        )
+        subset_agent = await _register(session, "freeze-asym-sub-new")
+        client._owners_by_agent_id[subset_agent.id] = {"is_shared": False, "owners": ["dan"]}
+
+        participant = await invite(
+            session,
+            actor_sub=owner.sub,
+            inviter_agent_id=owner.id,
+            conversation_id=conversation.id,
+            target_agent_id=subset_agent.id,
+            ownership_client=client,
+        )
+        assert participant.status == "invited"
+
     async def test_ownership_lookup_failure_on_invite_fails_closed(
         self, session: AsyncSession
     ) -> None:
@@ -3117,9 +3190,10 @@ class TestPostMessageBoundaryCrossing:
         )
         return owner, target, conversation
 
-    async def test_internal_note_never_checked_against_ownership(
-        self, session: AsyncSession
-    ) -> None:
+    async def test_internal_note_is_rechecked_live(self, session: AsyncSession) -> None:
+        """TECH-5735: `internal` no longer trusts conversation-open
+        admission forever -- a `note` re-resolves owner sets live, so a
+        raising client hard-denies rather than silently posting."""
         owner = await _register(session, "bc-int-owner")
         target = await _register(session, "bc-int-target")
         client = _FakeOwnershipClient(
@@ -3140,16 +3214,57 @@ class TestPostMessageBoundaryCrossing:
         await accept_invite(
             session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
         )
-        message = await post_message(
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await post_message(
+                session,
+                actor_sub=owner.sub,
+                sender_agent_id=owner.id,
+                conversation_id=conversation.id,
+                message_type="note",
+                payload={"text": "hello"},
+                ownership_client=_FailingOwnershipClient(),
+            )
+        assert exc_info.value.reason == "denied.risk_unscored"
+
+    async def test_internal_note_diverted_when_owner_sets_have_drifted(
+        self, session: AsyncSession
+    ) -> None:
+        """Owner sets were equal at conversation-open time but have since
+        drifted (e.g. `target`'s owner_sub was reassigned via
+        write_through_ownership/reconcile_agent_ownership) -- the live
+        recheck must catch this and divert to a hold, not post."""
+        owner = await _register(session, "bc-int-drift-owner")
+        target = await _register(session, "bc-int-drift-target")
+        client = _FakeOwnershipClient(
+            {
+                owner.id: {"is_shared": False, "owners": ["dan"]},
+                target.id: {"is_shared": False, "owners": ["dan"]},
+            }
+        )
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="internal",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            ownership_client=client,
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        client._owners_by_agent_id[target.id] = {"is_shared": False, "owners": ["priya"]}
+        result = await post_message(
             session,
             actor_sub=owner.sub,
             sender_agent_id=owner.id,
             conversation_id=conversation.id,
             message_type="note",
             payload={"text": "hello"},
-            ownership_client=_FailingOwnershipClient(),
+            ownership_client=client,
         )
-        assert message.type == "note"
+        assert isinstance(result, ApprovalHold)
+        assert result.risk_reason == "boundary_crossing"
 
     async def test_unrecognized_conversation_type_denied_with_own_audit_action(
         self, session: AsyncSession

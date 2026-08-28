@@ -225,19 +225,23 @@ Design notes:
  provide -- it cannot change as a side effect of the agent's own traffic --
  while giving an operator a deliberate, separately-audited (`agent.set_shared`)
  lever to fix a value an agent got wrong at registration. The per-message
- `_enforce_boundary_crossing` check (§9 Axis 2) queries the current row on
- every post, not a value cached at conversation-open time, so flipping
- `is_shared` takes effect retroactively on already-open `asymmetric`
- conversations for THAT check: correcting a wrongly-`False` agent to `True`
- immediately grants the boundary bypass on its existing conversations, and
- correcting a wrongly-`True` agent back to `False` immediately withdraws it,
- mid-conversation. This retroactive effect is narrower than it may sound,
- though: `_authorize_conversation_open`'s pairwise-ownership admission (§9
- Axis 1) runs exactly once, at conversation creation, so flipping the flag
- changes admission only for conversations opened AFTER the flip, never for
- ones already open. The invite gate (`_enforce_invite_owner_boundary`) is
- governed entirely by `Conversation.owner_snapshot`, frozen at open time with
- no `is_shared` bypass of its own, so it is unaffected by the flag either
+ risk scorer (`plugins.BoundaryCrossingScorer.score`, via `_score_message_risk`
+ — §9 Axis 2) queries the current row on every post, not a value cached at
+ conversation-open time, so flipping `is_shared` takes effect retroactively on
+ already-open `asymmetric` conversations for THAT check: correcting a
+ wrongly-`False` agent to `True` immediately grants the boundary bypass on its
+ existing conversations, and correcting a wrongly-`True` agent back to `False`
+ immediately withdraws it, mid-conversation. (TECH-5735: this liveness is no
+ longer `asymmetric`-only — `internal` now also re-checks the scorer's
+ owner-set EQUALITY on every send, live, though it never gets the
+ shared-sender bypass either way.) This retroactive effect is narrower than it
+ may sound, though: `_authorize_conversation_open`'s pairwise-ownership
+ admission (§9 Axis 1) runs exactly once, at conversation creation, so flipping
+ the flag changes admission only for conversations opened AFTER the flip,
+ never for ones already open. The invite gate
+ (`_authorize_invite_owner_freeze`) is governed entirely by
+ `Conversation.owner_snapshot`, frozen at open time with no `is_shared` bypass
+ of its own, so it is unaffected by the flag either
  way, at any time.
 
 ## 6. Message schemas (two-axis model)
@@ -366,9 +370,13 @@ real platform endpoint once shared agents exist.
 
 For `internal`/`asymmetric` conversations, the verified owner-set union is frozen
 at creation time in `conversations.owner_snapshot` (JSONB, nullable: `open` does
-not use it). Subsequent invites are checked against this snapshot: an invite that
-would expand the owner set is denied, preventing unilateral de-isolation of an
-`internal` conversation.
+not use it). Subsequent invites are checked against this snapshot, with the
+predicate matched to the type's own admission rule (TECH-5735): `internal`
+requires the target's owner set to EQUAL the snapshot (the snapshot is a union
+of already-equal sets, so equality to it is equality to every existing
+participant); `asymmetric` requires only a subset. An invite that fails its
+predicate is denied, preventing unilateral de-isolation of an `internal`
+conversation or a boundary-violating expansion of an `asymmetric` one.
 
 ### Axis 2: per-message risk scoring (pluggable) [TECH-5389]
 
@@ -391,13 +399,23 @@ high-risk (`RiskVerdict(high_risk, reason, detail)`). The v1 implementation,
 
 - A non-sensitive type is never high risk (no ownership lookup at all — the
  cheap common path).
-- `internal`: never high risk (every participant shares one owner set by
- construction).
-- `open`: a sensitive type is always high risk.
-- `asymmetric` + sensitive type: an ownership lookup decides (sender's owner
- set must be a superset of every other active-or-invited participant's), with
- the same shared-sender bypass as before (`agents.is_shared=True` skips the
- lookup unconditionally, audited `risk.shared_sender_bypass`).
+- `open`: a sensitive type is always high risk (no ownership lookup — `open`
+ has no ownership concept).
+- `internal`/`asymmetric` + sensitive type: an ownership lookup decides, and
+ (TECH-5735) it is re-resolved LIVE ON EVERY SEND — never trusted from
+ conversation-open admission. `_authorize_conversation_open`'s
+ equality/intersection check (Axis 1, above) runs exactly once; an agent's
+ owner set is not guaranteed to stay static after that (`owner_sub`
+ write-through/reconciliation — §5 — can reassign a registry-backed agent's
+ owner mid-conversation, and a future multi-member `OwnershipClient` for an
+ `is_shared` agent's roster would compound this). `internal`: high risk iff
+ any other participant's live owner set is not EQUAL to the sender's own — no
+ shared-sender bypass, matching Axis 1's own deliberate scoping (a shared
+ initiator does not bypass `internal`'s pairwise admission check either).
+ `asymmetric`: sender's owner set must be a superset of every other
+ active-or-invited participant's, with the same shared-sender bypass as
+ before (`agents.is_shared=True` skips the lookup unconditionally, audited
+ `risk.shared_sender_bypass`) — this bypass is `asymmetric`-only.
 - **Scorer infrastructure failure still hard-denies** (`denied.risk_unscored`,
  detail carries the cause: `ownership_unverified`/`empty_owner_set`/
  `unknown_conversation_type`) — an ownership-service outage must not flood
@@ -754,9 +772,12 @@ separate mechanisms:
 
 This is deliberately **universal**, unlike the risk scorer: the risk scorer
 answers a trust question (is this payload shaped safely enough to cross an
-ownership boundary), which `internal` conversations are exempt from by
-construction (no boundary exists between same-owner participants).
-`accepted_types` answers a capability question (does this specific running
+ownership boundary). `internal` conversations are NOT exempt from that
+question by construction (TECH-5735 corrected this — see §9 Axis 2): same-owner
+admission is checked once, at open, but an owner set can still drift
+afterward, so the risk scorer re-verifies it live on every sensitive send
+rather than assuming the boundary can never appear. `accepted_types` answers a
+different, capability question (does this specific running
 agent's own implementation know what to do with this message type at all),
 which has nothing to do with trust: a missing handler is a missing handler
 whether the sender is a stranger or your own other agent. So this check
@@ -883,6 +904,15 @@ ownership); production testing against real agents is not yet possible.
 The seam is already injected (`OwnershipClient` parameter on all functions that
 need it): swapping `AgentTableOwnershipClient` for a real HTTP client is the
 only change needed when the platform endpoint ships.
+
+Note that "single-owner" is not the same as "static," even in v1:
+`write_through_ownership`/`reconcile_agent_ownership` (TECH-5593) already
+update a registry-backed agent's cached `owner_sub` over its lifetime — the
+element itself can change even though the set stays single-valued. TECH-5735
+made the per-message risk scorer and the invite gate re-verify
+equality/subset live, on every check, specifically because Axis 1's
+open-time admission can no longer be assumed to hold for the life of a
+conversation.
 
 ### Known gap: no retention/archival policy for terminal or expired conversations
 

@@ -119,10 +119,13 @@ info-barrier logic, relocated verbatim in substance:
   former `boundary_safe=False` set, now scorer-private policy data.
 - Non-sensitive type → `high_risk=False` immediately (no ownership lookup — preserves
   today's cheap common path). `conversation_opened` (§6) is never sensitive.
-- Sensitive type: `internal` → not high risk; `open` → high risk
-  (`boundary_crossing`); `asymmetric` → ownership lookups (sequential — same
-  shared-`AsyncSession` constraint documented in `service._owner_sets_for`),
-  shared-sender bypass preserved (`high_risk=False`,
+- Sensitive type: `open` → high risk (`boundary_crossing`, no lookup — `open` has
+  no ownership concept); `internal`/`asymmetric` → ownership lookups (sequential —
+  same shared-`AsyncSession` constraint documented in `service._owner_sets_for`).
+  **`internal` is NOT a static "not high risk" — TECH-5735 made it re-check
+  owner-set EQUALITY live, on every send, the same as `asymmetric` re-checks
+  subset; it never gets the shared-sender bypass, matching admission's own
+  scoping.** `asymmetric`'s shared-sender bypass is preserved (`high_risk=False`,
   `detail={"bypass": "shared_sender"}` so the service emits a bypass-observability
   audit event — renamed to the scorer-neutral `risk.shared_sender_bypass`, replacing
   `agent.boundary_check_bypassed_shared`; backwards compatibility deliberately not
