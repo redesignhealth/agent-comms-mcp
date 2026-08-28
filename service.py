@@ -306,6 +306,16 @@ MAX_PENDING_INVITES_PER_INBOX = 100
 APPROVAL_HOLD_TTL = timedelta(days=7)
 MAX_APPROVAL_HOLDS_PER_HOUR = 10
 
+# TECH-5735: invite-holds (ApprovalHold.kind="invite") use fixed sentinel
+# values in place of a real message-schema/risk-scorer identifier, since no
+# RiskScorer plugin is invoked and there is no real schemas.MessageType for
+# "someone is being invited" — see ApprovalHold's class docstring and
+# _divert_invite_for_approval.
+INVITE_HOLD_MESSAGE_TYPE = "invite"
+INVITE_HOLD_SCHEMA_VERSION = 1
+INVITE_HOLD_RISK_REASON = "note_history_requires_approval"
+INVITE_HOLD_RISK_SCORER_LABEL = "invite_note_history_v1"
+
 # The one message type the SERVICE itself synthesizes (the seq-1 marker for
 # a diverted conversation opener, schemas.ConversationOpenedV1) -- never
 # legal as a caller-supplied message_type (denied.system_message_type,
@@ -790,6 +800,7 @@ def _hold_dict(hold: ApprovalHold) -> dict[str, Any]:
     result: dict[str, Any] = {
         "hold_id": str(hold.id),
         "conversation_id": str(hold.conversation_id),
+        "kind": hold.kind,
         "status": hold.status,
         "risk_reason": hold.risk_reason,
         "created_at": _iso(hold.created_at),
@@ -801,6 +812,8 @@ def _hold_dict(hold: ApprovalHold) -> dict[str, Any]:
         result["decision_reason"] = hold.decision_reason
     if hold.message_id is not None:
         result["message_id"] = str(hold.message_id)
+    if hold.target_agent_id is not None:
+        result["target_agent_id"] = str(hold.target_agent_id)
     return result
 
 
@@ -1788,6 +1801,31 @@ async def _authorize_conversation_open(
             agent_id=initiator.id,
             detail={"conversation_type": conversation_type},
         )
+    # TECH-5735: no `is_shared` participant may EVER be admitted to
+    # `internal`, full stop -- not "admitted if its roster happens to be a
+    # single owner right now." A shared agent's owner set is a roster that
+    # can change (a member added/removed) after this conversation opens,
+    # and `internal`'s whole risk model (BoundaryCrossingScorer treats
+    # `internal` as never high risk, unconditionally, forever) depends on
+    # open-time equality staying true for the conversation's entire life.
+    # Re-checking live on every message send does NOT fix this: the
+    # exposure isn't per-message, it's per-invite -- `comms_accept` grants
+    # full conversation history to whoever is invited, so the moment a
+    # participant is admitted it must already be treated as though it will
+    # read every message that exists or ever will. A live per-send check
+    # only gates the one `note` send it runs on; it does nothing about the
+    # participant's standing ability to read everything else. Excluding
+    # `is_shared` here (and at invite time, below) removes the only way
+    # this invariant could ever become false post-admission, which is what
+    # actually makes "never high risk by construction" true again.
+    if conversation_type == "internal" and any(is_shared_by_id.values()):
+        await _deny(
+            session,
+            actor_sub=actor_sub,
+            action="denied.shared_agent_not_allowed_internal",
+            agent_id=initiator.id,
+            detail={"conversation_type": conversation_type},
+        )
     # The shared-initiator bypass only applies to `asymmetric` — the type
     # `is_shared` exists to bridge (DESIGN.md §9). `internal` requires every
     # participant to share one owner set BY CONSTRUCTION; letting a shared
@@ -2305,6 +2343,14 @@ async def _authorize_invite_owner_freeze(
     """Reject an invite that would expand an ``internal``/``asymmetric``
     conversation's frozen owner set. No-op for ``open``.
 
+    TECH-5735: an ``is_shared`` target may never be invited into an
+    ``internal`` conversation, full stop -- the same admission-time
+    exclusion ``_authorize_conversation_open`` enforces at open. A shared
+    agent's owner set is a roster that can change later, which would
+    silently break `internal`'s "one owner, by construction" invariant
+    for a conversation that already trusted it; excluding shared agents
+    here closes the same hole at the other admission point.
+
     The admitted-vs-frozen-snapshot predicate matches each type's own
     admission rule (TECH-5735): ``internal`` requires the target's owner
     set to EQUAL the snapshot (mirroring ``_pairwise_admitted``'s
@@ -2320,9 +2366,7 @@ async def _authorize_invite_owner_freeze(
     if conversation.type == "open":
         return
     try:
-        target_owners = frozenset(
-            (await ownership_client.get_agent_owners(target.id)).get("owners") or []
-        )
+        target_info = await ownership_client.get_agent_owners(target.id)
     except Exception as exc:
         logger.warning(
             "ownership lookup failed authorizing an invite: %s",
@@ -2337,6 +2381,7 @@ async def _authorize_invite_owner_freeze(
             conversation_id=conversation.id,
             detail={"target_agent_id": str(target.id)},
         )
+    target_owners = frozenset(target_info.get("owners") or [])
     if not target_owners:
         # Fail closed, same posture as _authorize_conversation_open and
         # the risk scorer's ownership lookups: an empty owner set (a soft-failing
@@ -2346,6 +2391,15 @@ async def _authorize_invite_owner_freeze(
             session,
             actor_sub=actor_sub,
             action="denied.ownership_unverified",
+            agent_id=inviter_agent_id,
+            conversation_id=conversation.id,
+            detail={"target_agent_id": str(target.id)},
+        )
+    if conversation.type == "internal" and target_info.get("is_shared"):
+        await _deny(
+            session,
+            actor_sub=actor_sub,
+            action="denied.shared_agent_not_allowed_internal",
             agent_id=inviter_agent_id,
             conversation_id=conversation.id,
             detail={"target_agent_id": str(target.id)},
@@ -2367,6 +2421,26 @@ async def _authorize_invite_owner_freeze(
         )
 
 
+async def _conversation_has_note_history(session: AsyncSession, conversation_id: uuid.UUID) -> bool:
+    """Has any ``note`` (free-text) message ever been posted to this
+    conversation? Used by ``invite`` (TECH-5735) to decide whether
+    admitting a new participant requires human approval first —
+    ``comms_accept`` grants full retroactive history read the moment a
+    participant is admitted, and free text can't be structurally
+    guaranteed safe the way ownership equality can (see
+    ``_authorize_conversation_open``'s ``is_shared`` exclusion), so the
+    check has to run at invite time, treating the invitee as though it
+    will read every ``note`` that already exists.
+    """
+    return (
+        await session.execute(
+            select(Message.id)
+            .where(Message.conversation_id == conversation_id, Message.type == "note")
+            .limit(1)
+        )
+    ).first() is not None
+
+
 async def invite(
     session: AsyncSession,
     *,
@@ -2376,8 +2450,16 @@ async def invite(
     target_agent_id: uuid.UUID,
     ownership_client: OwnershipClient,
     active_checker: ActiveChecker,
-) -> Participant:
-    """Add ``target_agent_id`` to a conversation as a new ``invited`` row.
+    auto_approver: AutoApprover,
+    notifier: ApprovalNotifier,
+    owner_sub_claim: str | None = None,
+) -> Participant | ApprovalHold:
+    """Add ``target_agent_id`` to a conversation as a new ``invited`` row —
+    or, if the conversation already has free-text (``note``) history,
+    divert to an ``approval_holds`` row instead (TECH-5735; see
+    ``_divert_invite_for_approval``). Check ``held_for_approval``-shaped
+    callers via ``isinstance(result, ApprovalHold)``, same convention as
+    ``post_message``/``start_conversation``.
 
     ``inviter_agent_id`` must currently be an ``active`` participant
     (``may_invite`` — v1: any active member, tightenable to owner-only
@@ -2500,6 +2582,40 @@ async def invite(
             conversation_id=conversation.id,
             detail={"target_agent_id": str(target_agent_id), "current_status": existing.status},
         )
+
+    # TECH-5735: admitting `target` grants it full retroactive history read
+    # the moment it later calls comms_accept -- if any note (free-text)
+    # message already exists in this conversation, treat the invite itself
+    # as though target will read it, and require human approval first.
+    if await _conversation_has_note_history(session, conversation.id):
+        # Same submission-spam control post_message/start_conversation use
+        # (_deny_rate_limited_holds) -- an inviter flooding the human
+        # approval queue with invite-holds is still capped, same as one
+        # flooding it with high-risk messages.
+        await _deny_rate_limited_holds(
+            session, actor_sub=actor_sub, sender_agent_id=inviter_agent_id
+        )
+        inviter = await _require_active_agent(
+            session, actor_sub=actor_sub, agent_id=inviter_agent_id
+        )
+        result = await _divert_invite_for_approval(
+            session,
+            actor_sub=actor_sub,
+            conversation=conversation,
+            inviter_agent_id=inviter_agent_id,
+            target_agent_id=target.id,
+            target_display_name=target.display_name,
+            owner_sub_claim=owner_sub_claim,
+            owner_sub_fallback=inviter.owner_sub,
+            auto_approver=auto_approver,
+        )
+        await session.commit()
+        if isinstance(result, ApprovalHold):
+            await _fire_approval_notifier(
+                session, hold=result, conversation=conversation, sender=inviter, notifier=notifier
+            )
+        return result
+
     participant = Participant(
         conversation_id=conversation.id,
         agent_id=target.id,
@@ -2997,6 +3113,7 @@ async def _divert_high_risk_message(
     hold = ApprovalHold(
         conversation_id=conversation.id,
         sender_agent_id=sender_agent_id,
+        kind="message",
         owner_sub=hold_owner_sub,
         message_type=message_type,
         schema_version=schema_version,
@@ -3073,6 +3190,131 @@ async def _divert_high_risk_message(
         actor_sub=actor_sub,
         action="approval.escalate",
         agent_id=sender_agent_id,
+        conversation_id=conversation.id,
+        detail={"hold_id": str(hold.id), "auto_approver": approver_name},
+    )
+    return hold
+
+
+async def _divert_invite_for_approval(
+    session: AsyncSession,
+    *,
+    actor_sub: str,
+    conversation: Conversation,
+    inviter_agent_id: uuid.UUID,
+    target_agent_id: uuid.UUID,
+    target_display_name: str,
+    owner_sub_claim: str | None,
+    owner_sub_fallback: str,
+    auto_approver: AutoApprover,
+) -> Participant | ApprovalHold:
+    """TECH-5735: create a ``kind="invite"`` ``approval_holds`` row, run the
+    injected ``AutoApprover`` inline, and either create the ``Participant``
+    row atomically (cleared) or escalate to ``pending_human`` (v1's
+    ``EscalateAllAutoApprover``: always). Mirrors
+    ``_divert_high_risk_message``'s shape exactly, but for an invite rather
+    than a message — see ``ApprovalHold``'s class docstring for the field
+    mapping (``sender_agent_id`` is the INVITER here, not a message sender).
+
+    Caller MUST have already run every other invite gate (membership,
+    state, target validity, retirement check, schema-version recheck,
+    owner-freeze, already-participant check) — this function performs no
+    authorization of its own, only the hold/participant bookkeeping.
+    Returns the inserted ``Participant`` (cleared) or the ``ApprovalHold``
+    itself (escalated — caller commits and then fires the notifier
+    post-commit, per ``_fire_approval_notifier``'s docstring).
+    """
+    now = _now()
+    hold_owner_sub = owner_sub_claim if owner_sub_claim is not None else owner_sub_fallback
+    hold = ApprovalHold(
+        conversation_id=conversation.id,
+        sender_agent_id=inviter_agent_id,
+        target_agent_id=target_agent_id,
+        kind="invite",
+        owner_sub=hold_owner_sub,
+        message_type=INVITE_HOLD_MESSAGE_TYPE,
+        schema_version=INVITE_HOLD_SCHEMA_VERSION,
+        payload={
+            "target_agent_id": str(target_agent_id),
+            "target_display_name": target_display_name,
+        },
+        risk_reason=INVITE_HOLD_RISK_REASON,
+        risk_scorer=INVITE_HOLD_RISK_SCORER_LABEL,
+        status="pending_auto",
+        expires_at=now + APPROVAL_HOLD_TTL,
+    )
+    session.add(hold)
+    await session.flush()
+    _audit(
+        session,
+        actor_sub=actor_sub,
+        action="approval.hold",
+        agent_id=inviter_agent_id,
+        conversation_id=conversation.id,
+        detail={
+            "hold_id": str(hold.id),
+            "risk_reason": INVITE_HOLD_RISK_REASON,
+            "kind": "invite",
+            "target_agent_id": str(target_agent_id),
+        },
+    )
+
+    approver_name = _auto_approver_name(auto_approver)
+    hold.auto_approver = approver_name
+    ctx = HoldContext(
+        hold_id=hold.id,
+        conversation_id=conversation.id,
+        conversation_type=conversation.type,
+        sender_agent_id=inviter_agent_id,
+        owner_sub=hold_owner_sub,
+        message_type=INVITE_HOLD_MESSAGE_TYPE,
+        schema_version=INVITE_HOLD_SCHEMA_VERSION,
+        payload=hold.payload,
+        risk_reason=INVITE_HOLD_RISK_REASON,
+    )
+    decision = await auto_approver.review(ctx)
+    if decision.cleared:
+        participant = Participant(
+            conversation_id=conversation.id,
+            agent_id=target_agent_id,
+            role="member",
+            status="invited",
+            invited_by=inviter_agent_id,
+            joined_at=None,
+        )
+        session.add(participant)
+        await session.flush()
+        hold.status = "auto_approved"
+        hold.auto_decision = "cleared"
+        hold.auto_decided_at = _now()
+        system_actor = f"system:auto_approver/{approver_name}"
+        _audit(
+            session,
+            actor_sub=system_actor,
+            action="approval.auto_approve",
+            agent_id=inviter_agent_id,
+            conversation_id=conversation.id,
+            detail={"hold_id": str(hold.id)},
+        )
+        _audit(
+            session,
+            actor_sub=system_actor,
+            action="participant.invite",
+            agent_id=target_agent_id,
+            conversation_id=conversation.id,
+            detail={"invited_by_agent_id": str(inviter_agent_id), "hold_id": str(hold.id)},
+        )
+        participant.auto_approved_hold_id = hold.id  # type: ignore[attr-defined]
+        return participant
+
+    hold.status = "pending_human"
+    hold.auto_decision = "escalated"
+    hold.auto_decided_at = _now()
+    _audit(
+        session,
+        actor_sub=actor_sub,
+        action="approval.escalate",
+        agent_id=inviter_agent_id,
         conversation_id=conversation.id,
         detail={"hold_id": str(hold.id), "auto_approver": approver_name},
     )
@@ -3200,6 +3442,19 @@ async def get_hold_status(
         ).scalar_one_or_none()
         if seq is not None:
             result["message_seq"] = seq
+    if hold.kind == "invite" and hold.target_agent_id is not None:
+        # Mirrors message_seq above -- once decided, surface the outcome
+        # this hold actually produced (a Participant row, not a Message).
+        participant_status = (
+            await session.execute(
+                select(Participant.status).where(
+                    Participant.conversation_id == hold.conversation_id,
+                    Participant.agent_id == hold.target_agent_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if participant_status is not None:
+            result["participant_status"] = participant_status
     await session.commit()
     return result
 
@@ -3338,6 +3593,64 @@ async def decide_hold(
             current_state=conversation.state,
             message_type=hold.message_type,
         )
+
+    if hold.kind == "invite":
+        # TECH-5735: approving an invite-hold creates the Participant row
+        # this hold diverted, not a Message -- see ApprovalHold's class
+        # docstring. hold.sender_agent_id is the INVITER here.
+        if hold.target_agent_id is None:
+            raise RuntimeError(f"invariant violation: invite hold {hold_id} has no target_agent_id")
+        existing = await _find_participant(session, conversation.id, hold.target_agent_id)
+        if existing is not None:
+            # Someone else already admitted this target through a
+            # different path while this hold sat pending_human -- same
+            # uniform denial `invite` itself would raise for the identical
+            # race.
+            await _deny(
+                session,
+                actor_sub=approver_sub,
+                action="denied.already_participant",
+                agent_id=hold.sender_agent_id,
+                conversation_id=conversation.id,
+                detail={
+                    "target_agent_id": str(hold.target_agent_id),
+                    "current_status": existing.status,
+                },
+            )
+        participant = Participant(
+            conversation_id=conversation.id,
+            agent_id=hold.target_agent_id,
+            role="member",
+            status="invited",
+            invited_by=hold.sender_agent_id,
+            joined_at=None,
+        )
+        session.add(participant)
+        await session.flush()
+        hold.status = "approved"
+        hold.decided_by_sub = approver_sub
+        hold.decided_at = _now()
+        hold.decision_reason = reason
+        _audit(
+            session,
+            actor_sub=approver_sub,
+            action="approval.approve",
+            agent_id=hold.sender_agent_id,
+            conversation_id=conversation.id,
+            detail={"hold_id": str(hold_id), "has_reason": reason is not None},
+        )
+        _audit(
+            session,
+            actor_sub=approver_sub,
+            action="participant.invite",
+            agent_id=hold.target_agent_id,
+            conversation_id=conversation.id,
+            detail={"invited_by_agent_id": str(hold.sender_agent_id), "hold_id": str(hold_id)},
+        )
+        await session.commit()
+        result = _hold_dict(hold)
+        result["participant_status"] = participant.status
+        return result
 
     rows = (
         await session.execute(

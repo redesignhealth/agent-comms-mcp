@@ -144,27 +144,28 @@ class BoundaryCrossingScorer:
       pre-existing default-deny posture this scorer replaces (a
       boundary-safe message posted into an unrecognized conversation type
       was denied too, not just a sensitive one).
-    - ``open``: high risk iff the message type is sensitive (no ownership
-      lookup — ``open`` has no ownership concept).
-    - ``internal``/``asymmetric`` + sensitive type: an ownership lookup
-      decides, RE-RESOLVED LIVE ON EVERY SEND rather than trusted from
-      conversation-open admission (TECH-5735) — ``_authorize_conversation_open``
-      runs its equality/intersection check exactly once, and an agent's
-      owner set is no longer guaranteed static after that (``owner_sub``
-      write-through/reconciliation for a registry-backed agent, or a
-      future multi-member ``OwnershipClient`` for an ``is_shared`` agent,
-      can both make it drift). ``internal``: high risk iff any other
-      participant's live owner set is not EQUAL to the sender's own — no
-      shared-sender bypass here, matching admission's own deliberate
-      scoping (a shared initiator does not bypass `internal`'s pairwise
-      check either). ``asymmetric``: a shared sender (``is_shared``)
-      bypasses the check (``detail={"bypass": "shared_sender"}``);
-      otherwise high risk iff any other participant's owner falls outside
-      the sender's own owner set (subset, not equality). A lookup failure,
-      or an empty owner set for the sender or any other participant,
-      raises ``RiskScoringInfraError`` rather than resolving the crossing
-      question at all — an ownership-service outage must fail closed, not
-      be silently treated as safe OR flood the approval queue (deferred to
+    - ``internal``: never high risk. This is safe BY CONSTRUCTION, not by
+      runtime recheck (TECH-5735): admission (``_authorize_conversation_open``)
+      and the invite gate (``_authorize_invite_owner_freeze``) both refuse
+      to ever admit an ``is_shared`` agent into an `internal` conversation
+      — the one thing that could make an already-equal owner set drift
+      after open. With every participant pinned to one single, fixed
+      owner, equality can never become false post-admission, so there is
+      nothing here to recheck. (A per-message runtime check would not
+      have helped anyway: the exposure this ticket closes is at INVITE
+      time — ``comms_accept`` grants full conversation history the moment
+      a participant is admitted — not at each subsequent message send.)
+    - ``open``: high risk iff the message type is sensitive.
+    - ``asymmetric`` + sensitive type: an ownership lookup decides (sender's
+      owner set must be a superset of every other participant's). A shared
+      sender (``is_shared``) bypasses the check
+      (``detail={"bypass": "shared_sender"}``) — `asymmetric`-only, since
+      `internal` admission never lets a shared initiator bypass its own
+      pairwise check either. A lookup failure, or an empty owner set for
+      the sender or any other participant, raises
+      ``RiskScoringInfraError`` rather than resolving the crossing question
+      at all — an ownership-service outage must fail closed, not be
+      silently treated as safe OR flood the approval queue (deferred to
       PR2) with unscorable holds.
     """
 
@@ -173,18 +174,20 @@ class BoundaryCrossingScorer:
             raise RiskScoringInfraError("unknown_conversation_type")
         if ctx.message_type not in BARRIER_SENSITIVE_TYPES:
             return RiskVerdict(high_risk=False, reason=None, detail=None)
+        if ctx.conversation_type == "internal":
+            return RiskVerdict(high_risk=False, reason=None, detail=None)
         if ctx.conversation_type == "open":
             return RiskVerdict(high_risk=True, reason="boundary_crossing", detail=None)
 
-        # internal/asymmetric: sequential, not asyncio.gather -- the
-        # injected OwnershipClient shares this call's AsyncSession, which
+        # asymmetric: sequential, not asyncio.gather -- the injected
+        # OwnershipClient shares this call's AsyncSession, which
         # SQLAlchemy's AsyncSession does not support across concurrent
         # coroutines (see service._owner_sets_for's own docstring).
         try:
             sender_info = await ctx.ownership_client.get_agent_owners(ctx.sender_agent_id)
         except Exception as exc:
             raise RiskScoringInfraError("ownership_unverified") from exc
-        if ctx.conversation_type == "asymmetric" and sender_info.get("is_shared"):
+        if sender_info.get("is_shared"):
             return RiskVerdict(high_risk=False, reason=None, detail={"bypass": "shared_sender"})
         sender_owners = frozenset(sender_info.get("owners") or [])
         if not sender_owners:
@@ -199,11 +202,6 @@ class BoundaryCrossingScorer:
             raise RiskScoringInfraError("ownership_unverified") from exc
         if any(not owners for owners in other_owner_sets):
             raise RiskScoringInfraError("empty_owner_set")
-
-        if ctx.conversation_type == "internal":
-            if any(owners != sender_owners for owners in other_owner_sets):
-                return RiskVerdict(high_risk=True, reason="boundary_crossing", detail=None)
-            return RiskVerdict(high_risk=False, reason=None, detail=None)
 
         other_owners = frozenset().union(*other_owner_sets) if other_owner_sets else frozenset()
         if other_owners <= sender_owners:

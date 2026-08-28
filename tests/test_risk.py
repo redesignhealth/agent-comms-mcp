@@ -116,79 +116,12 @@ class TestOpenConversationType:
 
 
 class TestInternalConversationType:
-    """TECH-5735: `internal` re-checks live on every sensitive send, using
-    the same equality predicate `_pairwise_admitted` uses at conversation-
-    open time -- it no longer trusts that open-time equality holds forever
-    (an agent's owner_sub can drift via write-through/reconciliation, or a
-    future multi-member OwnershipClient for a shared agent)."""
+    """TECH-5735: `internal` stays "never high risk" -- but now that
+    invariant is guaranteed BY CONSTRUCTION (no `is_shared` agent can ever
+    be admitted to `internal` -- see test_service.py), not merely assumed,
+    so no ownership lookup is needed here at all."""
 
-    async def test_equal_owner_sets_not_high_risk(self) -> None:
-        sender = uuid.uuid4()
-        other = uuid.uuid4()
-        client = _FakeOwnershipClient(
-            {
-                sender: {"is_shared": False, "owners": ["dan"]},
-                other: {"is_shared": False, "owners": ["dan"]},
-            }
-        )
-        ctx = _ctx(
-            conversation_type="internal",
-            message_type=_SENSITIVE_TYPE,
-            sender_agent_id=sender,
-            other_agent_ids=[other],
-            ownership_client=client,
-        )
-        verdict = await BoundaryCrossingScorer().score(ctx)
-        assert verdict.high_risk is False
-        assert verdict.detail is None
-
-    async def test_drifted_owner_sets_high_risk(self) -> None:
-        # Owner sets were equal at conversation-open time but have since
-        # drifted (e.g. `other`'s owner_sub was reassigned via
-        # write_through_ownership/reconcile_agent_ownership) -- the live
-        # check must catch this, unlike the old "by construction" fast path.
-        sender = uuid.uuid4()
-        other = uuid.uuid4()
-        client = _FakeOwnershipClient(
-            {
-                sender: {"is_shared": False, "owners": ["dan"]},
-                other: {"is_shared": False, "owners": ["priya"]},
-            }
-        )
-        ctx = _ctx(
-            conversation_type="internal",
-            message_type=_SENSITIVE_TYPE,
-            sender_agent_id=sender,
-            other_agent_ids=[other],
-            ownership_client=client,
-        )
-        verdict = await BoundaryCrossingScorer().score(ctx)
-        assert verdict.high_risk is True
-        assert verdict.reason == "boundary_crossing"
-
-    async def test_shared_sender_does_not_bypass(self) -> None:
-        # Unlike asymmetric, internal admission never lets a shared
-        # initiator skip the pairwise check -- the scorer must not either.
-        sender = uuid.uuid4()
-        other = uuid.uuid4()
-        client = _FakeOwnershipClient(
-            {
-                sender: {"is_shared": True, "owners": ["dan", "priya"]},
-                other: {"is_shared": False, "owners": ["priya"]},
-            }
-        )
-        ctx = _ctx(
-            conversation_type="internal",
-            message_type=_SENSITIVE_TYPE,
-            sender_agent_id=sender,
-            other_agent_ids=[other],
-            ownership_client=client,
-        )
-        verdict = await BoundaryCrossingScorer().score(ctx)
-        assert verdict.high_risk is True
-        assert verdict.detail is None
-
-    async def test_ownership_lookup_failure_fails_closed(self) -> None:
+    async def test_sensitive_type_never_high_risk(self) -> None:
         ctx = _ctx(
             conversation_type="internal",
             message_type=_SENSITIVE_TYPE,
@@ -196,29 +129,8 @@ class TestInternalConversationType:
             other_agent_ids=[uuid.uuid4()],
             ownership_client=_FailingOwnershipClient(),
         )
-        with pytest.raises(RiskScoringInfraError) as exc_info:
-            await BoundaryCrossingScorer().score(ctx)
-        assert exc_info.value.cause == "ownership_unverified"
-
-    async def test_empty_sender_owner_set_fails_closed(self) -> None:
-        sender = uuid.uuid4()
-        other = uuid.uuid4()
-        client = _FakeOwnershipClient(
-            {
-                sender: {"is_shared": False, "owners": []},
-                other: {"is_shared": False, "owners": ["dan"]},
-            }
-        )
-        ctx = _ctx(
-            conversation_type="internal",
-            message_type=_SENSITIVE_TYPE,
-            sender_agent_id=sender,
-            other_agent_ids=[other],
-            ownership_client=client,
-        )
-        with pytest.raises(RiskScoringInfraError) as exc_info:
-            await BoundaryCrossingScorer().score(ctx)
-        assert exc_info.value.cause == "empty_owner_set"
+        verdict = await BoundaryCrossingScorer().score(ctx)
+        assert verdict.high_risk is False
 
 
 class TestAsymmetricConversationType:

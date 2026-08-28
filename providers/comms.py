@@ -902,23 +902,27 @@ async def post_message(
 
 @comms_server.tool
 async def get_hold_status(hold_id: str, agent_key: str | None = None) -> dict[str, Any]:
-    """Poll the status of a message held for human approval.
+    """Poll the status of a message OR invite held for human approval.
 
     Sender-only: the caller's resolved agent must equal the hold's own
-    sender. An unknown ``hold_id`` and someone else's hold both raise the
-    identical uniform ``access_denied`` error (the audit trail alone
-    distinguishes the two causes).
+    sender (for an invite hold — TECH-5735 — this is the INVITER, not the
+    agent being invited). An unknown ``hold_id`` and someone else's hold
+    both raise the identical uniform ``access_denied`` error (the audit
+    trail alone distinguishes the two causes).
 
-    Returns ``{hold_id, conversation_id, status, risk_reason, created_at,
-    expires_at}`` plus, once decided: ``decided_at``/``decision_reason``
-    (the human's optional free-text why — present on either approval or
-    rejection) and, once posted (``approved``/``auto_approved``),
+    Returns ``{hold_id, conversation_id, kind, status, risk_reason,
+    created_at, expires_at}`` (``kind`` is ``"message"`` or ``"invite"``)
+    plus, once decided: ``decided_at``/``decision_reason`` (the human's
+    optional free-text why — present on either approval or rejection) and,
+    once resolved (``approved``/``auto_approved``): for a ``message`` hold,
     ``message_id``/``message_seq`` so you can correlate with
-    ``comms_get_conversation``. ``status`` is one of ``pending_auto``,
-    ``pending_human``, ``auto_approved``, ``approved``, ``rejected``,
-    ``expired``. There is no push notification for a decision — poll this
-    tool with the ``hold_id`` from a held ``comms_post_message``/
-    ``comms_start_conversation`` response.
+    ``comms_get_conversation``; for an ``invite`` hold,
+    ``target_agent_id``/``participant_status``. ``status`` is one of
+    ``pending_auto``, ``pending_human``, ``auto_approved``, ``approved``,
+    ``rejected``, ``expired``. There is no push notification for a
+    decision — poll this tool with the ``hold_id`` from a held
+    ``comms_post_message``/``comms_start_conversation``/``comms_invite``
+    response.
     """
     token = _require_token()
     base_sub = _require_identity(token)
@@ -1153,12 +1157,27 @@ async def invite(
     - ``target_agent_id``: UUID string from ``comms_list_agents``. Target
       must be board-active and have no existing participant row (any status).
       For ``internal``/``asymmetric`` conversations, target must share the
-      conversation's owner set. If the target's registry reports it
+      conversation's owner set (``internal`` additionally never admits a
+      shared agent — TECH-5735). If the target's registry reports it
       retired (TECH-5703), this raises a specific "agent retired" error
       rather than the uniform unknown-agent denial. If the retirement check
       itself fails (e.g. registry timeout), the board fails open -- the
       target is treated as active, so a registry outage never blocks the
       invite, only temporarily suspends retirement enforcement.
+
+    Two response shapes (check ``held_for_approval`` — this is a distinct
+    shape, not an error), same convention as ``comms_post_message``:
+
+    - No existing free-text history (the common case): admitted
+      immediately -- ``conversation_id``, ``target_agent_id``, ``status``,
+      ``invited_by``.
+    - The conversation already has ``note`` history (TECH-5735): admitting
+      a new participant would grant it full retroactive read access to
+      that history the moment it accepts, so the invite is held for human
+      approval instead -- ``{"held_for_approval": true, "hold_id",
+      "conversation_id", "status", "risk_reason", "expires_at",
+      "created_at"}``. Poll ``comms_get_hold_status`` with ``hold_id``;
+      once decided, its response carries ``participant_status``.
     """
     token = _require_token()
     base_sub = _require_identity(token)
@@ -1167,10 +1186,12 @@ async def invite(
     conv_id = _parse_uuid("conversation_id", conversation_id)
     target_id = _parse_uuid("target_agent_id", target_agent_id)
 
+    owner_sub_claim = token.claims.get("owner_sub")
+
     async with get_session_factory()() as session:
         caller = await _resolve_caller_agent(session, sub, token)
         async with _map_service_errors():
-            participant = await service.invite(
+            result = await service.invite(
                 session,
                 actor_sub=sub,
                 inviter_agent_id=caller.id,
@@ -1178,8 +1199,22 @@ async def invite(
                 target_agent_id=target_id,
                 ownership_client=service.get_ownership_client_factory()(session),
                 active_checker=plugins.get_active_checker(),
+                auto_approver=plugins.get_auto_approver(),
+                notifier=plugins.get_approval_notifier(),
+                owner_sub_claim=owner_sub_claim,
             )
 
+    if isinstance(result, ApprovalHold):
+        return {
+            "held_for_approval": True,
+            "hold_id": str(result.id),
+            "conversation_id": conversation_id,
+            "status": result.status,
+            "risk_reason": result.risk_reason,
+            "expires_at": _iso(result.expires_at),
+            "created_at": _iso(result.created_at),
+        }
+    participant = result
     return {
         "conversation_id": conversation_id,
         "target_agent_id": str(participant.agent_id),

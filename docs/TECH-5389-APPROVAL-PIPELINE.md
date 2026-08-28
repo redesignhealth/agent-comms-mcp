@@ -119,13 +119,20 @@ info-barrier logic, relocated verbatim in substance:
   former `boundary_safe=False` set, now scorer-private policy data.
 - Non-sensitive type → `high_risk=False` immediately (no ownership lookup — preserves
   today's cheap common path). `conversation_opened` (§6) is never sensitive.
-- Sensitive type: `open` → high risk (`boundary_crossing`, no lookup — `open` has
-  no ownership concept); `internal`/`asymmetric` → ownership lookups (sequential —
-  same shared-`AsyncSession` constraint documented in `service._owner_sets_for`).
-  **`internal` is NOT a static "not high risk" — TECH-5735 made it re-check
-  owner-set EQUALITY live, on every send, the same as `asymmetric` re-checks
-  subset; it never gets the shared-sender bypass, matching admission's own
-  scoping.** `asymmetric`'s shared-sender bypass is preserved (`high_risk=False`,
+- Sensitive type: `internal` → not high risk, no ownership lookup at all — TECH-5735
+  made this an actual structural guarantee rather than an open-time assumption:
+  admission (`_authorize_conversation_open`) and the invite gate
+  (`_authorize_invite_owner_freeze`) both refuse to ever admit an `is_shared`
+  participant into `internal`, so the "one owner, forever" invariant this fast
+  path relies on can't become false after open — there is nothing left to
+  recheck. (Re-checking live on every `internal` send was considered and
+  rejected: the actual exposure TECH-5735 closes is at INVITE time —
+  `comms_accept` grants full retroactive history read the moment a participant
+  is admitted — not at each subsequent send; see `_divert_invite_for_approval`.)
+  `open` → high risk (`boundary_crossing`, no lookup — `open` has no ownership
+  concept); `asymmetric` → ownership lookups (sequential — same
+  shared-`AsyncSession` constraint documented in `service._owner_sets_for`).
+  `asymmetric`'s shared-sender bypass is preserved (`high_risk=False`,
   `detail={"bypass": "shared_sender"}` so the service emits a bypass-observability
   audit event — renamed to the scorer-neutral `risk.shared_sender_bypass`, replacing
   `agent.boundary_check_bypassed_shared`; backwards compatibility deliberately not

@@ -264,6 +264,7 @@ async def _make_hold(
     hold = ApprovalHold(
         conversation_id=conversation.id,
         sender_agent_id=sender.id,
+        kind="message",
         owner_sub=sender_owner_sub,
         message_type="note",
         schema_version=1,
