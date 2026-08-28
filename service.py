@@ -2496,8 +2496,10 @@ async def invite(
         agent_id=inviter_agent_id,
         conversation_id=conversation_id,
         required_status="active",
-        # TECH-5735: locked for the duration of this call so a concurrent
-        # `post_message` can't insert a `note` between the
+        # TECH-5735: locks the CONVERSATION row (not the participant row --
+        # `_load_participant_for_transition` only ever applies `for_update`
+        # to its `_find_conversation` call) for the duration of this call,
+        # so a concurrent `post_message` can't insert a `note` between the
         # `_conversation_has_note_history` check below and this invite's
         # commit -- without the lock, two concurrent invites (or an invite
         # racing a note post) could both observe "no note history yet" and
@@ -3539,12 +3541,19 @@ async def decide_hold(
     ``kind="invite"`` approval path (below) -- a hold can sit
     ``pending_human`` for up to ``APPROVAL_HOLD_TTL`` (7 days), during
     which the target could be retired, have its ``is_shared`` flag
-    flipped, or have its owner set change; approval re-runs every gate
-    ``invite()`` itself runs at hold-creation time, so none of that drift
-    can slip a target into an ``internal`` conversation it would no
-    longer qualify for. The ``kind="message"`` path takes neither
-    parameter — it only re-runs ``accepted_types`` (see below), which
-    needs neither seam.
+    flipped, or have its owner set change. Approval re-runs the target
+    status/retirement check and ``_authorize_invite_owner_freeze`` --
+    the two gates whose drift this ticket (TECH-5735) is specifically
+    about -- so none of THAT drift can slip a target into an ``internal``
+    conversation it would no longer qualify for. It does NOT re-run
+    ``invite()``'s schema-version pin check (an agent could re-register
+    with a narrower ``[min_schema_version, max_schema_version]`` range
+    during the pending window) or re-verify that ``hold.sender_agent_id``
+    is still an active participant (the inviter could have left or been
+    declined in the interim) -- both accepted as out of scope for this
+    ticket's fix, not silently overlooked. The ``kind="message"`` path
+    takes neither parameter — it only re-runs ``accepted_types`` (see
+    below), which needs neither seam.
 
     Raises ``AccessDeniedError`` (uniform, ``denied.unknown_hold`` /
     ``denied.hold_not_owner``) if the hold doesn't exist or the caller's
@@ -3659,42 +3668,70 @@ async def decide_hold(
             )
             await session.commit()
             raise HoldAlreadyDecidedError(hold.status)
-        target = await _find_agent_by_id(session, hold.target_agent_id)
-        if target is None or target.status != "active":
-            await _deny(
+        try:
+            target = await _find_agent_by_id(session, hold.target_agent_id)
+            if target is None or target.status != "active":
+                await _deny(
+                    session,
+                    actor_sub=approver_sub,
+                    action="denied.unknown_agent",
+                    agent_id=hold.sender_agent_id,
+                    conversation_id=conversation.id,
+                    detail={"target_agent_id": str(hold.target_agent_id)},
+                )
+            if not await _is_active_safe(active_checker, target.sub):
+                # TECH-5703: specific, not folded into the uniform denial above --
+                # see AgentRetiredError's docstring.
+                await _deny_agent_retired(
+                    session,
+                    actor_sub=approver_sub,
+                    agent_id=hold.sender_agent_id,
+                    conversation_id=conversation.id,
+                    target_agent_id=hold.target_agent_id,
+                )
+            # Re-run the exact gate `invite()` itself ran at hold-creation
+            # time. A hold can sit `pending_human` for up to
+            # APPROVAL_HOLD_TTL (7 days) -- during that window the target's
+            # `is_shared` flag, owner set, or retirement status can drift.
+            # Re-checking here (rather than trusting whatever was true when
+            # the hold was created) is what actually closes the gap;
+            # skipping it would let a target that no longer qualifies slip
+            # into an `internal` conversation anyway, via the approval path
+            # instead of `invite()`'s own checks.
+            await _authorize_invite_owner_freeze(
                 session,
                 actor_sub=approver_sub,
-                action="denied.unknown_agent",
-                agent_id=hold.sender_agent_id,
-                conversation_id=conversation.id,
-                detail={"target_agent_id": str(hold.target_agent_id)},
+                inviter_agent_id=hold.sender_agent_id,
+                conversation=conversation,
+                target=target,
+                ownership_client=ownership_client,
             )
-        if not await _is_active_safe(active_checker, target.sub):
-            # TECH-5703: specific, not folded into the uniform denial above --
-            # see AgentRetiredError's docstring.
-            await _deny_agent_retired(
+        except (AccessDeniedError, AgentRetiredError):
+            # Same stranded-hold concern as the already-participant branch
+            # above: any of the three re-validation checks failing means
+            # the target drifted out of eligibility during this hold's
+            # pending_human window. `_deny`/`_deny_agent_retired` already
+            # audited and committed the specific denial reason and raised
+            # -- this additionally resolves the HOLD itself to a terminal
+            # state (instead of leaving it pending_human until TTL expiry)
+            # before letting the original exception propagate, so the
+            # approver's client sees the real reason for the failure
+            # while the hold still ends up somewhere a human can see it
+            # resolved rather than dangling.
+            hold.status = "rejected"
+            hold.decided_by_sub = approver_sub
+            hold.decided_at = _now()
+            hold.decision_reason = "target no longer eligible for admission on re-validation"
+            _audit(
                 session,
                 actor_sub=approver_sub,
+                action="approval.reject",
                 agent_id=hold.sender_agent_id,
                 conversation_id=conversation.id,
-                target_agent_id=hold.target_agent_id,
+                detail={"hold_id": str(hold_id), "reason": "revalidation_failed"},
             )
-        # Re-run the exact gate `invite()` itself ran at hold-creation time.
-        # A hold can sit `pending_human` for up to APPROVAL_HOLD_TTL (7
-        # days) -- during that window the target's `is_shared` flag, owner
-        # set, or retirement status can drift. Re-checking here (rather
-        # than trusting whatever was true when the hold was created) is
-        # what actually closes the gap; skipping it would let a target
-        # that no longer qualifies slip into an `internal` conversation
-        # anyway, via the approval path instead of `invite()`'s own checks.
-        await _authorize_invite_owner_freeze(
-            session,
-            actor_sub=approver_sub,
-            inviter_agent_id=hold.sender_agent_id,
-            conversation=conversation,
-            target=target,
-            ownership_client=ownership_client,
-        )
+            await session.commit()
+            raise
         participant = Participant(
             conversation_id=conversation.id,
             agent_id=hold.target_agent_id,

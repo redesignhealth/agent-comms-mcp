@@ -35,6 +35,18 @@ f4a9c1d2b3e7 already documents and accepts for this table's other CHECKs).
 Rollback: dropping both columns is safe -- no other table references
 ``target_agent_id``, and ``kind`` is pure discriminator bookkeeping this
 revision itself introduces.
+
+NOTE on in-place amendment (same convention bb1ea7d2a0cf/18f2d7735523
+established): the FK-name fix (explicit name -> unnamed/auto-named,
+matching this table's other 3 FKs) and the ``ck_approval_holds_invite_target_agent_id``
+CHECK were both added to THIS revision, in place, rather than as a new one
+-- safe for the same reason those precedents give: this revision was
+authored and iterated on entirely within this single unmerged PR, was
+never on ``main``, and every local Postgres this PR's review testing ran
+against was recreated between rounds. No deployed dev/prod database, and
+no CI run, has ever executed the pre-amendment version. Once this PR
+merges, treat this file as frozen: any further schema change is a NEW
+revision, never an edit to this one.
 """
 
 from __future__ import annotations

@@ -2772,6 +2772,103 @@ class TestInviteRequiresApprovalForNoteHistory:
         assert hold.status == "auto_approved"
         assert hold.auto_decision == "cleared"
 
+    async def test_invite_hold_approve_retired_target_rejects_hold_not_stranded(
+        self, session: AsyncSession
+    ) -> None:
+        """The target's registry-reported retirement can happen anytime
+        during the hold's up-to-7-day pending_human window. Approving must
+        not admit a now-retired target -- and, per the Argus round-2
+        stranded-hold finding, must resolve the hold to a terminal state
+        rather than leaving it pending_human after the AgentRetiredError."""
+        owner, _target, conversation, client = await self._conversation_with_note(
+            session, "invite-hold-owner-5", "invite-hold-target-5"
+        )
+        new_agent = await _register(session, "invite-hold-new-5")
+        client._owners_by_agent_id[new_agent.id] = {"is_shared": False, "owners": ["dan"]}
+        hold = await invite(
+            session,
+            actor_sub=owner.sub,
+            inviter_agent_id=owner.id,
+            conversation_id=conversation.id,
+            target_agent_id=new_agent.id,
+            ownership_client=client,
+        )
+        assert isinstance(hold, ApprovalHold)
+
+        with pytest.raises(AgentRetiredError):
+            await decide_hold(
+                session,
+                approver_sub=owner.owner_sub,
+                hold_id=hold.id,
+                decision="approve",
+                reason=None,
+                ownership_client=client,
+                active_checker=_FakeActiveChecker({new_agent.sub}),
+            )
+
+        await session.refresh(hold)
+        assert hold.status == "rejected"
+        assert hold.decision_reason is not None
+
+        participant = (
+            await session.execute(
+                select(Participant).where(
+                    Participant.conversation_id == conversation.id,
+                    Participant.agent_id == new_agent.id,
+                )
+            )
+        ).scalar_one_or_none()
+        assert participant is None
+
+    async def test_invite_hold_approve_target_now_shared_rejects_hold_not_stranded(
+        self, session: AsyncSession
+    ) -> None:
+        """The target's `is_shared` flag can flip (via `set_agent_shared`)
+        during the hold's pending window too. Approving must re-run
+        `_authorize_invite_owner_freeze` and, on denial, resolve the hold
+        rather than strand it pending_human (Argus round-2 finding)."""
+        owner, _target, conversation, client = await self._conversation_with_note(
+            session, "invite-hold-owner-6", "invite-hold-target-6"
+        )
+        new_agent = await _register(session, "invite-hold-new-6")
+        client._owners_by_agent_id[new_agent.id] = {"is_shared": False, "owners": ["dan"]}
+        hold = await invite(
+            session,
+            actor_sub=owner.sub,
+            inviter_agent_id=owner.id,
+            conversation_id=conversation.id,
+            target_agent_id=new_agent.id,
+            ownership_client=client,
+        )
+        assert isinstance(hold, ApprovalHold)
+
+        # Drift: the target is now shared, as of decision time.
+        client._owners_by_agent_id[new_agent.id] = {"is_shared": True, "owners": ["dan"]}
+
+        with pytest.raises(AccessDeniedError):
+            await decide_hold(
+                session,
+                approver_sub=owner.owner_sub,
+                hold_id=hold.id,
+                decision="approve",
+                reason=None,
+                ownership_client=client,
+            )
+
+        await session.refresh(hold)
+        assert hold.status == "rejected"
+        assert hold.decision_reason is not None
+
+        participant = (
+            await session.execute(
+                select(Participant).where(
+                    Participant.conversation_id == conversation.id,
+                    Participant.agent_id == new_agent.id,
+                )
+            )
+        ).scalar_one_or_none()
+        assert participant is None
+
 
 # --- get_conversation ----------------------------------------------------------
 

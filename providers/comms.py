@@ -1170,7 +1170,10 @@ async def invite(
 
     - No existing free-text history (the common case): admitted
       immediately -- ``conversation_id``, ``target_agent_id``, ``status``,
-      ``invited_by``.
+      ``invited_by``, plus (only when an ``AutoApprover`` cleared an
+      invite hold inline rather than this being the ordinary no-hold path)
+      ``auto_approved: true`` and ``hold_id``, mirroring
+      ``comms_post_message``'s equivalent fields.
     - The conversation already has ``note`` history (TECH-5735): admitting
       a new participant would grant it full retroactive read access to
       that history the moment it accepts, so the invite is held for human

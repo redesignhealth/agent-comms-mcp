@@ -463,7 +463,7 @@ async def decide_approval(request: Request) -> Response:
         except AccessDeniedError:
             return JSONResponse(_UNIFORM_HOLD_NOT_FOUND, status_code=404)
         except AgentRetiredError as exc:
-            return JSONResponse({"error": "agent_retired", "detail": exc.reason}, status_code=409)
+            return JSONResponse({"error": "agent_retired", "detail": str(exc)}, status_code=409)
         except HoldExpiredError:
             return JSONResponse({"error": "expired"}, status_code=410)
         except HoldAwaitingAutoReviewError:
