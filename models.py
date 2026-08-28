@@ -477,8 +477,12 @@ class ApprovalHold(Base):
     # the INVITER (not a message sender at all) -- see class docstring.
     sender_agent_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agents.id"), nullable=False)
     # kind="invite" only: the agent being invited. NULL for kind="message".
+    # Named explicitly (matching the migration's pinned
+    # `approval_holds_target_agent_id_fkey` -- see that migration's own
+    # comment) so this can never diverge from the DB constraint's real
+    # name if a `naming_convention` is later added to `Base.metadata`.
     target_agent_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("agents.id"), nullable=True
+        ForeignKey("agents.id", name="approval_holds_target_agent_id_fkey"), nullable=True
     )
     kind: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'message'"))
     # Snapshotted from the sender's (or, for kind="invite", the inviter's)

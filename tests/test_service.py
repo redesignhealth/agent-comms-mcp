@@ -2551,7 +2551,7 @@ class TestInviteOwnerFreeze:
                 target_agent_id=new_agent.id,
                 ownership_client=_FailingOwnershipClient(),
             )
-        assert exc_info.value.reason == "denied.ownership_unverified"
+        assert exc_info.value.reason == "denied.ownership_lookup_failed"
 
 
 class TestInviteRequiresApprovalForNoteHistory:
@@ -2903,7 +2903,7 @@ class TestInviteRequiresApprovalForNoteHistory:
                 reason=None,
                 ownership_client=_FailingOwnershipClient(),
             )
-        assert exc_info.value.reason == "denied.ownership_unverified"
+        assert exc_info.value.reason == "denied.ownership_lookup_failed"
 
         await session.refresh(hold)
         assert hold.status == "pending_human"

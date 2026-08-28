@@ -382,6 +382,15 @@ async def _deny(
 
 
 _DENIED_TARGET_AGENT_RETIRED = "denied.target_agent_retired"
+# Argus round-4: distinct from `denied.ownership_unverified` (an empty
+# owner set from a SUCCESSFUL lookup -- deterministic, will never resolve
+# itself) specifically so decide_hold's invite re-validation can tell a
+# transient registry outage apart from a permanently-orphaned target. Only
+# `_authorize_invite_owner_freeze`'s lookup-EXCEPTION branch uses this;
+# `_authorize_conversation_open`'s analogous branch does not, since that
+# caller (start_conversation) has no stranded-hold concern to guard
+# against -- the whole open attempt just fails and the caller retries.
+_DENIED_OWNERSHIP_LOOKUP_FAILED = "denied.ownership_lookup_failed"
 
 
 async def _deny_agent_retired(
@@ -775,6 +784,16 @@ async def _find_hold(
         # both insert a message. Locking the hold row itself at fetch time
         # serializes concurrent decisions on the SAME hold.
         stmt = stmt.with_for_update()
+        # Argus round-4 BLOCKING catch: this session factory sets
+        # expire_on_commit=False (db.py), so re-calling this with the SAME
+        # hold_id already in the identity map (e.g. decide_hold's
+        # concurrent-resolution re-acquire, after an intervening commit)
+        # would otherwise hand back the cached Python object UNCHANGED --
+        # the `FOR UPDATE` still executes and blocks at the DB level, but
+        # the row's ACTUAL current column values never make it back into
+        # the object, silently defeating any "is it still pending_human"
+        # check a caller does against the returned row.
+        stmt = stmt.execution_options(populate_existing=True)
     return (await session.execute(stmt)).scalar_one_or_none()
 
 
@@ -2360,8 +2379,13 @@ async def _authorize_invite_owner_freeze(
     without ever satisfying the equality invariant `internal` is supposed
     to guarantee. ``asymmetric`` keeps the original subset check.
 
-    Fails closed (``denied.ownership_unverified``) on any lookup error,
-    same posture as conversation-open admission.
+    Fails closed on any lookup error -- ``denied.ownership_lookup_failed``
+    for a raised exception (transient: registry timeout/5xx), distinct
+    from ``denied.ownership_unverified`` below for a successful lookup
+    that returns an empty owner set (deterministic: an orphaned agent that
+    will never resolve itself). ``decide_hold``'s invite re-validation path
+    relies on this distinction to decide whether a denial here should
+    strand-resolve the hold or leave it retriable.
     """
     if conversation.type == "open":
         return
@@ -2376,7 +2400,7 @@ async def _authorize_invite_owner_freeze(
         await _deny(
             session,
             actor_sub=actor_sub,
-            action="denied.ownership_unverified",
+            action=_DENIED_OWNERSHIP_LOOKUP_FAILED,
             agent_id=inviter_agent_id,
             conversation_id=conversation.id,
             detail={"target_agent_id": str(target.id)},
@@ -3707,17 +3731,22 @@ async def decide_hold(
                 ownership_client=ownership_client,
             )
         except (AccessDeniedError, AgentRetiredError) as exc:
-            if getattr(exc, "reason", None) == "denied.ownership_unverified":
+            if isinstance(exc, AccessDeniedError) and exc.reason == _DENIED_OWNERSHIP_LOOKUP_FAILED:
                 # A transient ownership-lookup infra failure (registry
                 # timeout, 5xx), not genuine target drift -- distinguished
-                # from the other AccessDeniedError reasons
-                # (denied.unknown_agent / denied.shared_agent_not_allowed_internal
-                # / denied.owner_set_frozen) and from AgentRetiredError,
-                # none of which this string ever matches. Leave the hold
-                # `pending_human` so a human can retry the approval once
-                # the lookup succeeds again -- auto-resolving it here would
-                # destroy a still-valid invite over what may be a momentary
-                # outage, not a real reason to reject it.
+                # from the deterministic empty-owner-set case
+                # (denied.ownership_unverified, which DOES fall through to
+                # the stranded-hold resolution below: an orphaned agent's
+                # empty owner set won't fix itself, so leaving the hold
+                # pending_human for it would recreate the exact stranding
+                # this code exists to prevent), from the other
+                # AccessDeniedError reasons (denied.unknown_agent /
+                # denied.shared_agent_not_allowed_internal /
+                # denied.owner_set_frozen), and from AgentRetiredError.
+                # Leave the hold `pending_human` so a human can retry the
+                # approval once the lookup succeeds again -- auto-resolving
+                # it here would destroy a still-valid invite over what may
+                # be a momentary outage, not a real reason to reject it.
                 raise
             # Same stranded-hold concern as the already-participant branch
             # above: any of the three re-validation checks genuinely
@@ -3744,7 +3773,7 @@ async def decide_hold(
                     session,
                     actor_sub=approver_sub,
                     action="approval.reject",
-                    agent_id=hold.sender_agent_id,
+                    agent_id=refreshed.sender_agent_id,
                     conversation_id=conversation.id,
                     detail={"hold_id": str(hold_id), "reason": "revalidation_failed"},
                 )

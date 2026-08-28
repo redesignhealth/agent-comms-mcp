@@ -914,9 +914,11 @@ async def get_hold_status(hold_id: str, agent_key: str | None = None) -> dict[st
     created_at, expires_at}`` (``kind`` is ``"message"`` or ``"invite"``)
     plus, once decided: ``decided_at``/``decision_reason`` (the human's
     optional free-text why — present on either approval or rejection); for
-    a ``message`` hold, once approved/auto_approved specifically (not on
-    reject/expiry), ``message_id``/``message_seq`` so you can correlate
-    with ``comms_get_conversation``; for an ``invite`` hold,
+    a ``message`` hold, present whenever ``message_id`` is set on the hold
+    row (only ever set at message-creation time, on the approve/
+    auto_approve path -- never on reject/expiry, and never cleared once
+    set), ``message_id``/``message_seq`` so you can correlate with
+    ``comms_get_conversation``; for an ``invite`` hold,
     ``target_agent_id`` (always present, not gated on decision) and
     ``participant_status`` (present whenever a ``Participant`` row exists
     for the target — including a ``rejected`` hold whose target was
