@@ -66,8 +66,13 @@ def upgrade() -> None:
         sa.Column("target_agent_id", sa.UUID(), nullable=True),
         if_not_exists=True,
     )
+    # No explicit name: the other 3 FKs on this table were created without
+    # one (Postgres auto-named them `approval_holds_<col>_fkey`); an
+    # explicit name here would diverge from that convention and risk
+    # autogenerate emitting a spurious DROP+ADD pair against the ORM's own
+    # unnamed `ForeignKey("agents.id")` declaration.
     op.create_foreign_key(
-        "fk_approval_holds_target_agent_id_agents",
+        None,
         "approval_holds",
         "agents",
         ["target_agent_id"],
@@ -78,12 +83,16 @@ def upgrade() -> None:
         "approval_holds",
         "kind IN ('message', 'invite')",
     )
+    op.create_check_constraint(
+        "ck_approval_holds_invite_target_agent_id",
+        "approval_holds",
+        "kind != 'invite' OR target_agent_id IS NOT NULL",
+    )
 
 
 def downgrade() -> None:
+    op.drop_constraint("ck_approval_holds_invite_target_agent_id", "approval_holds", type_="check")
     op.drop_constraint("ck_approval_holds_kind", "approval_holds", type_="check")
-    op.drop_constraint(
-        "fk_approval_holds_target_agent_id_agents", "approval_holds", type_="foreignkey"
-    )
+    op.drop_constraint("approval_holds_target_agent_id_fkey", "approval_holds", type_="foreignkey")
     op.drop_column("approval_holds", "target_agent_id", if_exists=True)
     op.drop_column("approval_holds", "kind", if_exists=True)

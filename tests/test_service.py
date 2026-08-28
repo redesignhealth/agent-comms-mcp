@@ -126,6 +126,21 @@ async def invite(
     )
 
 
+async def decide_hold(
+    session: AsyncSession,
+    *,
+    ownership_client: OwnershipClient | None = None,
+    active_checker: plugins.ActiveChecker | None = None,
+    **kwargs: Any,
+) -> Any:
+    return await _service.decide_hold(
+        session,
+        ownership_client=ownership_client or AgentTableOwnershipClient(session),
+        active_checker=active_checker or plugins.AlwaysActiveChecker(),
+        **kwargs,
+    )
+
+
 async def list_agents(
     session: AsyncSession, *, active_checker: plugins.ActiveChecker | None = None, **kwargs: Any
 ) -> Any:
@@ -2654,12 +2669,13 @@ class TestInviteRequiresApprovalForNoteHistory:
         )
         assert isinstance(hold, ApprovalHold)
 
-        result = await _service.decide_hold(
+        result = await decide_hold(
             session,
             approver_sub=owner.owner_sub,
             hold_id=hold.id,
             decision="approve",
             reason=None,
+            ownership_client=client,
         )
         assert result["status"] == "approved"
         assert result["kind"] == "invite"
@@ -2698,7 +2714,7 @@ class TestInviteRequiresApprovalForNoteHistory:
         )
         assert isinstance(hold, ApprovalHold)
 
-        result = await _service.decide_hold(
+        result = await decide_hold(
             session,
             approver_sub=owner.owner_sub,
             hold_id=hold.id,
@@ -2716,6 +2732,45 @@ class TestInviteRequiresApprovalForNoteHistory:
             )
         ).scalar_one_or_none()
         assert participant is None
+
+    async def test_invite_hold_cleared_by_auto_approver_creates_participant_inline(
+        self, session: AsyncSession
+    ) -> None:
+        """The `_divert_invite_for_approval` branch taken when `auto_approver`
+        clears a hold instead of escalating -- dead in production under the
+        v1 `escalate_all` default (see AUTO_APPROVER_ENV_VAR), but still
+        real, reachable code that must create the Participant + auto_approved
+        hold row correctly."""
+
+        class _AlwaysClearAutoApprover:
+            async def review(self, ctx: plugins.HoldContext) -> plugins.AutoDecision:
+                return plugins.AutoDecision(cleared=True, detail={"stub": "always_clear"})
+
+        owner, _target, conversation, client = await self._conversation_with_note(
+            session, "invite-hold-owner-4", "invite-hold-target-4"
+        )
+        new_agent = await _register(session, "invite-hold-new-4")
+        client._owners_by_agent_id[new_agent.id] = {"is_shared": False, "owners": ["dan"]}
+        result = await invite(
+            session,
+            actor_sub=owner.sub,
+            inviter_agent_id=owner.id,
+            conversation_id=conversation.id,
+            target_agent_id=new_agent.id,
+            ownership_client=client,
+            auto_approver=_AlwaysClearAutoApprover(),
+        )
+        assert isinstance(result, Participant)
+        assert result.status == "invited"
+        assert result.invited_by == owner.id
+
+        hold = (
+            await session.execute(
+                select(ApprovalHold).where(ApprovalHold.target_agent_id == new_agent.id)
+            )
+        ).scalar_one()
+        assert hold.status == "auto_approved"
+        assert hold.auto_decision == "cleared"
 
 
 # --- get_conversation ----------------------------------------------------------

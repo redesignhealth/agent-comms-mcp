@@ -2672,6 +2672,7 @@ class TestApprovalPipeline:
         assert status["hold_id"] == result["hold_id"]
         assert status["status"] == "pending_human"
         assert status["risk_reason"] == "boundary_crossing"
+        assert status["kind"] == "message"
         assert "message_seq" not in status
 
         # The held content never became a visible message.
@@ -2683,6 +2684,73 @@ class TestApprovalPipeline:
             {"conversation_id": started["conversation_id"]},
         )
         assert all(m["type"] != "note" for m in conversation_view["messages"])
+
+    async def test_invite_into_conversation_with_note_history_returns_held_shape(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """TECH-5735: comms_invite diverts into an approval hold (not a
+        Participant row) when the target conversation already has `note`
+        history -- exercised end-to-end through the MCP tool boundary, not
+        just service.invite() directly (test_service.py's coverage)."""
+        owner_sub = "owner-invite-hold-e2e@example.com"
+        await _register(main, test_session_factory, "invite-hold-e2e-owner", owner_sub=owner_sub)
+        member = await _register(
+            main, test_session_factory, "invite-hold-e2e-member", owner_sub=owner_sub
+        )
+        new_agent = await _register(
+            main, test_session_factory, "invite-hold-e2e-new", owner_sub=owner_sub
+        )
+        owner_token = _token("invite-hold-e2e-owner", owner_sub=owner_sub)
+        new_token = _token("invite-hold-e2e-new", owner_sub=owner_sub)
+
+        started = await _call(
+            main,
+            test_session_factory,
+            owner_token,
+            "comms_start_conversation",
+            {
+                "conversation_type": "internal",
+                "target_agent_ids": [member["agent_id"]],
+                "initial_message": {"text": "hello"},
+                "message_type": "note",
+            },
+        )
+        conversation_id = started["conversation_id"]
+
+        result = await _call(
+            main,
+            test_session_factory,
+            owner_token,
+            "comms_invite",
+            {"conversation_id": conversation_id, "target_agent_id": new_agent["agent_id"]},
+        )
+        assert result["held_for_approval"] is True
+        assert result["status"] == "pending_human"
+        assert result["risk_reason"] == "note_history_requires_approval"
+        assert "hold_id" in result
+
+        status = await _call(
+            main,
+            test_session_factory,
+            owner_token,
+            "comms_get_hold_status",
+            {"hold_id": result["hold_id"]},
+        )
+        assert status["kind"] == "invite"
+        assert status["target_agent_id"] == new_agent["agent_id"]
+        assert "participant_status" not in status
+
+        # No Participant row exists yet -- the invitee is not a member.
+        with pytest.raises(
+            ToolError, match=re.escape("access_denied: not authorized for this resource")
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                new_token,
+                "comms_get_conversation",
+                {"conversation_id": conversation_id},
+            )
 
     async def test_get_hold_status_uniform_denial_for_non_sender(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]

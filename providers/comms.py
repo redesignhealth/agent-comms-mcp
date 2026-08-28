@@ -1186,7 +1186,7 @@ async def invite(
     conv_id = _parse_uuid("conversation_id", conversation_id)
     target_id = _parse_uuid("target_agent_id", target_agent_id)
 
-    owner_sub_claim = token.claims.get("owner_sub")
+    owner_sub_claim = _string_claim(token, "owner_sub")
 
     async with get_session_factory()() as session:
         caller = await _resolve_caller_agent(session, sub, token)
@@ -1215,12 +1215,17 @@ async def invite(
             "created_at": _iso(result.created_at),
         }
     participant = result
-    return {
+    response: dict[str, Any] = {
         "conversation_id": conversation_id,
         "target_agent_id": str(participant.agent_id),
         "status": participant.status,
         "invited_by": str(participant.invited_by) if participant.invited_by else None,
     }
+    auto_approved_hold_id = getattr(participant, "auto_approved_hold_id", None)
+    if auto_approved_hold_id is not None:
+        response["auto_approved"] = True
+        response["hold_id"] = str(auto_approved_hold_id)
+    return response
 
 
 @comms_server.tool

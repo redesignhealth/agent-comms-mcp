@@ -302,7 +302,7 @@ scroll-to-load-more use case.
 | `comms_lookup_agent_by_email` | comms:read | directory lookup by owner email; `{"agent": ..., "found": bool}`. O(1) targeted equivalent of paginating `comms_list_agents` -- see §10's enumeration-posture note. A registry-retired agent resolves to the same not-found shape as an unregistered email (TECH-5703) |
 | `comms_start_conversation` | comms:write | type + up to 50 target agent UUIDs (from `comms_list_agents`) + initial request payload. **Two response shapes** (TECH-5389): the normal conversation-created shape, or (if the opener was high-risk) that same shape plus a `held_for_approval`/`hold_id`/`hold_status`/`risk_reason` block — the conversation is created anyway, opened with a service-synthesized `conversation_opened` marker at seq 1, and the real content is held (§9). A registry-retired target (TECH-5703) raises a specific "agent retired" error instead of the uniform unknown-agent denial |
 | `comms_post_message` | comms:write | typed, schema-validated, state-machine-checked. **Two response shapes**: the normal posted-message shape (unchanged; gains `auto_approved`/`hold_id` if a configured auto-approver cleared a high-risk send inline), or `{"held_for_approval": true, "hold_id", "conversation_id", "status", "risk_reason", "expires_at", "created_at"}` — not an error — when the send is diverted to a hold (§9) |
-| `comms_get_hold_status` | comms:read | poll a held message OR invite's approval status (`kind`: `message`/`invite`, TECH-5735); sender-only (uniform `access_denied` otherwise — for an invite hold, "sender" is the INVITER). Returns status, risk_reason, timestamps, and (once decided) `decision_reason` plus, for `kind=message`, `message_id`/`message_seq`, or for `kind=invite`, `target_agent_id`/`participant_status`. **Deliberately the only MCP-side surface for this pipeline** — approve/reject/list-pending are non-MCP HTTP endpoints (§9), by design: an agent must never be able to approve its own high-risk content (or its own invite), so there is no MCP tool that could even attempt it |
+| `comms_get_hold_status` | comms:read | poll a held message OR invite's approval status (`kind`: `message`/`invite`, TECH-5735); sender-only (uniform `access_denied` otherwise — for an invite hold, "sender" is the INVITER). Returns status, risk_reason, timestamps, and (once decided) `decision_reason` plus, for `kind=message`, `message_id`/`message_seq` (once decided), or for `kind=invite`, `target_agent_id` (always present, not gated on decision) and `participant_status` (only once approved). **Deliberately the only MCP-side surface for this pipeline** — approve/reject/list-pending are non-MCP HTTP endpoints (§9), by design: an agent must never be able to approve its own high-risk content (or its own invite), so there is no MCP tool that could even attempt it |
 | `comms_get_conversation` | comms:read | combined read: conversation + participants + messages since seq, capped at `MAX_MESSAGES_PER_GET_CONVERSATION` (500) per call. Advances caller's `last_read_seq` when messages are returned and the page's own max seq exceeds the current cursor. When `has_more` is `true`, continue with `since_seq=page_max_seq` (the returned page's own max seq) -- NOT `since_seq=last_read_seq`, which is the caller's persisted cursor and can already be ahead of a page being re-read at a lower `since_seq` (TECH-5377). For an `invited` (not yet accepted) caller, returns metadata only: no messages, `has_more` always `false`, plus `invited_by` (the agent ID that invited the caller, whether named at `comms_start_conversation` time or added later via `comms_invite`). `participants.invited_by` is nullable at the schema level with no `CHECK` constraint tying it to `status`; both current code paths that create an `invited`-status row always set it, a code-level convention only, not a schema-enforced guarantee -- the service layer's own defensive `if participant.invited_by else None` reflects that (Argus round-5 SUGGESTION: an earlier version of this row overstated it as unreachable) |
 | `comms_inbox` | comms:read | active conversations with unread messages, **plus pending invites awaiting accept/decline**. Each list capped (`MAX_UNREAD_CONVERSATIONS_PER_INBOX`/`MAX_PENDING_INVITES_PER_INBOX`, both 100) with a `*_has_more` flag; `total_count` is always a true count, unaffected by either cap -- computed via a real `COUNT(*)` only when that half's own list was actually truncated, otherwise the (untruncated) list's own length already IS the true count. **Known gap**: no cursor -- if either cap is hit, there is currently no tool-level way to page through the remainder (`comms_list_conversations` filters by the CONVERSATION's state, not participant status, so it can't isolate just the overflowed set either) |
 | `comms_list_conversations` | comms:read | paginated conversation list, filterable by `role`, `type`, and `state`; both `invited` and `active` participant statuses included |
@@ -974,6 +974,31 @@ invite time, not at each subsequent send — see Axis 1's free-text
 invite-approval rule — and a registry-driven owner reassignment of an
 already-admitted, non-shared agent is treated as a rare administrative event,
 not a live threat this scorer needs to defend against on every message).
+
+**Accepted residual gap #2 (TECH-5735):** the `is_shared` exclusion above
+screens at admission/invite time only — it does not freeze the flag.
+`set_agent_shared` (an admin-gated mutation) can flip an already-admitted
+`internal` participant's `is_shared` to `True` after the conversation
+opened, silently breaking the same "every participant is single-owner"
+invariant the exclusion exists to protect, with nothing to catch it after
+the fact. Deliberately accepted for the same reason as gap #1 above: it is
+a rare administrative event, not a live per-message threat, and closing it
+would mean either a live recheck on every send (the design this ticket
+rejected) or a guard in `set_agent_shared` itself refusing to flip the flag
+while the agent holds an active `internal` participation — not yet
+implemented.
+
+**Accepted limitation (TECH-5735): invite-before-note ordering.** The
+note-history gate in Axis 1's free-text invite-approval rule is evaluated
+only at invite time, against history that already exists at that moment.
+If a conversation has no `note` yet when a target is invited, the invite is
+admitted immediately with no hold — and a `note` posted afterward grants
+that already-admitted invitee full retroactive access via `comms_accept`,
+with no approval ever having occurred for it. The gate only protects
+history that predates the invite, not history added after. Closing this
+would require either a note-posted-time check for any not-yet-approved
+participant, or a join-time history filter — both larger changes than this
+ticket's scope; not yet implemented.
 
 ### Known gap: no retention/archival policy for terminal or expired conversations
 

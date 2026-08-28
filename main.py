@@ -23,11 +23,13 @@ from fastmcp.tools import ToolResult
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 
+import plugins
 import service
 from auth import build_auth_provider
 from db import database_url, get_session_factory
 from exceptions import (
     AccessDeniedError,
+    AgentRetiredError,
     HoldAlreadyDecidedError,
     HoldAwaitingAutoReviewError,
     HoldExpiredError,
@@ -455,9 +457,13 @@ async def decide_approval(request: Request) -> Response:
                 hold_id=hold_id,
                 decision=decision,
                 reason=reason,
+                ownership_client=service.get_ownership_client_factory()(session),
+                active_checker=plugins.get_active_checker(),
             )
         except AccessDeniedError:
             return JSONResponse(_UNIFORM_HOLD_NOT_FOUND, status_code=404)
+        except AgentRetiredError as exc:
+            return JSONResponse({"error": "agent_retired", "detail": exc.reason}, status_code=409)
         except HoldExpiredError:
             return JSONResponse({"error": "expired"}, status_code=410)
         except HoldAwaitingAutoReviewError:

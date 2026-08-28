@@ -2405,6 +2405,14 @@ async def _authorize_invite_owner_freeze(
             detail={"target_agent_id": str(target.id)},
         )
     snapshot_owners = frozenset((conversation.owner_snapshot or {}).get("owners") or [])
+    # No legacy-data migration needed for this equality predicate:
+    # `_pairwise_admitted` has required exact owner-set equality for every
+    # pair of `internal` participants at OPEN time since `internal` was
+    # introduced, not just as of this ticket. This invite-time check is
+    # just applying that same, already-true-at-open invariant to a NEW
+    # target -- there is no earlier era where a strict-subset target could
+    # have opened an `internal` conversation for this check to now
+    # retroactively conflict with.
     admitted = (
         target_owners == snapshot_owners
         if conversation.type == "internal"
@@ -2488,6 +2496,13 @@ async def invite(
         agent_id=inviter_agent_id,
         conversation_id=conversation_id,
         required_status="active",
+        # TECH-5735: locked for the duration of this call so a concurrent
+        # `post_message` can't insert a `note` between the
+        # `_conversation_has_note_history` check below and this invite's
+        # commit -- without the lock, two concurrent invites (or an invite
+        # racing a note post) could both observe "no note history yet" and
+        # admit the target immediately, bypassing the approval hold.
+        for_update=True,
     )
     if not may_invite(inviter_participant.status):  # pragma: no cover — v1 always True here
         await _deny(
@@ -3514,9 +3529,22 @@ async def decide_hold(
     hold_id: uuid.UUID,
     decision: str,
     reason: str | None,
+    ownership_client: OwnershipClient,
+    active_checker: ActiveChecker,
 ) -> dict[str, Any]:
     """``POST /approvals/{hold_id}/decide`` (main.py, non-MCP,
     interactive+owner-gated). ``decision`` is ``"approve"`` or ``"reject"``.
+
+    ``ownership_client``/``active_checker`` are used ONLY by the
+    ``kind="invite"`` approval path (below) -- a hold can sit
+    ``pending_human`` for up to ``APPROVAL_HOLD_TTL`` (7 days), during
+    which the target could be retired, have its ``is_shared`` flag
+    flipped, or have its owner set change; approval re-runs every gate
+    ``invite()`` itself runs at hold-creation time, so none of that drift
+    can slip a target into an ``internal`` conversation it would no
+    longer qualify for. The ``kind="message"`` path takes neither
+    parameter — it only re-runs ``accepted_types`` (see below), which
+    needs neither seam.
 
     Raises ``AccessDeniedError`` (uniform, ``denied.unknown_hold`` /
     ``denied.hold_not_owner``) if the hold doesn't exist or the caller's
@@ -3603,20 +3631,70 @@ async def decide_hold(
         existing = await _find_participant(session, conversation.id, hold.target_agent_id)
         if existing is not None:
             # Someone else already admitted this target through a
-            # different path while this hold sat pending_human -- same
-            # uniform denial `invite` itself would raise for the identical
-            # race.
-            await _deny(
+            # different path while this hold sat pending_human. Unlike
+            # `invite`'s own identical check, this hold is a resolvable
+            # entity in its own right -- leaving it `pending_human` after
+            # this race (via the uniform `_deny`, which raises
+            # AccessDeniedError -> maps to a uniform 404) would strand it
+            # forever with no way for a human to close it out. Resolve it
+            # as rejected instead, with a reason that explains why, and
+            # raise the same 409 `decide_hold` already raises for any other
+            # already-decided hold.
+            hold.status = "rejected"
+            hold.decided_by_sub = approver_sub
+            hold.decided_at = _now()
+            hold.decision_reason = "target already admitted via a different path"
+            _audit(
                 session,
                 actor_sub=approver_sub,
-                action="denied.already_participant",
+                action="approval.reject",
                 agent_id=hold.sender_agent_id,
                 conversation_id=conversation.id,
                 detail={
+                    "hold_id": str(hold_id),
                     "target_agent_id": str(hold.target_agent_id),
                     "current_status": existing.status,
+                    "reason": "already_participant",
                 },
             )
+            await session.commit()
+            raise HoldAlreadyDecidedError(hold.status)
+        target = await _find_agent_by_id(session, hold.target_agent_id)
+        if target is None or target.status != "active":
+            await _deny(
+                session,
+                actor_sub=approver_sub,
+                action="denied.unknown_agent",
+                agent_id=hold.sender_agent_id,
+                conversation_id=conversation.id,
+                detail={"target_agent_id": str(hold.target_agent_id)},
+            )
+        if not await _is_active_safe(active_checker, target.sub):
+            # TECH-5703: specific, not folded into the uniform denial above --
+            # see AgentRetiredError's docstring.
+            await _deny_agent_retired(
+                session,
+                actor_sub=approver_sub,
+                agent_id=hold.sender_agent_id,
+                conversation_id=conversation.id,
+                target_agent_id=hold.target_agent_id,
+            )
+        # Re-run the exact gate `invite()` itself ran at hold-creation time.
+        # A hold can sit `pending_human` for up to APPROVAL_HOLD_TTL (7
+        # days) -- during that window the target's `is_shared` flag, owner
+        # set, or retirement status can drift. Re-checking here (rather
+        # than trusting whatever was true when the hold was created) is
+        # what actually closes the gap; skipping it would let a target
+        # that no longer qualifies slip into an `internal` conversation
+        # anyway, via the approval path instead of `invite()`'s own checks.
+        await _authorize_invite_owner_freeze(
+            session,
+            actor_sub=approver_sub,
+            inviter_agent_id=hold.sender_agent_id,
+            conversation=conversation,
+            target=target,
+            ownership_client=ownership_client,
+        )
         participant = Participant(
             conversation_id=conversation.id,
             agent_id=hold.target_agent_id,
@@ -4295,11 +4373,20 @@ class AgentTableOwnershipClient:
     make no further requests. Both are the ONE sanctioned exception to the
     freeze (see ``write_through_ownership``'s own docstring) -- an earlier
     version of this docstring claimed ``owner_sub`` "truly never changes";
-    that stopped being true once those two functions shipped, and this
-    scorer/gate must not assume open-time equality/intersection stays
-    valid for the life of a conversation as a result (TECH-5735 makes the
-    per-message risk scorer re-check live rather than trust the
-    conversation-open snapshot forever). ``is_shared`` IS still frozen
+    that stopped being true once those two functions shipped. TECH-5735
+    does NOT address this by re-checking live on every send (an earlier,
+    abandoned design did; see git history for commit c644780 on this
+    ticket's branch, superseded by 8c8b318) -- it closes the ``is_shared``
+    dimension of this problem STRUCTURALLY instead, by excluding any
+    ``is_shared`` agent from ``internal`` at admission and invite time
+    (``_authorize_conversation_open``/``_authorize_invite_owner_freeze``),
+    so a shared agent's mutable roster can never be the thing that breaks
+    an already-equal owner set. The narrower ``owner_sub``-reassignment
+    case above (two ALREADY non-shared, already-admitted participants,
+    reassigned independently after open) is a deliberately accepted
+    residual gap, not one this docstring's callers close -- see
+    ``docs/DESIGN.md`` §9's "Accepted residual gap (TECH-5735)" note.
+    ``is_shared`` IS still frozen
     against an agent's own re-registration, but -- unlike ``owner_sub`` --
     mutable via the separate ``comms:admin``-gated ``set_agent_shared``
     admin override (see that function's docstring); its only mutation path

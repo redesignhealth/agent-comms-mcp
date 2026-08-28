@@ -149,12 +149,19 @@ class BoundaryCrossingScorer:
       and the invite gate (``_authorize_invite_owner_freeze``) both refuse
       to ever admit an ``is_shared`` agent into an `internal` conversation
       — the one thing that could make an already-equal owner set drift
-      after open. With every participant pinned to one single, fixed
-      owner, equality can never become false post-admission, so there is
-      nothing here to recheck. (A per-message runtime check would not
-      have helped anyway: the exposure this ticket closes is at INVITE
-      time — ``comms_accept`` grants full conversation history the moment
-      a participant is admitted — not at each subsequent message send.)
+      after open for that dimension, so there is nothing here to recheck
+      for it. (A per-message runtime check would not have helped anyway:
+      the exposure this ticket closes is at INVITE time — ``comms_accept``
+      grants full conversation history the moment a participant is
+      admitted — not at each subsequent message send.) This does NOT mean
+      equality is unconditionally frozen forever: two accepted residual
+      gaps remain outside this scorer's reach — (1) two already-admitted,
+      already-non-shared participants' ``owner_sub``s can independently
+      drift apart via ``write_through_ownership``/``reconcile_agent_ownership``,
+      and (2) ``set_agent_shared`` can flip an already-admitted
+      participant's ``is_shared`` to ``True`` after the conversation
+      opened. Neither is checked here or anywhere else at send time — see
+      ``docs/DESIGN.md`` §9's "Accepted residual gap (TECH-5735)" notes.
     - ``open``: high risk iff the message type is sensitive.
     - ``asymmetric`` + sensitive type: an ownership lookup decides (sender's
       owner set must be a superset of every other participant's). A shared

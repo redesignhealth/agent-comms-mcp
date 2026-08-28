@@ -340,6 +340,18 @@ class Message(Base):
         # migration" convention as every other migration-created index in
         # this file.
         Index("idx_messages_sender_id_created_at", "sender_id", "created_at"),
+        # Backs service._conversation_has_note_history's
+        # WHERE conversation_id = ... AND type = 'note' LIMIT 1 query
+        # (TECH-5735) -- without this, Postgres uses the composite index
+        # above (conversation_id-leading) and scans every message in the
+        # conversation until it finds a note or exhausts the set. Partial
+        # (WHERE type = 'note') since every other message type never
+        # participates in this lookup.
+        Index(
+            "idx_messages_conversation_id_note",
+            "conversation_id",
+            postgresql_where=text("type = 'note'"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -423,6 +435,10 @@ class ApprovalHold(Base):
             name="ck_approval_holds_auto_decision",
         ),
         CheckConstraint(f"kind IN {APPROVAL_HOLD_KINDS!r}", name="ck_approval_holds_kind"),
+        CheckConstraint(
+            "kind != 'invite' OR target_agent_id IS NOT NULL",
+            name="ck_approval_holds_invite_target_agent_id",
+        ),
         UniqueConstraint("message_id", name="uq_approval_holds_message_id"),
         # Backs comms_get_hold_status's sender-only lookup and
         # GET /approvals/pending's owner-filtered pending_human listing,
