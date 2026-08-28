@@ -913,11 +913,15 @@ async def get_hold_status(hold_id: str, agent_key: str | None = None) -> dict[st
     Returns ``{hold_id, conversation_id, kind, status, risk_reason,
     created_at, expires_at}`` (``kind`` is ``"message"`` or ``"invite"``)
     plus, once decided: ``decided_at``/``decision_reason`` (the human's
-    optional free-text why — present on either approval or rejection) and,
-    once resolved (``approved``/``auto_approved``): for a ``message`` hold,
-    ``message_id``/``message_seq`` so you can correlate with
-    ``comms_get_conversation``; for an ``invite`` hold,
-    ``target_agent_id``/``participant_status``. ``status`` is one of
+    optional free-text why — present on either approval or rejection); for
+    a ``message`` hold, once approved/auto_approved specifically (not on
+    reject/expiry), ``message_id``/``message_seq`` so you can correlate
+    with ``comms_get_conversation``; for an ``invite`` hold,
+    ``target_agent_id`` (always present, not gated on decision) and
+    ``participant_status`` (present whenever a ``Participant`` row exists
+    for the target — including a ``rejected`` hold whose target was
+    admitted via a different path — not gated on THIS hold's own
+    decision). ``status`` is one of
     ``pending_auto``, ``pending_human``, ``auto_approved``, ``approved``,
     ``rejected``, ``expired``. There is no push notification for a
     decision — poll this tool with the ``hold_id`` from a held

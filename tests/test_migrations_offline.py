@@ -143,3 +143,29 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
         "CREATE INDEX IF NOT EXISTS idx_approval_holds_conversation_id "
         "ON approval_holds (conversation_id)" in result.stdout
     )
+    # e73892f01b89 (TECH-5735): kind + target_agent_id on approval_holds.
+    assert (
+        "ALTER TABLE approval_holds ADD COLUMN IF NOT EXISTS kind TEXT DEFAULT 'message' NOT NULL"
+        in result.stdout
+    )
+    assert "ALTER TABLE approval_holds ADD COLUMN IF NOT EXISTS target_agent_id UUID" in (
+        result.stdout
+    )
+    assert (
+        "ALTER TABLE approval_holds ADD CONSTRAINT approval_holds_target_agent_id_fkey "
+        "FOREIGN KEY(target_agent_id) REFERENCES agents (id)" in result.stdout
+    )
+    assert (
+        "ALTER TABLE approval_holds ADD CONSTRAINT ck_approval_holds_kind "
+        "CHECK (kind IN ('message', 'invite'))" in result.stdout
+    )
+    assert (
+        "ALTER TABLE approval_holds ADD CONSTRAINT ck_approval_holds_invite_target_agent_id "
+        "CHECK (kind != 'invite' OR target_agent_id IS NOT NULL)" in result.stdout
+    )
+    # b2bb6ccde02e (TECH-5735): partial index backing
+    # service._conversation_has_note_history.
+    assert (
+        "CREATE INDEX IF NOT EXISTS idx_messages_conversation_id_note "
+        "ON messages (conversation_id) WHERE type = 'note'" in result.stdout
+    )

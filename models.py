@@ -480,7 +480,7 @@ class ApprovalHold(Base):
     target_agent_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("agents.id"), nullable=True
     )
-    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'message'"))
     # Snapshotted from the sender's (or, for kind="invite", the inviter's)
     # verified owner_sub claim at hold-creation time (fallback:
     # agents.owner_sub) -- see the class docstring and

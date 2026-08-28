@@ -3706,31 +3706,49 @@ async def decide_hold(
                 target=target,
                 ownership_client=ownership_client,
             )
-        except (AccessDeniedError, AgentRetiredError):
+        except (AccessDeniedError, AgentRetiredError) as exc:
+            if getattr(exc, "reason", None) == "denied.ownership_unverified":
+                # A transient ownership-lookup infra failure (registry
+                # timeout, 5xx), not genuine target drift -- distinguished
+                # from the other AccessDeniedError reasons
+                # (denied.unknown_agent / denied.shared_agent_not_allowed_internal
+                # / denied.owner_set_frozen) and from AgentRetiredError,
+                # none of which this string ever matches. Leave the hold
+                # `pending_human` so a human can retry the approval once
+                # the lookup succeeds again -- auto-resolving it here would
+                # destroy a still-valid invite over what may be a momentary
+                # outage, not a real reason to reject it.
+                raise
             # Same stranded-hold concern as the already-participant branch
-            # above: any of the three re-validation checks failing means
-            # the target drifted out of eligibility during this hold's
-            # pending_human window. `_deny`/`_deny_agent_retired` already
-            # audited and committed the specific denial reason and raised
-            # -- this additionally resolves the HOLD itself to a terminal
-            # state (instead of leaving it pending_human until TTL expiry)
-            # before letting the original exception propagate, so the
-            # approver's client sees the real reason for the failure
-            # while the hold still ends up somewhere a human can see it
-            # resolved rather than dangling.
-            hold.status = "rejected"
-            hold.decided_by_sub = approver_sub
-            hold.decided_at = _now()
-            hold.decision_reason = "target no longer eligible for admission on re-validation"
-            _audit(
-                session,
-                actor_sub=approver_sub,
-                action="approval.reject",
-                agent_id=hold.sender_agent_id,
-                conversation_id=conversation.id,
-                detail={"hold_id": str(hold_id), "reason": "revalidation_failed"},
-            )
-            await session.commit()
+            # above: any of the three re-validation checks genuinely
+            # failing means the target drifted out of eligibility during
+            # this hold's pending_human window. `_deny`/`_deny_agent_retired`
+            # already audited and committed the specific denial reason and
+            # raised -- that commit released this hold row's own
+            # `FOR UPDATE` lock (acquired above), opening a window for a
+            # concurrent `decide_hold` call on the SAME hold to resolve it
+            # first. Re-acquire the lock and only mutate if it's still
+            # `pending_human`; if a concurrent call already resolved it,
+            # leave that resolution alone (whatever it is) and just
+            # propagate this exception without a second, conflicting
+            # commit.
+            refreshed = await _find_hold(session, hold_id, for_update=True)
+            if refreshed is not None and refreshed.status == "pending_human":
+                refreshed.status = "rejected"
+                refreshed.decided_by_sub = approver_sub
+                refreshed.decided_at = _now()
+                refreshed.decision_reason = (
+                    "target no longer eligible for admission on re-validation"
+                )
+                _audit(
+                    session,
+                    actor_sub=approver_sub,
+                    action="approval.reject",
+                    agent_id=hold.sender_agent_id,
+                    conversation_id=conversation.id,
+                    detail={"hold_id": str(hold_id), "reason": "revalidation_failed"},
+                )
+                await session.commit()
             raise
         participant = Participant(
             conversation_id=conversation.id,

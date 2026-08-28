@@ -2869,6 +2869,151 @@ class TestInviteRequiresApprovalForNoteHistory:
         ).scalar_one_or_none()
         assert participant is None
 
+    async def test_invite_hold_approve_ownership_lookup_failure_leaves_hold_pending(
+        self, session: AsyncSession
+    ) -> None:
+        """A transient ownership-lookup failure at re-validation time
+        (registry timeout, 5xx) is NOT the same thing as genuine target
+        drift -- Argus round-3 finding: the earlier version of this except
+        block rejected the hold on ANY AccessDeniedError, including this
+        infra-failure case, destroying a still-valid invite over what may
+        be a momentary outage. It must stay `pending_human` so a human can
+        retry once the lookup succeeds again."""
+        owner, _target, conversation, client = await self._conversation_with_note(
+            session, "invite-hold-owner-7", "invite-hold-target-7"
+        )
+        new_agent = await _register(session, "invite-hold-new-7")
+        client._owners_by_agent_id[new_agent.id] = {"is_shared": False, "owners": ["dan"]}
+        hold = await invite(
+            session,
+            actor_sub=owner.sub,
+            inviter_agent_id=owner.id,
+            conversation_id=conversation.id,
+            target_agent_id=new_agent.id,
+            ownership_client=client,
+        )
+        assert isinstance(hold, ApprovalHold)
+
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await decide_hold(
+                session,
+                approver_sub=owner.owner_sub,
+                hold_id=hold.id,
+                decision="approve",
+                reason=None,
+                ownership_client=_FailingOwnershipClient(),
+            )
+        assert exc_info.value.reason == "denied.ownership_unverified"
+
+        await session.refresh(hold)
+        assert hold.status == "pending_human"
+        assert hold.decision_reason is None
+
+    async def test_invite_hold_approve_owner_set_changed_rejects_hold_not_stranded(
+        self, session: AsyncSession
+    ) -> None:
+        """The third re-validation drift axis (owner set changed, not
+        is_shared): the target's owner set no longer equals the
+        conversation's frozen snapshot by decision time, so
+        `_authorize_invite_owner_freeze` denies `denied.owner_set_frozen`
+        -- and, same as the other two drift axes, the hold must resolve to
+        `rejected` rather than strand `pending_human`."""
+        owner, _target, conversation, client = await self._conversation_with_note(
+            session, "invite-hold-owner-8", "invite-hold-target-8"
+        )
+        new_agent = await _register(session, "invite-hold-new-8")
+        client._owners_by_agent_id[new_agent.id] = {"is_shared": False, "owners": ["dan"]}
+        hold = await invite(
+            session,
+            actor_sub=owner.sub,
+            inviter_agent_id=owner.id,
+            conversation_id=conversation.id,
+            target_agent_id=new_agent.id,
+            ownership_client=client,
+        )
+        assert isinstance(hold, ApprovalHold)
+
+        # Drift: the target's owner set no longer equals the frozen
+        # snapshot (still non-shared -- isolates the equality predicate).
+        client._owners_by_agent_id[new_agent.id] = {"is_shared": False, "owners": ["someone-else"]}
+
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await decide_hold(
+                session,
+                approver_sub=owner.owner_sub,
+                hold_id=hold.id,
+                decision="approve",
+                reason=None,
+                ownership_client=client,
+            )
+        assert exc_info.value.reason == "denied.owner_set_frozen"
+
+        await session.refresh(hold)
+        assert hold.status == "rejected"
+        assert hold.decision_reason is not None
+
+        participant = (
+            await session.execute(
+                select(Participant).where(
+                    Participant.conversation_id == conversation.id,
+                    Participant.agent_id == new_agent.id,
+                )
+            )
+        ).scalar_one_or_none()
+        assert participant is None
+
+    async def test_invite_hold_approve_target_deactivated_rejects_hold_not_stranded(
+        self, session: AsyncSession
+    ) -> None:
+        """The target agent's own `status` (board-level, not the registry's
+        retirement flag `_is_active_safe` checks) can also change to
+        non-`active` during the hold's pending window -- `denied.unknown_agent`
+        is the third `AccessDeniedError` reason routed through the same
+        except block; it must resolve the hold too, not just the
+        owner-set-frozen and already-participant cases."""
+        owner, _target, conversation, client = await self._conversation_with_note(
+            session, "invite-hold-owner-9", "invite-hold-target-9"
+        )
+        new_agent = await _register(session, "invite-hold-new-9")
+        client._owners_by_agent_id[new_agent.id] = {"is_shared": False, "owners": ["dan"]}
+        hold = await invite(
+            session,
+            actor_sub=owner.sub,
+            inviter_agent_id=owner.id,
+            conversation_id=conversation.id,
+            target_agent_id=new_agent.id,
+            ownership_client=client,
+        )
+        assert isinstance(hold, ApprovalHold)
+
+        new_agent.status = "suspended"
+        await session.flush()
+
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await decide_hold(
+                session,
+                approver_sub=owner.owner_sub,
+                hold_id=hold.id,
+                decision="approve",
+                reason=None,
+                ownership_client=client,
+            )
+        assert exc_info.value.reason == "denied.unknown_agent"
+
+        await session.refresh(hold)
+        assert hold.status == "rejected"
+        assert hold.decision_reason is not None
+
+        participant = (
+            await session.execute(
+                select(Participant).where(
+                    Participant.conversation_id == conversation.id,
+                    Participant.agent_id == new_agent.id,
+                )
+            )
+        ).scalar_one_or_none()
+        assert participant is None
+
 
 # --- get_conversation ----------------------------------------------------------
 

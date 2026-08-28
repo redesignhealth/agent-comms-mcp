@@ -78,13 +78,15 @@ def upgrade() -> None:
         sa.Column("target_agent_id", sa.UUID(), nullable=True),
         if_not_exists=True,
     )
-    # No explicit name: the other 3 FKs on this table were created without
-    # one (Postgres auto-named them `approval_holds_<col>_fkey`); an
-    # explicit name here would diverge from that convention and risk
-    # autogenerate emitting a spurious DROP+ADD pair against the ORM's own
-    # unnamed `ForeignKey("agents.id")` declaration.
+    # Explicit name matching exactly what Postgres's own default naming
+    # convention would produce (`<table>_<col>_fkey`, same as the other 3
+    # unnamed FKs on this table -- verified: `approval_holds_target_agent_id_fkey`).
+    # Pinned explicitly rather than left to `constraint_name=None` so
+    # `downgrade()`'s hardcoded `DROP CONSTRAINT` name is guaranteed to
+    # match even if a `naming_convention` is later added to `Base.metadata`
+    # and changes what an unnamed `create_foreign_key` would generate.
     op.create_foreign_key(
-        None,
+        "approval_holds_target_agent_id_fkey",
         "approval_holds",
         "agents",
         ["target_agent_id"],
