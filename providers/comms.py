@@ -182,11 +182,32 @@ async def _resolve_caller_agent(session: Any, sub: str, token: AccessToken | Non
     default) skips write-through entirely -- callers that don't have a
     token handy, or that intentionally don't want this side effect, are
     unaffected.
+
+    Raises ``ToolError`` if the resolved agent's ``status`` is
+    ``"suspended"`` (TECH-5736 follow-on): ``comms_deregister_agent`` is
+    meant to be a real kill switch, but this function -- called on every
+    read-path tool (``inbox``, ``get_conversation``, ``list_conversations``,
+    ...) to resolve the CALLER's own identity -- previously had no status
+    filter, so a suspended agent's still-unexpired token kept working for
+    every one of those calls. Suspension only blocked a suspended agent
+    from being a *target* in some paths, never from acting as a caller
+    itself, which defeated the point of deregistering it. This check is
+    specific to resolving the CALLER's identity -- ``comms_deregister_agent``
+    itself looks up its TARGET agent directly by ``agent_id``
+    (``service._find_agent_by_id``), never through this function, so an
+    admin whose own agent happens to be suspended can still deregister
+    someone else; this only blocks a suspended agent from using its own
+    token to keep acting on the board.
     """
     agent = await service.get_agent_by_sub(session, sub)
     if agent is None:
         raise ToolError(
             "not_registered: no board agent is bound to this caller yet — call comms_register first"
+        )
+    if agent.status == "suspended":
+        raise ToolError(
+            "agent_suspended: this agent has been deregistered (status=suspended) and "
+            "can no longer act on the board"
         )
     if token is not None and is_registry_backed_agent_token(token):
         await service.write_through_ownership(
@@ -436,11 +457,11 @@ async def register(
       one token. Appended to the token's verified sub
       (``"{base_sub}::{agent_key}"``) to produce a distinct board row.
       Technically optional (``None``/absent is itself a valid, distinct
-      key — the "bare base sub" identity), but treat it as REQUIRED in
+      key -- the "bare base sub" identity), but treat it as REQUIRED in
       practice for any deployment where more than one agent might ever
       share a token or a base identity: a live incident (TECH-5736)
       happened because a caller omitted it on a later call, which is NOT
-      a no-op — it doesn't re-bind the caller's existing identity, it
+      a no-op -- it doesn't re-bind the caller's existing identity, it
       silently registers an entirely SEPARATE one on the bare base sub.
       Always pass the SAME ``agent_key`` on every call for a given agent,
       from the very first registration onward. A different ``agent_key``
@@ -449,7 +470,7 @@ async def register(
       ``base_sub`` that already has one or more OTHER registered
       identities, it is rejected with ``identity_fork_detected`` (listing
       the existing sibling ``agent_key`` values) unless
-      ``confirm_new_identity=True`` is passed — see that parameter below.
+      ``confirm_new_identity=True`` is passed -- see that parameter below.
 
       The ``email`` claim fallback is gated on ``is_interactive_token``
       (``scopes.py``). For a token with no ``iss`` at all, that check and
@@ -491,13 +512,13 @@ async def register(
       GENUINELY SEPARATE identity for this base_sub" (TECH-5736). Only
       relevant when this call would otherwise create a new row for a
       ``base_sub`` that already has at least one other registered
-      identity under a different ``agent_key`` — the default (``False``)
+      identity under a different ``agent_key`` -- the default (``False``)
       rejects that with ``identity_fork_detected`` instead of silently
       creating it. Legitimate for the documented multi-agent-per-token
       use of ``agent_key``; almost always a mistake (an omitted/typoed
-      ``agent_key``) otherwise — pass it deliberately, per new identity,
+      ``agent_key``) otherwise -- pass it deliberately, per new identity,
       never as a blanket default. Requires only the baseline
-      ``comms:write`` scope, unlike ``is_shared=True`` above — deliberately
+      ``comms:write`` scope, unlike ``is_shared=True`` above -- deliberately
       not ``comms:admin``-gated: unlike ``is_shared``, this flag is not an
       admission-decision input (it affects no authorization path), and any
       caller with ``comms:write`` legitimately needs to be able to
@@ -510,7 +531,7 @@ async def register(
     Registering a NEW identity (this call's ``base_sub`` + ``agent_key``
     combination has no existing row) also fails with
     ``display_name_collision`` if ``display_name`` matches an already
-    board-active agent's, case-insensitively — regardless of whose
+    board-active agent's, case-insensitively -- regardless of whose
     identity that is. Not gated by ``confirm_new_identity``: that flag
     only concerns identity forking, not two unrelated agents ending up
     indistinguishable by name to anything (like a whitelist) that keys on
@@ -646,12 +667,12 @@ async def deregister_agent(agent_id: str) -> dict[str, Any]:
 
     Closes a gap the schema always supported (``AGENT_STATUSES`` has
     included ``"suspended"`` since the initial schema) but nothing ever
-    exercised until now — a stray, mis-registered row (e.g. one created by
+    exercised until now -- a stray, mis-registered row (e.g. one created by
     a caller omitting ``agent_key`` on ``comms_register`` -- see that
     tool's docstring) previously had NO way to be retired.
 
     Requires the caller's token to carry the ``comms:admin`` scope (or be
-    an interactive/Okta caller) — same gate as ``comms_set_agent_shared``.
+    an interactive/Okta caller) -- same gate as ``comms_set_agent_shared``.
     A caller without it gets the standard anti-enumeration
     ``access_denied`` error (the specific reason,
     ``denied.deregister_requires_elevated_scope``, is recorded only in the
@@ -660,7 +681,7 @@ async def deregister_agent(agent_id: str) -> dict[str, Any]:
     Idempotent: deregistering an already-``suspended`` agent succeeds
     again rather than erroring.
 
-    One-directional (suspend only) — there is no reactivate tool today.
+    One-directional (suspend only) -- there is no reactivate tool today.
 
     - ``agent_id``: UUID string from ``comms_list_agents``.
     """

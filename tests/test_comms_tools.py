@@ -1072,6 +1072,73 @@ class TestDeregisterAgent:
         )
         assert result["status"] == "suspended"
 
+    async def test_suspended_agent_loses_read_path_access(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """TECH-5736 suggestion: suspension is meant to be a real kill
+        switch, but before this fix, `_resolve_caller_agent` had no status
+        filter -- a suspended agent's still-unexpired token kept working
+        for every read-path tool (comms_inbox and friends) that resolves the
+        caller's own identity through it. Confirms comms_inbox now rejects a
+        suspended caller instead of quietly serving it."""
+        registered = await _register(main, test_session_factory, "kill-switch-target-mcp")
+
+        admin_token = _token(
+            "admin-operator-kill-switch-mcp", scopes=["comms:read", "comms:write", "comms:admin"]
+        )
+        await _call(
+            main,
+            test_session_factory,
+            admin_token,
+            "comms_deregister_agent",
+            {"agent_id": registered["agent_id"]},
+        )
+
+        with pytest.raises(ToolError, match="agent_suspended"):
+            await _call(
+                main,
+                test_session_factory,
+                _token("kill-switch-target-mcp"),
+                "comms_inbox",
+            )
+
+    async def test_admin_can_still_deregister_target_while_admins_own_agent_suspended(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """The caller-suspension check lives in `_resolve_caller_agent`,
+        which resolves the CALLER's own identity -- `comms_deregister_agent`
+        looks up its TARGET directly by `agent_id`
+        (`service._find_agent_by_id`), never through that function. An
+        admin whose own registered agent has been suspended must still be
+        able to deregister someone else -- the admin scope on the token is
+        what gates this tool, not the admin's own board-agent row."""
+        admin_registered = await _register(main, test_session_factory, "admin-self-suspended-mcp")
+        target = await _register(main, test_session_factory, "another-stray-agent-mcp")
+
+        admin_token = _token(
+            "admin-self-suspended-mcp", scopes=["comms:read", "comms:write", "comms:admin"]
+        )
+        # Suspend the admin's own agent row first.
+        await _call(
+            main,
+            test_session_factory,
+            admin_token,
+            "comms_deregister_agent",
+            {"agent_id": admin_registered["agent_id"]},
+        )
+
+        # The admin's token (comms:admin scope) can still deregister a
+        # different target -- the tool never resolves the admin's own agent
+        # row via _resolve_caller_agent.
+        result = await _call(
+            main,
+            test_session_factory,
+            admin_token,
+            "comms_deregister_agent",
+            {"agent_id": target["agent_id"]},
+        )
+        assert result["status"] == "suspended"
+
 
 # --- AXI empty-state / shape spot checks --------------------------------------------
 

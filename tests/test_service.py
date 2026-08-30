@@ -6798,6 +6798,56 @@ class TestDeregisterAgent:
         assert audited_agent_id == agent.id
         assert detail == {"sub": "stray-to-reregister"}
 
+    async def test_reregistering_a_suspended_sub_after_name_reclaimed_stays_denied(
+        self, session: AsyncSession
+    ) -> None:
+        """Regression for TECH-5736 item 2 (follow-on of item 1): before the
+        `AgentSuspendedError` guard, this exact sequence -- register A,
+        deregister A, register B with A's now-freed display_name, then
+        re-register A -- would have silently reactivated A as
+        status="active" while B, a DIFFERENT agent, already held the same
+        display_name, producing two simultaneously-active agents sharing one
+        display_name (the downstream-whitelist hazard DisplayNameCollisionError
+        exists to prevent). Confirms fixing item 1 (block suspended
+        reactivation) closes item 2 as well: A stays suspended, and B's claim
+        on the display_name is undisturbed."""
+        agent_a = await _register(session, "agent-a-reclaim", display_name="Shared Name")
+        await deregister_agent(
+            session, actor_sub="admin-operator", agent_id=agent_a.id, deregister_authorized=True
+        )
+
+        agent_b = await register_agent(
+            session,
+            sub="agent-b-reclaim",
+            base_sub="agent-b-reclaim",
+            owner_sub="agent-b-reclaim",
+            owner_email="agent-b-reclaim@example.com",
+            display_name="Shared Name",
+            accepted_types=sorted(MESSAGE_TYPES),
+        )
+        assert agent_b.status == "active"
+        assert agent_b.display_name == "Shared Name"
+
+        with pytest.raises(AgentSuspendedError) as exc_info:
+            await register_agent(
+                session,
+                sub="agent-a-reclaim",
+                base_sub="agent-a-reclaim",
+                owner_sub="agent-a-reclaim",
+                owner_email="agent-a-reclaim@example.com",
+                display_name="Shared Name",
+                accepted_types=sorted(MESSAGE_TYPES),
+            )
+        assert exc_info.value.sub == "agent-a-reclaim"
+
+        # A remains suspended; B is untouched and still the sole active
+        # holder of the display_name -- no two-active-agents-one-name state.
+        row_a = (await session.execute(select(Agent).where(Agent.id == agent_a.id))).scalar_one()
+        assert row_a.status == "suspended"
+        row_b = (await session.execute(select(Agent).where(Agent.id == agent_b.id))).scalar_one()
+        assert row_b.status == "active"
+        assert row_b.display_name == "Shared Name"
+
     async def test_deregistering_a_sibling_frees_up_plain_reregistration(
         self, session: AsyncSession
     ) -> None:

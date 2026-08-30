@@ -1338,6 +1338,19 @@ async def register_agent(
         # a stray sibling (the documented remediation path, DESIGN.md §5)
         # should actually free up plain re-registration afterward, matching
         # the display_name guard's own `status == "active"` scoping below.
+        #
+        # Accepted race (TECH-5736 suggestion, code-level only -- the
+        # display_name guard is separately getting a DB unique index; this
+        # sibling check is not): this is an application-level read-then-insert
+        # check with no DB constraint backing it. Two concurrent
+        # `register_agent` calls for genuinely new siblings under the same
+        # `base_sub` (both omitting `confirm_new_identity`) could both read
+        # zero existing siblings here, both pass this check, and both insert
+        # their own new row before either commits -- silently recreating the
+        # exact identity-fork this guard exists to catch, just for two rows
+        # created in the same instant instead of two calls spaced apart. Not
+        # closed by locking/a transaction here; documenting it rather than
+        # implying the check is airtight.
         sibling_subs = (
             (
                 await session.execute(
