@@ -1320,10 +1320,16 @@ class TestStartConversation:
     ) -> None:
         """TECH-5754 Argus round-1 catch: the list comprehension building
         ``HoldContext.participants`` from ``targets`` was only exercised
-        with a single target -- this covers N>1."""
+        with a single target -- this covers N>1.
+
+        Registered as "zzz-..."/"aaa-..." (Argus round-2 catch), not
+        insertion order, so the expected ``sub``-sorted order below is
+        non-vacuous: it only passes if the participants list is actually
+        sorted by ``sub``, not left in ``targets``' original (or `str(uuid)`)
+        order."""
         owner = await _register(session, "owner-open-note-multi-participants")
-        target_a = await _register(session, "target-a-open-note-multi-participants")
-        target_b = await _register(session, "target-b-open-note-multi-participants")
+        target_a = await _register(session, "zzz-open-note-multi-participants")
+        target_b = await _register(session, "aaa-open-note-multi-participants")
         recorder = _RecordingAutoApprover()
 
         await start_conversation(
@@ -1337,28 +1343,21 @@ class TestStartConversation:
             auto_approver=recorder,
         )
         assert recorder.captured_ctx is not None
-        # start_conversation sorts target_ids by str(uuid) before resolving
-        # targets (de-dup step, unrelated to this ticket) -- not
-        # insertion order, so the expected order here mirrors that sort
-        # rather than [target_a, target_b].
-        expected = sorted(
-            [
-                plugins.ParticipantInfo(
-                    agent_id=target_a.id,
-                    display_name=target_a.display_name,
-                    role="member",
-                    status="invited",
-                ),
-                plugins.ParticipantInfo(
-                    agent_id=target_b.id,
-                    display_name=target_b.display_name,
-                    role="member",
-                    status="invited",
-                ),
-            ],
-            key=lambda p: str(p.agent_id),
-        )
-        assert recorder.captured_ctx.participants == expected
+        # target_b's sub ("aaa-...") sorts before target_a's ("zzz-...").
+        assert recorder.captured_ctx.participants == [
+            plugins.ParticipantInfo(
+                agent_id=target_b.id,
+                display_name=target_b.display_name,
+                role="member",
+                status="invited",
+            ),
+            plugins.ParticipantInfo(
+                agent_id=target_a.id,
+                display_name=target_a.display_name,
+                role="member",
+                status="invited",
+            ),
+        ]
 
     async def test_task_decline_as_initial_message_denied(self, session: AsyncSession) -> None:
         """``task_decline`` is member-role-restricted, but the initiator's
@@ -2857,6 +2856,75 @@ class TestInviteRequiresApprovalForNoteHistory:
             )
         ]
 
+    async def test_invite_hold_context_participants_ordered_by_sub_for_n_greater_than_one(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-5754 Argus round-2 catch: `_divert_invite_for_approval`'s
+        new query had no N>1 coverage. Registered as "zzz-.../aaa-..." so
+        the sub-order assertion is non-vacuous."""
+        owner = await _register(session, "invite-hold-owner-ordering")
+        target_a = await _register(session, "zzz-invite-hold-target-ordering")
+        target_b = await _register(session, "aaa-invite-hold-target-ordering")
+        client = _FakeOwnershipClient(
+            {
+                owner.id: {"is_shared": False, "owners": ["dan"]},
+                target_a.id: {"is_shared": False, "owners": ["dan"]},
+                target_b.id: {"is_shared": False, "owners": ["dan"]},
+            }
+        )
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="internal",
+            target_agent_ids=[target_a.id, target_b.id],
+            initial_message=_request_payload(),
+            ownership_client=client,
+        )
+        await accept_invite(
+            session, actor_sub=target_a.sub, agent_id=target_a.id, conversation_id=conversation.id
+        )
+        await accept_invite(
+            session, actor_sub=target_b.sub, agent_id=target_b.id, conversation_id=conversation.id
+        )
+        await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="note",
+            payload={"text": "hello"},
+            ownership_client=client,
+        )
+        new_agent = await _register(session, "invite-hold-new-ordering")
+        client._owners_by_agent_id[new_agent.id] = {"is_shared": False, "owners": ["dan"]}
+        recorder = _RecordingAutoApprover()
+        await invite(
+            session,
+            actor_sub=owner.sub,
+            inviter_agent_id=owner.id,
+            conversation_id=conversation.id,
+            target_agent_id=new_agent.id,
+            ownership_client=client,
+            auto_approver=recorder,
+        )
+        assert recorder.captured_ctx is not None
+        # target_b's sub ("aaa-...") sorts before target_a's ("zzz-...").
+        assert recorder.captured_ctx.participants == [
+            plugins.ParticipantInfo(
+                agent_id=target_b.id,
+                display_name=target_b.display_name,
+                role="member",
+                status="active",
+            ),
+            plugins.ParticipantInfo(
+                agent_id=target_a.id,
+                display_name=target_a.display_name,
+                role="member",
+                status="active",
+            ),
+        ]
+
     async def test_invite_hold_cleared_by_auto_approver_creates_participant_inline(
         self, session: AsyncSession
     ) -> None:
@@ -3760,6 +3828,59 @@ class TestPostMessageBoundaryCrossing:
                 role="member",
                 status="active",
             )
+        ]
+
+    async def test_hold_context_participants_ordered_by_sub_for_n_greater_than_one(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-5754 Argus round-2 catch: the `.order_by(Agent.sub)` added
+        to `_check_boundary_crossing`'s participants query had no N>1
+        coverage -- a regression dropping that clause would pass the full
+        suite undetected with only one other participant. Registered as
+        "zzz-.../aaa-..." (sub-order the reverse of registration order) so
+        the assertion is non-vacuous."""
+        owner = await _register(session, "bc-ordering-owner")
+        target_a = await _register(session, "zzz-bc-ordering-target")
+        target_b = await _register(session, "aaa-bc-ordering-target")
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target_a.id, target_b.id],
+            initial_message=_request_payload(),
+        )
+        await accept_invite(
+            session, actor_sub=target_a.sub, agent_id=target_a.id, conversation_id=conversation.id
+        )
+        await accept_invite(
+            session, actor_sub=target_b.sub, agent_id=target_b.id, conversation_id=conversation.id
+        )
+        recorder = _RecordingAutoApprover()
+        await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="note",
+            payload={"text": "hello"},
+            auto_approver=recorder,
+        )
+        assert recorder.captured_ctx is not None
+        # target_b's sub ("aaa-...") sorts before target_a's ("zzz-...").
+        assert recorder.captured_ctx.participants == [
+            plugins.ParticipantInfo(
+                agent_id=target_b.id,
+                display_name=target_b.display_name,
+                role="member",
+                status="active",
+            ),
+            plugins.ParticipantInfo(
+                agent_id=target_a.id,
+                display_name=target_a.display_name,
+                role="member",
+                status="active",
+            ),
         ]
 
     async def test_second_lookup_failure_denied(self, session: AsyncSession) -> None:

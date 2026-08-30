@@ -2162,6 +2162,12 @@ async def start_conversation(
             auto_approver=auto_approver,
             # TECH-5754: `targets` are the just-inserted `role="member",
             # status="invited"` participant rows above -- no query needed.
+            # Sorted by `target.sub` (Argus round-2 catch), not left in
+            # `targets`' own str(uuid) order (see the sort at target_ids'
+            # de-dup above) -- matches the `.order_by(Agent.sub)` the other
+            # two producer sites use, so a downstream ordering-sensitive
+            # consumer (TECH-5755's LLM judge) sees one consistent key
+            # across every hold type, not two different ones.
             participants=[
                 ParticipantInfo(
                     agent_id=target.id,
@@ -2169,7 +2175,7 @@ async def start_conversation(
                     role="member",
                     status="invited",
                 )
-                for target in targets
+                for target in sorted(targets, key=lambda t: t.sub)
             ],
         )
         _audit(
@@ -3359,7 +3365,7 @@ async def _divert_invite_for_approval(
     # query, same active/invited shape _check_boundary_crossing uses.
     participant_rows = (
         await session.execute(
-            select(Participant.status, Participant.role, Agent.id, Agent.display_name)
+            select(Agent.id, Participant.status, Participant.role, Agent.display_name)
             .join(Agent, Agent.id == Participant.agent_id)
             .where(
                 Participant.conversation_id == conversation.id,
@@ -3383,7 +3389,7 @@ async def _divert_invite_for_approval(
         risk_reason=INVITE_HOLD_RISK_REASON,
         participants=[
             ParticipantInfo(agent_id=agent_id, display_name=display_name, role=role, status=status)
-            for status, role, agent_id, display_name in participant_rows
+            for agent_id, status, role, display_name in participant_rows
         ],
     )
     decision = await auto_approver.review(ctx)

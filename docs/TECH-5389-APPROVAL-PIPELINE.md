@@ -199,7 +199,15 @@ stays light and the expensive judgment belongs here.)
 participants — who this hold's message is actually addressed to, or who is
 already in the conversation being invited into. Always excludes the
 sender/inviter itself. Additive: existing `AutoApprover` implementations
-ignore it.
+ignore it. Sorted by `Agent.sub` on every path (deterministic, matching the
+sibling `get_hold_conversation_participants`/`get_conversation` HTTP
+surfaces) — important for an ordering-sensitive downstream consumer (e.g. an
+LLM-judge AutoApprover) to get a stable, cacheable prompt across repeated
+holds. Also note `ParticipantInfo` is field-name-compatible with, but not
+identical to, `get_hold_conversation_participants`'s HTTP response entries:
+that endpoint includes the sender/inviter (this never does), and its
+`agent_id` is a `str` (here it's a `uuid.UUID`) — see `plugins.py`'s
+`ParticipantInfo` docstring.
 
 **v1 implementation `EscalateAllAutoApprover` ("escalate_all")**: returns
 `cleared=False` unconditionally. Invoked inline, for real, in the `post_message`
