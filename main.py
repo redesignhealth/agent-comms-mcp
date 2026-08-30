@@ -508,7 +508,9 @@ async def get_hold_conversation(request: Request) -> Response:
     """Participant list ("To") for one pending hold's conversation
     (TECH-5751) -- same auth gate as the decide endpoint. Unknown-hold and
     not-your-hold are a uniform 404 (anti-enumeration, matching
-    ``decide_approval``/``list_pending_approvals``).
+    ``decide_approval``/``list_pending_approvals``). Scoped to a still-
+    pending hold, same as the decide endpoint: 410 if expired, 409 if
+    already decided or still awaiting auto-review.
     """
     approver_sub, status = await _authenticate_approval_caller(request)
     if approver_sub is None:
@@ -527,6 +529,17 @@ async def get_hold_conversation(request: Request) -> Response:
             )
         except AccessDeniedError:
             return JSONResponse(_UNIFORM_HOLD_NOT_FOUND, status_code=404)
+        except HoldExpiredError:
+            return JSONResponse({"error": "expired"}, status_code=410)
+        except HoldAwaitingAutoReviewError:
+            return JSONResponse({"error": "awaiting_auto_review"}, status_code=409)
+        except HoldAlreadyDecidedError as exc:
+            return JSONResponse({"error": "already_decided", "status": exc.status}, status_code=409)
+        except RuntimeError:
+            logger.exception(
+                "get_hold_conversation_participants invariant violation for hold_id=%s", hold_id
+            )
+            return JSONResponse({"error": "internal_error"}, status_code=500)
 
     return JSONResponse(result, status_code=200)
 

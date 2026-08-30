@@ -3567,6 +3567,18 @@ async def get_hold_conversation_participants(
     read-only participant metadata only, no message content, and no
     ``last_read_seq`` mutation -- a human glancing at "who is this message
     to" must never advance an AGENT's own read cursor as a side effect.
+
+    Scoped to a still-``pending_human`` hold, mirroring ``decide_hold``'s
+    own status gate: raises ``HoldExpiredError`` if lazy TTL expiry fires
+    on this touch, ``HoldAwaitingAutoReviewError`` if still
+    ``pending_auto`` (unreachable in v1), and ``HoldAlreadyDecidedError``
+    if already approved/rejected -- the "To" list is for a hold a human is
+    actively about to decide, not a stale snapshot of one that already
+    resolved (the very next ``decide`` call would 410/409/409 on it
+    anyway). Only ``active``/``invited``
+    participants are returned -- a ``left``/``declined`` agent is no longer
+    a real recipient, and showing one would mislead the approving human
+    about who the message is actually going to.
     """
     hold = await _find_hold(session, hold_id)
     if hold is None:
@@ -3585,12 +3597,24 @@ async def get_hold_conversation_participants(
             detail={"attempted_hold_id": str(hold_id)},
         )
     _maybe_expire_hold(session, approver_sub, hold)
+    if hold.status == "expired":
+        await session.commit()
+        raise HoldExpiredError
+    if hold.status == "pending_auto":
+        await session.commit()
+        raise HoldAwaitingAutoReviewError
+    if hold.status != "pending_human":
+        await session.commit()
+        raise HoldAlreadyDecidedError(hold.status)
 
     part_rows = (
         await session.execute(
             select(Participant, Agent)
             .join(Agent, Agent.id == Participant.agent_id)
-            .where(Participant.conversation_id == hold.conversation_id)
+            .where(
+                Participant.conversation_id == hold.conversation_id,
+                Participant.status.in_(("active", "invited")),
+            )
             .order_by(Agent.sub)
         )
     ).all()

@@ -832,6 +832,61 @@ class TestHoldConversationEndpoint:
         assert resp.status_code == 404
         assert resp.json() == {"error": "not_found"}
 
+    async def test_agent_jwt_token_returns_403_even_with_comms_admin_scope(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        """Same structural gate as TestAuthGate's identically-named test on
+        /approvals/pending -- this route shares _authenticate_approval_caller,
+        but Argus round-1 flagged that the gate had no per-route regression
+        test of its own."""
+        http_client, provider = client
+        provider.tokens["agent-token"] = _agent_jwt_token(
+            "some-agent-sub", scopes=["comms:admin", "comms:read", "comms:write"]
+        )
+        resp = await http_client.get(
+            f"/approvals/{uuid.uuid4()}/conversation",
+            headers={"Authorization": "Bearer agent-token"},
+        )
+        assert resp.status_code == 403
+
+    async def test_expired_hold_returns_410(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        http_client, provider = client
+        _sender, hold = await _make_hold(
+            session,
+            sender_owner_sub="owner-expired@example.com",
+            expires_at=datetime.now(UTC) - timedelta(seconds=1),
+        )
+        provider.tokens["human-token"] = _interactive_token("owner-expired@example.com")
+
+        resp = await http_client.get(
+            f"/approvals/{hold.id}/conversation",
+            headers={"Authorization": "Bearer human-token"},
+        )
+        assert resp.status_code == 410
+        assert resp.json() == {"error": "expired"}
+
+    async def test_already_decided_hold_returns_409(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        http_client, provider = client
+        _sender, hold = await _make_hold(
+            session, sender_owner_sub="owner-decided@example.com", status="rejected"
+        )
+        provider.tokens["human-token"] = _interactive_token("owner-decided@example.com")
+
+        resp = await http_client.get(
+            f"/approvals/{hold.id}/conversation",
+            headers={"Authorization": "Bearer human-token"},
+        )
+        assert resp.status_code == 409
+        assert resp.json() == {"error": "already_decided", "status": "rejected"}
+
     async def test_returns_participants_for_the_holds_conversation(
         self,
         client: tuple[httpx.AsyncClient, _FakeAuthProvider],
@@ -860,7 +915,7 @@ class TestHoldConversationEndpoint:
                 conversation_id=hold.conversation_id,
                 agent_id=recipient.id,
                 role="member",
-                status="active",
+                status="invited",
             )
         )
         await session.commit()
@@ -873,11 +928,81 @@ class TestHoldConversationEndpoint:
         assert resp.status_code == 200
         body = resp.json()
         assert body["conversation_id"] == str(hold.conversation_id)
-        display_names = {p["display_name"] for p in body["participants"]}
-        assert display_names == {"hold sender", "hold recipient"}
+        participants_by_name = {p["display_name"]: p for p in body["participants"]}
+        assert set(participants_by_name) == {"hold sender", "hold recipient"}
+        assert participants_by_name["hold sender"] == {
+            "agent_id": str(sender.id),
+            "display_name": "hold sender",
+            "role": "member",
+            "status": "active",
+        }
+        assert participants_by_name["hold recipient"] == {
+            "agent_id": str(recipient.id),
+            "display_name": "hold recipient",
+            "role": "member",
+            "status": "invited",
+        }
         # No message content, no read-cursor field -- this endpoint is
         # participant metadata only (TECH-5751's narrower scope vs.
         # comms_get_conversation).
         assert "messages" not in body
         for participant in body["participants"]:
             assert "last_read_seq" not in participant
+
+    async def test_excludes_left_and_declined_participants(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        http_client, provider = client
+        sender, hold = await _make_hold(session, sender_owner_sub="owner-departed@example.com")
+        left_agent = await register_agent(
+            session,
+            sub=f"hold-left-{uuid.uuid4()}",
+            owner_sub="owner-left@example.com",
+            owner_email="owner-left@example.com",
+            display_name="left agent",
+            accepted_types=["note"],
+        )
+        declined_agent = await register_agent(
+            session,
+            sub=f"hold-declined-{uuid.uuid4()}",
+            owner_sub="owner-declined@example.com",
+            owner_email="owner-declined@example.com",
+            display_name="declined agent",
+            accepted_types=["note"],
+        )
+        session.add(
+            Participant(
+                conversation_id=hold.conversation_id,
+                agent_id=sender.id,
+                role="member",
+                status="active",
+            )
+        )
+        session.add(
+            Participant(
+                conversation_id=hold.conversation_id,
+                agent_id=left_agent.id,
+                role="member",
+                status="left",
+            )
+        )
+        session.add(
+            Participant(
+                conversation_id=hold.conversation_id,
+                agent_id=declined_agent.id,
+                role="member",
+                status="declined",
+            )
+        )
+        await session.commit()
+        provider.tokens["human-token"] = _interactive_token("owner-departed@example.com")
+
+        resp = await http_client.get(
+            f"/approvals/{hold.id}/conversation",
+            headers={"Authorization": "Bearer human-token"},
+        )
+        assert resp.status_code == 200
+        display_names = {p["display_name"] for p in resp.json()["participants"]}
+        assert display_names == {"hold sender"}

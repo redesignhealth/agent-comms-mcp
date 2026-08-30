@@ -39,6 +39,8 @@ import service as _service
 from exceptions import (
     AccessDeniedError,
     AgentRetiredError,
+    HoldAlreadyDecidedError,
+    HoldExpiredError,
     InvalidConversationStateError,
     RateLimitExceededError,
     SchemaVersionMismatchError,
@@ -4927,6 +4929,118 @@ class TestListPendingApprovalHolds:
         # The still-pending `newest` hold exists but is not surfaced this call.
         assert result == {"holds": [], "has_more": False}
         assert newest.status == "pending_human"
+
+
+# --- get_hold_conversation_participants --------------------------------------------
+
+
+class TestGetHoldConversationParticipants:
+    """``GET /approvals/{hold_id}/conversation`` (TECH-5751/TECH-5752)'s
+    service layer -- previously only exercised indirectly via
+    test_approval_endpoint.py's HTTP integration tests, which don't cover
+    query-level behavior (join correctness, the active/invited filter,
+    or the status gate) independent of the HTTP error mapping."""
+
+    async def _make_hold_via_diversion(
+        self, session: AsyncSession, *, owner_suffix: str
+    ) -> tuple[Agent, Agent, ApprovalHold]:
+        owner = await _register(session, f"gc-owner-{owner_suffix}")
+        target = await _register(session, f"gc-target-{owner_suffix}")
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="note",
+            payload={"text": "hello"},
+        )
+        hold = (
+            await session.execute(
+                select(ApprovalHold).where(ApprovalHold.sender_agent_id == owner.id)
+            )
+        ).scalar_one()
+        assert hold.status == "pending_human"
+        return owner, target, hold
+
+    async def test_happy_path_returns_active_and_invited_participants(
+        self, session: AsyncSession
+    ) -> None:
+        owner, target, hold = await self._make_hold_via_diversion(session, owner_suffix="happy")
+
+        result = await _service.get_hold_conversation_participants(
+            session, approver_sub=owner.owner_sub, hold_id=hold.id
+        )
+
+        assert result["conversation_id"] == str(hold.conversation_id)
+        participants_by_id = {p["agent_id"]: p for p in result["participants"]}
+        assert set(participants_by_id) == {str(owner.id), str(target.id)}
+        assert participants_by_id[str(owner.id)]["status"] == "active"
+        # target accepted the invite in _make_hold_via_diversion, so it's
+        # active too -- see test_excludes_left_and_declined_participants
+        # below for the filtered-out statuses.
+        assert participants_by_id[str(target.id)]["status"] == "active"
+
+    async def test_excludes_left_and_declined_participants(self, session: AsyncSession) -> None:
+        owner, target, hold = await self._make_hold_via_diversion(session, owner_suffix="excl")
+        await leave(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=hold.conversation_id
+        )
+
+        result = await _service.get_hold_conversation_participants(
+            session, approver_sub=owner.owner_sub, hold_id=hold.id
+        )
+
+        assert {p["agent_id"] for p in result["participants"]} == {str(owner.id)}
+
+    async def test_unknown_hold_raises_access_denied(self, session: AsyncSession) -> None:
+        owner = await _register(session, "gc-owner-unknown")
+
+        with pytest.raises(AccessDeniedError):
+            await _service.get_hold_conversation_participants(
+                session, approver_sub=owner.owner_sub, hold_id=uuid.uuid4()
+            )
+
+    async def test_not_your_hold_raises_access_denied(self, session: AsyncSession) -> None:
+        _owner, _target, hold = await self._make_hold_via_diversion(session, owner_suffix="notmine")
+        other = await _register(session, "gc-owner-other")
+
+        with pytest.raises(AccessDeniedError):
+            await _service.get_hold_conversation_participants(
+                session, approver_sub=other.owner_sub, hold_id=hold.id
+            )
+
+    async def test_expired_hold_raises_hold_expired(self, session: AsyncSession) -> None:
+        owner, _target, hold = await self._make_hold_via_diversion(session, owner_suffix="expired")
+        hold.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+
+        with pytest.raises(HoldExpiredError):
+            await _service.get_hold_conversation_participants(
+                session, approver_sub=owner.owner_sub, hold_id=hold.id
+            )
+
+    async def test_already_decided_hold_raises_hold_already_decided(
+        self, session: AsyncSession
+    ) -> None:
+        owner, _target, hold = await self._make_hold_via_diversion(session, owner_suffix="decided")
+        hold.status = "rejected"
+        await session.commit()
+
+        with pytest.raises(HoldAlreadyDecidedError):
+            await _service.get_hold_conversation_participants(
+                session, approver_sub=owner.owner_sub, hold_id=hold.id
+            )
 
 
 # --- expiry -----------------------------------------------------------------------
