@@ -3553,6 +3553,91 @@ async def list_pending_approval_holds(
     return {"holds": holds, "has_more": has_more}
 
 
+async def get_hold_conversation_participants(
+    session: AsyncSession, *, approver_sub: str, hold_id: uuid.UUID
+) -> dict[str, Any]:
+    """``GET /approvals/{hold_id}/conversation`` (main.py, non-MCP,
+    interactive+owner-gated): the participant list for one pending hold's
+    conversation, for the decision page's "To" display (TECH-5751).
+
+    Same ownership gate as ``decide_hold`` (uniform ``AccessDeniedError``,
+    ``denied.unknown_hold`` / ``denied.hold_not_owner`` -- the caller's
+    verified sub must equal the hold's own ``owner_sub`` snapshot, not a
+    live join), but deliberately narrower than ``get_conversation``:
+    read-only participant metadata only, no message content, and no
+    ``last_read_seq`` mutation -- a human glancing at "who is this message
+    to" must never advance an AGENT's own read cursor as a side effect.
+
+    Scoped to a still-``pending_human`` hold, mirroring ``decide_hold``'s
+    own status gate (and its ``for_update=True`` lock on ``_find_hold`` --
+    without it, this read-then-write-status call can race a concurrent
+    ``decide`` and lose-update its just-approved/rejected row back to
+    ``expired``): raises ``HoldExpiredError`` if lazy TTL expiry fires on
+    this touch, ``HoldAwaitingAutoReviewError`` if still ``pending_auto``
+    (unreachable in v1), and ``HoldAlreadyDecidedError`` if already
+    approved/rejected -- the "To" list is for a hold a human is actively
+    about to decide, not a stale snapshot of one that already resolved
+    (the very next ``decide`` call would 410/409/409 on it anyway). Only
+    ``active``/``invited`` participants are returned -- a
+    ``left``/``declined`` agent is no longer a real recipient, and showing
+    one would mislead the approving human about who the message is
+    actually going to.
+    """
+    hold = await _find_hold(session, hold_id, for_update=True)
+    if hold is None:
+        await _deny(
+            session,
+            actor_sub=approver_sub,
+            action="denied.unknown_hold",
+            detail={"attempted_hold_id": str(hold_id)},
+        )
+    if hold.owner_sub != approver_sub:
+        await _deny(
+            session,
+            actor_sub=approver_sub,
+            action="denied.hold_not_owner",
+            conversation_id=hold.conversation_id,
+            detail={"attempted_hold_id": str(hold_id)},
+        )
+    _maybe_expire_hold(session, approver_sub, hold)
+    if hold.status == "expired":
+        await session.commit()
+        raise HoldExpiredError
+    if hold.status == "pending_auto":
+        await session.commit()
+        raise HoldAwaitingAutoReviewError
+    if hold.status != "pending_human":
+        await session.commit()
+        raise HoldAlreadyDecidedError(hold.status)
+
+    conversation = await _find_conversation(session, hold.conversation_id)
+    if conversation is None:
+        raise RuntimeError(f"invariant violation: hold {hold_id} references a missing conversation")
+
+    part_rows = (
+        await session.execute(
+            select(Participant, Agent)
+            .join(Agent, Agent.id == Participant.agent_id)
+            .where(
+                Participant.conversation_id == hold.conversation_id,
+                Participant.status.in_(("active", "invited")),
+            )
+            .order_by(Agent.sub)
+        )
+    ).all()
+    participants = [
+        {
+            "agent_id": str(a.id),
+            "display_name": a.display_name,
+            "role": p.role,
+            "status": p.status,
+        }
+        for p, a in part_rows
+    ]
+    await session.commit()
+    return {"conversation_id": str(hold.conversation_id), "participants": participants}
+
+
 async def decide_hold(
     session: AsyncSession,
     *,
