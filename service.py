@@ -2164,8 +2164,8 @@ async def start_conversation(
             # status="invited"` participant rows above -- no query needed.
             # Sorted by `target.sub` (Argus round-2 catch), not left in
             # `targets`' own str(uuid) order (see the sort at target_ids'
-            # de-dup above) -- matches the `.order_by(Agent.sub)` the other
-            # two producer sites use, so a downstream ordering-sensitive
+            # de-dup above) -- matches the `.order_by(Agent.sub.collate("C"))`
+            # the other two producer sites use, so a downstream ordering-sensitive
             # consumer (TECH-5755's LLM judge) sees one consistent key
             # across every hold type, not two different ones.
             participants=[
@@ -3047,19 +3047,20 @@ async def _check_boundary_crossing(
                 Participant.status.in_(("active", "invited")),
             )
             # Deterministic HoldContext.participants ordering (TECH-5754
-            # Argus round-1 catch), matching the sibling
-            # get_hold_conversation_participants/get_conversation queries --
-            # without this, identical holds could see different participant
-            # orderings across requests, causing prompt-cache misses (and
-            # potentially unstable judgments) for a downstream LLM-judge
-            # AutoApprover consuming this field.
+            # Argus round-1 catch) -- without this, identical holds could
+            # see different participant orderings across requests, causing
+            # prompt-cache misses (and potentially unstable judgments) for
+            # a downstream LLM-judge AutoApprover consuming this field.
             # collate("C") (Argus round-3 catch): plain .order_by(Agent.sub)
             # sorts under Postgres's configured locale, which can order
             # mixed-case subs differently than start_conversation's Python
             # `sorted(targets, key=lambda t: t.sub)` (always codepoint
             # order) -- pinning the SQL side to byte/codepoint order keeps
             # every HoldContext.participants producer path on the exact
-            # same comparator, not just "each individually deterministic."
+            # same comparator. NOTE (Argus round-4 catch): this does NOT
+            # match get_hold_conversation_participants/get_conversation
+            # below, which query without a COLLATE pin -- see
+            # TECH-5389-APPROVAL-PIPELINE.md's participants section.
             .order_by(Agent.sub.collate("C"))
         )
     ).all()

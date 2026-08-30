@@ -2925,6 +2925,80 @@ class TestInviteRequiresApprovalForNoteHistory:
             ),
         ]
 
+    async def test_invite_hold_context_participants_ordered_by_codepoint_not_db_locale(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-5754 Argus round-4 catch: the sibling `post_message` ordering
+        test uses a mixed-case sub pair to distinguish Python codepoint
+        order from a locale-aware DB collation, but this invite-hold path's
+        own ordering test used all-lowercase subs, which sort identically
+        under any collation -- a regression dropping `.collate("C"))` from
+        `_divert_invite_for_approval`'s query would have passed undetected."""
+        owner = await _register(session, "invite-hold-owner-collation")
+        target_a = await _register(session, "alice-invite-hold-target-collation")
+        target_b = await _register(session, "Zed-invite-hold-target-collation")
+        client = _FakeOwnershipClient(
+            {
+                owner.id: {"is_shared": False, "owners": ["dan"]},
+                target_a.id: {"is_shared": False, "owners": ["dan"]},
+                target_b.id: {"is_shared": False, "owners": ["dan"]},
+            }
+        )
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="internal",
+            target_agent_ids=[target_a.id, target_b.id],
+            initial_message=_request_payload(),
+            ownership_client=client,
+        )
+        await accept_invite(
+            session, actor_sub=target_a.sub, agent_id=target_a.id, conversation_id=conversation.id
+        )
+        await accept_invite(
+            session, actor_sub=target_b.sub, agent_id=target_b.id, conversation_id=conversation.id
+        )
+        await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="note",
+            payload={"text": "hello"},
+            ownership_client=client,
+        )
+        new_agent = await _register(session, "invite-hold-new-collation")
+        client._owners_by_agent_id[new_agent.id] = {"is_shared": False, "owners": ["dan"]}
+        recorder = _RecordingAutoApprover()
+        await invite(
+            session,
+            actor_sub=owner.sub,
+            inviter_agent_id=owner.id,
+            conversation_id=conversation.id,
+            target_agent_id=new_agent.id,
+            ownership_client=client,
+            auto_approver=recorder,
+        )
+        assert recorder.captured_ctx is not None
+        # "Zed-..." sorts before "alice-..." in codepoint order (uppercase
+        # < lowercase) -- confirms `.collate("C")` is actually pinning
+        # codepoint order rather than the DB's default locale.
+        assert recorder.captured_ctx.participants == [
+            plugins.ParticipantInfo(
+                agent_id=target_b.id,
+                display_name=target_b.display_name,
+                role="member",
+                status="active",
+            ),
+            plugins.ParticipantInfo(
+                agent_id=target_a.id,
+                display_name=target_a.display_name,
+                role="member",
+                status="active",
+            ),
+        ]
+
     async def test_invite_hold_cleared_by_auto_approver_creates_participant_inline(
         self, session: AsyncSession
     ) -> None:
@@ -3893,7 +3967,10 @@ class TestPostMessageBoundaryCrossing:
         `.order_by(Agent.sub.collate("C"))` exists specifically to prevent
         that -- this pins it down with subs that would sort oppositely
         under a case-insensitive-ish locale collation (uppercase "Z" < "a"
-        in codepoint order; most locale collations would put "alice" first)."""
+        in codepoint order; most locale collations would put "alice" first).
+        The owner is absent from both expected lists below -- also
+        confirms sender-exclusion holds under this ordering, not just the
+        plain zzz-/aaa- case."""
         owner = await _register(session, "bc-collation-owner")
         target_a = await _register(session, "alice-bc-collation-target")
         target_b = await _register(session, "Zed-bc-collation-target")
