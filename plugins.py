@@ -365,13 +365,20 @@ class ParticipantInfo(NamedTuple):
     active/invited participant including the sender/inviter, while this
     always EXCLUDES the sender/inviter (see ``HoldContext.participants``'s
     own docstring). Also note ``agent_id`` is a ``uuid.UUID`` here vs a
-    ``str`` in the HTTP response.
+    ``str`` in the HTTP response, and that response has no ``sub`` field
+    at all (``sub`` added here, TECH-5755, same reasoning as
+    ``HoldContext.sender_sub``: an ``AutoApprover`` that needs to map a
+    participant to an external system's own identity for that agent --
+    e.g. confirming a message recipient is a specific Arc site's
+    orchestrator bot -- has no DB session of its own to resolve
+    ``agent_id`` -> ``sub`` another way).
     """
 
     agent_id: uuid.UUID
     display_name: str
     role: str
     status: str
+    sub: str
 
 
 class HoldContext(NamedTuple):
@@ -403,9 +410,9 @@ class HoldContext(NamedTuple):
     session of its own (this Protocol's only input is this NamedTuple).
     Additive, same as ``participants``: existing implementations ignore
     it. Threaded straight through from the already-loaded sender ``Agent``
-    row at both call sites (``initiator``/``sender`` in ``service.py`` —
-    no extra query needed, same reasoning as ``participants``'s own
-    docstring above).
+    row at all three producer paths (``initiator``/``sender``/``inviter``
+    in ``service.py`` — no extra query needed, same reasoning as
+    ``participants``'s own docstring above).
     """
 
     hold_id: uuid.UUID

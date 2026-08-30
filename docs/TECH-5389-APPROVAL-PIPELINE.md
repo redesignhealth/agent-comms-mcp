@@ -211,9 +211,11 @@ pin), so don't assume byte-for-byte parity with those endpoints' ordering,
 only that every `HoldContext.participants` producer path agrees with each
 other. Also note `ParticipantInfo` is field-name-compatible with, but not
 identical to, `get_hold_conversation_participants`'s HTTP response entries:
-that endpoint includes the sender/inviter (this never does), and its
-`agent_id` is a `str` (here it's a `uuid.UUID`) — see `plugins.py`'s
-`ParticipantInfo` docstring.
+that endpoint includes the sender/inviter (this never does), its
+`agent_id` is a `str` (here it's a `uuid.UUID`), and it has no `sub` field
+at all (`ParticipantInfo.sub`, added TECH-5755 for the same reason as
+`HoldContext.sender_sub` below) — see `plugins.py`'s `ParticipantInfo`
+docstring.
 
 `sender_sub` (added TECH-5755): the sender/inviter's own `Agent.sub` —
 board-wide-unique, and for a real RH-internal bot the same string as its
@@ -224,7 +226,21 @@ can map a hold back to an external system's own identity for that agent
 without a DB session of its own — `review()`'s only input is this
 NamedTuple. Threaded straight through from the already-loaded sender
 `Agent` row at every producer path, same as `participants` above — no
-extra query.
+extra query. `ParticipantInfo.sub` (above) is the same idea applied to
+recipients rather than the sender: an `AutoApprover` that needs to confirm
+a specific *participant* is, say, a particular external system's own
+service identity (not just the sender) needs this too.
+
+**NamedTuple field-addition deployment ordering**: neither `participants`
+(TECH-5754) nor `sender_sub`/`ParticipantInfo.sub` (TECH-5755) have
+default values, so any external consumer that constructs `HoldContext`/
+`ParticipantInfo` directly (most plausibly `agent-comms-approvals`' own
+`AutoApprover` unit-test fixtures) gets a loud `TypeError` the moment it
+picks up a version of this repo with a field it doesn't yet pass — this
+repo must deploy (or at least merge, for a same-day pairing) before a
+consumer updates its own fixtures to match. A sentinel default is
+deliberately not used instead: a defaulted `sender_sub=""` would silently
+break the Arc `bot_id` mapping rather than fail loudly.
 
 **v1 implementation `EscalateAllAutoApprover` ("escalate_all")**: returns
 `cleared=False` unconditionally. Invoked inline, for real, in the `post_message`
@@ -733,7 +749,7 @@ resolution logic is shared (factored so both call sites use one implementation).
   path — §1's resolution rule verbatim. `MultiAuth(verifiers=[...])` already takes a
   list (auth.py's own docstring documents trial order: OIDCProxy first, then each
   verifier), so **coexistence and replacement both fall out of the same knob**:
-  `AGENT_TOKEN_VERIFIERS=agent_jwt_hs256,rh_comms_plugins.auth:BotKeyVerifier` runs the
+  `AGENT_TOKEN_VERIFIERS=agent_jwt_hs256,rh_comms_plugins.auth:build_rh_agent_verifier` runs the
   OSS default and a consumer verifier side by side (tried in that order); a lone import
   path fully replaces the default. An empty value is a startup `RuntimeError`
   (fail-fast; an interactive-only deployment is out of scope until someone needs it).

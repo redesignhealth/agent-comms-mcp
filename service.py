@@ -2174,6 +2174,7 @@ async def start_conversation(
                     display_name=target.display_name,
                     role="member",
                     status="invited",
+                    sub=target.sub,
                 )
                 for target in sorted(targets, key=lambda t: t.sub)
             ],
@@ -3041,6 +3042,7 @@ async def _check_boundary_crossing(
                 Participant.role,
                 Agent.accepted_types,
                 Agent.display_name,
+                Agent.sub,
             )
             .join(Agent, Agent.id == Participant.agent_id)
             .where(
@@ -3066,15 +3068,17 @@ async def _check_boundary_crossing(
             .order_by(Agent.sub.collate("C"))
         )
     ).all()
-    other_ids = [agent_id for agent_id, _status, _role, _accepted, _display_name in rows]
+    other_ids = [agent_id for agent_id, _status, _role, _accepted, _display_name, _sub in rows]
     capability_others = [
         (agent_id, accepted)
-        for agent_id, status, _role, accepted, _display_name in rows
+        for agent_id, status, _role, accepted, _display_name, _sub in rows
         if status == "active"
     ]
     participants = [
-        ParticipantInfo(agent_id=agent_id, display_name=display_name, role=role, status=status)
-        for agent_id, status, role, _accepted, display_name in rows
+        ParticipantInfo(
+            agent_id=agent_id, display_name=display_name, role=role, status=status, sub=sub
+        )
+        for agent_id, status, role, _accepted, display_name, sub in rows
     ]
     await _enforce_message_type_accepted(
         session,
@@ -3207,6 +3211,10 @@ async def _divert_high_risk_message(
     ``_check_boundary_crossing``'s own participants-join for
     ``post_message``, or from the just-loaded ``targets`` for
     ``start_conversation``), so this function does not query for it itself.
+
+    ``sender_sub`` (TECH-5755) is likewise passed straight through into
+    ``HoldContext.sender_sub`` -- the caller's own already-loaded sender
+    ``Agent`` row (``sender.sub``/``initiator.sub``), no extra query.
     """
     now = _now()
     scorer_name = _risk_scorer_name(risk_scorer)
@@ -3334,6 +3342,10 @@ async def _divert_invite_for_approval(
     Returns the inserted ``Participant`` (cleared) or the ``ApprovalHold``
     itself (escalated — caller commits and then fires the notifier
     post-commit, per ``_fire_approval_notifier``'s docstring).
+
+    ``sender_sub`` (TECH-5755) is the INVITER's own sub, not the target's --
+    passed straight through into ``HoldContext.sender_sub`` from the
+    caller's already-loaded ``inviter`` ``Agent`` row, no extra query.
     """
     now = _now()
     hold_owner_sub = owner_sub_claim if owner_sub_claim is not None else owner_sub_fallback
@@ -3378,7 +3390,7 @@ async def _divert_invite_for_approval(
     # query, same active/invited shape _check_boundary_crossing uses.
     participant_rows = (
         await session.execute(
-            select(Agent.id, Participant.status, Participant.role, Agent.display_name)
+            select(Agent.id, Participant.status, Participant.role, Agent.display_name, Agent.sub)
             .join(Agent, Agent.id == Participant.agent_id)
             .where(
                 Participant.conversation_id == conversation.id,
@@ -3402,8 +3414,10 @@ async def _divert_invite_for_approval(
         payload=hold.payload,
         risk_reason=INVITE_HOLD_RISK_REASON,
         participants=[
-            ParticipantInfo(agent_id=agent_id, display_name=display_name, role=role, status=status)
-            for agent_id, status, role, display_name in participant_rows
+            ParticipantInfo(
+                agent_id=agent_id, display_name=display_name, role=role, status=status, sub=sub
+            )
+            for agent_id, status, role, display_name, sub in participant_rows
         ],
         sender_sub=sender_sub,
     )
