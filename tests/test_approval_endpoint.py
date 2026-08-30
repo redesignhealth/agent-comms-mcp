@@ -887,6 +887,24 @@ class TestHoldConversationEndpoint:
         assert resp.status_code == 409
         assert resp.json() == {"error": "already_decided", "status": "rejected"}
 
+    async def test_pending_auto_returns_409(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        http_client, provider = client
+        _sender, hold = await _make_hold(
+            session, sender_owner_sub="owner-pending-auto@example.com", status="pending_auto"
+        )
+        provider.tokens["human-token"] = _interactive_token("owner-pending-auto@example.com")
+
+        resp = await http_client.get(
+            f"/approvals/{hold.id}/conversation",
+            headers={"Authorization": "Bearer human-token"},
+        )
+        assert resp.status_code == 409
+        assert resp.json() == {"error": "awaiting_auto_review"}
+
     async def test_returns_participants_for_the_holds_conversation(
         self,
         client: tuple[httpx.AsyncClient, _FakeAuthProvider],

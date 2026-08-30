@@ -40,6 +40,7 @@ from exceptions import (
     AccessDeniedError,
     AgentRetiredError,
     HoldAlreadyDecidedError,
+    HoldAwaitingAutoReviewError,
     HoldExpiredError,
     InvalidConversationStateError,
     RateLimitExceededError,
@@ -4996,12 +4997,34 @@ class TestGetHoldConversationParticipants:
         await leave(
             session, actor_sub=target.sub, agent_id=target.id, conversation_id=hold.conversation_id
         )
+        declined_agent = await _register(session, "gc-declined-excl")
+        session.add(
+            Participant(
+                conversation_id=hold.conversation_id,
+                agent_id=declined_agent.id,
+                role="member",
+                status="declined",
+            )
+        )
+        await session.commit()
 
         result = await _service.get_hold_conversation_participants(
             session, approver_sub=owner.owner_sub, hold_id=hold.id
         )
 
         assert {p["agent_id"] for p in result["participants"]} == {str(owner.id)}
+
+    async def test_pending_auto_raises_hold_awaiting_auto_review(
+        self, session: AsyncSession
+    ) -> None:
+        owner, _target, hold = await self._make_hold_via_diversion(session, owner_suffix="pauto")
+        hold.status = "pending_auto"
+        await session.commit()
+
+        with pytest.raises(HoldAwaitingAutoReviewError):
+            await _service.get_hold_conversation_participants(
+                session, approver_sub=owner.owner_sub, hold_id=hold.id
+            )
 
     async def test_unknown_hold_raises_access_denied(self, session: AsyncSession) -> None:
         owner = await _register(session, "gc-owner-unknown")

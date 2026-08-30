@@ -3569,18 +3569,21 @@ async def get_hold_conversation_participants(
     to" must never advance an AGENT's own read cursor as a side effect.
 
     Scoped to a still-``pending_human`` hold, mirroring ``decide_hold``'s
-    own status gate: raises ``HoldExpiredError`` if lazy TTL expiry fires
-    on this touch, ``HoldAwaitingAutoReviewError`` if still
-    ``pending_auto`` (unreachable in v1), and ``HoldAlreadyDecidedError``
-    if already approved/rejected -- the "To" list is for a hold a human is
-    actively about to decide, not a stale snapshot of one that already
-    resolved (the very next ``decide`` call would 410/409/409 on it
-    anyway). Only ``active``/``invited``
-    participants are returned -- a ``left``/``declined`` agent is no longer
-    a real recipient, and showing one would mislead the approving human
-    about who the message is actually going to.
+    own status gate (and its ``for_update=True`` lock on ``_find_hold`` --
+    without it, this read-then-write-status call can race a concurrent
+    ``decide`` and lose-update its just-approved/rejected row back to
+    ``expired``): raises ``HoldExpiredError`` if lazy TTL expiry fires on
+    this touch, ``HoldAwaitingAutoReviewError`` if still ``pending_auto``
+    (unreachable in v1), and ``HoldAlreadyDecidedError`` if already
+    approved/rejected -- the "To" list is for a hold a human is actively
+    about to decide, not a stale snapshot of one that already resolved
+    (the very next ``decide`` call would 410/409/409 on it anyway). Only
+    ``active``/``invited`` participants are returned -- a
+    ``left``/``declined`` agent is no longer a real recipient, and showing
+    one would mislead the approving human about who the message is
+    actually going to.
     """
-    hold = await _find_hold(session, hold_id)
+    hold = await _find_hold(session, hold_id, for_update=True)
     if hold is None:
         await _deny(
             session,
@@ -3606,6 +3609,10 @@ async def get_hold_conversation_participants(
     if hold.status != "pending_human":
         await session.commit()
         raise HoldAlreadyDecidedError(hold.status)
+
+    conversation = await _find_conversation(session, hold.conversation_id)
+    if conversation is None:
+        raise RuntimeError(f"invariant violation: hold {hold_id} references a missing conversation")
 
     part_rows = (
         await session.execute(
