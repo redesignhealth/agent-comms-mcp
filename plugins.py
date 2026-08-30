@@ -357,10 +357,15 @@ class AutoDecision(NamedTuple):
 class ParticipantInfo(NamedTuple):
     """One other conversation participant, as seen by a ``HoldContext``.
 
-    Same shape as ``service.get_hold_conversation_participants``'s HTTP
-    response entries (``agent_id``/``display_name``/``role``/``status``),
-    kept here as a typed value rather than a dict since this travels
-    in-process through the ``AutoApprover`` seam, not over HTTP.
+    Same FIELD NAMES as ``service.get_hold_conversation_participants``'s
+    HTTP response entries (``agent_id``/``display_name``/``role``/
+    ``status``), kept here as a typed value rather than a dict since this
+    travels in-process through the ``AutoApprover`` seam, not over HTTP --
+    but NOT the same membership: that HTTP endpoint returns every
+    active/invited participant including the sender/inviter, while this
+    always EXCLUDES the sender/inviter (see ``HoldContext.participants``'s
+    own docstring). Also note ``agent_id`` is a ``uuid.UUID`` here vs a
+    ``str`` in the HTTP response.
     """
 
     agent_id: uuid.UUID

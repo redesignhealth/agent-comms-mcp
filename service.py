@@ -2992,7 +2992,7 @@ async def _check_boundary_crossing(
     (``active``/``invited``) participants for the other side rather than
     requiring the caller to already know them.
 
-    Returns ``(risk_reason, participants)`` — ``participants`` (TECH-5754)
+    Returns ``(risk_reason, participants)`` -- ``participants`` (TECH-5754)
     is this same query's rows, reshaped into ``ParticipantInfo``, for the
     caller to thread into ``HoldContext`` on a diversion; it is NOT a
     second query.
@@ -3040,6 +3040,14 @@ async def _check_boundary_crossing(
                 Participant.agent_id != sender_agent_id,
                 Participant.status.in_(("active", "invited")),
             )
+            # Deterministic HoldContext.participants ordering (TECH-5754
+            # Argus round-1 catch), matching the sibling
+            # get_hold_conversation_participants/get_conversation queries --
+            # without this, identical holds could see different participant
+            # orderings across requests, causing prompt-cache misses (and
+            # potentially unstable judgments) for a downstream LLM-judge
+            # AutoApprover consuming this field.
+            .order_by(Agent.sub)
         )
     ).all()
     other_ids = [agent_id for agent_id, _status, _role, _accepted, _display_name in rows]
@@ -3178,7 +3186,7 @@ async def _divert_high_risk_message(
     post-commit, per ``_fire_approval_notifier``'s docstring).
 
     ``participants`` (TECH-5754) is passed straight through into
-    ``HoldContext.participants`` — the caller already resolved it (from
+    ``HoldContext.participants`` -- the caller already resolved it (from
     ``_check_boundary_crossing``'s own participants-join for
     ``post_message``, or from the just-loaded ``targets`` for
     ``start_conversation``), so this function does not query for it itself.
@@ -3358,6 +3366,9 @@ async def _divert_invite_for_approval(
                 Participant.agent_id != inviter_agent_id,
                 Participant.status.in_(("active", "invited")),
             )
+            # Deterministic ordering (TECH-5754 Argus round-1 catch) --
+            # see _check_boundary_crossing's matching .order_by(Agent.sub).
+            .order_by(Agent.sub)
         )
     ).all()
     ctx = HoldContext(

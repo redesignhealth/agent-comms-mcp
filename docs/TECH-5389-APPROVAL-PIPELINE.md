@@ -191,9 +191,15 @@ class AutoApprover(Protocol):
 ```
 
 `HoldContext`: hold id, conversation id/type, sender agent id + owner_sub,
-message_type, schema_version, payload, risk reason. (Unlike the scorer, the
-auto-approver *does* get the payload — per the owner, the risk flag stays light and
-the expensive judgment belongs here.)
+message_type, schema_version, payload, risk reason, participants. (Unlike the
+scorer, the auto-approver *does* get the payload — per the owner, the risk flag
+stays light and the expensive judgment belongs here.)
+
+`participants` (added TECH-5754): the OTHER active/invited conversation
+participants — who this hold's message is actually addressed to, or who is
+already in the conversation being invited into. Always excludes the
+sender/inviter itself. Additive: existing `AutoApprover` implementations
+ignore it.
 
 **v1 implementation `EscalateAllAutoApprover` ("escalate_all")**: returns
 `cleared=False` unconditionally. Invoked inline, for real, in the `post_message`

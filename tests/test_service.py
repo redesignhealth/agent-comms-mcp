@@ -1315,6 +1315,51 @@ class TestStartConversation:
             )
         ]
 
+    async def test_open_note_as_initial_message_hold_context_carries_multiple_targets(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-5754 Argus round-1 catch: the list comprehension building
+        ``HoldContext.participants`` from ``targets`` was only exercised
+        with a single target -- this covers N>1."""
+        owner = await _register(session, "owner-open-note-multi-participants")
+        target_a = await _register(session, "target-a-open-note-multi-participants")
+        target_b = await _register(session, "target-b-open-note-multi-participants")
+        recorder = _RecordingAutoApprover()
+
+        await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target_a.id, target_b.id],
+            initial_message={"text": "hello"},
+            message_type="note",
+            auto_approver=recorder,
+        )
+        assert recorder.captured_ctx is not None
+        # start_conversation sorts target_ids by str(uuid) before resolving
+        # targets (de-dup step, unrelated to this ticket) -- not
+        # insertion order, so the expected order here mirrors that sort
+        # rather than [target_a, target_b].
+        expected = sorted(
+            [
+                plugins.ParticipantInfo(
+                    agent_id=target_a.id,
+                    display_name=target_a.display_name,
+                    role="member",
+                    status="invited",
+                ),
+                plugins.ParticipantInfo(
+                    agent_id=target_b.id,
+                    display_name=target_b.display_name,
+                    role="member",
+                    status="invited",
+                ),
+            ],
+            key=lambda p: str(p.agent_id),
+        )
+        assert recorder.captured_ctx.participants == expected
+
     async def test_task_decline_as_initial_message_denied(self, session: AsyncSession) -> None:
         """``task_decline`` is member-role-restricted, but the initiator's
         role is always "owner" for the seq-1 message -- exactly the
