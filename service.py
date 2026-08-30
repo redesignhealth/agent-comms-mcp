@@ -3053,7 +3053,14 @@ async def _check_boundary_crossing(
             # orderings across requests, causing prompt-cache misses (and
             # potentially unstable judgments) for a downstream LLM-judge
             # AutoApprover consuming this field.
-            .order_by(Agent.sub)
+            # collate("C") (Argus round-3 catch): plain .order_by(Agent.sub)
+            # sorts under Postgres's configured locale, which can order
+            # mixed-case subs differently than start_conversation's Python
+            # `sorted(targets, key=lambda t: t.sub)` (always codepoint
+            # order) -- pinning the SQL side to byte/codepoint order keeps
+            # every HoldContext.participants producer path on the exact
+            # same comparator, not just "each individually deterministic."
+            .order_by(Agent.sub.collate("C"))
         )
     ).all()
     other_ids = [agent_id for agent_id, _status, _role, _accepted, _display_name in rows]
@@ -3372,9 +3379,10 @@ async def _divert_invite_for_approval(
                 Participant.agent_id != inviter_agent_id,
                 Participant.status.in_(("active", "invited")),
             )
-            # Deterministic ordering (TECH-5754 Argus round-1 catch) --
-            # see _check_boundary_crossing's matching .order_by(Agent.sub).
-            .order_by(Agent.sub)
+            # Deterministic ordering (TECH-5754 Argus round-1 catch), pinned
+            # to codepoint order (Argus round-3 catch) -- see
+            # _check_boundary_crossing's matching .order_by(Agent.sub.collate("C")).
+            .order_by(Agent.sub.collate("C"))
         )
     ).all()
     ctx = HoldContext(

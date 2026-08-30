@@ -199,11 +199,17 @@ stays light and the expensive judgment belongs here.)
 participants — who this hold's message is actually addressed to, or who is
 already in the conversation being invited into. Always excludes the
 sender/inviter itself. Additive: existing `AutoApprover` implementations
-ignore it. Sorted by `Agent.sub` on every path (deterministic, matching the
-sibling `get_hold_conversation_participants`/`get_conversation` HTTP
-surfaces) — important for an ordering-sensitive downstream consumer (e.g. an
-LLM-judge AutoApprover) to get a stable, cacheable prompt across repeated
-holds. Also note `ParticipantInfo` is field-name-compatible with, but not
+ignore it. Sorted by `Agent.sub` in codepoint order on every path (the two
+SQL-backed paths pin `.order_by(Agent.sub.collate("C"))` specifically so
+they can't drift from `start_conversation`'s plain Python `sorted(...,
+key=lambda t: t.sub)` under a non-C Postgres locale) — important for an
+ordering-sensitive downstream consumer (e.g. an LLM-judge AutoApprover) to
+get a stable, cacheable prompt across repeated holds. This is NOT
+necessarily the same order `get_hold_conversation_participants`/
+`get_conversation`'s HTTP surfaces use (those query without a `COLLATE`
+pin), so don't assume byte-for-byte parity with those endpoints' ordering,
+only that every `HoldContext.participants` producer path agrees with each
+other. Also note `ParticipantInfo` is field-name-compatible with, but not
 identical to, `get_hold_conversation_participants`'s HTTP response entries:
 that endpoint includes the sender/inviter (this never does), and its
 `agent_id` is a `str` (here it's a `uuid.UUID`) — see `plugins.py`'s

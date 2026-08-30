@@ -385,7 +385,13 @@ class HoldContext(NamedTuple):
     participants (never includes ``sender_agent_id``/the inviter) — who
     this hold's message is actually addressed to, or who is already in the
     conversation being invited into. Additive: existing ``AutoApprover``
-    implementations (``EscalateAllAutoApprover``) ignore it.
+    implementations (``EscalateAllAutoApprover``) ignore it. Sorted by
+    ``Agent.sub`` in codepoint order, consistently across every producer
+    path (``service.py``'s SQL sites pin ``COLLATE "C"`` specifically so
+    they can't drift from the ``start_conversation`` path's plain Python
+    sort under a non-C Postgres locale) — an ``AutoApprover`` that builds a
+    prompt from this list should preserve that order rather than
+    re-sorting, for stable/cacheable prompts across repeated holds.
     """
 
     hold_id: uuid.UUID
