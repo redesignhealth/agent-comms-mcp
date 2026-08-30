@@ -860,6 +860,20 @@ class TestRegisterAgent:
         ).scalar_one_or_none()
         assert row is None
 
+        audit_rows = (
+            (
+                await session.execute(
+                    select(AuditLog.action).where(
+                        AuditLog.actor_sub == "dan@example.com",
+                        AuditLog.action == "denied.sibling_identity_exists",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert audit_rows == ["denied.sibling_identity_exists"]
+
     async def test_sibling_identity_lists_all_existing_agent_keys(
         self, session: AsyncSession
     ) -> None:
@@ -901,6 +915,20 @@ class TestRegisterAgent:
             None,
             "key-a",
         ]
+
+        audit_rows = (
+            (
+                await session.execute(
+                    select(AuditLog.action).where(
+                        AuditLog.actor_sub == "multi-key-base::key-b",
+                        AuditLog.action == "denied.sibling_identity_exists",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert audit_rows == ["denied.sibling_identity_exists"]
 
     async def test_confirm_new_identity_bypasses_sibling_check(self, session: AsyncSession) -> None:
         await register_agent(
@@ -1107,6 +1135,49 @@ class TestRegisterAgent:
             is_shared_authorized=True,
         )
         assert again.id == agent.id
+
+    async def test_db_level_collision_on_reregister_rename(self, session: AsyncSession) -> None:
+        """TECH-5736 round-3's "case (b)": a RE-registration renaming onto
+        a display_name a DIFFERENT active agent already holds. The
+        app-level guard in ``register_agent`` only queries for collisions
+        `if created` (see the block above the `session.flush()` call), so
+        this scenario skips it entirely and falls through to
+        ``idx_agents_lower_display_name_active`` (migration a45f344c9c00)
+        for enforcement, exercised here against a real Postgres backend.
+        This is the exact path the round-3 fix's ``_is_display_name_index_violation``
+        helper exists to translate into ``DisplayNameCollisionError`` instead
+        of letting the raw ``IntegrityError`` escape as an unmapped 500 --
+        see ~service.py:1533's comment for the "case (a)"/"case (b)" split.
+        """
+        await _register(session, "db-collision-a", display_name="Bond 007")
+        await _register(session, "db-collision-b", display_name="Distinct Name")
+
+        with pytest.raises(DisplayNameCollisionError):
+            await register_agent(
+                session,
+                sub="db-collision-b",
+                base_sub="db-collision-b",
+                owner_sub="db-collision-b",
+                owner_email="db-collision-b@example.com",
+                display_name="Bond 007",
+                accepted_types=sorted(MESSAGE_TYPES),
+                is_shared_authorized=True,
+            )
+
+        row = (
+            await session.execute(select(Agent).where(Agent.sub == "db-collision-b"))
+        ).scalar_one()
+        assert row.display_name == "Distinct Name"
+
+        audit_action = (
+            await session.execute(
+                select(AuditLog.action).where(
+                    AuditLog.actor_sub == "db-collision-b",
+                    AuditLog.action == "denied.display_name_collision",
+                )
+            )
+        ).scalar_one_or_none()
+        assert audit_action == "denied.display_name_collision"
 
 
 # --- set_agent_shared ----------------------------------------------------------

@@ -31,13 +31,23 @@ persistent database -- only ephemeral CI/local Postgres containers that
 get torn down between rounds. Once this PR merges, treat this file as
 frozen as usual.
 
-Tightening to UNIQUE does carry a real (if currently unconfirmed) risk
-that hasn't changed: if any already-``active`` row in a real deployment
+Tightening to UNIQUE does carry a real, currently-unconfirmed risk that
+hasn't changed: if any already-``active`` row in a real deployment
 already has a case-insensitive display_name duplicate, this index build
-will fail. That risk is accepted here because there is no deployed
-environment for this service today (see above) -- there is no existing
-data for the index to conflict with. If that ever stops being true
-before this merges, re-litigate before amending further.
+will fail. This risk can NOT be waved away on "there is no deployed
+environment for this service today" grounds -- that claim is false, for
+the same reason bb1ea7d2a0cf's earlier docstring was corrected: DESIGN.md
+§12 has said "Infrastructure: done -- deployed and running" since before
+this PR opened, and `entrypoint.sh` runs `alembic upgrade head`
+automatically on every deploy. (The separate "in-place amendment is
+safe" reasoning above still holds -- that's about THIS revision never
+having run anywhere, deployed or otherwise, not about whether a deployed
+environment exists at all.) A deployed environment with real agent data
+exists, and this migration WILL run against it once merged. Verify
+before deploying that no already-``active`` row collides
+case-insensitively on ``display_name`` with another; if one does,
+resolve it (rename or deactivate the older row) before this migration
+runs, or the ``CREATE UNIQUE INDEX`` below will fail in that environment.
 """
 
 from __future__ import annotations

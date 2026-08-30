@@ -450,11 +450,22 @@ def _is_display_name_index_violation(exc: IntegrityError) -> bool:
     ``idx_agents_lower_display_name_active`` (migration a45f344c9c00),
     not merely "some IntegrityError". Postgres reports a unique partial
     index's name in the underlying error's ``constraint_name`` diagnostic
-    field the same way it would a real named constraint -- asyncpg
-    surfaces that as an attribute on ``exc.orig``. Deliberately not a
-    blanket catch: any other IntegrityError (e.g. a genuinely unrelated
-    constraint) must keep propagating as itself."""
-    return getattr(exc.orig, "constraint_name", None) == "idx_agents_lower_display_name_active"
+    field the same way it would a real named constraint. Under this
+    project's driver stack (SQLAlchemy 2.0.x + asyncpg), ``exc.orig`` is
+    ``AsyncAdapt_asyncpg_dbapi.IntegrityError``, a thin wrapper that only
+    copies ``pgcode``/``sqlstate`` from the real
+    ``asyncpg.exceptions.UniqueViolationError`` -- NOT ``constraint_name``.
+    The real asyncpg exception (which does carry ``constraint_name``) is
+    reachable via ``exc.orig.__cause__``. Check there first, falling back
+    to ``exc.orig`` itself in case a different driver/version puts the
+    attribute there directly. Deliberately not a blanket catch: any other
+    IntegrityError (e.g. a genuinely unrelated constraint) must keep
+    propagating as itself."""
+    cause = getattr(exc.orig, "__cause__", None)
+    name = getattr(cause, "constraint_name", None)
+    if name is None:
+        name = getattr(exc.orig, "constraint_name", None)
+    return name == "idx_agents_lower_display_name_active"
 
 
 async def _deny_sibling_identity_exists(
@@ -1474,6 +1485,18 @@ async def register_agent(
             # this escalation vector (or an accidental downgrade attempt) go
             # unnoticed. Note only, not a `_deny()` call: nothing is
             # actually being denied here.
+            #
+            # Committed immediately, standalone, rather than left staged
+            # alongside the field mutations below (Argus round-4 finding):
+            # this function's later `flush()` can raise `IntegrityError` on
+            # a colliding `display_name`, and the handler for that
+            # unconditionally `rollback()`s -- which would silently discard
+            # this row too, letting an actor pair an `is_shared=True`
+            # escalation probe with a colliding display_name to suppress
+            # this audit entirely. Committing it here, before that flush,
+            # means it survives regardless of what happens later in this
+            # call. `expire_on_commit=False` (db.py) keeps `agent` usable
+            # afterward without a refresh.
             _audit(
                 session,
                 actor_sub=sub,
@@ -1485,6 +1508,7 @@ async def register_agent(
                     "is_shared_authorized": is_shared_authorized,
                 },
             )
+            await session.commit()
         # owner_sub and is_shared are deliberately NOT overwritten by THIS
         # function on re-registration. owner_sub is read by
         # AgentTableOwnershipClient as the input to may_assign's admission
@@ -1541,18 +1565,35 @@ async def register_agent(
         # itself rather than being mislabeled.
         await session.rollback()
         if _is_display_name_index_violation(exc):
+            # Unlike the app-level check's `colliding_subs`, the
+            # DB-level violation itself doesn't hand us the other row's
+            # `sub` -- only that a conflict exists. But the row IS now
+            # queryable post-rollback (it's what the unique index just
+            # rejected our write in favor of), so look it up instead of
+            # recording "sub unknown" (Argus round-4 finding): a real
+            # value here makes this audit path distinguishable from a
+            # bug when reviewed later. `existing_subs` remains
+            # server-side-audit-only (never surfaced to the caller, see
+            # DisplayNameCollisionError's docstring). Fall back to `[]`
+            # if a further race means the row is already gone again by
+            # the time we look.
+            colliding_subs_post_rollback = (
+                (
+                    await session.execute(
+                        select(Agent.sub).where(
+                            func.lower(Agent.display_name) == display_name.lower(),
+                            Agent.status == "active",
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
             await _deny_display_name_collision(
                 session,
                 actor_sub=sub,
                 display_name=display_name,
-                # Unlike the app-level check's `colliding_subs`, the
-                # DB-level violation doesn't hand us the other row's
-                # `sub` -- only that a conflict exists. `existing_subs`
-                # is server-side-audit-only (never surfaced to the
-                # caller, see DisplayNameCollisionError's docstring), so
-                # recording "detected at the DB layer, sub unknown" here
-                # is honest rather than fabricating a value.
-                existing_subs=[],
+                existing_subs=list(colliding_subs_post_rollback),
             )
         raise
     _audit(

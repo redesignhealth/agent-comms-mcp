@@ -197,13 +197,22 @@ class SiblingIdentityExistsError(Exception):
     caller legitimately running multiple agents under one token (the
     documented purpose of ``agent_key``) must still be able to register a
     genuinely new sibling identity on purpose.
+
+    ``existing_agent_keys`` is deliberately excluded from ``str(exc)`` --
+    same treatment ``DisplayNameCollisionError.existing_subs`` got in
+    round 1 (see that class's docstring), applied here for the analogous
+    reason: a ``comms:write``-only caller can trigger this error
+    repeatedly (it's on the write path, not gated behind ``comms:read``)
+    and would otherwise be able to enumerate its own sibling agent_keys
+    purely from the client-facing message. It remains a plain attribute
+    on the exception for server-side callers (audit logging) only, never
+    surfaced across the service/tools boundary.
     """
 
     def __init__(self, *, base_sub: str, existing_agent_keys: list[str | None]) -> None:
-        rendered = ", ".join(repr(k) for k in existing_agent_keys)
         super().__init__(
-            f"identity_fork_detected: {base_sub!r} already has a registered agent under "
-            f"agent_key {rendered} -- pass confirm_new_identity=True to register a "
+            f"identity_fork_detected: {base_sub!r} already has at least one other "
+            "registered agent -- pass confirm_new_identity=True to register a "
             "genuinely separate identity, or pass the matching agent_key to re-bind "
             "the existing one instead"
         )

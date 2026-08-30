@@ -333,8 +333,8 @@ Design notes:
  target of `start_conversation`/`invite` (pre-existing checks these guards made live
  for the first time), and drops out of `comms_lookup_agent_by_email`'s directory
  lookup. It is a full kill switch on the caller's OWN identity: `_resolve_caller_agent`
- (the helper every tool uses to resolve the CALLER's own board `Agent` row from the
- token) raises `agent_suspended` for any suspended caller, which blocks all ten tools
+ (the helper the ten messaging/query tools use to resolve the CALLER's own board `Agent`
+ row from the token) raises `agent_suspended` for any suspended caller, which blocks all ten tools
  that call it -- including the read-path tools, `comms_inbox`/`comms_get_conversation`/
  `comms_list_conversations`. A suspended agent's still-valid token cannot use ANY of
  them, read or write, even for a conversation it already belongs to: once
