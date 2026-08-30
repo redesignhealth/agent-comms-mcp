@@ -354,12 +354,44 @@ class AutoDecision(NamedTuple):
     detail: dict[str, Any] | None
 
 
+class ParticipantInfo(NamedTuple):
+    """One other conversation participant, as seen by a ``HoldContext``.
+
+    Same FIELD NAMES as ``service.get_hold_conversation_participants``'s
+    HTTP response entries (``agent_id``/``display_name``/``role``/
+    ``status``), kept here as a typed value rather than a dict since this
+    travels in-process through the ``AutoApprover`` seam, not over HTTP --
+    but NOT the same membership: that HTTP endpoint returns every
+    active/invited participant including the sender/inviter, while this
+    always EXCLUDES the sender/inviter (see ``HoldContext.participants``'s
+    own docstring). Also note ``agent_id`` is a ``uuid.UUID`` here vs a
+    ``str`` in the HTTP response.
+    """
+
+    agent_id: uuid.UUID
+    display_name: str
+    role: str
+    status: str
+
+
 class HoldContext(NamedTuple):
     """Everything an ``AutoApprover`` needs to review one hold.
 
     Unlike ``MessageRiskContext``, this DOES carry the payload — per the
     plan doc, the risk flag stays light and the expensive judgment belongs
     here.
+
+    ``participants`` (TECH-5754) is the OTHER active/invited conversation
+    participants (never includes ``sender_agent_id``/the inviter) — who
+    this hold's message is actually addressed to, or who is already in the
+    conversation being invited into. Additive: existing ``AutoApprover``
+    implementations (``EscalateAllAutoApprover``) ignore it. Sorted by
+    ``Agent.sub`` in codepoint order, consistently across every producer
+    path (``service.py``'s SQL sites pin ``COLLATE "C"`` specifically so
+    they can't drift from the ``start_conversation`` path's plain Python
+    sort under a non-C Postgres locale) — an ``AutoApprover`` that builds a
+    prompt from this list should preserve that order rather than
+    re-sorting, for stable/cacheable prompts across repeated holds.
     """
 
     hold_id: uuid.UUID
@@ -371,6 +403,7 @@ class HoldContext(NamedTuple):
     schema_version: int
     payload: dict[str, Any]
     risk_reason: str
+    participants: list[ParticipantInfo]
 
 
 class AutoApprover(Protocol):
@@ -652,6 +685,7 @@ __all__ = [
     "HoldContext",
     "LogOnlyNotifier",
     "MessageRiskContext",
+    "ParticipantInfo",
     "RiskScorer",
     "RiskScoringInfraError",
     "RiskVerdict",

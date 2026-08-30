@@ -314,6 +314,19 @@ class _RaisingActiveChecker:
         raise RuntimeError("simulated registry failure")
 
 
+class _RecordingAutoApprover:
+    """TECH-5754 test double: captures the ``HoldContext`` it was called
+    with (so a test can assert on ``.participants``) and always escalates
+    -- same v1 ``EscalateAllAutoApprover`` behavior, just observed."""
+
+    def __init__(self) -> None:
+        self.captured_ctx: plugins.HoldContext | None = None
+
+    async def review(self, ctx: plugins.HoldContext) -> plugins.AutoDecision:
+        self.captured_ctx = ctx
+        return plugins.AutoDecision(cleared=False, detail=None)
+
+
 def _request_payload(**overrides: Any) -> dict[str, Any]:
     now = datetime.now(UTC)
     payload: dict[str, Any] = {
@@ -1270,6 +1283,81 @@ class TestStartConversation:
         assert "approval.hold" in hold_actions
         assert "approval.escalate" in hold_actions
         assert "denied.boundary_crossing" not in hold_actions
+
+    async def test_open_note_as_initial_message_hold_context_carries_targets(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-5754: the opener-diversion path builds ``HoldContext.participants``
+        from the just-inserted target `Participant` rows (role="member",
+        status="invited") -- not from a query, and never includes the
+        initiator itself."""
+        owner = await _register(session, "owner-open-note-participants")
+        target = await _register(session, "target-open-note-participants")
+        recorder = _RecordingAutoApprover()
+
+        await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message={"text": "hello"},
+            message_type="note",
+            auto_approver=recorder,
+        )
+        assert recorder.captured_ctx is not None
+        assert recorder.captured_ctx.participants == [
+            plugins.ParticipantInfo(
+                agent_id=target.id,
+                display_name=target.display_name,
+                role="member",
+                status="invited",
+            )
+        ]
+
+    async def test_open_note_as_initial_message_hold_context_carries_multiple_targets(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-5754 Argus round-1 catch: the list comprehension building
+        ``HoldContext.participants`` from ``targets`` was only exercised
+        with a single target -- this covers N>1.
+
+        Registered as "zzz-..."/"aaa-..." (Argus round-2 catch), not
+        insertion order, so the expected ``sub``-sorted order below is
+        non-vacuous: it only passes if the participants list is actually
+        sorted by ``sub``, not left in ``targets``' original (or `str(uuid)`)
+        order."""
+        owner = await _register(session, "owner-open-note-multi-participants")
+        target_a = await _register(session, "zzz-open-note-multi-participants")
+        target_b = await _register(session, "aaa-open-note-multi-participants")
+        recorder = _RecordingAutoApprover()
+
+        await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target_a.id, target_b.id],
+            initial_message={"text": "hello"},
+            message_type="note",
+            auto_approver=recorder,
+        )
+        assert recorder.captured_ctx is not None
+        # target_b's sub ("aaa-...") sorts before target_a's ("zzz-...").
+        assert recorder.captured_ctx.participants == [
+            plugins.ParticipantInfo(
+                agent_id=target_b.id,
+                display_name=target_b.display_name,
+                role="member",
+                status="invited",
+            ),
+            plugins.ParticipantInfo(
+                agent_id=target_a.id,
+                display_name=target_a.display_name,
+                role="member",
+                status="invited",
+            ),
+        ]
 
     async def test_task_decline_as_initial_message_denied(self, session: AsyncSession) -> None:
         """``task_decline`` is member-role-restricted, but the initiator's
@@ -2736,6 +2824,181 @@ class TestInviteRequiresApprovalForNoteHistory:
         ).scalar_one_or_none()
         assert participant is None
 
+    async def test_invite_hold_context_carries_existing_participants(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-5754: unlike ``_divert_high_risk_message``'s two call sites,
+        this diversion path has no participants already loaded -- confirms
+        the one query it adds excludes the inviter and returns the
+        already-active target."""
+        owner, target, conversation, client = await self._conversation_with_note(
+            session, "invite-hold-owner-participants", "invite-hold-target-participants"
+        )
+        new_agent = await _register(session, "invite-hold-new-participants")
+        client._owners_by_agent_id[new_agent.id] = {"is_shared": False, "owners": ["dan"]}
+        recorder = _RecordingAutoApprover()
+        await invite(
+            session,
+            actor_sub=owner.sub,
+            inviter_agent_id=owner.id,
+            conversation_id=conversation.id,
+            target_agent_id=new_agent.id,
+            ownership_client=client,
+            auto_approver=recorder,
+        )
+        assert recorder.captured_ctx is not None
+        assert recorder.captured_ctx.participants == [
+            plugins.ParticipantInfo(
+                agent_id=target.id,
+                display_name=target.display_name,
+                role="member",
+                status="active",
+            )
+        ]
+
+    async def test_invite_hold_context_participants_ordered_by_sub_for_n_greater_than_one(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-5754 Argus round-2 catch: `_divert_invite_for_approval`'s
+        new query had no N>1 coverage. Registered as "zzz-.../aaa-..." so
+        the sub-order assertion is non-vacuous."""
+        owner = await _register(session, "invite-hold-owner-ordering")
+        target_a = await _register(session, "zzz-invite-hold-target-ordering")
+        target_b = await _register(session, "aaa-invite-hold-target-ordering")
+        client = _FakeOwnershipClient(
+            {
+                owner.id: {"is_shared": False, "owners": ["dan"]},
+                target_a.id: {"is_shared": False, "owners": ["dan"]},
+                target_b.id: {"is_shared": False, "owners": ["dan"]},
+            }
+        )
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="internal",
+            target_agent_ids=[target_a.id, target_b.id],
+            initial_message=_request_payload(),
+            ownership_client=client,
+        )
+        await accept_invite(
+            session, actor_sub=target_a.sub, agent_id=target_a.id, conversation_id=conversation.id
+        )
+        await accept_invite(
+            session, actor_sub=target_b.sub, agent_id=target_b.id, conversation_id=conversation.id
+        )
+        await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="note",
+            payload={"text": "hello"},
+            ownership_client=client,
+        )
+        new_agent = await _register(session, "invite-hold-new-ordering")
+        client._owners_by_agent_id[new_agent.id] = {"is_shared": False, "owners": ["dan"]}
+        recorder = _RecordingAutoApprover()
+        await invite(
+            session,
+            actor_sub=owner.sub,
+            inviter_agent_id=owner.id,
+            conversation_id=conversation.id,
+            target_agent_id=new_agent.id,
+            ownership_client=client,
+            auto_approver=recorder,
+        )
+        assert recorder.captured_ctx is not None
+        # target_b's sub ("aaa-...") sorts before target_a's ("zzz-...").
+        assert recorder.captured_ctx.participants == [
+            plugins.ParticipantInfo(
+                agent_id=target_b.id,
+                display_name=target_b.display_name,
+                role="member",
+                status="active",
+            ),
+            plugins.ParticipantInfo(
+                agent_id=target_a.id,
+                display_name=target_a.display_name,
+                role="member",
+                status="active",
+            ),
+        ]
+
+    async def test_invite_hold_context_participants_ordered_by_codepoint_not_db_locale(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-5754 Argus round-4 catch: the sibling `post_message` ordering
+        test uses a mixed-case sub pair to distinguish Python codepoint
+        order from a locale-aware DB collation, but this invite-hold path's
+        own ordering test used all-lowercase subs, which sort identically
+        under any collation -- a regression dropping `.collate("C"))` from
+        `_divert_invite_for_approval`'s query would have passed undetected."""
+        owner = await _register(session, "invite-hold-owner-collation")
+        target_a = await _register(session, "alice-invite-hold-target-collation")
+        target_b = await _register(session, "Zed-invite-hold-target-collation")
+        client = _FakeOwnershipClient(
+            {
+                owner.id: {"is_shared": False, "owners": ["dan"]},
+                target_a.id: {"is_shared": False, "owners": ["dan"]},
+                target_b.id: {"is_shared": False, "owners": ["dan"]},
+            }
+        )
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="internal",
+            target_agent_ids=[target_a.id, target_b.id],
+            initial_message=_request_payload(),
+            ownership_client=client,
+        )
+        await accept_invite(
+            session, actor_sub=target_a.sub, agent_id=target_a.id, conversation_id=conversation.id
+        )
+        await accept_invite(
+            session, actor_sub=target_b.sub, agent_id=target_b.id, conversation_id=conversation.id
+        )
+        await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="note",
+            payload={"text": "hello"},
+            ownership_client=client,
+        )
+        new_agent = await _register(session, "invite-hold-new-collation")
+        client._owners_by_agent_id[new_agent.id] = {"is_shared": False, "owners": ["dan"]}
+        recorder = _RecordingAutoApprover()
+        await invite(
+            session,
+            actor_sub=owner.sub,
+            inviter_agent_id=owner.id,
+            conversation_id=conversation.id,
+            target_agent_id=new_agent.id,
+            ownership_client=client,
+            auto_approver=recorder,
+        )
+        assert recorder.captured_ctx is not None
+        # "Zed-..." sorts before "alice-..." in codepoint order (uppercase
+        # < lowercase) -- confirms `.collate("C")` is actually pinning
+        # codepoint order rather than the DB's default locale.
+        assert recorder.captured_ctx.participants == [
+            plugins.ParticipantInfo(
+                agent_id=target_b.id,
+                display_name=target_b.display_name,
+                role="member",
+                status="active",
+            ),
+            plugins.ParticipantInfo(
+                agent_id=target_a.id,
+                display_name=target_a.display_name,
+                role="member",
+                status="active",
+            ),
+        ]
+
     async def test_invite_hold_cleared_by_auto_approver_creates_participant_inline(
         self, session: AsyncSession
     ) -> None:
@@ -3611,6 +3874,147 @@ class TestPostMessageBoundaryCrossing:
         assert "approval.hold" in actions
         assert "approval.escalate" in actions
         assert "denied.boundary_crossing" not in actions
+
+    async def test_hold_context_carries_participants(self, session: AsyncSession) -> None:
+        """TECH-5754: ``_check_boundary_crossing``'s own participants-join
+        (already run for the capability gate) is reshaped into
+        ``HoldContext.participants`` -- the accepted target, active by this
+        point, not the sender."""
+        owner, target, conversation, client = await self._asymmetric_pair(
+            session, ["dan"], ["dan", "priya"]
+        )
+        recorder = _RecordingAutoApprover()
+        await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="note",
+            payload={"text": "hello"},
+            ownership_client=client,
+            auto_approver=recorder,
+        )
+        assert recorder.captured_ctx is not None
+        assert recorder.captured_ctx.participants == [
+            plugins.ParticipantInfo(
+                agent_id=target.id,
+                display_name=target.display_name,
+                role="member",
+                status="active",
+            )
+        ]
+
+    async def test_hold_context_participants_ordered_by_sub_for_n_greater_than_one(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-5754 Argus round-2 catch: the `.order_by(Agent.sub)` added
+        to `_check_boundary_crossing`'s participants query had no N>1
+        coverage -- a regression dropping that clause would pass the full
+        suite undetected with only one other participant. Registered as
+        "zzz-.../aaa-..." (sub-order the reverse of registration order) so
+        the assertion is non-vacuous."""
+        owner = await _register(session, "bc-ordering-owner")
+        target_a = await _register(session, "zzz-bc-ordering-target")
+        target_b = await _register(session, "aaa-bc-ordering-target")
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target_a.id, target_b.id],
+            initial_message=_request_payload(),
+        )
+        await accept_invite(
+            session, actor_sub=target_a.sub, agent_id=target_a.id, conversation_id=conversation.id
+        )
+        await accept_invite(
+            session, actor_sub=target_b.sub, agent_id=target_b.id, conversation_id=conversation.id
+        )
+        recorder = _RecordingAutoApprover()
+        await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="note",
+            payload={"text": "hello"},
+            auto_approver=recorder,
+        )
+        assert recorder.captured_ctx is not None
+        # target_b's sub ("aaa-...") sorts before target_a's ("zzz-...").
+        assert recorder.captured_ctx.participants == [
+            plugins.ParticipantInfo(
+                agent_id=target_b.id,
+                display_name=target_b.display_name,
+                role="member",
+                status="active",
+            ),
+            plugins.ParticipantInfo(
+                agent_id=target_a.id,
+                display_name=target_a.display_name,
+                role="member",
+                status="active",
+            ),
+        ]
+
+    async def test_hold_context_participants_ordered_by_codepoint_not_db_locale(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-5754 Argus round-3 catch: a mixed-case sub pair distinguishes
+        Python's (always codepoint) string order from a locale-aware DB
+        collation, which could otherwise silently order this query's
+        results differently from `start_conversation`'s plain Python sort.
+        `.order_by(Agent.sub.collate("C"))` exists specifically to prevent
+        that -- this pins it down with subs that would sort oppositely
+        under a case-insensitive-ish locale collation (uppercase "Z" < "a"
+        in codepoint order; most locale collations would put "alice" first).
+        The owner is absent from both expected lists below -- also
+        confirms sender-exclusion holds under this ordering, not just the
+        plain zzz-/aaa- case."""
+        owner = await _register(session, "bc-collation-owner")
+        target_a = await _register(session, "alice-bc-collation-target")
+        target_b = await _register(session, "Zed-bc-collation-target")
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target_a.id, target_b.id],
+            initial_message=_request_payload(),
+        )
+        await accept_invite(
+            session, actor_sub=target_a.sub, agent_id=target_a.id, conversation_id=conversation.id
+        )
+        await accept_invite(
+            session, actor_sub=target_b.sub, agent_id=target_b.id, conversation_id=conversation.id
+        )
+        recorder = _RecordingAutoApprover()
+        await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="note",
+            payload={"text": "hello"},
+            auto_approver=recorder,
+        )
+        assert recorder.captured_ctx is not None
+        # "Zed-..." sorts before "alice-..." in codepoint order (uppercase
+        # < lowercase), matching Python's `sorted(..., key=lambda t: t.sub)`.
+        assert recorder.captured_ctx.participants == [
+            plugins.ParticipantInfo(
+                agent_id=target_b.id,
+                display_name=target_b.display_name,
+                role="member",
+                status="active",
+            ),
+            plugins.ParticipantInfo(
+                agent_id=target_a.id,
+                display_name=target_a.display_name,
+                role="member",
+                status="active",
+            ),
+        ]
 
     async def test_second_lookup_failure_denied(self, session: AsyncSession) -> None:
         """The sender's own ownership lookup succeeds, but a later

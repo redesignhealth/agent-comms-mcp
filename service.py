@@ -181,6 +181,7 @@ from plugins import (
     AutoApprover,
     HoldContext,
     MessageRiskContext,
+    ParticipantInfo,
     RiskScorer,
     RiskScoringInfraError,
     resolve_plugin,
@@ -2159,6 +2160,23 @@ async def start_conversation(
             risk_reason=risk_reason,
             risk_scorer=risk_scorer,
             auto_approver=auto_approver,
+            # TECH-5754: `targets` are the just-inserted `role="member",
+            # status="invited"` participant rows above -- no query needed.
+            # Sorted by `target.sub` (Argus round-2 catch), not left in
+            # `targets`' own str(uuid) order (see the sort at target_ids'
+            # de-dup above) -- matches the `.order_by(Agent.sub.collate("C"))`
+            # the other two producer sites use, so a downstream ordering-sensitive
+            # consumer (TECH-5755's LLM judge) sees one consistent key
+            # across every hold type, not two different ones.
+            participants=[
+                ParticipantInfo(
+                    agent_id=target.id,
+                    display_name=target.display_name,
+                    role="member",
+                    status="invited",
+                )
+                for target in sorted(targets, key=lambda t: t.sub)
+            ],
         )
         _audit(
             session,
@@ -2974,11 +2992,16 @@ async def _check_boundary_crossing(
     schema_version: int,
     ownership_client: OwnershipClient,
     risk_scorer: RiskScorer,
-) -> str | None:
+) -> tuple[str | None, list[ParticipantInfo]]:
     """``_score_message_risk`` (+ the universal ``accepted_types``
     capability gate) for an existing conversation row — queries current
     (``active``/``invited``) participants for the other side rather than
     requiring the caller to already know them.
+
+    Returns ``(risk_reason, participants)`` -- ``participants`` (TECH-5754)
+    is this same query's rows, reshaped into ``ParticipantInfo``, for the
+    caller to thread into ``HoldContext`` on a diversion; it is NOT a
+    second query.
 
     Single join query (participants + agents), not two separate
     round-trips: covers both ``_score_message_risk``'s
@@ -3010,18 +3033,46 @@ async def _check_boundary_crossing(
     """
     rows = (
         await session.execute(
-            select(Participant.agent_id, Participant.status, Agent.accepted_types)
+            select(
+                Participant.agent_id,
+                Participant.status,
+                Participant.role,
+                Agent.accepted_types,
+                Agent.display_name,
+            )
             .join(Agent, Agent.id == Participant.agent_id)
             .where(
                 Participant.conversation_id == conversation.id,
                 Participant.agent_id != sender_agent_id,
                 Participant.status.in_(("active", "invited")),
             )
+            # Deterministic HoldContext.participants ordering (TECH-5754
+            # Argus round-1 catch) -- without this, identical holds could
+            # see different participant orderings across requests, causing
+            # prompt-cache misses (and potentially unstable judgments) for
+            # a downstream LLM-judge AutoApprover consuming this field.
+            # collate("C") (Argus round-3 catch): plain .order_by(Agent.sub)
+            # sorts under Postgres's configured locale, which can order
+            # mixed-case subs differently than start_conversation's Python
+            # `sorted(targets, key=lambda t: t.sub)` (always codepoint
+            # order) -- pinning the SQL side to byte/codepoint order keeps
+            # every HoldContext.participants producer path on the exact
+            # same comparator. NOTE (Argus round-4 catch): this does NOT
+            # match get_hold_conversation_participants/get_conversation
+            # below, which query without a COLLATE pin -- see
+            # TECH-5389-APPROVAL-PIPELINE.md's participants section.
+            .order_by(Agent.sub.collate("C"))
         )
     ).all()
-    other_ids = [agent_id for agent_id, _status, _accepted in rows]
+    other_ids = [agent_id for agent_id, _status, _role, _accepted, _display_name in rows]
     capability_others = [
-        (agent_id, accepted) for agent_id, status, accepted in rows if status == "active"
+        (agent_id, accepted)
+        for agent_id, status, _role, accepted, _display_name in rows
+        if status == "active"
+    ]
+    participants = [
+        ParticipantInfo(agent_id=agent_id, display_name=display_name, role=role, status=status)
+        for agent_id, status, role, _accepted, display_name in rows
     ]
     await _enforce_message_type_accepted(
         session,
@@ -3031,7 +3082,7 @@ async def _check_boundary_crossing(
         other_agents=capability_others,
         message_type=message_type,
     )
-    return await _score_message_risk(
+    risk_reason = await _score_message_risk(
         session,
         actor_sub=actor_sub,
         sender_agent_id=sender_agent_id,
@@ -3043,6 +3094,7 @@ async def _check_boundary_crossing(
         ownership_client=ownership_client,
         risk_scorer=risk_scorer,
     )
+    return risk_reason, participants
 
 
 # Message types restricted to a specific sender participant role
@@ -3128,6 +3180,7 @@ async def _divert_high_risk_message(
     risk_reason: str,
     risk_scorer: RiskScorer,
     auto_approver: AutoApprover,
+    participants: list[ParticipantInfo],
 ) -> Message | ApprovalHold:
     """Create the ``approval_holds`` row for a high-risk verdict, run the
     injected ``AutoApprover`` inline, and either post the message
@@ -3145,6 +3198,12 @@ async def _divert_high_risk_message(
     transient-attribute convention) or the ``ApprovalHold`` itself
     (escalated — the caller commits and then fires the notifier
     post-commit, per ``_fire_approval_notifier``'s docstring).
+
+    ``participants`` (TECH-5754) is passed straight through into
+    ``HoldContext.participants`` -- the caller already resolved it (from
+    ``_check_boundary_crossing``'s own participants-join for
+    ``post_message``, or from the just-loaded ``targets`` for
+    ``start_conversation``), so this function does not query for it itself.
     """
     now = _now()
     scorer_name = _risk_scorer_name(risk_scorer)
@@ -3197,6 +3256,7 @@ async def _divert_high_risk_message(
         schema_version=schema_version,
         payload=payload,
         risk_reason=risk_reason,
+        participants=participants,
     )
     decision = await auto_approver.review(ctx)
     if decision.cleared:
@@ -3307,6 +3367,25 @@ async def _divert_invite_for_approval(
 
     approver_name = _auto_approver_name(auto_approver)
     hold.auto_approver = approver_name
+    # TECH-5754: unlike _divert_high_risk_message's two call sites, neither
+    # caller of this function already has the conversation's current
+    # participants loaded (only the not-yet-admitted `target`) -- one
+    # query, same active/invited shape _check_boundary_crossing uses.
+    participant_rows = (
+        await session.execute(
+            select(Agent.id, Participant.status, Participant.role, Agent.display_name)
+            .join(Agent, Agent.id == Participant.agent_id)
+            .where(
+                Participant.conversation_id == conversation.id,
+                Participant.agent_id != inviter_agent_id,
+                Participant.status.in_(("active", "invited")),
+            )
+            # Deterministic ordering (TECH-5754 Argus round-1 catch), pinned
+            # to codepoint order (Argus round-3 catch) -- see
+            # _check_boundary_crossing's matching .order_by(Agent.sub.collate("C")).
+            .order_by(Agent.sub.collate("C"))
+        )
+    ).all()
     ctx = HoldContext(
         hold_id=hold.id,
         conversation_id=conversation.id,
@@ -3317,6 +3396,10 @@ async def _divert_invite_for_approval(
         schema_version=INVITE_HOLD_SCHEMA_VERSION,
         payload=hold.payload,
         risk_reason=INVITE_HOLD_RISK_REASON,
+        participants=[
+            ParticipantInfo(agent_id=agent_id, display_name=display_name, role=role, status=status)
+            for agent_id, status, role, display_name in participant_rows
+        ],
     )
     decision = await auto_approver.review(ctx)
     if decision.cleared:
@@ -4086,7 +4169,7 @@ async def post_message(
     # schema_version) pair must go through _deny_bad_schema's audit trail
     # above, not reach the risk scorer at all -- DESIGN.md §8's "every
     # denial is audited" invariant.
-    risk_reason = await _check_boundary_crossing(
+    risk_reason, boundary_participants = await _check_boundary_crossing(
         session,
         actor_sub=actor_sub,
         sender_agent_id=sender_agent_id,
@@ -4119,6 +4202,7 @@ async def post_message(
             risk_reason=risk_reason,
             risk_scorer=risk_scorer,
             auto_approver=auto_approver,
+            participants=boundary_participants,
         )
         await session.commit()
         if isinstance(result, ApprovalHold):
