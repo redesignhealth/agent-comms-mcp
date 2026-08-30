@@ -169,16 +169,18 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
         "CREATE INDEX IF NOT EXISTS idx_messages_conversation_id_note "
         "ON messages (conversation_id) WHERE type = 'note'" in result.stdout
     )
-    # a45f344c9c00 (TECH-5736): register_agent's collision-guard indexes.
-    # idx_agents_lower_display_name_active is UNIQUE (DB-enforced,
-    # race-free display-name-collision guard -- Argus round-2), not just a
-    # performance index; idx_agents_sub_prefix is a plain text_pattern_ops
-    # index (lookup-performance only, no uniqueness invariant to enforce).
+    # a45f344c9c00 (TECH-5736): register_agent's display-name-collision
+    # guard index. idx_agents_lower_display_name_active is UNIQUE
+    # (DB-enforced, race-free display-name-collision guard -- Argus
+    # round-2), not just a performance index. This migration originally
+    # also added idx_agents_sub_prefix (text_pattern_ops on `sub`), but
+    # that index was removed -- it never actually served the
+    # sibling-identity query's `LIKE ... ESCAPE` predicate, and making it
+    # usable by dropping the query's `autoescape=True` would have been
+    # unsafe given `base_sub`'s IdP-controlled content. See the
+    # migration's own docstring for the full history.
     assert (
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_lower_display_name_active "
         "ON agents (lower(display_name)) WHERE status = 'active'" in result.stdout
     )
-    assert (
-        "CREATE INDEX IF NOT EXISTS idx_agents_sub_prefix "
-        "ON agents (sub text_pattern_ops)" in result.stdout
-    )
+    assert "idx_agents_sub_prefix" not in result.stdout

@@ -4,15 +4,30 @@ Revision ID: a45f344c9c00
 Revises: b2bb6ccde02e
 Create Date: 2026-08-29 00:00:00.000000
 
-Backs two new query patterns added by TECH-5736's ``register_agent``
-guards, added the same round as this migration (Argus round-1 suggestions
-S2/S3): the display-name-collision check
-(``func.lower(Agent.display_name) == ... AND Agent.status == "active"``)
-and the sibling-identity check's prefix match
-(``Agent.sub.startswith(f"{base_sub}::", autoescape=True)``, a
-``LIKE 'base_sub::%'`` predicate). Same rationale as ``bb1ea7d2a0cf``:
-fine at today's table size, worth having in place before real traffic
-rather than adding reactively later.
+Backs the query pattern added by TECH-5736's ``register_agent``
+display-name-collision guard (Argus round-1 suggestion S2):
+``func.lower(Agent.display_name) == ... AND Agent.status == "active"``.
+Same rationale as ``bb1ea7d2a0cf``: fine at today's table size, worth
+having in place before real traffic rather than adding reactively later.
+
+NOTE on the sibling-identity prefix check: an earlier revision of this
+migration also added ``idx_agents_sub_prefix`` (a ``text_pattern_ops``
+index on ``sub``) to back the sibling-identity check's
+``Agent.sub.startswith(f"{base_sub}::", autoescape=True)`` predicate.
+That index was dead weight and has been removed (see the corresponding
+removal in ``models.py``): ``text_pattern_ops`` only accelerates
+Postgres's two-argument pattern operator (``~~``, plain ``LIKE``), not
+the ``LIKE ... ESCAPE '\\'`` form SQLAlchemy emits for
+``autoescape=True``. Dropping ``autoescape=True`` instead (to let the
+index apply) was considered and rejected: ``base_sub`` is sourced from
+``identity.try_resolve_email``, which returns the token's ``email`` or
+``preferred_username`` claim verbatim when present -- IdP-controlled
+content with no allowlist restricting ``%``/``_`` (unlike ``agent_key``,
+which IS restricted to ``[A-Za-z0-9._-]+``). An IdP-supplied
+``preferred_username`` or ``email`` containing a literal ``%`` or ``_``
+would, unescaped, turn the prefix predicate into a real wildcard match
+and could produce false-positive sibling hits. Correctness wins over a
+performance index on this small table: accept a sequential scan here.
 
 NOTE on in-place amendment: the ``idx_agents_lower_display_name_active``
 index below was originally created as a plain (non-unique) index --
@@ -79,16 +94,12 @@ def upgrade() -> None:
         "ON agents (lower(display_name)) "
         "WHERE status = 'active'"
     )
-    # Matches the sibling-identity query's `sub.startswith(f"{base_sub}::")`
-    # prefix predicate, which compiles to `LIKE 'base_sub::%'`. The
-    # existing unique index on `sub` (see ef8394b37c8d) was not created
-    # with text_pattern_ops, so a LIKE prefix scan can't use it under a
-    # non-C locale. text_pattern_ops also serves plain equality lookups,
-    # so this doesn't duplicate the existing unique index's purpose.
-    op.execute("CREATE INDEX IF NOT EXISTS idx_agents_sub_prefix ON agents (sub text_pattern_ops)")
+    # `idx_agents_sub_prefix` (text_pattern_ops on `sub`) was removed here --
+    # see module docstring for why it never actually served the
+    # sibling-identity query and why an unescaped LIKE would be unsafe
+    # instead.
 
 
 def downgrade() -> None:
     # Schema-qualified per bb1ea7d2a0cf's convention.
-    op.execute("DROP INDEX IF EXISTS public.idx_agents_sub_prefix")
     op.execute("DROP INDEX IF EXISTS public.idx_agents_lower_display_name_active")

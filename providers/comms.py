@@ -468,9 +468,11 @@ async def register(
       registers a distinct row; the same ``agent_key`` rebinds the
       existing one. If this call would otherwise create a new row for a
       ``base_sub`` that already has one or more OTHER registered
-      identities, it is rejected with ``identity_fork_detected`` (listing
-      the existing sibling ``agent_key`` values) unless
+      identities, it is rejected with ``identity_fork_detected`` unless
       ``confirm_new_identity=True`` is passed -- see that parameter below.
+      The existing sibling ``agent_key`` values are recorded in the
+      server-side audit log only; they are NOT included in the error
+      message returned to the caller.
 
       The ``email`` claim fallback is gated on ``is_interactive_token``
       (``scopes.py``). For a token with no ``iss`` at all, that check and

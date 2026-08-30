@@ -206,18 +206,20 @@ class Agent(Base):
             unique=True,
             postgresql_where=text("status = 'active'"),
         ),
-        # Backs service.register_agent's sibling-identity prefix check
-        # (Agent.sub.startswith(f"{base_sub}::")), which compiles to a
-        # `LIKE 'base_sub::%'` predicate -- the existing unique index on
-        # `sub` (ef8394b37c8d) isn't built with text_pattern_ops, so it
-        # can't serve a LIKE prefix scan under a non-C locale. Declared
-        # here too, not just in migration a45f344c9c00, for the same
-        # autogenerate-drift reason as the indexes above.
-        Index(
-            "idx_agents_sub_prefix",
-            "sub",
-            postgresql_ops={"sub": "text_pattern_ops"},
-        ),
+        # NOTE: no `idx_agents_sub_prefix` here. service.register_agent's
+        # sibling-identity prefix check
+        # (Agent.sub.startswith(f"{base_sub}::", autoescape=True)) compiles
+        # to `LIKE 'base_sub::%' ESCAPE '\\'`, which a `text_pattern_ops`
+        # index can't serve -- that opclass only accelerates the
+        # two-argument `~~` (plain LIKE) operator, not the ESCAPE form.
+        # Dropping `autoescape=True` to make the index usable was
+        # considered and rejected: `base_sub` comes from
+        # `identity.try_resolve_email`'s `email`/`preferred_username`
+        # claims, which are IdP-controlled and not restricted against
+        # `%`/`_` the way `agent_key` is. So this query accepts a
+        # sequential scan on this small table instead of an index that
+        # would either be dead weight or unsafe. See migration
+        # a45f344c9c00's docstring for the full history.
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()

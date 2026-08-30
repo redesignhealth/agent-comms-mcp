@@ -60,7 +60,18 @@ TOOL_SCOPES: dict[str, str] = {
     "comms_get_hold_status": "comms:read",
     # Writes (mutate board/agent/conversation state)
     "comms_register": "comms:write",
+    # Registered at comms:write deliberately -- the elevated `comms:admin`
+    # requirement to correct `is_shared` is enforced by an in-handler
+    # `comms:admin`-or-interactive-caller check (see the `:admin` verb note
+    # above), not by this table. Do not assume TOOL_SCOPES alone gates this
+    # tool's `is_shared` correction.
     "comms_set_agent_shared": "comms:write",
+    # Registered at comms:write deliberately -- the actual authorization
+    # (comms:admin OR an interactive/Okta caller) is enforced by an
+    # in-handler check (see the `:admin` verb note above), not by this
+    # table. If that in-handler check is ever removed, this entry alone
+    # would silently grant every comms:write token deregistration power --
+    # do not assume TOOL_SCOPES alone gates this tool.
     "comms_deregister_agent": "comms:write",
     "comms_start_conversation": "comms:write",
     "comms_post_message": "comms:write",

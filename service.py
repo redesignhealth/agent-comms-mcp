@@ -1382,12 +1382,25 @@ async def register_agent(
         # is redundant given `existing is None` already means no row
         # equals `sub`, but kept explicit so this query's own intent (find
         # OTHER identities under this base_sub) doesn't depend on that
-        # invariant holding. Filtered to `status == "active"` (Argus
-        # round-1 suggestion): a SUSPENDED sibling must not permanently
-        # force `confirm_new_identity=True` on this base_sub -- deregistering
-        # a stray sibling (the documented remediation path, DESIGN.md §5)
-        # should actually free up plain re-registration afterward, matching
-        # the display_name guard's own `status == "active"` scoping below.
+        # invariant holding. Deliberately NOT filtered to `status ==
+        # "active"` (Argus round-1 suggestion S3, later reverted): an
+        # earlier revision scoped this to active siblings only, on the
+        # theory that a SUSPENDED sibling shouldn't permanently force
+        # `confirm_new_identity=True`. That reasoning turned out to be
+        # wrong -- it meant `comms_deregister_agent` (the kill-switch for a
+        # stray/compromised identity) could be silently bypassed: suspend
+        # every sibling under a `base_sub`, then register a brand-new
+        # `agent_key` with zero *active* siblings found, sailing through
+        # this guard unconfirmed. A `base_sub` with ANY prior identity --
+        # active or suspended -- is exactly the silent-identity-churn
+        # signal this guard exists to catch, so ALL rows (regardless of
+        # status) count as siblings here. This intentionally does NOT
+        # affect the display_name guard below, which is a different check
+        # (case-insensitive display_name collision, not identity-fork
+        # detection) and correctly keeps its own `status == "active"`
+        # scoping -- nor does it affect re-registration of an agent's OWN
+        # existing `sub` (active or suspended), which is a separate code
+        # path entirely (`existing is not None`) and never reaches here.
         #
         # Accepted race (TECH-5736 suggestion, code-level only -- the
         # display_name guard is separately getting a DB unique index; this
@@ -1406,7 +1419,6 @@ async def register_agent(
                 await session.execute(
                     select(Agent.sub).where(
                         Agent.sub != sub,
-                        Agent.status == "active",
                         or_(
                             Agent.sub == base_sub,
                             Agent.sub.startswith(f"{base_sub}::", autoescape=True),

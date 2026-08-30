@@ -6970,13 +6970,18 @@ class TestDeregisterAgent:
         assert row_b.status == "active"
         assert row_b.display_name == "Shared Name"
 
-    async def test_deregistering_a_sibling_frees_up_plain_reregistration(
+    async def test_deregistering_a_sibling_still_requires_confirmation_for_new_identity(
         self, session: AsyncSession
     ) -> None:
-        """Argus round-1 (TECH-5736): the sibling-fork guard must only
-        consider ACTIVE siblings -- a suspended one must not permanently
-        force confirm_new_identity=True on this base_sub, since
-        deregistering a stray sibling is the documented remediation path."""
+        """Argus round-1 (TECH-5736) originally scoped the sibling-fork
+        guard to ACTIVE siblings only, so a suspended sibling wouldn't
+        permanently force confirm_new_identity=True. That was reverted
+        (later round): scoping to active-only meant comms_deregister_agent
+        -- the kill-switch for a stray/compromised identity -- could be
+        silently bypassed by suspending every sibling and then registering
+        a brand-new agent_key with zero *active* siblings found. A
+        base_sub with ANY prior identity, active or suspended, must still
+        require confirm_new_identity=True for a genuinely new sibling."""
         base_sub = "multi-agent-with-stray-sibling"
         stray = await register_agent(
             session,
@@ -6991,8 +6996,21 @@ class TestDeregisterAgent:
             session, actor_sub="admin-operator", agent_id=stray.id, deregister_authorized=True
         )
 
-        # Bare base_sub, no confirm_new_identity -- would be
-        # identity_fork_detected if the suspended sibling still counted.
+        # Bare base_sub, no confirm_new_identity -- the suspended sibling
+        # still counts, so this must be denied as an identity fork.
+        with pytest.raises(SiblingIdentityExistsError) as exc_info:
+            await register_agent(
+                session,
+                sub=base_sub,
+                base_sub=base_sub,
+                owner_sub=base_sub,
+                owner_email="multi-agent@example.com",
+                display_name="Primary",
+                accepted_types=sorted(MESSAGE_TYPES),
+            )
+        assert exc_info.value.base_sub == base_sub
+
+        # With confirm_new_identity=True, the new identity is allowed.
         registered = await register_agent(
             session,
             sub=base_sub,
@@ -7001,8 +7019,60 @@ class TestDeregisterAgent:
             owner_email="multi-agent@example.com",
             display_name="Primary",
             accepted_types=sorted(MESSAGE_TYPES),
+            confirm_new_identity=True,
         )
         assert registered.sub == base_sub
+
+    async def test_reentry_after_suspending_all_siblings_requires_confirmation(
+        self, session: AsyncSession
+    ) -> None:
+        """Regression for the kill-switch-bypass gap: register agent A
+        under base_sub with agent_key "a1", deregister (suspend) it, then
+        attempt to register a NEW agent_key "a2" under the same base_sub
+        without confirm_new_identity=True. Previously this silently
+        succeeded because the sibling-count query only looked at ACTIVE
+        rows, so a fully-suspended base_sub looked identical to a
+        never-registered one. It must now raise
+        SiblingIdentityExistsError."""
+        base_sub = "multi-agent-fully-suspended"
+        agent_a = await register_agent(
+            session,
+            sub=f"{base_sub}::a1",
+            base_sub=base_sub,
+            owner_sub=base_sub,
+            owner_email="multi-agent-fully-suspended@example.com",
+            display_name="Agent A1",
+            accepted_types=sorted(MESSAGE_TYPES),
+        )
+        await deregister_agent(
+            session, actor_sub="admin-operator", agent_id=agent_a.id, deregister_authorized=True
+        )
+
+        with pytest.raises(SiblingIdentityExistsError) as exc_info:
+            await register_agent(
+                session,
+                sub=f"{base_sub}::a2",
+                base_sub=base_sub,
+                owner_sub=base_sub,
+                owner_email="multi-agent-fully-suspended@example.com",
+                display_name="Agent A2",
+                accepted_types=sorted(MESSAGE_TYPES),
+            )
+        assert exc_info.value.base_sub == base_sub
+        assert exc_info.value.existing_agent_keys == ["a1"]
+
+        # confirm_new_identity=True still lets the caller through.
+        agent_a2 = await register_agent(
+            session,
+            sub=f"{base_sub}::a2",
+            base_sub=base_sub,
+            owner_sub=base_sub,
+            owner_email="multi-agent-fully-suspended@example.com",
+            display_name="Agent A2",
+            accepted_types=sorted(MESSAGE_TYPES),
+            confirm_new_identity=True,
+        )
+        assert agent_a2.sub == f"{base_sub}::a2"
 
     async def test_deregistered_agent_cannot_be_conversation_target(
         self, session: AsyncSession

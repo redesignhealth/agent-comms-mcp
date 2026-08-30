@@ -102,9 +102,11 @@ instead of erroring or re-binding the one they meant -- this is exactly the "Pep
 Pots overwrote Bond 007" failure mode inverted (a stray row instead of a clobber).
 `register_agent` now refuses to create a new row when the caller's base identity
 already owns at least one *active* row under a *different* `agent_key` (including no
-key at all), raising `identity_fork_detected` and listing the existing sibling
-`agent_key`s, unless the caller passes `confirm_new_identity=True` to say explicitly
-"yes, this is a deliberate additional identity." Filtered to `status == "active"`:
+key at all), raising `identity_fork_detected`, unless the caller passes
+`confirm_new_identity=True` to say explicitly "yes, this is a deliberate additional
+identity." The existing sibling `agent_key`s are recorded server-side, in the audit
+log only -- like `display_name_collision`'s colliding `sub`s below, they are never
+included in the error message returned to the caller. Filtered to `status == "active"`:
 a *suspended* sibling (retired via `comms_deregister_agent`, below) must not
 permanently force `confirm_new_identity=True` on every future registration under
 that base identity -- deregistering a stray row is the documented remediation path,

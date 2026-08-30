@@ -1102,6 +1102,33 @@ class TestDeregisterAgent:
                 "comms_inbox",
             )
 
+    async def test_suspended_agent_cannot_re_register(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """TECH-5736 suggestion: the same `_resolve_caller_agent`
+        suspension check covered above for `comms_inbox` also needs
+        coverage on the `comms_register` tool-boundary itself -- the write
+        path a suspended agent is most likely to retry with its
+        still-unexpired token. Confirms a deregistered agent calling
+        `comms_register` again (same `sub`, same token) is rejected with
+        `agent_suspended` rather than being silently reactivated."""
+        registered = await _register(main, test_session_factory, "kill-switch-reregister-mcp")
+
+        admin_token = _token(
+            "admin-operator-kill-switch-reregister-mcp",
+            scopes=["comms:read", "comms:write", "comms:admin"],
+        )
+        await _call(
+            main,
+            test_session_factory,
+            admin_token,
+            "comms_deregister_agent",
+            {"agent_id": registered["agent_id"]},
+        )
+
+        with pytest.raises(ToolError, match="agent_suspended"):
+            await _register(main, test_session_factory, "kill-switch-reregister-mcp")
+
     async def test_admin_can_still_deregister_target_while_admins_own_agent_suspended(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
