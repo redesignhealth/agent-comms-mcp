@@ -101,16 +101,22 @@ would otherwise silently create a brand-new sibling row under the bare base iden
 instead of erroring or re-binding the one they meant -- this is exactly the "Pepper
 Pots overwrote Bond 007" failure mode inverted (a stray row instead of a clobber).
 `register_agent` now refuses to create a new row when the caller's base identity
-already owns at least one *active* row under a *different* `agent_key` (including no
+already owns at least one row under a *different* `agent_key` (including no
 key at all), raising `identity_fork_detected`, unless the caller passes
 `confirm_new_identity=True` to say explicitly "yes, this is a deliberate additional
 identity." The existing sibling `agent_key`s are recorded server-side, in the audit
 log only -- like `display_name_collision`'s colliding `sub`s below, they are never
-included in the error message returned to the caller. Filtered to `status == "active"`:
-a *suspended* sibling (retired via `comms_deregister_agent`, below) must not
-permanently force `confirm_new_identity=True` on every future registration under
-that base identity -- deregistering a stray row is the documented remediation path,
-and it should actually free up plain re-registration afterward. `confirm_new_identity`
+included in the error message returned to the caller. Deliberately NOT filtered to
+`status == "active"`: ALL siblings under a base identity count toward this check,
+regardless of status. This closes a kill-switch bypass -- filtering to active-only
+would let a caller suspend every existing identity under a base_sub (via
+`comms_deregister_agent`) and then register a brand-new `agent_key` with the guard
+silently skipped, since no *active* sibling would remain to trigger it. The
+consequence is permanent: once any identity under a base_sub has ever been
+registered and then suspended, every future new sibling under that base
+permanently requires `confirm_new_identity=True`. There is no operator
+remediation action that clears this condition -- deregistering a row doesn't
+undo it; deregistering is what triggers it in the first place. `confirm_new_identity`
 requires only the baseline `comms:write` scope, not `comms:admin`: it is not an
 admission-decision input (unlike `is_shared`, directly below), and any caller
 legitimately running multiple agents under one token needs to be able to register a
@@ -137,12 +143,13 @@ case-insensitive `display_name` collision among active agents cannot slip past a
 race: two concurrent `comms_register` calls for the same `display_name` can both
 pass the application-level check, but only one can commit, and the loser gets a DB
 constraint violation instead of a silently-admitted duplicate. The sibling-identity
-(fork) check's prefix predicate, by contrast, is backed only by
-`idx_agents_sub_prefix`, a plain (non-unique) index on `sub` using
-`text_pattern_ops` purely for `LIKE 'base_sub::%'` lookup performance, not to enforce
-any uniqueness invariant -- there is nothing for it to enforce, since sibling rows
-under the same base identity are expected to have distinct `sub`s already covered by
-the pre-existing unique index on `sub` itself. So `identity_fork_detected` remains
+(fork) check's prefix predicate, by contrast, has no dedicated index backing it --
+it accepts a sequential scan, given the table's expected size. An index was tried
+and removed: `text_pattern_ops` only accelerates the plain two-argument `LIKE`
+operator, not the `LIKE ... ESCAPE` form that SQLAlchemy's
+`startswith(..., autoescape=True)` emits for this query, so a `text_pattern_ops`
+index here was never actually effective, and was removed rather than kept as
+dead weight. So `identity_fork_detected` remains
 best-effort under concurrent registration load, not race-free: two concurrent
 `comms_register` calls for the same base identity with different (or omitted)
 `agent_key`s can both pass the check before either commits, each creating its own
@@ -394,7 +401,7 @@ scroll-to-load-more use case.
 | `comms_whoami` | comms:read | caller identity/scopes; also returns this identity's registered min/max_schema_version via a best-effort DB lookup if already `comms_register`'d -- omitted if not yet registered or the DB is unreachable (this tool remains usable as an auth-only diagnostic either way) |
 | `comms_register` | comms:write | idempotent self-provisioning: display_name, accepted_types (max 20, 100 chars each), min/max_schema_version (default 1/1, for schema-version capability negotiation); `is_shared=True` on first registration additionally requires comms:admin (see §5); rejects a new sibling row under the same base identity (`identity_fork_detected`) unless `confirm_new_identity=True`, and rejects a new row whose `display_name` collides with an existing active agent's (`display_name_collision`, not bypassable by `confirm_new_identity` -- DB-enforced race-free via a `UNIQUE` partial index, see §5) |
 | `comms_set_agent_shared` | comms:write | admin override of an existing agent's `is_shared`, since `comms_register` freezes it against the agent's own re-registration; additionally requires comms:admin OR an interactive/Okta caller (see §5) |
-| `comms_deregister_agent` | comms:write | sets an existing agent's `status="suspended"`; additionally requires comms:admin OR an interactive/Okta caller (see §5); one-directional by design -- no reactivate tool |
+| `comms_deregister_agent` | comms:write | sets an existing agent's `status="suspended"`; additionally requires comms:admin OR an interactive/Okta caller (see §5); one-directional by design -- no reactivate tool. Because it is one-directional, suspending an identity here is exactly what makes the sibling-fork check's "all siblings count, not just active ones" condition (see §5) trigger permanently for that base identity -- there is no reactivation path to undo it. This is intentional, to prevent kill-switch bypasses |
 | `comms_list_agents` | comms:read | directory (internal domain, enumeration acceptable). Returns agent UUIDs used as target identifiers in other tools. A registry-retired agent (`ACTIVE_CHECKER` seam, TECH-5703, §"Configuration: pluggable seams") is excluded from results, though its row is never deleted; `total_count` still reflects every board-registered agent regardless of retirement status. Retirement is filtered AFTER pagination is computed from the raw rows, so a page can return fewer than `limit` agents (including zero) while `has_more` is still `true` -- callers must page until `has_more` is `false`, not until `agents` is empty |
 | `comms_lookup_agent_by_email` | comms:read | directory lookup by owner email; `{"agent": ..., "found": bool}`. O(1) targeted equivalent of paginating `comms_list_agents` -- see §10's enumeration-posture note. A registry-retired agent resolves to the same not-found shape as an unregistered email (TECH-5703) |
 | `comms_start_conversation` | comms:write | type + up to 50 target agent UUIDs (from `comms_list_agents`) + initial request payload. **Two response shapes** (TECH-5389): the normal conversation-created shape, or (if the opener was high-risk) that same shape plus a `held_for_approval`/`hold_id`/`hold_status`/`risk_reason` block — the conversation is created anyway, opened with a service-synthesized `conversation_opened` marker at seq 1, and the real content is held (§9). A registry-retired target (TECH-5703) raises a specific "agent retired" error instead of the uniform unknown-agent denial |

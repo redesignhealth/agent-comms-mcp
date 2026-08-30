@@ -1129,6 +1129,58 @@ class TestDeregisterAgent:
         with pytest.raises(ToolError, match="agent_suspended"):
             await _register(main, test_session_factory, "kill-switch-reregister-mcp")
 
+    async def test_new_agent_key_after_suspending_all_siblings_requires_confirmation(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """MCP-boundary regression for the kill-switch-bypass gap
+        (mirrors ``test_service.py``'s
+        ``test_reentry_after_suspending_all_siblings_requires_confirmation``):
+        register agent A under a base sub with ``agent_key="a1"``, suspend
+        it via ``comms_deregister_agent``, then attempt to register a NEW
+        ``agent_key="a2"`` under the same base sub without
+        ``confirm_new_identity``. The fully-suspended base sub must still
+        be treated as having an existing sibling identity, not a fresh
+        one -- this must raise ``identity_fork_detected``, not silently
+        succeed."""
+        base_sub = "kill-switch-fork-mcp"
+        token = _token(base_sub, owner_sub=base_sub)
+        registered = await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {
+                "display_name": "Agent A1",
+                "accepted_types": ["availability_request"],
+                "agent_key": "a1",
+            },
+        )
+
+        admin_token = _token(
+            "admin-operator-kill-switch-fork-mcp",
+            scopes=["comms:read", "comms:write", "comms:admin"],
+        )
+        await _call(
+            main,
+            test_session_factory,
+            admin_token,
+            "comms_deregister_agent",
+            {"agent_id": registered["agent_id"]},
+        )
+
+        with pytest.raises(ToolError, match="identity_fork_detected"):
+            await _call(
+                main,
+                test_session_factory,
+                _token(base_sub, owner_sub=base_sub),
+                "comms_register",
+                {
+                    "display_name": "Agent A2",
+                    "accepted_types": ["availability_request"],
+                    "agent_key": "a2",
+                },
+            )
+
     async def test_admin_can_still_deregister_target_while_admins_own_agent_suspended(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:

@@ -853,6 +853,7 @@ class TestRegisterAgent:
             )
         assert exc_info.value.base_sub == "dan@example.com"
         assert exc_info.value.existing_agent_keys == ["bond-007"]
+        assert "bond-007" not in str(exc_info.value)
 
         # No stray row was created.
         row = (
@@ -7060,6 +7061,21 @@ class TestDeregisterAgent:
             )
         assert exc_info.value.base_sub == base_sub
         assert exc_info.value.existing_agent_keys == ["a1"]
+        assert "a1" not in str(exc_info.value)
+
+        audit_rows = (
+            (
+                await session.execute(
+                    select(AuditLog.action).where(
+                        AuditLog.actor_sub == f"{base_sub}::a2",
+                        AuditLog.action == "denied.sibling_identity_exists",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert audit_rows == ["denied.sibling_identity_exists"]
 
         # confirm_new_identity=True still lets the caller through.
         agent_a2 = await register_agent(

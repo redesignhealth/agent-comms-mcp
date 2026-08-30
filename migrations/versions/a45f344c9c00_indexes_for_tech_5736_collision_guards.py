@@ -103,3 +103,8 @@ def upgrade() -> None:
 def downgrade() -> None:
     # Schema-qualified per bb1ea7d2a0cf's convention.
     op.execute("DROP INDEX IF EXISTS public.idx_agents_lower_display_name_active")
+    # `idx_agents_sub_prefix` is no longer created by upgrade() (see module
+    # docstring), but an earlier revision of this migration did create it.
+    # Keeping the DROP here makes downgrade self-healing for any database
+    # that ran that earlier revision, without recreating the index.
+    op.execute("DROP INDEX IF EXISTS public.idx_agents_sub_prefix")
