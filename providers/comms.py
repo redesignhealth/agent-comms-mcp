@@ -686,6 +686,22 @@ async def deregister_agent(agent_id: str) -> dict[str, Any]:
     - ``agent_id``: UUID string from ``comms_list_agents``.
     """
     token = _require_token()
+    # Deliberately `_require_identity`, not `_resolve_caller_agent`
+    # (TECH-5736 investigation): this call only needs `actor_sub` as a
+    # string for the audit log's `actor_sub` field, not a board `Agent`
+    # row -- authorization below is entirely token-scope-based
+    # (`comms:admin` or interactive/Okta), independent of whether the
+    # ADMIN's own agent (if it even has one) is suspended.
+    # `_resolve_caller_agent`'s suspension check exists to stop a
+    # suspended agent from continuing to act AS ITSELF on read-path
+    # tools; it has no bearing on whether a comms:admin-scoped caller may
+    # administer OTHER agents, and `_resolve_caller_agent`'s own
+    # docstring says as much ("an admin whose own agent happens to be
+    # suspended can still deregister someone else"). Routing this call
+    # through `_resolve_caller_agent` instead would also break callers
+    # who are legitimately admin (comms:admin scope or interactive/Okta)
+    # but have never called `comms_register` at all and so have no
+    # `Agent` row to resolve.
     actor_sub = _require_identity(token)
     deregister_authorized = is_interactive_token(token) or "comms:admin" in scopes_for_token(token)
     target_id = _parse_uuid("agent_id", agent_id)

@@ -160,6 +160,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, NoReturn, Protocol
 
 from sqlalchemy import func, literal, or_, select, tuple_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from exceptions import (
@@ -442,6 +443,44 @@ async def _deny_agent_suspended(
     )
     await session.commit()
     raise AgentSuspendedError(sub=sub)
+
+
+def _is_display_name_index_violation(exc: IntegrityError) -> bool:
+    """Narrow check that ``exc`` is specifically a violation of
+    ``idx_agents_lower_display_name_active`` (migration a45f344c9c00),
+    not merely "some IntegrityError". Postgres reports a unique partial
+    index's name in the underlying error's ``constraint_name`` diagnostic
+    field the same way it would a real named constraint -- asyncpg
+    surfaces that as an attribute on ``exc.orig``. Deliberately not a
+    blanket catch: any other IntegrityError (e.g. a genuinely unrelated
+    constraint) must keep propagating as itself."""
+    return getattr(exc.orig, "constraint_name", None) == "idx_agents_lower_display_name_active"
+
+
+async def _deny_sibling_identity_exists(
+    session: AsyncSession,
+    *,
+    base_sub: str,
+    sub: str,
+    existing_agent_keys: list[str | None],
+) -> NoReturn:
+    """Same audit/commit shape as ``_deny``, but for
+    ``exceptions.SiblingIdentityExistsError`` (TECH-5736): about to create a
+    brand-new row for ``sub`` while ``base_sub`` already has at least one
+    other active identity. DESIGN.md §8 invariant 5 requires every denial to
+    be audited, the same as every other fail-closed branch in
+    ``register_agent`` -- this one was missed when the check itself was
+    added. ``actor_sub`` is ``sub`` itself, matching every other denial
+    inside ``register_agent`` (no authenticated identity distinct from the
+    registering caller is available at this point)."""
+    _audit(
+        session,
+        actor_sub=sub,
+        action="denied.sibling_identity_exists",
+        detail={"base_sub": base_sub, "sub": sub, "existing_agent_keys": existing_agent_keys},
+    )
+    await session.commit()
+    raise SiblingIdentityExistsError(base_sub=base_sub, existing_agent_keys=existing_agent_keys)
 
 
 async def _deny_display_name_collision(
@@ -1368,8 +1407,10 @@ async def register_agent(
             .all()
         )
         if sibling_subs:
-            raise SiblingIdentityExistsError(
+            await _deny_sibling_identity_exists(
+                session,
                 base_sub=base_sub,
+                sub=sub,
                 existing_agent_keys=[_agent_key_from_sub(s, base_sub) for s in sibling_subs],
             )
     if created:
@@ -1481,7 +1522,39 @@ async def register_agent(
         agent.bound_at = now
         agent.min_schema_version = min_schema_version
         agent.max_schema_version = max_schema_version
-    await session.flush()
+    try:
+        await session.flush()
+    except IntegrityError as exc:
+        # TECH-5736 (Argus round-2 finding): idx_agents_lower_display_name_active
+        # (migration a45f344c9c00) is a UNIQUE partial index backing the
+        # app-level display_name check above -- it exists precisely to
+        # catch what that racy read-then-insert check can miss: (a) two
+        # concurrent first-time registrations racing past the check with
+        # the same display_name, or (b) a re-registration (line ~1477)
+        # renaming onto a name a DIFFERENT active agent already holds,
+        # which the check above never even queries for (it only runs
+        # `if created`). Without this, either case surfaces as a raw,
+        # unmapped IntegrityError (a 500) instead of the intended
+        # DisplayNameCollisionError. Narrowed to THIS index by name --
+        # not a blanket IntegrityError->DisplayNameCollisionError mapping
+        # -- so an unrelated constraint violation still propagates as
+        # itself rather than being mislabeled.
+        await session.rollback()
+        if _is_display_name_index_violation(exc):
+            await _deny_display_name_collision(
+                session,
+                actor_sub=sub,
+                display_name=display_name,
+                # Unlike the app-level check's `colliding_subs`, the
+                # DB-level violation doesn't hand us the other row's
+                # `sub` -- only that a conflict exists. `existing_subs`
+                # is server-side-audit-only (never surfaced to the
+                # caller, see DisplayNameCollisionError's docstring), so
+                # recording "detected at the DB layer, sub unknown" here
+                # is honest rather than fabricating a value.
+                existing_subs=[],
+            )
+        raise
     _audit(
         session,
         actor_sub=sub,

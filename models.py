@@ -192,6 +192,32 @@ class Agent(Base):
             column("id").asc(),
             postgresql_where=text("status = 'active' AND is_shared = false"),
         ),
+        # Backs service.register_agent's display-name-collision check
+        # (func.lower(Agent.display_name) == ... AND status == "active")
+        # and, since migration a45f344c9c00's in-place amendment, is a
+        # UNIQUE index -- a DB-level backstop closing the race the
+        # app-level read-then-insert check alone can't (see that
+        # migration's docstring). Declared here too, not just in the
+        # migration, for the same autogenerate-drift reason as
+        # idx_agents_lower_owner_email_active above.
+        Index(
+            "idx_agents_lower_display_name_active",
+            text("lower(display_name)"),
+            unique=True,
+            postgresql_where=text("status = 'active'"),
+        ),
+        # Backs service.register_agent's sibling-identity prefix check
+        # (Agent.sub.startswith(f"{base_sub}::")), which compiles to a
+        # `LIKE 'base_sub::%'` predicate -- the existing unique index on
+        # `sub` (ef8394b37c8d) isn't built with text_pattern_ops, so it
+        # can't serve a LIKE prefix scan under a non-C locale. Declared
+        # here too, not just in migration a45f344c9c00, for the same
+        # autogenerate-drift reason as the indexes above.
+        Index(
+            "idx_agents_sub_prefix",
+            "sub",
+            postgresql_ops={"sub": "text_pattern_ops"},
+        ),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()

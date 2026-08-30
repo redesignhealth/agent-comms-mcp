@@ -955,6 +955,51 @@ class TestRegisterAgent:
         )
         assert again.display_name == "One Renamed"
 
+    async def test_sibling_check_does_not_fire_on_re_registration_with_other_active_siblings(
+        self, session: AsyncSession
+    ) -> None:
+        """Two active siblings already exist under the same base_sub.
+        Re-registering ONE of them with its OWN existing agent_key is a
+        legitimate re-registration, not a fork -- it must succeed. Only
+        omitting/mismatching the key against an existing sibling should
+        trip SiblingIdentityExistsError (covered by
+        test_sibling_identity_blocks_new_row_without_confirmation and
+        test_sibling_identity_lists_all_existing_agent_keys above)."""
+        await register_agent(
+            session,
+            sub="rereg-multi-base::one",
+            base_sub="rereg-multi-base",
+            owner_sub="rereg-multi-base",
+            owner_email="rereg-multi-base@example.com",
+            display_name="One",
+            accepted_types=sorted(MESSAGE_TYPES),
+            is_shared_authorized=True,
+        )
+        await register_agent(
+            session,
+            sub="rereg-multi-base::two",
+            base_sub="rereg-multi-base",
+            owner_sub="rereg-multi-base",
+            owner_email="rereg-multi-base@example.com",
+            display_name="Two",
+            accepted_types=sorted(MESSAGE_TYPES),
+            is_shared_authorized=True,
+            confirm_new_identity=True,
+        )
+
+        again = await register_agent(
+            session,
+            sub="rereg-multi-base::one",
+            base_sub="rereg-multi-base",
+            owner_sub="rereg-multi-base",
+            owner_email="rereg-multi-base@example.com",
+            display_name="One Renamed",
+            accepted_types=sorted(MESSAGE_TYPES),
+            is_shared_authorized=True,
+        )
+        assert again.sub == "rereg-multi-base::one"
+        assert again.display_name == "One Renamed"
+
     async def test_display_name_collision_blocks_new_row(self, session: AsyncSession) -> None:
         await _register(session, "display-collision-a", display_name="Bond 007")
 
@@ -971,6 +1016,12 @@ class TestRegisterAgent:
             )
         assert exc_info.value.display_name == "Bond 007"
         assert exc_info.value.existing_subs == ["display-collision-a"]
+        # Round-1 Argus sub-enumeration fix: the colliding sibling's `sub`
+        # must never appear in the exception's string form (a
+        # comms:write-only caller can see this message but not
+        # comms_list_agents), even though `existing_subs` remains a real
+        # attribute above for server-side audit logging.
+        assert "display-collision-a" not in str(exc_info.value)
 
         row = (
             await session.execute(select(Agent).where(Agent.sub == "display-collision-b"))
