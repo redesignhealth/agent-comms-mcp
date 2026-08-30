@@ -354,12 +354,33 @@ class AutoDecision(NamedTuple):
     detail: dict[str, Any] | None
 
 
+class ParticipantInfo(NamedTuple):
+    """One other conversation participant, as seen by a ``HoldContext``.
+
+    Same shape as ``service.get_hold_conversation_participants``'s HTTP
+    response entries (``agent_id``/``display_name``/``role``/``status``),
+    kept here as a typed value rather than a dict since this travels
+    in-process through the ``AutoApprover`` seam, not over HTTP.
+    """
+
+    agent_id: uuid.UUID
+    display_name: str
+    role: str
+    status: str
+
+
 class HoldContext(NamedTuple):
     """Everything an ``AutoApprover`` needs to review one hold.
 
     Unlike ``MessageRiskContext``, this DOES carry the payload — per the
     plan doc, the risk flag stays light and the expensive judgment belongs
     here.
+
+    ``participants`` (TECH-5754) is the OTHER active/invited conversation
+    participants (never includes ``sender_agent_id``/the inviter) — who
+    this hold's message is actually addressed to, or who is already in the
+    conversation being invited into. Additive: existing ``AutoApprover``
+    implementations (``EscalateAllAutoApprover``) ignore it.
     """
 
     hold_id: uuid.UUID
@@ -371,6 +392,7 @@ class HoldContext(NamedTuple):
     schema_version: int
     payload: dict[str, Any]
     risk_reason: str
+    participants: list[ParticipantInfo]
 
 
 class AutoApprover(Protocol):
@@ -652,6 +674,7 @@ __all__ = [
     "HoldContext",
     "LogOnlyNotifier",
     "MessageRiskContext",
+    "ParticipantInfo",
     "RiskScorer",
     "RiskScoringInfraError",
     "RiskVerdict",

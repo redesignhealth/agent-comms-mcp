@@ -314,6 +314,19 @@ class _RaisingActiveChecker:
         raise RuntimeError("simulated registry failure")
 
 
+class _RecordingAutoApprover:
+    """TECH-5754 test double: captures the ``HoldContext`` it was called
+    with (so a test can assert on ``.participants``) and always escalates
+    -- same v1 ``EscalateAllAutoApprover`` behavior, just observed."""
+
+    def __init__(self) -> None:
+        self.captured_ctx: plugins.HoldContext | None = None
+
+    async def review(self, ctx: plugins.HoldContext) -> plugins.AutoDecision:
+        self.captured_ctx = ctx
+        return plugins.AutoDecision(cleared=False, detail=None)
+
+
 def _request_payload(**overrides: Any) -> dict[str, Any]:
     now = datetime.now(UTC)
     payload: dict[str, Any] = {
@@ -1270,6 +1283,37 @@ class TestStartConversation:
         assert "approval.hold" in hold_actions
         assert "approval.escalate" in hold_actions
         assert "denied.boundary_crossing" not in hold_actions
+
+    async def test_open_note_as_initial_message_hold_context_carries_targets(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-5754: the opener-diversion path builds ``HoldContext.participants``
+        from the just-inserted target `Participant` rows (role="member",
+        status="invited") -- not from a query, and never includes the
+        initiator itself."""
+        owner = await _register(session, "owner-open-note-participants")
+        target = await _register(session, "target-open-note-participants")
+        recorder = _RecordingAutoApprover()
+
+        await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message={"text": "hello"},
+            message_type="note",
+            auto_approver=recorder,
+        )
+        assert recorder.captured_ctx is not None
+        assert recorder.captured_ctx.participants == [
+            plugins.ParticipantInfo(
+                agent_id=target.id,
+                display_name=target.display_name,
+                role="member",
+                status="invited",
+            )
+        ]
 
     async def test_task_decline_as_initial_message_denied(self, session: AsyncSession) -> None:
         """``task_decline`` is member-role-restricted, but the initiator's
@@ -2736,6 +2780,38 @@ class TestInviteRequiresApprovalForNoteHistory:
         ).scalar_one_or_none()
         assert participant is None
 
+    async def test_invite_hold_context_carries_existing_participants(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-5754: unlike ``_divert_high_risk_message``'s two call sites,
+        this diversion path has no participants already loaded -- confirms
+        the one query it adds excludes the inviter and returns the
+        already-active target."""
+        owner, target, conversation, client = await self._conversation_with_note(
+            session, "invite-hold-owner-participants", "invite-hold-target-participants"
+        )
+        new_agent = await _register(session, "invite-hold-new-participants")
+        client._owners_by_agent_id[new_agent.id] = {"is_shared": False, "owners": ["dan"]}
+        recorder = _RecordingAutoApprover()
+        await invite(
+            session,
+            actor_sub=owner.sub,
+            inviter_agent_id=owner.id,
+            conversation_id=conversation.id,
+            target_agent_id=new_agent.id,
+            ownership_client=client,
+            auto_approver=recorder,
+        )
+        assert recorder.captured_ctx is not None
+        assert recorder.captured_ctx.participants == [
+            plugins.ParticipantInfo(
+                agent_id=target.id,
+                display_name=target.display_name,
+                role="member",
+                status="active",
+            )
+        ]
+
     async def test_invite_hold_cleared_by_auto_approver_creates_participant_inline(
         self, session: AsyncSession
     ) -> None:
@@ -3611,6 +3687,35 @@ class TestPostMessageBoundaryCrossing:
         assert "approval.hold" in actions
         assert "approval.escalate" in actions
         assert "denied.boundary_crossing" not in actions
+
+    async def test_hold_context_carries_participants(self, session: AsyncSession) -> None:
+        """TECH-5754: ``_check_boundary_crossing``'s own participants-join
+        (already run for the capability gate) is reshaped into
+        ``HoldContext.participants`` -- the accepted target, active by this
+        point, not the sender."""
+        owner, target, conversation, client = await self._asymmetric_pair(
+            session, ["dan"], ["dan", "priya"]
+        )
+        recorder = _RecordingAutoApprover()
+        await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="note",
+            payload={"text": "hello"},
+            ownership_client=client,
+            auto_approver=recorder,
+        )
+        assert recorder.captured_ctx is not None
+        assert recorder.captured_ctx.participants == [
+            plugins.ParticipantInfo(
+                agent_id=target.id,
+                display_name=target.display_name,
+                role="member",
+                status="active",
+            )
+        ]
 
     async def test_second_lookup_failure_denied(self, session: AsyncSession) -> None:
         """The sender's own ownership lookup succeeds, but a later
