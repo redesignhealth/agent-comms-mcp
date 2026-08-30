@@ -1,7 +1,7 @@
 """indexes for TECH-5736 collision guards
 
 Revision ID: a45f344c9c00
-Revises: 4f6eb79742ec
+Revises: b2bb6ccde02e
 Create Date: 2026-08-29 00:00:00.000000
 
 Backs two new query patterns added by TECH-5736's ``register_agent``
@@ -33,7 +33,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "a45f344c9c00"
-down_revision: str | None = "4f6eb79742ec"
+down_revision: str | None = "b2bb6ccde02e"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
