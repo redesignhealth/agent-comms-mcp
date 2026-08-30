@@ -392,6 +392,20 @@ class HoldContext(NamedTuple):
     sort under a non-C Postgres locale) — an ``AutoApprover`` that builds a
     prompt from this list should preserve that order rather than
     re-sorting, for stable/cacheable prompts across repeated holds.
+
+    ``sender_sub`` (TECH-5755) is the sender's own ``Agent.sub`` — the
+    agent-jwt subject this agent registered with, board-wide-unique. For a
+    real RH-internal bot this is the same string as its Arc ``bot_id``
+    (``RHAgentVerifier`` normalizes an rh-auth service token's ``sub``
+    straight through as the board identity at registration — see
+    ``rh_comms_plugins.auth``, ``agent-comms-approvals``), which is what
+    lets an ``AutoApprover`` map a hold back to an Arc site without a DB
+    session of its own (this Protocol's only input is this NamedTuple).
+    Additive, same as ``participants``: existing implementations ignore
+    it. Threaded straight through from the already-loaded sender ``Agent``
+    row at both call sites (``initiator``/``sender`` in ``service.py`` —
+    no extra query needed, same reasoning as ``participants``'s own
+    docstring above).
     """
 
     hold_id: uuid.UUID
@@ -404,6 +418,7 @@ class HoldContext(NamedTuple):
     payload: dict[str, Any]
     risk_reason: str
     participants: list[ParticipantInfo]
+    sender_sub: str
 
 
 class AutoApprover(Protocol):

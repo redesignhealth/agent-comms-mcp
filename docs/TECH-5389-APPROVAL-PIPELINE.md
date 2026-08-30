@@ -191,9 +191,9 @@ class AutoApprover(Protocol):
 ```
 
 `HoldContext`: hold id, conversation id/type, sender agent id + owner_sub,
-message_type, schema_version, payload, risk reason, participants. (Unlike the
-scorer, the auto-approver *does* get the payload — per the owner, the risk flag
-stays light and the expensive judgment belongs here.)
+message_type, schema_version, payload, risk reason, participants, sender_sub.
+(Unlike the scorer, the auto-approver *does* get the payload — per the owner,
+the risk flag stays light and the expensive judgment belongs here.)
 
 `participants` (added TECH-5754): the OTHER active/invited conversation
 participants — who this hold's message is actually addressed to, or who is
@@ -214,6 +214,17 @@ identical to, `get_hold_conversation_participants`'s HTTP response entries:
 that endpoint includes the sender/inviter (this never does), and its
 `agent_id` is a `str` (here it's a `uuid.UUID`) — see `plugins.py`'s
 `ParticipantInfo` docstring.
+
+`sender_sub` (added TECH-5755): the sender/inviter's own `Agent.sub` —
+board-wide-unique, and for a real RH-internal bot the same string as its
+Arc `bot_id` (an rh-auth service token's `sub` is normalized straight
+through as the board identity at registration — see
+`agent-comms-approvals`' `RHAgentVerifier`). Exists so an `AutoApprover`
+can map a hold back to an external system's own identity for that agent
+without a DB session of its own — `review()`'s only input is this
+NamedTuple. Threaded straight through from the already-loaded sender
+`Agent` row at every producer path, same as `participants` above — no
+extra query.
 
 **v1 implementation `EscalateAllAutoApprover` ("escalate_all")**: returns
 `cleared=False` unconditionally. Invoked inline, for real, in the `post_message`

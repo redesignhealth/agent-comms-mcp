@@ -2177,6 +2177,7 @@ async def start_conversation(
                 )
                 for target in sorted(targets, key=lambda t: t.sub)
             ],
+            sender_sub=initiator.sub,
         )
         _audit(
             session,
@@ -2672,6 +2673,7 @@ async def invite(
             owner_sub_claim=owner_sub_claim,
             owner_sub_fallback=inviter.owner_sub,
             auto_approver=auto_approver,
+            sender_sub=inviter.sub,
         )
         await session.commit()
         if isinstance(result, ApprovalHold):
@@ -3181,6 +3183,7 @@ async def _divert_high_risk_message(
     risk_scorer: RiskScorer,
     auto_approver: AutoApprover,
     participants: list[ParticipantInfo],
+    sender_sub: str,
 ) -> Message | ApprovalHold:
     """Create the ``approval_holds`` row for a high-risk verdict, run the
     injected ``AutoApprover`` inline, and either post the message
@@ -3257,6 +3260,7 @@ async def _divert_high_risk_message(
         payload=payload,
         risk_reason=risk_reason,
         participants=participants,
+        sender_sub=sender_sub,
     )
     decision = await auto_approver.review(ctx)
     if decision.cleared:
@@ -3313,6 +3317,7 @@ async def _divert_invite_for_approval(
     owner_sub_claim: str | None,
     owner_sub_fallback: str,
     auto_approver: AutoApprover,
+    sender_sub: str,
 ) -> Participant | ApprovalHold:
     """TECH-5735: create a ``kind="invite"`` ``approval_holds`` row, run the
     injected ``AutoApprover`` inline, and either create the ``Participant``
@@ -3400,6 +3405,7 @@ async def _divert_invite_for_approval(
             ParticipantInfo(agent_id=agent_id, display_name=display_name, role=role, status=status)
             for agent_id, status, role, display_name in participant_rows
         ],
+        sender_sub=sender_sub,
     )
     decision = await auto_approver.review(ctx)
     if decision.cleared:
@@ -4203,6 +4209,7 @@ async def post_message(
             risk_scorer=risk_scorer,
             auto_approver=auto_approver,
             participants=boundary_participants,
+            sender_sub=sender.sub,
         )
         await session.commit()
         if isinstance(result, ApprovalHold):

@@ -1314,6 +1314,10 @@ class TestStartConversation:
                 status="invited",
             )
         ]
+        # TECH-5755: HoldContext.sender_sub is the opener's own Agent.sub,
+        # threaded straight through from the already-loaded `initiator`
+        # object -- no extra query.
+        assert recorder.captured_ctx.sender_sub == owner.sub
 
     async def test_open_note_as_initial_message_hold_context_carries_multiple_targets(
         self, session: AsyncSession
@@ -2855,6 +2859,9 @@ class TestInviteRequiresApprovalForNoteHistory:
                 status="active",
             )
         ]
+        # TECH-5755: the INVITER's own sub, not the invitee's -- ApprovalHold's
+        # own docstring notes sender_agent_id is the inviter here.
+        assert recorder.captured_ctx.sender_sub == owner.sub
 
     async def test_invite_hold_context_participants_ordered_by_sub_for_n_greater_than_one(
         self, session: AsyncSession
@@ -3903,6 +3910,8 @@ class TestPostMessageBoundaryCrossing:
                 status="active",
             )
         ]
+        # TECH-5755: the message SENDER's own sub, not the recipient's.
+        assert recorder.captured_ctx.sender_sub == owner.sub
 
     async def test_hold_context_participants_ordered_by_sub_for_n_greater_than_one(
         self, session: AsyncSession
