@@ -168,6 +168,7 @@ class TestAutoApproverRegistry:
             payload={"type": "note", "text": "hello"},
             risk_reason="boundary_crossing",
             participants=[],
+            sender_sub="sender-a",
         )
         decision = await approver.review(ctx)
         assert decision.cleared is False

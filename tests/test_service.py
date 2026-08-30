@@ -1312,8 +1312,13 @@ class TestStartConversation:
                 display_name=target.display_name,
                 role="member",
                 status="invited",
+                sub=target.sub,
             )
         ]
+        # TECH-5755: HoldContext.sender_sub is the opener's own Agent.sub,
+        # threaded straight through from the already-loaded `initiator`
+        # object -- no extra query.
+        assert recorder.captured_ctx.sender_sub == owner.sub
 
     async def test_open_note_as_initial_message_hold_context_carries_multiple_targets(
         self, session: AsyncSession
@@ -1350,14 +1355,17 @@ class TestStartConversation:
                 display_name=target_b.display_name,
                 role="member",
                 status="invited",
+                sub=target_b.sub,
             ),
             plugins.ParticipantInfo(
                 agent_id=target_a.id,
                 display_name=target_a.display_name,
                 role="member",
                 status="invited",
+                sub=target_a.sub,
             ),
         ]
+        assert recorder.captured_ctx.sender_sub == owner.sub
 
     async def test_task_decline_as_initial_message_denied(self, session: AsyncSession) -> None:
         """``task_decline`` is member-role-restricted, but the initiator's
@@ -2853,8 +2861,12 @@ class TestInviteRequiresApprovalForNoteHistory:
                 display_name=target.display_name,
                 role="member",
                 status="active",
+                sub=target.sub,
             )
         ]
+        # TECH-5755: the INVITER's own sub, not the invitee's -- ApprovalHold's
+        # own docstring notes sender_agent_id is the inviter here.
+        assert recorder.captured_ctx.sender_sub == owner.sub
 
     async def test_invite_hold_context_participants_ordered_by_sub_for_n_greater_than_one(
         self, session: AsyncSession
@@ -2916,14 +2928,17 @@ class TestInviteRequiresApprovalForNoteHistory:
                 display_name=target_b.display_name,
                 role="member",
                 status="active",
+                sub=target_b.sub,
             ),
             plugins.ParticipantInfo(
                 agent_id=target_a.id,
                 display_name=target_a.display_name,
                 role="member",
                 status="active",
+                sub=target_a.sub,
             ),
         ]
+        assert recorder.captured_ctx.sender_sub == owner.sub
 
     async def test_invite_hold_context_participants_ordered_by_codepoint_not_db_locale(
         self, session: AsyncSession
@@ -2990,14 +3005,17 @@ class TestInviteRequiresApprovalForNoteHistory:
                 display_name=target_b.display_name,
                 role="member",
                 status="active",
+                sub=target_b.sub,
             ),
             plugins.ParticipantInfo(
                 agent_id=target_a.id,
                 display_name=target_a.display_name,
                 role="member",
                 status="active",
+                sub=target_a.sub,
             ),
         ]
+        assert recorder.captured_ctx.sender_sub == owner.sub
 
     async def test_invite_hold_cleared_by_auto_approver_creates_participant_inline(
         self, session: AsyncSession
@@ -3901,8 +3919,11 @@ class TestPostMessageBoundaryCrossing:
                 display_name=target.display_name,
                 role="member",
                 status="active",
+                sub=target.sub,
             )
         ]
+        # TECH-5755: the message SENDER's own sub, not the recipient's.
+        assert recorder.captured_ctx.sender_sub == owner.sub
 
     async def test_hold_context_participants_ordered_by_sub_for_n_greater_than_one(
         self, session: AsyncSession
@@ -3948,14 +3969,17 @@ class TestPostMessageBoundaryCrossing:
                 display_name=target_b.display_name,
                 role="member",
                 status="active",
+                sub=target_b.sub,
             ),
             plugins.ParticipantInfo(
                 agent_id=target_a.id,
                 display_name=target_a.display_name,
                 role="member",
                 status="active",
+                sub=target_a.sub,
             ),
         ]
+        assert recorder.captured_ctx.sender_sub == owner.sub
 
     async def test_hold_context_participants_ordered_by_codepoint_not_db_locale(
         self, session: AsyncSession
@@ -4007,14 +4031,17 @@ class TestPostMessageBoundaryCrossing:
                 display_name=target_b.display_name,
                 role="member",
                 status="active",
+                sub=target_b.sub,
             ),
             plugins.ParticipantInfo(
                 agent_id=target_a.id,
                 display_name=target_a.display_name,
                 role="member",
                 status="active",
+                sub=target_a.sub,
             ),
         ]
+        assert recorder.captured_ctx.sender_sub == owner.sub
 
     async def test_second_lookup_failure_denied(self, session: AsyncSession) -> None:
         """The sender's own ownership lookup succeeds, but a later
