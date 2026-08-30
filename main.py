@@ -503,6 +503,34 @@ async def list_pending_approvals(request: Request) -> Response:
     return JSONResponse(result, status_code=200)
 
 
+@mcp.custom_route("/approvals/{hold_id}/conversation", methods=["GET"])
+async def get_hold_conversation(request: Request) -> Response:
+    """Participant list ("To") for one pending hold's conversation
+    (TECH-5751) -- same auth gate as the decide endpoint. Unknown-hold and
+    not-your-hold are a uniform 404 (anti-enumeration, matching
+    ``decide_approval``/``list_pending_approvals``).
+    """
+    approver_sub, status = await _authenticate_approval_caller(request)
+    if approver_sub is None:
+        return JSONResponse({"error": "unauthorized"}, status_code=status)
+
+    hold_id_str = request.path_params["hold_id"]
+    try:
+        hold_id = uuid.UUID(hold_id_str)
+    except ValueError:
+        return JSONResponse(_UNIFORM_HOLD_NOT_FOUND, status_code=404)
+
+    async with get_session_factory()() as session:
+        try:
+            result = await service.get_hold_conversation_participants(
+                session, approver_sub=approver_sub, hold_id=hold_id
+            )
+        except AccessDeniedError:
+            return JSONResponse(_UNIFORM_HOLD_NOT_FOUND, status_code=404)
+
+    return JSONResponse(result, status_code=200)
+
+
 @mcp.custom_route("/admin/agents/reconcile-ownership", methods=["POST"])
 async def reconcile_ownership(request: Request) -> Response:
     """Admin-triggered run of TECH-5593 item 4's ownership reconciliation

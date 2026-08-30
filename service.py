@@ -3553,6 +3553,60 @@ async def list_pending_approval_holds(
     return {"holds": holds, "has_more": has_more}
 
 
+async def get_hold_conversation_participants(
+    session: AsyncSession, *, approver_sub: str, hold_id: uuid.UUID
+) -> dict[str, Any]:
+    """``GET /approvals/{hold_id}/conversation`` (main.py, non-MCP,
+    interactive+owner-gated): the participant list for one pending hold's
+    conversation, for the decision page's "To" display (TECH-5751).
+
+    Same ownership gate as ``decide_hold`` (uniform ``AccessDeniedError``,
+    ``denied.unknown_hold`` / ``denied.hold_not_owner`` -- the caller's
+    verified sub must equal the hold's own ``owner_sub`` snapshot, not a
+    live join), but deliberately narrower than ``get_conversation``:
+    read-only participant metadata only, no message content, and no
+    ``last_read_seq`` mutation -- a human glancing at "who is this message
+    to" must never advance an AGENT's own read cursor as a side effect.
+    """
+    hold = await _find_hold(session, hold_id)
+    if hold is None:
+        await _deny(
+            session,
+            actor_sub=approver_sub,
+            action="denied.unknown_hold",
+            detail={"attempted_hold_id": str(hold_id)},
+        )
+    if hold.owner_sub != approver_sub:
+        await _deny(
+            session,
+            actor_sub=approver_sub,
+            action="denied.hold_not_owner",
+            conversation_id=hold.conversation_id,
+            detail={"attempted_hold_id": str(hold_id)},
+        )
+    _maybe_expire_hold(session, approver_sub, hold)
+
+    part_rows = (
+        await session.execute(
+            select(Participant, Agent)
+            .join(Agent, Agent.id == Participant.agent_id)
+            .where(Participant.conversation_id == hold.conversation_id)
+            .order_by(Agent.sub)
+        )
+    ).all()
+    participants = [
+        {
+            "agent_id": str(a.id),
+            "display_name": a.display_name,
+            "role": p.role,
+            "status": p.status,
+        }
+        for p, a in part_rows
+    ]
+    await session.commit()
+    return {"conversation_id": str(hold.conversation_id), "participants": participants}
+
+
 async def decide_hold(
     session: AsyncSession,
     *,

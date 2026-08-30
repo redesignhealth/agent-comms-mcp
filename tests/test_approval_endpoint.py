@@ -40,7 +40,7 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 
 from exceptions import AgentRetiredError
-from models import ApprovalHold, AuditLog, Conversation
+from models import ApprovalHold, AuditLog, Conversation, Participant
 from service import register_agent
 
 SERVICE_ROOT = Path(__file__).parent.parent
@@ -220,6 +220,11 @@ async def client(
         routes=[
             Route("/approvals/{hold_id}/decide", main.decide_approval, methods=["POST"]),
             Route("/approvals/pending", main.list_pending_approvals, methods=["GET"]),
+            Route(
+                "/approvals/{hold_id}/conversation",
+                main.get_hold_conversation,
+                methods=["GET"],
+            ),
             Route(
                 "/admin/agents/reconcile-ownership",
                 main.reconcile_ownership,
@@ -774,3 +779,105 @@ class TestReconcileOwnershipEndpoint:
             headers={"Authorization": "Bearer human-token"},
         )
         assert resp.status_code == 422
+
+
+class TestHoldConversationEndpoint:
+    """``GET /approvals/{hold_id}/conversation`` (TECH-5751/TECH-5752):
+    the decision page's "To" data source."""
+
+    async def test_missing_token_returns_401(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, _provider = client
+        resp = await http_client.get(f"/approvals/{uuid.uuid4()}/conversation")
+        assert resp.status_code == 401
+
+    async def test_uniform_404_for_unknown_hold(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+        resp = await http_client.get(
+            f"/approvals/{uuid.uuid4()}/conversation",
+            headers={"Authorization": "Bearer human-token"},
+        )
+        assert resp.status_code == 404
+        assert resp.json() == {"error": "not_found"}
+
+    async def test_uniform_404_for_malformed_hold_id(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+        resp = await http_client.get(
+            "/approvals/not-a-uuid/conversation",
+            headers={"Authorization": "Bearer human-token"},
+        )
+        assert resp.status_code == 404
+        assert resp.json() == {"error": "not_found"}
+
+    async def test_uniform_404_for_not_your_hold(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        http_client, provider = client
+        _sender, hold = await _make_hold(session, sender_owner_sub="owner-a@example.com")
+        provider.tokens["human-token"] = _interactive_token("owner-b@example.com")
+
+        resp = await http_client.get(
+            f"/approvals/{hold.id}/conversation",
+            headers={"Authorization": "Bearer human-token"},
+        )
+        assert resp.status_code == 404
+        assert resp.json() == {"error": "not_found"}
+
+    async def test_returns_participants_for_the_holds_conversation(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        http_client, provider = client
+        sender, hold = await _make_hold(session, sender_owner_sub="owner-participants@example.com")
+        recipient = await register_agent(
+            session,
+            sub=f"hold-recipient-{uuid.uuid4()}",
+            owner_sub="owner-recipient@example.com",
+            owner_email="owner-recipient@example.com",
+            display_name="hold recipient",
+            accepted_types=["note"],
+        )
+        session.add(
+            Participant(
+                conversation_id=hold.conversation_id,
+                agent_id=sender.id,
+                role="member",
+                status="active",
+            )
+        )
+        session.add(
+            Participant(
+                conversation_id=hold.conversation_id,
+                agent_id=recipient.id,
+                role="member",
+                status="active",
+            )
+        )
+        await session.commit()
+        provider.tokens["human-token"] = _interactive_token("owner-participants@example.com")
+
+        resp = await http_client.get(
+            f"/approvals/{hold.id}/conversation",
+            headers={"Authorization": "Bearer human-token"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["conversation_id"] == str(hold.conversation_id)
+        display_names = {p["display_name"] for p in body["participants"]}
+        assert display_names == {"hold sender", "hold recipient"}
+        # No message content, no read-cursor field -- this endpoint is
+        # participant metadata only (TECH-5751's narrower scope vs.
+        # comms_get_conversation).
+        assert "messages" not in body
+        for participant in body["participants"]:
+            assert "last_read_seq" not in participant
