@@ -39,6 +39,7 @@ import service as _service
 from exceptions import (
     AccessDeniedError,
     AgentRetiredError,
+    AgentSuspendedError,
     DisplayNameCollisionError,
     HoldAlreadyDecidedError,
     HoldAwaitingAutoReviewError,
@@ -6758,3 +6759,99 @@ class TestDeregisterAgent:
             is_shared_authorized=True,
         )
         assert replacement.display_name == "Bond 007"
+
+    async def test_reregistering_a_suspended_sub_is_denied(self, session: AsyncSession) -> None:
+        """Argus round-1 (TECH-5736): before this guard, re-registering a
+        suspended sub silently reset status back to "active", reverting
+        every comms_deregister_agent call on the caller's very next
+        comms_register -- exactly the incident scenario this ticket exists
+        to close."""
+        agent = await _register(session, "stray-to-reregister", display_name="Stray")
+        await deregister_agent(
+            session, actor_sub="admin-operator", agent_id=agent.id, deregister_authorized=True
+        )
+
+        with pytest.raises(AgentSuspendedError) as exc_info:
+            await register_agent(
+                session,
+                sub="stray-to-reregister",
+                base_sub="stray-to-reregister",
+                owner_sub="stray-to-reregister",
+                owner_email="stray-to-reregister@example.com",
+                display_name="Stray",
+                accepted_types=sorted(MESSAGE_TYPES),
+            )
+        assert exc_info.value.sub == "stray-to-reregister"
+
+        row = (await session.execute(select(Agent).where(Agent.id == agent.id))).scalar_one()
+        assert row.status == "suspended"
+
+        rows = (
+            await session.execute(
+                select(AuditLog.agent_id, AuditLog.detail).where(
+                    AuditLog.action == "denied.reregister_suspended_agent"
+                )
+            )
+        ).all()
+        assert len(rows) == 1
+        audited_agent_id, detail = rows[0]
+        assert audited_agent_id == agent.id
+        assert detail == {"sub": "stray-to-reregister"}
+
+    async def test_deregistering_a_sibling_frees_up_plain_reregistration(
+        self, session: AsyncSession
+    ) -> None:
+        """Argus round-1 (TECH-5736): the sibling-fork guard must only
+        consider ACTIVE siblings -- a suspended one must not permanently
+        force confirm_new_identity=True on this base_sub, since
+        deregistering a stray sibling is the documented remediation path."""
+        base_sub = "multi-agent-with-stray-sibling"
+        stray = await register_agent(
+            session,
+            sub=f"{base_sub}::stray",
+            base_sub=base_sub,
+            owner_sub=base_sub,
+            owner_email="multi-agent@example.com",
+            display_name="Stray Sibling",
+            accepted_types=sorted(MESSAGE_TYPES),
+        )
+        await deregister_agent(
+            session, actor_sub="admin-operator", agent_id=stray.id, deregister_authorized=True
+        )
+
+        # Bare base_sub, no confirm_new_identity -- would be
+        # identity_fork_detected if the suspended sibling still counted.
+        registered = await register_agent(
+            session,
+            sub=base_sub,
+            base_sub=base_sub,
+            owner_sub=base_sub,
+            owner_email="multi-agent@example.com",
+            display_name="Primary",
+            accepted_types=sorted(MESSAGE_TYPES),
+        )
+        assert registered.sub == base_sub
+
+    async def test_deregistered_agent_cannot_be_conversation_target(
+        self, session: AsyncSession
+    ) -> None:
+        """Argus round-1 (TECH-5736): start_conversation's board-active
+        target check was previously "inert, future-proofing" (nothing ever
+        wrote status="suspended"); deregister_agent makes it live for the
+        first time."""
+        owner = await _register(session, "owner-suspended-target")
+        target = await _register(session, "target-to-suspend")
+        await deregister_agent(
+            session, actor_sub="admin-operator", agent_id=target.id, deregister_authorized=True
+        )
+
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await start_conversation(
+                session,
+                actor_sub=owner.sub,
+                initiator_agent_id=owner.id,
+                conversation_type="open",
+                target_agent_ids=[target.id],
+                initial_message=_request_payload(),
+            )
+        assert exc_info.value.reason == "denied.unknown_agent"

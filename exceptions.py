@@ -228,21 +228,62 @@ class DisplayNameCollisionError(Exception):
     Only checked on FIRST registration (a new row being created), not on
     every re-registration of an existing row -- see ``register_agent``'s
     own docstring for why re-registration is deliberately exempt.
+
+    Round-1 Argus review (TECH-5736) flagged the original message as a sub-
+    enumeration path: a token scoped only to ``comms:write`` (sufficient to
+    call ``comms_register``) cannot call ``comms_list_agents``
+    (``comms:read``), yet could otherwise learn a target agent's ``sub`` by
+    probing display names and reading it off this error. The
+    ``comms_list_agents`` justification above holds only when the caller
+    already has ``comms:read`` too, which ``TOOL_SCOPES`` does not
+    guarantee. ``existing_subs`` is therefore no longer part of ``str(exc)``
+    -- it remains an attribute for server-side callers (audit logging) only,
+    never surfaced across the service/tools boundary.
     """
 
     def __init__(self, *, display_name: str, existing_subs: list[str]) -> None:
-        rendered = ", ".join(repr(s) for s in existing_subs)
         super().__init__(
             f"display_name_collision: {display_name!r} is already used by an active "
-            f"agent ({rendered}) -- choose a distinct display_name"
+            "agent -- choose a distinct display_name"
         )
         self.display_name = display_name
         self.existing_subs = existing_subs
 
 
+class AgentSuspendedError(Exception):
+    """``register_agent`` was called for a ``sub`` currently
+    ``status="suspended"`` (TECH-5736) -- deliberately NOT silently
+    reactivated.
+
+    ``comms_deregister_agent`` is documented as one-directional (no
+    reactivate tool, by design -- see its own docstring). Before this
+    check, the idempotent re-registration branch unconditionally reset
+    ``status`` back to ``"active"`` on any subsequent ``comms_register``
+    call, which silently reverted every deregistration the moment the
+    same caller (often the exact misbehaving caller a deregistration was
+    meant to stop) called ``comms_register`` again -- undermining the
+    entire feature this ticket added. There is intentionally no bypass
+    parameter here (unlike ``confirm_new_identity``/``is_shared_authorized``):
+    reactivation has no supported path yet; add one as its own change, with
+    its own authorization gate, if that need arises.
+
+    Specific and client-safe: this only describes the calling ``sub``'s own
+    state, never another caller's data, the same non-enumeration reasoning
+    as ``SiblingIdentityExistsError``.
+    """
+
+    def __init__(self, *, sub: str) -> None:
+        super().__init__(
+            f"agent_suspended: {sub!r} has been deregistered (status=suspended) and "
+            "cannot be re-registered -- there is no reactivation path"
+        )
+        self.sub = sub
+
+
 __all__ = [
     "AccessDeniedError",
     "AgentRetiredError",
+    "AgentSuspendedError",
     "DisplayNameCollisionError",
     "HoldAlreadyDecidedError",
     "HoldAwaitingAutoReviewError",

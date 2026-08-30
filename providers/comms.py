@@ -51,6 +51,7 @@ from db import get_session_factory
 from exceptions import (
     AccessDeniedError,
     AgentRetiredError,
+    AgentSuspendedError,
     DisplayNameCollisionError,
     InvalidConversationStateError,
     RateLimitExceededError,
@@ -245,11 +246,13 @@ async def _map_service_errors() -> AsyncIterator[None]:
     negotiated at ``comms_start_conversation`` -- see exceptions.py.
     ``AgentRetiredError`` (TECH-5703) is deliberately specific rather than
     folded into ``AccessDeniedError`` -- see its own docstring.
-    ``SiblingIdentityExistsError``/``DisplayNameCollisionError``
-    (TECH-5736) are the same story: both describe only the calling
-    identity's own registration state (or a fact already public via
-    ``comms_list_agents``), never another caller's secret data -- see
-    their own docstrings in exceptions.py.
+    ``SiblingIdentityExistsError``/``DisplayNameCollisionError``/
+    ``AgentSuspendedError`` (TECH-5736) are the same story: each describes
+    only the calling identity's own registration state (or, for
+    ``DisplayNameCollisionError``, a fact already public via
+    ``comms_list_agents`` -- and no longer includes the colliding ``sub``s
+    themselves, see that exception's own docstring for why), never another
+    caller's secret data -- see their own docstrings in exceptions.py.
 
     A bare ``ValueError`` is different: the service layer raises it for
     internal parameter-shape problems (e.g. an empty ``display_name`` or
@@ -273,6 +276,7 @@ async def _map_service_errors() -> AsyncIterator[None]:
         AgentRetiredError,
         SiblingIdentityExistsError,
         DisplayNameCollisionError,
+        AgentSuspendedError,
     ) as exc:
         raise ToolError(str(exc)) from None
     except (ValueError, RuntimeError):
@@ -492,7 +496,16 @@ async def register(
       creating it. Legitimate for the documented multi-agent-per-token
       use of ``agent_key``; almost always a mistake (an omitted/typoed
       ``agent_key``) otherwise — pass it deliberately, per new identity,
-      never as a blanket default.
+      never as a blanket default. Requires only the baseline
+      ``comms:write`` scope, unlike ``is_shared=True`` above — deliberately
+      not ``comms:admin``-gated: unlike ``is_shared``, this flag is not an
+      admission-decision input (it affects no authorization path), and any
+      caller with ``comms:write`` legitimately needs to be able to
+      register a genuinely new sibling identity under their own
+      ``base_sub`` on purpose (see ``exceptions.SiblingIdentityExistsError``).
+      The guard this flag opts out of exists to catch an ACCIDENTAL fork
+      (an omitted/typoed ``agent_key``), not to prevent a caller from ever
+      registering more than one identity for themselves.
 
     Registering a NEW identity (this call's ``base_sub`` + ``agent_key``
     combination has no existing row) also fails with
@@ -507,7 +520,11 @@ async def register(
     (both absent counts as the same) re-binds ``display_name``/
     ``accepted_types`` in place (see ``service.register_agent``); a
     different ``agent_key`` registers a distinct row instead (subject to
-    the collision guards above).
+    the collision guards above) -- UNLESS that existing row was suspended
+    via ``comms_deregister_agent``, in which case this call fails with
+    ``agent_suspended`` instead of silently reactivating it (TECH-5736):
+    deregistration is deliberately one-directional, with no reactivate
+    tool, so re-registration must not undo it.
 
     ``accepted_types`` is enforced, not just declarative (DESIGN.md §9's
     capability gate): a message type omitted here causes any message of
