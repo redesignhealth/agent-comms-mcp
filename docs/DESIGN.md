@@ -65,8 +65,16 @@ never accepted as a parameter.
 admission: token issuance is the permissioned ceremony, and it happens upstream of this
 service. Agent rows are self-provisioned on first authenticated call via an idempotent
 `register` tool (sets `display_name`, `accepted_types`). The `status` column
-(`active`/`suspended`) is an ops kill-switch. It carries no permission
-semantics: no authorization decision reads it.
+(`active`/`suspended`) is an ops kill-switch, not an admission-decision input: it is
+never consulted by `may_assign` or the pairwise ownership-boundary check. It IS
+consulted, though, by a handful of specific write/read gates a suspended agent hits
+directly -- see §5 for exactly which ones (TECH-5736 made this column live for the
+first time; before it, nothing ever wrote `"suspended"`, so those gates were inert by
+construction, not by design). It is set to `suspended` only by the
+comms:admin-gated `comms_deregister_agent` tool (TECH-5736); re-registration writes
+`"active"` on an already-`active` row, but is refused outright (`agent_suspended`) on
+a currently-`suspended` one, rather than silently reactivating it -- there is no
+reactivate tool, by design (see §5).
 
 **`agent_key`: stopgap for one-token-per-many-agents.** The board's
 `sub` is keyed on the caller's verified token identity, which today is one Okta sub
@@ -86,6 +94,68 @@ on verified ownership. Two different owners can pass an identical `agent_key` st
 without colliding, since the prefix differs. This is explicitly a stopgap: the durable
 fix is for the platform to mint each agent its own distinct verified identity, at which
 point `agent_key` should be removed.
+
+**Identity-fork and display-name collision guards (TECH-5736).** Because `agent_key`
+is caller-chosen and easy to omit by accident, a caller who forgets it on a later call
+would otherwise silently create a brand-new sibling row under the bare base identity
+instead of erroring or re-binding the one they meant -- this is exactly the "Pepper
+Pots overwrote Bond 007" failure mode inverted (a stray row instead of a clobber).
+`register_agent` now refuses to create a new row when the caller's base identity
+already owns at least one row under a *different* `agent_key` (including no
+key at all), raising `identity_fork_detected`, unless the caller passes
+`confirm_new_identity=True` to say explicitly "yes, this is a deliberate additional
+identity." The existing sibling `agent_key`s are recorded server-side, in the audit
+log only -- like `display_name_collision`'s colliding `sub`s below, they are never
+included in the error message returned to the caller. Deliberately NOT filtered to
+`status == "active"`: ALL siblings under a base identity count toward this check,
+regardless of status. This closes a kill-switch bypass -- filtering to active-only
+would let a caller suspend every existing identity under a base_sub (via
+`comms_deregister_agent`) and then register a brand-new `agent_key` with the guard
+silently skipped, since no *active* sibling would remain to trigger it. The
+consequence is permanent: once any identity under a base_sub has ever been
+registered and then suspended, every future new sibling under that base
+permanently requires `confirm_new_identity=True`. There is no operator
+remediation action that clears this condition -- deregistering a row doesn't
+undo it; deregistering is what triggers it in the first place. `confirm_new_identity`
+requires only the baseline `comms:write` scope, not `comms:admin`: it is not an
+admission-decision input (unlike `is_shared`, directly below), and any caller
+legitimately running multiple agents under one token needs to be able to register a
+genuinely new sibling identity on purpose -- the guard it opts out of exists to catch
+an *accidental* fork (an omitted/typoed `agent_key`), not to gate intentional
+multi-agent registration behind an elevated scope.
+
+Independently -- and NOT bypassable by `confirm_new_identity`, since it guards a
+different invariant -- a new row whose `display_name` collides (case-insensitively)
+with an existing ACTIVE row's `display_name` is rejected with `display_name_collision`
+(the error message names only the fact of a collision, never the colliding `sub`s --
+those are recorded server-side, in the audit log only, to avoid letting a
+`comms:write`-only caller enumerate other agents' `sub`s by probing display names).
+Both checks fire only when a genuinely new row is about to be created, never on
+idempotent re-registration of an existing `sub` -- except that re-registration of a
+`sub` that is currently `suspended` is refused outright (`agent_suspended`) rather
+than silently reactivating it; see the `comms_deregister_agent` entry below for why.
+
+Both guards are application-level read-then-insert checks in `register_agent`, but
+they are backed asymmetrically at the DB level. The display-name-collision check's
+`WHERE` predicate is backed by `idx_agents_lower_display_name_active`, a `UNIQUE`
+partial index (`ON agents (lower(display_name)) WHERE status = 'active'`) -- so a
+case-insensitive `display_name` collision among active agents cannot slip past a
+race: two concurrent `comms_register` calls for the same `display_name` can both
+pass the application-level check, but only one can commit, and the loser gets a DB
+constraint violation instead of a silently-admitted duplicate. The sibling-identity
+(fork) check's prefix predicate, by contrast, has no dedicated index backing it --
+it accepts a sequential scan, given the table's expected size. An index was tried
+and removed: `text_pattern_ops` only accelerates the plain two-argument `LIKE`
+operator, not the `LIKE ... ESCAPE` form that SQLAlchemy's
+`startswith(..., autoescape=True)` emits for this query, so a `text_pattern_ops`
+index here was never actually effective, and was removed rather than kept as
+dead weight. So `identity_fork_detected` remains
+best-effort under concurrent registration load, not race-free: two concurrent
+`comms_register` calls for the same base identity with different (or omitted)
+`agent_key`s can both pass the check before either commits, each creating its own
+sibling row. Acceptable for the threat model this ticket targets (an accidental,
+sequential omission of `agent_key`), not a defense against an adversarial,
+precisely-timed race.
 
 **Permissions live in three places:**
 
@@ -255,6 +325,39 @@ Design notes:
  `False` to `True` after a conversation already opened does retroactively
  block that agent from being invited into it later, even though it does
  nothing to participants already admitted before the correction.
+- `agents.status` (`active`/`suspended`) has always been part of the schema but,
+ before TECH-5736, no code path ever wrote `"suspended"` -- `comms_deregister_agent`
+ closes that gap. It follows the identical admin-gate shape as `comms_set_agent_shared`:
+ gated on the caller's `comms:admin` scope (or interactive/Okta caller), a caller
+ without it gets `denied.deregister_requires_elevated_scope` (audit-log reason key
+ only), and a successful transition is audited as `agent.deregistered` with the
+ previous status in the detail. Idempotent (deregistering an already-suspended agent
+ is a no-op write, still audited) and deliberately one-directional: there is no
+ reactivate tool -- calling `comms_register` again for a suspended `sub` is refused
+ (`agent_suspended`), not treated as a reactivation request (see §2). `status` still
+ carries no *admission-decision* semantics (see §2) -- it is not read by
+ `may_assign` or either ownership-boundary check -- but it IS now a live gate on a
+ specific, narrow set of paths: a suspended agent cannot be the acting caller of
+ `register_agent`'s re-registration branch (denied outright, above), cannot be the
+ target of `start_conversation`/`invite` (pre-existing checks these guards made live
+ for the first time), and drops out of `comms_lookup_agent_by_email`'s directory
+ lookup. It is a full kill switch on the caller's OWN identity: `_resolve_caller_agent`
+ (the helper the ten messaging/query tools use to resolve the CALLER's own board `Agent`
+ row from the token) raises `agent_suspended` for any suspended caller, which blocks all ten tools
+ that call it -- including the read-path tools, `comms_inbox`/`comms_get_conversation`/
+ `comms_list_conversations`. A suspended agent's still-valid token cannot use ANY of
+ them, read or write, even for a conversation it already belongs to: once
+ `comms_deregister_agent` suspends an identity, that identity is fully cut off from
+ acting on the board under its own name, which is the point of a kill switch. The one
+ documented exception is `comms_deregister_agent` itself: its OWN caller authenticates
+ via `_require_identity` (which only resolves the caller's `sub` from verified token
+ claims, with no `agents.status` lookup at all), not `_resolve_caller_agent` --
+ `comms_deregister_agent` looks up its TARGET agent directly by `agent_id`
+ (`service._find_agent_by_id`), so a suspended agent is never the thing
+ `_resolve_caller_agent` would need to resolve on this path. That means an admin whose
+ own agent happens to be suspended can still deregister someone else; it is a
+ deliberate, narrow exception (admin authorization here rides on the token's scope/
+ interactive-caller status, not on the admin's own `agents.status`), not a bug.
 
 ## 6. Message schemas (two-axis model)
 
@@ -296,8 +399,9 @@ scroll-to-load-more use case.
 | Tool | Scope | Notes |
 |---|---|---|
 | `comms_whoami` | comms:read | caller identity/scopes; also returns this identity's registered min/max_schema_version via a best-effort DB lookup if already `comms_register`'d -- omitted if not yet registered or the DB is unreachable (this tool remains usable as an auth-only diagnostic either way) |
-| `comms_register` | comms:write | idempotent self-provisioning: display_name, accepted_types (max 20, 100 chars each), min/max_schema_version (default 1/1, for schema-version capability negotiation); `is_shared=True` on first registration additionally requires comms:admin (see §5) |
-| `comms_set_agent_shared` | comms:write | admin override of an existing agent's `is_shared`, since `comms_register` freezes it against the agent's own re-registration; additionally requires comms:admin (see §5) |
+| `comms_register` | comms:write | idempotent self-provisioning: display_name, accepted_types (max 20, 100 chars each), min/max_schema_version (default 1/1, for schema-version capability negotiation); `is_shared=True` on first registration additionally requires comms:admin (see §5); rejects a new sibling row under the same base identity (`identity_fork_detected`) unless `confirm_new_identity=True`, and rejects a new row whose `display_name` collides with an existing active agent's (`display_name_collision`, not bypassable by `confirm_new_identity` -- DB-enforced race-free via a `UNIQUE` partial index, see §5) |
+| `comms_set_agent_shared` | comms:write | admin override of an existing agent's `is_shared`, since `comms_register` freezes it against the agent's own re-registration; additionally requires comms:admin OR an interactive/Okta caller (see §5) |
+| `comms_deregister_agent` | comms:write | sets an existing agent's `status="suspended"`; additionally requires comms:admin OR an interactive/Okta caller (see §5); one-directional by design -- no reactivate tool. Because it is one-directional, suspending an identity here is exactly what makes the sibling-fork check's "all siblings count, not just active ones" condition (see §5) trigger permanently for that base identity -- there is no reactivation path to undo it. This is intentional, to prevent kill-switch bypasses |
 | `comms_list_agents` | comms:read | directory (internal domain, enumeration acceptable). Returns agent UUIDs used as target identifiers in other tools. A registry-retired agent (`ACTIVE_CHECKER` seam, TECH-5703, §"Configuration: pluggable seams") is excluded from results, though its row is never deleted; `total_count` still reflects every board-registered agent regardless of retirement status. Retirement is filtered AFTER pagination is computed from the raw rows, so a page can return fewer than `limit` agents (including zero) while `has_more` is still `true` -- callers must page until `has_more` is `false`, not until `agents` is empty |
 | `comms_lookup_agent_by_email` | comms:read | directory lookup by owner email; `{"agent": ..., "found": bool}`. O(1) targeted equivalent of paginating `comms_list_agents` -- see §10's enumeration-posture note. A registry-retired agent resolves to the same not-found shape as an unregistered email (TECH-5703) |
 | `comms_start_conversation` | comms:write | type + up to 50 target agent UUIDs (from `comms_list_agents`) + initial request payload. **Two response shapes** (TECH-5389): the normal conversation-created shape, or (if the opener was high-risk) that same shape plus a `held_for_approval`/`hold_id`/`hold_status`/`risk_reason` block — the conversation is created anyway, opened with a service-synthesized `conversation_opened` marker at seq 1, and the real content is held (§9). A registry-retired target (TECH-5703) raises a specific "agent retired" error instead of the uniform unknown-agent denial |

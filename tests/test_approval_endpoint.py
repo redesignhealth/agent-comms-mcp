@@ -250,13 +250,16 @@ async def _make_hold(
     sender_owner_sub: str = "owner-a@example.com",
     status: str = "pending_human",
     expires_at: datetime | None = None,
+    sender_display_name: str = "hold sender",
 ) -> tuple[Any, ApprovalHold]:
+    sender_sub = f"hold-sender-{uuid.uuid4()}"
     sender = await register_agent(
         session,
-        sub=f"hold-sender-{uuid.uuid4()}",
+        sub=sender_sub,
+        base_sub=sender_sub,
         owner_sub=sender_owner_sub,
         owner_email=sender_owner_sub,
-        display_name="hold sender",
+        display_name=sender_display_name,
         accepted_types=["note"],
     )
     conversation = Conversation(
@@ -626,8 +629,16 @@ class TestListPendingEndpoint:
         session: AsyncSession,
     ) -> None:
         http_client, provider = client
-        _sender_a, hold_a = await _make_hold(session, sender_owner_sub="owner-list-a@example.com")
-        _sender_b, _hold_b = await _make_hold(session, sender_owner_sub="owner-list-b@example.com")
+        _sender_a, hold_a = await _make_hold(
+            session,
+            sender_owner_sub="owner-list-a@example.com",
+            sender_display_name="hold sender a",
+        )
+        _sender_b, _hold_b = await _make_hold(
+            session,
+            sender_owner_sub="owner-list-b@example.com",
+            sender_display_name="hold sender b",
+        )
         provider.tokens["human-token"] = _interactive_token("owner-list-a@example.com")
 
         resp = await http_client.get(
@@ -720,6 +731,7 @@ class TestReconcileOwnershipEndpoint:
         await register_agent(
             session,
             sub="reconcile-endpoint-agent",
+            base_sub="reconcile-endpoint-agent",
             owner_sub="owner-x@example.com",
             owner_email="owner-x@example.com",
             display_name="reconcile endpoint agent",
@@ -912,9 +924,11 @@ class TestHoldConversationEndpoint:
     ) -> None:
         http_client, provider = client
         sender, hold = await _make_hold(session, sender_owner_sub="owner-participants@example.com")
+        recipient_sub = f"hold-recipient-{uuid.uuid4()}"
         recipient = await register_agent(
             session,
-            sub=f"hold-recipient-{uuid.uuid4()}",
+            sub=recipient_sub,
+            base_sub=recipient_sub,
             owner_sub="owner-recipient@example.com",
             owner_email="owner-recipient@example.com",
             display_name="hold recipient",
@@ -974,17 +988,21 @@ class TestHoldConversationEndpoint:
     ) -> None:
         http_client, provider = client
         sender, hold = await _make_hold(session, sender_owner_sub="owner-departed@example.com")
+        left_sub = f"hold-left-{uuid.uuid4()}"
         left_agent = await register_agent(
             session,
-            sub=f"hold-left-{uuid.uuid4()}",
+            sub=left_sub,
+            base_sub=left_sub,
             owner_sub="owner-left@example.com",
             owner_email="owner-left@example.com",
             display_name="left agent",
             accepted_types=["note"],
         )
+        declined_sub = f"hold-declined-{uuid.uuid4()}"
         declined_agent = await register_agent(
             session,
-            sub=f"hold-declined-{uuid.uuid4()}",
+            sub=declined_sub,
+            base_sub=declined_sub,
             owner_sub="owner-declined@example.com",
             owner_email="owner-declined@example.com",
             display_name="declined agent",

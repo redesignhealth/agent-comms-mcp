@@ -367,6 +367,11 @@ class TestRegister:
                 "display_name": "Pepper Pots",
                 "accepted_types": ["availability_request"],
                 "agent_key": "pepper-pots",
+                # TECH-5736: a second identity under the same base_sub is
+                # exactly the collision guard's target case -- this test's
+                # whole point is that it's a legitimate, deliberate use,
+                # so it must explicitly confirm it.
+                "confirm_new_identity": True,
             },
         )
         assert first["agent_id"] != second["agent_id"]
@@ -794,6 +799,112 @@ class TestRegister:
         )
         assert result["is_shared"] is True
 
+    async def test_omitting_agent_key_after_a_keyed_registration_is_rejected(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """TECH-5736 regression: the exact incident shape. A caller
+        registers once with ``agent_key="bond-007"``, then calls again
+        omitting ``agent_key`` entirely -- this must be rejected as an
+        identity fork, not silently create a second, stray row on the
+        bare base sub."""
+        token = _token("dan-example-mcp", owner_sub="dan-example-mcp")
+        await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {
+                "display_name": "Bond 007",
+                "accepted_types": ["availability_request"],
+                "agent_key": "bond-007",
+            },
+        )
+
+        with pytest.raises(ToolError, match="identity_fork_detected"):
+            await _call(
+                main,
+                test_session_factory,
+                token,
+                "comms_register",
+                {
+                    "display_name": "Bond 007 (stray)",
+                    "accepted_types": ["availability_request"],
+                },
+            )
+
+        whoami_original = await _call(
+            main,
+            test_session_factory,
+            _token("dan-example-mcp", owner_sub="dan-example-mcp"),
+            "comms_lookup_agent_by_email",
+            {"owner_email": "dan-example-mcp"},
+        )
+        # The stray bare-sub row was never created -- the directory lookup
+        # still resolves to the ORIGINAL, correctly-keyed identity.
+        assert whoami_original["agent"]["sub"] == "dan-example-mcp::bond-007"
+
+    async def test_confirm_new_identity_allows_the_fork_deliberately(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        token = _token("multi-agent-human-mcp", owner_sub="multi-agent-human-mcp")
+        await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {
+                "display_name": "Agent One",
+                "accepted_types": ["availability_request"],
+                "agent_key": "one",
+            },
+        )
+
+        result = await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {
+                "display_name": "Agent Two",
+                "accepted_types": ["availability_request"],
+                "agent_key": "two",
+                "confirm_new_identity": True,
+            },
+        )
+        assert result["sub"] == "multi-agent-human-mcp::two"
+
+    async def test_display_name_collision_rejected_across_different_base_subs(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        await _register(
+            main, test_session_factory, "display-collision-agent-a", display_name="Bond 007"
+        )
+
+        with pytest.raises(ToolError, match="display_name_collision"):
+            await _call(
+                main,
+                test_session_factory,
+                _token("display-collision-agent-b"),
+                "comms_register",
+                {"display_name": "Bond 007", "accepted_types": ["availability_request"]},
+            )
+
+    async def test_display_name_collision_not_triggered_by_own_re_registration(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        await _register(
+            main, test_session_factory, "self-rename-agent-mcp", display_name="Same Name"
+        )
+
+        result = await _call(
+            main,
+            test_session_factory,
+            _token("self-rename-agent-mcp"),
+            "comms_register",
+            {"display_name": "Same Name", "accepted_types": ["availability_request"]},
+        )
+        assert result["display_name"] == "Same Name"
+
 
 # --- Admin override of is_shared -------------------------------------------------
 
@@ -879,6 +990,248 @@ class TestSetAgentShared:
             {"agent_id": registered["agent_id"], "is_shared": True},
         )
         assert result["is_shared"] is True
+
+
+class TestDeregisterAgent:
+    """TECH-5736: comms_deregister_agent, the tool that finally exercises
+    AGENT_STATUSES's long-unused "suspended" value."""
+
+    async def test_admin_scope_can_deregister(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        registered = await _register(main, test_session_factory, "stray-agent-mcp")
+
+        admin_token = _token(
+            "admin-operator-deregister-mcp", scopes=["comms:read", "comms:write", "comms:admin"]
+        )
+        result = await _call(
+            main,
+            test_session_factory,
+            admin_token,
+            "comms_deregister_agent",
+            {"agent_id": registered["agent_id"]},
+        )
+        assert result["status"] == "suspended"
+        assert result["agent_id"] == registered["agent_id"]
+
+    async def test_requires_admin_scope(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        registered = await _register(main, test_session_factory, "deregister-unauthorized-mcp")
+
+        unauthorized_token = _token(
+            "unauthorized-deregister-operator-mcp", scopes=["comms:read", "comms:write"]
+        )
+        with pytest.raises(
+            ToolError, match=re.escape("access_denied: not authorized for this resource")
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                unauthorized_token,
+                "comms_deregister_agent",
+                {"agent_id": registered["agent_id"]},
+            )
+
+    async def test_unknown_agent_id_denied(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        admin_token = _token(
+            "admin-operator-deregister-mcp-2", scopes=["comms:read", "comms:write", "comms:admin"]
+        )
+        with pytest.raises(
+            ToolError, match=re.escape("access_denied: not authorized for this resource")
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                admin_token,
+                "comms_deregister_agent",
+                {"agent_id": str(uuid.uuid4())},
+            )
+
+    async def test_interactive_caller_no_admin_scope_needed(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        registered = await _register(main, test_session_factory, "stray-agent-interactive-mcp")
+
+        interactive_token = MagicMock()
+        interactive_token.claims = {
+            "iss": "https://agent-comms.example/mcp",
+            "sub": "interactive-deregister-operator",
+        }
+        interactive_token.scopes = []
+        interactive_token.client_id = "interactive-deregister-operator"
+
+        result = await _call(
+            main,
+            test_session_factory,
+            interactive_token,
+            "comms_deregister_agent",
+            {"agent_id": registered["agent_id"]},
+        )
+        assert result["status"] == "suspended"
+
+    async def test_suspended_agent_loses_read_path_access(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """TECH-5736 suggestion: suspension is meant to be a real kill
+        switch, but before this fix, `_resolve_caller_agent` had no status
+        filter -- a suspended agent's still-unexpired token kept working
+        for every read-path tool (comms_inbox and friends) that resolves the
+        caller's own identity through it. Confirms comms_inbox now rejects a
+        suspended caller instead of quietly serving it."""
+        registered = await _register(main, test_session_factory, "kill-switch-target-mcp")
+
+        admin_token = _token(
+            "admin-operator-kill-switch-mcp", scopes=["comms:read", "comms:write", "comms:admin"]
+        )
+        await _call(
+            main,
+            test_session_factory,
+            admin_token,
+            "comms_deregister_agent",
+            {"agent_id": registered["agent_id"]},
+        )
+
+        with pytest.raises(ToolError, match="agent_suspended"):
+            await _call(
+                main,
+                test_session_factory,
+                _token("kill-switch-target-mcp"),
+                "comms_inbox",
+            )
+
+    async def test_suspended_agent_cannot_re_register(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """TECH-5736 suggestion: the same `_resolve_caller_agent`
+        suspension check covered above for `comms_inbox` also needs
+        coverage on the `comms_register` tool-boundary itself -- the write
+        path a suspended agent is most likely to retry with its
+        still-unexpired token. Confirms a deregistered agent calling
+        `comms_register` again (same `sub`, same token) is rejected with
+        `agent_suspended` rather than being silently reactivated."""
+        registered = await _register(main, test_session_factory, "kill-switch-reregister-mcp")
+
+        admin_token = _token(
+            "admin-operator-kill-switch-reregister-mcp",
+            scopes=["comms:read", "comms:write", "comms:admin"],
+        )
+        await _call(
+            main,
+            test_session_factory,
+            admin_token,
+            "comms_deregister_agent",
+            {"agent_id": registered["agent_id"]},
+        )
+
+        with pytest.raises(ToolError, match="agent_suspended"):
+            await _register(main, test_session_factory, "kill-switch-reregister-mcp")
+
+    async def test_new_agent_key_after_suspending_all_siblings_requires_confirmation(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """MCP-boundary regression for the kill-switch-bypass gap
+        (mirrors ``test_service.py``'s
+        ``test_reentry_after_suspending_all_siblings_requires_confirmation``):
+        register agent A under a base sub with ``agent_key="a1"``, suspend
+        it via ``comms_deregister_agent``, then attempt to register a NEW
+        ``agent_key="a2"`` under the same base sub without
+        ``confirm_new_identity``. The fully-suspended base sub must still
+        be treated as having an existing sibling identity, not a fresh
+        one -- this must raise ``identity_fork_detected``, not silently
+        succeed."""
+        base_sub = "kill-switch-fork-mcp"
+        token = _token(base_sub, owner_sub=base_sub)
+        registered = await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {
+                "display_name": "Agent A1",
+                "accepted_types": ["availability_request"],
+                "agent_key": "a1",
+            },
+        )
+
+        admin_token = _token(
+            "admin-operator-kill-switch-fork-mcp",
+            scopes=["comms:read", "comms:write", "comms:admin"],
+        )
+        await _call(
+            main,
+            test_session_factory,
+            admin_token,
+            "comms_deregister_agent",
+            {"agent_id": registered["agent_id"]},
+        )
+
+        with pytest.raises(ToolError, match="identity_fork_detected") as exc_info:
+            await _call(
+                main,
+                test_session_factory,
+                _token(base_sub, owner_sub=base_sub),
+                "comms_register",
+                {
+                    "display_name": "Agent A2",
+                    "accepted_types": ["availability_request"],
+                    "agent_key": "a2",
+                },
+            )
+        assert "a1" not in str(exc_info.value)
+
+        confirmed = await _call(
+            main,
+            test_session_factory,
+            _token(base_sub, owner_sub=base_sub),
+            "comms_register",
+            {
+                "display_name": "Agent A2",
+                "accepted_types": ["availability_request"],
+                "agent_key": "a2",
+                "confirm_new_identity": True,
+            },
+        )
+        assert confirmed["agent_id"]
+
+    async def test_admin_can_still_deregister_target_while_admins_own_agent_suspended(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """The caller-suspension check lives in `_resolve_caller_agent`,
+        which resolves the CALLER's own identity -- `comms_deregister_agent`
+        looks up its TARGET directly by `agent_id`
+        (`service._find_agent_by_id`), never through that function. An
+        admin whose own registered agent has been suspended must still be
+        able to deregister someone else -- the admin scope on the token is
+        what gates this tool, not the admin's own board-agent row."""
+        admin_registered = await _register(main, test_session_factory, "admin-self-suspended-mcp")
+        target = await _register(main, test_session_factory, "another-stray-agent-mcp")
+
+        admin_token = _token(
+            "admin-self-suspended-mcp", scopes=["comms:read", "comms:write", "comms:admin"]
+        )
+        # Suspend the admin's own agent row first.
+        await _call(
+            main,
+            test_session_factory,
+            admin_token,
+            "comms_deregister_agent",
+            {"agent_id": admin_registered["agent_id"]},
+        )
+
+        # The admin's token (comms:admin scope) can still deregister a
+        # different target -- the tool never resolves the admin's own agent
+        # row via _resolve_caller_agent.
+        result = await _call(
+            main,
+            test_session_factory,
+            admin_token,
+            "comms_deregister_agent",
+            {"agent_id": target["agent_id"]},
+        )
+        assert result["status"] == "suspended"
 
 
 # --- AXI empty-state / shape spot checks --------------------------------------------

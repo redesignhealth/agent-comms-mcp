@@ -160,17 +160,21 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, NoReturn, Protocol
 
 from sqlalchemy import func, literal, or_, select, tuple_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from exceptions import (
     AccessDeniedError,
     AgentRetiredError,
+    AgentSuspendedError,
+    DisplayNameCollisionError,
     HoldAlreadyDecidedError,
     HoldAwaitingAutoReviewError,
     HoldExpiredError,
     InvalidConversationStateError,
     RateLimitExceededError,
     SchemaVersionMismatchError,
+    SiblingIdentityExistsError,
     UnknownConversationTypeError,
 )
 from models import Agent, ApprovalHold, AuditLog, Conversation, Message, Participant
@@ -420,6 +424,92 @@ async def _deny_agent_retired(
     )
     await session.commit()
     raise AgentRetiredError(reason=_DENIED_TARGET_AGENT_RETIRED)
+
+
+async def _deny_agent_suspended(
+    session: AsyncSession, *, sub: str, agent_id: uuid.UUID
+) -> NoReturn:
+    """Same audit/commit shape as ``_deny``, but for
+    ``exceptions.AgentSuspendedError`` (TECH-5736): a re-registration
+    attempt against a suspended ``sub``. ``actor_sub`` is ``sub`` itself --
+    this denial fires before any authenticated identity distinct from the
+    registering caller is available, the same as every other denial inside
+    ``register_agent``."""
+    _audit(
+        session,
+        actor_sub=sub,
+        action="denied.reregister_suspended_agent",
+        agent_id=agent_id,
+        detail={"sub": sub},
+    )
+    await session.commit()
+    raise AgentSuspendedError(sub=sub)
+
+
+def _is_display_name_index_violation(exc: IntegrityError) -> bool:
+    """Narrow check that ``exc`` is specifically a violation of
+    ``idx_agents_lower_display_name_active`` (migration a45f344c9c00),
+    not merely "some IntegrityError". Postgres reports a unique partial
+    index's name in the underlying error's ``constraint_name`` diagnostic
+    field the same way it would a real named constraint. Under this
+    project's driver stack (SQLAlchemy 2.0.x + asyncpg), ``exc.orig`` is
+    ``AsyncAdapt_asyncpg_dbapi.IntegrityError``, a thin wrapper that only
+    copies ``pgcode``/``sqlstate`` from the real
+    ``asyncpg.exceptions.UniqueViolationError`` -- NOT ``constraint_name``.
+    The real asyncpg exception (which does carry ``constraint_name``) is
+    reachable via ``exc.orig.__cause__``. Check there first, falling back
+    to ``exc.orig`` itself in case a different driver/version puts the
+    attribute there directly. Deliberately not a blanket catch: any other
+    IntegrityError (e.g. a genuinely unrelated constraint) must keep
+    propagating as itself."""
+    cause = getattr(exc.orig, "__cause__", None)
+    name = getattr(cause, "constraint_name", None)
+    if name is None:
+        name = getattr(exc.orig, "constraint_name", None)
+    return name == "idx_agents_lower_display_name_active"
+
+
+async def _deny_sibling_identity_exists(
+    session: AsyncSession,
+    *,
+    base_sub: str,
+    sub: str,
+    existing_agent_keys: list[str | None],
+) -> NoReturn:
+    """Same audit/commit shape as ``_deny``, but for
+    ``exceptions.SiblingIdentityExistsError`` (TECH-5736): about to create a
+    brand-new row for ``sub`` while ``base_sub`` already has at least one
+    other active identity. DESIGN.md §8 invariant 5 requires every denial to
+    be audited, the same as every other fail-closed branch in
+    ``register_agent`` -- this one was missed when the check itself was
+    added. ``actor_sub`` is ``sub`` itself, matching every other denial
+    inside ``register_agent`` (no authenticated identity distinct from the
+    registering caller is available at this point)."""
+    _audit(
+        session,
+        actor_sub=sub,
+        action="denied.sibling_identity_exists",
+        detail={"base_sub": base_sub, "sub": sub, "existing_agent_keys": existing_agent_keys},
+    )
+    await session.commit()
+    raise SiblingIdentityExistsError(base_sub=base_sub, existing_agent_keys=existing_agent_keys)
+
+
+async def _deny_display_name_collision(
+    session: AsyncSession, *, actor_sub: str, display_name: str, existing_subs: list[str]
+) -> NoReturn:
+    """Same audit/commit shape as ``_deny``, but for
+    ``exceptions.DisplayNameCollisionError`` (TECH-5736). The colliding
+    ``sub``s are recorded here, server-side only -- see that exception's
+    docstring for why they were removed from the client-facing message."""
+    _audit(
+        session,
+        actor_sub=actor_sub,
+        action="denied.display_name_collision",
+        detail={"display_name": display_name, "colliding_subs": existing_subs},
+    )
+    await session.commit()
+    raise DisplayNameCollisionError(display_name=display_name, existing_subs=existing_subs)
 
 
 async def _is_active_safe(active_checker: ActiveChecker, sub: str) -> bool:
@@ -1083,10 +1173,27 @@ def validate_schema_version_range(min_schema_version: int, max_schema_version: i
         raise ValueError("min_schema_version must be <= max_schema_version")
 
 
+def _agent_key_from_sub(sub: str, base_sub: str) -> str | None:
+    """Recover the ``agent_key`` half of a composed board identity.
+
+    Inverse of ``providers.comms._compose_sub``: ``sub`` is either exactly
+    ``base_sub`` (no ``agent_key`` was given) or ``f"{base_sub}::{agent_key}"``
+    -- both ``base_sub`` and ``agent_key`` are validated elsewhere to never
+    contain ``"::"`` themselves, so this split is unambiguous. Used only to
+    render existing sibling identities back into a human-readable error
+    (``SiblingIdentityExistsError``) -- never for any authorization
+    decision.
+    """
+    if sub == base_sub:
+        return None
+    return sub[len(base_sub) + 2 :]
+
+
 async def register_agent(
     session: AsyncSession,
     *,
     sub: str,
+    base_sub: str,
     owner_sub: str,
     owner_email: str,
     display_name: str,
@@ -1095,8 +1202,31 @@ async def register_agent(
     max_schema_version: int = 1,
     is_shared: bool = False,
     is_shared_authorized: bool = False,
+    confirm_new_identity: bool = False,
 ) -> Agent:
     """Idempotently create or re-bind the board ``Agent`` row for ``sub``.
+
+    ``base_sub`` (TECH-5736) is the caller's verified identity BEFORE
+    ``agent_key`` composition (``providers.comms._require_identity``'s
+    result) -- ``sub`` is ``base_sub`` alone or ``f"{base_sub}::{agent_key}"``.
+    Passed separately, not re-derived from ``sub``, so this function can
+    check for SIBLING identities under the same ``base_sub`` without
+    guessing where a ``"::"`` in ``sub`` came from. Raises
+    ``SiblingIdentityExistsError`` on FIRST registration (a brand new
+    ``sub``) if ``base_sub`` already has at least one OTHER registered row
+    and ``confirm_new_identity`` is not ``True`` -- this is the actual
+    incident this check exists to prevent: a caller that omits or typos
+    ``agent_key`` on a later call doesn't re-bind its existing identity,
+    it silently forks a new one, and nothing before this check ever
+    surfaced that as an error. Re-registration of an ALREADY-existing
+    ``sub`` never triggers this (idempotent re-binding is exactly the
+    safe, intended path) -- it only guards the moment a genuinely new row
+    is about to be created.
+
+    Also raises ``DisplayNameCollisionError`` on first registration if
+    ``display_name`` (case-insensitively) matches an existing board-
+    ``active`` agent's -- see that exception's own docstring for why this
+    is checked only on creation, not on every re-registration.
 
     SECURITY: ``owner_sub``/``owner_email`` MUST be sourced by the caller
     (the MCP tools layer) from verified OAuth token claims — DESIGN.md §4:
@@ -1125,7 +1255,12 @@ async def register_agent(
     Idempotent: calling again with the same ``sub`` updates
     ``display_name``/``accepted_types``/``owner_email`` in place (unique on
     ``agents.sub``) rather than creating a duplicate row, and re-marks the
-    agent ``active`` + refreshes ``bound_at``. ``owner_sub`` is the
+    agent ``active`` + refreshes ``bound_at`` -- UNLESS the existing row is
+    currently ``status="suspended"`` (TECH-5736), in which case this raises
+    ``AgentSuspendedError`` instead of touching the row at all: silently
+    reactivating on re-registration would undo every
+    ``comms_deregister_agent`` call on the very next ``comms_register`` from
+    the same ``sub``. ``owner_sub`` is the
     exception: THIS function never overwrites it on a later call, even one
     presenting a different ``owner_sub`` — see the inline comment on the
     re-registration branch below: once ``add_task``'s ``may_assign`` started
@@ -1225,6 +1360,109 @@ async def register_agent(
     existing = (await session.execute(select(Agent).where(Agent.sub == sub))).scalar_one_or_none()
     now = _now()
     created = existing is None
+    if existing is not None and existing.status == "suspended":
+        # TECH-5736 (Argus round-1 finding): without this check, this
+        # idempotent re-registration branch would unconditionally reset
+        # `status` back to "active" a few lines below, silently reverting
+        # every `comms_deregister_agent` call the moment the same `sub`
+        # (often the exact misbehaving caller a deregistration was meant to
+        # stop) called `comms_register` again -- undermining the entire
+        # feature this ticket added, and breaking the display_name
+        # collision invariant if a different agent had since claimed the
+        # suspended agent's name (display_name is only checked `if
+        # created`, and this path is a re-registration). See
+        # `exceptions.AgentSuspendedError` for why there is no bypass here.
+        await _deny_agent_suspended(session, sub=sub, agent_id=existing.id)
+    if created and not confirm_new_identity:
+        # TECH-5736: about to create a brand-new row for `sub` -- check
+        # whether `base_sub` already has ANY other registered identity
+        # first. This is the actual incident this check exists to catch:
+        # omitting/typoing `agent_key` on a later call doesn't re-bind an
+        # existing row (that path never reaches here -- `existing` would
+        # be non-None), it silently creates a new one. `Agent.sub != sub`
+        # is redundant given `existing is None` already means no row
+        # equals `sub`, but kept explicit so this query's own intent (find
+        # OTHER identities under this base_sub) doesn't depend on that
+        # invariant holding. Deliberately NOT filtered to `status ==
+        # "active"` (Argus round-1 suggestion S3, later reverted): an
+        # earlier revision scoped this to active siblings only, on the
+        # theory that a SUSPENDED sibling shouldn't permanently force
+        # `confirm_new_identity=True`. That reasoning turned out to be
+        # wrong -- it meant `comms_deregister_agent` (the kill-switch for a
+        # stray/compromised identity) could be silently bypassed: suspend
+        # every sibling under a `base_sub`, then register a brand-new
+        # `agent_key` with zero *active* siblings found, sailing through
+        # this guard unconfirmed. A `base_sub` with ANY prior identity --
+        # active or suspended -- is exactly the silent-identity-churn
+        # signal this guard exists to catch, so ALL rows (regardless of
+        # status) count as siblings here. This intentionally does NOT
+        # affect the display_name guard below, which is a different check
+        # (case-insensitive display_name collision, not identity-fork
+        # detection) and correctly keeps its own `status == "active"`
+        # scoping -- nor does it affect re-registration of an agent's OWN
+        # existing `sub` (active or suspended), which is a separate code
+        # path entirely (`existing is not None`) and never reaches here.
+        #
+        # Accepted race (TECH-5736 suggestion, code-level only -- the
+        # display_name guard is separately getting a DB unique index; this
+        # sibling check is not): this is an application-level read-then-insert
+        # check with no DB constraint backing it. Two concurrent
+        # `register_agent` calls for genuinely new siblings under the same
+        # `base_sub` (both omitting `confirm_new_identity`) could both read
+        # zero existing siblings here, both pass this check, and both insert
+        # their own new row before either commits -- silently recreating the
+        # exact identity-fork this guard exists to catch, just for two rows
+        # created in the same instant instead of two calls spaced apart. Not
+        # closed by locking/a transaction here; documenting it rather than
+        # implying the check is airtight.
+        sibling_subs = (
+            (
+                await session.execute(
+                    select(Agent.sub).where(
+                        Agent.sub != sub,
+                        or_(
+                            Agent.sub == base_sub,
+                            Agent.sub.startswith(f"{base_sub}::", autoescape=True),
+                        ),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if sibling_subs:
+            await _deny_sibling_identity_exists(
+                session,
+                base_sub=base_sub,
+                sub=sub,
+                existing_agent_keys=[_agent_key_from_sub(s, base_sub) for s in sibling_subs],
+            )
+    if created:
+        # TECH-5736: same "about to create a new row" moment, but this
+        # check is NOT gated on `confirm_new_identity` -- that flag means
+        # "I intend to register a genuinely separate identity," not "I
+        # intend to collide with another active agent's display_name."
+        # See DisplayNameCollisionError's docstring for why this only
+        # fires on creation, not on every re-registration.
+        colliding_subs = (
+            (
+                await session.execute(
+                    select(Agent.sub).where(
+                        func.lower(Agent.display_name) == display_name.lower(),
+                        Agent.status == "active",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if colliding_subs:
+            await _deny_display_name_collision(
+                session,
+                actor_sub=sub,
+                display_name=display_name,
+                existing_subs=list(colliding_subs),
+            )
     if created and is_shared and not is_shared_authorized:
         # First-registration self-escalation: `is_shared` is frozen after
         # this point (see the re-registration branch below), so this is the
@@ -1260,6 +1498,18 @@ async def register_agent(
             # this escalation vector (or an accidental downgrade attempt) go
             # unnoticed. Note only, not a `_deny()` call: nothing is
             # actually being denied here.
+            #
+            # Committed immediately, standalone, rather than left staged
+            # alongside the field mutations below (Argus round-4 finding):
+            # this function's later `flush()` can raise `IntegrityError` on
+            # a colliding `display_name`, and the handler for that
+            # unconditionally `rollback()`s -- which would silently discard
+            # this row too, letting an actor pair an `is_shared=True`
+            # escalation probe with a colliding display_name to suppress
+            # this audit entirely. Committing it here, before that flush,
+            # means it survives regardless of what happens later in this
+            # call. `expire_on_commit=False` (db.py) keeps `agent` usable
+            # afterward without a refresh.
             _audit(
                 session,
                 actor_sub=sub,
@@ -1271,6 +1521,7 @@ async def register_agent(
                     "is_shared_authorized": is_shared_authorized,
                 },
             )
+            await session.commit()
         # owner_sub and is_shared are deliberately NOT overwritten by THIS
         # function on re-registration. owner_sub is read by
         # AgentTableOwnershipClient as the input to may_assign's admission
@@ -1308,7 +1559,56 @@ async def register_agent(
         agent.bound_at = now
         agent.min_schema_version = min_schema_version
         agent.max_schema_version = max_schema_version
-    await session.flush()
+    try:
+        await session.flush()
+    except IntegrityError as exc:
+        # TECH-5736 (Argus round-2 finding): idx_agents_lower_display_name_active
+        # (migration a45f344c9c00) is a UNIQUE partial index backing the
+        # app-level display_name check above -- it exists precisely to
+        # catch what that racy read-then-insert check can miss: (a) two
+        # concurrent first-time registrations racing past the check with
+        # the same display_name, or (b) a re-registration (line ~1477)
+        # renaming onto a name a DIFFERENT active agent already holds,
+        # which the check above never even queries for (it only runs
+        # `if created`). Without this, either case surfaces as a raw,
+        # unmapped IntegrityError (a 500) instead of the intended
+        # DisplayNameCollisionError. Narrowed to THIS index by name --
+        # not a blanket IntegrityError->DisplayNameCollisionError mapping
+        # -- so an unrelated constraint violation still propagates as
+        # itself rather than being mislabeled.
+        await session.rollback()
+        if _is_display_name_index_violation(exc):
+            # Unlike the app-level check's `colliding_subs`, the
+            # DB-level violation itself doesn't hand us the other row's
+            # `sub` -- only that a conflict exists. But the row IS now
+            # queryable post-rollback (it's what the unique index just
+            # rejected our write in favor of), so look it up instead of
+            # recording "sub unknown" (Argus round-4 finding): a real
+            # value here makes this audit path distinguishable from a
+            # bug when reviewed later. `existing_subs` remains
+            # server-side-audit-only (never surfaced to the caller, see
+            # DisplayNameCollisionError's docstring). Fall back to `[]`
+            # if a further race means the row is already gone again by
+            # the time we look.
+            colliding_subs_post_rollback = (
+                (
+                    await session.execute(
+                        select(Agent.sub).where(
+                            func.lower(Agent.display_name) == display_name.lower(),
+                            Agent.status == "active",
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            await _deny_display_name_collision(
+                session,
+                actor_sub=sub,
+                display_name=display_name,
+                existing_subs=list(colliding_subs_post_rollback),
+            )
+        raise
     _audit(
         session,
         actor_sub=sub,
@@ -1433,6 +1733,78 @@ async def set_agent_shared(
         action="agent.set_shared",
         agent_id=agent.id,
         detail={"is_shared": is_shared, "previous": previous},
+    )
+    await session.commit()
+    return agent
+
+
+async def deregister_agent(
+    session: AsyncSession,
+    *,
+    actor_sub: str,
+    agent_id: uuid.UUID,
+    deregister_authorized: bool,
+) -> Agent:
+    """Admin-gated deregistration: transitions ``agent.status`` to
+    ``"suspended"`` (TECH-5736).
+
+    Closes a gap the schema has always supported but nothing ever
+    exercised: ``models.AGENT_STATUSES`` has included ``"suspended"``
+    since the initial schema, but before this function NOTHING in this
+    codebase ever wrote it -- ``lookup_agent_by_email``'s own docstring
+    used to describe the ``status == "active"`` filter as "inert,
+    future-proofing for deregistration rather than an enforced guarantee."
+    A live incident needed exactly this (a stray, mis-registered row with
+    no way to retire it) and found it didn't exist.
+
+    Mirrors ``set_agent_shared``'s admin-gate shape exactly:
+    ``deregister_authorized`` MUST be computed by the caller (the tools
+    layer) from the actor's own verified token (``comms:admin`` scope, or
+    an interactive/Okta caller) -- no default is provided, since this
+    function's entire purpose is the privileged mutation and there is no
+    unprivileged call site to protect with a fail-closed default.
+
+    Idempotent: deregistering an already-``suspended`` agent is a no-op
+    write (still audited) rather than an error -- safe to retry.
+
+    Raises ``AccessDeniedError`` with reason
+    ``denied.deregister_requires_elevated_scope`` if
+    ``deregister_authorized`` is ``False`` (checked FIRST, before the
+    existence lookup, so an unauthorized caller's audit trail always
+    records the authorization failure, not ``denied.unknown_agent``,
+    regardless of whether ``agent_id`` happens to be valid), or
+    ``denied.unknown_agent`` if ``agent_id`` does not match any agent
+    (uniform with every other unknown-agent-id denial in this module).
+
+    Deliberately one-directional (suspend only, no reactivate path) --
+    this repo has no reactivation use case yet; add one as its own
+    change, with its own authorization gate, if that need arises rather
+    than overloading this function with a ``status`` parameter now.
+    """
+    if not deregister_authorized:
+        await _deny(
+            session,
+            actor_sub=actor_sub,
+            action="denied.deregister_requires_elevated_scope",
+            detail={"target_agent_id": str(agent_id)},
+        )
+    agent = await _find_agent_by_id(session, agent_id)
+    if agent is None:
+        await _deny(
+            session,
+            actor_sub=actor_sub,
+            action="denied.unknown_agent",
+            detail={"target_agent_id": str(agent_id)},
+        )
+    previous = agent.status
+    agent.status = "suspended"
+    await session.flush()
+    _audit(
+        session,
+        actor_sub=actor_sub,
+        action="agent.deregistered",
+        agent_id=agent.id,
+        detail={"previous_status": previous},
     )
     await session.commit()
     return agent
@@ -1568,12 +1940,11 @@ async def lookup_agent_by_email(
     registered in the same transaction get an identical value), then
     ``id`` (the UUID primary key, the only column here actually guaranteed
     unique) as the final, always-deterministic tiebreaker. This is NOT
-    "the" registered EA in any stronger sense. Do not read the
-    ``status == "active"`` filter as "a deregistered agent is
-    never returned": nothing in this codebase currently transitions an
-    agent to ``"suspended"`` (the only other value ``AGENT_STATUSES``
-    allows), so today that filter is inert, future-proofing for
-    deregistration rather than an enforced guarantee. TECH-5703's
+    "the" registered EA in any stronger sense. The ``status == "active"``
+    filter excludes agents suspended via ``deregister_agent`` (TECH-5736) --
+    before that function existed, nothing in this codebase ever transitioned
+    an agent to ``"suspended"``, so this filter was inert; it is now live.
+    TECH-5703's
     ``active_checker`` filter below is the actual enforcement mechanism for
     retirement today -- a registry-retired agent is excluded here the same
     way an unregistered email is (``None``, not a distinguishable error),
@@ -4969,6 +5340,7 @@ __all__ = [
     "audit_denied_approval_requires_interactive",
     "decide_hold",
     "decline_invite",
+    "deregister_agent",
     "get_agent_by_sub",
     "get_conversation",
     "get_hold_status",

@@ -175,14 +175,131 @@ class AgentRetiredError(Exception):
         self.reason = reason
 
 
+class SiblingIdentityExistsError(Exception):
+    """``register_agent`` would create a NEW row for a ``base_sub`` that
+    already has at least one board identity under a DIFFERENT
+    ``agent_key`` (TECH-5736) -- the silent-identity-fork failure mode a
+    live incident actually hit: a caller that omits or typos
+    ``agent_key`` on a later call does not re-bind an existing identity,
+    it creates an entirely separate one, invisibly to the caller (the
+    board is working exactly as documented -- "absent" is a distinct key
+    from any named one -- which is precisely what makes this dangerous).
+
+    Specific and client-safe by design, unlike ``AccessDeniedError``: this
+    only ever describes the CALLING ``base_sub``'s own other
+    registrations, never another caller's data -- similar non-enumeration
+    reasoning to ``UnknownConversationTypeError``'s fixed public
+    vocabulary (module docstring above), just scoped to one caller's own
+    history instead of a global fixed list.
+
+    Not fail-closed in the security sense -- ``register_agent`` accepts an
+    explicit ``confirm_new_identity=True`` to proceed anyway, since a
+    caller legitimately running multiple agents under one token (the
+    documented purpose of ``agent_key``) must still be able to register a
+    genuinely new sibling identity on purpose.
+
+    ``existing_agent_keys`` is deliberately excluded from ``str(exc)`` --
+    same treatment ``DisplayNameCollisionError.existing_subs`` got in
+    round 1 (see that class's docstring), applied here for the analogous
+    reason: a ``comms:write``-only caller can trigger this error
+    repeatedly (it's on the write path, not gated behind ``comms:read``)
+    and would otherwise be able to enumerate its own sibling agent_keys
+    purely from the client-facing message. It remains a plain attribute
+    on the exception for server-side callers (audit logging) only, never
+    surfaced across the service/tools boundary.
+    """
+
+    def __init__(self, *, base_sub: str, existing_agent_keys: list[str | None]) -> None:
+        super().__init__(
+            f"identity_fork_detected: {base_sub!r} already has at least one other "
+            "registered agent -- pass confirm_new_identity=True to register a "
+            "genuinely separate identity, or pass the matching agent_key to re-bind "
+            "the existing one instead"
+        )
+        self.base_sub = base_sub
+        self.existing_agent_keys = existing_agent_keys
+
+
+class DisplayNameCollisionError(Exception):
+    """``register_agent`` would create a NEW row whose ``display_name``
+    matches an already board-``active`` agent's ``display_name``
+    (TECH-5736). ``display_name`` is not a board-enforced identity key --
+    ``sub`` is -- but a live incident showed downstream consumers (a site
+    agent's message whitelist) treat it as one in practice, so two
+    simultaneously-active, identically-named agents is a real hazard
+    worth rejecting at creation time rather than silently allowing.
+
+    Specific and client-safe: ``display_name`` is already public via
+    ``comms_list_agents``, so naming which ``sub`` already holds it is not
+    a new disclosure -- the caller could already learn the same fact by
+    listing the directory.
+
+    Only checked on FIRST registration (a new row being created), not on
+    every re-registration of an existing row -- see ``register_agent``'s
+    own docstring for why re-registration is deliberately exempt.
+
+    Round-1 Argus review (TECH-5736) flagged the original message as a sub-
+    enumeration path: a token scoped only to ``comms:write`` (sufficient to
+    call ``comms_register``) cannot call ``comms_list_agents``
+    (``comms:read``), yet could otherwise learn a target agent's ``sub`` by
+    probing display names and reading it off this error. The
+    ``comms_list_agents`` justification above holds only when the caller
+    already has ``comms:read`` too, which ``TOOL_SCOPES`` does not
+    guarantee. ``existing_subs`` is therefore no longer part of ``str(exc)``
+    -- it remains an attribute for server-side callers (audit logging) only,
+    never surfaced across the service/tools boundary.
+    """
+
+    def __init__(self, *, display_name: str, existing_subs: list[str]) -> None:
+        super().__init__(
+            f"display_name_collision: {display_name!r} is already used by an active "
+            "agent -- choose a distinct display_name"
+        )
+        self.display_name = display_name
+        self.existing_subs = existing_subs
+
+
+class AgentSuspendedError(Exception):
+    """``register_agent`` was called for a ``sub`` currently
+    ``status="suspended"`` (TECH-5736) -- deliberately NOT silently
+    reactivated.
+
+    ``comms_deregister_agent`` is documented as one-directional (no
+    reactivate tool, by design -- see its own docstring). Before this
+    check, the idempotent re-registration branch unconditionally reset
+    ``status`` back to ``"active"`` on any subsequent ``comms_register``
+    call, which silently reverted every deregistration the moment the
+    same caller (often the exact misbehaving caller a deregistration was
+    meant to stop) called ``comms_register`` again -- undermining the
+    entire feature this ticket added. There is intentionally no bypass
+    parameter here (unlike ``confirm_new_identity``/``is_shared_authorized``):
+    reactivation has no supported path yet; add one as its own change, with
+    its own authorization gate, if that need arises.
+
+    Specific and client-safe: this only describes the calling ``sub``'s own
+    state, never another caller's data, the same non-enumeration reasoning
+    as ``SiblingIdentityExistsError``.
+    """
+
+    def __init__(self, *, sub: str) -> None:
+        super().__init__(
+            f"agent_suspended: {sub!r} has been deregistered (status=suspended) and "
+            "cannot be re-registered -- there is no reactivation path"
+        )
+        self.sub = sub
+
+
 __all__ = [
     "AccessDeniedError",
     "AgentRetiredError",
+    "AgentSuspendedError",
+    "DisplayNameCollisionError",
     "HoldAlreadyDecidedError",
     "HoldAwaitingAutoReviewError",
     "HoldExpiredError",
     "InvalidConversationStateError",
     "RateLimitExceededError",
     "SchemaVersionMismatchError",
+    "SiblingIdentityExistsError",
     "UnknownConversationTypeError",
 ]

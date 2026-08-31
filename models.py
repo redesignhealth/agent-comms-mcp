@@ -192,6 +192,34 @@ class Agent(Base):
             column("id").asc(),
             postgresql_where=text("status = 'active' AND is_shared = false"),
         ),
+        # Backs service.register_agent's display-name-collision check
+        # (func.lower(Agent.display_name) == ... AND status == "active")
+        # and, since migration a45f344c9c00's in-place amendment, is a
+        # UNIQUE index -- a DB-level backstop closing the race the
+        # app-level read-then-insert check alone can't (see that
+        # migration's docstring). Declared here too, not just in the
+        # migration, for the same autogenerate-drift reason as
+        # idx_agents_lower_owner_email_active above.
+        Index(
+            "idx_agents_lower_display_name_active",
+            text("lower(display_name)"),
+            unique=True,
+            postgresql_where=text("status = 'active'"),
+        ),
+        # NOTE: no `idx_agents_sub_prefix` here. service.register_agent's
+        # sibling-identity prefix check
+        # (Agent.sub.startswith(f"{base_sub}::", autoescape=True)) compiles
+        # to `LIKE 'base_sub::%' ESCAPE '\\'`, which a `text_pattern_ops`
+        # index can't serve -- that opclass only accelerates the
+        # two-argument `~~` (plain LIKE) operator, not the ESCAPE form.
+        # Dropping `autoescape=True` to make the index usable was
+        # considered and rejected: `base_sub` comes from
+        # `identity.try_resolve_email`'s `email`/`preferred_username`
+        # claims, which are IdP-controlled and not restricted against
+        # `%`/`_` the way `agent_key` is. So this query accepts a
+        # sequential scan on this small table instead of an index that
+        # would either be dead weight or unsafe. See migration
+        # a45f344c9c00's docstring for the full history.
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()

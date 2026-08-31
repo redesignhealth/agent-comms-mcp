@@ -39,12 +39,15 @@ import service as _service
 from exceptions import (
     AccessDeniedError,
     AgentRetiredError,
+    AgentSuspendedError,
+    DisplayNameCollisionError,
     HoldAlreadyDecidedError,
     HoldAwaitingAutoReviewError,
     HoldExpiredError,
     InvalidConversationStateError,
     RateLimitExceededError,
     SchemaVersionMismatchError,
+    SiblingIdentityExistsError,
     UnknownConversationTypeError,
 )
 from models import Agent, ApprovalHold, AuditLog, Conversation, Message, Participant
@@ -69,6 +72,7 @@ from service import (
     OwnershipClient,
     accept_invite,
     decline_invite,
+    deregister_agent,
     get_conversation,
     inbox,
     leave,
@@ -273,6 +277,7 @@ def session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
 async def _register(session: AsyncSession, sub: str, **overrides: Any) -> Agent:
     kwargs: dict[str, Any] = {
         "sub": sub,
+        "base_sub": sub,
         "owner_sub": f"owner-{sub}",
         "owner_email": f"{sub}@example.com",
         "display_name": sub,
@@ -753,6 +758,7 @@ class TestRegisterAgent:
             await register_agent(
                 session,
                 sub="shared-unauthorized",
+                base_sub="shared-unauthorized",
                 owner_sub="owner-shared-unauthorized",
                 owner_email="shared-unauthorized@example.com",
                 display_name="Shared Unauthorized",
@@ -826,6 +832,366 @@ class TestRegisterAgent:
         assert agent_id == shared.id
         assert conversation_id == conversation.id
         assert detail["message_type"] == "note"
+
+    # --- Identity-fork / display-name collision guards (TECH-5736) ---------
+
+    async def test_sibling_identity_blocks_new_row_without_confirmation(
+        self, session: AsyncSession
+    ) -> None:
+        """The actual incident: a base_sub already has a registered
+        identity under one agent_key; a call that would create a SECOND
+        identity under a different key (including the "absent" key) must
+        be rejected, not silently create the fork."""
+        await register_agent(
+            session,
+            sub="dan@example.com::bond-007",
+            base_sub="dan@example.com",
+            owner_sub="dan@example.com",
+            owner_email="dan@example.com",
+            display_name="Bond 007",
+            accepted_types=sorted(MESSAGE_TYPES),
+            is_shared_authorized=True,
+        )
+
+        with pytest.raises(SiblingIdentityExistsError) as exc_info:
+            await register_agent(
+                session,
+                sub="dan@example.com",
+                base_sub="dan@example.com",
+                owner_sub="dan@example.com",
+                owner_email="dan@example.com",
+                display_name="Bond 007 (stray)",
+                accepted_types=sorted(MESSAGE_TYPES),
+                is_shared_authorized=True,
+            )
+        assert exc_info.value.base_sub == "dan@example.com"
+        assert exc_info.value.existing_agent_keys == ["bond-007"]
+        assert "bond-007" not in str(exc_info.value)
+
+        # No stray row was created.
+        row = (
+            await session.execute(select(Agent).where(Agent.sub == "dan@example.com"))
+        ).scalar_one_or_none()
+        assert row is None
+
+        audit_rows = (
+            (
+                await session.execute(
+                    select(AuditLog.action).where(
+                        AuditLog.actor_sub == "dan@example.com",
+                        AuditLog.action == "denied.sibling_identity_exists",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert audit_rows == ["denied.sibling_identity_exists"]
+
+    async def test_sibling_identity_lists_all_existing_agent_keys(
+        self, session: AsyncSession
+    ) -> None:
+        await register_agent(
+            session,
+            sub="multi-key-base::key-a",
+            base_sub="multi-key-base",
+            owner_sub="multi-key-base",
+            owner_email="multi-key-base@example.com",
+            display_name="Key A",
+            accepted_types=sorted(MESSAGE_TYPES),
+            is_shared_authorized=True,
+            confirm_new_identity=True,
+        )
+        await register_agent(
+            session,
+            sub="multi-key-base",
+            base_sub="multi-key-base",
+            owner_sub="multi-key-base",
+            owner_email="multi-key-base@example.com",
+            display_name="Bare Base",
+            accepted_types=sorted(MESSAGE_TYPES),
+            is_shared_authorized=True,
+            confirm_new_identity=True,
+        )
+
+        with pytest.raises(SiblingIdentityExistsError) as exc_info:
+            await register_agent(
+                session,
+                sub="multi-key-base::key-b",
+                base_sub="multi-key-base",
+                owner_sub="multi-key-base",
+                owner_email="multi-key-base@example.com",
+                display_name="Key B",
+                accepted_types=sorted(MESSAGE_TYPES),
+                is_shared_authorized=True,
+            )
+        assert sorted(exc_info.value.existing_agent_keys, key=lambda k: k or "") == [
+            None,
+            "key-a",
+        ]
+
+        audit_rows = (
+            (
+                await session.execute(
+                    select(AuditLog.action).where(
+                        AuditLog.actor_sub == "multi-key-base::key-b",
+                        AuditLog.action == "denied.sibling_identity_exists",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert audit_rows == ["denied.sibling_identity_exists"]
+
+    async def test_confirm_new_identity_bypasses_sibling_check(self, session: AsyncSession) -> None:
+        await register_agent(
+            session,
+            sub="confirmed-base::first",
+            base_sub="confirmed-base",
+            owner_sub="confirmed-base",
+            owner_email="confirmed-base@example.com",
+            display_name="First",
+            accepted_types=sorted(MESSAGE_TYPES),
+            is_shared_authorized=True,
+        )
+
+        second = await register_agent(
+            session,
+            sub="confirmed-base::second",
+            base_sub="confirmed-base",
+            owner_sub="confirmed-base",
+            owner_email="confirmed-base@example.com",
+            display_name="Second",
+            accepted_types=sorted(MESSAGE_TYPES),
+            is_shared_authorized=True,
+            confirm_new_identity=True,
+        )
+        assert second.sub == "confirmed-base::second"
+
+    async def test_sibling_check_does_not_fire_on_re_registration(
+        self, session: AsyncSession
+    ) -> None:
+        """Re-registering an ALREADY-existing sub is the safe, intended
+        idempotent path -- it must never trip the sibling-fork guard, even
+        though other identities exist under the same base_sub."""
+        await register_agent(
+            session,
+            sub="rereg-base::one",
+            base_sub="rereg-base",
+            owner_sub="rereg-base",
+            owner_email="rereg-base@example.com",
+            display_name="One",
+            accepted_types=sorted(MESSAGE_TYPES),
+            is_shared_authorized=True,
+        )
+        again = await register_agent(
+            session,
+            sub="rereg-base::one",
+            base_sub="rereg-base",
+            owner_sub="rereg-base",
+            owner_email="rereg-base@example.com",
+            display_name="One Renamed",
+            accepted_types=sorted(MESSAGE_TYPES),
+            is_shared_authorized=True,
+        )
+        assert again.display_name == "One Renamed"
+
+    async def test_sibling_check_does_not_fire_on_re_registration_with_other_active_siblings(
+        self, session: AsyncSession
+    ) -> None:
+        """Two active siblings already exist under the same base_sub.
+        Re-registering ONE of them with its OWN existing agent_key is a
+        legitimate re-registration, not a fork -- it must succeed. Only
+        omitting/mismatching the key against an existing sibling should
+        trip SiblingIdentityExistsError (covered by
+        test_sibling_identity_blocks_new_row_without_confirmation and
+        test_sibling_identity_lists_all_existing_agent_keys above)."""
+        await register_agent(
+            session,
+            sub="rereg-multi-base::one",
+            base_sub="rereg-multi-base",
+            owner_sub="rereg-multi-base",
+            owner_email="rereg-multi-base@example.com",
+            display_name="One",
+            accepted_types=sorted(MESSAGE_TYPES),
+            is_shared_authorized=True,
+        )
+        await register_agent(
+            session,
+            sub="rereg-multi-base::two",
+            base_sub="rereg-multi-base",
+            owner_sub="rereg-multi-base",
+            owner_email="rereg-multi-base@example.com",
+            display_name="Two",
+            accepted_types=sorted(MESSAGE_TYPES),
+            is_shared_authorized=True,
+            confirm_new_identity=True,
+        )
+
+        again = await register_agent(
+            session,
+            sub="rereg-multi-base::one",
+            base_sub="rereg-multi-base",
+            owner_sub="rereg-multi-base",
+            owner_email="rereg-multi-base@example.com",
+            display_name="One Renamed",
+            accepted_types=sorted(MESSAGE_TYPES),
+            is_shared_authorized=True,
+        )
+        assert again.sub == "rereg-multi-base::one"
+        assert again.display_name == "One Renamed"
+
+    async def test_display_name_collision_blocks_new_row(self, session: AsyncSession) -> None:
+        await _register(session, "display-collision-a", display_name="Bond 007")
+
+        with pytest.raises(DisplayNameCollisionError) as exc_info:
+            await register_agent(
+                session,
+                sub="display-collision-b",
+                base_sub="display-collision-b",
+                owner_sub="display-collision-b",
+                owner_email="display-collision-b@example.com",
+                display_name="Bond 007",
+                accepted_types=sorted(MESSAGE_TYPES),
+                is_shared_authorized=True,
+            )
+        assert exc_info.value.display_name == "Bond 007"
+        assert exc_info.value.existing_subs == ["display-collision-a"]
+        # Round-1 Argus sub-enumeration fix: the colliding sibling's `sub`
+        # must never appear in the exception's string form (a
+        # comms:write-only caller can see this message but not
+        # comms_list_agents), even though `existing_subs` remains a real
+        # attribute above for server-side audit logging.
+        assert "display-collision-a" not in str(exc_info.value)
+
+        row = (
+            await session.execute(select(Agent).where(Agent.sub == "display-collision-b"))
+        ).scalar_one_or_none()
+        assert row is None
+
+    async def test_display_name_collision_is_case_insensitive(self, session: AsyncSession) -> None:
+        await _register(session, "case-collision-a", display_name="Bond 007")
+
+        with pytest.raises(DisplayNameCollisionError):
+            await register_agent(
+                session,
+                sub="case-collision-b",
+                base_sub="case-collision-b",
+                owner_sub="case-collision-b",
+                owner_email="case-collision-b@example.com",
+                display_name="bond 007",
+                accepted_types=sorted(MESSAGE_TYPES),
+                is_shared_authorized=True,
+            )
+
+    async def test_display_name_collision_ignores_suspended_agents(
+        self, session: AsyncSession
+    ) -> None:
+        """Only board-ACTIVE agents count as a collision -- a suspended
+        (deregistered) agent's old display_name is free to reuse."""
+        suspended = await _register(session, "suspended-name-holder", display_name="Bond 007")
+        await deregister_agent(
+            session,
+            actor_sub="admin-operator",
+            agent_id=suspended.id,
+            deregister_authorized=True,
+        )
+
+        agent = await register_agent(
+            session,
+            sub="new-bond-007",
+            base_sub="new-bond-007",
+            owner_sub="new-bond-007",
+            owner_email="new-bond-007@example.com",
+            display_name="Bond 007",
+            accepted_types=sorted(MESSAGE_TYPES),
+            is_shared_authorized=True,
+        )
+        assert agent.display_name == "Bond 007"
+
+    async def test_display_name_collision_not_bypassed_by_confirm_new_identity(
+        self, session: AsyncSession
+    ) -> None:
+        """confirm_new_identity only concerns identity forking -- it must
+        NOT also silently permit a display_name collision, a separate
+        hazard with no legitimate reason to allow."""
+        await _register(session, "confirm-vs-name-a", display_name="Bond 007")
+
+        with pytest.raises(DisplayNameCollisionError):
+            await register_agent(
+                session,
+                sub="confirm-vs-name-b",
+                base_sub="confirm-vs-name-b",
+                owner_sub="confirm-vs-name-b",
+                owner_email="confirm-vs-name-b@example.com",
+                display_name="Bond 007",
+                accepted_types=sorted(MESSAGE_TYPES),
+                is_shared_authorized=True,
+                confirm_new_identity=True,
+            )
+
+    async def test_display_name_collision_does_not_fire_on_re_registration(
+        self, session: AsyncSession
+    ) -> None:
+        """Re-registering an existing row under its OWN already-active
+        display_name must not collide with itself."""
+        agent = await _register(session, "self-name-agent", display_name="Same Name")
+
+        again = await register_agent(
+            session,
+            sub="self-name-agent",
+            base_sub="self-name-agent",
+            owner_sub="self-name-agent",
+            owner_email="self-name-agent@example.com",
+            display_name="Same Name",
+            accepted_types=sorted(MESSAGE_TYPES),
+            is_shared_authorized=True,
+        )
+        assert again.id == agent.id
+
+    async def test_db_level_collision_on_reregister_rename(self, session: AsyncSession) -> None:
+        """TECH-5736 round-3's "case (b)": a RE-registration renaming onto
+        a display_name a DIFFERENT active agent already holds. The
+        app-level guard in ``register_agent`` only queries for collisions
+        `if created` (see the block above the `session.flush()` call), so
+        this scenario skips it entirely and falls through to
+        ``idx_agents_lower_display_name_active`` (migration a45f344c9c00)
+        for enforcement, exercised here against a real Postgres backend.
+        This is the exact path the round-3 fix's ``_is_display_name_index_violation``
+        helper exists to translate into ``DisplayNameCollisionError`` instead
+        of letting the raw ``IntegrityError`` escape as an unmapped 500 --
+        see ~service.py:1533's comment for the "case (a)"/"case (b)" split.
+        """
+        await _register(session, "db-collision-a", display_name="Bond 007")
+        await _register(session, "db-collision-b", display_name="Distinct Name")
+
+        with pytest.raises(DisplayNameCollisionError):
+            await register_agent(
+                session,
+                sub="db-collision-b",
+                base_sub="db-collision-b",
+                owner_sub="db-collision-b",
+                owner_email="db-collision-b@example.com",
+                display_name="Bond 007",
+                accepted_types=sorted(MESSAGE_TYPES),
+                is_shared_authorized=True,
+            )
+
+        row = (
+            await session.execute(select(Agent).where(Agent.sub == "db-collision-b"))
+        ).scalar_one()
+        assert row.display_name == "Distinct Name"
+
+        audit_action = (
+            await session.execute(
+                select(AuditLog.action).where(
+                    AuditLog.actor_sub == "db-collision-b",
+                    AuditLog.action == "denied.display_name_collision",
+                )
+            )
+        ).scalar_one_or_none()
+        assert audit_action == "denied.display_name_collision"
 
 
 # --- set_agent_shared ----------------------------------------------------------
@@ -6559,6 +6925,7 @@ class TestWriteThroughOwnership:
         reregistered = await register_agent(
             session,
             sub="write-through-vs-freeze",
+            base_sub="write-through-vs-freeze",
             owner_sub="attempted-forged-owner",
             owner_email="attempted-forged-owner@example.com",
             display_name="write-through-vs-freeze",
@@ -6822,3 +7189,357 @@ class TestReconcileAgentOwnership:
         )
 
         assert result == {"checked": 1, "updated": 1, "skipped_shared": 0, "errors": 0}
+
+
+# --- deregister_agent (TECH-5736) -------------------------------------------
+
+
+class TestDeregisterAgent:
+    async def test_admin_deregisters_agent(self, session: AsyncSession) -> None:
+        agent = await _register(session, "stray-agent")
+
+        deregistered = await deregister_agent(
+            session,
+            actor_sub="admin-operator",
+            agent_id=agent.id,
+            deregister_authorized=True,
+        )
+
+        assert deregistered.status == "suspended"
+        row = (await session.execute(select(Agent).where(Agent.id == agent.id))).scalar_one()
+        assert row.status == "suspended"
+
+        rows = (
+            await session.execute(
+                select(AuditLog.agent_id, AuditLog.detail).where(
+                    AuditLog.action == "agent.deregistered"
+                )
+            )
+        ).all()
+        assert len(rows) == 1
+        audited_agent_id, detail = rows[0]
+        assert audited_agent_id == agent.id
+        assert detail == {"previous_status": "active"}
+
+    async def test_denied_without_authorization(self, session: AsyncSession) -> None:
+        agent = await _register(session, "deregister-unauthorized")
+
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await deregister_agent(
+                session,
+                actor_sub="unauthorized-operator",
+                agent_id=agent.id,
+                deregister_authorized=False,
+            )
+        assert exc_info.value.reason == "denied.deregister_requires_elevated_scope"
+
+        row = (await session.execute(select(Agent).where(Agent.id == agent.id))).scalar_one()
+        assert row.status == "active"
+
+        rows = (
+            await session.execute(
+                select(AuditLog.action, AuditLog.agent_id, AuditLog.detail).where(
+                    AuditLog.actor_sub == "unauthorized-operator"
+                )
+            )
+        ).all()
+        assert len(rows) == 1
+        action, audited_agent_id, detail = rows[0]
+        assert action == "denied.deregister_requires_elevated_scope"
+        # No agent lookup happens before this denial (auth checked first,
+        # mirrors set_agent_shared's own ordering) -- the audit row can't
+        # reference a row id, but still preserves the attempted target.
+        assert audited_agent_id is None
+        assert detail == {"target_agent_id": str(agent.id)}
+
+    async def test_denied_unknown_agent(self, session: AsyncSession) -> None:
+        bogus_id = uuid.uuid4()
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await deregister_agent(
+                session,
+                actor_sub="admin-operator",
+                agent_id=bogus_id,
+                deregister_authorized=True,
+            )
+        assert exc_info.value.reason == "denied.unknown_agent"
+
+    async def test_idempotent_on_already_suspended_agent(self, session: AsyncSession) -> None:
+        agent = await _register(session, "already-suspended")
+        await deregister_agent(
+            session, actor_sub="admin-operator", agent_id=agent.id, deregister_authorized=True
+        )
+
+        again = await deregister_agent(
+            session, actor_sub="admin-operator", agent_id=agent.id, deregister_authorized=True
+        )
+
+        assert again.status == "suspended"
+        rows = (
+            (
+                await session.execute(
+                    select(AuditLog.detail)
+                    .where(AuditLog.action == "agent.deregistered", AuditLog.agent_id == agent.id)
+                    .order_by(AuditLog.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert rows == [
+            {"previous_status": "active"},
+            {"previous_status": "suspended"},
+        ]
+
+    async def test_frees_up_display_name_for_a_new_registration(
+        self, session: AsyncSession
+    ) -> None:
+        """The actual point of item 3 for the incident that motivated it:
+        deregistering the stray agent should free its display_name for a
+        correctly re-registered replacement (DisplayNameCollisionError
+        only checks ``status == "active"`` agents)."""
+        stray = await _register(session, "stray-bond-007", display_name="Bond 007")
+        await deregister_agent(
+            session, actor_sub="admin-operator", agent_id=stray.id, deregister_authorized=True
+        )
+
+        replacement = await register_agent(
+            session,
+            sub="corrected-bond-007",
+            base_sub="corrected-bond-007",
+            owner_sub="corrected-bond-007",
+            owner_email="corrected-bond-007@example.com",
+            display_name="Bond 007",
+            accepted_types=sorted(MESSAGE_TYPES),
+            is_shared_authorized=True,
+        )
+        assert replacement.display_name == "Bond 007"
+
+    async def test_reregistering_a_suspended_sub_is_denied(self, session: AsyncSession) -> None:
+        """Argus round-1 (TECH-5736): before this guard, re-registering a
+        suspended sub silently reset status back to "active", reverting
+        every comms_deregister_agent call on the caller's very next
+        comms_register -- exactly the incident scenario this ticket exists
+        to close."""
+        agent = await _register(session, "stray-to-reregister", display_name="Stray")
+        await deregister_agent(
+            session, actor_sub="admin-operator", agent_id=agent.id, deregister_authorized=True
+        )
+
+        with pytest.raises(AgentSuspendedError) as exc_info:
+            await register_agent(
+                session,
+                sub="stray-to-reregister",
+                base_sub="stray-to-reregister",
+                owner_sub="stray-to-reregister",
+                owner_email="stray-to-reregister@example.com",
+                display_name="Stray",
+                accepted_types=sorted(MESSAGE_TYPES),
+            )
+        assert exc_info.value.sub == "stray-to-reregister"
+
+        row = (await session.execute(select(Agent).where(Agent.id == agent.id))).scalar_one()
+        assert row.status == "suspended"
+
+        rows = (
+            await session.execute(
+                select(AuditLog.agent_id, AuditLog.detail).where(
+                    AuditLog.action == "denied.reregister_suspended_agent"
+                )
+            )
+        ).all()
+        assert len(rows) == 1
+        audited_agent_id, detail = rows[0]
+        assert audited_agent_id == agent.id
+        assert detail == {"sub": "stray-to-reregister"}
+
+    async def test_reregistering_a_suspended_sub_after_name_reclaimed_stays_denied(
+        self, session: AsyncSession
+    ) -> None:
+        """Regression for TECH-5736 item 2 (follow-on of item 1): before the
+        `AgentSuspendedError` guard, this exact sequence -- register A,
+        deregister A, register B with A's now-freed display_name, then
+        re-register A -- would have silently reactivated A as
+        status="active" while B, a DIFFERENT agent, already held the same
+        display_name, producing two simultaneously-active agents sharing one
+        display_name (the downstream-whitelist hazard DisplayNameCollisionError
+        exists to prevent). Confirms fixing item 1 (block suspended
+        reactivation) closes item 2 as well: A stays suspended, and B's claim
+        on the display_name is undisturbed."""
+        agent_a = await _register(session, "agent-a-reclaim", display_name="Shared Name")
+        await deregister_agent(
+            session, actor_sub="admin-operator", agent_id=agent_a.id, deregister_authorized=True
+        )
+
+        agent_b = await register_agent(
+            session,
+            sub="agent-b-reclaim",
+            base_sub="agent-b-reclaim",
+            owner_sub="agent-b-reclaim",
+            owner_email="agent-b-reclaim@example.com",
+            display_name="Shared Name",
+            accepted_types=sorted(MESSAGE_TYPES),
+        )
+        assert agent_b.status == "active"
+        assert agent_b.display_name == "Shared Name"
+
+        with pytest.raises(AgentSuspendedError) as exc_info:
+            await register_agent(
+                session,
+                sub="agent-a-reclaim",
+                base_sub="agent-a-reclaim",
+                owner_sub="agent-a-reclaim",
+                owner_email="agent-a-reclaim@example.com",
+                display_name="Shared Name",
+                accepted_types=sorted(MESSAGE_TYPES),
+            )
+        assert exc_info.value.sub == "agent-a-reclaim"
+
+        # A remains suspended; B is untouched and still the sole active
+        # holder of the display_name -- no two-active-agents-one-name state.
+        row_a = (await session.execute(select(Agent).where(Agent.id == agent_a.id))).scalar_one()
+        assert row_a.status == "suspended"
+        row_b = (await session.execute(select(Agent).where(Agent.id == agent_b.id))).scalar_one()
+        assert row_b.status == "active"
+        assert row_b.display_name == "Shared Name"
+
+    async def test_deregistering_a_sibling_still_requires_confirmation_for_new_identity(
+        self, session: AsyncSession
+    ) -> None:
+        """Argus round-1 (TECH-5736) originally scoped the sibling-fork
+        guard to ACTIVE siblings only, so a suspended sibling wouldn't
+        permanently force confirm_new_identity=True. That was reverted
+        (later round): scoping to active-only meant comms_deregister_agent
+        -- the kill-switch for a stray/compromised identity -- could be
+        silently bypassed by suspending every sibling and then registering
+        a brand-new agent_key with zero *active* siblings found. A
+        base_sub with ANY prior identity, active or suspended, must still
+        require confirm_new_identity=True for a genuinely new sibling."""
+        base_sub = "multi-agent-with-stray-sibling"
+        stray = await register_agent(
+            session,
+            sub=f"{base_sub}::stray",
+            base_sub=base_sub,
+            owner_sub=base_sub,
+            owner_email="multi-agent@example.com",
+            display_name="Stray Sibling",
+            accepted_types=sorted(MESSAGE_TYPES),
+        )
+        await deregister_agent(
+            session, actor_sub="admin-operator", agent_id=stray.id, deregister_authorized=True
+        )
+
+        # Bare base_sub, no confirm_new_identity -- the suspended sibling
+        # still counts, so this must be denied as an identity fork.
+        with pytest.raises(SiblingIdentityExistsError) as exc_info:
+            await register_agent(
+                session,
+                sub=base_sub,
+                base_sub=base_sub,
+                owner_sub=base_sub,
+                owner_email="multi-agent@example.com",
+                display_name="Primary",
+                accepted_types=sorted(MESSAGE_TYPES),
+            )
+        assert exc_info.value.base_sub == base_sub
+
+        # With confirm_new_identity=True, the new identity is allowed.
+        registered = await register_agent(
+            session,
+            sub=base_sub,
+            base_sub=base_sub,
+            owner_sub=base_sub,
+            owner_email="multi-agent@example.com",
+            display_name="Primary",
+            accepted_types=sorted(MESSAGE_TYPES),
+            confirm_new_identity=True,
+        )
+        assert registered.sub == base_sub
+
+    async def test_reentry_after_suspending_all_siblings_requires_confirmation(
+        self, session: AsyncSession
+    ) -> None:
+        """Regression for the kill-switch-bypass gap: register agent A
+        under base_sub with agent_key "a1", deregister (suspend) it, then
+        attempt to register a NEW agent_key "a2" under the same base_sub
+        without confirm_new_identity=True. Previously this silently
+        succeeded because the sibling-count query only looked at ACTIVE
+        rows, so a fully-suspended base_sub looked identical to a
+        never-registered one. It must now raise
+        SiblingIdentityExistsError."""
+        base_sub = "multi-agent-fully-suspended"
+        agent_a = await register_agent(
+            session,
+            sub=f"{base_sub}::a1",
+            base_sub=base_sub,
+            owner_sub=base_sub,
+            owner_email="multi-agent-fully-suspended@example.com",
+            display_name="Agent A1",
+            accepted_types=sorted(MESSAGE_TYPES),
+        )
+        await deregister_agent(
+            session, actor_sub="admin-operator", agent_id=agent_a.id, deregister_authorized=True
+        )
+
+        with pytest.raises(SiblingIdentityExistsError) as exc_info:
+            await register_agent(
+                session,
+                sub=f"{base_sub}::a2",
+                base_sub=base_sub,
+                owner_sub=base_sub,
+                owner_email="multi-agent-fully-suspended@example.com",
+                display_name="Agent A2",
+                accepted_types=sorted(MESSAGE_TYPES),
+            )
+        assert exc_info.value.base_sub == base_sub
+        assert exc_info.value.existing_agent_keys == ["a1"]
+        assert "a1" not in str(exc_info.value)
+
+        audit_rows = (
+            await session.execute(
+                select(AuditLog.action, AuditLog.detail).where(
+                    AuditLog.actor_sub == f"{base_sub}::a2",
+                    AuditLog.action == "denied.sibling_identity_exists",
+                )
+            )
+        ).all()
+        assert len(audit_rows) == 1
+        action, detail = audit_rows[0]
+        assert action == "denied.sibling_identity_exists"
+        assert detail["existing_agent_keys"] == ["a1"]
+
+        # confirm_new_identity=True still lets the caller through.
+        agent_a2 = await register_agent(
+            session,
+            sub=f"{base_sub}::a2",
+            base_sub=base_sub,
+            owner_sub=base_sub,
+            owner_email="multi-agent-fully-suspended@example.com",
+            display_name="Agent A2",
+            accepted_types=sorted(MESSAGE_TYPES),
+            confirm_new_identity=True,
+        )
+        assert agent_a2.sub == f"{base_sub}::a2"
+
+    async def test_deregistered_agent_cannot_be_conversation_target(
+        self, session: AsyncSession
+    ) -> None:
+        """Argus round-1 (TECH-5736): start_conversation's board-active
+        target check was previously "inert, future-proofing" (nothing ever
+        wrote status="suspended"); deregister_agent makes it live for the
+        first time."""
+        owner = await _register(session, "owner-suspended-target")
+        target = await _register(session, "target-to-suspend")
+        await deregister_agent(
+            session, actor_sub="admin-operator", agent_id=target.id, deregister_authorized=True
+        )
+
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await start_conversation(
+                session,
+                actor_sub=owner.sub,
+                initiator_agent_id=owner.id,
+                conversation_type="open",
+                target_agent_ids=[target.id],
+                initial_message=_request_payload(),
+            )
+        assert exc_info.value.reason == "denied.unknown_agent"
