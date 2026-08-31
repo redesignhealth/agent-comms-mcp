@@ -7064,18 +7064,17 @@ class TestDeregisterAgent:
         assert "a1" not in str(exc_info.value)
 
         audit_rows = (
-            (
-                await session.execute(
-                    select(AuditLog.action).where(
-                        AuditLog.actor_sub == f"{base_sub}::a2",
-                        AuditLog.action == "denied.sibling_identity_exists",
-                    )
+            await session.execute(
+                select(AuditLog.action, AuditLog.detail).where(
+                    AuditLog.actor_sub == f"{base_sub}::a2",
+                    AuditLog.action == "denied.sibling_identity_exists",
                 )
             )
-            .scalars()
-            .all()
-        )
-        assert audit_rows == ["denied.sibling_identity_exists"]
+        ).all()
+        assert len(audit_rows) == 1
+        action, detail = audit_rows[0]
+        assert action == "denied.sibling_identity_exists"
+        assert detail["existing_agent_keys"] == ["a1"]
 
         # confirm_new_identity=True still lets the caller through.
         agent_a2 = await register_agent(

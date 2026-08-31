@@ -1168,7 +1168,7 @@ class TestDeregisterAgent:
             {"agent_id": registered["agent_id"]},
         )
 
-        with pytest.raises(ToolError, match="identity_fork_detected"):
+        with pytest.raises(ToolError, match="identity_fork_detected") as exc_info:
             await _call(
                 main,
                 test_session_factory,
@@ -1180,6 +1180,21 @@ class TestDeregisterAgent:
                     "agent_key": "a2",
                 },
             )
+        assert "a1" not in str(exc_info.value)
+
+        confirmed = await _call(
+            main,
+            test_session_factory,
+            _token(base_sub, owner_sub=base_sub),
+            "comms_register",
+            {
+                "display_name": "Agent A2",
+                "accepted_types": ["availability_request"],
+                "agent_key": "a2",
+                "confirm_new_identity": True,
+            },
+        )
+        assert confirmed["agent_id"]
 
     async def test_admin_can_still_deregister_target_while_admins_own_agent_suspended(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
