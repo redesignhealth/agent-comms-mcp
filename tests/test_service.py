@@ -4666,6 +4666,144 @@ class TestPostMessageBoundaryCrossing:
         assert "approval.hold" not in actions
 
 
+class TestPostMessageAgentRequestedReview:
+    """TECH-5786: ``review_reason`` lets the sender force a hold regardless
+    of the injected RiskScorer's own verdict -- including inside an
+    ``internal`` conversation, which structurally never produces a non-None
+    ``risk_reason`` from ``_check_boundary_crossing`` on its own."""
+
+    async def test_review_reason_forces_hold_in_internal_conversation(
+        self, session: AsyncSession
+    ) -> None:
+        owner_sub = "review-reason-shared-owner"
+        initiator = await _register(session, "review-reason-initiator", owner_sub=owner_sub)
+        other = await _register(session, "review-reason-other", owner_sub=owner_sub)
+        client = _FakeOwnershipClient(
+            {
+                initiator.id: {"is_shared": False, "owners": [owner_sub]},
+                other.id: {"is_shared": False, "owners": [owner_sub]},
+            }
+        )
+        conversation = await start_conversation(
+            session,
+            actor_sub=initiator.sub,
+            initiator_agent_id=initiator.id,
+            conversation_type="internal",
+            target_agent_ids=[other.id],
+            initial_message=_request_payload(),
+            ownership_client=client,
+        )
+        await accept_invite(
+            session, actor_sub=other.sub, agent_id=other.id, conversation_id=conversation.id
+        )
+        result = await post_message(
+            session,
+            actor_sub=initiator.sub,
+            sender_agent_id=initiator.id,
+            conversation_id=conversation.id,
+            message_type="note",
+            payload={"text": "please double check this"},
+            ownership_client=client,
+            review_reason="unsure this is safe to send",
+        )
+        assert isinstance(result, ApprovalHold)
+        assert result.status == "pending_human"
+        assert result.risk_reason == "agent_requested"
+        actions = await _audit_actions(session, conversation.id)
+        assert "approval.hold" in actions
+        assert "approval.escalate" in actions
+
+    async def test_review_reason_omitted_leaves_internal_conversation_unaffected(
+        self, session: AsyncSession
+    ) -> None:
+        owner_sub = "review-reason-omitted-shared-owner"
+        initiator = await _register(session, "review-reason-omitted-initiator", owner_sub=owner_sub)
+        other = await _register(session, "review-reason-omitted-other", owner_sub=owner_sub)
+        client = _FakeOwnershipClient(
+            {
+                initiator.id: {"is_shared": False, "owners": [owner_sub]},
+                other.id: {"is_shared": False, "owners": [owner_sub]},
+            }
+        )
+        conversation = await start_conversation(
+            session,
+            actor_sub=initiator.sub,
+            initiator_agent_id=initiator.id,
+            conversation_type="internal",
+            target_agent_ids=[other.id],
+            initial_message=_request_payload(),
+            ownership_client=client,
+        )
+        await accept_invite(
+            session, actor_sub=other.sub, agent_id=other.id, conversation_id=conversation.id
+        )
+        result = await post_message(
+            session,
+            actor_sub=initiator.sub,
+            sender_agent_id=initiator.id,
+            conversation_id=conversation.id,
+            message_type="note",
+            payload={"text": "hello"},
+            ownership_client=client,
+        )
+        assert isinstance(result, Message)
+        actions = await _audit_actions(session, conversation.id)
+        assert "approval.hold" not in actions
+
+    async def test_review_reason_audit_detail_captures_reason_and_scorer_verdict(
+        self, session: AsyncSession
+    ) -> None:
+        owner, _target, conversation, client = await self._boundary_pair(session)
+        result = await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="note",
+            payload={"text": "hello"},
+            ownership_client=client,
+            review_reason="want a second set of eyes",
+        )
+        assert isinstance(result, ApprovalHold)
+        assert result.risk_reason == "agent_requested"
+        rows = (
+            await session.execute(
+                select(AuditLog.detail).where(
+                    AuditLog.conversation_id == conversation.id,
+                    AuditLog.action == "approval.hold",
+                )
+            )
+        ).all()
+        assert len(rows) == 1
+        (detail,) = rows[0]
+        assert detail["risk_reason"] == "agent_requested"
+        assert detail["review_reason"] == "want a second set of eyes"
+        assert detail["scorer_risk_reason"] == "boundary_crossing"
+
+    async def _boundary_pair(self, session: AsyncSession) -> Any:
+        owner = await _register(session, "review-reason-boundary-owner")
+        target = await _register(session, "review-reason-boundary-target")
+        client = _FakeOwnershipClient(
+            {
+                owner.id: {"is_shared": False, "owners": ["dan"]},
+                target.id: {"is_shared": True, "owners": ["dan", "priya"]},
+            }
+        )
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="asymmetric",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            ownership_client=client,
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        return owner, target, conversation, client
+
+
 class TestMessageTypeAcceptedCapability:
     """accepted_types is a capability gate, not a trust boundary (DESIGN.md
     §9's Capability gate section): applies universally, including to

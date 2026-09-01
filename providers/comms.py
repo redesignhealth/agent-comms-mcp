@@ -936,10 +936,19 @@ async def post_message(
     payload: dict[str, Any],
     schema_version: Literal[1] = 1,
     agent_key: str | None = None,
+    review_reason: str | None = None,
 ) -> dict[str, Any]:
     """Post a typed, schema-validated message to an active conversation.
 
     Caller must be an ``active`` participant (uniform denial otherwise).
+
+    ``review_reason``: optional. When set, this message is held for human
+    review unconditionally -- including in an ``internal`` conversation,
+    which otherwise never reaches a hold. Use this when the message is
+    low-risk by the normal rules but you want a human to look at it anyway;
+    the reason string is stored on the hold for the reviewer to see. This
+    can never be auto-cleared by the configured AutoApprover -- an
+    agent-requested review always reaches a human.
 
     ``message_type`` and required ``payload`` fields:
 
@@ -1018,6 +1027,7 @@ async def post_message(
                 notifier=plugins.get_approval_notifier(),
                 schema_version=schema_version,
                 owner_sub_claim=owner_sub_claim,
+                review_reason=review_reason,
             )
 
     if isinstance(result, ApprovalHold):

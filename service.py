@@ -326,6 +326,16 @@ INVITE_HOLD_SCHEMA_VERSION = 1
 INVITE_HOLD_RISK_REASON = "note_history_requires_approval"
 INVITE_HOLD_RISK_SCORER_LABEL = "invite_note_history_v1"
 
+# TECH-5786: the risk_reason a sender's own explicit `review_reason` on
+# post_message forces onto the hold, overriding whatever the injected
+# RiskScorer verdict was (including None, e.g. in an `internal` conversation
+# where the scorer structurally never returns non-None). Distinct from every
+# scorer-produced value (e.g. "boundary_crossing") on purpose: an
+# AutoApprover that special-cases the scorer's own boundary-crossing reason
+# (as RHAutoApprover's chief-of-staff rule does) must not accidentally treat
+# an agent-requested review as that case and auto-clear it.
+AGENT_REQUESTED_RISK_REASON = "agent_requested"
+
 # The one message type the SERVICE itself synthesizes (the seq-1 marker for
 # a diverted conversation opener, schemas.ConversationOpenedV1) -- never
 # legal as a caller-supplied message_type (denied.system_message_type,
@@ -3559,6 +3569,7 @@ async def _divert_high_risk_message(
     auto_approver: AutoApprover,
     participants: list[ParticipantInfo],
     sender_sub: str,
+    extra_audit_detail: dict[str, Any] | None = None,
 ) -> Message | ApprovalHold:
     """Create the ``approval_holds`` row for a high-risk verdict, run the
     injected ``AutoApprover`` inline, and either post the message
@@ -3586,6 +3597,13 @@ async def _divert_high_risk_message(
     ``sender_sub`` (TECH-5755) is likewise passed straight through into
     ``HoldContext.sender_sub`` -- the caller's own already-loaded sender
     ``Agent`` row (``sender.sub``/``initiator.sub``), no extra query.
+
+    ``extra_audit_detail`` (TECH-5786) is merged into the ``approval.hold``
+    audit entry's ``detail`` dict, not stored anywhere else -- the reuse of
+    one action name across every ``risk_reason`` value (this ticket's
+    ``"agent_requested"`` included) is the existing, deliberate pattern per
+    DESIGN.md's audit contract, so this is additive detail on that same
+    entry, not a new action.
     """
     now = _now()
     scorer_name = _risk_scorer_name(risk_scorer)
@@ -3623,6 +3641,7 @@ async def _divert_high_risk_message(
             "risk_reason": risk_reason,
             "risk_scorer": scorer_name,
             "message_type": message_type,
+            **(extra_audit_detail or {}),
         },
     )
 
@@ -4452,8 +4471,19 @@ async def post_message(
     notifier: ApprovalNotifier,
     schema_version: int = 1,
     owner_sub_claim: str | None = None,
+    review_reason: str | None = None,
 ) -> Message | ApprovalHold:
     """Append a schema-validated message; apply state-machine side effects.
+
+    ``review_reason`` (TECH-5786): when the sender supplies a non-``None``
+    reason, the message is diverted to a hold unconditionally, overriding
+    whatever the injected ``risk_scorer`` verdict would otherwise be --
+    including in an ``internal`` conversation, where the scorer structurally
+    never returns non-``None`` on its own. The scorer still runs first (for
+    its other, unconditional side effect -- ``_enforce_message_type_accepted``
+    -- and so its own verdict can be recorded in the hold's audit detail for
+    context), but its ``risk_reason`` return value is discarded in favor of
+    ``AGENT_REQUESTED_RISK_REASON`` once a ``review_reason`` is present.
 
     Requires ``sender_agent_id`` to be a board-active agent (uniform denial
     otherwise) AND a currently-``active`` participant on ``conversation_id``
@@ -4571,6 +4601,17 @@ async def post_message(
         risk_scorer=risk_scorer,
     )
 
+    # TECH-5786: an explicit review_reason forces a hold regardless of the
+    # scorer's own verdict (captured above as `risk_reason`, which may be
+    # None -- e.g. always, structurally, in an `internal` conversation).
+    # Overriding after the call, not skipping the call, so
+    # _enforce_message_type_accepted (inside _check_boundary_crossing) still
+    # runs unconditionally, and the scorer's own verdict is still available
+    # to record in the hold's audit detail below.
+    scorer_risk_reason = risk_reason
+    if review_reason is not None:
+        risk_reason = AGENT_REQUESTED_RISK_REASON
+
     if risk_reason is not None:
         # Divert-not-deny (TECH-5389 PR2): a genuine high-risk verdict no
         # longer denies -- it is held for approval instead. The hold-
@@ -4595,6 +4636,11 @@ async def post_message(
             auto_approver=auto_approver,
             participants=boundary_participants,
             sender_sub=sender.sub,
+            extra_audit_detail=(
+                {"review_reason": review_reason, "scorer_risk_reason": scorer_risk_reason}
+                if review_reason is not None
+                else None
+            ),
         )
         await session.commit()
         if isinstance(result, ApprovalHold):

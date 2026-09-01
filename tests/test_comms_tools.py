@@ -3264,6 +3264,58 @@ class TestApprovalPipeline:
                 },
             )
 
+    async def test_review_reason_forces_hold_even_in_internal_conversation(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """TECH-5786: ``review_reason`` on ``comms_post_message`` reaches the
+        service layer and forces a hold inside an ``internal`` conversation --
+        the one conversation type that never reaches a hold on its own."""
+        owner_sub = "hold-e2e-review-reason-owner"
+        await _register(
+            main, test_session_factory, "hold-e2e-review-reason-initiator", owner_sub=owner_sub
+        )
+        target = await _register(
+            main, test_session_factory, "hold-e2e-review-reason-target", owner_sub=owner_sub
+        )
+        initiator_token = _token("hold-e2e-review-reason-initiator", owner_sub=owner_sub)
+        target_token = _token("hold-e2e-review-reason-target", owner_sub=owner_sub)
+
+        started = await _call(
+            main,
+            test_session_factory,
+            initiator_token,
+            "comms_start_conversation",
+            {
+                "conversation_type": "internal",
+                "target_agent_ids": [target["agent_id"]],
+                "initial_message": _availability_request(),
+                "message_type": "availability_request",
+            },
+        )
+        await _call(
+            main,
+            test_session_factory,
+            target_token,
+            "comms_accept",
+            {"conversation_id": started["conversation_id"]},
+        )
+
+        result = await _call(
+            main,
+            test_session_factory,
+            initiator_token,
+            "comms_post_message",
+            {
+                "conversation_id": started["conversation_id"],
+                "message_type": "note",
+                "payload": {"text": "please double check this"},
+                "review_reason": "unsure this is safe to send",
+            },
+        )
+        assert result["held_for_approval"] is True
+        assert result["status"] == "pending_human"
+        assert result["risk_reason"] == "agent_requested"
+
 
 class TestOwnershipWriteThrough:
     """TECH-5593 item 1, end-to-end through the real tool surface: a
