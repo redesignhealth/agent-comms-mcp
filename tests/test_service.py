@@ -2972,16 +2972,20 @@ class TestInviteOwnerFreeze:
         )
         assert participant.status == "invited"
 
-    async def test_asymmetric_invite_shared_target_admits_despite_disjoint_owners(
+    async def test_asymmetric_invite_shared_target_with_disjoint_owners_denied(
         self, session: AsyncSession
     ) -> None:
-        """Mirrors ``test_asymmetric_shared_target_admits_despite_disjoint_owners``
-        at invite time: an ``asymmetric`` invite target whose owner set is
-        disjoint from the frozen snapshot is still admitted (not
-        ``denied.owner_set_frozen``) when that target is itself
-        ``is_shared`` -- review happens downstream at message-send time via
-        the risk scorer's shared-recipient check, not by denying the
-        invite."""
+        """Deliberately does NOT mirror
+        ``test_asymmetric_shared_target_admits_despite_disjoint_owners`` at
+        invite time (Argus round 1, TECH-5786 PR follow-up): an
+        ``asymmetric`` invite target whose owner set is disjoint from the
+        frozen snapshot is still ``denied.owner_set_frozen``, even when
+        that target is ``is_shared``. Unlike the open-time bypass, an
+        invite grants the target full RETROACTIVE history read the instant
+        it's admitted, and the risk scorer's shared-recipient review only
+        covers messages sent AFTER admission -- so bypassing this check
+        would let a shared, disjoint-owner target read the conversation's
+        entire existing history with no hold and no audit event."""
         owner = await _register(session, "freeze-asym-shared-target-owner")
         target = await _register(session, "freeze-asym-shared-target-target")
         client = _FakeOwnershipClient(
@@ -3005,15 +3009,16 @@ class TestInviteOwnerFreeze:
             "owners": ["priya"],
         }
 
-        participant = await invite(
-            session,
-            actor_sub=owner.sub,
-            inviter_agent_id=owner.id,
-            conversation_id=conversation.id,
-            target_agent_id=disjoint_shared_agent.id,
-            ownership_client=client,
-        )
-        assert participant.status == "invited"
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await invite(
+                session,
+                actor_sub=owner.sub,
+                inviter_agent_id=owner.id,
+                conversation_id=conversation.id,
+                target_agent_id=disjoint_shared_agent.id,
+                ownership_client=client,
+            )
+        assert exc_info.value.reason == "denied.owner_set_frozen"
 
     async def test_internal_invite_of_shared_target_denied(self, session: AsyncSession) -> None:
         """TECH-5735: the `is_shared` exclusion applies at invite time too,
@@ -4549,15 +4554,41 @@ class TestPostMessageBoundaryCrossing:
         )
         assert message.type == "note"
 
-    async def test_boundary_safe_message_never_checked_against_ownership(
+    async def test_boundary_safe_message_skips_sender_side_crossing_check(
         self, session: AsyncSession
     ) -> None:
-        # dan/{dan,priya} intersect (so admission succeeds) but a note
-        # from dan would cross (priya is outside dan's set) -- proving
-        # boundary_safe=True (counter_proposal) skips the crossing check
-        # entirely rather than happening to pass it.
-        owner, _target, conversation, _client = await self._asymmetric_pair(
-            session, ["dan"], ["dan", "priya"]
+        """A ``boundary_safe`` type (``counter_proposal``) skips the
+        SENDER-side owner-set superset comparison entirely: dan/{dan,priya}
+        intersect (so admission succeeds) but a `note` from dan would cross
+        (priya is outside dan's set), and this send still succeeds despite
+        that. NOT a totally-failing client (Argus round 1, TECH-5786 PR
+        follow-up): the shared-recipient check now runs for every message
+        type, so a non-sensitive send in `asymmetric` still resolves the
+        recipient's `is_shared` flag -- only the SENDER-side comparison
+        (and lookup) is skipped for a non-sensitive type. A non-shared,
+        non-empty-owner-set target (rather than `_asymmetric_pair`'s
+        ``len(owners) > 1`` shared heuristic) keeps this test isolated to
+        that skip, since a shared recipient would force review on its own,
+        for an unrelated reason."""
+        owner = await _register(session, "bc-safe-owner")
+        target = await _register(session, "bc-safe-target")
+        client = _FakeOwnershipClient(
+            {
+                owner.id: {"is_shared": False, "owners": ["dan"]},
+                target.id: {"is_shared": False, "owners": ["dan", "priya"]},
+            }
+        )
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="asymmetric",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            ownership_client=client,
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
         )
         message = await post_message(
             session,
@@ -4566,7 +4597,7 @@ class TestPostMessageBoundaryCrossing:
             conversation_id=conversation.id,
             message_type="counter_proposal",
             payload=_counter_proposal_payload(),
-            ownership_client=_FailingOwnershipClient(),
+            ownership_client=client,
         )
         assert message.type == "counter_proposal"
 
@@ -4711,9 +4742,32 @@ class TestPostMessageBoundaryCrossing:
         covered elsewhere): a raising ownership_client on an asymmetric
         conversation's non-boundary_safe message hard-denies with
         denied.risk_unscored (an unscorable message never diverts to a
-        hold -- only a GENUINE crossing verdict does)."""
-        owner, _target, conversation, _client = await self._asymmetric_pair(
-            session, ["dan"], ["dan", "priya"]
+        hold -- only a GENUINE crossing verdict does). Non-shared target
+        (unlike `_asymmetric_pair`'s `len(owners) > 1` shared heuristic),
+        since Argus round 1 (TECH-5786 PR follow-up): a shared target would
+        make `start_conversation`'s own initial (non-`note`) message force
+        a hold during setup, polluting this test's `"approval.hold" not in
+        actions` assertion with a hold unrelated to the failure this test
+        is actually checking."""
+        owner = await _register(session, "bc-lookup-fail-owner")
+        target = await _register(session, "bc-lookup-fail-target")
+        setup_client = _FakeOwnershipClient(
+            {
+                owner.id: {"is_shared": False, "owners": ["dan"]},
+                target.id: {"is_shared": False, "owners": ["dan", "priya"]},
+            }
+        )
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="asymmetric",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            ownership_client=setup_client,
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
         )
         with pytest.raises(AccessDeniedError) as exc_info:
             await post_message(
@@ -4986,12 +5040,21 @@ class TestPostMessageAgentRequestedReview:
         assert "scorer_risk_reason" not in detail
 
     async def _boundary_pair(self, session: AsyncSession) -> Any:
+        """Non-``is_shared`` target (Argus round 1, TECH-5786 PR follow-up):
+        an ``is_shared`` target now forces ``high_risk=True`` on EVERY
+        message type, including ``start_conversation``'s own non-``note``
+        initial message -- which would create a second, unwanted hold here
+        and break this class's "exactly one hold, from the explicit `note`
+        send" assumption. Owner sets still intersect-but-aren't-a-subset
+        (``{"dan"}`` / ``{"dan", "priya"}``) so the explicit `note` message
+        below still scores plain ``boundary_crossing``, unrelated to the
+        shared-recipient rule this class isn't testing."""
         owner = await _register(session, "review-reason-boundary-owner")
         target = await _register(session, "review-reason-boundary-target")
         client = _FakeOwnershipClient(
             {
                 owner.id: {"is_shared": False, "owners": ["dan"]},
-                target.id: {"is_shared": True, "owners": ["dan", "priya"]},
+                target.id: {"is_shared": False, "owners": ["dan", "priya"]},
             }
         )
         conversation = await start_conversation(

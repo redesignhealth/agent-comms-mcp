@@ -137,7 +137,12 @@ class BoundaryCrossingScorer:
     ``service._enforce_boundary_crossing`` (TECH-5389 PR1).
 
     - A message type not in ``BARRIER_SENSITIVE_TYPES`` is never high risk
-      and never triggers an ownership lookup.
+      on its own — but for ``asymmetric`` this is no longer checked first
+      (Argus round 1 fix, TECH-5786 PR follow-up): the shared-recipient
+      check below runs regardless of message type, since it must catch
+      every send to a shared recipient, not just sensitive-type ones. Only
+      ``internal``/``open`` skip the ownership lookup entirely for a
+      non-sensitive type.
     - An unrecognized ``conversation_type`` (e.g. a legacy pre-rename row)
       is checked FIRST, for every message type, and raises
       ``RiskScoringInfraError("unknown_conversation_type")`` — matching the
@@ -163,35 +168,43 @@ class BoundaryCrossingScorer:
       opened. Neither is checked here or anywhere else at send time — see
       ``docs/DESIGN.md`` §9's "Accepted residual gap (TECH-5735)" notes.
     - ``open``: high risk iff the message type is sensitive.
-    - ``asymmetric`` + sensitive type: an ownership lookup decides (sender's
-      owner set must be a superset of every other participant's), subject to
-      two ``is_shared`` special cases that are checked BEFORE that lookup's
-      result is consulted at all:
+    - ``asymmetric``: every message (ANY type, not just a sensitive one)
+      resolves every other participant's ownership info first, to run the
+      shared-recipient check below before any type-based short-circuit.
+      Two ``is_shared`` special cases are checked BEFORE the ordinary
+      owner-set comparison is consulted at all, and BEFORE the
+      ``BARRIER_SENSITIVE_TYPES`` filter for the shared-recipient case
+      specifically:
 
       - A shared RECIPIENT (any participant in ``other_agent_ids`` with
         ``is_shared=True``) always forces ``high_risk=True``
         (``reason="boundary_crossing"``, ``detail={"reason":
         "shared_recipient"}``) — symmetric to, but the opposite effect of,
-        the shared-sender bypass below. This is checked FIRST and wins even
-        when the sender is ALSO shared: sending TO a shared agent must
-        always get flagged for review (the whole point of the DESIGN.md §5
-        `is_shared` semantics — a shared agent spans ownership boundaries,
-        so traffic reaching it is exactly the boundary-crossing traffic this
-        scorer exists to catch), and a message must never be able to launder
-        its way past that by routing through a sender who also happens to be
-        shared. There is no such thing as a "shared-to-shared bypass" here.
-      - Only once no OTHER participant is shared does a shared SENDER
-        (``is_shared``) bypass the check (``detail={"bypass":
-        "shared_sender"}``) — `asymmetric`-only, since `internal` admission
-        never lets a shared initiator bypass its own pairwise check either.
+        the shared-sender bypass below. This is checked FIRST, for EVERY
+        message type, and wins even when the sender is ALSO shared: sending
+        TO a shared agent must always get flagged for review (the whole
+        point of the DESIGN.md §5 `is_shared` semantics — a shared agent
+        spans ownership boundaries, so traffic reaching it is exactly the
+        boundary-crossing traffic this scorer exists to catch), and a
+        message must never be able to launder its way past that by routing
+        through a sender who also happens to be shared, or by using a
+        non-sensitive message type. There is no such thing as a
+        "shared-to-shared bypass" here.
+      - Once no OTHER participant is shared, the ``BARRIER_SENSITIVE_TYPES``
+        filter applies as usual (non-sensitive → low risk, no further
+        lookup), and for a sensitive type a shared SENDER (``is_shared``)
+        bypasses the check (``detail={"bypass": "shared_sender"}``) —
+        `asymmetric`-only, since `internal` admission never lets a shared
+        initiator bypass its own pairwise check either.
 
       Because the shared-recipient check must inspect every other
-      participant's ``is_shared`` flag regardless of the sender's own status,
-      this scorer now always resolves every other participant's ownership
-      info in `asymmetric` + sensitive-type cases — the shared-sender bypass
-      no longer short-circuits before those lookups the way it used to (it
-      only skips resolving their OWNER SETS into the superset comparison,
-      once it's confirmed none of them are shared). A lookup failure, or an
+      participant's ``is_shared`` flag regardless of the sender's own status
+      OR the message type, this scorer now always resolves every other
+      participant's ownership info for every `asymmetric` message — not just
+      sensitive-type ones, and the shared-sender bypass no longer
+      short-circuits before those lookups the way it used to (it only skips
+      resolving their OWNER SETS into the superset comparison, once it's
+      confirmed none of them are shared). A lookup failure, or an
       empty owner set for the sender or any other non-shared participant,
       raises ``RiskScoringInfraError`` rather than resolving the crossing
       question at all — an ownership-service outage must fail closed, not be
@@ -202,22 +215,17 @@ class BoundaryCrossingScorer:
     async def score(self, ctx: MessageRiskContext) -> RiskVerdict:
         if ctx.conversation_type not in CONVERSATION_TYPES:
             raise RiskScoringInfraError("unknown_conversation_type")
-        if ctx.message_type not in BARRIER_SENSITIVE_TYPES:
-            return RiskVerdict(high_risk=False, reason=None, detail=None)
         if ctx.conversation_type == "internal":
             return RiskVerdict(high_risk=False, reason=None, detail=None)
         if ctx.conversation_type == "open":
+            if ctx.message_type not in BARRIER_SENSITIVE_TYPES:
+                return RiskVerdict(high_risk=False, reason=None, detail=None)
             return RiskVerdict(high_risk=True, reason="boundary_crossing", detail=None)
 
-        # asymmetric: sequential, not asyncio.gather -- the injected
-        # OwnershipClient shares this call's AsyncSession, which
+        # asymmetric from here on: sequential, not asyncio.gather -- the
+        # injected OwnershipClient shares this call's AsyncSession, which
         # SQLAlchemy's AsyncSession does not support across concurrent
         # coroutines (see service._owner_sets_for's own docstring).
-        try:
-            sender_info = await ctx.ownership_client.get_agent_owners(ctx.sender_agent_id)
-        except Exception as exc:
-            raise RiskScoringInfraError("ownership_unverified") from exc
-
         other_infos: list[dict[str, Any]] = []
         try:
             for agent_id in ctx.other_agent_ids:
@@ -225,16 +233,34 @@ class BoundaryCrossingScorer:
         except Exception as exc:
             raise RiskScoringInfraError("ownership_unverified") from exc
 
-        # Shared-RECIPIENT check takes priority over the shared-sender bypass
-        # below, and over the ordinary owner-set comparison -- see the class
-        # docstring. Deliberately does not touch `other_infos`' "owners"
-        # sets at all: a shared agent's set is a roster, not the point here.
+        # Shared-RECIPIENT check runs BEFORE the BARRIER_SENSITIVE_TYPES
+        # filter below and regardless of message type (Argus round 1 fix,
+        # TECH-5786 PR follow-up): the filter used to run first and return
+        # low-risk for any non-`note` type with no ownership lookup at all,
+        # so `availability_request`/`task_assign`/etc. crossed an ownership
+        # boundary to a shared recipient with ZERO review -- directly
+        # contradicting this PR's own stated intent ("shared-recipient
+        # traffic ALWAYS forces boundary-crossing review") and DESIGN.md
+        # §6's framing of exactly those types as where "judgment crosses
+        # the boundary." Takes priority over the shared-sender bypass
+        # below too, and over the ordinary owner-set comparison -- see the
+        # class docstring. Deliberately does not touch `other_infos`'
+        # "owners" sets at all: a shared agent's set is a roster, not the
+        # point here.
         if any(info.get("is_shared") for info in other_infos):
             return RiskVerdict(
                 high_risk=True,
                 reason="boundary_crossing",
                 detail={"reason": "shared_recipient"},
             )
+
+        if ctx.message_type not in BARRIER_SENSITIVE_TYPES:
+            return RiskVerdict(high_risk=False, reason=None, detail=None)
+
+        try:
+            sender_info = await ctx.ownership_client.get_agent_owners(ctx.sender_agent_id)
+        except Exception as exc:
+            raise RiskScoringInfraError("ownership_unverified") from exc
 
         if sender_info.get("is_shared"):
             return RiskVerdict(high_risk=False, reason=None, detail={"bypass": "shared_sender"})

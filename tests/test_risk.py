@@ -67,10 +67,15 @@ def _ctx(
 
 class TestNonSensitiveTypesNeverScored:
     """A message type outside ``BARRIER_SENSITIVE_TYPES`` is never high
-    risk and never touches the ownership client, for every recognized
-    conversation type."""
+    risk, and never touches the ownership client, for ``open``/``internal``
+    (neither has an ownership concept for a non-sensitive type). NOT true
+    for ``asymmetric`` since Argus round 1 (TECH-5786 PR follow-up): the
+    shared-recipient check must resolve every other participant's
+    ``is_shared`` flag regardless of message type, so ``asymmetric`` now
+    always touches the client — see ``TestAsymmetricConversationType``'s
+    own non-sensitive-type tests for that behavior instead."""
 
-    @pytest.mark.parametrize("conversation_type", ["open", "internal", "asymmetric"])
+    @pytest.mark.parametrize("conversation_type", ["open", "internal"])
     async def test_non_sensitive_type_is_low_risk_without_lookup(
         self, conversation_type: str
     ) -> None:
@@ -342,16 +347,63 @@ class TestAsymmetricConversationType:
         assert verdict.high_risk is True
         assert verdict.detail == {"reason": "shared_recipient"}
 
-    async def test_non_sensitive_type_skips_lookup_even_in_asymmetric(self) -> None:
+    async def test_non_sensitive_type_still_resolves_other_infos_but_is_low_risk(
+        self,
+    ) -> None:
+        """Deliberately does NOT use ``_FailingOwnershipClient`` (Argus
+        round 1, TECH-5786 PR follow-up): a non-sensitive type in
+        ``asymmetric`` no longer skips the ownership lookup entirely --
+        the shared-recipient check must run for every message type, so
+        this now touches the client to resolve the other participant's
+        ``is_shared`` flag, and only returns low risk once that flag comes
+        back ``False``."""
+        sender = uuid.uuid4()
+        other = uuid.uuid4()
+        client = _FakeOwnershipClient(
+            {
+                sender: {"is_shared": False, "owners": ["dan"]},
+                other: {"is_shared": False, "owners": ["priya"]},
+            }
+        )
         ctx = _ctx(
             conversation_type="asymmetric",
             message_type=_SAFE_TYPE,
-            sender_agent_id=uuid.uuid4(),
-            other_agent_ids=[uuid.uuid4()],
-            ownership_client=_FailingOwnershipClient(),
+            sender_agent_id=sender,
+            other_agent_ids=[other],
+            ownership_client=client,
         )
         verdict = await BoundaryCrossingScorer().score(ctx)
         assert verdict.high_risk is False
+        assert other in client.calls
+        assert sender not in client.calls
+
+    async def test_non_sensitive_type_still_forces_review_for_shared_recipient(
+        self,
+    ) -> None:
+        """The core Argus round 1 fix (TECH-5786 PR follow-up): previously,
+        a non-``note`` message type returned low risk before any lookup at
+        all, so `availability_request`/`task_assign`/etc. crossed the
+        boundary to a shared recipient with ZERO review. Must now force
+        ``high_risk=True`` exactly like a sensitive-type send would."""
+        sender = uuid.uuid4()
+        other = uuid.uuid4()
+        client = _FakeOwnershipClient(
+            {
+                sender: {"is_shared": False, "owners": ["dan"]},
+                other: {"is_shared": True, "owners": ["priya"]},
+            }
+        )
+        ctx = _ctx(
+            conversation_type="asymmetric",
+            message_type=_SAFE_TYPE,
+            sender_agent_id=sender,
+            other_agent_ids=[other],
+            ownership_client=client,
+        )
+        verdict = await BoundaryCrossingScorer().score(ctx)
+        assert verdict.high_risk is True
+        assert verdict.reason == "boundary_crossing"
+        assert verdict.detail == {"reason": "shared_recipient"}
 
     async def test_sender_lookup_failure_raises_ownership_unverified(self) -> None:
         ctx = _ctx(

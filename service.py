@@ -1093,10 +1093,22 @@ def _pairwise_admitted(
     conversation_type: str,
     participants: list[Agent],
     owner_sets: dict[uuid.UUID, frozenset[str]],
+    is_shared_by_id: dict[uuid.UUID, bool] | None = None,
 ) -> bool:
     """Pure pairwise decision given already-resolved owner sets — every pair
     must independently satisfy the type's predicate (no star-topology
     exception: A-B and B-C admitted doesn't imply A-C is).
+
+    For ``asymmetric``, a pair where EITHER side is ``is_shared`` is
+    admitted regardless of owner-set overlap (Argus round 1, TECH-5786 PR
+    follow-up): the bypass must apply PER PAIR, not to the whole
+    participant set via a single ``any(is_shared_by_id.values())`` check
+    at the call site -- a multi-target conversation with one shared target
+    and one unrelated non-shared target (fully disjoint owners) must still
+    deny that second pair, even though the first pair is legitimately
+    bypassed. ``is_shared_by_id`` is ignored for ``internal`` (already
+    hard-denied for any ``is_shared`` participant before this function is
+    ever called).
     """
     pairs = itertools.combinations(participants, 2)
     if conversation_type == "internal":
@@ -1104,8 +1116,15 @@ def _pairwise_admitted(
     # asymmetric: exactly may_assign's owner-set-intersection predicate,
     # applied pairwise (this is the reuse the ticket calls out — one
     # predicate, not two independently-drifting implementations of
-    # "do these owner sets intersect").
-    return all(may_assign(owner_sets[a.id], owner_sets[b.id]) for a, b in pairs)
+    # "do these owner sets intersect") — except a pair with a shared
+    # participant, which bypasses the predicate entirely for that pair.
+    is_shared_by_id = is_shared_by_id or {}
+    return all(
+        is_shared_by_id.get(a.id, False)
+        or is_shared_by_id.get(b.id, False)
+        or may_assign(owner_sets[a.id], owner_sets[b.id])
+        for a, b in pairs
+    )
 
 
 def may_invite(inviter_participant_status: str) -> bool:
@@ -2296,7 +2315,14 @@ async def _authorize_conversation_open(
                 "bypass": "shared_initiator" if shared_initiator else "shared_target",
             },
         )
-    if not shared_bypass and not _pairwise_admitted(conversation_type, participants, owner_sets):
+    # NOT gated on `shared_bypass` (Argus round 1, TECH-5786 PR follow-up):
+    # `shared_bypass` is a whole-conversation flag ("at least one
+    # participant is shared"), which would skip this check for every pair,
+    # including pairs between two NON-shared participants with disjoint
+    # owner sets. The per-pair shared exemption now lives inside
+    # `_pairwise_admitted` itself (via `is_shared_by_id`), so this always
+    # runs.
+    if not _pairwise_admitted(conversation_type, participants, owner_sets, is_shared_by_id):
         await _deny(
             session,
             actor_sub=actor_sub,
@@ -2884,23 +2910,24 @@ async def _authorize_invite_owner_freeze(
     # have opened an `internal` conversation for this check to now
     # retroactively conflict with.
     #
-    # Mirrors `_authorize_conversation_open`'s shared-target admission
-    # bypass: an `asymmetric` target whose roster doesn't (yet) intersect
-    # the frozen snapshot must still be ADMITTED, not denied outright with
-    # `denied.owner_set_frozen`, when that target is itself `is_shared` --
-    # the whole reason to invite a shared bridging agent into an
-    # `asymmetric` conversation is to reach across owner sets that don't
-    # overlap. Review for that traffic happens downstream, at message-send
-    # time, via `plugins.BoundaryCrossingScorer`'s shared-recipient check
-    # (which always forces `high_risk=True` for a send to a shared
-    # participant) -- this function only decides invite ADMISSION.
-    # `internal`'s exclusion above already forbids an `is_shared` target
-    # from ever reaching this branch for that type, so no analogous bypass
-    # is needed there.
+    # Deliberately NOT mirroring `_authorize_conversation_open`'s
+    # shared-target admission bypass here (Argus round 1, TECH-5786 PR
+    # follow-up): `comms_accept` grants the invitee full RETROACTIVE
+    # history read the instant it's admitted (see `_conversation_has_note_history`'s
+    # docstring), and `plugins.BoundaryCrossingScorer`'s shared-recipient
+    # check only reviews messages sent AFTER admission -- it does nothing
+    # about history that already exists. A bypass here would let an
+    # `is_shared` target with a disjoint owner set read an entire existing
+    # `asymmetric` conversation with no hold and no audit event, reopening
+    # the exact per-invite exposure `internal`'s exclusion above (and this
+    # function's own docstring) was written to close. If a shared-target
+    # invite bypass is wanted later, it needs its own dedicated gate (e.g.
+    # requiring an explicit hold, or checking the conversation's message
+    # history), not a copy of the open-time bypass.
     admitted = (
         target_owners == snapshot_owners
         if conversation.type == "internal"
-        else (target_owners <= snapshot_owners or bool(target_info.get("is_shared")))
+        else target_owners <= snapshot_owners
     )
     if not admitted:
         await _deny(

@@ -530,16 +530,18 @@ not use it). Subsequent invites are checked against this snapshot, with the
 predicate matched to the type's own admission rule (TECH-5735): `internal`
 requires the target's owner set to EQUAL the snapshot (the snapshot is a union
 of already-equal sets, so equality to it is equality to every existing
-participant); `asymmetric` requires only a subset, **except**: an `is_shared`
-target is admitted even when its owner set isn't a subset of the snapshot —
-mirroring Axis 1's shared-target admission bypass above, for the identical
-reason (denying the invite outright would silently drop traffic that should
-instead always be reviewed at message-send time via the risk scorer's
-shared-recipient rule, §9 Axis 2). `internal`'s exclusion of any `is_shared`
-target (immediately below) means this exception never reaches the equality
-branch. An invite that fails its predicate is denied, preventing unilateral
-de-isolation of an `internal` conversation or a boundary-violating expansion
-of an `asymmetric` one.
+participant); `asymmetric` requires only a subset. Unlike Axis 1's open-time
+shared-target admission bypass, an `is_shared` target gets **no** exception
+here (Argus round 1, TECH-5786 PR follow-up): `comms_accept` grants a new
+participant full RETROACTIVE read of the conversation's entire existing
+history the moment it's admitted, and the risk scorer's shared-recipient rule
+only reviews messages sent AFTER admission — it does nothing to gate that
+one-time history read. Bypassing this check for a shared, disjoint-owner
+target would let it read an `asymmetric` conversation's full history with no
+hold and no audit event, reopening the exact per-invite exposure the
+free-text rule immediately below exists to close. An invite that fails its
+predicate is denied, preventing unilateral de-isolation of an `internal`
+conversation or a boundary-violating expansion of an `asymmetric` one.
 
 **Any invite into a conversation with existing free-text (`note`) history
 requires human approval (TECH-5735), regardless of conversation type.**
