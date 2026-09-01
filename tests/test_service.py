@@ -8329,3 +8329,254 @@ class TestAdminRegisterAgent:
             accepted_types=sorted(MESSAGE_TYPES),
         )
         assert self_registered.owner_email == "drifted-owner-email@example.com"
+
+    async def test_min_schema_version_over_max_rejected(self, session: AsyncSession) -> None:
+        """Argus round 1 suggestion (TECH-5786 PR follow-up): mirrors
+        register_agent's own coverage of this same validator -- was
+        entirely untested for admin_register_agent."""
+        with pytest.raises(ValueError, match="min_schema_version"):
+            await admin_register_agent(
+                session,
+                actor_sub="admin-operator",
+                admin_authorized=True,
+                sub="arc-bot-bad-schema-range",
+                owner_sub="owner-arc-bot-bad-schema-range",
+                owner_email="arc-bot-bad-schema-range@example.com",
+                display_name="Arc Bot Bad Schema Range",
+                accepted_types=sorted(MESSAGE_TYPES),
+                min_schema_version=2,
+                max_schema_version=1,
+            )
+        row = (
+            await session.execute(select(Agent).where(Agent.sub == "arc-bot-bad-schema-range"))
+        ).scalar_one_or_none()
+        assert row is None
+
+    async def test_sub_must_not_be_email_shaped(self, session: AsyncSession) -> None:
+        """Argus round 1 BLOCKING finding (TECH-5786 PR follow-up):
+        register_agent's token-derived `sub` is rejected if email-shaped
+        (identity.validate_sub_shape) to prevent impersonation of a future
+        Okta-derived identity. admin_register_agent accepts `sub` as a
+        plain caller-supplied parameter, so it needs the equivalent check
+        applied explicitly -- without it, a comms:admin holder could
+        pre-register `sub="victim@company.com"` with an attacker-controlled
+        owner_sub/is_shared that would survive the victim's later
+        re-registration freeze."""
+        with pytest.raises(ValueError, match="email-shaped"):
+            await admin_register_agent(
+                session,
+                actor_sub="admin-operator",
+                admin_authorized=True,
+                sub="victim@company.com",
+                owner_sub="owner-victim",
+                owner_email="victim-owner@example.com",
+                display_name="Victim Impersonation Attempt",
+                accepted_types=sorted(MESSAGE_TYPES),
+            )
+        row = (
+            await session.execute(select(Agent).where(Agent.sub == "victim@company.com"))
+        ).scalar_one_or_none()
+        assert row is None
+
+    async def test_owner_sub_must_not_be_email_shaped(self, session: AsyncSession) -> None:
+        with pytest.raises(ValueError, match="email-shaped"):
+            await admin_register_agent(
+                session,
+                actor_sub="admin-operator",
+                admin_authorized=True,
+                sub="arc-bot-forged-owner-sub",
+                owner_sub="victim@company.com",
+                owner_email="arc-bot-forged-owner-sub@example.com",
+                display_name="Arc Bot Forged Owner Sub",
+                accepted_types=sorted(MESSAGE_TYPES),
+            )
+
+    async def test_sub_length_capped(self, session: AsyncSession) -> None:
+        """Argus round 1 suggestion (TECH-5786 PR follow-up): sub/owner_sub/
+        owner_email are caller-supplied here (unlike register_agent's
+        IdP-length-constrained equivalents), so nothing bounded them before
+        being written into audit_log.detail (JSONB)."""
+        with pytest.raises(ValueError, match="exceeds"):
+            await admin_register_agent(
+                session,
+                actor_sub="admin-operator",
+                admin_authorized=True,
+                sub="x" * 257,
+                owner_sub="owner-oversized-sub",
+                owner_email="oversized-sub@example.com",
+                display_name="Oversized Sub",
+                accepted_types=sorted(MESSAGE_TYPES),
+            )
+
+    async def test_owner_email_length_capped(self, session: AsyncSession) -> None:
+        with pytest.raises(ValueError, match="exceeds"):
+            await admin_register_agent(
+                session,
+                actor_sub="admin-operator",
+                admin_authorized=True,
+                sub="arc-bot-oversized-owner-email",
+                owner_sub="owner-oversized-owner-email",
+                owner_email="a" * 255 + "@example.com",
+                display_name="Oversized Owner Email",
+                accepted_types=sorted(MESSAGE_TYPES),
+            )
+
+    async def test_denied_sibling_identity_exists(self, session: AsyncSession) -> None:
+        """Argus round 1 BLOCKING finding (TECH-5786 PR follow-up):
+        admin_register_agent must not silently omit register_agent's
+        sibling-identity-fork guard (TECH-5736) -- omitting it would
+        reopen the exact kill-switch bypass that guard exists to close
+        (suspend every identity under a base_sub via
+        comms_deregister_agent, then admin-register a brand-new sub under
+        that same base_sub to route around the suspension)."""
+        existing = await _register(session, "fork-base-sub")
+
+        with pytest.raises(SiblingIdentityExistsError) as exc_info:
+            await admin_register_agent(
+                session,
+                actor_sub="admin-operator",
+                admin_authorized=True,
+                sub="fork-base-sub::second-key",
+                owner_sub="owner-fork-base-sub-second-key",
+                owner_email="fork-base-sub-second-key@example.com",
+                display_name="Fork Base Sub Second Key",
+                accepted_types=sorted(MESSAGE_TYPES),
+            )
+        assert exc_info.value.base_sub == "fork-base-sub"
+
+        row = (
+            await session.execute(select(Agent).where(Agent.sub == "fork-base-sub::second-key"))
+        ).scalar_one_or_none()
+        assert row is None
+
+        rows = (
+            await session.execute(
+                select(AuditLog.actor_sub, AuditLog.detail).where(
+                    AuditLog.action == "denied.sibling_identity_exists",
+                    AuditLog.actor_sub == "admin-operator",
+                )
+            )
+        ).all()
+        assert len(rows) == 1
+        actor_sub, detail = rows[0]
+        # actor_sub is the PRIVILEGED CALLER, not the target sub -- unlike
+        # register_agent's own call site for this same denial helper.
+        assert actor_sub == "admin-operator"
+        assert detail["base_sub"] == "fork-base-sub"
+        assert detail["sub"] == "fork-base-sub::second-key"
+
+        # existing.id untouched
+        existing_row = (
+            await session.execute(select(Agent).where(Agent.id == existing.id))
+        ).scalar_one()
+        assert existing_row.status == "active"
+
+    async def test_sibling_identity_fork_confirmed_proceeds(self, session: AsyncSession) -> None:
+        await _register(session, "fork-confirmed-base-sub")
+
+        agent = await admin_register_agent(
+            session,
+            actor_sub="admin-operator",
+            admin_authorized=True,
+            sub="fork-confirmed-base-sub::second-key",
+            owner_sub="owner-fork-confirmed-base-sub-second-key",
+            owner_email="fork-confirmed-base-sub-second-key@example.com",
+            display_name="Fork Confirmed Base Sub Second Key",
+            accepted_types=sorted(MESSAGE_TYPES),
+            confirm_new_identity=True,
+        )
+        assert agent.sub == "fork-confirmed-base-sub::second-key"
+
+    async def test_sibling_identity_fork_counts_suspended_siblings(
+        self, session: AsyncSession
+    ) -> None:
+        """A SUSPENDED sibling still counts -- otherwise
+        comms_deregister_agent followed by this tool would silently
+        bypass the kill-switch, exactly as register_agent's own comment
+        documents for its identical check."""
+        existing = await _register(session, "fork-suspended-base-sub")
+        existing.status = "suspended"
+        await session.commit()
+
+        with pytest.raises(SiblingIdentityExistsError):
+            await admin_register_agent(
+                session,
+                actor_sub="admin-operator",
+                admin_authorized=True,
+                sub="fork-suspended-base-sub::second-key",
+                owner_sub="owner-fork-suspended-base-sub-second-key",
+                owner_email="fork-suspended-base-sub-second-key@example.com",
+                display_name="Fork Suspended Base Sub Second Key",
+                accepted_types=sorted(MESSAGE_TYPES),
+            )
+
+    async def test_display_name_db_level_collision(self, session: AsyncSession) -> None:
+        """Argus round 1 suggestion (TECH-5786 PR follow-up): mirrors
+        register_agent's own db-level display-name race backstop test --
+        was entirely untested for admin_register_agent's own IntegrityError
+        handler."""
+        await _register(session, "admin-db-collision-a", display_name="Taken Name")
+
+        with pytest.raises(DisplayNameCollisionError):
+            await admin_register_agent(
+                session,
+                actor_sub="admin-operator",
+                admin_authorized=True,
+                sub="admin-db-collision-b",
+                owner_sub="owner-admin-db-collision-b",
+                owner_email="admin-db-collision-b@example.com",
+                display_name="Taken Name",
+                accepted_types=sorted(MESSAGE_TYPES),
+            )
+
+        row = (
+            await session.execute(select(Agent).where(Agent.sub == "admin-db-collision-b"))
+        ).scalar_one_or_none()
+        assert row is None
+
+    async def test_concurrent_admin_registration_same_sub_one_wins_one_already_registered(
+        self, session: AsyncSession, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Argus round 1 BLOCKING finding (TECH-5786 PR follow-up): unlike
+        register_agent (idempotent -- a concurrent duplicate call is
+        benign), admin_register_agent is first-registration-only, so two
+        concurrent admin calls for the same sub that both pass the
+        pre-flush existence check race for the agents_sub_key unique
+        constraint at flush time. The loser must get
+        AgentAlreadyRegisteredError, not a bare unmapped IntegrityError
+        (500 with raw DB constraint text) -- this function's own docstring
+        promises AgentAlreadyRegisteredError for any duplicate-sub case,
+        concurrent or not."""
+
+        async def _admin_register(display_name: str) -> Agent:
+            async with session_factory() as sess:
+                return await admin_register_agent(
+                    sess,
+                    actor_sub="admin-operator",
+                    admin_authorized=True,
+                    sub="race-admin-register-target",
+                    owner_sub="owner-race-admin-register-target",
+                    owner_email="race-admin-register-target@example.com",
+                    display_name=display_name,
+                    accepted_types=sorted(MESSAGE_TYPES),
+                )
+
+        results = await asyncio.gather(
+            _admin_register("Race Winner"),
+            _admin_register("Race Loser"),
+            return_exceptions=True,
+        )
+
+        successes = [r for r in results if isinstance(r, Agent)]
+        errors = [r for r in results if isinstance(r, BaseException)]
+        assert len(successes) == 1
+        assert len(errors) == 1
+        assert isinstance(errors[0], AgentAlreadyRegisteredError)
+        assert errors[0].sub == "race-admin-register-target"
+
+        rows = (
+            (await session.execute(select(Agent).where(Agent.sub == "race-admin-register-target")))
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1

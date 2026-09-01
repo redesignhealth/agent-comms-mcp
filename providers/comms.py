@@ -747,6 +747,7 @@ async def admin_register(
     is_shared: bool = False,
     min_schema_version: int = 1,
     max_schema_version: int = 1,
+    confirm_new_identity: bool = False,
 ) -> dict[str, Any]:
     """Admin-gated, on-behalf-of FIRST registration for a ``sub`` that has
     never registered itself.
@@ -759,9 +760,11 @@ async def admin_register(
     Arc bot's board credential) needs to set that bot's ``is_shared``
     before the bot has ever spoken for itself on this board. The only
     workarounds without this tool are both bad — granting the bot's own
-    permanent credential ``comms:admin`` (this board's own
-    ``docs/BOT-AGENT-SETUP-CHECKLIST.md`` says an ordinary bot must never
-    hold that), or minting a throwaway token impersonating the target
+    permanent credential ``comms:admin`` (an ordinary bot has no
+    legitimate reason to hold a scope that lets it register/re-authorize
+    OTHER agents on this board — doing so turns every such bot's
+    credential into a full admin-capability leak risk), or minting a
+    throwaway token impersonating the target
     ``sub`` just to make one call. This tool is the real fix: an explicit,
     audited, on-behalf-of registration capability.
 
@@ -800,6 +803,21 @@ async def admin_register(
       ``comms_admin_register`` call already requires the same elevated
       authorization, so there is no less-privileged path through this tool
       for ``is_shared`` to escalate past.
+    - ``confirm_new_identity``: same acknowledgement semantics as
+      ``comms_register``'s parameter of the same name (TECH-5736) — this
+      tool deliberately does NOT skip that guard just because it's an
+      on-behalf-of registration. ``base_sub`` here is derived from the
+      TARGET ``sub`` itself (everything before its first ``::``, if any),
+      since there's no calling-token agent_key composition to read it
+      from the way ``comms_register`` does. Omitting this guard would
+      reopen the exact kill-switch bypass it exists to close: suspend
+      every existing identity under a ``base_sub`` via
+      ``comms_deregister_agent``, then admin-register a brand-new ``sub``
+      under that same ``base_sub`` to route around the suspension. The
+      default (``False``) rejects that with ``identity_fork_detected``
+      instead of silently creating it; pass ``True`` only when you
+      genuinely intend to register another identity alongside an existing
+      one under the same ``base_sub``.
 
     Once created, the resulting row is ordinary: if the target later calls
     ``comms_register`` itself with the same ``sub``, that hits
@@ -831,6 +849,7 @@ async def admin_register(
             is_shared=is_shared,
             min_schema_version=min_schema_version,
             max_schema_version=max_schema_version,
+            confirm_new_identity=confirm_new_identity,
         )
 
     return {

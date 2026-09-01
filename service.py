@@ -488,9 +488,33 @@ def _is_display_name_index_violation(exc: IntegrityError) -> bool:
     return name == "idx_agents_lower_display_name_active"
 
 
+def _is_sub_unique_violation(exc: IntegrityError) -> bool:
+    """Narrow check that ``exc`` is specifically a violation of
+    ``agents_sub_key`` (the ``Agent.sub`` ``unique=True`` column's
+    auto-generated constraint name), not merely "some IntegrityError" --
+    same extraction logic and rationale as
+    ``_is_display_name_index_violation``, just a different constraint name.
+    Added for ``admin_register_agent`` (Argus round 1, TECH-5786 PR
+    follow-up): unlike ``register_agent`` (idempotent -- a concurrent
+    duplicate call just re-resolves the same row), ``admin_register_agent``
+    is first-registration-only, so two concurrent calls for the same `sub`
+    that both pass the pre-flush `scalar_one_or_none` check race for this
+    constraint at flush time. Without narrowing to this specific
+    constraint, the loser's `IntegrityError` would re-raise as a bare,
+    unmapped 500 with raw DB constraint text, instead of the
+    ``AgentAlreadyRegisteredError`` this function's docstring promises for
+    any duplicate-``sub`` case."""
+    cause = getattr(exc.orig, "__cause__", None)
+    name = getattr(cause, "constraint_name", None)
+    if name is None:
+        name = getattr(exc.orig, "constraint_name", None)
+    return name == "agents_sub_key"
+
+
 async def _deny_sibling_identity_exists(
     session: AsyncSession,
     *,
+    actor_sub: str,
     base_sub: str,
     sub: str,
     existing_agent_keys: list[str | None],
@@ -501,12 +525,16 @@ async def _deny_sibling_identity_exists(
     other active identity. DESIGN.md §8 invariant 5 requires every denial to
     be audited, the same as every other fail-closed branch in
     ``register_agent`` -- this one was missed when the check itself was
-    added. ``actor_sub`` is ``sub`` itself, matching every other denial
-    inside ``register_agent`` (no authenticated identity distinct from the
-    registering caller is available at this point)."""
+    added. ``actor_sub`` is an explicit parameter, NOT always ``sub`` itself
+    (Argus round 1, TECH-5786 PR follow-up): ``register_agent``'s own call
+    site passes ``actor_sub=sub`` (no authenticated identity distinct from
+    the registering caller exists at that point), but
+    ``admin_register_agent`` reuses this same denial for a PRIVILEGED CALLER
+    registering a target ``sub`` on its behalf -- same distinction
+    ``_deny_agent_already_registered`` already draws for that function."""
     _audit(
         session,
-        actor_sub=sub,
+        actor_sub=actor_sub,
         action="denied.sibling_identity_exists",
         detail={"base_sub": base_sub, "sub": sub, "existing_agent_keys": existing_agent_keys},
     )
@@ -1287,6 +1315,18 @@ async def _deny_agent_already_registered(
     raise AgentAlreadyRegisteredError(sub=sub)
 
 
+# Argus round 1, TECH-5786 PR follow-up: `admin_register_agent`'s
+# `sub`/`owner_sub`/`owner_email` are explicit caller-supplied parameters
+# (unlike `register_agent`'s token-derived, IdP-length-constrained
+# equivalents), so nothing bounds them before they're written into
+# `audit_log.detail` (JSONB) -- a legitimately-credentialed admin could
+# otherwise write an arbitrarily large string into the audit log.
+MAX_SUB_LENGTH = 256  # generous bound for a board `sub`/`owner_sub` identifier
+MAX_OWNER_EMAIL_LENGTH = 254  # RFC 5321 4.5.3.1.3 total-address cap, same bound
+# as MAX_LOOKUP_EMAIL_LENGTH below -- duplicated rather than forward-referenced,
+# since that constant isn't defined until later in this module.
+
+
 async def admin_register_agent(
     session: AsyncSession,
     *,
@@ -1300,6 +1340,7 @@ async def admin_register_agent(
     is_shared: bool = False,
     min_schema_version: int = 1,
     max_schema_version: int = 1,
+    confirm_new_identity: bool = False,
 ) -> Agent:
     """Register a NEW agent identity on behalf of an explicit target
     ``sub``, for a privileged (``comms:admin``-scoped or interactive)
@@ -1315,9 +1356,11 @@ async def admin_register_agent(
     (e.g. redesign-ai minting an Arc bot's board credential) needs to set
     ``is_shared=True`` on that bot's row before the bot has ever spoken for
     itself -- and the only workarounds available without this tool are both
-    bad: (a) grant the bot's own permanent credential ``comms:admin`` (this
-    board's own ``docs/BOT-AGENT-SETUP-CHECKLIST.md`` says an ordinary bot
-    must never hold that), or (b) mint a throwaway token impersonating the
+    bad: (a) grant the bot's own permanent credential ``comms:admin`` --
+    an ordinary bot has no legitimate reason to hold a scope that lets it
+    register/re-authorize OTHER agents on this board, and doing so would
+    make every such bot's credential a full admin-capability leak risk --
+    or (b) mint a throwaway token impersonating the
     target ``sub`` just to make one self-registration call. This function is
     the real, first-class fix: an explicit, audited, on-behalf-of
     registration capability, distinct from both ``register_agent`` (self-
@@ -1368,6 +1411,26 @@ async def admin_register_agent(
     supported way to change an existing agent's ``owner_sub``/
     ``owner_email``/``display_name`` through this admin surface.
 
+    **Sibling-identity-fork guard applies here too (Argus round 1,
+    TECH-5786 PR follow-up)**: mirrors ``register_agent``'s
+    ``SiblingIdentityExistsError`` check (TECH-5736) rather than silently
+    omitting it. Without this, a ``comms:admin`` caller could reopen the
+    exact kill-switch bypass that check exists to close: suspend every
+    existing identity under a ``base_sub`` (via ``deregister_agent``), then
+    admin-register a brand-new ``sub`` under that same ``base_sub`` to
+    route around the suspension. ``base_sub`` here is derived from the
+    TARGET ``sub`` itself (``sub.split("::", 1)[0]``), not from the
+    caller's own identity the way ``register_agent`` receives it -- this
+    function has no notion of "the caller's own agent_key composition"
+    since the caller and the target are different identities by design.
+    ``confirm_new_identity=True`` acknowledges the fork and proceeds
+    anyway, same semantics as ``register_agent``'s own parameter; the
+    resulting audit action (on denial) is still
+    ``denied.sibling_identity_exists``, but attributed to the PRIVILEGED
+    CALLER's ``actor_sub``, not the target ``sub`` -- see
+    ``_deny_sibling_identity_exists``'s own docstring for why that split
+    matters here specifically.
+
     **Interaction with later self-registration**: a row this function
     creates is, once created, ordinary -- indistinguishable from one
     ``register_agent`` created directly. If the target later calls
@@ -1407,12 +1470,33 @@ async def admin_register_agent(
     sub = sub.strip()
     if not sub:
         raise ValueError("sub must be non-empty")
+    # Argus round 1, TECH-5786 PR follow-up: mirrors `identity.validate_sub_shape`'s
+    # "@" rejection (raised here as `ValueError`, not that module's `ToolError`,
+    # to match this function's own input-validation error shape rather than
+    # importing an MCP-transport-layer exception into the service layer). A
+    # token-derived `sub` already goes through `validate_sub_shape` via
+    # `_require_identity` -- this function accepts `sub`/`owner_sub` as plain
+    # caller-supplied parameters instead, so without an equivalent check here a
+    # `comms:admin` holder could pre-register `sub="victim@company.com"`,
+    # squatting a real user's future Okta-derived identity with an
+    # attacker-controlled `owner_sub`/`is_shared` that survives the
+    # re-registration freeze once the victim actually self-registers.
+    if "@" in sub:
+        raise ValueError("sub must not be email-shaped")
+    if len(sub) > MAX_SUB_LENGTH:
+        raise ValueError(f"sub exceeds {MAX_SUB_LENGTH} characters")
     owner_sub = owner_sub.strip()
     if not owner_sub:
         raise ValueError("owner_sub must be non-empty")
+    if "@" in owner_sub:
+        raise ValueError("owner_sub must not be email-shaped")
+    if len(owner_sub) > MAX_SUB_LENGTH:
+        raise ValueError(f"owner_sub exceeds {MAX_SUB_LENGTH} characters")
     owner_email = owner_email.strip()
     if not owner_email:
         raise ValueError("owner_email must be non-empty")
+    if len(owner_email) > MAX_OWNER_EMAIL_LENGTH:
+        raise ValueError(f"owner_email exceeds {MAX_OWNER_EMAIL_LENGTH} characters")
     display_name, normalized_types = _validate_display_name_and_accepted_types(
         display_name, accepted_types
     )
@@ -1430,6 +1514,42 @@ async def admin_register_agent(
         await _deny_agent_already_registered(
             session, actor_sub=actor_sub, sub=sub, existing_agent_id=existing.id
         )
+
+    # Sibling-identity-fork guard (Argus round 1, TECH-5786 PR follow-up):
+    # same check as register_agent's own (TECH-5736), deliberately not
+    # omitted here -- see this function's docstring for why omitting it
+    # would reopen the kill-switch bypass that check exists to close.
+    # `base_sub` is derived from the TARGET `sub` itself, since this
+    # function has no caller-side base_sub/agent_key composition the way
+    # register_agent does. Deliberately NOT filtered to `status ==
+    # "active"` -- same reasoning as register_agent's own comment: a
+    # suspended sibling must still count, or `deregister_agent` followed
+    # by this tool would silently bypass the suspension.
+    if not confirm_new_identity:
+        target_base_sub = sub.split("::", 1)[0]
+        sibling_subs = (
+            (
+                await session.execute(
+                    select(Agent.sub).where(
+                        Agent.sub != sub,
+                        or_(
+                            Agent.sub == target_base_sub,
+                            Agent.sub.startswith(f"{target_base_sub}::", autoescape=True),
+                        ),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if sibling_subs:
+            await _deny_sibling_identity_exists(
+                session,
+                actor_sub=actor_sub,
+                base_sub=target_base_sub,
+                sub=sub,
+                existing_agent_keys=[_agent_key_from_sub(s, target_base_sub) for s in sibling_subs],
+            )
 
     # Same display-name-collision-on-creation guard as register_agent
     # (see that function's own comments for why this only fires on
@@ -1495,6 +1615,27 @@ async def admin_register_agent(
                 display_name=display_name,
                 existing_subs=list(colliding_subs_post_rollback),
             )
+        # Second race-closing backstop, specific to this function (Argus
+        # round 1, TECH-5786 PR follow-up): unlike register_agent
+        # (idempotent -- a concurrent duplicate is benign), this path is
+        # first-registration-only, so two concurrent admin calls for the
+        # same `sub` that both pass the pre-flush `scalar_one_or_none`
+        # check above race for `agents_sub_key` at flush time. Without
+        # this branch, the loser's IntegrityError falls through to the
+        # bare `raise` below as an unmapped 500 with raw DB constraint
+        # text, contradicting this function's own docstring promise of
+        # `AgentAlreadyRegisteredError` for any duplicate-`sub` case.
+        if _is_sub_unique_violation(exc):
+            existing_post_rollback = (
+                await session.execute(select(Agent).where(Agent.sub == sub))
+            ).scalar_one_or_none()
+            if existing_post_rollback is not None:
+                await _deny_agent_already_registered(
+                    session,
+                    actor_sub=actor_sub,
+                    sub=sub,
+                    existing_agent_id=existing_post_rollback.id,
+                )
         raise
     _audit(
         session,
@@ -1719,6 +1860,7 @@ async def register_agent(
         if sibling_subs:
             await _deny_sibling_identity_exists(
                 session,
+                actor_sub=sub,
                 base_sub=base_sub,
                 sub=sub,
                 existing_agent_keys=[_agent_key_from_sub(s, base_sub) for s in sibling_subs],

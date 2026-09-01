@@ -1234,6 +1234,140 @@ class TestDeregisterAgent:
         assert result["status"] == "suspended"
 
 
+class TestAdminRegister:
+    """Argus round 1 finding (TECH-5786 PR follow-up): the service-layer
+    tests in test_service.py call service.admin_register_agent directly
+    with admin_authorized pre-set, so they can't catch a wrong
+    provider-side authorization computation. These exercise the actual
+    MCP boundary -- comms_admin_register's own token-gate and
+    _map_service_errors path -- mirroring TestSetAgentShared/
+    TestDeregisterAgent's own coverage of their sibling admin tools."""
+
+    async def test_admin_scope_can_register(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        admin_token = _token(
+            "admin-operator-register-mcp", scopes=["comms:read", "comms:write", "comms:admin"]
+        )
+        result = await _call(
+            main,
+            test_session_factory,
+            admin_token,
+            "comms_admin_register",
+            {
+                "sub": "arc-bot-mcp-boundary",
+                "owner_sub": "owner-arc-bot-mcp-boundary",
+                "owner_email": "arc-bot-mcp-boundary@example.com",
+                "display_name": "Arc Bot MCP Boundary",
+                "accepted_types": sorted(MESSAGE_TYPES),
+                "is_shared": True,
+            },
+        )
+        assert result["sub"] == "arc-bot-mcp-boundary"
+        assert result["owner_email"] == "arc-bot-mcp-boundary@example.com"
+        assert result["is_shared"] is True
+        assert result["status"] == "active"
+        assert result["min_schema_version"] == 1
+        assert result["max_schema_version"] == 1
+        assert result["accepted_types"] == sorted(MESSAGE_TYPES)
+        assert "agent_id" in result
+
+    async def test_interactive_caller_no_admin_scope_needed(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        interactive_token = MagicMock()
+        interactive_token.claims = {
+            "iss": "https://agent-comms.example/mcp",
+            "sub": "interactive-admin-register-operator",
+        }
+        interactive_token.scopes = []
+        interactive_token.client_id = "interactive-admin-register-operator"
+
+        result = await _call(
+            main,
+            test_session_factory,
+            interactive_token,
+            "comms_admin_register",
+            {
+                "sub": "arc-bot-interactive-mcp",
+                "owner_sub": "owner-arc-bot-interactive-mcp",
+                "owner_email": "arc-bot-interactive-mcp@example.com",
+                "display_name": "Arc Bot Interactive MCP",
+                "accepted_types": sorted(MESSAGE_TYPES),
+            },
+        )
+        assert result["sub"] == "arc-bot-interactive-mcp"
+
+    async def test_requires_admin_scope(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        unauthorized_token = _token(
+            "unauthorized-admin-register-operator-mcp", scopes=["comms:read", "comms:write"]
+        )
+        with pytest.raises(
+            ToolError, match=re.escape("access_denied: not authorized for this resource")
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                unauthorized_token,
+                "comms_admin_register",
+                {
+                    "sub": "arc-bot-unauthorized-mcp",
+                    "owner_sub": "owner-arc-bot-unauthorized-mcp",
+                    "owner_email": "arc-bot-unauthorized-mcp@example.com",
+                    "display_name": "Arc Bot Unauthorized MCP",
+                    "accepted_types": sorted(MESSAGE_TYPES),
+                },
+            )
+
+    async def test_already_registered_maps_to_tool_error(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        registered = await _register(main, test_session_factory, "already-registered-mcp")
+        admin_token = _token(
+            "admin-operator-already-registered-mcp",
+            scopes=["comms:read", "comms:write", "comms:admin"],
+        )
+        with pytest.raises(ToolError, match=re.escape("already_registered")):
+            await _call(
+                main,
+                test_session_factory,
+                admin_token,
+                "comms_admin_register",
+                {
+                    "sub": registered["sub"],
+                    "owner_sub": "owner-already-registered-mcp",
+                    "owner_email": "already-registered-mcp-new@example.com",
+                    "display_name": "Already Registered MCP Attempt",
+                    "accepted_types": sorted(MESSAGE_TYPES),
+                },
+            )
+
+    async def test_invalid_schema_version_range_maps_to_tool_error(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        admin_token = _token(
+            "admin-operator-bad-schema-mcp", scopes=["comms:read", "comms:write", "comms:admin"]
+        )
+        with pytest.raises(ToolError, match=re.escape("invalid_request")):
+            await _call(
+                main,
+                test_session_factory,
+                admin_token,
+                "comms_admin_register",
+                {
+                    "sub": "arc-bot-bad-schema-mcp",
+                    "owner_sub": "owner-arc-bot-bad-schema-mcp",
+                    "owner_email": "arc-bot-bad-schema-mcp@example.com",
+                    "display_name": "Arc Bot Bad Schema MCP",
+                    "accepted_types": sorted(MESSAGE_TYPES),
+                    "min_schema_version": 2,
+                    "max_schema_version": 1,
+                },
+            )
+
+
 # --- AXI empty-state / shape spot checks --------------------------------------------
 
 
@@ -2627,6 +2761,7 @@ class TestScopesUnaffected:
             "comms_invite",
             "comms_leave",
             "comms_get_hold_status",
+            "comms_admin_register",
         }
         assert expected <= mounted
         assert expected <= set(TOOL_SCOPES)
