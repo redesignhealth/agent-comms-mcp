@@ -3195,9 +3195,7 @@ class TestDecisionUrlHelper:
     independent of any specific tool's held-response wiring (see
     TestApprovalPipeline below for the end-to-end assertions)."""
 
-    def test_strips_trailing_slash_on_base_url(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_strips_trailing_slash_on_base_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from providers.comms import _decision_url
 
         monkeypatch.setenv("DECISION_PAGE_BASE_URL", "https://decisions.example.com/")
