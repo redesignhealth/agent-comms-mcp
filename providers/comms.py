@@ -33,6 +33,7 @@ never reach it.
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
@@ -78,6 +79,32 @@ comms_server: FastMCP[Any] = FastMCP("comms")
 # unbounded review_reason would let an authenticated agent cause unbounded
 # audit_log write amplification. Matches decision_reason's own cap.
 MAX_REVIEW_REASON_LENGTH = 2000
+
+# Base URL of the separate agent-comms-approvals-decision-page service, used
+# to build a `decision_url` on every `held_for_approval` response so a human
+# has something to click straight to the hold. Optional and unrelated to
+# that service's OWN internal `DECISION_PAGE_BASE_URL`-shaped env var (its
+# own base URL, configured on ITS side) -- this is this board's copy of the
+# same string, read independently. Fails open: if unset, `decision_url` is
+# simply omitted from the response rather than raising, matching this
+# codebase's convention for optional integrations (e.g. WebhookNotifier is
+# opt-in via APPROVAL_NOTIFIER, not required) -- a board that hasn't
+# configured a decision page must not have hold responses break.
+DECISION_PAGE_BASE_URL_ENV_VAR = "DECISION_PAGE_BASE_URL"
+
+
+def _decision_url(hold_id: str) -> str | None:
+    """Build the human-clickable decision-page URL for a hold, or ``None``.
+
+    Returns ``None`` (never raises) when ``DECISION_PAGE_BASE_URL`` isn't
+    configured, so callers can conditionally add the `decision_url` key
+    without ever needing a fallback/error path.
+    """
+    base_url = os.environ.get(DECISION_PAGE_BASE_URL_ENV_VAR)
+    if not base_url:
+        return None
+    return f"{base_url}/holds/{hold_id}"
+
 
 # Plain stdlib logging, matching service.py's own module logger convention
 # (see its docstring comment) -- this exists solely so a genuine
@@ -1067,6 +1094,9 @@ async def start_conversation(
         result["risk_reason"] = pending_hold.risk_reason
         result["hold_expires_at"] = _iso(pending_hold.expires_at)
         result["hold_created_at"] = _iso(pending_hold.created_at)
+        decision_url = _decision_url(str(pending_hold.id))
+        if decision_url is not None:
+            result["decision_url"] = decision_url
     return result
 
 
@@ -1183,7 +1213,7 @@ async def post_message(
             )
 
     if isinstance(result, ApprovalHold):
-        return {
+        held_response: dict[str, Any] = {
             "held_for_approval": True,
             "hold_id": str(result.id),
             "conversation_id": conversation_id,
@@ -1192,6 +1222,10 @@ async def post_message(
             "expires_at": _iso(result.expires_at),
             "created_at": _iso(result.created_at),
         }
+        decision_url = _decision_url(str(result.id))
+        if decision_url is not None:
+            held_response["decision_url"] = decision_url
+        return held_response
     message = result
     response: dict[str, Any] = {
         "conversation_id": conversation_id,
@@ -1522,7 +1556,7 @@ async def invite(
             )
 
     if isinstance(result, ApprovalHold):
-        return {
+        held_response: dict[str, Any] = {
             "held_for_approval": True,
             "hold_id": str(result.id),
             "conversation_id": conversation_id,
@@ -1531,6 +1565,10 @@ async def invite(
             "expires_at": _iso(result.expires_at),
             "created_at": _iso(result.created_at),
         }
+        decision_url = _decision_url(str(result.id))
+        if decision_url is not None:
+            held_response["decision_url"] = decision_url
+        return held_response
     participant = result
     response: dict[str, Any] = {
         "conversation_id": conversation_id,

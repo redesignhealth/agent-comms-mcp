@@ -3264,6 +3264,100 @@ class TestApprovalPipeline:
         )
         assert all(m["type"] != "note" for m in conversation_view["messages"])
 
+    async def test_post_message_held_response_omits_decision_url_when_unset(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("DECISION_PAGE_BASE_URL", raising=False)
+
+        await _register(main, test_session_factory, "hold-e2e-nourl-initiator")
+        target = await _register(main, test_session_factory, "hold-e2e-nourl-target")
+        initiator_token = _token("hold-e2e-nourl-initiator")
+        target_token = _token("hold-e2e-nourl-target")
+
+        started = await _call(
+            main,
+            test_session_factory,
+            initiator_token,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [target["agent_id"]],
+                "initial_message": _availability_request(),
+                "message_type": "availability_request",
+            },
+        )
+        await _call(
+            main,
+            test_session_factory,
+            target_token,
+            "comms_accept",
+            {"conversation_id": started["conversation_id"]},
+        )
+
+        result = await _call(
+            main,
+            test_session_factory,
+            initiator_token,
+            "comms_post_message",
+            {
+                "conversation_id": started["conversation_id"],
+                "message_type": "note",
+                "payload": {"text": "secret cross-boundary note"},
+            },
+        )
+        assert result["held_for_approval"] is True
+        assert "decision_url" not in result
+
+    async def test_post_message_held_response_includes_decision_url_when_set(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("DECISION_PAGE_BASE_URL", "https://decisions.example.com")
+
+        await _register(main, test_session_factory, "hold-e2e-url-initiator")
+        target = await _register(main, test_session_factory, "hold-e2e-url-target")
+        initiator_token = _token("hold-e2e-url-initiator")
+        target_token = _token("hold-e2e-url-target")
+
+        started = await _call(
+            main,
+            test_session_factory,
+            initiator_token,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [target["agent_id"]],
+                "initial_message": _availability_request(),
+                "message_type": "availability_request",
+            },
+        )
+        await _call(
+            main,
+            test_session_factory,
+            target_token,
+            "comms_accept",
+            {"conversation_id": started["conversation_id"]},
+        )
+
+        result = await _call(
+            main,
+            test_session_factory,
+            initiator_token,
+            "comms_post_message",
+            {
+                "conversation_id": started["conversation_id"],
+                "message_type": "note",
+                "payload": {"text": "secret cross-boundary note"},
+            },
+        )
+        assert result["held_for_approval"] is True
+        assert result["decision_url"] == f"https://decisions.example.com/holds/{result['hold_id']}"
+
     async def test_invite_into_conversation_with_note_history_returns_held_shape(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
@@ -3330,6 +3424,94 @@ class TestApprovalPipeline:
                 "comms_get_conversation",
                 {"conversation_id": conversation_id},
             )
+
+    async def test_invite_held_response_omits_decision_url_when_unset(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("DECISION_PAGE_BASE_URL", raising=False)
+
+        owner_sub = "owner-invite-hold-nourl@example.com"
+        await _register(main, test_session_factory, "invite-hold-nourl-owner", owner_sub=owner_sub)
+        member = await _register(
+            main, test_session_factory, "invite-hold-nourl-member", owner_sub=owner_sub
+        )
+        new_agent = await _register(
+            main, test_session_factory, "invite-hold-nourl-new", owner_sub=owner_sub
+        )
+        owner_token = _token("invite-hold-nourl-owner", owner_sub=owner_sub)
+
+        started = await _call(
+            main,
+            test_session_factory,
+            owner_token,
+            "comms_start_conversation",
+            {
+                "conversation_type": "internal",
+                "target_agent_ids": [member["agent_id"]],
+                "initial_message": {"text": "hello"},
+                "message_type": "note",
+            },
+        )
+
+        result = await _call(
+            main,
+            test_session_factory,
+            owner_token,
+            "comms_invite",
+            {
+                "conversation_id": started["conversation_id"],
+                "target_agent_id": new_agent["agent_id"],
+            },
+        )
+        assert result["held_for_approval"] is True
+        assert "decision_url" not in result
+
+    async def test_invite_held_response_includes_decision_url_when_set(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("DECISION_PAGE_BASE_URL", "https://decisions.example.com")
+
+        owner_sub = "owner-invite-hold-url@example.com"
+        await _register(main, test_session_factory, "invite-hold-url-owner", owner_sub=owner_sub)
+        member = await _register(
+            main, test_session_factory, "invite-hold-url-member", owner_sub=owner_sub
+        )
+        new_agent = await _register(
+            main, test_session_factory, "invite-hold-url-new", owner_sub=owner_sub
+        )
+        owner_token = _token("invite-hold-url-owner", owner_sub=owner_sub)
+
+        started = await _call(
+            main,
+            test_session_factory,
+            owner_token,
+            "comms_start_conversation",
+            {
+                "conversation_type": "internal",
+                "target_agent_ids": [member["agent_id"]],
+                "initial_message": {"text": "hello"},
+                "message_type": "note",
+            },
+        )
+
+        result = await _call(
+            main,
+            test_session_factory,
+            owner_token,
+            "comms_invite",
+            {
+                "conversation_id": started["conversation_id"],
+                "target_agent_id": new_agent["agent_id"],
+            },
+        )
+        assert result["held_for_approval"] is True
+        assert result["decision_url"] == f"https://decisions.example.com/holds/{result['hold_id']}"
 
     async def test_get_hold_status_uniform_denial_for_non_sender(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
@@ -3446,6 +3628,62 @@ class TestApprovalPipeline:
         assert len(conversation_view["messages"]) == 1
         assert conversation_view["messages"][0]["type"] == "conversation_opened"
         assert conversation_view["messages"][0]["seq"] == 1
+
+    async def test_start_conversation_held_response_omits_decision_url_when_unset(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("DECISION_PAGE_BASE_URL", raising=False)
+
+        await _register(main, test_session_factory, "hold-e2e-opener-nourl-initiator")
+        target = await _register(main, test_session_factory, "hold-e2e-opener-nourl-target")
+        initiator_token = _token("hold-e2e-opener-nourl-initiator")
+
+        started = await _call(
+            main,
+            test_session_factory,
+            initiator_token,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [target["agent_id"]],
+                "initial_message": {"text": "secret opener"},
+                "message_type": "note",
+            },
+        )
+        assert started["held_for_approval"] is True
+        assert "decision_url" not in started
+
+    async def test_start_conversation_held_response_includes_decision_url_when_set(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("DECISION_PAGE_BASE_URL", "https://decisions.example.com")
+
+        await _register(main, test_session_factory, "hold-e2e-opener-url-initiator")
+        target = await _register(main, test_session_factory, "hold-e2e-opener-url-target")
+        initiator_token = _token("hold-e2e-opener-url-initiator")
+
+        started = await _call(
+            main,
+            test_session_factory,
+            initiator_token,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [target["agent_id"]],
+                "initial_message": {"text": "secret opener"},
+                "message_type": "note",
+            },
+        )
+        assert started["held_for_approval"] is True
+        assert (
+            started["decision_url"] == f"https://decisions.example.com/holds/{started['hold_id']}"
+        )
 
     async def test_direct_post_of_system_message_type_denied(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
