@@ -71,6 +71,13 @@ from scopes import is_interactive_token, is_registry_backed_agent_token, scopes_
 
 comms_server: FastMCP[Any] = FastMCP("comms")
 
+# TECH-5786 Argus round-1 BLOCKING catch: every other caller-supplied string
+# stored verbatim in the audit log has an explicit ceiling (agent_key at
+# MAX_AGENT_KEY_LENGTH, decision_reason at 2000 chars in main.py) -- an
+# unbounded review_reason would let an authenticated agent cause unbounded
+# audit_log write amplification. Matches decision_reason's own cap.
+MAX_REVIEW_REASON_LENGTH = 2000
+
 # Plain stdlib logging, matching service.py's own module logger convention
 # (see its docstring comment) -- this exists solely so a genuine
 # connectivity/config failure swallowed by comms_whoami's best-effort
@@ -942,13 +949,17 @@ async def post_message(
 
     Caller must be an ``active`` participant (uniform denial otherwise).
 
-    ``review_reason``: optional. When set, this message is held for human
+    ``review_reason``: optional, max 2000 chars; empty/whitespace-only is
+    treated as not provided. When set, this message is held for human
     review unconditionally -- including in an ``internal`` conversation,
     which otherwise never reaches a hold. Use this when the message is
     low-risk by the normal rules but you want a human to look at it anyway;
-    the reason string is stored on the hold for the reviewer to see. This
-    can never be auto-cleared by the configured AutoApprover -- an
-    agent-requested review always reaches a human.
+    the reason string is recorded in the audit log (``approval.hold``
+    entry's ``detail.review_reason``) for later inspection, not returned on
+    the hold/status response itself. This can never be auto-cleared by the
+    configured AutoApprover -- an agent-requested review always escalates
+    to a human, enforced structurally regardless of the AutoApprover's own
+    verdict.
 
     ``message_type`` and required ``payload`` fields:
 
@@ -1008,6 +1019,10 @@ async def post_message(
     agent_key = _validate_agent_key(agent_key)
     sub = _compose_sub(base_sub, agent_key)
     conv_id = _parse_uuid("conversation_id", conversation_id)
+    if review_reason is not None and len(review_reason) > MAX_REVIEW_REASON_LENGTH:
+        raise ToolError(
+            f"invalid_request: review_reason exceeds {MAX_REVIEW_REASON_LENGTH} characters"
+        )
 
     owner_sub_claim = token.claims.get("owner_sub")
 

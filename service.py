@@ -336,6 +336,14 @@ INVITE_HOLD_RISK_SCORER_LABEL = "invite_note_history_v1"
 # an agent-requested review as that case and auto-clear it.
 AGENT_REQUESTED_RISK_REASON = "agent_requested"
 
+# Analogous to INVITE_HOLD_RISK_SCORER_LABEL above: an agent-requested hold's
+# `risk_scorer` field must not read as the injected RiskScorer's own name
+# (e.g. "boundary_v1"), since the scorer itself never emitted this hold --
+# that would misattribute it to the scorer's false-positive rate in any
+# dashboard grouping by risk_scorer. The scorer's own verdict, if any, is
+# preserved separately as `scorer_risk_reason` in the audit detail.
+AGENT_REQUESTED_RISK_SCORER_LABEL = "agent_requested"
+
 # The one message type the SERVICE itself synthesizes (the seq-1 marker for
 # a diverted conversation opener, schemas.ConversationOpenedV1) -- never
 # legal as a caller-supplied message_type (denied.system_message_type,
@@ -3615,6 +3623,17 @@ async def _divert_high_risk_message(
     # empty-string claim is present, not absent, and must not silently
     # fall back to a different identity.
     hold_owner_sub = owner_sub_claim if owner_sub_claim is not None else owner_sub_fallback
+    # TECH-5786 Argus round-1 SUGGESTION catch: an agent-requested hold uses
+    # a fixed non-plugin label, not the injected RiskScorer's own name --
+    # the scorer never emitted this hold, so attributing it to the scorer
+    # would misattribute it in any dashboard grouping by risk_scorer. Mirrors
+    # INVITE_HOLD_RISK_SCORER_LABEL's existing precedent above. The scorer's
+    # own verdict, if any, is preserved separately in extra_audit_detail.
+    hold_risk_scorer = (
+        AGENT_REQUESTED_RISK_SCORER_LABEL
+        if risk_reason == AGENT_REQUESTED_RISK_REASON
+        else scorer_name
+    )
     hold = ApprovalHold(
         conversation_id=conversation.id,
         sender_agent_id=sender_agent_id,
@@ -3624,7 +3643,7 @@ async def _divert_high_risk_message(
         schema_version=schema_version,
         payload=payload,
         risk_reason=risk_reason,
-        risk_scorer=scorer_name,
+        risk_scorer=hold_risk_scorer,
         status="pending_auto",
         expires_at=now + APPROVAL_HOLD_TTL,
     )
@@ -3637,11 +3656,15 @@ async def _divert_high_risk_message(
         agent_id=sender_agent_id,
         conversation_id=conversation.id,
         detail={
+            # extra_audit_detail unpacked FIRST (Argus round-1 SUGGESTION
+            # catch): the fixed keys below are authoritative and must win
+            # over anything a caller-supplied extra_audit_detail happens to
+            # collide with, not be silently overwritten by it.
+            **(extra_audit_detail or {}),
             "hold_id": str(hold.id),
             "risk_reason": risk_reason,
-            "risk_scorer": scorer_name,
+            "risk_scorer": hold_risk_scorer,
             "message_type": message_type,
-            **(extra_audit_detail or {}),
         },
     )
 
@@ -3661,6 +3684,16 @@ async def _divert_high_risk_message(
         sender_sub=sender_sub,
     )
     decision = await auto_approver.review(ctx)
+    if risk_reason == AGENT_REQUESTED_RISK_REASON:
+        # TECH-5786 Argus round-1 BLOCKING catch: the AutoApprover still runs
+        # above (for its own side effects/telemetry, same as the RiskScorer
+        # running unconditionally for _enforce_message_type_accepted), but an
+        # agent-requested hold's whole purpose is to reach a human -- an
+        # AutoApprover that special-cases some other risk_reason (or one that
+        # clears everything, e.g. a future LLM-judge approver) must not be
+        # able to auto-clear this one. Enforced structurally here, not left
+        # to every AutoApprover implementation to remember.
+        decision = decision._replace(cleared=False)
     if decision.cleared:
         message, next_seq = await _insert_message_for_hold(
             session, conversation=conversation, hold=hold
@@ -4475,15 +4508,20 @@ async def post_message(
 ) -> Message | ApprovalHold:
     """Append a schema-validated message; apply state-machine side effects.
 
-    ``review_reason`` (TECH-5786): when the sender supplies a non-``None``
-    reason, the message is diverted to a hold unconditionally, overriding
-    whatever the injected ``risk_scorer`` verdict would otherwise be --
-    including in an ``internal`` conversation, where the scorer structurally
-    never returns non-``None`` on its own. The scorer still runs first (for
+    ``review_reason`` (TECH-5786): when the sender supplies a non-empty,
+    non-whitespace-only reason, the message is diverted to a hold
+    unconditionally, overriding whatever the injected ``risk_scorer``
+    verdict would otherwise be -- including in an ``internal`` conversation,
+    where the scorer structurally never returns non-``None`` on its own. An
+    empty or whitespace-only ``review_reason`` is treated the same as
+    ``None`` -- it does not force a hold. The scorer still runs first (for
     its other, unconditional side effect -- ``_enforce_message_type_accepted``
     -- and so its own verdict can be recorded in the hold's audit detail for
     context), but its ``risk_reason`` return value is discarded in favor of
-    ``AGENT_REQUESTED_RISK_REASON`` once a ``review_reason`` is present.
+    ``AGENT_REQUESTED_RISK_REASON`` once a ``review_reason`` is present. The
+    resulting hold's ``AutoApprover`` review always structurally escalates
+    to a human regardless of the configured ``AutoApprover``'s own verdict
+    -- see ``_divert_high_risk_message``'s override of ``decision.cleared``.
 
     Requires ``sender_agent_id`` to be a board-active agent (uniform denial
     otherwise) AND a currently-``active`` participant on ``conversation_id``
@@ -4609,7 +4647,12 @@ async def post_message(
     # runs unconditionally, and the scorer's own verdict is still available
     # to record in the hold's audit detail below.
     scorer_risk_reason = risk_reason
-    if review_reason is not None:
+    # `review_reason.strip()`, not bare `is not None` (Argus round-1
+    # BLOCKING catch): an empty or whitespace-only string is not a
+    # meaningful reason, and forcing a hold on one is indistinguishable
+    # from a legitimate request once recorded in the audit detail.
+    review_reason_requested = review_reason is not None and review_reason.strip() != ""
+    if review_reason_requested:
         risk_reason = AGENT_REQUESTED_RISK_REASON
 
     if risk_reason is not None:
@@ -4637,8 +4680,20 @@ async def post_message(
             participants=boundary_participants,
             sender_sub=sender.sub,
             extra_audit_detail=(
-                {"review_reason": review_reason, "scorer_risk_reason": scorer_risk_reason}
-                if review_reason is not None
+                {
+                    "review_reason": review_reason,
+                    # Omitted when None (Argus round-1 SUGGESTION catch),
+                    # not `"scorer_risk_reason": null` -- the key's presence
+                    # would otherwise imply a risk reason was found when the
+                    # scorer actually returned none (e.g. always, in an
+                    # `internal` conversation).
+                    **(
+                        {"scorer_risk_reason": scorer_risk_reason}
+                        if scorer_risk_reason is not None
+                        else {}
+                    ),
+                }
+                if review_reason_requested
                 else None
             ),
         )

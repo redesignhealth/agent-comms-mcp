@@ -4712,6 +4712,69 @@ class TestPostMessageAgentRequestedReview:
         actions = await _audit_actions(session, conversation.id)
         assert "approval.hold" in actions
         assert "approval.escalate" in actions
+        rows = (
+            await session.execute(
+                select(AuditLog.detail).where(
+                    AuditLog.conversation_id == conversation.id,
+                    AuditLog.action == "approval.hold",
+                )
+            )
+        ).all()
+        assert len(rows) == 1
+        (detail,) = rows[0]
+        assert detail["review_reason"] == "unsure this is safe to send"
+        # The scorer never returns non-None in an `internal` conversation --
+        # `scorer_risk_reason` must be omitted entirely, not present as null.
+        assert "scorer_risk_reason" not in detail
+
+    async def test_review_reason_forces_hold_even_with_clearing_auto_approver(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-5786 Argus round-1 BLOCKING catch: an agent-requested hold's
+        whole purpose is to reach a human -- a configured AutoApprover that
+        would clear anything else must not be able to auto-clear this one."""
+
+        class _AlwaysClearAutoApprover:
+            async def review(self, ctx: plugins.HoldContext) -> plugins.AutoDecision:
+                return plugins.AutoDecision(cleared=True, detail={"stub": "always_clear"})
+
+        owner_sub = "review-reason-clearing-shared-owner"
+        initiator = await _register(
+            session, "review-reason-clearing-initiator", owner_sub=owner_sub
+        )
+        other = await _register(session, "review-reason-clearing-other", owner_sub=owner_sub)
+        client = _FakeOwnershipClient(
+            {
+                initiator.id: {"is_shared": False, "owners": [owner_sub]},
+                other.id: {"is_shared": False, "owners": [owner_sub]},
+            }
+        )
+        conversation = await start_conversation(
+            session,
+            actor_sub=initiator.sub,
+            initiator_agent_id=initiator.id,
+            conversation_type="internal",
+            target_agent_ids=[other.id],
+            initial_message=_request_payload(),
+            ownership_client=client,
+        )
+        await accept_invite(
+            session, actor_sub=other.sub, agent_id=other.id, conversation_id=conversation.id
+        )
+        result = await post_message(
+            session,
+            actor_sub=initiator.sub,
+            sender_agent_id=initiator.id,
+            conversation_id=conversation.id,
+            message_type="note",
+            payload={"text": "please double check this"},
+            ownership_client=client,
+            review_reason="unsure this is safe to send",
+            auto_approver=_AlwaysClearAutoApprover(),
+        )
+        assert isinstance(result, ApprovalHold)
+        assert result.status == "pending_human"
+        assert result.risk_reason == "agent_requested"
 
     async def test_review_reason_omitted_leaves_internal_conversation_unaffected(
         self, session: AsyncSession
@@ -4779,6 +4842,37 @@ class TestPostMessageAgentRequestedReview:
         assert detail["risk_reason"] == "agent_requested"
         assert detail["review_reason"] == "want a second set of eyes"
         assert detail["scorer_risk_reason"] == "boundary_crossing"
+
+    async def test_review_reason_omitted_audit_detail_has_no_new_keys(
+        self, session: AsyncSession
+    ) -> None:
+        """Backward-compat direction: a plain scorer-driven boundary_crossing
+        hold (no review_reason) must not gain either of this ticket's new
+        audit-detail keys."""
+        owner, _target, conversation, client = await self._boundary_pair(session)
+        result = await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="note",
+            payload={"text": "hello"},
+            ownership_client=client,
+        )
+        assert isinstance(result, ApprovalHold)
+        assert result.risk_reason == "boundary_crossing"
+        rows = (
+            await session.execute(
+                select(AuditLog.detail).where(
+                    AuditLog.conversation_id == conversation.id,
+                    AuditLog.action == "approval.hold",
+                )
+            )
+        ).all()
+        assert len(rows) == 1
+        (detail,) = rows[0]
+        assert "review_reason" not in detail
+        assert "scorer_risk_reason" not in detail
 
     async def _boundary_pair(self, session: AsyncSession) -> Any:
         owner = await _register(session, "review-reason-boundary-owner")
