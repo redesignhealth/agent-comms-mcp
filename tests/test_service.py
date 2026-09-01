@@ -2310,14 +2310,20 @@ class TestConversationOwnershipAdmission:
         agent_id, detail = rows[0]
         assert agent_id == owner.id
         assert detail["conversation_type"] == "asymmetric"
+        assert detail["bypass"] == "shared_initiator"
 
-    async def test_asymmetric_shared_target_does_not_bypass_for_nonshared_initiator(
+    async def test_asymmetric_shared_target_admits_despite_disjoint_owners(
         self, session: AsyncSession
     ) -> None:
-        """The shared-initiator bypass (DESIGN.md §9) keys off the
-        INITIATOR's ``is_shared`` flag only. A shared TARGET must not grant
-        the same free pass -- a non-shared initiator with disjoint owners
-        from a shared target is still denied the normal pairwise way."""
+        """A shared TARGET (not just a shared initiator) now also admits an
+        ``asymmetric`` conversation open, even when its owner set is
+        disjoint from the non-shared initiator's -- denying it outright
+        (``denied.no_owner_overlap``) would silently drop traffic that
+        should instead always be flagged for review. That review happens
+        downstream, at message-send time, via
+        ``plugins.BoundaryCrossingScorer``'s shared-recipient check (which,
+        unlike this admission bypass, always forces ``high_risk=True`` --
+        see ``tests/test_risk.py``), not by denying the open."""
         owner = await _register(session, "asym-owner-nonshared-initiator")
         target = await _register(session, "asym-target-shared-not-initiator")
         client = _FakeOwnershipClient(
@@ -2326,29 +2332,45 @@ class TestConversationOwnershipAdmission:
                 target.id: {"is_shared": True, "owners": ["priya", "sam"]},
             }
         )
-        with pytest.raises(AccessDeniedError) as exc_info:
-            await start_conversation(
-                session,
-                actor_sub=owner.sub,
-                initiator_agent_id=owner.id,
-                conversation_type="asymmetric",
-                target_agent_ids=[target.id],
-                initial_message=_request_payload(),
-                ownership_client=client,
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="asymmetric",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            ownership_client=client,
+        )
+        assert conversation.state == "active"
+
+        rows = (
+            await session.execute(
+                select(AuditLog.agent_id, AuditLog.detail).where(
+                    AuditLog.action == "agent.conversation_open_bypassed_shared",
+                )
             )
-        assert exc_info.value.reason == "denied.no_owner_overlap"
+        ).all()
+        assert len(rows) == 1
+        agent_id, detail = rows[0]
+        assert agent_id == owner.id
+        assert detail["conversation_type"] == "asymmetric"
+        assert detail["bypass"] == "shared_target"
 
     async def test_asymmetric_no_star_topology_exception(self, session: AsyncSession) -> None:
         """A(dan) - B(dan,priya) - C(priya): A-B and B-C each intersect, but
         A-C does not -- every PAIR must independently satisfy the
-        predicate, not just a chain through an intermediary."""
+        predicate, not just a chain through an intermediary. None of A/B/C
+        is ``is_shared`` here (see
+        ``test_asymmetric_shared_target_admits_despite_disjoint_owners``
+        for that case, which now admits unconditionally instead of running
+        this pairwise check at all)."""
         a = await _register(session, "asym-a")
         b = await _register(session, "asym-b")
         c = await _register(session, "asym-c")
         client = _FakeOwnershipClient(
             {
                 a.id: {"is_shared": False, "owners": ["dan"]},
-                b.id: {"is_shared": True, "owners": ["dan", "priya"]},
+                b.id: {"is_shared": False, "owners": ["dan", "priya"]},
                 c.id: {"is_shared": False, "owners": ["priya"]},
             }
         )
@@ -2946,6 +2968,49 @@ class TestInviteOwnerFreeze:
             inviter_agent_id=owner.id,
             conversation_id=conversation.id,
             target_agent_id=subset_agent.id,
+            ownership_client=client,
+        )
+        assert participant.status == "invited"
+
+    async def test_asymmetric_invite_shared_target_admits_despite_disjoint_owners(
+        self, session: AsyncSession
+    ) -> None:
+        """Mirrors ``test_asymmetric_shared_target_admits_despite_disjoint_owners``
+        at invite time: an ``asymmetric`` invite target whose owner set is
+        disjoint from the frozen snapshot is still admitted (not
+        ``denied.owner_set_frozen``) when that target is itself
+        ``is_shared`` -- review happens downstream at message-send time via
+        the risk scorer's shared-recipient check, not by denying the
+        invite."""
+        owner = await _register(session, "freeze-asym-shared-target-owner")
+        target = await _register(session, "freeze-asym-shared-target-target")
+        client = _FakeOwnershipClient(
+            {
+                owner.id: {"is_shared": False, "owners": ["dan"]},
+                target.id: {"is_shared": False, "owners": ["dan"]},
+            }
+        )
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="asymmetric",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            ownership_client=client,
+        )
+        disjoint_shared_agent = await _register(session, "freeze-asym-shared-target-new")
+        client._owners_by_agent_id[disjoint_shared_agent.id] = {
+            "is_shared": True,
+            "owners": ["priya"],
+        }
+
+        participant = await invite(
+            session,
+            actor_sub=owner.sub,
+            inviter_agent_id=owner.id,
+            conversation_id=conversation.id,
+            target_agent_id=disjoint_shared_agent.id,
             ownership_client=client,
         )
         assert participant.status == "invited"

@@ -456,7 +456,11 @@ scroll-to-load-more use case.
  or fire-and-forget paths that are neither mutations nor denials:
  `risk.shared_sender_bypass`/`agent.conversation_open_bypassed_shared`
  (a `comms:admin`-authorized shared sender/initiator skipped the ownership-boundary
- check, §9), `agent.reregister_is_shared_ignored` (a re-registration's requested
+ check, §9 — `agent.conversation_open_bypassed_shared`'s `detail.bypass` is
+ `"shared_initiator"` or `"shared_target"` depending on which side was
+ shared; both admit identically, but only the shared-TARGET/RECIPIENT case
+ also forces the per-message risk scorer to flag every send for review — see
+ §9's shared-recipient rule), `agent.reregister_is_shared_ignored` (a re-registration's requested
  `is_shared` diverged from the frozen row value and was ignored, §5), and
  `approval.notify_failed` (the post-commit approval notifier raised — logged,
  never fails the triggering call, §9). Unlike denial
@@ -491,7 +495,7 @@ is untouched.
 |---|---|---|
 | `open` | any active agent (no ownership check) | scheduling negotiation across ownership boundaries |
 | `internal` | all participants share identical verified owner sets, AND no participant is `is_shared` (TECH-5735 — see below; no exception either way — a shared initiator does not bypass this) | same-owner multi-agent coordination (e.g. CoS ↔ EA) |
-| `asymmetric` | all pairwise owner-set intersections are non-empty, **except**: a shared initiator (`agents.is_shared=True`) is admitted without the pairwise check | cross-owner task delegation where a shared agent bridges two users |
+| `asymmetric` | all pairwise owner-set intersections are non-empty, **except**: a shared initiator OR a shared non-initiator target (`agents.is_shared=True` on either side) is admitted without the pairwise check (the shared-target half is newer than the shared-initiator half — see below) | cross-owner task delegation where a shared agent bridges two users |
 
 Ownership is resolved via an injected `OwnershipClient` seam. It is never read
 from `agents.owner_sub` directly, since a shared agent's row can't represent
@@ -526,9 +530,16 @@ not use it). Subsequent invites are checked against this snapshot, with the
 predicate matched to the type's own admission rule (TECH-5735): `internal`
 requires the target's owner set to EQUAL the snapshot (the snapshot is a union
 of already-equal sets, so equality to it is equality to every existing
-participant); `asymmetric` requires only a subset. An invite that fails its
-predicate is denied, preventing unilateral de-isolation of an `internal`
-conversation or a boundary-violating expansion of an `asymmetric` one.
+participant); `asymmetric` requires only a subset, **except**: an `is_shared`
+target is admitted even when its owner set isn't a subset of the snapshot —
+mirroring Axis 1's shared-target admission bypass above, for the identical
+reason (denying the invite outright would silently drop traffic that should
+instead always be reviewed at message-send time via the risk scorer's
+shared-recipient rule, §9 Axis 2). `internal`'s exclusion of any `is_shared`
+target (immediately below) means this exception never reaches the equality
+branch. An invite that fails its predicate is denied, preventing unilateral
+de-isolation of an `internal` conversation or a boundary-violating expansion
+of an `asymmetric` one.
 
 **Any invite into a conversation with existing free-text (`note`) history
 requires human approval (TECH-5735), regardless of conversation type.**
@@ -580,11 +591,41 @@ high-risk (`RiskVerdict(high_risk, reason, detail)`). The v1 implementation,
 - `open`: a sensitive type is always high risk (no ownership lookup — `open`
  has no ownership concept).
 - `asymmetric` + sensitive type: an ownership lookup decides (sender's owner
- set must be a superset of every other active-or-invited participant's), with
- the same shared-sender bypass as before (`agents.is_shared=True` skips the
- lookup unconditionally, audited `risk.shared_sender_bypass`) —
- `asymmetric`-only, since `internal` admission never lets a shared initiator
- bypass its own pairwise check either.
+ set must be a superset of every other active-or-invited participant's),
+ subject to two `is_shared`-driven special cases that are resolved BEFORE
+ that superset comparison, in this priority order:
+
+ 1. **Shared RECIPIENT always forces review.** If ANY other participant
+    (i.e. anyone in `other_agent_ids` — not the sender) is `is_shared=True`,
+    the verdict is unconditionally `high_risk=True`
+    (`reason="boundary_crossing"`, `detail={"reason": "shared_recipient"}`)
+    — no ownership-set comparison is even consulted for that participant.
+    This is the symmetric counterpart to the shared-sender bypass below,
+    with the opposite effect: `is_shared` marks an agent that spans
+    ownership boundaries (§5), so traffic reaching one is exactly the
+    boundary-crossing traffic this scorer exists to flag, and Axis 1 (above)
+    now admits that conversation-open case rather than denying it outright —
+    the review this rule performs is what makes that admission safe. This
+    check is checked FIRST and takes priority over the shared-sender bypass:
+    **a sender that is itself shared does NOT get to skip review when
+    sending to a shared recipient.** There is deliberately no
+    "shared-to-shared" bypass — allowing one would let a shared sender
+    launder traffic past a shared recipient's own review requirement, which
+    would defeat the reason this rule exists in the first place.
+ 2. Only once no other participant is shared does the pre-existing
+    shared-SENDER bypass apply, unchanged: `agents.is_shared=True` on the
+    sender skips the ownership-set lookup for the superset comparison
+    unconditionally (`detail={"bypass": "shared_sender"}`, audited
+    `risk.shared_sender_bypass`) — `asymmetric`-only, since `internal`
+    admission never lets a shared initiator bypass its own pairwise check
+    either.
+
+ Because the shared-recipient check must inspect every other participant's
+ `is_shared` flag regardless of the sender's own status, the scorer now
+ always resolves every other participant's ownership-client record in this
+ branch — the shared-sender bypass no longer avoids those lookups entirely
+ the way it used to; it only avoids folding their owner SETS into the
+ superset comparison once none of them turn out to be shared.
 - **Scorer infrastructure failure still hard-denies** (`denied.risk_unscored`,
  detail carries the cause: `ownership_unverified`/`empty_owner_set`/
  `unknown_conversation_type`) — an ownership-service outage must not flood

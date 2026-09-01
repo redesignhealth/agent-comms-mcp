@@ -164,14 +164,37 @@ class BoundaryCrossingScorer:
       ``docs/DESIGN.md`` §9's "Accepted residual gap (TECH-5735)" notes.
     - ``open``: high risk iff the message type is sensitive.
     - ``asymmetric`` + sensitive type: an ownership lookup decides (sender's
-      owner set must be a superset of every other participant's). A shared
-      sender (``is_shared``) bypasses the check
-      (``detail={"bypass": "shared_sender"}``) — `asymmetric`-only, since
-      `internal` admission never lets a shared initiator bypass its own
-      pairwise check either. A lookup failure, or an empty owner set for
-      the sender or any other participant, raises
-      ``RiskScoringInfraError`` rather than resolving the crossing question
-      at all — an ownership-service outage must fail closed, not be
+      owner set must be a superset of every other participant's), subject to
+      two ``is_shared`` special cases that are checked BEFORE that lookup's
+      result is consulted at all:
+
+      - A shared RECIPIENT (any participant in ``other_agent_ids`` with
+        ``is_shared=True``) always forces ``high_risk=True``
+        (``reason="boundary_crossing"``, ``detail={"reason":
+        "shared_recipient"}``) — symmetric to, but the opposite effect of,
+        the shared-sender bypass below. This is checked FIRST and wins even
+        when the sender is ALSO shared: sending TO a shared agent must
+        always get flagged for review (the whole point of the DESIGN.md §5
+        `is_shared` semantics — a shared agent spans ownership boundaries,
+        so traffic reaching it is exactly the boundary-crossing traffic this
+        scorer exists to catch), and a message must never be able to launder
+        its way past that by routing through a sender who also happens to be
+        shared. There is no such thing as a "shared-to-shared bypass" here.
+      - Only once no OTHER participant is shared does a shared SENDER
+        (``is_shared``) bypass the check (``detail={"bypass":
+        "shared_sender"}``) — `asymmetric`-only, since `internal` admission
+        never lets a shared initiator bypass its own pairwise check either.
+
+      Because the shared-recipient check must inspect every other
+      participant's ``is_shared`` flag regardless of the sender's own status,
+      this scorer now always resolves every other participant's ownership
+      info in `asymmetric` + sensitive-type cases — the shared-sender bypass
+      no longer short-circuits before those lookups the way it used to (it
+      only skips resolving their OWNER SETS into the superset comparison,
+      once it's confirmed none of them are shared). A lookup failure, or an
+      empty owner set for the sender or any other non-shared participant,
+      raises ``RiskScoringInfraError`` rather than resolving the crossing
+      question at all — an ownership-service outage must fail closed, not be
       silently treated as safe OR flood the approval queue (deferred to
       PR2) with unscorable holds.
     """
@@ -194,19 +217,32 @@ class BoundaryCrossingScorer:
             sender_info = await ctx.ownership_client.get_agent_owners(ctx.sender_agent_id)
         except Exception as exc:
             raise RiskScoringInfraError("ownership_unverified") from exc
+
+        other_infos: list[dict[str, Any]] = []
+        try:
+            for agent_id in ctx.other_agent_ids:
+                other_infos.append(await ctx.ownership_client.get_agent_owners(agent_id))
+        except Exception as exc:
+            raise RiskScoringInfraError("ownership_unverified") from exc
+
+        # Shared-RECIPIENT check takes priority over the shared-sender bypass
+        # below, and over the ordinary owner-set comparison -- see the class
+        # docstring. Deliberately does not touch `other_infos`' "owners"
+        # sets at all: a shared agent's set is a roster, not the point here.
+        if any(info.get("is_shared") for info in other_infos):
+            return RiskVerdict(
+                high_risk=True,
+                reason="boundary_crossing",
+                detail={"reason": "shared_recipient"},
+            )
+
         if sender_info.get("is_shared"):
             return RiskVerdict(high_risk=False, reason=None, detail={"bypass": "shared_sender"})
         sender_owners = frozenset(sender_info.get("owners") or [])
         if not sender_owners:
             raise RiskScoringInfraError("empty_owner_set")
 
-        other_owner_sets: list[frozenset[str]] = []
-        try:
-            for agent_id in ctx.other_agent_ids:
-                info = await ctx.ownership_client.get_agent_owners(agent_id)
-                other_owner_sets.append(frozenset(info.get("owners") or []))
-        except Exception as exc:
-            raise RiskScoringInfraError("ownership_unverified") from exc
+        other_owner_sets = [frozenset(info.get("owners") or []) for info in other_infos]
         if any(not owners for owners in other_owner_sets):
             raise RiskScoringInfraError("empty_owner_set")
 

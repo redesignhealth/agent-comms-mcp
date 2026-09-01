@@ -2240,12 +2240,35 @@ async def _authorize_conversation_open(
             agent_id=initiator.id,
             detail={"conversation_type": conversation_type},
         )
-    # The shared-initiator bypass only applies to `asymmetric` — the type
-    # `is_shared` exists to bridge (DESIGN.md §9). `internal` requires every
-    # participant to share one owner set BY CONSTRUCTION; letting a shared
-    # initiator skip that check would let it open an `internal` conversation
-    # across disjoint owners, defeating the type's invariant entirely.
-    shared_bypass = conversation_type == "asymmetric" and is_shared_by_id.get(initiator.id, False)
+    # The shared-initiator/shared-target admission bypass only applies to
+    # `asymmetric` — the type `is_shared` exists to bridge (DESIGN.md §9).
+    # `internal` requires every participant to share one owner set BY
+    # CONSTRUCTION; letting either side skip that check would let it open an
+    # `internal` conversation across disjoint owners, defeating the type's
+    # invariant entirely (the `internal` exclusion above already forbids any
+    # `is_shared` participant there at all, so this branch never reaches
+    # `internal` in practice -- this comment states the invariant, not a
+    # runtime distinction).
+    #
+    # A shared TARGET (not just a shared INITIATOR) also admits at open time
+    # now: denying a non-shared sender outright with `denied.no_owner_overlap`
+    # just because a shared agent's roster doesn't happen to overlap today
+    # would silently drop traffic that should instead always be flagged for
+    # human/auto-approval review. That review happens downstream, in
+    # `plugins.BoundaryCrossingScorer.score`'s shared-recipient check (which
+    # -- unlike this admission bypass -- always forces `high_risk=True`,
+    # never bypasses review, even when the sender is also shared): this
+    # function only decides whether the conversation is ADMITTED, not whether
+    # any given send within it is reviewed. Both the shared-initiator and
+    # shared-target cases admit identically here; they diverge only in the
+    # scorer.
+    shared_initiator = conversation_type == "asymmetric" and is_shared_by_id.get(
+        initiator.id, False
+    )
+    shared_target = conversation_type == "asymmetric" and any(
+        is_shared_by_id.get(target.id, False) for target in targets
+    )
+    shared_bypass = shared_initiator or shared_target
     if shared_bypass:
         # Mirrors _score_message_risk's risk.shared_sender_bypass
         # audit: staged, not committed, for consistency
@@ -2262,7 +2285,16 @@ async def _authorize_conversation_open(
             actor_sub=actor_sub,
             action="agent.conversation_open_bypassed_shared",
             agent_id=initiator.id,
-            detail={"conversation_type": conversation_type},
+            detail={
+                "conversation_type": conversation_type,
+                # If BOTH sides happen to be shared, "shared_initiator" wins
+                # here for audit-detail purposes only -- admission is
+                # identical either way, and the scorer (which is what
+                # actually matters for review) always treats a shared
+                # target/recipient as forcing review regardless of this
+                # value.
+                "bypass": "shared_initiator" if shared_initiator else "shared_target",
+            },
         )
     if not shared_bypass and not _pairwise_admitted(conversation_type, participants, owner_sets):
         await _deny(
@@ -2851,10 +2883,24 @@ async def _authorize_invite_owner_freeze(
     # target -- there is no earlier era where a strict-subset target could
     # have opened an `internal` conversation for this check to now
     # retroactively conflict with.
+    #
+    # Mirrors `_authorize_conversation_open`'s shared-target admission
+    # bypass: an `asymmetric` target whose roster doesn't (yet) intersect
+    # the frozen snapshot must still be ADMITTED, not denied outright with
+    # `denied.owner_set_frozen`, when that target is itself `is_shared` --
+    # the whole reason to invite a shared bridging agent into an
+    # `asymmetric` conversation is to reach across owner sets that don't
+    # overlap. Review for that traffic happens downstream, at message-send
+    # time, via `plugins.BoundaryCrossingScorer`'s shared-recipient check
+    # (which always forces `high_risk=True` for a send to a shared
+    # participant) -- this function only decides invite ADMISSION.
+    # `internal`'s exclusion above already forbids an `is_shared` target
+    # from ever reaching this branch for that type, so no analogous bypass
+    # is needed there.
     admitted = (
         target_owners == snapshot_owners
         if conversation.type == "internal"
-        else target_owners <= snapshot_owners
+        else (target_owners <= snapshot_owners or bool(target_info.get("is_shared")))
     )
     if not admitted:
         await _deny(
