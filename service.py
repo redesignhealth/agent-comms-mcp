@@ -317,6 +317,14 @@ MAX_PENDING_INVITES_PER_INBOX = 100
 APPROVAL_HOLD_TTL = timedelta(days=7)
 MAX_APPROVAL_HOLDS_PER_HOUR = 10
 
+# RFC 5321 4.5.3.1.3 total-address cap. Hoisted here (Argus round 2,
+# TECH-5786 PR follow-up) rather than left as two independently-drifting
+# copies -- `lookup_agent_by_email` and `admin_register_agent` both bound
+# an email against this same limit, and a drift between them would make an
+# `owner_email` that `admin_register_agent` accepts permanently unfindable
+# via `lookup_agent_by_email` (which returns `None` for over-cap input).
+MAX_LOOKUP_EMAIL_LENGTH = 254
+
 # TECH-5735: invite-holds (ApprovalHold.kind="invite") use fixed sentinel
 # values in place of a real message-schema/risk-scorer identifier, since no
 # RiskScorer plugin is invoked and there is no real schemas.MessageType for
@@ -465,50 +473,33 @@ async def _deny_agent_suspended(
     raise AgentSuspendedError(sub=sub)
 
 
-def _is_display_name_index_violation(exc: IntegrityError) -> bool:
-    """Narrow check that ``exc`` is specifically a violation of
-    ``idx_agents_lower_display_name_active`` (migration a45f344c9c00),
-    not merely "some IntegrityError". Postgres reports a unique partial
-    index's name in the underlying error's ``constraint_name`` diagnostic
-    field the same way it would a real named constraint. Under this
-    project's driver stack (SQLAlchemy 2.0.x + asyncpg), ``exc.orig`` is
-    ``AsyncAdapt_asyncpg_dbapi.IntegrityError``, a thin wrapper that only
-    copies ``pgcode``/``sqlstate`` from the real
+def _is_constraint_violation(exc: IntegrityError, name: str) -> bool:
+    """Narrow check that ``exc`` is specifically a violation of the named
+    constraint/index ``name``, not merely "some IntegrityError". Postgres
+    reports a unique (partial) index's name in the underlying error's
+    ``constraint_name`` diagnostic field the same way it would a real named
+    constraint. Under this project's driver stack (SQLAlchemy 2.0.x +
+    asyncpg), ``exc.orig`` is ``AsyncAdapt_asyncpg_dbapi.IntegrityError``, a
+    thin wrapper that only copies ``pgcode``/``sqlstate`` from the real
     ``asyncpg.exceptions.UniqueViolationError`` -- NOT ``constraint_name``.
     The real asyncpg exception (which does carry ``constraint_name``) is
     reachable via ``exc.orig.__cause__``. Check there first, falling back
     to ``exc.orig`` itself in case a different driver/version puts the
     attribute there directly. Deliberately not a blanket catch: any other
     IntegrityError (e.g. a genuinely unrelated constraint) must keep
-    propagating as itself."""
-    cause = getattr(exc.orig, "__cause__", None)
-    name = getattr(cause, "constraint_name", None)
-    if name is None:
-        name = getattr(exc.orig, "constraint_name", None)
-    return name == "idx_agents_lower_display_name_active"
+    propagating as itself.
 
-
-def _is_sub_unique_violation(exc: IntegrityError) -> bool:
-    """Narrow check that ``exc`` is specifically a violation of
-    ``agents_sub_key`` (the ``Agent.sub`` ``unique=True`` column's
-    auto-generated constraint name), not merely "some IntegrityError" --
-    same extraction logic and rationale as
-    ``_is_display_name_index_violation``, just a different constraint name.
-    Added for ``admin_register_agent`` (Argus round 1, TECH-5786 PR
-    follow-up): unlike ``register_agent`` (idempotent -- a concurrent
-    duplicate call just re-resolves the same row), ``admin_register_agent``
-    is first-registration-only, so two concurrent calls for the same `sub`
-    that both pass the pre-flush `scalar_one_or_none` check race for this
-    constraint at flush time. Without narrowing to this specific
-    constraint, the loser's `IntegrityError` would re-raise as a bare,
-    unmapped 500 with raw DB constraint text, instead of the
-    ``AgentAlreadyRegisteredError`` this function's docstring promises for
-    any duplicate-``sub`` case."""
+    Extracted from two near-identical copies (Argus round 2, TECH-5786 PR
+    follow-up: ``_is_display_name_index_violation``/``_is_sub_unique_violation``
+    differed only in the constraint-name literal) -- a future
+    SQLAlchemy/asyncpg change to this extraction logic now only needs one
+    fix, not two, closing the risk of one call site silently degrading to a
+    bare 500 if only the other copy got updated."""
     cause = getattr(exc.orig, "__cause__", None)
-    name = getattr(cause, "constraint_name", None)
-    if name is None:
-        name = getattr(exc.orig, "constraint_name", None)
-    return name == "agents_sub_key"
+    constraint_name = getattr(cause, "constraint_name", None)
+    if constraint_name is None:
+        constraint_name = getattr(exc.orig, "constraint_name", None)
+    return constraint_name == name
 
 
 async def _deny_sibling_identity_exists(
@@ -1322,9 +1313,6 @@ async def _deny_agent_already_registered(
 # `audit_log.detail` (JSONB) -- a legitimately-credentialed admin could
 # otherwise write an arbitrarily large string into the audit log.
 MAX_SUB_LENGTH = 256  # generous bound for a board `sub`/`owner_sub` identifier
-MAX_OWNER_EMAIL_LENGTH = 254  # RFC 5321 4.5.3.1.3 total-address cap, same bound
-# as MAX_LOOKUP_EMAIL_LENGTH below -- duplicated rather than forward-referenced,
-# since that constant isn't defined until later in this module.
 
 
 async def admin_register_agent(
@@ -1475,12 +1463,25 @@ async def admin_register_agent(
     # to match this function's own input-validation error shape rather than
     # importing an MCP-transport-layer exception into the service layer). A
     # token-derived `sub` already goes through `validate_sub_shape` via
-    # `_require_identity` -- this function accepts `sub`/`owner_sub` as plain
-    # caller-supplied parameters instead, so without an equivalent check here a
+    # `_require_identity` -- this function accepts `sub` as a plain
+    # caller-supplied parameter instead, so without an equivalent check here a
     # `comms:admin` holder could pre-register `sub="victim@company.com"`,
     # squatting a real user's future Okta-derived identity with an
     # attacker-controlled `owner_sub`/`is_shared` that survives the
     # re-registration freeze once the victim actually self-registers.
+    # `owner_sub` deliberately gets NO analogous "@"-rejection (Argus round
+    # 2, TECH-5786 PR follow-up: an earlier revision of this fix wrongly
+    # applied the same check to `owner_sub`) -- unlike `sub` (a board
+    # IDENTITY, never email-shaped by spec), `owner_sub` is legitimately
+    # email-shaped for any Okta/interactive-derived owner:
+    # `register_agent` itself sets `owner_sub = token.claims.get("owner_sub")
+    # or base_sub`, where `base_sub` resolves via `try_resolve_email` for
+    # exactly that case. Rejecting it here would make it impossible to
+    # admin-register a bot on behalf of an ordinary human owner, and
+    # `approve_hold`/`reject_hold` gate on `hold.owner_sub == approver_sub`
+    # (an email for an Okta approver) -- a worked-around non-email
+    # `owner_sub` would make every hold that bot creates permanently
+    # unapprovable by its real owner.
     if "@" in sub:
         raise ValueError("sub must not be email-shaped")
     if len(sub) > MAX_SUB_LENGTH:
@@ -1488,15 +1489,15 @@ async def admin_register_agent(
     owner_sub = owner_sub.strip()
     if not owner_sub:
         raise ValueError("owner_sub must be non-empty")
-    if "@" in owner_sub:
-        raise ValueError("owner_sub must not be email-shaped")
     if len(owner_sub) > MAX_SUB_LENGTH:
         raise ValueError(f"owner_sub exceeds {MAX_SUB_LENGTH} characters")
     owner_email = owner_email.strip()
     if not owner_email:
         raise ValueError("owner_email must be non-empty")
-    if len(owner_email) > MAX_OWNER_EMAIL_LENGTH:
-        raise ValueError(f"owner_email exceeds {MAX_OWNER_EMAIL_LENGTH} characters")
+    if len(owner_email) > MAX_LOOKUP_EMAIL_LENGTH:
+        raise ValueError(f"owner_email exceeds {MAX_LOOKUP_EMAIL_LENGTH} characters")
+    if "@" not in owner_email:
+        raise ValueError("owner_email must be email-shaped")
     display_name, normalized_types = _validate_display_name_and_accepted_types(
         display_name, accepted_types
     )
@@ -1596,7 +1597,7 @@ async def admin_register_agent(
         # exactly this named index rather than a blanket
         # IntegrityError->DisplayNameCollisionError mapping.
         await session.rollback()
-        if _is_display_name_index_violation(exc):
+        if _is_constraint_violation(exc, "idx_agents_lower_display_name_active"):
             colliding_subs_post_rollback = (
                 (
                     await session.execute(
@@ -1625,7 +1626,7 @@ async def admin_register_agent(
         # bare `raise` below as an unmapped 500 with raw DB constraint
         # text, contradicting this function's own docstring promise of
         # `AgentAlreadyRegisteredError` for any duplicate-`sub` case.
-        if _is_sub_unique_violation(exc):
+        if _is_constraint_violation(exc, "agents_sub_key"):
             existing_post_rollback = (
                 await session.execute(select(Agent).where(Agent.sub == sub))
             ).scalar_one_or_none()
@@ -1636,6 +1637,17 @@ async def admin_register_agent(
                     sub=sub,
                     existing_agent_id=existing_post_rollback.id,
                 )
+            # Argus round 2, TECH-5786 PR follow-up: the constraint violation
+            # confirms a row for `sub` exists, even in the vanishingly rare
+            # window where it's since been deleted again before this re-read
+            # (so `existing_post_rollback` came back `None`) -- raise the
+            # same client-safe error directly rather than falling through to
+            # the bare `raise` below, which would leak the raw `IntegrityError`
+            # (including the internal `agents_sub_key` constraint name) to the
+            # MCP transport as an unmapped 500. No audit write here (no agent
+            # row to reference), same trade-off the display-name branch above
+            # implicitly makes when it fires with an empty colliding-subs list.
+            raise AgentAlreadyRegisteredError(sub=sub) from exc
         raise
     _audit(
         session,
@@ -1648,6 +1660,12 @@ async def admin_register_agent(
             "owner_email": owner_email,
             "display_name": display_name,
             "is_shared": is_shared,
+            # Argus round 2, TECH-5786 PR follow-up: before the confirm_new_identity
+            # wiring existed, a bypass of the sibling-fork guard was unreachable
+            # from the provider layer; now it's a first-class parameter, and a
+            # forensic audit must be able to distinguish a clean first
+            # registration from a kill-switch bypass of a base_sub suspension.
+            "confirm_new_identity": confirm_new_identity,
         },
     )
     await session.commit()
@@ -2005,7 +2023,7 @@ async def register_agent(
         # -- so an unrelated constraint violation still propagates as
         # itself rather than being mislabeled.
         await session.rollback()
-        if _is_display_name_index_violation(exc):
+        if _is_constraint_violation(exc, "idx_agents_lower_display_name_active"):
             # Unlike the app-level check's `colliding_subs`, the
             # DB-level violation itself doesn't hand us the other row's
             # `sub` -- only that a conflict exists. But the row IS now
@@ -2286,9 +2304,6 @@ async def list_agents(
         "has_more": has_more,
         "next_cursor": rows[-1].sub if has_more and rows else None,
     }
-
-
-MAX_LOOKUP_EMAIL_LENGTH = 254  # RFC 5321 4.5.3.1.3 total-address cap
 
 
 async def lookup_agent_by_email(

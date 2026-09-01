@@ -1161,7 +1161,7 @@ class TestRegisterAgent:
         this scenario skips it entirely and falls through to
         ``idx_agents_lower_display_name_active`` (migration a45f344c9c00)
         for enforcement, exercised here against a real Postgres backend.
-        This is the exact path the round-3 fix's ``_is_display_name_index_violation``
+        This is the exact path the round-3 fix's ``_is_constraint_violation``
         helper exists to translate into ``DisplayNameCollisionError`` instead
         of letting the raw ``IntegrityError`` escape as an unmapped 500 --
         see ~service.py:1533's comment for the "case (a)"/"case (b)" split.
@@ -8035,6 +8035,7 @@ class TestAdminRegisterAgent:
             "owner_email": "arc-bot-42-owner@example.com",
             "display_name": "Arc Bot 42",
             "is_shared": True,
+            "confirm_new_identity": False,
         }
 
     async def test_admin_registers_new_agent_defaults_is_shared_false(
@@ -8378,16 +8379,55 @@ class TestAdminRegisterAgent:
         ).scalar_one_or_none()
         assert row is None
 
-    async def test_owner_sub_must_not_be_email_shaped(self, session: AsyncSession) -> None:
+    async def test_owner_sub_may_be_email_shaped(self, session: AsyncSession) -> None:
+        """Argus round 2 BLOCKING finding (TECH-5786 PR follow-up): an
+        earlier revision of this fix wrongly rejected email-shaped
+        `owner_sub`, mirroring the (correct) `sub` check. Unlike `sub`
+        (never email-shaped by spec), `owner_sub` is legitimately
+        email-shaped for any Okta/interactive-derived owner --
+        register_agent itself sets it from `token.claims.get("owner_sub")
+        or base_sub`, where base_sub resolves via try_resolve_email for
+        that case. Rejecting it here would make it impossible to
+        admin-register a bot on behalf of an ordinary human owner."""
+        agent = await admin_register_agent(
+            session,
+            actor_sub="admin-operator",
+            admin_authorized=True,
+            sub="arc-bot-human-owned",
+            owner_sub="dan@example.com",
+            owner_email="arc-bot-human-owned@example.com",
+            display_name="Arc Bot Human Owned",
+            accepted_types=sorted(MESSAGE_TYPES),
+        )
+        assert agent.owner_sub == "dan@example.com"
+
+    async def test_owner_sub_length_capped(self, session: AsyncSession) -> None:
+        with pytest.raises(ValueError, match="exceeds"):
+            await admin_register_agent(
+                session,
+                actor_sub="admin-operator",
+                admin_authorized=True,
+                sub="arc-bot-oversized-owner-sub",
+                owner_sub="x" * 257,
+                owner_email="oversized-owner-sub@example.com",
+                display_name="Oversized Owner Sub",
+                accepted_types=sorted(MESSAGE_TYPES),
+            )
+
+    async def test_owner_email_must_be_email_shaped(self, session: AsyncSession) -> None:
+        """Argus round 2 suggestion (TECH-5786 PR follow-up): `sub`/
+        `owner_sub` both get explicit shape guards; `owner_email` had none,
+        letting a comms:admin caller register an unfindable-by-email agent
+        with no error signal."""
         with pytest.raises(ValueError, match="email-shaped"):
             await admin_register_agent(
                 session,
                 actor_sub="admin-operator",
                 admin_authorized=True,
-                sub="arc-bot-forged-owner-sub",
-                owner_sub="victim@company.com",
-                owner_email="arc-bot-forged-owner-sub@example.com",
-                display_name="Arc Bot Forged Owner Sub",
+                sub="arc-bot-bad-owner-email",
+                owner_sub="owner-arc-bot-bad-owner-email",
+                owner_email="notanemail",
+                display_name="Arc Bot Bad Owner Email",
                 accepted_types=sorted(MESSAGE_TYPES),
             )
 
@@ -8576,6 +8616,55 @@ class TestAdminRegisterAgent:
 
         rows = (
             (await session.execute(select(Agent).where(Agent.sub == "race-admin-register-target")))
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1
+
+    async def test_concurrent_admin_registration_same_display_name_db_level_backstop(
+        self, session: AsyncSession, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Argus round 2 suggestion (TECH-5786 PR follow-up):
+        test_display_name_db_level_collision only exercises the PRE-flush
+        SELECT guard (the colliding row is already committed, so the
+        pre-check catches it before flush() is ever reached) -- this
+        exercises the actual POST-flush `IntegrityError` ->
+        `_deny_display_name_collision` handler via a genuine two-session
+        race, mirroring the sub-uniqueness race test above."""
+
+        async def _admin_register(sub: str) -> Agent:
+            async with session_factory() as sess:
+                return await admin_register_agent(
+                    sess,
+                    actor_sub="admin-operator",
+                    admin_authorized=True,
+                    sub=sub,
+                    owner_sub=f"owner-{sub}",
+                    owner_email=f"{sub}@example.com",
+                    display_name="Race Display Name",
+                    accepted_types=sorted(MESSAGE_TYPES),
+                )
+
+        results = await asyncio.gather(
+            _admin_register("race-display-name-a"),
+            _admin_register("race-display-name-b"),
+            return_exceptions=True,
+        )
+
+        successes = [r for r in results if isinstance(r, Agent)]
+        errors = [r for r in results if isinstance(r, BaseException)]
+        assert len(successes) == 1
+        assert len(errors) == 1
+        assert isinstance(errors[0], DisplayNameCollisionError)
+
+        rows = (
+            (
+                await session.execute(
+                    select(Agent).where(
+                        Agent.sub.in_(["race-display-name-a", "race-display-name-b"])
+                    )
+                )
+            )
             .scalars()
             .all()
         )

@@ -59,7 +59,7 @@ headless agent tokens (`AGENT_TOKEN_VERIFIERS`, default: the built-in HS256
 `JWTVerifier`, `iss="agent-jwt"` — see "Configuration: pluggable agent-token
 verification" below).
 Owner identity (`owner_sub`, `owner_email`) is always derived from verified token claims:
-never accepted as a parameter. **Exception:** `comms_admin_register` (§5) — the one
+never accepted as a parameter. **Exception:** `comms_admin_register` (§5) -- the one
 deliberate, audited, on-behalf-of exception to this invariant, for a target that has
 never authenticated to this board yet.
 
@@ -411,6 +411,21 @@ Design notes:
  `denied.sibling_identity_exists`, `actor_sub` the PRIVILEGED CALLER) unless
  `confirm_new_identity=True` acknowledges the fork, same semantics as
  `comms_register`'s own parameter of the same name.
+
+ **Accepted residual risk (Argus round 2, TECH-5786 PR follow-up):** because
+ `confirm_new_identity=True` is now reachable through this admin surface (it
+ was not, before this PR -- the provider layer never forwarded it), a
+ `comms:admin` credential holder can still reconstitute access for a
+ suspended `base_sub`: suspend every existing identity under it via
+ `comms_deregister_agent`, then admin-register a brand-new `sub` under that
+ same `base_sub` with `confirm_new_identity=True`. This does not defeat the
+ guard's DEFAULT posture (an accidental fork is still caught), but a
+ privileged caller can deliberately opt out of it, same as `comms_register`'s
+ own self-service equivalent already allows for a caller acting on itself.
+ Not detected or specially audited beyond the ordinary
+ `agent.admin_registered` event (which does record `confirm_new_identity`) --
+ revisit if `comms:admin` credential compromise becomes a live threat model
+ concern for this board.
 
  `owner_sub`/`owner_email` are the one deliberate exception to §4's "never accepted
  as a parameter" rule on this tool, and only because there is structurally no

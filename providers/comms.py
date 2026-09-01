@@ -762,7 +762,7 @@ async def admin_register(
     workarounds without this tool are both bad — granting the bot's own
     permanent credential ``comms:admin`` (an ordinary bot has no
     legitimate reason to hold a scope that lets it register/re-authorize
-    OTHER agents on this board — doing so turns every such bot's
+    OTHER agents on this board -- doing so turns every such bot's
     credential into a full admin-capability leak risk), or minting a
     throwaway token impersonating the target
     ``sub`` just to make one call. This tool is the real fix: an explicit,
@@ -804,7 +804,7 @@ async def admin_register(
       authorization, so there is no less-privileged path through this tool
       for ``is_shared`` to escalate past.
     - ``confirm_new_identity``: same acknowledgement semantics as
-      ``comms_register``'s parameter of the same name (TECH-5736) — this
+      ``comms_register``'s parameter of the same name (TECH-5736) -- this
       tool deliberately does NOT skip that guard just because it's an
       on-behalf-of registration. ``base_sub`` here is derived from the
       TARGET ``sub`` itself (everything before its first ``::``, if any),
