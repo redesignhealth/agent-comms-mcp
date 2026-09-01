@@ -3316,6 +3316,56 @@ class TestApprovalPipeline:
         assert result["status"] == "pending_human"
         assert result["risk_reason"] == "agent_requested"
 
+    async def test_review_reason_exceeding_length_cap_rejected_at_tool_boundary(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Argus round-2 SUGGESTION catch: the 2000-char review_reason cap
+        (providers/comms.py's MAX_REVIEW_REASON_LENGTH) had no regression
+        coverage -- the guard could be silently removed without CI noticing."""
+        await _register(main, test_session_factory, "hold-e2e-review-reason-toolong-initiator")
+        target = await _register(
+            main, test_session_factory, "hold-e2e-review-reason-toolong-target"
+        )
+        initiator_token = _token("hold-e2e-review-reason-toolong-initiator")
+        target_token = _token("hold-e2e-review-reason-toolong-target")
+
+        started = await _call(
+            main,
+            test_session_factory,
+            initiator_token,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [target["agent_id"]],
+                "initial_message": _availability_request(),
+                "message_type": "availability_request",
+            },
+        )
+        await _call(
+            main,
+            test_session_factory,
+            target_token,
+            "comms_accept",
+            {"conversation_id": started["conversation_id"]},
+        )
+
+        with pytest.raises(
+            ToolError,
+            match=re.escape("invalid_request: review_reason exceeds 2000 characters"),
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                initiator_token,
+                "comms_post_message",
+                {
+                    "conversation_id": started["conversation_id"],
+                    "message_type": "note",
+                    "payload": {"text": "hello"},
+                    "review_reason": "x" * 2001,
+                },
+            )
+
 
 class TestOwnershipWriteThrough:
     """TECH-5593 item 1, end-to-end through the real tool surface: a

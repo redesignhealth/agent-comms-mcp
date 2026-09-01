@@ -949,17 +949,20 @@ async def post_message(
 
     Caller must be an ``active`` participant (uniform denial otherwise).
 
-    ``review_reason``: optional, max 2000 chars; empty/whitespace-only is
-    treated as not provided. When set, this message is held for human
-    review unconditionally -- including in an ``internal`` conversation,
-    which otherwise never reaches a hold. Use this when the message is
-    low-risk by the normal rules but you want a human to look at it anyway;
-    the reason string is recorded in the audit log (``approval.hold``
-    entry's ``detail.review_reason``) for later inspection, not returned on
-    the hold/status response itself. This can never be auto-cleared by the
-    configured AutoApprover -- an agent-requested review always escalates
-    to a human, enforced structurally regardless of the AutoApprover's own
-    verdict.
+    ``review_reason``: optional, max 2000 chars, enforced at this tool
+    boundary BEFORE any whitespace stripping (so a >2000-char all-whitespace
+    string is rejected as too long, not silently treated as absent);
+    empty/whitespace-only is treated as not provided once past that check,
+    but the stripping itself happens in the service layer, not here. When
+    set, this message is held for human review unconditionally -- including
+    in an ``internal`` conversation, which otherwise never reaches a hold.
+    Use this when the message is low-risk by the normal rules but you want
+    a human to look at it anyway; the reason string is recorded in the
+    audit log (``approval.hold`` entry's ``detail.review_reason``) for
+    later inspection, not returned on the hold/status response itself. This
+    can never be auto-cleared by the configured AutoApprover -- an
+    agent-requested review always escalates to a human, enforced
+    structurally regardless of the AutoApprover's own verdict.
 
     ``message_type`` and required ``payload`` fields:
 

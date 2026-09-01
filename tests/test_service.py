@@ -59,6 +59,7 @@ from schemas import (
     PayloadValidationError,
 )
 from service import (
+    AGENT_REQUESTED_RISK_SCORER_LABEL,
     CONVERSATION_TTL,
     MAX_APPROVAL_HOLDS_PER_HOUR,
     MAX_CONVERSATION_STARTS_PER_HOUR,
@@ -4776,6 +4777,49 @@ class TestPostMessageAgentRequestedReview:
         assert result.status == "pending_human"
         assert result.risk_reason == "agent_requested"
 
+    async def test_review_reason_whitespace_only_leaves_internal_conversation_unaffected(
+        self, session: AsyncSession
+    ) -> None:
+        """Argus round-2 SUGGESTION catch: the round-1 fix treating a
+        whitespace-only review_reason the same as None (service.py's
+        review_reason_requested guard) had no regression coverage."""
+        owner_sub = "review-reason-whitespace-shared-owner"
+        initiator = await _register(
+            session, "review-reason-whitespace-initiator", owner_sub=owner_sub
+        )
+        other = await _register(session, "review-reason-whitespace-other", owner_sub=owner_sub)
+        client = _FakeOwnershipClient(
+            {
+                initiator.id: {"is_shared": False, "owners": [owner_sub]},
+                other.id: {"is_shared": False, "owners": [owner_sub]},
+            }
+        )
+        conversation = await start_conversation(
+            session,
+            actor_sub=initiator.sub,
+            initiator_agent_id=initiator.id,
+            conversation_type="internal",
+            target_agent_ids=[other.id],
+            initial_message=_request_payload(),
+            ownership_client=client,
+        )
+        await accept_invite(
+            session, actor_sub=other.sub, agent_id=other.id, conversation_id=conversation.id
+        )
+        result = await post_message(
+            session,
+            actor_sub=initiator.sub,
+            sender_agent_id=initiator.id,
+            conversation_id=conversation.id,
+            message_type="note",
+            payload={"text": "hello"},
+            ownership_client=client,
+            review_reason="   ",
+        )
+        assert isinstance(result, Message)
+        actions = await _audit_actions(session, conversation.id)
+        assert "approval.hold" not in actions
+
     async def test_review_reason_omitted_leaves_internal_conversation_unaffected(
         self, session: AsyncSession
     ) -> None:
@@ -4829,6 +4873,7 @@ class TestPostMessageAgentRequestedReview:
         )
         assert isinstance(result, ApprovalHold)
         assert result.risk_reason == "agent_requested"
+        assert result.risk_scorer == AGENT_REQUESTED_RISK_SCORER_LABEL
         rows = (
             await session.execute(
                 select(AuditLog.detail).where(
@@ -4840,6 +4885,7 @@ class TestPostMessageAgentRequestedReview:
         assert len(rows) == 1
         (detail,) = rows[0]
         assert detail["risk_reason"] == "agent_requested"
+        assert detail["risk_scorer"] == AGENT_REQUESTED_RISK_SCORER_LABEL
         assert detail["review_reason"] == "want a second set of eyes"
         assert detail["scorer_risk_reason"] == "boundary_crossing"
 
