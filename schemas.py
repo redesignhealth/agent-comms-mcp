@@ -1,16 +1,21 @@
 """Versioned Pydantic payload schemas for typed board messages.
 
 Every message posted to the board must validate against the schema
-registered for ``(message_type, schema_version)`` — there is no free text
-anywhere in v1 outside the explicitly-marked ``note`` type (DESIGN.md §6,
-§9). Validation rules:
+registered for ``(message_type, schema_version)`` — free text is limited to
+two explicitly-marked, individually-controlled types: ``note`` and
+``instruction_share`` (doc-backed kinds only; TECH-5822) (DESIGN.md §6, §9).
+Validation rules:
 
 - ``extra="forbid"`` on every model (strict — unknown fields rejected).
 - All datetimes are timezone-aware ISO 8601 (``AwareDatetime``); naive
   datetimes are rejected.
-- Enumerated string fields are closed ``Literal`` sets. No free-text
-  fields anywhere — every field is a bounded numeric/datetime/enum value
-  or a bounded list of them.
+- Enumerated string fields are closed ``Literal`` sets. Outside ``note``
+  and ``instruction_share``, no free-text fields anywhere — every other
+  field is a bounded numeric/datetime/enum value or a bounded list of them.
+  ``instruction_share``'s ``text`` is itself drawn from a closed
+  ``InstructionKind`` enum and verified downstream against a canonical hash
+  (see that model's docstring) — it is bounded free text, not an open
+  channel.
 
 Discriminator field: every top-level message model also carries a
 ``type: Literal[...]`` field matching the DB ``messages.type`` column
@@ -159,6 +164,30 @@ InstructionKind = Literal[
 ]
 
 
+def _check_instruction_kind_partition() -> None:
+    """Fail loudly at import time if DOC_BACKED/LINK_BACKED_INSTRUCTION_KINDS
+    ever stop exactly partitioning InstructionKind (disjoint, full coverage)
+    -- mirrors _check_message_type_literal_matches_schemas's fail-loud-at-
+    import posture. Without this, a future kind added to the InstructionKind
+    Literal but to neither frozenset would silently route to
+    InstructionShareV1's link-backed branch (the `else` in
+    _text_or_link_per_kind_group), requiring `link` and rejecting `text`
+    with no boot-time error."""
+    all_kinds = frozenset(get_args(InstructionKind))
+    overlap = DOC_BACKED_INSTRUCTION_KINDS & LINK_BACKED_INSTRUCTION_KINDS
+    union = DOC_BACKED_INSTRUCTION_KINDS | LINK_BACKED_INSTRUCTION_KINDS
+    if overlap or union != all_kinds:
+        raise RuntimeError(
+            "DOC_BACKED_INSTRUCTION_KINDS and LINK_BACKED_INSTRUCTION_KINDS "
+            "no longer exactly partition InstructionKind -- "
+            f"overlap: {overlap}, kind-only: {all_kinds - union}, "
+            f"group-only: {union - all_kinds}"
+        )
+
+
+_check_instruction_kind_partition()
+
+
 class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -299,11 +328,11 @@ class NeedsClarificationV1(_StrictModel):
 
 
 class InstructionRequestV1(_StrictModel):
-    """instruction_request / v1 — TECH-5822.
+    """instruction_request / v1 -- TECH-5822.
 
     A newly-onboarding (or handed-off) agent's request for startup/handoff
     instructions from another agent (e.g. its site orchestrator). Carries
-    no content at all, only which fixed ``InstructionKind`` it wants back —
+    no content at all, only which fixed ``InstructionKind`` it wants back --
     unlike ``note``, there is no free-text field here for a request to
     smuggle anything through, so this type is deliberately excluded from
     ``plugins.BARRIER_SENSITIVE_TYPES``.
@@ -314,24 +343,27 @@ class InstructionRequestV1(_StrictModel):
 
 
 class InstructionShareV1(_StrictModel):
-    """instruction_share / v1 — TECH-5822.
+    """instruction_share / v1 -- TECH-5822.
 
     The reply to an ``instruction_request`` (or an unsolicited push of the
     same shape): pre-defined instruction content selected from a fixed
     ``InstructionKind`` enum, never arbitrary text. Exactly one of two
     mutually-exclusive branches is populated, chosen by ``kind``'s group
     (``schemas.DOC_BACKED_INSTRUCTION_KINDS`` /
-    ``schemas.LINK_BACKED_INSTRUCTION_KINDS`` — see the module-level
+    ``schemas.LINK_BACKED_INSTRUCTION_KINDS`` -- see the module-level
     comment above ``InstructionKind``), mirroring
     ``AvailabilityResponseV1``'s either/or shape:
 
     - doc-backed kinds: ``text`` (the instruction content itself, checked
       downstream against ``instruction_registry.json``'s canonical hash for
-      that kind — this schema only bounds its length).
-    - link-backed kinds: ``link`` (a URL into a deployment-side allowlist —
-      checked downstream, not here; this schema only bounds its length).
+      that kind -- this schema only bounds its length).
+    - link-backed kinds: ``link`` (an ``https://`` URL checked downstream
+      against ``INSTRUCTION_LINK_ALLOWLIST``, an env-var-backed allowlist
+      defined in ``agent-comms-approvals``'s ``rh_comms_plugins`` package,
+      not in this repo -- this schema only enforces well-formedness: scheme
+      and length, never allowlist membership).
 
-    Unlike ``note``, this type IS in ``plugins.BARRIER_SENSITIVE_TYPES`` —
+    Unlike ``note``, this type IS in ``plugins.BARRIER_SENSITIVE_TYPES`` --
     the enum-only shape makes it safe to accept in the first place, but the
     content (which canonical text, or which link) still needs the
     downstream hash/allowlist check whenever a message would cross an
@@ -341,7 +373,10 @@ class InstructionShareV1(_StrictModel):
     type: Literal["instruction_share"] = "instruction_share"
     kind: InstructionKind
     text: str | None = Field(default=None, min_length=1, max_length=20000)
-    link: str | None = Field(default=None, min_length=1, max_length=2048)
+    # https:// only -- a javascript:/data:/file:// value would otherwise
+    # pass schema validation and be stored/forwarded verbatim (XSS/SSRF
+    # surface for any consumer that renders or fetches it downstream).
+    link: str | None = Field(default=None, min_length=1, max_length=2048, pattern=r"^https://")
 
     @model_validator(mode="after")
     def _text_or_link_per_kind_group(self) -> InstructionShareV1:

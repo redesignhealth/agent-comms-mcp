@@ -3172,6 +3172,72 @@ class TestInviteRequiresApprovalForNoteHistory:
         )
         return owner, target, conversation, client
 
+    async def _conversation_with_instruction_share(
+        self, session: AsyncSession, owner_sub: str, target_sub: str
+    ) -> tuple[Agent, Agent, Any, OwnershipClient]:
+        owner = await _register(session, owner_sub)
+        target = await _register(session, target_sub)
+        client = _FakeOwnershipClient(
+            {
+                owner.id: {"is_shared": False, "owners": ["dan"]},
+                target.id: {"is_shared": False, "owners": ["dan"]},
+            }
+        )
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="internal",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            ownership_client=client,
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="instruction_share",
+            payload={"kind": "onboarding_welcome", "text": "hello there"},
+            ownership_client=client,
+        )
+        return owner, target, conversation, client
+
+    async def test_invite_with_instruction_share_history_diverted_to_hold(
+        self, session: AsyncSession
+    ) -> None:
+        # TECH-5822, Argus round 1 BLOCKING: before this fix,
+        # _conversation_has_note_history was hardcoded to Message.type ==
+        # "note", so an internal conversation's instruction_share history
+        # (never diverted to a hold itself, since internal is never checked
+        # by BoundaryCrossingScorer) was invisible to this gate -- inviting
+        # a new participant skipped human approval despite comms_accept
+        # granting that participant a full retroactive read of the
+        # unreviewed instruction_share text. Mirrors
+        # test_invite_with_note_history_diverted_to_hold above exactly,
+        # substituting instruction_share for note.
+        owner, _target, conversation, client = await self._conversation_with_instruction_share(
+            session, "invite-hold-owner-instr-1", "invite-hold-target-instr-1"
+        )
+        new_agent = await _register(session, "invite-hold-new-instr-1")
+        client._owners_by_agent_id[new_agent.id] = {"is_shared": False, "owners": ["dan"]}
+        result = await invite(
+            session,
+            actor_sub=owner.sub,
+            inviter_agent_id=owner.id,
+            conversation_id=conversation.id,
+            target_agent_id=new_agent.id,
+            ownership_client=client,
+        )
+        assert isinstance(result, ApprovalHold)
+        assert result.kind == "invite"
+        assert result.status == "pending_human"
+        assert result.risk_reason == "note_history_requires_approval"
+        assert result.target_agent_id == new_agent.id
+
     async def test_invite_without_note_history_admitted_immediately(
         self, session: AsyncSession
     ) -> None:

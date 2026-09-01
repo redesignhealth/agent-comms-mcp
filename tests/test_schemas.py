@@ -608,6 +608,46 @@ class TestInstructionShareV1:
                 {"kind": "setup_skill_via_link", "link": "https://x/" + "y" * 2048}
             )
 
+    def test_rejects_link_backed_kind_with_both_text_and_link(self) -> None:
+        with pytest.raises(ValidationError):
+            InstructionShareV1.model_validate(
+                {
+                    "kind": "setup_skill_via_link",
+                    "text": "hello",
+                    "link": "https://example.com/setup",
+                }
+            )
+
+    @pytest.mark.parametrize(
+        "link", ["javascript:alert(1)", "data:text/html,x", "file:///etc/passwd", "http://x.com"]
+    )
+    def test_rejects_non_https_link_schemes(self, link: str) -> None:
+        with pytest.raises(ValidationError):
+            InstructionShareV1.model_validate({"kind": "setup_skill_via_link", "link": link})
+
+
+class TestInstructionKindPartitionGuard:
+    """Argus round 1, TECH-5822 SUGGESTION: exercise
+    _check_instruction_kind_partition directly, the same monkeypatch style
+    TestMessageTypeDriftGuard below uses for its own drift guard."""
+
+    def test_passes_on_the_real_current_values(self) -> None:
+        schemas._check_instruction_kind_partition()
+
+    def test_raises_on_overlap(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        overlapping = DOC_BACKED_INSTRUCTION_KINDS | {next(iter(LINK_BACKED_INSTRUCTION_KINDS))}
+        monkeypatch.setattr(schemas, "DOC_BACKED_INSTRUCTION_KINDS", overlapping)
+        with pytest.raises(RuntimeError, match="no longer exactly partition"):
+            schemas._check_instruction_kind_partition()
+
+    def test_raises_on_gap(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        missing = next(iter(DOC_BACKED_INSTRUCTION_KINDS))
+        monkeypatch.setattr(
+            schemas, "DOC_BACKED_INSTRUCTION_KINDS", DOC_BACKED_INSTRUCTION_KINDS - {missing}
+        )
+        with pytest.raises(RuntimeError, match="no longer exactly partition"):
+            schemas._check_instruction_kind_partition()
+
 
 class TestMessageTypeDriftGuard:
     """TECH-5377 (Argus round-1 SUGGESTION): the guard itself is exercised

@@ -88,9 +88,25 @@ BARRIER_SENSITIVE_TYPES: frozenset[str] = frozenset({"note", "instruction_share"
 # RHAutoApprover rule (it hashes an incoming instruction_share's ``text``
 # and compares against the value loaded here) -- this repo only owns the
 # canonical text and its hash, the same "code-owns-the-vocabulary, deploy-
-# side-owns-the-judgment" split as the link allowlist
-# (``INSTRUCTION_LINK_ALLOWLIST``, also deployment-side).
+# side-owns-the-judgment" split as the link-backed kinds' allowlist, which
+# lives entirely in agent-comms-approvals (the ``INSTRUCTION_LINK_ALLOWLIST``
+# env var read by that repo's ``rh_comms_plugins`` package) -- there is no
+# identifier of that name anywhere in this repo; it's named here only to
+# point at where the analogous control actually lives.
 INSTRUCTION_REGISTRY_PATH = Path(__file__).with_name("instruction_registry.json")
+
+
+def normalize_instruction_text(text: str) -> str:
+    """Whitespace-collapse + strip + lowercase -- the exact, load-bearing
+    normalization recipe applied before hashing an ``instruction_share``
+    doc-backed ``text`` for comparison against its registry entry's
+    ``sha256``. Exported (not just used internally) so agent-comms-approvals'
+    ``RHAutoApprover`` rule -- which performs the actual comparison at
+    hold-review time, this repo only owns the canonical vocabulary -- can
+    import this exact function rather than reimplementing it from a
+    docstring/PR-description description, which is what let a
+    reimplementation silently diverge before this function existed."""
+    return " ".join(text.split()).strip().lower()
 
 
 def _load_instruction_registry_hashes(raw: dict[str, Any]) -> dict[str, str]:
@@ -98,11 +114,17 @@ def _load_instruction_registry_hashes(raw: dict[str, Any]) -> dict[str, str]:
 
     Raises ``RuntimeError`` (not a bare ``assert`` -- see
     ``schemas._check_message_type_literal_matches_schemas``'s docstring for
-    why this codebase avoids asserts for fail-loud invariants) if the
-    registry's keys don't exactly match
-    ``schemas.DOC_BACKED_INSTRUCTION_KINDS``. Factored out from the
-    file-loading call below so a test can exercise the drift guard against a
-    deliberately-broken dict without touching the real file on disk.
+    why this codebase avoids asserts for fail-loud invariants) if:
+    - the registry's keys don't exactly match
+      ``schemas.DOC_BACKED_INSTRUCTION_KINDS``;
+    - any entry is malformed (not a dict, or missing ``sha256``/``text``);
+    - any entry's stored ``sha256`` doesn't match
+      ``sha256(normalize_instruction_text(entry["text"]))`` -- this
+      self-consistency check is what actually guarantees the registry is
+      internally correct at boot, rather than only checking key-set shape
+      and trusting the stored hash blindly. Factored out from the
+      file-loading call below so a test can exercise both guards against a
+      deliberately-broken dict without touching the real file on disk.
     """
     registry_kinds = frozenset(raw)
     if registry_kinds != DOC_BACKED_INSTRUCTION_KINDS:
@@ -112,7 +134,26 @@ def _load_instruction_registry_hashes(raw: dict[str, Any]) -> dict[str, str]:
             f"registry-only: {registry_kinds - DOC_BACKED_INSTRUCTION_KINDS}, "
             f"kinds-only: {DOC_BACKED_INSTRUCTION_KINDS - registry_kinds}"
         )
-    return {kind: entry["sha256"] for kind, entry in raw.items()}
+    hashes: dict[str, str] = {}
+    for kind, entry in raw.items():
+        if not isinstance(entry, dict) or "sha256" not in entry or "text" not in entry:
+            raise RuntimeError(
+                f"instruction_registry.json entry for {kind!r} is malformed -- "
+                "expected a dict with 'text' and 'sha256' keys, "
+                f"got: {entry!r}"
+            )
+        expected_hash = hashlib.sha256(
+            normalize_instruction_text(entry["text"]).encode("utf-8")
+        ).hexdigest()
+        if entry["sha256"] != expected_hash:
+            raise RuntimeError(
+                f"instruction_registry.json entry for {kind!r} has a stale/wrong "
+                f"sha256 -- stored={entry['sha256']!r}, "
+                f"recomputed-from-text={expected_hash!r}. Recompute and update "
+                "the stored hash whenever the canonical text changes."
+            )
+        hashes[kind] = entry["sha256"]
+    return hashes
 
 
 def _read_instruction_registry() -> dict[str, str]:
@@ -839,6 +880,7 @@ __all__ = [
     "get_approval_notifier",
     "get_auto_approver",
     "get_risk_scorer",
+    "normalize_instruction_text",
     "notifier_name",
     "resolve_plugin",
     "resolve_plugin_name",

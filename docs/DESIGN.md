@@ -463,7 +463,10 @@ Design notes:
 ## 6. Message schemas (two-axis model)
 
 Strict Pydantic (`extra='forbid'`), timezone-aware datetimes only, enum-coded reasons,
-**no free-text fields anywhere except `note`**. All types legal only in `state=active`.
+**no free-text fields anywhere except `note` and `instruction_share`'s doc-backed kinds**
+(TECH-5822 — the latter's `text` is drawn from a closed `InstructionKind` enum and
+verified downstream against a canonical per-kind hash, so it is bounded, pre-approved
+free text, not an open channel). All types legal only in `state=active`.
 
 The `boundary_safe` column (below) no longer exists as a schema field (TECH-5389):
 which types can cross an ownership boundary is now scorer-private policy
@@ -486,6 +489,8 @@ crossing a boundary no longer denies the send — it diverts to a human-approval
 | `task_decline` | no | reason (enum) | member-only; transitions conversation → `canceled` |
 | `task_cancel` | no | reason (enum) | owner-only; transitions conversation → `canceled` |
 | `note` | **yes** | text (string) | free-text note; posts immediately unless it would cross a boundary, in which case it is held for human approval (never denied for that reason alone — see §9) |
+| `instruction_request` | no | kind (closed `InstructionKind` enum) | a newly-onboarding/handed-off agent's request for one of a fixed set of startup/handoff instructions; no content, so not boundary-sensitive |
+| `instruction_share` | **yes** | kind (`InstructionKind`) + exactly one of text (doc-backed kinds, 1-20000 chars) or link (link-backed kinds, `https://` URL, 1-2048 chars), per `kind`'s group | pre-defined instruction content, never arbitrary text; same posts-immediately-unless-crossing-a-boundary behavior as `note`. Content verified downstream (agent-comms-approvals' `RHAutoApprover`): doc-backed `text` against a canonical per-kind hash, link-backed `link` against a deployment-side allowlist — a mismatch always escalates to a human, never auto-clears |
 | `conversation_opened` | no (exempt) | reason (enum, fixed `"pending_approval"`) | service-synthesized-only marker; never legal as a caller-supplied `message_type` (`denied.system_message_type`); the seq-1 message of a conversation whose real opener was diverted to a hold (§9) |
 
 ## 7. MCP tool surface
@@ -641,23 +646,32 @@ invite that fails its predicate is denied, preventing unilateral de-isolation
 of an `internal` conversation or a boundary-violating expansion of an
 `asymmetric` one.
 
-**Any invite into a conversation with existing free-text (`note`) history
+**Any invite into a conversation with existing free-text history — `note` or
+`instruction_share` (TECH-5822; jointly, `plugins.BARRIER_SENSITIVE_TYPES`) —
 requires human approval (TECH-5735), regardless of conversation type.**
 `comms_accept` grants a new participant full retroactive read access to every
-existing message the moment it accepts — including any `note`, whose content
-is unstructured and can't be risk-scored the way ownership sets can. A
-per-message check can never catch this, because the exposure isn't "a new
-risky message was sent" — it's "someone new can now read messages that were
-already fine to send at the time." So `invite` itself checks whether the
-target conversation has ANY `note` message and, if so, diverts to an
-`approval_holds` row (`kind="invite"`) instead of creating the `Participant`
-row directly — same `held_for_approval`/`hold_id` shape `comms_post_message`
-already uses, reusing the same `AutoApprover` seam (v1: always escalates) and
-the same per-sender hold-creation rate limit. Approving creates the
-`Participant` row (`status="invited"`); rejecting creates nothing. See
-`ApprovalHold`'s class docstring (models.py) for the two hold shapes this
-produces, and Axis 2 below for the (separate, message-shaped) hold pipeline
-this reuses.
+existing message the moment it accepts — including any `note` or
+`instruction_share`, whose content is unstructured (or, for `instruction_share`,
+verified only at send time against a specific canonical value, not re-verified
+retroactively for a new reader) and can't be risk-scored the way ownership sets
+can. A per-message check can never catch this, because the exposure isn't "a
+new risky message was sent" — it's "someone new can now read messages that
+were already fine to send at the time." So `invite` itself checks whether the
+target conversation has ANY message of a `BARRIER_SENSITIVE_TYPES` type and,
+if so, diverts to an `approval_holds` row (`kind="invite"`) instead of creating
+the `Participant` row directly — same `held_for_approval`/`hold_id` shape
+`comms_post_message` already uses, reusing the same `AutoApprover` seam (v1:
+always escalates) and the same per-sender hold-creation rate limit. This gate
+is deliberately driven by `plugins.BARRIER_SENSITIVE_TYPES` itself, not a
+separately-maintained type list, so a future type joining that set can never
+silently bypass it (TECH-5822 Argus round 1 BLOCKING: this check was briefly
+hardcoded to `type == "note"` after `instruction_share` was added to
+`BARRIER_SENSITIVE_TYPES` but before this invite gate caught up, exposing
+unreviewed `instruction_share` text via an `internal` conversation's invite).
+Approving creates the `Participant` row (`status="invited"`); rejecting
+creates nothing. See `ApprovalHold`'s class docstring (models.py) for the two
+hold shapes this produces, and Axis 2 below for the (separate, message-shaped)
+hold pipeline this reuses.
 
 ### Axis 2: per-message risk scoring (pluggable) [TECH-5389]
 

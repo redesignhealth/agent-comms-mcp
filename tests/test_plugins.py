@@ -540,27 +540,84 @@ class TestInstructionRegistryDriftGuard:
             assert len(digest) == 64, kind
             int(digest, 16)  # raises ValueError if not valid hex
 
-    def test_loader_accepts_matching_keys(self) -> None:
-        raw = {kind: {"sha256": "0" * 64} for kind in schemas.DOC_BACKED_INSTRUCTION_KINDS}
+    def test_real_registry_hashes_match_recomputed_text_hash(self) -> None:
+        # Argus round 1, TECH-5822 BLOCKING: the well-formed-hex check above
+        # alone can't catch a stored hash that's simply wrong for its own
+        # text -- only an independent recompute-and-compare can. This is
+        # deliberately independent of _load_instruction_registry_hashes'
+        # own self-consistency check (below) so a bug in that function
+        # can't hide a real registry/text mismatch from the test suite too.
+        with plugins.INSTRUCTION_REGISTRY_PATH.open("r", encoding="utf-8") as f:
+            raw = json.load(f)
+        for kind, entry in raw.items():
+            expected = hashlib.sha256(
+                plugins.normalize_instruction_text(entry["text"]).encode("utf-8")
+            ).hexdigest()
+            assert entry["sha256"] == expected, (
+                f"{kind}: stored hash does not match sha256(normalize(text))"
+            )
+
+    def _entry(self, text: str = "placeholder text") -> dict[str, str]:
+        return {
+            "text": text,
+            "sha256": hashlib.sha256(
+                plugins.normalize_instruction_text(text).encode("utf-8")
+            ).hexdigest(),
+        }
+
+    def test_loader_accepts_matching_keys_with_correct_hashes(self) -> None:
+        raw = {kind: self._entry() for kind in schemas.DOC_BACKED_INSTRUCTION_KINDS}
         result = plugins._load_instruction_registry_hashes(raw)
         assert frozenset(result) == schemas.DOC_BACKED_INSTRUCTION_KINDS
 
     def test_loader_raises_on_missing_kind(self) -> None:
         missing = next(iter(schemas.DOC_BACKED_INSTRUCTION_KINDS))
         raw = {
-            kind: {"sha256": "0" * 64}
-            for kind in schemas.DOC_BACKED_INSTRUCTION_KINDS
-            if kind != missing
+            kind: self._entry() for kind in schemas.DOC_BACKED_INSTRUCTION_KINDS if kind != missing
         }
         with pytest.raises(RuntimeError, match="drifted out of sync"):
             plugins._load_instruction_registry_hashes(raw)
 
     def test_loader_raises_on_unknown_extra_kind(self) -> None:
-        raw = {kind: {"sha256": "0" * 64} for kind in schemas.DOC_BACKED_INSTRUCTION_KINDS}
-        raw["not_a_real_kind"] = {"sha256": "0" * 64}
+        raw = {kind: self._entry() for kind in schemas.DOC_BACKED_INSTRUCTION_KINDS}
+        raw["not_a_real_kind"] = self._entry()
         with pytest.raises(RuntimeError, match="drifted out of sync"):
             plugins._load_instruction_registry_hashes(raw)
 
     def test_loader_raises_on_completely_wrong_keys(self) -> None:
         with pytest.raises(RuntimeError, match="drifted out of sync"):
-            plugins._load_instruction_registry_hashes({"totally_unrelated": {"sha256": "0" * 64}})
+            plugins._load_instruction_registry_hashes({"totally_unrelated": self._entry()})
+
+    def test_loader_raises_on_malformed_entry_missing_text(self) -> None:
+        raw = {kind: self._entry() for kind in schemas.DOC_BACKED_INSTRUCTION_KINDS}
+        bad_kind = next(iter(schemas.DOC_BACKED_INSTRUCTION_KINDS))
+        raw[bad_kind] = {"sha256": "0" * 64}  # no "text" key
+        with pytest.raises(RuntimeError, match="malformed"):
+            plugins._load_instruction_registry_hashes(raw)
+
+    def test_loader_raises_on_malformed_entry_not_a_dict(self) -> None:
+        raw = {kind: self._entry() for kind in schemas.DOC_BACKED_INSTRUCTION_KINDS}
+        bad_kind = next(iter(schemas.DOC_BACKED_INSTRUCTION_KINDS))
+        raw[bad_kind] = "not a dict"
+        with pytest.raises(RuntimeError, match="malformed"):
+            plugins._load_instruction_registry_hashes(raw)
+
+    def test_loader_raises_on_hash_mismatch(self) -> None:
+        # Argus round 1, TECH-5822 BLOCKING: the loader must verify
+        # hash(normalize(text)) == stored sha256 at boot, not just trust it.
+        raw = {kind: self._entry() for kind in schemas.DOC_BACKED_INSTRUCTION_KINDS}
+        bad_kind = next(iter(schemas.DOC_BACKED_INSTRUCTION_KINDS))
+        raw[bad_kind] = {"text": "some real text", "sha256": "0" * 64}
+        with pytest.raises(RuntimeError, match="stale/wrong sha256"):
+            plugins._load_instruction_registry_hashes(raw)
+
+
+class TestNormalizeInstructionText:
+    def test_collapses_whitespace_strips_and_lowercases(self) -> None:
+        assert plugins.normalize_instruction_text("  Hello   World \n\tFoo  ") == "hello world foo"
+
+    def test_empty_string(self) -> None:
+        assert plugins.normalize_instruction_text("") == ""
+
+    def test_already_normalized_text_is_unchanged(self) -> None:
+        assert plugins.normalize_instruction_text("already normalized") == "already normalized"

@@ -180,6 +180,7 @@ from exceptions import (
 )
 from models import Agent, ApprovalHold, AuditLog, Conversation, Message, Participant
 from plugins import (
+    BARRIER_SENSITIVE_TYPES,
     ActiveChecker,
     ApprovalNotification,
     ApprovalNotifier,
@@ -3357,20 +3358,36 @@ async def _authorize_invite_owner_freeze(
 
 
 async def _conversation_has_note_history(session: AsyncSession, conversation_id: uuid.UUID) -> bool:
-    """Has any ``note`` (free-text) message ever been posted to this
-    conversation? Used by ``invite`` (TECH-5735) to decide whether
-    admitting a new participant requires human approval first —
-    ``comms_accept`` grants full retroactive history read the moment a
-    participant is admitted, and free text can't be structurally
+    """Has any free-text message (``plugins.BARRIER_SENSITIVE_TYPES`` --
+    ``note``, or ``instruction_share``'s doc-backed ``text``, TECH-5822)
+    ever been posted to this conversation? Used by ``invite`` (TECH-5735)
+    to decide whether admitting a new participant requires human approval
+    first -- ``comms_accept`` grants full retroactive history read the
+    moment a participant is admitted, and free text can't be structurally
     guaranteed safe the way ownership equality can (see
     ``_authorize_conversation_open``'s ``is_shared`` exclusion), so the
     check has to run at invite time, treating the invitee as though it
-    will read every ``note`` that already exists.
+    will read every barrier-sensitive message that already exists.
+
+    Deliberately checks ``plugins.BARRIER_SENSITIVE_TYPES`` (not a
+    separately-maintained set) so this gate can never silently miss a type
+    that ``BoundaryCrossingScorer`` itself already treats as free-text-risky
+    -- the two lists staying in lockstep is exactly the property that broke
+    when this function was still hardcoded to ``Message.type == "note"``
+    and ``instruction_share`` joined ``BARRIER_SENSITIVE_TYPES`` without a
+    matching update here (TECH-5822 Argus round 1 BLOCKING finding: an
+    ``internal`` conversation's ``instruction_share`` history was invisible
+    to this gate, so inviting a new participant into it skipped human
+    approval despite exposing unreviewed free text via
+    ``comms_accept``'s retroactive read).
     """
     return (
         await session.execute(
             select(Message.id)
-            .where(Message.conversation_id == conversation_id, Message.type == "note")
+            .where(
+                Message.conversation_id == conversation_id,
+                Message.type.in_(BARRIER_SENSITIVE_TYPES),
+            )
             .limit(1)
         )
     ).first() is not None
