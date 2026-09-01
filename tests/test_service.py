@@ -2385,6 +2385,38 @@ class TestConversationOwnershipAdmission:
                 ownership_client=client,
             )
 
+    async def test_asymmetric_multi_target_shared_bypass_does_not_leak_to_non_shared_pair(
+        self, session: AsyncSession
+    ) -> None:
+        """Argus round 1 fix (TECH-5786 PR follow-up), regression coverage:
+        one shared target must only bypass the pairwise check for ITS OWN
+        pair, not for the whole conversation. initiator(dan) + shared
+        target(priya, disjoint but bypassed) + non-shared target(sam,
+        disjoint from initiator and never bypassed) -- the shared pair
+        alone must not admit the second, unrelated non-shared pair, which
+        is exactly the ``_pairwise_admitted`` docstring's own example."""
+        initiator = await _register(session, "asym-multi-initiator")
+        shared_target = await _register(session, "asym-multi-shared-target")
+        other_target = await _register(session, "asym-multi-nonshared-target")
+        client = _FakeOwnershipClient(
+            {
+                initiator.id: {"is_shared": False, "owners": ["dan"]},
+                shared_target.id: {"is_shared": True, "owners": ["priya"]},
+                other_target.id: {"is_shared": False, "owners": ["sam"]},
+            }
+        )
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await start_conversation(
+                session,
+                actor_sub=initiator.sub,
+                initiator_agent_id=initiator.id,
+                conversation_type="asymmetric",
+                target_agent_ids=[shared_target.id, other_target.id],
+                initial_message=_request_payload(),
+                ownership_client=client,
+            )
+        assert exc_info.value.reason == "denied.no_owner_overlap"
+
     async def test_open_never_touches_ownership_client(self, session: AsyncSession) -> None:
         owner = await _register(session, "open-owner-1")
         target = await _register(session, "open-target-1")
@@ -2981,11 +3013,13 @@ class TestInviteOwnerFreeze:
         ``asymmetric`` invite target whose owner set is disjoint from the
         frozen snapshot is still ``denied.owner_set_frozen``, even when
         that target is ``is_shared``. Unlike the open-time bypass, an
-        invite grants the target full RETROACTIVE history read the instant
-        it's admitted, and the risk scorer's shared-recipient review only
-        covers messages sent AFTER admission -- so bypassing this check
-        would let a shared, disjoint-owner target read the conversation's
-        entire existing history with no hold and no audit event."""
+        invite grants the target full RETROACTIVE read of every message
+        that PREDATES it -- messages sent from the invite onward are
+        already covered by the risk scorer's shared-recipient review
+        (its "other" set includes ``invited`` participants, not just
+        ``active`` ones) -- so bypassing this check would let a shared,
+        disjoint-owner target read the conversation's pre-existing history
+        with no hold and no audit event."""
         owner = await _register(session, "freeze-asym-shared-target-owner")
         target = await _register(session, "freeze-asym-shared-target-target")
         client = _FakeOwnershipClient(

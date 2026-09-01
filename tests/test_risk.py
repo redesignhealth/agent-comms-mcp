@@ -405,13 +405,43 @@ class TestAsymmetricConversationType:
         assert verdict.reason == "boundary_crossing"
         assert verdict.detail == {"reason": "shared_recipient"}
 
-    async def test_sender_lookup_failure_raises_ownership_unverified(self) -> None:
+    async def test_non_sensitive_type_fails_closed_on_ownership_outage(self) -> None:
+        """Argus round 2 (TECH-5786 PR follow-up): a non-sensitive type in
+        ``asymmetric`` used to be immune to an ownership-service outage --
+        the ``BARRIER_SENSITIVE_TYPES`` filter ran first and returned low
+        risk with no lookup at all. Now that the shared-recipient check
+        resolves ``other_infos`` for EVERY message type, a lookup failure
+        must fail closed for a non-sensitive type too, not just a
+        sensitive one."""
         ctx = _ctx(
             conversation_type="asymmetric",
-            message_type=_SENSITIVE_TYPE,
+            message_type=_SAFE_TYPE,
             sender_agent_id=uuid.uuid4(),
             other_agent_ids=[uuid.uuid4()],
             ownership_client=_FailingOwnershipClient(),
+        )
+        with pytest.raises(RiskScoringInfraError) as exc_info:
+            await BoundaryCrossingScorer().score(ctx)
+        assert exc_info.value.cause == "ownership_unverified"
+
+    async def test_sender_lookup_failure_raises_ownership_unverified(self) -> None:
+        """Deliberately does NOT use ``_FailingOwnershipClient`` for both
+        sides (Argus round 2, TECH-5786 PR follow-up): since the
+        shared-recipient check now resolves ``other_infos`` FIRST, a
+        client that fails unconditionally would raise there instead,
+        leaving the SENDER-specific failure path (below the
+        shared-recipient check and the ``BARRIER_SENSITIVE_TYPES`` filter)
+        untested. ``other`` succeeds and is non-shared here so execution
+        actually reaches the sender lookup before failing."""
+        sender = uuid.uuid4()
+        other = uuid.uuid4()
+        client = _FakeOwnershipClient({other: {"is_shared": False, "owners": ["dan"]}})
+        ctx = _ctx(
+            conversation_type="asymmetric",
+            message_type=_SENSITIVE_TYPE,
+            sender_agent_id=sender,
+            other_agent_ids=[other],
+            ownership_client=client,
         )
         with pytest.raises(RiskScoringInfraError) as exc_info:
             await BoundaryCrossingScorer().score(ctx)

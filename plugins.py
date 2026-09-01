@@ -247,7 +247,12 @@ class BoundaryCrossingScorer:
         # class docstring. Deliberately does not touch `other_infos`'
         # "owners" sets at all: a shared agent's set is a roster, not the
         # point here.
-        if any(info.get("is_shared") for info in other_infos):
+        # Explicit `is True` (Argus round 2, TECH-5786 PR follow-up), not
+        # bare truthiness: the current DB-backed OwnershipClient always
+        # returns a real bool, but a future malformed or HTTP-backed
+        # response with `None`/`0`/a missing key must not silently be
+        # treated as "not shared" for a check this security-relevant.
+        if any(info.get("is_shared") is True for info in other_infos):
             return RiskVerdict(
                 high_risk=True,
                 reason="boundary_crossing",
@@ -262,7 +267,7 @@ class BoundaryCrossingScorer:
         except Exception as exc:
             raise RiskScoringInfraError("ownership_unverified") from exc
 
-        if sender_info.get("is_shared"):
+        if sender_info.get("is_shared") is True:
             return RiskVerdict(high_risk=False, reason=None, detail={"bypass": "shared_sender"})
         sender_owners = frozenset(sender_info.get("owners") or [])
         if not sender_owners:
