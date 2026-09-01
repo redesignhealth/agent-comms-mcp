@@ -333,6 +333,16 @@ MAX_LOOKUP_EMAIL_LENGTH = 254
 # _divert_invite_for_approval.
 INVITE_HOLD_MESSAGE_TYPE = "invite"
 INVITE_HOLD_SCHEMA_VERSION = 1
+# Argus round 2, TECH-5822 SUGGESTION: these two string VALUES are a
+# cross-repo audit-vocabulary contract (agent-comms-approvals'
+# RHAutoApprover and any consumer of ApprovalHold.risk_reason/scorer_label
+# branch on the literal values, not the Python identifier names) -- renaming
+# the values themselves is a breaking change requiring coordination with
+# that repo, so deliberately NOT done here even though the names now read
+# "note"-specific. Since _conversation_has_note_history checks
+# BARRIER_SENSITIVE_TYPES (TECH-5822), these values are emitted for ANY
+# barrier-sensitive free-text history (today: note or instruction_share),
+# not just note history -- the historical name undersells what they cover.
 INVITE_HOLD_RISK_REASON = "note_history_requires_approval"
 INVITE_HOLD_RISK_SCORER_LABEL = "invite_note_history_v1"
 

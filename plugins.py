@@ -41,7 +41,7 @@ import os
 import uuid
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
-from pathlib import Path
+from importlib.resources import files
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
 import httpx
@@ -93,11 +93,22 @@ BARRIER_SENSITIVE_TYPES: frozenset[str] = frozenset({"note", "instruction_share"
 # env var read by that repo's ``rh_comms_plugins`` package) -- there is no
 # identifier of that name anywhere in this repo; it's named here only to
 # point at where the analogous control actually lives.
-INSTRUCTION_REGISTRY_PATH = Path(__file__).with_name("instruction_registry.json")
+# Lives inside the `providers` PACKAGE (not alongside this py-module) and is
+# loaded via `importlib.resources`, not `Path(__file__)` -- Argus round 2,
+# TECH-5822 BLOCKING: this repo's `pyproject.toml` ships `plugins.py` etc. as
+# bare `py-modules`, which setuptools has no package-data mechanism for, so a
+# file sitting next to `plugins.py` (the round-1 shape) is silently dropped
+# from any built wheel. `providers` IS a real package (`packages = [...]` in
+# pyproject.toml, with `[tool.setuptools.package-data]` covering this exact
+# file) and `importlib.resources` resolves correctly whether the package is
+# installed from a wheel, run from a Docker `COPY . .` checkout, or run
+# in-place from a git clone -- unlike `Path(__file__)`, which only ever
+# worked for the last two.
+INSTRUCTION_REGISTRY_PATH = files("providers").joinpath("instruction_registry.json")
 
 
 def normalize_instruction_text(text: str) -> str:
-    """Whitespace-collapse + strip + lowercase -- the exact, load-bearing
+    """Whitespace-collapse + lowercase -- the exact, load-bearing
     normalization recipe applied before hashing an ``instruction_share``
     doc-backed ``text`` for comparison against its registry entry's
     ``sha256``. Exported (not just used internally) so agent-comms-approvals'
@@ -105,8 +116,15 @@ def normalize_instruction_text(text: str) -> str:
     hold-review time, this repo only owns the canonical vocabulary -- can
     import this exact function rather than reimplementing it from a
     docstring/PR-description description, which is what let a
-    reimplementation silently diverge before this function existed."""
-    return " ".join(text.split()).strip().lower()
+    reimplementation silently diverge before this function existed.
+
+    No separate ``.strip()`` call (Argus round 2 SUGGESTION): ``str.split()``
+    with no argument already splits on every whitespace run, including
+    leading/trailing ones, and discards the resulting empty tokens, so
+    ``" ".join(text.split())`` can never itself produce a leading or
+    trailing space for ``.strip()`` to remove -- it would always be a no-op.
+    """
+    return " ".join(text.split()).lower()
 
 
 def _load_instruction_registry_hashes(raw: dict[str, Any]) -> dict[str, str]:
@@ -136,10 +154,14 @@ def _load_instruction_registry_hashes(raw: dict[str, Any]) -> dict[str, str]:
         )
     hashes: dict[str, str] = {}
     for kind, entry in raw.items():
-        if not isinstance(entry, dict) or "sha256" not in entry or "text" not in entry:
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("text"), str)
+            or not isinstance(entry.get("sha256"), str)
+        ):
             raise RuntimeError(
                 f"instruction_registry.json entry for {kind!r} is malformed -- "
-                "expected a dict with 'text' and 'sha256' keys, "
+                "expected a dict with string 'text' and 'sha256' keys, "
                 f"got: {entry!r}"
             )
         expected_hash = hashlib.sha256(

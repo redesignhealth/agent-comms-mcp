@@ -619,7 +619,18 @@ class TestInstructionShareV1:
             )
 
     @pytest.mark.parametrize(
-        "link", ["javascript:alert(1)", "data:text/html,x", "file:///etc/passwd", "http://x.com"]
+        "link",
+        [
+            "javascript:alert(1)",
+            "data:text/html,x",
+            "file:///etc/passwd",
+            "http://x.com",
+            # Argus round 2, TECH-5822 BLOCKING: the un-anchored r"^https://"
+            # pattern from round 1 passed this via re.search (string starts
+            # with https://) while smuggling a javascript: payload after an
+            # embedded newline.
+            "https://safe.example.com\njavascript:alert(1)",
+        ],
     )
     def test_rejects_non_https_link_schemes(self, link: str) -> None:
         with pytest.raises(ValidationError):

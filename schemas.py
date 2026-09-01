@@ -12,9 +12,10 @@ Validation rules:
 - Enumerated string fields are closed ``Literal`` sets. Outside ``note``
   and ``instruction_share``, no free-text fields anywhere — every other
   field is a bounded numeric/datetime/enum value or a bounded list of them.
-  ``instruction_share``'s ``text`` is itself drawn from a closed
-  ``InstructionKind`` enum and verified downstream against a canonical hash
-  (see that model's docstring) — it is bounded free text, not an open
+  ``instruction_share``'s ``kind`` (not ``text`` itself) is drawn from a
+  closed ``InstructionKind`` enum; ``text`` is bounded by ``max_length`` and
+  verified downstream against a canonical per-``kind`` hash (see that
+  model's docstring) — bounded, pre-approved free text, not an open
   channel.
 
 Discriminator field: every top-level message model also carries a
@@ -376,7 +377,22 @@ class InstructionShareV1(_StrictModel):
     # https:// only -- a javascript:/data:/file:// value would otherwise
     # pass schema validation and be stored/forwarded verbatim (XSS/SSRF
     # surface for any consumer that renders or fetches it downstream).
-    link: str | None = Field(default=None, min_length=1, max_length=2048, pattern=r"^https://")
+    # Argus round 2, TECH-5822 BLOCKING: r"^https://" alone has no end
+    # anchor, and pattern matching here searches for the regex anywhere in
+    # the string -- "https://safe.example.com\njavascript:alert(1)" would
+    # pass (the string STARTS with https://) while storing an embedded
+    # javascript: payload verbatim after a newline, defeating the whole
+    # point of this restriction for any consumer that splits on lines.
+    # [^\r\n]+ excludes embedded line terminators, and $ anchors to true
+    # end-of-string here: pydantic-core's regex engine (Rust's `regex`
+    # crate, not Python's `re`) has no "also matches just before a trailing
+    # newline" special case for `$` outside `(?m)` mode -- verified
+    # directly (a trailing "\n" after the URL is correctly rejected) --
+    # so `$` alone is sufficient and `\Z` (a Python re-only escape) is
+    # neither needed nor valid in this engine.
+    link: str | None = Field(
+        default=None, min_length=1, max_length=2048, pattern=r"^https://[^\r\n]+$"
+    )
 
     @model_validator(mode="after")
     def _text_or_link_per_kind_group(self) -> InstructionShareV1:

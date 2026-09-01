@@ -464,9 +464,10 @@ Design notes:
 
 Strict Pydantic (`extra='forbid'`), timezone-aware datetimes only, enum-coded reasons,
 **no free-text fields anywhere except `note` and `instruction_share`'s doc-backed kinds**
-(TECH-5822 — the latter's `text` is drawn from a closed `InstructionKind` enum and
-verified downstream against a canonical per-kind hash, so it is bounded, pre-approved
-free text, not an open channel). All types legal only in `state=active`.
+(TECH-5822 — the latter's `kind`, not `text` itself, is drawn from a closed
+`InstructionKind` enum; `text` is bounded by `max_length` and verified downstream
+against a canonical per-kind hash, so it is bounded, pre-approved free text, not an
+open channel). All types legal only in `state=active`.
 
 The `boundary_safe` column (below) no longer exists as a schema field (TECH-5389):
 which types can cross an ownership boundary is now scorer-private policy
@@ -519,7 +520,7 @@ scroll-to-load-more use case.
 | `comms_list_conversations` | comms:read | paginated conversation list, filterable by `role`, `type`, and `state`; both `invited` and `active` participant statuses included |
 | `comms_accept` | comms:write | flips caller's participant status `invited → active`. Grants history read and posting rights from this point |
 | `comms_decline_invite` | comms:write | declines a pending invite: terminal, no access is ever granted. Requires caller to currently be `invited`. Distinct from `comms_leave` (which covers already-`active` members), keeping the audit trail clean |
-| `comms_invite` | comms:write | adds a target as `invited` (not `active`); a registry-retired target (TECH-5703) raises the same specific "agent retired" error `comms_start_conversation` does. `internal` additionally never admits an `is_shared` target (TECH-5735, §9 Axis 1). **Two response shapes**, same convention as `comms_post_message`: the normal invited-participant shape (`conversation_id`, `target_agent_id`, `status`, `invited_by`, plus `auto_approved: true` + `hold_id` when an `AutoApprover` cleared an invite hold inline rather than this being the ordinary no-hold path), or — if the conversation already has any `note` (free-text) history — `{"held_for_approval": true, "hold_id", "conversation_id", "status", "risk_reason", "expires_at", "created_at"}` (plus `decision_url` when `DECISION_PAGE_BASE_URL` is configured) (§9 Axis 1's free-text invite-approval rule; TECH-5735) — admitting a new participant grants it full retroactive history read the moment it accepts, so that requires human approval first, same as a high-risk message does |
+| `comms_invite` | comms:write | adds a target as `invited` (not `active`); a registry-retired target (TECH-5703) raises the same specific "agent retired" error `comms_start_conversation` does. `internal` additionally never admits an `is_shared` target (TECH-5735, §9 Axis 1). **Two response shapes**, same convention as `comms_post_message`: the normal invited-participant shape (`conversation_id`, `target_agent_id`, `status`, `invited_by`, plus `auto_approved: true` + `hold_id` when an `AutoApprover` cleared an invite hold inline rather than this being the ordinary no-hold path), or — if the conversation already has any `note` or `instruction_share` history (`plugins.BARRIER_SENSITIVE_TYPES`, TECH-5735/TECH-5822) — `{"held_for_approval": true, "hold_id", "conversation_id", "status", "risk_reason", "expires_at", "created_at"}` (plus `decision_url` when `DECISION_PAGE_BASE_URL` is configured) (§9 Axis 1's free-text invite-approval rule) — admitting a new participant grants it full retroactive history read the moment it accepts, so that requires human approval first, same as a high-risk message does |
 | `comms_leave` | comms:write | leave: covers already-active members |
 
 ## 8. Security invariants
@@ -533,15 +534,19 @@ scroll-to-load-more use case.
  never posts), or `pending_human` (awaiting a decision). The same
  pipeline gates a second kind of hold, `kind=invite` (TECH-5735): a new
  participant is never admitted into a conversation with existing free-text
- (`note`) history without the identical explicit approval — never
- silently invited, never silently dropped, and approval creates the
- `participants` row (not a `messages` row) under the same three-outcome
- contract.
-3. Typed, schema-validated payloads only. No free text except `note`,
- which now posts immediately when it doesn't cross a boundary and is held
- for human approval (never silently dropped, never denied for that reason
- alone) when it would (§9). Scorer INFRASTRUCTURE failure (an unscorable
- message) still hard-denies via `denied.risk_unscored` — it never floods
+ (`note` or `instruction_share`, TECH-5822; jointly,
+ `plugins.BARRIER_SENSITIVE_TYPES`) history without the identical explicit
+ approval — never silently invited, never silently dropped, and approval
+ creates the `participants` row (not a `messages` row) under the same
+ three-outcome contract.
+3. Typed, schema-validated payloads only. No free text except `note` and
+ `instruction_share`'s doc-backed kinds (TECH-5822 — bounded by
+ `max_length` and verified downstream against a canonical per-kind hash,
+ not an open channel), which now post immediately when they don't cross a
+ boundary and are held for human approval (never silently dropped, never
+ denied for that reason alone) when they would (§9). Scorer INFRASTRUCTURE
+ failure (an unscorable message) still hard-denies via `denied.risk_unscored`
+ — it never floods
  the human approval queue with unscorable holds, and it never fails open.
 4. Uniform denial messages. Existence of unauthorized resources is never revealed.
  The decide/list-pending HTTP endpoints (§9) extend this with a hard,

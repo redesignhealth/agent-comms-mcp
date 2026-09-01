@@ -566,9 +566,17 @@ class TestInstructionRegistryDriftGuard:
         }
 
     def test_loader_accepts_matching_keys_with_correct_hashes(self) -> None:
-        raw = {kind: self._entry() for kind in schemas.DOC_BACKED_INSTRUCTION_KINDS}
+        # Argus round 2 SUGGESTION: distinct text (and therefore distinct
+        # hash) per kind -- identical text for every kind would let a
+        # mutant that returns the same hash regardless of entry content
+        # pass this test.
+        raw = {
+            kind: self._entry(f"placeholder text for {kind}")
+            for kind in schemas.DOC_BACKED_INSTRUCTION_KINDS
+        }
         result = plugins._load_instruction_registry_hashes(raw)
         assert frozenset(result) == schemas.DOC_BACKED_INSTRUCTION_KINDS
+        assert len(set(result.values())) == len(result), "expected distinct hashes per kind"
 
     def test_loader_raises_on_missing_kind(self) -> None:
         missing = next(iter(schemas.DOC_BACKED_INSTRUCTION_KINDS))

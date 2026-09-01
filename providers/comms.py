@@ -1557,7 +1557,8 @@ async def invite(
       invite hold inline rather than this being the ordinary no-hold path)
       ``auto_approved: true`` and ``hold_id``, mirroring
       ``comms_post_message``'s equivalent fields.
-    - The conversation already has ``note`` history (TECH-5735): admitting
+    - The conversation already has ``note`` or ``instruction_share`` history
+      (``BARRIER_SENSITIVE_TYPES``, TECH-5735/TECH-5822): admitting
       a new participant would grant it full retroactive read access to
       that history the moment it accepts, so the invite is held for human
       approval instead -- ``{"held_for_approval": true, "hold_id",

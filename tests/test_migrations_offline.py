@@ -184,3 +184,17 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
         "ON agents (lower(display_name)) WHERE status = 'active'" in result.stdout
     )
     assert "idx_agents_sub_prefix" not in result.stdout
+    # c1a2b3d4e5f6 (TECH-5822, Argus round 2 SUGGESTION): broadens the
+    # note-only partial index to cover instruction_share too, backing
+    # service._conversation_has_note_history's now-broadened
+    # Message.type.in_(BARRIER_SENSITIVE_TYPES) query. Explicit assertions
+    # here (not just relying on this file's existing per-migration
+    # convention) since the offline --sql output is cumulative across every
+    # migration in order -- a typo in this migration's index name, column,
+    # or WHERE predicate would otherwise be invisible to CI, exactly as the
+    # stale b2bb6ccde02e assertion above would keep passing regardless.
+    assert "DROP INDEX IF EXISTS public.idx_messages_conversation_id_note" in result.stdout
+    assert (
+        "CREATE INDEX IF NOT EXISTS idx_messages_conversation_id_free_text "
+        "ON messages (conversation_id) WHERE type IN ('note', 'instruction_share')" in result.stdout
+    )
