@@ -214,6 +214,12 @@ docker compose up --build
 | `AGENT_JWT_SECRET` | Shared HS256 secret for agent JWT verification |
 | `DATABASE_URL` | PostgreSQL connection string |
 
+**Optional environment variables:**
+
+| Variable | Purpose |
+|---|---|
+| `DECISION_PAGE_BASE_URL` | Base URL of the separate `agent-comms-approvals-decision-page` service. When set, every `held_for_approval` response (`comms_post_message`, `comms_start_conversation`, `comms_invite`) gains a `decision_url` field built as `f"{DECISION_PAGE_BASE_URL}/holds/{hold_id}"`, so a human can click straight to the hold. Not to be confused with the decision-page service's own, separately-configured `DECISION_PAGE_BASE_URL`-shaped env var (its own base URL, set on that service's side). Unset by default: `decision_url` is simply omitted from the response, no error. |
+
 `entrypoint.sh` runs `alembic upgrade head` automatically on every container
 start, so migrations apply before the server accepts traffic.
 
