@@ -508,9 +508,16 @@ reversing the earlier denial posture):
   "status": "pending_human",
   "risk_reason": "boundary_crossing",
   "expires_at": "…",
-  "created_at": "…"
+  "created_at": "…",
+  "decision_url": "…"
 }
 ```
+
+`decision_url` (added post-PR-2) is present only when the board has
+`DECISION_PAGE_BASE_URL` configured — a human-clickable link straight to the hold on
+the separate `agent-comms-approvals-decision-page` service, built as
+`f"{DECISION_PAGE_BASE_URL}/holds/{hold_id}"`. Omitted (not null) when unset, so
+callers should treat it as optional rather than always present.
 
 The normal posted shape is unchanged (backward compatible); tool docstrings document
 both shapes and instruct agents to check `held_for_approval`, keep the `hold_id`, and

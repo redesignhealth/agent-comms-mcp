@@ -103,6 +103,20 @@ def _decision_url(hold_id: str) -> str | None:
     base_url = os.environ.get(DECISION_PAGE_BASE_URL_ENV_VAR)
     if not base_url:
         return None
+    # Argus round-1 SUGGESTION: this is embedded directly in every
+    # held_for_approval response, so a misconfigured non-https value (or a
+    # trailing slash producing a doubled `//holds/`) would silently poison
+    # every caller. Fails open (same posture as the "unset" case above)
+    # rather than raising -- a malformed value is a config error to fix,
+    # not a reason to break every hold response.
+    base_url = base_url.rstrip("/")
+    if not base_url.startswith("https://"):
+        logger.warning(
+            "%s must be an https:// URL, got %r -- omitting decision_url",
+            DECISION_PAGE_BASE_URL_ENV_VAR,
+            base_url,
+        )
+        return None
     return f"{base_url}/holds/{hold_id}"
 
 
@@ -1008,7 +1022,9 @@ async def start_conversation(
     marker as its seq-1 message — and your actual content is held for
     human approval instead of denied. The response then additionally has
     ``held_for_approval: true``, ``hold_id``, ``hold_status``,
-    ``risk_reason``, ``hold_expires_at``, ``hold_created_at``; poll
+    ``risk_reason``, ``hold_expires_at``, ``hold_created_at``, and
+    (only when the board has ``DECISION_PAGE_BASE_URL`` configured)
+    ``decision_url`` — a human-clickable link straight to the hold; poll
     ``comms_get_hold_status`` with ``hold_id`` for the outcome. Once
     approved, your content posts as seq 2 under its original type.
     """
@@ -1178,8 +1194,9 @@ async def post_message(
       ``auto_approved: true`` and ``hold_id``.
     - High-risk, escalated (v1's default outcome for a crossing ``note``):
       ``{"held_for_approval": true, "hold_id", "conversation_id",
-      "status", "risk_reason", "expires_at", "created_at"}`` — no ``seq``,
-      keep ``hold_id`` and poll ``comms_get_hold_status``.
+      "status", "risk_reason", "expires_at", "created_at"}``, plus
+      ``decision_url`` when ``DECISION_PAGE_BASE_URL`` is configured — no
+      ``seq``, keep ``hold_id`` and poll ``comms_get_hold_status``.
     """
     token = _require_token()
     base_sub = _require_identity(token)
@@ -1527,8 +1544,10 @@ async def invite(
       that history the moment it accepts, so the invite is held for human
       approval instead -- ``{"held_for_approval": true, "hold_id",
       "conversation_id", "status", "risk_reason", "expires_at",
-      "created_at"}``. Poll ``comms_get_hold_status`` with ``hold_id``;
-      once decided, its response carries ``participant_status``.
+      "created_at"}``, plus ``decision_url`` when
+      ``DECISION_PAGE_BASE_URL`` is configured. Poll
+      ``comms_get_hold_status`` with ``hold_id``; once decided, its
+      response carries ``participant_status``.
     """
     token = _require_token()
     base_sub = _require_identity(token)

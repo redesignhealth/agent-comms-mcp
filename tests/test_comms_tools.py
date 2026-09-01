@@ -3190,6 +3190,26 @@ class TestListConversationsTool:
 # --- Approval pipeline (TECH-5389 PR2) ---------------------------------------
 
 
+class TestDecisionUrlHelper:
+    """Unit coverage of ``providers.comms._decision_url``'s own normalization,
+    independent of any specific tool's held-response wiring (see
+    TestApprovalPipeline below for the end-to-end assertions)."""
+
+    def test_strips_trailing_slash_on_base_url(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from providers.comms import _decision_url
+
+        monkeypatch.setenv("DECISION_PAGE_BASE_URL", "https://decisions.example.com/")
+        assert _decision_url("abc-123") == "https://decisions.example.com/holds/abc-123"
+
+    def test_rejects_non_https_scheme(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from providers.comms import _decision_url
+
+        monkeypatch.setenv("DECISION_PAGE_BASE_URL", "http://decisions.example.com")
+        assert _decision_url("abc-123") is None
+
+
 class TestApprovalPipeline:
     """End-to-end coverage of the divert-not-deny pipeline at the MCP tool
     boundary: a high-risk ``comms_post_message``/``comms_start_conversation``
