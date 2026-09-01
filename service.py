@@ -165,6 +165,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from exceptions import (
     AccessDeniedError,
+    AgentAlreadyRegisteredError,
     AgentRetiredError,
     AgentSuspendedError,
     DisplayNameCollisionError,
@@ -316,6 +317,14 @@ MAX_PENDING_INVITES_PER_INBOX = 100
 APPROVAL_HOLD_TTL = timedelta(days=7)
 MAX_APPROVAL_HOLDS_PER_HOUR = 10
 
+# RFC 5321 4.5.3.1.3 total-address cap. Hoisted here (Argus round 2,
+# TECH-5786 PR follow-up) rather than left as two independently-drifting
+# copies -- `lookup_agent_by_email` and `admin_register_agent` both bound
+# an email against this same limit, and a drift between them would make an
+# `owner_email` that `admin_register_agent` accepts permanently unfindable
+# via `lookup_agent_by_email` (which returns `None` for over-cap input).
+MAX_LOOKUP_EMAIL_LENGTH = 254
+
 # TECH-5735: invite-holds (ApprovalHold.kind="invite") use fixed sentinel
 # values in place of a real message-schema/risk-scorer identifier, since no
 # RiskScorer plugin is invoked and there is no real schemas.MessageType for
@@ -464,32 +473,39 @@ async def _deny_agent_suspended(
     raise AgentSuspendedError(sub=sub)
 
 
-def _is_display_name_index_violation(exc: IntegrityError) -> bool:
-    """Narrow check that ``exc`` is specifically a violation of
-    ``idx_agents_lower_display_name_active`` (migration a45f344c9c00),
-    not merely "some IntegrityError". Postgres reports a unique partial
-    index's name in the underlying error's ``constraint_name`` diagnostic
-    field the same way it would a real named constraint. Under this
-    project's driver stack (SQLAlchemy 2.0.x + asyncpg), ``exc.orig`` is
-    ``AsyncAdapt_asyncpg_dbapi.IntegrityError``, a thin wrapper that only
-    copies ``pgcode``/``sqlstate`` from the real
+def _is_constraint_violation(exc: IntegrityError, name: str) -> bool:
+    """Narrow check that ``exc`` is specifically a violation of the named
+    constraint/index ``name``, not merely "some IntegrityError". Postgres
+    reports a unique (partial) index's name in the underlying error's
+    ``constraint_name`` diagnostic field the same way it would a real named
+    constraint. Under this project's driver stack (SQLAlchemy 2.0.x +
+    asyncpg), ``exc.orig`` is ``AsyncAdapt_asyncpg_dbapi.IntegrityError``, a
+    thin wrapper that only copies ``pgcode``/``sqlstate`` from the real
     ``asyncpg.exceptions.UniqueViolationError`` -- NOT ``constraint_name``.
     The real asyncpg exception (which does carry ``constraint_name``) is
     reachable via ``exc.orig.__cause__``. Check there first, falling back
     to ``exc.orig`` itself in case a different driver/version puts the
     attribute there directly. Deliberately not a blanket catch: any other
     IntegrityError (e.g. a genuinely unrelated constraint) must keep
-    propagating as itself."""
+    propagating as itself.
+
+    Extracted from two near-identical copies (Argus round 2, TECH-5786 PR
+    follow-up: ``_is_display_name_index_violation``/``_is_sub_unique_violation``
+    differed only in the constraint-name literal) -- a future
+    SQLAlchemy/asyncpg change to this extraction logic now only needs one
+    fix, not two, closing the risk of one call site silently degrading to a
+    bare 500 if only the other copy got updated."""
     cause = getattr(exc.orig, "__cause__", None)
-    name = getattr(cause, "constraint_name", None)
-    if name is None:
-        name = getattr(exc.orig, "constraint_name", None)
-    return name == "idx_agents_lower_display_name_active"
+    constraint_name = getattr(cause, "constraint_name", None)
+    if constraint_name is None:
+        constraint_name = getattr(exc.orig, "constraint_name", None)
+    return constraint_name == name
 
 
 async def _deny_sibling_identity_exists(
     session: AsyncSession,
     *,
+    actor_sub: str,
     base_sub: str,
     sub: str,
     existing_agent_keys: list[str | None],
@@ -500,12 +516,16 @@ async def _deny_sibling_identity_exists(
     other active identity. DESIGN.md §8 invariant 5 requires every denial to
     be audited, the same as every other fail-closed branch in
     ``register_agent`` -- this one was missed when the check itself was
-    added. ``actor_sub`` is ``sub`` itself, matching every other denial
-    inside ``register_agent`` (no authenticated identity distinct from the
-    registering caller is available at this point)."""
+    added. ``actor_sub`` is an explicit parameter, NOT always ``sub`` itself
+    (Argus round 1, TECH-5786 PR follow-up): ``register_agent``'s own call
+    site passes ``actor_sub=sub`` (no authenticated identity distinct from
+    the registering caller exists at that point), but
+    ``admin_register_agent`` reuses this same denial for a PRIVILEGED CALLER
+    registering a target ``sub`` on its behalf -- same distinction
+    ``_deny_agent_already_registered`` already draws for that function."""
     _audit(
         session,
-        actor_sub=sub,
+        actor_sub=actor_sub,
         action="denied.sibling_identity_exists",
         detail={"base_sub": base_sub, "sub": sub, "existing_agent_keys": existing_agent_keys},
     )
@@ -1228,6 +1248,430 @@ def _agent_key_from_sub(sub: str, base_sub: str) -> str | None:
     return sub[len(base_sub) + 2 :]
 
 
+def _validate_display_name_and_accepted_types(
+    display_name: str, accepted_types: list[str]
+) -> tuple[str, list[str]]:
+    """Shared input validation for ``display_name``/``accepted_types``,
+    factored out of ``register_agent`` so ``admin_register_agent`` (the
+    on-behalf-of path) enforces the identical rules rather than a
+    hand-copied, driftable duplicate. Returns ``(display_name,
+    normalized_types)`` -- stripped/deduped/sorted, same shape both
+    callers persist. Raises ``ValueError``/``UnknownConversationTypeError``
+    exactly as ``register_agent``'s docstring documents; see that
+    docstring for the full validation-order rationale (cap checks run
+    BEFORE computing ``unknown_types``, so an over-sized/over-long input
+    can never get echoed back verbatim in the error message).
+    """
+    display_name = display_name.strip()
+    if not display_name:
+        raise ValueError("display_name must be non-empty")
+    if len(display_name) > MAX_DISPLAY_NAME_LENGTH:
+        raise ValueError(f"display_name exceeds {MAX_DISPLAY_NAME_LENGTH} characters")
+    if len(accepted_types) > MAX_ACCEPTED_TYPES:
+        raise ValueError(f"accepted_types exceeds {MAX_ACCEPTED_TYPES} entries")
+    if not accepted_types:
+        raise ValueError("accepted_types must be non-empty")
+    if any(len(t) > MAX_ACCEPTED_TYPE_LENGTH for t in accepted_types):
+        raise ValueError(
+            f"accepted_types entries must not exceed {MAX_ACCEPTED_TYPE_LENGTH} characters"
+        )
+    unknown_types = sorted(set(accepted_types) - MESSAGE_TYPES)
+    if unknown_types:
+        raise UnknownConversationTypeError(
+            "accepted_types must be a non-empty subset of "
+            f"{sorted(MESSAGE_TYPES)} (got unknown: {unknown_types})"
+        )
+    normalized_types = sorted(set(accepted_types))
+    return display_name, normalized_types
+
+
+async def _deny_agent_already_registered(
+    session: AsyncSession, *, actor_sub: str, sub: str, existing_agent_id: uuid.UUID
+) -> NoReturn:
+    """Same audit/commit shape as ``_deny``, but for
+    ``exceptions.AgentAlreadyRegisteredError`` (the ``comms_admin_register``
+    on-behalf-of tool). ``actor_sub`` is the PRIVILEGED CALLER here, not
+    ``sub`` (the target) -- unlike every denial inside ``register_agent``,
+    this tool always has an authenticated actor distinct from the target
+    it's registering, and the audit trail must record who attempted the
+    on-behalf-of registration, not just which sub it targeted."""
+    _audit(
+        session,
+        actor_sub=actor_sub,
+        action="denied.agent_already_registered",
+        agent_id=existing_agent_id,
+        detail={"target_sub": sub},
+    )
+    await session.commit()
+    raise AgentAlreadyRegisteredError(sub=sub)
+
+
+# Argus round 1, TECH-5786 PR follow-up: `admin_register_agent`'s
+# `sub`/`owner_sub`/`owner_email` are explicit caller-supplied parameters
+# (unlike `register_agent`'s token-derived, IdP-length-constrained
+# equivalents), so nothing bounds them before they're written into
+# `audit_log.detail` (JSONB) -- a legitimately-credentialed admin could
+# otherwise write an arbitrarily large string into the audit log.
+MAX_SUB_LENGTH = 256  # generous bound for a board `sub`/`owner_sub` identifier
+
+
+async def admin_register_agent(
+    session: AsyncSession,
+    *,
+    actor_sub: str,
+    admin_authorized: bool,
+    sub: str,
+    owner_sub: str,
+    owner_email: str,
+    display_name: str,
+    accepted_types: list[str],
+    is_shared: bool = False,
+    min_schema_version: int = 1,
+    max_schema_version: int = 1,
+    confirm_new_identity: bool = False,
+) -> Agent:
+    """Register a NEW agent identity on behalf of an explicit target
+    ``sub``, for a privileged (``comms:admin``-scoped or interactive)
+    caller -- the ``comms_admin_register`` MCP tool.
+
+    Why this exists: ``register_agent`` always derives ``sub`` from the
+    CALLING token's own verified identity (``providers.comms.
+    _require_identity``) -- by design, DESIGN.md §4's "owner identity is
+    always derived from verified token claims, never accepted as a
+    parameter" invariant means nothing can register OR claim an identity
+    that isn't its own token's. That's a deliberate anti-impersonation
+    property, but it leaves a real gap: a platform provisioning a new bot
+    (e.g. redesign-ai minting an Arc bot's board credential) needs to set
+    ``is_shared=True`` on that bot's row before the bot has ever spoken for
+    itself -- and the only workarounds available without this tool are both
+    bad: (a) grant the bot's own permanent credential ``comms:admin`` --
+    an ordinary bot has no legitimate reason to hold a scope that lets it
+    register/re-authorize OTHER agents on this board, and doing so would
+    make every such bot's credential a full admin-capability leak risk --
+    or (b) mint a throwaway token impersonating the
+    target ``sub`` just to make one self-registration call. This function is
+    the real, first-class fix: an explicit, audited, on-behalf-of
+    registration capability, distinct from both ``register_agent`` (self-
+    service, idempotent, ``sub`` always the caller's own) and
+    ``set_agent_shared`` (corrects ``is_shared`` on an agent that ALREADY
+    exists -- this function is a genuine FIRST registration for a ``sub``
+    that has never registered at all).
+
+    **Authorization**: mirrors ``set_agent_shared``/``deregister_agent``
+    exactly -- ``admin_authorized`` MUST be computed by the caller (the
+    tools layer) from the actor's own verified token (``comms:admin``
+    scope, or an interactive/Okta caller), checked FIRST via
+    ``_deny_agent_already_registered``'s sibling ``_deny`` call so an
+    unauthorized attempt's audit trail always records the authorization
+    failure, never ``denied.agent_already_registered``, regardless of
+    whether ``sub`` happens to already exist. No default is provided (same
+    reasoning as ``set_agent_shared``): this function's entire purpose is
+    the privileged mutation, so there is no unprivileged call site to
+    protect with a fail-closed default. Unlike ``register_agent``'s
+    ``is_shared_authorized`` (a NARROWER gate on one parameter of an
+    otherwise-reachable self-service tool), ``admin_authorized`` gates the
+    entire call -- there is no unprivileged use of this function, so
+    ``is_shared`` itself needs no separate authorization check here.
+
+    **``owner_sub``/``owner_email`` are explicit, caller-supplied
+    parameters here** -- the one deliberate exception to DESIGN.md §4's
+    "never accepted as a parameter" rule, and only because this is
+    fundamentally an on-behalf-of operation: there IS no verified token for
+    the target to derive them from (that's the entire gap this tool closes
+    -- the target hasn't authenticated to this board yet). This board's
+    injected ``OwnershipClient`` seam (``_owner_sets_for`` and friends) is
+    keyed by board ``agent_id`` (a UUID), which does not exist yet for a
+    ``sub`` that has never registered -- it structurally cannot resolve
+    ownership for a not-yet-registered identity, so there is no existing
+    mechanism this function could reuse instead of trusting its caller.
+    The privileged caller is expected to source these from whatever
+    ownership registry it already trusts for this ``sub`` (e.g. the same
+    registry that minted the target's own board credential) -- this
+    function performs no verification of its own, the same trust contract
+    ``register_agent`` already documents for its own (token-derived)
+    ``owner_sub``/``owner_email`` parameters.
+
+    **First-registration only, never an upsert**: raises
+    ``AgentAlreadyRegisteredError`` if ``sub`` already has a board row
+    (any ``status``) -- unlike ``register_agent``'s idempotent self-service
+    re-bind. Correcting an EXISTING agent's ``is_shared``/``status`` goes
+    through ``set_agent_shared``/``deregister_agent`` instead; there is no
+    supported way to change an existing agent's ``owner_sub``/
+    ``owner_email``/``display_name`` through this admin surface.
+
+    **Sibling-identity-fork guard applies here too (Argus round 1,
+    TECH-5786 PR follow-up)**: mirrors ``register_agent``'s
+    ``SiblingIdentityExistsError`` check (TECH-5736) rather than silently
+    omitting it. Without this, a ``comms:admin`` caller could reopen the
+    exact kill-switch bypass that check exists to close: suspend every
+    existing identity under a ``base_sub`` (via ``deregister_agent``), then
+    admin-register a brand-new ``sub`` under that same ``base_sub`` to
+    route around the suspension. ``base_sub`` here is derived from the
+    TARGET ``sub`` itself (``sub.split("::", 1)[0]``), not from the
+    caller's own identity the way ``register_agent`` receives it -- this
+    function has no notion of "the caller's own agent_key composition"
+    since the caller and the target are different identities by design.
+    ``confirm_new_identity=True`` acknowledges the fork and proceeds
+    anyway, same semantics as ``register_agent``'s own parameter; the
+    resulting audit action (on denial) is still
+    ``denied.sibling_identity_exists``, but attributed to the PRIVILEGED
+    CALLER's ``actor_sub``, not the target ``sub`` -- see
+    ``_deny_sibling_identity_exists``'s own docstring for why that split
+    matters here specifically.
+
+    **Interaction with later self-registration**: a row this function
+    creates is, once created, ordinary -- indistinguishable from one
+    ``register_agent`` created directly. If the target later calls
+    ``comms_register`` itself (e.g. during its own ReClaw setup, using its
+    own restricted credential), that hits ``register_agent``'s existing
+    RE-registration branch (``existing is not None``) for the same ``sub``:
+    ``is_shared`` and ``owner_sub`` stay frozen exactly as they would after
+    any other first registration (a mismatched self-reported ``is_shared``
+    is ignored and audited as ``agent.reregister_is_shared_ignored``, same
+    as always) -- this function's own admin-set values are not
+    retroactively escalatable by the target's own later, less-privileged
+    call. ``owner_email`` is the one field ``register_agent`` DOES
+    overwrite on re-registration (see its docstring) -- so a target's later
+    self-registration can move ``owner_email`` away from what this
+    function set, if its own token's claims (or ``base_sub`` fallback)
+    disagree. This is not a new gap this function introduces: it is
+    exactly ``register_agent``'s existing, already-documented
+    ``owner_email`` mutability, unrelated to how the row was first
+    created. Callers relying on a stable admin-set ``owner_email`` should
+    ensure the target's own later credential is minted with a matching
+    ``owner_email`` claim.
+
+    Reuses ``register_agent``'s exact ``display_name``/``accepted_types``
+    validation (``_validate_display_name_and_accepted_types``) and its
+    display-name-collision-on-creation check, so the two registration
+    paths can never silently drift apart on those rules.
+
+    Raises ``ValueError``/``UnknownConversationTypeError`` for malformed
+    input, same shapes and ordering as ``register_agent`` (see its
+    docstring) -- checked BEFORE the authorization gate for ``sub``'s own
+    non-emptiness (a data-shape failure, not an authorization decision),
+    but the authorization gate itself still runs before the
+    already-registered/display-name-collision checks below, per the
+    ordering note above.
+    """
+    validate_schema_version_range(min_schema_version, max_schema_version)
+    sub = sub.strip()
+    if not sub:
+        raise ValueError("sub must be non-empty")
+    # Argus round 1, TECH-5786 PR follow-up: mirrors `identity.validate_sub_shape`'s
+    # "@" rejection (raised here as `ValueError`, not that module's `ToolError`,
+    # to match this function's own input-validation error shape rather than
+    # importing an MCP-transport-layer exception into the service layer). A
+    # token-derived `sub` already goes through `validate_sub_shape` via
+    # `_require_identity` -- this function accepts `sub` as a plain
+    # caller-supplied parameter instead, so without an equivalent check here a
+    # `comms:admin` holder could pre-register `sub="victim@company.com"`,
+    # squatting a real user's future Okta-derived identity with an
+    # attacker-controlled `owner_sub`/`is_shared` that survives the
+    # re-registration freeze once the victim actually self-registers.
+    # `owner_sub` deliberately gets NO analogous "@"-rejection (Argus round
+    # 2, TECH-5786 PR follow-up: an earlier revision of this fix wrongly
+    # applied the same check to `owner_sub`) -- unlike `sub` (a board
+    # IDENTITY, never email-shaped by spec), `owner_sub` is legitimately
+    # email-shaped for any Okta/interactive-derived owner:
+    # `register_agent` itself sets `owner_sub = token.claims.get("owner_sub")
+    # or base_sub`, where `base_sub` resolves via `try_resolve_email` for
+    # exactly that case. Rejecting it here would make it impossible to
+    # admin-register a bot on behalf of an ordinary human owner, and
+    # `approve_hold`/`reject_hold` gate on `hold.owner_sub == approver_sub`
+    # (an email for an Okta approver) -- a worked-around non-email
+    # `owner_sub` would make every hold that bot creates permanently
+    # unapprovable by its real owner.
+    if "@" in sub:
+        raise ValueError("sub must not be email-shaped")
+    if len(sub) > MAX_SUB_LENGTH:
+        raise ValueError(f"sub exceeds {MAX_SUB_LENGTH} characters")
+    owner_sub = owner_sub.strip()
+    if not owner_sub:
+        raise ValueError("owner_sub must be non-empty")
+    if len(owner_sub) > MAX_SUB_LENGTH:
+        raise ValueError(f"owner_sub exceeds {MAX_SUB_LENGTH} characters")
+    owner_email = owner_email.strip()
+    if not owner_email:
+        raise ValueError("owner_email must be non-empty")
+    if len(owner_email) > MAX_LOOKUP_EMAIL_LENGTH:
+        raise ValueError(f"owner_email exceeds {MAX_LOOKUP_EMAIL_LENGTH} characters")
+    if "@" not in owner_email:
+        raise ValueError("owner_email must be email-shaped")
+    display_name, normalized_types = _validate_display_name_and_accepted_types(
+        display_name, accepted_types
+    )
+
+    if not admin_authorized:
+        await _deny(
+            session,
+            actor_sub=actor_sub,
+            action="denied.admin_register_requires_elevated_scope",
+            detail={"target_sub": sub, "display_name": display_name},
+        )
+
+    existing = (await session.execute(select(Agent).where(Agent.sub == sub))).scalar_one_or_none()
+    if existing is not None:
+        await _deny_agent_already_registered(
+            session, actor_sub=actor_sub, sub=sub, existing_agent_id=existing.id
+        )
+
+    # Sibling-identity-fork guard (Argus round 1, TECH-5786 PR follow-up):
+    # same check as register_agent's own (TECH-5736), deliberately not
+    # omitted here -- see this function's docstring for why omitting it
+    # would reopen the kill-switch bypass that check exists to close.
+    # `base_sub` is derived from the TARGET `sub` itself, since this
+    # function has no caller-side base_sub/agent_key composition the way
+    # register_agent does. Deliberately NOT filtered to `status ==
+    # "active"` -- same reasoning as register_agent's own comment: a
+    # suspended sibling must still count, or `deregister_agent` followed
+    # by this tool would silently bypass the suspension.
+    if not confirm_new_identity:
+        target_base_sub = sub.split("::", 1)[0]
+        sibling_subs = (
+            (
+                await session.execute(
+                    select(Agent.sub).where(
+                        Agent.sub != sub,
+                        or_(
+                            Agent.sub == target_base_sub,
+                            Agent.sub.startswith(f"{target_base_sub}::", autoescape=True),
+                        ),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if sibling_subs:
+            await _deny_sibling_identity_exists(
+                session,
+                actor_sub=actor_sub,
+                base_sub=target_base_sub,
+                sub=sub,
+                existing_agent_keys=[_agent_key_from_sub(s, target_base_sub) for s in sibling_subs],
+            )
+
+    # Same display-name-collision-on-creation guard as register_agent
+    # (see that function's own comments for why this only fires on
+    # creation -- always true here, since this path never re-registers).
+    colliding_subs = (
+        (
+            await session.execute(
+                select(Agent.sub).where(
+                    func.lower(Agent.display_name) == display_name.lower(),
+                    Agent.status == "active",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if colliding_subs:
+        await _deny_display_name_collision(
+            session,
+            actor_sub=actor_sub,
+            display_name=display_name,
+            existing_subs=list(colliding_subs),
+        )
+
+    now = _now()
+    agent = Agent(
+        sub=sub,
+        owner_sub=owner_sub,
+        owner_email=owner_email,
+        display_name=display_name,
+        accepted_types=normalized_types,
+        status="active",
+        is_shared=is_shared,
+        bound_at=now,
+        min_schema_version=min_schema_version,
+        max_schema_version=max_schema_version,
+    )
+    session.add(agent)
+    try:
+        await session.flush()
+    except IntegrityError as exc:
+        # Same race-closing DB-level backstop as register_agent's own
+        # flush handler -- see its comment for why this is narrowed to
+        # exactly this named index rather than a blanket
+        # IntegrityError->DisplayNameCollisionError mapping.
+        await session.rollback()
+        if _is_constraint_violation(exc, "idx_agents_lower_display_name_active"):
+            colliding_subs_post_rollback = (
+                (
+                    await session.execute(
+                        select(Agent.sub).where(
+                            func.lower(Agent.display_name) == display_name.lower(),
+                            Agent.status == "active",
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            await _deny_display_name_collision(
+                session,
+                actor_sub=actor_sub,
+                display_name=display_name,
+                existing_subs=list(colliding_subs_post_rollback),
+            )
+        # Second race-closing backstop, specific to this function (Argus
+        # round 1, TECH-5786 PR follow-up): unlike register_agent
+        # (idempotent -- a concurrent duplicate is benign), this path is
+        # first-registration-only, so two concurrent admin calls for the
+        # same `sub` that both pass the pre-flush `scalar_one_or_none`
+        # check above race for `agents_sub_key` at flush time. Without
+        # this branch, the loser's IntegrityError falls through to the
+        # bare `raise` below as an unmapped 500 with raw DB constraint
+        # text, contradicting this function's own docstring promise of
+        # `AgentAlreadyRegisteredError` for any duplicate-`sub` case.
+        if _is_constraint_violation(exc, "agents_sub_key"):
+            existing_post_rollback = (
+                await session.execute(select(Agent).where(Agent.sub == sub))
+            ).scalar_one_or_none()
+            if existing_post_rollback is not None:
+                await _deny_agent_already_registered(
+                    session,
+                    actor_sub=actor_sub,
+                    sub=sub,
+                    existing_agent_id=existing_post_rollback.id,
+                )
+            # Argus round 2, TECH-5786 PR follow-up: the constraint violation
+            # confirms a row for `sub` exists, even in the vanishingly rare
+            # window where it's since been deleted again before this re-read
+            # (so `existing_post_rollback` came back `None`) -- raise the
+            # same client-safe error directly rather than falling through to
+            # the bare `raise` below, which would leak the raw `IntegrityError`
+            # (including the internal `agents_sub_key` constraint name) to the
+            # MCP transport as an unmapped 500. No audit write here (no agent
+            # row to reference), same trade-off the display-name branch above
+            # implicitly makes when it fires with an empty colliding-subs list.
+            raise AgentAlreadyRegisteredError(sub=sub) from exc
+        raise
+    _audit(
+        session,
+        actor_sub=actor_sub,
+        action="agent.admin_registered",
+        agent_id=agent.id,
+        detail={
+            "target_sub": sub,
+            "owner_sub": owner_sub,
+            "owner_email": owner_email,
+            "display_name": display_name,
+            "is_shared": is_shared,
+            # Argus round 2, TECH-5786 PR follow-up: before the confirm_new_identity
+            # wiring existed, a bypass of the sibling-fork guard was unreachable
+            # from the provider layer; now it's a first-class parameter, and a
+            # forensic audit must be able to distinguish a clean first
+            # registration from a kill-switch bypass of a base_sub suspension.
+            "confirm_new_identity": confirm_new_identity,
+        },
+    )
+    await session.commit()
+    return agent
+
+
 async def register_agent(
     session: AsyncSession,
     *,
@@ -1354,47 +1798,9 @@ async def register_agent(
     sub = sub.strip()
     if not sub:
         raise ValueError("sub must be non-empty")
-    display_name = display_name.strip()
-    if not display_name:
-        raise ValueError("display_name must be non-empty")
-    if len(display_name) > MAX_DISPLAY_NAME_LENGTH:
-        raise ValueError(f"display_name exceeds {MAX_DISPLAY_NAME_LENGTH} characters")
-    # Cap check runs FIRST, before computing unknown_types -- for security:
-    # the old order let a caller submit an arbitrarily large
-    # list of unknown-type strings and get every one of them echoed back
-    # verbatim in the error message, silently bypassing the declared
-    # MAX_ACCEPTED_TYPES cap for this input shape. Bounding the input size
-    # up front means unknown_types is now computed over an already-capped
-    # list, whatever the values.
-    if len(accepted_types) > MAX_ACCEPTED_TYPES:
-        raise ValueError(f"accepted_types exceeds {MAX_ACCEPTED_TYPES} entries")
-    # Empty list is a distinct failure from "contains an unknown type" --
-    # it's not client-safe/specific in the same way (there's no unknown
-    # value to usefully enumerate), so it stays a bare ValueError rather
-    # than UnknownConversationTypeError. Splitting these
-    # avoids the confusing prior message "... (got unknown: [])" for an
-    # empty list, which named zero unknown values while still claiming
-    # something was unknown.
-    if not accepted_types:
-        raise ValueError("accepted_types must be non-empty")
-    # Per-entry length cap, for security: the count cap above
-    # bounds how many entries there are, not how long any one entry is --
-    # without this, 20 arbitrarily large strings would all pass the count
-    # check, then get echoed back verbatim in UnknownConversationTypeError
-    # below. Checked before computing unknown_types for the same
-    # echo-bounding reason as the count check.  Every real MESSAGE_TYPES
-    # value is under 30 characters; 100 is a generous margin.
-    if any(len(t) > MAX_ACCEPTED_TYPE_LENGTH for t in accepted_types):
-        raise ValueError(
-            f"accepted_types entries must not exceed {MAX_ACCEPTED_TYPE_LENGTH} characters"
-        )
-    unknown_types = sorted(set(accepted_types) - MESSAGE_TYPES)
-    if unknown_types:
-        raise UnknownConversationTypeError(
-            "accepted_types must be a non-empty subset of "
-            f"{sorted(MESSAGE_TYPES)} (got unknown: {unknown_types})"
-        )
-    normalized_types = sorted(set(accepted_types))
+    display_name, normalized_types = _validate_display_name_and_accepted_types(
+        display_name, accepted_types
+    )
 
     existing = (await session.execute(select(Agent).where(Agent.sub == sub))).scalar_one_or_none()
     now = _now()
@@ -1472,6 +1878,7 @@ async def register_agent(
         if sibling_subs:
             await _deny_sibling_identity_exists(
                 session,
+                actor_sub=sub,
                 base_sub=base_sub,
                 sub=sub,
                 existing_agent_keys=[_agent_key_from_sub(s, base_sub) for s in sibling_subs],
@@ -1616,7 +2023,7 @@ async def register_agent(
         # -- so an unrelated constraint violation still propagates as
         # itself rather than being mislabeled.
         await session.rollback()
-        if _is_display_name_index_violation(exc):
+        if _is_constraint_violation(exc, "idx_agents_lower_display_name_active"):
             # Unlike the app-level check's `colliding_subs`, the
             # DB-level violation itself doesn't hand us the other row's
             # `sub` -- only that a conflict exists. But the row IS now
@@ -1897,9 +2304,6 @@ async def list_agents(
         "has_more": has_more,
         "next_cursor": rows[-1].sub if has_more and rows else None,
     }
-
-
-MAX_LOOKUP_EMAIL_LENGTH = 254  # RFC 5321 4.5.3.1.3 total-address cap
 
 
 async def lookup_agent_by_email(

@@ -38,6 +38,7 @@ import plugins
 import service as _service
 from exceptions import (
     AccessDeniedError,
+    AgentAlreadyRegisteredError,
     AgentRetiredError,
     AgentSuspendedError,
     DisplayNameCollisionError,
@@ -72,6 +73,7 @@ from service import (
     AgentTableOwnershipClient,
     OwnershipClient,
     accept_invite,
+    admin_register_agent,
     decline_invite,
     deregister_agent,
     get_conversation,
@@ -1159,7 +1161,7 @@ class TestRegisterAgent:
         this scenario skips it entirely and falls through to
         ``idx_agents_lower_display_name_active`` (migration a45f344c9c00)
         for enforcement, exercised here against a real Postgres backend.
-        This is the exact path the round-3 fix's ``_is_display_name_index_violation``
+        This is the exact path the round-3 fix's ``_is_constraint_violation``
         helper exists to translate into ``DisplayNameCollisionError`` instead
         of letting the raw ``IntegrityError`` escape as an unmapped 500 --
         see ~service.py:1533's comment for the "case (a)"/"case (b)" split.
@@ -7983,3 +7985,687 @@ class TestDeregisterAgent:
                 initial_message=_request_payload(),
             )
         assert exc_info.value.reason == "denied.unknown_agent"
+
+
+class TestAdminRegisterAgent:
+    """``comms_admin_register`` — an explicit on-behalf-of FIRST
+    registration path for a privileged (``comms:admin``-scoped or
+    interactive) caller, closing the gap where nothing could register or
+    set ``is_shared`` on a ``sub`` that hasn't authenticated to this board
+    itself yet (see ``service.admin_register_agent``'s docstring)."""
+
+    async def test_admin_registers_new_agent_with_is_shared(self, session: AsyncSession) -> None:
+        agent = await admin_register_agent(
+            session,
+            actor_sub="admin-operator",
+            admin_authorized=True,
+            sub="arc-bot-42",
+            owner_sub="owner-arc-bot-42",
+            owner_email="arc-bot-42-owner@example.com",
+            display_name="Arc Bot 42",
+            accepted_types=sorted(MESSAGE_TYPES),
+            is_shared=True,
+        )
+
+        assert agent.sub == "arc-bot-42"
+        assert agent.owner_sub == "owner-arc-bot-42"
+        assert agent.owner_email == "arc-bot-42-owner@example.com"
+        assert agent.is_shared is True
+        assert agent.status == "active"
+
+        row = (await session.execute(select(Agent).where(Agent.id == agent.id))).scalar_one()
+        assert row.sub == "arc-bot-42"
+
+        rows = (
+            await session.execute(
+                select(AuditLog.actor_sub, AuditLog.agent_id, AuditLog.detail).where(
+                    AuditLog.action == "agent.admin_registered"
+                )
+            )
+        ).all()
+        assert len(rows) == 1
+        actor_sub, audited_agent_id, detail = rows[0]
+        # actor_sub is the ADMIN, not the target -- unlike agent.register's
+        # audit trail, where actor_sub is always the registering sub itself.
+        assert actor_sub == "admin-operator"
+        assert audited_agent_id == agent.id
+        assert detail == {
+            "target_sub": "arc-bot-42",
+            "owner_sub": "owner-arc-bot-42",
+            "owner_email": "arc-bot-42-owner@example.com",
+            "display_name": "Arc Bot 42",
+            "is_shared": True,
+            "confirm_new_identity": False,
+        }
+
+    async def test_admin_registers_new_agent_defaults_is_shared_false(
+        self, session: AsyncSession
+    ) -> None:
+        agent = await admin_register_agent(
+            session,
+            actor_sub="admin-operator",
+            admin_authorized=True,
+            sub="personal-bot-1",
+            owner_sub="owner-personal-bot-1",
+            owner_email="personal-bot-1-owner@example.com",
+            display_name="Personal Bot 1",
+            accepted_types=sorted(MESSAGE_TYPES),
+        )
+        assert agent.is_shared is False
+
+    async def test_denied_without_authorization(self, session: AsyncSession) -> None:
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await admin_register_agent(
+                session,
+                actor_sub="unauthorized-operator",
+                admin_authorized=False,
+                sub="arc-bot-unauth",
+                owner_sub="owner-arc-bot-unauth",
+                owner_email="arc-bot-unauth-owner@example.com",
+                display_name="Arc Bot Unauth",
+                accepted_types=sorted(MESSAGE_TYPES),
+                is_shared=True,
+            )
+        assert exc_info.value.reason == "denied.admin_register_requires_elevated_scope"
+
+        row = (
+            await session.execute(select(Agent).where(Agent.sub == "arc-bot-unauth"))
+        ).scalar_one_or_none()
+        assert row is None
+
+        rows = (
+            await session.execute(
+                select(AuditLog.action, AuditLog.agent_id, AuditLog.detail).where(
+                    AuditLog.actor_sub == "unauthorized-operator"
+                )
+            )
+        ).all()
+        assert len(rows) == 1
+        action, audited_agent_id, detail = rows[0]
+        assert action == "denied.admin_register_requires_elevated_scope"
+        # No row is created before this denial (auth checked first), so
+        # there's nothing to reference by id yet.
+        assert audited_agent_id is None
+        assert detail == {"target_sub": "arc-bot-unauth", "display_name": "Arc Bot Unauth"}
+
+    async def test_denied_already_registered_checked_before_authorization_result_used(
+        self, session: AsyncSession
+    ) -> None:
+        """Authorization is checked FIRST -- an unauthorized attempt against
+        an ALREADY-registered sub still reports the authorization failure,
+        not agent_already_registered, mirroring set_agent_shared/
+        deregister_agent's own ordering."""
+        existing = await _register(session, "already-there")
+
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await admin_register_agent(
+                session,
+                actor_sub="unauthorized-operator",
+                admin_authorized=False,
+                sub=existing.sub,
+                owner_sub="owner-already-there",
+                owner_email="already-there@example.com",
+                display_name="Already There Attempt",
+                accepted_types=sorted(MESSAGE_TYPES),
+            )
+        assert exc_info.value.reason == "denied.admin_register_requires_elevated_scope"
+
+    async def test_denied_agent_already_registered(self, session: AsyncSession) -> None:
+        existing = await _register(session, "already-registered-bot")
+
+        with pytest.raises(AgentAlreadyRegisteredError) as exc_info:
+            await admin_register_agent(
+                session,
+                actor_sub="admin-operator",
+                admin_authorized=True,
+                sub=existing.sub,
+                owner_sub="owner-already-registered-bot",
+                owner_email="already-registered-bot-new@example.com",
+                display_name="Already Registered Bot Attempt",
+                accepted_types=sorted(MESSAGE_TYPES),
+            )
+        assert exc_info.value.sub == existing.sub
+
+        # Not an upsert: the existing row is untouched.
+        row = (await session.execute(select(Agent).where(Agent.id == existing.id))).scalar_one()
+        assert row.owner_email == existing.owner_email
+        assert row.display_name == existing.display_name
+
+        rows = (
+            await session.execute(
+                select(AuditLog.actor_sub, AuditLog.agent_id, AuditLog.detail).where(
+                    AuditLog.action == "denied.agent_already_registered"
+                )
+            )
+        ).all()
+        assert len(rows) == 1
+        actor_sub, audited_agent_id, detail = rows[0]
+        assert actor_sub == "admin-operator"
+        assert audited_agent_id == existing.id
+        assert detail == {"target_sub": existing.sub}
+
+    async def test_denied_already_registered_even_if_suspended(self, session: AsyncSession) -> None:
+        """First-registration-only, unlike register_agent's idempotent
+        self-service rebind -- a SUSPENDED sub still counts as
+        "already registered" here, since this tool has no re-registration
+        path at all to distinguish."""
+        existing = await _register(session, "suspended-already-there")
+        await deregister_agent(
+            session, actor_sub="admin-operator", agent_id=existing.id, deregister_authorized=True
+        )
+
+        with pytest.raises(AgentAlreadyRegisteredError):
+            await admin_register_agent(
+                session,
+                actor_sub="admin-operator",
+                admin_authorized=True,
+                sub=existing.sub,
+                owner_sub="owner-suspended-already-there",
+                owner_email="suspended-already-there-new@example.com",
+                display_name="Suspended Already There Attempt",
+                accepted_types=sorted(MESSAGE_TYPES),
+            )
+
+    async def test_denied_display_name_collision(self, session: AsyncSession) -> None:
+        await _register(session, "name-holder", display_name="Taken Name")
+
+        with pytest.raises(DisplayNameCollisionError) as exc_info:
+            await admin_register_agent(
+                session,
+                actor_sub="admin-operator",
+                admin_authorized=True,
+                sub="name-collider",
+                owner_sub="owner-name-collider",
+                owner_email="name-collider@example.com",
+                display_name="Taken Name",
+                accepted_types=sorted(MESSAGE_TYPES),
+            )
+        assert exc_info.value.display_name == "Taken Name"
+
+        row = (
+            await session.execute(select(Agent).where(Agent.sub == "name-collider"))
+        ).scalar_one_or_none()
+        assert row is None
+
+    async def test_rejects_unknown_accepted_type(self, session: AsyncSession) -> None:
+        with pytest.raises(UnknownConversationTypeError):
+            await admin_register_agent(
+                session,
+                actor_sub="admin-operator",
+                admin_authorized=True,
+                sub="bad-types-bot",
+                owner_sub="owner-bad-types-bot",
+                owner_email="bad-types-bot@example.com",
+                display_name="Bad Types Bot",
+                accepted_types=["not_a_real_type"],
+            )
+
+    async def test_rejects_empty_owner_sub(self, session: AsyncSession) -> None:
+        with pytest.raises(ValueError, match="owner_sub"):
+            await admin_register_agent(
+                session,
+                actor_sub="admin-operator",
+                admin_authorized=True,
+                sub="empty-owner-sub-bot",
+                owner_sub="   ",
+                owner_email="empty-owner-sub-bot@example.com",
+                display_name="Empty Owner Sub Bot",
+                accepted_types=sorted(MESSAGE_TYPES),
+            )
+
+    async def test_rejects_empty_owner_email(self, session: AsyncSession) -> None:
+        with pytest.raises(ValueError, match="owner_email"):
+            await admin_register_agent(
+                session,
+                actor_sub="admin-operator",
+                admin_authorized=True,
+                sub="empty-owner-email-bot",
+                owner_sub="owner-empty-owner-email-bot",
+                owner_email="   ",
+                display_name="Empty Owner Email Bot",
+                accepted_types=sorted(MESSAGE_TYPES),
+            )
+
+    async def test_rejects_empty_sub(self, session: AsyncSession) -> None:
+        with pytest.raises(ValueError, match="sub"):
+            await admin_register_agent(
+                session,
+                actor_sub="admin-operator",
+                admin_authorized=True,
+                sub="   ",
+                owner_sub="owner-empty-sub-bot",
+                owner_email="empty-sub-bot@example.com",
+                display_name="Empty Sub Bot",
+                accepted_types=sorted(MESSAGE_TYPES),
+            )
+
+    async def test_later_self_registration_freezes_is_shared_and_owner_sub(
+        self, session: AsyncSession
+    ) -> None:
+        """The interaction this ticket explicitly calls out: once
+        admin_register_agent creates a row, the target's LATER
+        self-registration via register_agent (its own restricted
+        comms:write-only credential) must not be able to escalate
+        is_shared or move owner_sub away from what the admin set --
+        register_agent's existing freeze (agent.reregister_is_shared_ignored)
+        already protects this, unchanged; this test proves the admin-created
+        row is not somehow exempt from it."""
+        admin_created = await admin_register_agent(
+            session,
+            actor_sub="admin-operator",
+            admin_authorized=True,
+            sub="arc-bot-later-self-register",
+            owner_sub="owner-arc-bot-later-self-register",
+            owner_email="arc-bot-later-self-register@example.com",
+            display_name="Arc Bot Later Self Register",
+            accepted_types=sorted(MESSAGE_TYPES),
+            is_shared=True,
+        )
+        assert admin_created.is_shared is True
+
+        # The bot's own later self-registration call: unprivileged
+        # (is_shared_authorized=False, matching a plain comms:write-scoped
+        # agent-jwt token), attempting to self-report is_shared=False and a
+        # different owner_sub -- neither should take effect.
+        self_registered = await register_agent(
+            session,
+            sub="arc-bot-later-self-register",
+            base_sub="arc-bot-later-self-register",
+            owner_sub="a-forged-different-owner-sub",
+            owner_email="arc-bot-later-self-register@example.com",
+            display_name="Arc Bot Later Self Register",
+            accepted_types=sorted(MESSAGE_TYPES),
+            is_shared=False,
+            is_shared_authorized=False,
+        )
+
+        assert self_registered.id == admin_created.id
+        assert self_registered.is_shared is True, "is_shared must stay frozen from admin_register"
+        assert self_registered.owner_sub == "owner-arc-bot-later-self-register", (
+            "owner_sub must stay frozen from admin_register -- register_agent never "
+            "overwrites it on re-registration"
+        )
+
+        rows = (
+            await session.execute(
+                select(AuditLog.detail).where(
+                    AuditLog.action == "agent.reregister_is_shared_ignored",
+                    AuditLog.agent_id == admin_created.id,
+                )
+            )
+        ).all()
+        assert len(rows) == 1
+        assert rows[0][0] == {
+            "is_shared_requested": False,
+            "is_shared_effective": True,
+            "is_shared_authorized": False,
+        }
+
+    async def test_later_self_registration_can_move_owner_email(
+        self, session: AsyncSession
+    ) -> None:
+        """Documents the one field that ISN'T frozen: register_agent
+        already overwrites owner_email on every re-registration (see its
+        own docstring) -- this is pre-existing behavior, unrelated to how
+        the row was first created, not a new gap admin_register_agent
+        introduces."""
+        await admin_register_agent(
+            session,
+            actor_sub="admin-operator",
+            admin_authorized=True,
+            sub="arc-bot-owner-email-drift",
+            owner_sub="owner-arc-bot-owner-email-drift",
+            owner_email="original-owner-email@example.com",
+            display_name="Arc Bot Owner Email Drift",
+            accepted_types=sorted(MESSAGE_TYPES),
+        )
+
+        self_registered = await register_agent(
+            session,
+            sub="arc-bot-owner-email-drift",
+            base_sub="arc-bot-owner-email-drift",
+            owner_sub="owner-arc-bot-owner-email-drift",
+            owner_email="drifted-owner-email@example.com",
+            display_name="Arc Bot Owner Email Drift",
+            accepted_types=sorted(MESSAGE_TYPES),
+        )
+        assert self_registered.owner_email == "drifted-owner-email@example.com"
+
+    async def test_min_schema_version_over_max_rejected(self, session: AsyncSession) -> None:
+        """Argus round 1 suggestion (TECH-5786 PR follow-up): mirrors
+        register_agent's own coverage of this same validator -- was
+        entirely untested for admin_register_agent."""
+        with pytest.raises(ValueError, match="min_schema_version"):
+            await admin_register_agent(
+                session,
+                actor_sub="admin-operator",
+                admin_authorized=True,
+                sub="arc-bot-bad-schema-range",
+                owner_sub="owner-arc-bot-bad-schema-range",
+                owner_email="arc-bot-bad-schema-range@example.com",
+                display_name="Arc Bot Bad Schema Range",
+                accepted_types=sorted(MESSAGE_TYPES),
+                min_schema_version=2,
+                max_schema_version=1,
+            )
+        row = (
+            await session.execute(select(Agent).where(Agent.sub == "arc-bot-bad-schema-range"))
+        ).scalar_one_or_none()
+        assert row is None
+
+    async def test_sub_must_not_be_email_shaped(self, session: AsyncSession) -> None:
+        """Argus round 1 BLOCKING finding (TECH-5786 PR follow-up):
+        register_agent's token-derived `sub` is rejected if email-shaped
+        (identity.validate_sub_shape) to prevent impersonation of a future
+        Okta-derived identity. admin_register_agent accepts `sub` as a
+        plain caller-supplied parameter, so it needs the equivalent check
+        applied explicitly -- without it, a comms:admin holder could
+        pre-register `sub="victim@company.com"` with an attacker-controlled
+        owner_sub/is_shared that would survive the victim's later
+        re-registration freeze."""
+        with pytest.raises(ValueError, match="email-shaped"):
+            await admin_register_agent(
+                session,
+                actor_sub="admin-operator",
+                admin_authorized=True,
+                sub="victim@company.com",
+                owner_sub="owner-victim",
+                owner_email="victim-owner@example.com",
+                display_name="Victim Impersonation Attempt",
+                accepted_types=sorted(MESSAGE_TYPES),
+            )
+        row = (
+            await session.execute(select(Agent).where(Agent.sub == "victim@company.com"))
+        ).scalar_one_or_none()
+        assert row is None
+
+    async def test_owner_sub_may_be_email_shaped(self, session: AsyncSession) -> None:
+        """Argus round 2 BLOCKING finding (TECH-5786 PR follow-up): an
+        earlier revision of this fix wrongly rejected email-shaped
+        `owner_sub`, mirroring the (correct) `sub` check. Unlike `sub`
+        (never email-shaped by spec), `owner_sub` is legitimately
+        email-shaped for any Okta/interactive-derived owner --
+        register_agent itself sets it from `token.claims.get("owner_sub")
+        or base_sub`, where base_sub resolves via try_resolve_email for
+        that case. Rejecting it here would make it impossible to
+        admin-register a bot on behalf of an ordinary human owner."""
+        agent = await admin_register_agent(
+            session,
+            actor_sub="admin-operator",
+            admin_authorized=True,
+            sub="arc-bot-human-owned",
+            owner_sub="dan@example.com",
+            owner_email="arc-bot-human-owned@example.com",
+            display_name="Arc Bot Human Owned",
+            accepted_types=sorted(MESSAGE_TYPES),
+        )
+        assert agent.owner_sub == "dan@example.com"
+
+    async def test_owner_sub_length_capped(self, session: AsyncSession) -> None:
+        with pytest.raises(ValueError, match="exceeds"):
+            await admin_register_agent(
+                session,
+                actor_sub="admin-operator",
+                admin_authorized=True,
+                sub="arc-bot-oversized-owner-sub",
+                owner_sub="x" * 257,
+                owner_email="oversized-owner-sub@example.com",
+                display_name="Oversized Owner Sub",
+                accepted_types=sorted(MESSAGE_TYPES),
+            )
+
+    async def test_owner_email_must_be_email_shaped(self, session: AsyncSession) -> None:
+        """Argus round 2 suggestion (TECH-5786 PR follow-up): `sub`/
+        `owner_sub` both get explicit shape guards; `owner_email` had none,
+        letting a comms:admin caller register an unfindable-by-email agent
+        with no error signal."""
+        with pytest.raises(ValueError, match="email-shaped"):
+            await admin_register_agent(
+                session,
+                actor_sub="admin-operator",
+                admin_authorized=True,
+                sub="arc-bot-bad-owner-email",
+                owner_sub="owner-arc-bot-bad-owner-email",
+                owner_email="notanemail",
+                display_name="Arc Bot Bad Owner Email",
+                accepted_types=sorted(MESSAGE_TYPES),
+            )
+
+    async def test_sub_length_capped(self, session: AsyncSession) -> None:
+        """Argus round 1 suggestion (TECH-5786 PR follow-up): sub/owner_sub/
+        owner_email are caller-supplied here (unlike register_agent's
+        IdP-length-constrained equivalents), so nothing bounded them before
+        being written into audit_log.detail (JSONB)."""
+        with pytest.raises(ValueError, match="exceeds"):
+            await admin_register_agent(
+                session,
+                actor_sub="admin-operator",
+                admin_authorized=True,
+                sub="x" * 257,
+                owner_sub="owner-oversized-sub",
+                owner_email="oversized-sub@example.com",
+                display_name="Oversized Sub",
+                accepted_types=sorted(MESSAGE_TYPES),
+            )
+
+    async def test_owner_email_length_capped(self, session: AsyncSession) -> None:
+        with pytest.raises(ValueError, match="exceeds"):
+            await admin_register_agent(
+                session,
+                actor_sub="admin-operator",
+                admin_authorized=True,
+                sub="arc-bot-oversized-owner-email",
+                owner_sub="owner-oversized-owner-email",
+                owner_email="a" * 255 + "@example.com",
+                display_name="Oversized Owner Email",
+                accepted_types=sorted(MESSAGE_TYPES),
+            )
+
+    async def test_denied_sibling_identity_exists(self, session: AsyncSession) -> None:
+        """Argus round 1 BLOCKING finding (TECH-5786 PR follow-up):
+        admin_register_agent must not silently omit register_agent's
+        sibling-identity-fork guard (TECH-5736) -- omitting it would
+        reopen the exact kill-switch bypass that guard exists to close
+        (suspend every identity under a base_sub via
+        comms_deregister_agent, then admin-register a brand-new sub under
+        that same base_sub to route around the suspension)."""
+        existing = await _register(session, "fork-base-sub")
+
+        with pytest.raises(SiblingIdentityExistsError) as exc_info:
+            await admin_register_agent(
+                session,
+                actor_sub="admin-operator",
+                admin_authorized=True,
+                sub="fork-base-sub::second-key",
+                owner_sub="owner-fork-base-sub-second-key",
+                owner_email="fork-base-sub-second-key@example.com",
+                display_name="Fork Base Sub Second Key",
+                accepted_types=sorted(MESSAGE_TYPES),
+            )
+        assert exc_info.value.base_sub == "fork-base-sub"
+
+        row = (
+            await session.execute(select(Agent).where(Agent.sub == "fork-base-sub::second-key"))
+        ).scalar_one_or_none()
+        assert row is None
+
+        rows = (
+            await session.execute(
+                select(AuditLog.actor_sub, AuditLog.detail).where(
+                    AuditLog.action == "denied.sibling_identity_exists",
+                    AuditLog.actor_sub == "admin-operator",
+                )
+            )
+        ).all()
+        assert len(rows) == 1
+        actor_sub, detail = rows[0]
+        # actor_sub is the PRIVILEGED CALLER, not the target sub -- unlike
+        # register_agent's own call site for this same denial helper.
+        assert actor_sub == "admin-operator"
+        assert detail["base_sub"] == "fork-base-sub"
+        assert detail["sub"] == "fork-base-sub::second-key"
+
+        # existing.id untouched
+        existing_row = (
+            await session.execute(select(Agent).where(Agent.id == existing.id))
+        ).scalar_one()
+        assert existing_row.status == "active"
+
+    async def test_sibling_identity_fork_confirmed_proceeds(self, session: AsyncSession) -> None:
+        await _register(session, "fork-confirmed-base-sub")
+
+        agent = await admin_register_agent(
+            session,
+            actor_sub="admin-operator",
+            admin_authorized=True,
+            sub="fork-confirmed-base-sub::second-key",
+            owner_sub="owner-fork-confirmed-base-sub-second-key",
+            owner_email="fork-confirmed-base-sub-second-key@example.com",
+            display_name="Fork Confirmed Base Sub Second Key",
+            accepted_types=sorted(MESSAGE_TYPES),
+            confirm_new_identity=True,
+        )
+        assert agent.sub == "fork-confirmed-base-sub::second-key"
+
+    async def test_sibling_identity_fork_counts_suspended_siblings(
+        self, session: AsyncSession
+    ) -> None:
+        """A SUSPENDED sibling still counts -- otherwise
+        comms_deregister_agent followed by this tool would silently
+        bypass the kill-switch, exactly as register_agent's own comment
+        documents for its identical check."""
+        existing = await _register(session, "fork-suspended-base-sub")
+        existing.status = "suspended"
+        await session.commit()
+
+        with pytest.raises(SiblingIdentityExistsError):
+            await admin_register_agent(
+                session,
+                actor_sub="admin-operator",
+                admin_authorized=True,
+                sub="fork-suspended-base-sub::second-key",
+                owner_sub="owner-fork-suspended-base-sub-second-key",
+                owner_email="fork-suspended-base-sub-second-key@example.com",
+                display_name="Fork Suspended Base Sub Second Key",
+                accepted_types=sorted(MESSAGE_TYPES),
+            )
+
+    async def test_display_name_db_level_collision(self, session: AsyncSession) -> None:
+        """Argus round 1 suggestion (TECH-5786 PR follow-up): mirrors
+        register_agent's own db-level display-name race backstop test --
+        was entirely untested for admin_register_agent's own IntegrityError
+        handler."""
+        await _register(session, "admin-db-collision-a", display_name="Taken Name")
+
+        with pytest.raises(DisplayNameCollisionError):
+            await admin_register_agent(
+                session,
+                actor_sub="admin-operator",
+                admin_authorized=True,
+                sub="admin-db-collision-b",
+                owner_sub="owner-admin-db-collision-b",
+                owner_email="admin-db-collision-b@example.com",
+                display_name="Taken Name",
+                accepted_types=sorted(MESSAGE_TYPES),
+            )
+
+        row = (
+            await session.execute(select(Agent).where(Agent.sub == "admin-db-collision-b"))
+        ).scalar_one_or_none()
+        assert row is None
+
+    async def test_concurrent_admin_registration_same_sub_one_wins_one_already_registered(
+        self, session: AsyncSession, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Argus round 1 BLOCKING finding (TECH-5786 PR follow-up): unlike
+        register_agent (idempotent -- a concurrent duplicate call is
+        benign), admin_register_agent is first-registration-only, so two
+        concurrent admin calls for the same sub that both pass the
+        pre-flush existence check race for the agents_sub_key unique
+        constraint at flush time. The loser must get
+        AgentAlreadyRegisteredError, not a bare unmapped IntegrityError
+        (500 with raw DB constraint text) -- this function's own docstring
+        promises AgentAlreadyRegisteredError for any duplicate-sub case,
+        concurrent or not."""
+
+        async def _admin_register(display_name: str) -> Agent:
+            async with session_factory() as sess:
+                return await admin_register_agent(
+                    sess,
+                    actor_sub="admin-operator",
+                    admin_authorized=True,
+                    sub="race-admin-register-target",
+                    owner_sub="owner-race-admin-register-target",
+                    owner_email="race-admin-register-target@example.com",
+                    display_name=display_name,
+                    accepted_types=sorted(MESSAGE_TYPES),
+                )
+
+        results = await asyncio.gather(
+            _admin_register("Race Winner"),
+            _admin_register("Race Loser"),
+            return_exceptions=True,
+        )
+
+        successes = [r for r in results if isinstance(r, Agent)]
+        errors = [r for r in results if isinstance(r, BaseException)]
+        assert len(successes) == 1
+        assert len(errors) == 1
+        assert isinstance(errors[0], AgentAlreadyRegisteredError)
+        assert errors[0].sub == "race-admin-register-target"
+
+        rows = (
+            (await session.execute(select(Agent).where(Agent.sub == "race-admin-register-target")))
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1
+
+    async def test_concurrent_admin_registration_same_display_name_db_level_backstop(
+        self, session: AsyncSession, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Argus round 2 suggestion (TECH-5786 PR follow-up):
+        test_display_name_db_level_collision only exercises the PRE-flush
+        SELECT guard (the colliding row is already committed, so the
+        pre-check catches it before flush() is ever reached) -- this
+        exercises the actual POST-flush `IntegrityError` ->
+        `_deny_display_name_collision` handler via a genuine two-session
+        race, mirroring the sub-uniqueness race test above."""
+
+        async def _admin_register(sub: str) -> Agent:
+            async with session_factory() as sess:
+                return await admin_register_agent(
+                    sess,
+                    actor_sub="admin-operator",
+                    admin_authorized=True,
+                    sub=sub,
+                    owner_sub=f"owner-{sub}",
+                    owner_email=f"{sub}@example.com",
+                    display_name="Race Display Name",
+                    accepted_types=sorted(MESSAGE_TYPES),
+                )
+
+        results = await asyncio.gather(
+            _admin_register("race-display-name-a"),
+            _admin_register("race-display-name-b"),
+            return_exceptions=True,
+        )
+
+        successes = [r for r in results if isinstance(r, Agent)]
+        errors = [r for r in results if isinstance(r, BaseException)]
+        assert len(successes) == 1
+        assert len(errors) == 1
+        assert isinstance(errors[0], DisplayNameCollisionError)
+
+        rows = (
+            (
+                await session.execute(
+                    select(Agent).where(
+                        Agent.sub.in_(["race-display-name-a", "race-display-name-b"])
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1
