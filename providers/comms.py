@@ -50,6 +50,7 @@ import service
 from db import get_session_factory
 from exceptions import (
     AccessDeniedError,
+    AgentAlreadyRegisteredError,
     AgentRetiredError,
     AgentSuspendedError,
     DisplayNameCollisionError,
@@ -281,6 +282,10 @@ async def _map_service_errors() -> AsyncIterator[None]:
     ``comms_list_agents`` -- and no longer includes the colliding ``sub``s
     themselves, see that exception's own docstring for why), never another
     caller's secret data -- see their own docstrings in exceptions.py.
+    ``AgentAlreadyRegisteredError`` (``comms_admin_register``) is the same
+    story again: the caller is a privileged admin who supplied the target
+    ``sub`` explicitly, so confirming it's already registered discloses
+    nothing new -- see its own docstring.
 
     A bare ``ValueError`` is different: the service layer raises it for
     internal parameter-shape problems (e.g. an empty ``display_name`` or
@@ -305,6 +310,7 @@ async def _map_service_errors() -> AsyncIterator[None]:
         SiblingIdentityExistsError,
         DisplayNameCollisionError,
         AgentSuspendedError,
+        AgentAlreadyRegisteredError,
     ) as exc:
         raise ToolError(str(exc)) from None
     except (ValueError, RuntimeError):
@@ -728,6 +734,115 @@ async def deregister_agent(agent_id: str) -> dict[str, Any]:
         "sub": agent.sub,
         "display_name": agent.display_name,
         "status": agent.status,
+    }
+
+
+@comms_server.tool
+async def admin_register(
+    sub: str,
+    owner_sub: str,
+    owner_email: str,
+    display_name: str,
+    accepted_types: list[str],
+    is_shared: bool = False,
+    min_schema_version: int = 1,
+    max_schema_version: int = 1,
+) -> dict[str, Any]:
+    """Admin-gated, on-behalf-of FIRST registration for a ``sub`` that has
+    never registered itself.
+
+    ``comms_register`` always derives ``sub`` from the CALLING token's own
+    verified identity — by design, nothing can register or claim an
+    identity that isn't its own token's, even with ``comms:admin`` scope
+    (DESIGN.md §4). That's the right anti-impersonation default, but it
+    leaves a real gap: a platform provisioning a new bot (e.g. minting an
+    Arc bot's board credential) needs to set that bot's ``is_shared``
+    before the bot has ever spoken for itself on this board. The only
+    workarounds without this tool are both bad — granting the bot's own
+    permanent credential ``comms:admin`` (this board's own
+    ``docs/BOT-AGENT-SETUP-CHECKLIST.md`` says an ordinary bot must never
+    hold that), or minting a throwaway token impersonating the target
+    ``sub`` just to make one call. This tool is the real fix: an explicit,
+    audited, on-behalf-of registration capability.
+
+    Requires the caller's token to carry the ``comms:admin`` scope (or be
+    an interactive/Okta caller) — same gate as ``comms_set_agent_shared``/
+    ``comms_deregister_agent``. A caller without it gets the standard
+    anti-enumeration ``access_denied`` error (the specific reason,
+    ``denied.admin_register_requires_elevated_scope``, is recorded only in
+    the audit log).
+
+    **First registration only, never an upsert.** Fails with
+    ``already_registered`` if ``sub`` already has a board row (any
+    status) — use ``comms_set_agent_shared``/``comms_deregister_agent`` to
+    modify an existing agent instead. Unlike ``comms_register``, there is
+    no re-registration/idempotent-rebind behavior here at all.
+
+    - ``sub``: the target's board identity — the SAME value that agent's
+      own future ``comms_register``/agent-jwt ``sub`` claim will carry
+      (from whatever issued its credential). This is NOT derived from the
+      calling admin's own identity.
+    - ``owner_sub``/``owner_email``: the target's ownership-decision
+      inputs, exactly as ``comms_register`` would derive them from the
+      target's OWN verified token claims — except here, since there is no
+      such token yet, the calling admin supplies them directly, sourced
+      from whatever ownership registry it already trusts for this ``sub``
+      (e.g. the same registry used to mint the target's own credential).
+      This tool performs no verification of its own on these two fields —
+      same trust contract ``comms_register`` already documents for its own
+      token-derived equivalents.
+    - ``display_name``/``accepted_types``/``min_schema_version``/
+      ``max_schema_version``: identical validation and semantics to
+      ``comms_register`` — see that tool's docstring.
+    - ``is_shared``: set ``True`` if this agent spans ownership boundaries.
+      No separate authorization check on this parameter (unlike
+      ``comms_register``'s ``is_shared=True`` gate) — the entire
+      ``comms_admin_register`` call already requires the same elevated
+      authorization, so there is no less-privileged path through this tool
+      for ``is_shared`` to escalate past.
+
+    Once created, the resulting row is ordinary: if the target later calls
+    ``comms_register`` itself with the same ``sub``, that hits
+    ``comms_register``'s normal re-registration path — ``is_shared`` and
+    ``owner_sub`` stay frozen (a mismatched self-reported ``is_shared`` is
+    ignored and audited, same as any other agent), though ``owner_email``
+    can still move if the target's own token claims disagree, exactly as
+    ``comms_register``'s own re-registration already documents.
+    """
+    token = _require_token()
+    actor_sub = _require_identity(token)
+    admin_authorized = is_interactive_token(token) or "comms:admin" in scopes_for_token(token)
+
+    try:
+        service.validate_schema_version_range(min_schema_version, max_schema_version)
+    except ValueError as exc:
+        raise ToolError(f"invalid_request: {exc}") from None
+
+    async with get_session_factory()() as session, _map_service_errors():
+        agent = await service.admin_register_agent(
+            session,
+            actor_sub=actor_sub,
+            admin_authorized=admin_authorized,
+            sub=sub,
+            owner_sub=owner_sub,
+            owner_email=owner_email,
+            display_name=display_name,
+            accepted_types=accepted_types,
+            is_shared=is_shared,
+            min_schema_version=min_schema_version,
+            max_schema_version=max_schema_version,
+        )
+
+    return {
+        "agent_id": str(agent.id),
+        "sub": agent.sub,
+        "display_name": agent.display_name,
+        "accepted_types": list(agent.accepted_types),
+        "status": agent.status,
+        "owner_email": agent.owner_email,
+        "is_shared": agent.is_shared,
+        "min_schema_version": agent.min_schema_version,
+        "max_schema_version": agent.max_schema_version,
     }
 
 

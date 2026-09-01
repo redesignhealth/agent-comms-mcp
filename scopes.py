@@ -47,7 +47,11 @@ from observability import log_auth_rejected
 #             ``service.set_agent_shared``'s ``is_shared_authorized`` param),
 #             and by ``providers.comms.deregister_agent`` (TECH-5736) to
 #             transition an agent to ``status="suspended"`` (see
-#             ``service.deregister_agent``'s ``deregister_authorized`` param).
+#             ``service.deregister_agent``'s ``deregister_authorized`` param),
+#             and by ``providers.comms.admin_register`` to perform an
+#             on-behalf-of FIRST registration for a ``sub`` other than the
+#             caller's own (see ``service.admin_register_agent``'s
+#             ``admin_authorized`` param).
 TOOL_SCOPES: dict[str, str] = {
     # --- comms (provider: providers/comms.py, namespace="comms") ---
     "comms_whoami": "comms:read",
@@ -73,6 +77,14 @@ TOOL_SCOPES: dict[str, str] = {
     # would silently grant every comms:write token deregistration power --
     # do not assume TOOL_SCOPES alone gates this tool.
     "comms_deregister_agent": "comms:write",
+    # Registered at comms:write deliberately -- the actual authorization
+    # (comms:admin OR an interactive/Okta caller) is enforced by an
+    # in-handler check (see the `:admin` verb note above), not by this
+    # table. If that in-handler check is ever removed, this entry alone
+    # would silently grant every comms:write token on-behalf-of
+    # registration power -- do not assume TOOL_SCOPES alone gates this
+    # tool.
+    "comms_admin_register": "comms:write",
     "comms_start_conversation": "comms:write",
     "comms_post_message": "comms:write",
     "comms_accept": "comms:write",

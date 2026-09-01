@@ -165,6 +165,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from exceptions import (
     AccessDeniedError,
+    AgentAlreadyRegisteredError,
     AgentRetiredError,
     AgentSuspendedError,
     DisplayNameCollisionError,
@@ -1228,6 +1229,290 @@ def _agent_key_from_sub(sub: str, base_sub: str) -> str | None:
     return sub[len(base_sub) + 2 :]
 
 
+def _validate_display_name_and_accepted_types(
+    display_name: str, accepted_types: list[str]
+) -> tuple[str, list[str]]:
+    """Shared input validation for ``display_name``/``accepted_types``,
+    factored out of ``register_agent`` so ``admin_register_agent`` (the
+    on-behalf-of path) enforces the identical rules rather than a
+    hand-copied, driftable duplicate. Returns ``(display_name,
+    normalized_types)`` -- stripped/deduped/sorted, same shape both
+    callers persist. Raises ``ValueError``/``UnknownConversationTypeError``
+    exactly as ``register_agent``'s docstring documents; see that
+    docstring for the full validation-order rationale (cap checks run
+    BEFORE computing ``unknown_types``, so an over-sized/over-long input
+    can never get echoed back verbatim in the error message).
+    """
+    display_name = display_name.strip()
+    if not display_name:
+        raise ValueError("display_name must be non-empty")
+    if len(display_name) > MAX_DISPLAY_NAME_LENGTH:
+        raise ValueError(f"display_name exceeds {MAX_DISPLAY_NAME_LENGTH} characters")
+    if len(accepted_types) > MAX_ACCEPTED_TYPES:
+        raise ValueError(f"accepted_types exceeds {MAX_ACCEPTED_TYPES} entries")
+    if not accepted_types:
+        raise ValueError("accepted_types must be non-empty")
+    if any(len(t) > MAX_ACCEPTED_TYPE_LENGTH for t in accepted_types):
+        raise ValueError(
+            f"accepted_types entries must not exceed {MAX_ACCEPTED_TYPE_LENGTH} characters"
+        )
+    unknown_types = sorted(set(accepted_types) - MESSAGE_TYPES)
+    if unknown_types:
+        raise UnknownConversationTypeError(
+            "accepted_types must be a non-empty subset of "
+            f"{sorted(MESSAGE_TYPES)} (got unknown: {unknown_types})"
+        )
+    normalized_types = sorted(set(accepted_types))
+    return display_name, normalized_types
+
+
+async def _deny_agent_already_registered(
+    session: AsyncSession, *, actor_sub: str, sub: str, existing_agent_id: uuid.UUID
+) -> NoReturn:
+    """Same audit/commit shape as ``_deny``, but for
+    ``exceptions.AgentAlreadyRegisteredError`` (the ``comms_admin_register``
+    on-behalf-of tool). ``actor_sub`` is the PRIVILEGED CALLER here, not
+    ``sub`` (the target) -- unlike every denial inside ``register_agent``,
+    this tool always has an authenticated actor distinct from the target
+    it's registering, and the audit trail must record who attempted the
+    on-behalf-of registration, not just which sub it targeted."""
+    _audit(
+        session,
+        actor_sub=actor_sub,
+        action="denied.agent_already_registered",
+        agent_id=existing_agent_id,
+        detail={"target_sub": sub},
+    )
+    await session.commit()
+    raise AgentAlreadyRegisteredError(sub=sub)
+
+
+async def admin_register_agent(
+    session: AsyncSession,
+    *,
+    actor_sub: str,
+    admin_authorized: bool,
+    sub: str,
+    owner_sub: str,
+    owner_email: str,
+    display_name: str,
+    accepted_types: list[str],
+    is_shared: bool = False,
+    min_schema_version: int = 1,
+    max_schema_version: int = 1,
+) -> Agent:
+    """Register a NEW agent identity on behalf of an explicit target
+    ``sub``, for a privileged (``comms:admin``-scoped or interactive)
+    caller -- the ``comms_admin_register`` MCP tool.
+
+    Why this exists: ``register_agent`` always derives ``sub`` from the
+    CALLING token's own verified identity (``providers.comms.
+    _require_identity``) -- by design, DESIGN.md §4's "owner identity is
+    always derived from verified token claims, never accepted as a
+    parameter" invariant means nothing can register OR claim an identity
+    that isn't its own token's. That's a deliberate anti-impersonation
+    property, but it leaves a real gap: a platform provisioning a new bot
+    (e.g. redesign-ai minting an Arc bot's board credential) needs to set
+    ``is_shared=True`` on that bot's row before the bot has ever spoken for
+    itself -- and the only workarounds available without this tool are both
+    bad: (a) grant the bot's own permanent credential ``comms:admin`` (this
+    board's own ``docs/BOT-AGENT-SETUP-CHECKLIST.md`` says an ordinary bot
+    must never hold that), or (b) mint a throwaway token impersonating the
+    target ``sub`` just to make one self-registration call. This function is
+    the real, first-class fix: an explicit, audited, on-behalf-of
+    registration capability, distinct from both ``register_agent`` (self-
+    service, idempotent, ``sub`` always the caller's own) and
+    ``set_agent_shared`` (corrects ``is_shared`` on an agent that ALREADY
+    exists -- this function is a genuine FIRST registration for a ``sub``
+    that has never registered at all).
+
+    **Authorization**: mirrors ``set_agent_shared``/``deregister_agent``
+    exactly -- ``admin_authorized`` MUST be computed by the caller (the
+    tools layer) from the actor's own verified token (``comms:admin``
+    scope, or an interactive/Okta caller), checked FIRST via
+    ``_deny_agent_already_registered``'s sibling ``_deny`` call so an
+    unauthorized attempt's audit trail always records the authorization
+    failure, never ``denied.agent_already_registered``, regardless of
+    whether ``sub`` happens to already exist. No default is provided (same
+    reasoning as ``set_agent_shared``): this function's entire purpose is
+    the privileged mutation, so there is no unprivileged call site to
+    protect with a fail-closed default. Unlike ``register_agent``'s
+    ``is_shared_authorized`` (a NARROWER gate on one parameter of an
+    otherwise-reachable self-service tool), ``admin_authorized`` gates the
+    entire call -- there is no unprivileged use of this function, so
+    ``is_shared`` itself needs no separate authorization check here.
+
+    **``owner_sub``/``owner_email`` are explicit, caller-supplied
+    parameters here** -- the one deliberate exception to DESIGN.md §4's
+    "never accepted as a parameter" rule, and only because this is
+    fundamentally an on-behalf-of operation: there IS no verified token for
+    the target to derive them from (that's the entire gap this tool closes
+    -- the target hasn't authenticated to this board yet). This board's
+    injected ``OwnershipClient`` seam (``_owner_sets_for`` and friends) is
+    keyed by board ``agent_id`` (a UUID), which does not exist yet for a
+    ``sub`` that has never registered -- it structurally cannot resolve
+    ownership for a not-yet-registered identity, so there is no existing
+    mechanism this function could reuse instead of trusting its caller.
+    The privileged caller is expected to source these from whatever
+    ownership registry it already trusts for this ``sub`` (e.g. the same
+    registry that minted the target's own board credential) -- this
+    function performs no verification of its own, the same trust contract
+    ``register_agent`` already documents for its own (token-derived)
+    ``owner_sub``/``owner_email`` parameters.
+
+    **First-registration only, never an upsert**: raises
+    ``AgentAlreadyRegisteredError`` if ``sub`` already has a board row
+    (any ``status``) -- unlike ``register_agent``'s idempotent self-service
+    re-bind. Correcting an EXISTING agent's ``is_shared``/``status`` goes
+    through ``set_agent_shared``/``deregister_agent`` instead; there is no
+    supported way to change an existing agent's ``owner_sub``/
+    ``owner_email``/``display_name`` through this admin surface.
+
+    **Interaction with later self-registration**: a row this function
+    creates is, once created, ordinary -- indistinguishable from one
+    ``register_agent`` created directly. If the target later calls
+    ``comms_register`` itself (e.g. during its own ReClaw setup, using its
+    own restricted credential), that hits ``register_agent``'s existing
+    RE-registration branch (``existing is not None``) for the same ``sub``:
+    ``is_shared`` and ``owner_sub`` stay frozen exactly as they would after
+    any other first registration (a mismatched self-reported ``is_shared``
+    is ignored and audited as ``agent.reregister_is_shared_ignored``, same
+    as always) -- this function's own admin-set values are not
+    retroactively escalatable by the target's own later, less-privileged
+    call. ``owner_email`` is the one field ``register_agent`` DOES
+    overwrite on re-registration (see its docstring) -- so a target's later
+    self-registration can move ``owner_email`` away from what this
+    function set, if its own token's claims (or ``base_sub`` fallback)
+    disagree. This is not a new gap this function introduces: it is
+    exactly ``register_agent``'s existing, already-documented
+    ``owner_email`` mutability, unrelated to how the row was first
+    created. Callers relying on a stable admin-set ``owner_email`` should
+    ensure the target's own later credential is minted with a matching
+    ``owner_email`` claim.
+
+    Reuses ``register_agent``'s exact ``display_name``/``accepted_types``
+    validation (``_validate_display_name_and_accepted_types``) and its
+    display-name-collision-on-creation check, so the two registration
+    paths can never silently drift apart on those rules.
+
+    Raises ``ValueError``/``UnknownConversationTypeError`` for malformed
+    input, same shapes and ordering as ``register_agent`` (see its
+    docstring) -- checked BEFORE the authorization gate for ``sub``'s own
+    non-emptiness (a data-shape failure, not an authorization decision),
+    but the authorization gate itself still runs before the
+    already-registered/display-name-collision checks below, per the
+    ordering note above.
+    """
+    validate_schema_version_range(min_schema_version, max_schema_version)
+    sub = sub.strip()
+    if not sub:
+        raise ValueError("sub must be non-empty")
+    owner_sub = owner_sub.strip()
+    if not owner_sub:
+        raise ValueError("owner_sub must be non-empty")
+    owner_email = owner_email.strip()
+    if not owner_email:
+        raise ValueError("owner_email must be non-empty")
+    display_name, normalized_types = _validate_display_name_and_accepted_types(
+        display_name, accepted_types
+    )
+
+    if not admin_authorized:
+        await _deny(
+            session,
+            actor_sub=actor_sub,
+            action="denied.admin_register_requires_elevated_scope",
+            detail={"target_sub": sub, "display_name": display_name},
+        )
+
+    existing = (await session.execute(select(Agent).where(Agent.sub == sub))).scalar_one_or_none()
+    if existing is not None:
+        await _deny_agent_already_registered(
+            session, actor_sub=actor_sub, sub=sub, existing_agent_id=existing.id
+        )
+
+    # Same display-name-collision-on-creation guard as register_agent
+    # (see that function's own comments for why this only fires on
+    # creation -- always true here, since this path never re-registers).
+    colliding_subs = (
+        (
+            await session.execute(
+                select(Agent.sub).where(
+                    func.lower(Agent.display_name) == display_name.lower(),
+                    Agent.status == "active",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if colliding_subs:
+        await _deny_display_name_collision(
+            session,
+            actor_sub=actor_sub,
+            display_name=display_name,
+            existing_subs=list(colliding_subs),
+        )
+
+    now = _now()
+    agent = Agent(
+        sub=sub,
+        owner_sub=owner_sub,
+        owner_email=owner_email,
+        display_name=display_name,
+        accepted_types=normalized_types,
+        status="active",
+        is_shared=is_shared,
+        bound_at=now,
+        min_schema_version=min_schema_version,
+        max_schema_version=max_schema_version,
+    )
+    session.add(agent)
+    try:
+        await session.flush()
+    except IntegrityError as exc:
+        # Same race-closing DB-level backstop as register_agent's own
+        # flush handler -- see its comment for why this is narrowed to
+        # exactly this named index rather than a blanket
+        # IntegrityError->DisplayNameCollisionError mapping.
+        await session.rollback()
+        if _is_display_name_index_violation(exc):
+            colliding_subs_post_rollback = (
+                (
+                    await session.execute(
+                        select(Agent.sub).where(
+                            func.lower(Agent.display_name) == display_name.lower(),
+                            Agent.status == "active",
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            await _deny_display_name_collision(
+                session,
+                actor_sub=actor_sub,
+                display_name=display_name,
+                existing_subs=list(colliding_subs_post_rollback),
+            )
+        raise
+    _audit(
+        session,
+        actor_sub=actor_sub,
+        action="agent.admin_registered",
+        agent_id=agent.id,
+        detail={
+            "target_sub": sub,
+            "owner_sub": owner_sub,
+            "owner_email": owner_email,
+            "display_name": display_name,
+            "is_shared": is_shared,
+        },
+    )
+    await session.commit()
+    return agent
+
+
 async def register_agent(
     session: AsyncSession,
     *,
@@ -1354,47 +1639,9 @@ async def register_agent(
     sub = sub.strip()
     if not sub:
         raise ValueError("sub must be non-empty")
-    display_name = display_name.strip()
-    if not display_name:
-        raise ValueError("display_name must be non-empty")
-    if len(display_name) > MAX_DISPLAY_NAME_LENGTH:
-        raise ValueError(f"display_name exceeds {MAX_DISPLAY_NAME_LENGTH} characters")
-    # Cap check runs FIRST, before computing unknown_types -- for security:
-    # the old order let a caller submit an arbitrarily large
-    # list of unknown-type strings and get every one of them echoed back
-    # verbatim in the error message, silently bypassing the declared
-    # MAX_ACCEPTED_TYPES cap for this input shape. Bounding the input size
-    # up front means unknown_types is now computed over an already-capped
-    # list, whatever the values.
-    if len(accepted_types) > MAX_ACCEPTED_TYPES:
-        raise ValueError(f"accepted_types exceeds {MAX_ACCEPTED_TYPES} entries")
-    # Empty list is a distinct failure from "contains an unknown type" --
-    # it's not client-safe/specific in the same way (there's no unknown
-    # value to usefully enumerate), so it stays a bare ValueError rather
-    # than UnknownConversationTypeError. Splitting these
-    # avoids the confusing prior message "... (got unknown: [])" for an
-    # empty list, which named zero unknown values while still claiming
-    # something was unknown.
-    if not accepted_types:
-        raise ValueError("accepted_types must be non-empty")
-    # Per-entry length cap, for security: the count cap above
-    # bounds how many entries there are, not how long any one entry is --
-    # without this, 20 arbitrarily large strings would all pass the count
-    # check, then get echoed back verbatim in UnknownConversationTypeError
-    # below. Checked before computing unknown_types for the same
-    # echo-bounding reason as the count check.  Every real MESSAGE_TYPES
-    # value is under 30 characters; 100 is a generous margin.
-    if any(len(t) > MAX_ACCEPTED_TYPE_LENGTH for t in accepted_types):
-        raise ValueError(
-            f"accepted_types entries must not exceed {MAX_ACCEPTED_TYPE_LENGTH} characters"
-        )
-    unknown_types = sorted(set(accepted_types) - MESSAGE_TYPES)
-    if unknown_types:
-        raise UnknownConversationTypeError(
-            "accepted_types must be a non-empty subset of "
-            f"{sorted(MESSAGE_TYPES)} (got unknown: {unknown_types})"
-        )
-    normalized_types = sorted(set(accepted_types))
+    display_name, normalized_types = _validate_display_name_and_accepted_types(
+        display_name, accepted_types
+    )
 
     existing = (await session.execute(select(Agent).where(Agent.sub == sub))).scalar_one_or_none()
     now = _now()

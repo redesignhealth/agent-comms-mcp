@@ -289,8 +289,43 @@ class AgentSuspendedError(Exception):
         self.sub = sub
 
 
+class AgentAlreadyRegisteredError(Exception):
+    """``admin_register_agent`` (the ``comms_admin_register`` on-behalf-of
+    tool) targeted a ``sub`` that already has a board row -- this is a
+    FIRST-registration-only path, not an upsert (unlike ``register_agent``'s
+    self-service idempotent re-bind).
+
+    Specific and client-safe by design, unlike ``AccessDeniedError``: the
+    caller here is a privileged (``comms:admin``-scoped or interactive)
+    operator who supplied this exact ``sub`` explicitly (typically because
+    they just minted a credential for it), not a party probing for facts
+    about agents it doesn't already know about -- confirming "this one you
+    just named is already registered" discloses nothing an
+    enumeration-style attack could exploit, the same reasoning
+    ``DisplayNameCollisionError``/``SiblingIdentityExistsError`` already
+    apply to this admin-facing registration surface.
+
+    Points the caller at the two supported ways to change an
+    already-registered agent instead of silently upserting: ``sub``'s
+    ``is_shared`` via ``comms_set_agent_shared``, or its ``status`` via
+    ``comms_deregister_agent``. There is no supported way to change an
+    existing agent's ``owner_sub``/``owner_email``/``display_name`` through
+    this admin surface -- those remain governed by ``register_agent``'s own
+    self-service re-registration rules (and its ``owner_sub`` freeze).
+    """
+
+    def __init__(self, *, sub: str) -> None:
+        super().__init__(
+            f"already_registered: {sub!r} is already a board agent -- use "
+            "comms_set_agent_shared or comms_deregister_agent to modify it, "
+            "this tool only performs first-time on-behalf-of registration"
+        )
+        self.sub = sub
+
+
 __all__ = [
     "AccessDeniedError",
+    "AgentAlreadyRegisteredError",
     "AgentRetiredError",
     "AgentSuspendedError",
     "DisplayNameCollisionError",

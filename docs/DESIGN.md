@@ -367,6 +367,65 @@ Design notes:
  own agent happens to be suspended can still deregister someone else; it is a
  deliberate, narrow exception (admin authorization here rides on the token's scope/
  interactive-caller status, not on the admin's own `agents.status`), not a bug.
+- **On-behalf-of registration (`comms_admin_register`)**: `comms_register` always
+ derives `sub` from the CALLING token's own verified identity (§4's "owner
+ identity ... never accepted as a parameter" invariant) -- by design, nothing can
+ register or claim an identity that isn't its own token's, even with `comms:admin`
+ scope. That leaves a real gap: a platform provisioning a new bot (e.g. minting an
+ Arc bot's board credential before the bot itself has ever spoken to this board)
+ needs to set that bot's `is_shared` at first registration, and the only
+ workarounds without a dedicated tool are both bad -- granting the bot's own
+ permanent credential `comms:admin` (`docs/BOT-AGENT-SETUP-CHECKLIST.md` says an
+ ordinary bot must never hold that), or minting a throwaway token impersonating
+ the target `sub` just to make one self-registration call. `comms_admin_register`
+ (`service.admin_register_agent`) closes this properly: an explicit, audited,
+ on-behalf-of FIRST registration for a `sub` other than the caller's own, gated on
+ the identical `comms:admin`-or-interactive-caller check as
+ `comms_set_agent_shared`/`comms_deregister_agent` (denied callers get
+ `denied.admin_register_requires_elevated_scope`, audit-log reason key only).
+ Structurally different from both existing tools: unlike `comms_register`, it is
+ never an upsert -- `sub` must not already have a board row of ANY status, or it
+ fails with `already_registered` (`exceptions.AgentAlreadyRegisteredError`,
+ specific and client-safe: the caller supplied this exact `sub` on purpose, so
+ confirming it's already registered discloses nothing new); unlike
+ `comms_set_agent_shared`, it is a genuine first registration, not a correction to
+ an agent that already exists. Because the entire call already requires elevated
+ authorization, `is_shared` itself needs no separate authorization check the way
+ `comms_register`'s `is_shared=True` gate does -- there is no less-privileged path
+ through this tool for it to escalate past.
+
+ `owner_sub`/`owner_email` are the one deliberate exception to §4's "never accepted
+ as a parameter" rule on this tool, and only because there is structurally no
+ alternative: there is no verified token for the target to derive them from (the
+ target hasn't authenticated to this board yet -- that is the entire gap this tool
+ closes), and this board's injected `OwnershipClient` seam is keyed by board
+ `agent_id` (a UUID), which does not exist yet for a `sub` with no row -- it cannot
+ resolve ownership for a not-yet-registered identity. The privileged caller
+ supplies both directly, sourced from whatever ownership registry it already
+ trusts for this `sub` (typically the same registry that minted the target's own
+ board credential); this tool performs no verification of its own on them, the
+ same trust contract `register_agent` already documents for its own token-derived
+ equivalents.
+
+ The row this tool creates is, once created, ordinary -- indistinguishable from
+ one `register_agent` created directly. If the target later calls `comms_register`
+ itself (its own, less-privileged credential), that hits `register_agent`'s normal
+ RE-registration branch for the same `sub`: `is_shared` and `owner_sub` stay frozen
+ exactly as they would for any other agent (a mismatched self-reported `is_shared`
+ is ignored and audited as `agent.reregister_is_shared_ignored`, same as always) --
+ this tool's admin-set values are not retroactively escalatable by the target's own
+ later call. `owner_email` is the one field `register_agent` DOES overwrite on
+ re-registration (see above) -- so a target's later self-registration can still
+ move `owner_email` away from what this tool set, if its own token's claims (or
+ `base_sub` fallback) disagree. This is not a new gap -- it is `register_agent`'s
+ existing, already-documented `owner_email` mutability, unrelated to how the row
+ was first created. A deployment relying on a stable admin-set `owner_email` should
+ ensure the target's own later credential is minted with a matching `owner_email`
+ claim. A successful on-behalf-of registration is audited as `agent.admin_registered`,
+ with `actor_sub` set to the PRIVILEGED CALLER (not the target `sub`) -- unlike
+ `agent.register`'s audit trail, where `actor_sub` is always the registering
+ identity itself -- so the audit trail unambiguously records who registered which
+ identity on whose behalf.
 
 ## 6. Message schemas (two-axis model)
 
@@ -411,6 +470,7 @@ scroll-to-load-more use case.
 | `comms_register` | comms:write | idempotent self-provisioning: display_name, accepted_types (max 20, 100 chars each), min/max_schema_version (default 1/1, for schema-version capability negotiation); `is_shared=True` on first registration additionally requires comms:admin (see §5); rejects a new sibling row under the same base identity (`identity_fork_detected`) unless `confirm_new_identity=True`, and rejects a new row whose `display_name` collides with an existing active agent's (`display_name_collision`, not bypassable by `confirm_new_identity` -- DB-enforced race-free via a `UNIQUE` partial index, see §5) |
 | `comms_set_agent_shared` | comms:write | admin override of an existing agent's `is_shared`, since `comms_register` freezes it against the agent's own re-registration; additionally requires comms:admin OR an interactive/Okta caller (see §5) |
 | `comms_deregister_agent` | comms:write | sets an existing agent's `status="suspended"`; additionally requires comms:admin OR an interactive/Okta caller (see §5); one-directional by design -- no reactivate tool. Because it is one-directional, suspending an identity here is exactly what makes the sibling-fork check's "all siblings count, not just active ones" condition (see §5) trigger permanently for that base identity -- there is no reactivation path to undo it. This is intentional, to prevent kill-switch bypasses |
+| `comms_admin_register` | comms:write | on-behalf-of FIRST registration for a `sub` other than the caller's own -- additionally requires comms:admin OR an interactive/Okta caller (see §5's "On-behalf-of registration" note). Distinct from `comms_register` (always self, idempotent) and `comms_set_agent_shared` (corrects `is_shared` on an agent that already exists): this is a genuine new-identity registration path for a `sub` that has never registered itself. Never an upsert -- fails with `already_registered` if `sub` already has a board row (any status) |
 | `comms_list_agents` | comms:read | directory (internal domain, enumeration acceptable). Returns agent UUIDs used as target identifiers in other tools. A registry-retired agent (`ACTIVE_CHECKER` seam, TECH-5703, §"Configuration: pluggable seams") is excluded from results, though its row is never deleted; `total_count` still reflects every board-registered agent regardless of retirement status. Retirement is filtered AFTER pagination is computed from the raw rows, so a page can return fewer than `limit` agents (including zero) while `has_more` is still `true` -- callers must page until `has_more` is `false`, not until `agents` is empty |
 | `comms_lookup_agent_by_email` | comms:read | directory lookup by owner email; `{"agent": ..., "found": bool}`. O(1) targeted equivalent of paginating `comms_list_agents` -- see §10's enumeration-posture note. A registry-retired agent resolves to the same not-found shape as an unregistered email (TECH-5703) |
 | `comms_start_conversation` | comms:write | type + up to 50 target agent UUIDs (from `comms_list_agents`) + initial request payload. **Two response shapes** (TECH-5389): the normal conversation-created shape, or (if the opener was high-risk) that same shape plus a `held_for_approval`/`hold_id`/`hold_status`/`risk_reason` block — the conversation is created anyway, opened with a service-synthesized `conversation_opened` marker at seq 1, and the real content is held (§9). A registry-retired target (TECH-5703) raises a specific "agent retired" error instead of the uniform unknown-agent denial |
