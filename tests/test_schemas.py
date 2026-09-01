@@ -10,6 +10,8 @@ from pydantic import ValidationError
 
 import schemas
 from schemas import (
+    DOC_BACKED_INSTRUCTION_KINDS,
+    LINK_BACKED_INSTRUCTION_KINDS,
     MAX_ACCEPTED_TYPES,
     MESSAGE_TYPES,
     AvailabilityRequestV1,
@@ -17,6 +19,8 @@ from schemas import (
     ConfirmV1,
     CounterProposalV1,
     DeclineV1,
+    InstructionRequestV1,
+    InstructionShareV1,
     NeedsClarificationV1,
     NoteV1,
     PayloadValidationError,
@@ -507,6 +511,102 @@ class TestTaskCancelV1:
     def test_rejects_missing_reason(self) -> None:
         with pytest.raises(ValidationError):
             TaskCancelV1.model_validate({})
+
+
+class TestInstructionRequestV1:
+    def test_accepts_doc_backed_kind(self) -> None:
+        model = InstructionRequestV1.model_validate({"kind": "onboarding_welcome"})
+        assert model.type == "instruction_request"
+        assert model.kind == "onboarding_welcome"
+
+    def test_accepts_link_backed_kind(self) -> None:
+        model = InstructionRequestV1.model_validate({"kind": "setup_skill_via_link"})
+        assert model.kind == "setup_skill_via_link"
+
+    def test_rejects_unknown_kind(self) -> None:
+        with pytest.raises(ValidationError):
+            InstructionRequestV1.model_validate({"kind": "not_a_real_kind"})
+
+    def test_rejects_missing_kind(self) -> None:
+        with pytest.raises(ValidationError):
+            InstructionRequestV1.model_validate({})
+
+    def test_rejects_extra_field(self) -> None:
+        with pytest.raises(ValidationError):
+            InstructionRequestV1.model_validate({"kind": "onboarding_welcome", "text": "hi"})
+
+
+class TestInstructionShareV1:
+    @pytest.mark.parametrize("kind", sorted(DOC_BACKED_INSTRUCTION_KINDS))
+    def test_accepts_doc_backed_kind_with_text(self, kind: str) -> None:
+        model = InstructionShareV1.model_validate({"kind": kind, "text": "hello there"})
+        assert model.type == "instruction_share"
+        assert model.text == "hello there"
+        assert model.link is None
+
+    @pytest.mark.parametrize("kind", sorted(LINK_BACKED_INSTRUCTION_KINDS))
+    def test_accepts_link_backed_kind_with_link(self, kind: str) -> None:
+        model = InstructionShareV1.model_validate(
+            {"kind": kind, "link": "https://example.com/setup"}
+        )
+        assert model.link == "https://example.com/setup"
+        assert model.text is None
+
+    def test_rejects_doc_backed_kind_with_link_instead_of_text(self) -> None:
+        with pytest.raises(ValidationError):
+            InstructionShareV1.model_validate(
+                {"kind": "onboarding_welcome", "link": "https://example.com/setup"}
+            )
+
+    def test_rejects_doc_backed_kind_with_both_text_and_link(self) -> None:
+        with pytest.raises(ValidationError):
+            InstructionShareV1.model_validate(
+                {
+                    "kind": "onboarding_welcome",
+                    "text": "hello",
+                    "link": "https://example.com/setup",
+                }
+            )
+
+    def test_rejects_doc_backed_kind_missing_text(self) -> None:
+        with pytest.raises(ValidationError):
+            InstructionShareV1.model_validate({"kind": "onboarding_welcome"})
+
+    def test_rejects_link_backed_kind_with_text_instead_of_link(self) -> None:
+        with pytest.raises(ValidationError):
+            InstructionShareV1.model_validate({"kind": "setup_skill_via_link", "text": "hello"})
+
+    def test_rejects_link_backed_kind_missing_link(self) -> None:
+        with pytest.raises(ValidationError):
+            InstructionShareV1.model_validate({"kind": "setup_skill_via_link"})
+
+    def test_rejects_unknown_kind(self) -> None:
+        with pytest.raises(ValidationError):
+            InstructionShareV1.model_validate({"kind": "not_a_real_kind", "text": "hello"})
+
+    def test_rejects_extra_field(self) -> None:
+        with pytest.raises(ValidationError):
+            InstructionShareV1.model_validate(
+                {"kind": "onboarding_welcome", "text": "hello", "other": 1}
+            )
+
+    def test_rejects_empty_text(self) -> None:
+        with pytest.raises(ValidationError):
+            InstructionShareV1.model_validate({"kind": "onboarding_welcome", "text": ""})
+
+    def test_rejects_overlong_text(self) -> None:
+        with pytest.raises(ValidationError):
+            InstructionShareV1.model_validate({"kind": "onboarding_welcome", "text": "x" * 20001})
+
+    def test_rejects_empty_link(self) -> None:
+        with pytest.raises(ValidationError):
+            InstructionShareV1.model_validate({"kind": "setup_skill_via_link", "link": ""})
+
+    def test_rejects_overlong_link(self) -> None:
+        with pytest.raises(ValidationError):
+            InstructionShareV1.model_validate(
+                {"kind": "setup_skill_via_link", "link": "https://x/" + "y" * 2048}
+            )
 
 
 class TestMessageTypeDriftGuard:

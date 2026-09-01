@@ -19,10 +19,13 @@ from plugins import (
     RiskScoringInfraError,
 )
 
-# "note" is the one barrier-sensitive type (plugins.BARRIER_SENSITIVE_TYPES);
+# "note" is a barrier-sensitive type (plugins.BARRIER_SENSITIVE_TYPES);
 # any other registered type is a stand-in for "not sensitive".
 _SENSITIVE_TYPE = "note"
 _SAFE_TYPE = "confirm"
+# TECH-5822: "instruction_share" joined BARRIER_SENSITIVE_TYPES alongside
+# "note" -- used below to prove it gets identical scorer treatment.
+_OTHER_SENSITIVE_TYPE = "instruction_share"
 
 
 class _FakeOwnershipClient:
@@ -501,6 +504,90 @@ class TestAsymmetricConversationType:
         with pytest.raises(RiskScoringInfraError) as exc_info:
             await BoundaryCrossingScorer().score(ctx)
         assert exc_info.value.cause == "empty_owner_set"
+
+
+class TestInstructionShareMatchesNoteBoundaryBehavior:
+    """TECH-5822: ``instruction_share`` was added to
+    ``BARRIER_SENSITIVE_TYPES`` alongside ``note`` -- it must get the exact
+    same boundary-crossing treatment ``note`` already gets across every
+    conversation type. ``instruction_request`` must NOT get that treatment
+    (it isn't in the set at all)."""
+
+    async def test_open_is_high_risk(self) -> None:
+        ctx = _ctx(
+            conversation_type="open",
+            message_type=_OTHER_SENSITIVE_TYPE,
+            sender_agent_id=uuid.uuid4(),
+        )
+        verdict = await BoundaryCrossingScorer().score(ctx)
+        assert verdict.high_risk is True
+        assert verdict.reason == "boundary_crossing"
+
+    async def test_internal_never_high_risk(self) -> None:
+        ctx = _ctx(
+            conversation_type="internal",
+            message_type=_OTHER_SENSITIVE_TYPE,
+            sender_agent_id=uuid.uuid4(),
+            other_agent_ids=[uuid.uuid4()],
+            ownership_client=_FailingOwnershipClient(),
+        )
+        verdict = await BoundaryCrossingScorer().score(ctx)
+        assert verdict.high_risk is False
+
+    async def test_asymmetric_disjoint_owners_crosses(self) -> None:
+        sender = uuid.uuid4()
+        other = uuid.uuid4()
+        client = _FakeOwnershipClient(
+            {
+                sender: {"is_shared": False, "owners": ["dan"]},
+                other: {"is_shared": False, "owners": ["priya"]},
+            }
+        )
+        ctx = _ctx(
+            conversation_type="asymmetric",
+            message_type=_OTHER_SENSITIVE_TYPE,
+            sender_agent_id=sender,
+            other_agent_ids=[other],
+            ownership_client=client,
+        )
+        verdict = await BoundaryCrossingScorer().score(ctx)
+        assert verdict.high_risk is True
+        assert verdict.reason == "boundary_crossing"
+
+    async def test_asymmetric_same_single_owner_does_not_cross(self) -> None:
+        sender = uuid.uuid4()
+        other = uuid.uuid4()
+        client = _FakeOwnershipClient(
+            {
+                sender: {"is_shared": False, "owners": ["dan"]},
+                other: {"is_shared": False, "owners": ["dan"]},
+            }
+        )
+        ctx = _ctx(
+            conversation_type="asymmetric",
+            message_type=_OTHER_SENSITIVE_TYPE,
+            sender_agent_id=sender,
+            other_agent_ids=[other],
+            ownership_client=client,
+        )
+        verdict = await BoundaryCrossingScorer().score(ctx)
+        assert verdict.high_risk is False
+
+    async def test_instruction_request_is_not_sensitive_like_safe_type(self) -> None:
+        # instruction_request carries no content and is deliberately absent
+        # from BARRIER_SENSITIVE_TYPES -- open/internal never even touch the
+        # ownership client for it, exactly like _SAFE_TYPE.
+        sender = uuid.uuid4()
+        other = uuid.uuid4()
+        ctx = _ctx(
+            conversation_type="open",
+            message_type="instruction_request",
+            sender_agent_id=sender,
+            other_agent_ids=[other],
+            ownership_client=_FailingOwnershipClient(),
+        )
+        verdict = await BoundaryCrossingScorer().score(ctx)
+        assert verdict.high_risk is False
 
 
 class TestUnrecognizedConversationType:

@@ -112,6 +112,8 @@ MessageType = Literal[
     "counter_proposal",
     "confirm",
     "decline",
+    "instruction_request",
+    "instruction_share",
     "needs_clarification",
     "note",
     "task_assign",
@@ -119,6 +121,41 @@ MessageType = Literal[
     "task_complete",
     "task_decline",
     "task_cancel",
+]
+
+# InstructionKind's two groups (TECH-5822): which branch of
+# InstructionShareV1's either/or validator applies to a given kind. Doc-backed
+# kinds carry canonical, pre-approved instruction text (verified downstream,
+# in agent-comms-approvals, against instruction_registry.json's hash for that
+# kind); link-backed kinds carry a link into an allowlist maintained
+# deployment-side. Split out as their own frozensets (rather than inlined in
+# the validator) so plugins.py's instruction-registry drift guard can import
+# DOC_BACKED_INSTRUCTION_KINDS directly instead of re-deriving it from
+# InstructionKind's get_args().
+DOC_BACKED_INSTRUCTION_KINDS: frozenset[str] = frozenset(
+    {
+        "onboarding_welcome",
+        "handoff_context_summary",
+        "role_boundaries_reminder",
+        "escalation_procedure",
+        "safety_and_compliance_briefing",
+    }
+)
+LINK_BACKED_INSTRUCTION_KINDS: frozenset[str] = frozenset(
+    {
+        "setup_skill_via_link",
+        "setup_job_via_link",
+    }
+)
+
+InstructionKind = Literal[
+    "onboarding_welcome",
+    "handoff_context_summary",
+    "role_boundaries_reminder",
+    "escalation_procedure",
+    "safety_and_compliance_briefing",
+    "setup_skill_via_link",
+    "setup_job_via_link",
 ]
 
 
@@ -259,6 +296,71 @@ class NeedsClarificationV1(_StrictModel):
 
     type: Literal["needs_clarification"] = "needs_clarification"
     about_seq: int = Field(ge=1)
+
+
+class InstructionRequestV1(_StrictModel):
+    """instruction_request / v1 — TECH-5822.
+
+    A newly-onboarding (or handed-off) agent's request for startup/handoff
+    instructions from another agent (e.g. its site orchestrator). Carries
+    no content at all, only which fixed ``InstructionKind`` it wants back —
+    unlike ``note``, there is no free-text field here for a request to
+    smuggle anything through, so this type is deliberately excluded from
+    ``plugins.BARRIER_SENSITIVE_TYPES``.
+    """
+
+    type: Literal["instruction_request"] = "instruction_request"
+    kind: InstructionKind
+
+
+class InstructionShareV1(_StrictModel):
+    """instruction_share / v1 — TECH-5822.
+
+    The reply to an ``instruction_request`` (or an unsolicited push of the
+    same shape): pre-defined instruction content selected from a fixed
+    ``InstructionKind`` enum, never arbitrary text. Exactly one of two
+    mutually-exclusive branches is populated, chosen by ``kind``'s group
+    (``schemas.DOC_BACKED_INSTRUCTION_KINDS`` /
+    ``schemas.LINK_BACKED_INSTRUCTION_KINDS`` — see the module-level
+    comment above ``InstructionKind``), mirroring
+    ``AvailabilityResponseV1``'s either/or shape:
+
+    - doc-backed kinds: ``text`` (the instruction content itself, checked
+      downstream against ``instruction_registry.json``'s canonical hash for
+      that kind — this schema only bounds its length).
+    - link-backed kinds: ``link`` (a URL into a deployment-side allowlist —
+      checked downstream, not here; this schema only bounds its length).
+
+    Unlike ``note``, this type IS in ``plugins.BARRIER_SENSITIVE_TYPES`` —
+    the enum-only shape makes it safe to accept in the first place, but the
+    content (which canonical text, or which link) still needs the
+    downstream hash/allowlist check whenever a message would cross an
+    ownership boundary, same as any other barrier-sensitive type.
+    """
+
+    type: Literal["instruction_share"] = "instruction_share"
+    kind: InstructionKind
+    text: str | None = Field(default=None, min_length=1, max_length=20000)
+    link: str | None = Field(default=None, min_length=1, max_length=2048)
+
+    @model_validator(mode="after")
+    def _text_or_link_per_kind_group(self) -> InstructionShareV1:
+        if self.kind in DOC_BACKED_INSTRUCTION_KINDS:
+            if self.text is None:
+                raise ValueError(f"kind '{self.kind}' requires 'text'")
+            if self.link is not None:
+                raise ValueError(f"'link' is not valid alongside doc-backed kind '{self.kind}'")
+        else:
+            # kind is validated as an InstructionKind by the field annotation
+            # above before this validator ever runs, and DOC_BACKED/
+            # LINK_BACKED_INSTRUCTION_KINDS partition InstructionKind
+            # exactly (schemas.py module docstring), so this else branch is
+            # always the link-backed group.
+            if self.link is None:
+                raise ValueError(f"kind '{self.kind}' requires 'link'")
+            if self.text is not None:
+                raise ValueError(f"'text' is not valid alongside link-backed kind '{self.kind}'")
+        return self
 
 
 class NoteV1(_StrictModel):
@@ -416,6 +518,8 @@ MESSAGE_SCHEMAS: dict[tuple[str, int], type[BaseModel]] = {
     ("counter_proposal", 1): CounterProposalV1,
     ("confirm", 1): ConfirmV1,
     ("decline", 1): DeclineV1,
+    ("instruction_request", 1): InstructionRequestV1,
+    ("instruction_share", 1): InstructionShareV1,
     ("needs_clarification", 1): NeedsClarificationV1,
     ("note", 1): NoteV1,
     ("task_assign", 1): TaskAssignV1,
@@ -549,6 +653,8 @@ def _check_payload_size(payload: dict[str, Any]) -> None:
 
 __all__ = [
     "CONVERSATION_TYPES",
+    "DOC_BACKED_INSTRUCTION_KINDS",
+    "LINK_BACKED_INSTRUCTION_KINDS",
     "MAX_ACCEPTED_TYPES",
     "MAX_ACCEPTED_TYPE_LENGTH",
     "MAX_DISPLAY_NAME_LENGTH",
@@ -562,6 +668,9 @@ __all__ = [
     "ConversationOpenedV1",
     "CounterProposalV1",
     "DeclineV1",
+    "InstructionKind",
+    "InstructionRequestV1",
+    "InstructionShareV1",
     "MessageType",
     "NeedsClarificationV1",
     "NoteV1",

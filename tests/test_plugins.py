@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 import plugins
+import schemas
 import service
 from plugins import (
     ApprovalNotification,
@@ -502,3 +503,64 @@ class TestGetOwnershipClientFactoryAndValidateConfiguration:
         )
         with pytest.raises(RuntimeError, match="is not callable"):
             service.validate_ownership_client_configuration()
+
+
+class TestInstructionShareBarrierSensitivity:
+    """TECH-5822: ``instruction_share`` joins ``note`` in
+    ``BARRIER_SENSITIVE_TYPES``; ``instruction_request`` (no content)
+    deliberately does not."""
+
+    def test_instruction_share_is_barrier_sensitive(self) -> None:
+        assert "instruction_share" in plugins.BARRIER_SENSITIVE_TYPES
+
+    def test_instruction_request_is_not_barrier_sensitive(self) -> None:
+        assert "instruction_request" not in plugins.BARRIER_SENSITIVE_TYPES
+
+    def test_note_is_still_barrier_sensitive(self) -> None:
+        # Regression: adding instruction_share must not have replaced the
+        # set instead of extending it.
+        assert "note" in plugins.BARRIER_SENSITIVE_TYPES
+
+
+class TestInstructionRegistryDriftGuard:
+    """TECH-5822: ``instruction_registry.json``'s keys must exactly match
+    ``schemas.DOC_BACKED_INSTRUCTION_KINDS`` -- mirrors
+    ``schemas._check_message_type_literal_matches_schemas``'s fail-loud-at-
+    import posture for the ``MessageType`` Literal/``MESSAGE_SCHEMAS`` pair.
+    """
+
+    def test_real_registry_file_loads_and_matches(self) -> None:
+        # Exercises the actual on-disk instruction_registry.json (loaded at
+        # plugins.py import time) rather than only the loader function in
+        # isolation below.
+        assert frozenset(plugins.INSTRUCTION_TEXT_HASHES) == schemas.DOC_BACKED_INSTRUCTION_KINDS
+
+    def test_real_registry_hashes_are_well_formed_sha256(self) -> None:
+        for kind, digest in plugins.INSTRUCTION_TEXT_HASHES.items():
+            assert len(digest) == 64, kind
+            int(digest, 16)  # raises ValueError if not valid hex
+
+    def test_loader_accepts_matching_keys(self) -> None:
+        raw = {kind: {"sha256": "0" * 64} for kind in schemas.DOC_BACKED_INSTRUCTION_KINDS}
+        result = plugins._load_instruction_registry_hashes(raw)
+        assert frozenset(result) == schemas.DOC_BACKED_INSTRUCTION_KINDS
+
+    def test_loader_raises_on_missing_kind(self) -> None:
+        missing = next(iter(schemas.DOC_BACKED_INSTRUCTION_KINDS))
+        raw = {
+            kind: {"sha256": "0" * 64}
+            for kind in schemas.DOC_BACKED_INSTRUCTION_KINDS
+            if kind != missing
+        }
+        with pytest.raises(RuntimeError, match="drifted out of sync"):
+            plugins._load_instruction_registry_hashes(raw)
+
+    def test_loader_raises_on_unknown_extra_kind(self) -> None:
+        raw = {kind: {"sha256": "0" * 64} for kind in schemas.DOC_BACKED_INSTRUCTION_KINDS}
+        raw["not_a_real_kind"] = {"sha256": "0" * 64}
+        with pytest.raises(RuntimeError, match="drifted out of sync"):
+            plugins._load_instruction_registry_hashes(raw)
+
+    def test_loader_raises_on_completely_wrong_keys(self) -> None:
+        with pytest.raises(RuntimeError, match="drifted out of sync"):
+            plugins._load_instruction_registry_hashes({"totally_unrelated": {"sha256": "0" * 64}})

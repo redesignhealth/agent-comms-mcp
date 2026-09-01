@@ -41,12 +41,13 @@ import os
 import uuid
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
 import httpx
 import structlog
 
-from schemas import CONVERSATION_TYPES
+from schemas import CONVERSATION_TYPES, DOC_BACKED_INSTRUCTION_KINDS
 
 if TYPE_CHECKING:
     # Avoids a runtime circular import: service.py imports this module to
@@ -73,7 +74,59 @@ DEFAULT_RISK_SCORER = "boundary_v1"
 # scorer-private policy data instead of a schema field. Any message type
 # NOT in this set is exempt from ownership-boundary scoring entirely (no
 # lookup, always low risk) -- the cheap common path.
-BARRIER_SENSITIVE_TYPES: frozenset[str] = frozenset({"note"})
+BARRIER_SENSITIVE_TYPES: frozenset[str] = frozenset({"note", "instruction_share"})
+# ``instruction_request`` is deliberately NOT included here (TECH-5822) --
+# it carries no content (schemas.InstructionRequestV1 has only a ``kind``
+# enum field, nothing free-text or link-shaped to inspect), so it gets the
+# same treatment as any other non-sensitive type: the universal
+# shared-recipient check still applies, but there is no boundary-crossing
+# CONTENT risk to score.
+
+# Canonical instruction-text registry (TECH-5822): the codebase's source of
+# truth for what each doc-backed ``InstructionKind`` is ALLOWED to say.
+# Content verification itself lives downstream, in agent-comms-approvals'
+# RHAutoApprover rule (it hashes an incoming instruction_share's ``text``
+# and compares against the value loaded here) -- this repo only owns the
+# canonical text and its hash, the same "code-owns-the-vocabulary, deploy-
+# side-owns-the-judgment" split as the link allowlist
+# (``INSTRUCTION_LINK_ALLOWLIST``, also deployment-side).
+INSTRUCTION_REGISTRY_PATH = Path(__file__).with_name("instruction_registry.json")
+
+
+def _load_instruction_registry_hashes(raw: dict[str, Any]) -> dict[str, str]:
+    """Build ``kind -> sha256`` from a decoded ``instruction_registry.json``.
+
+    Raises ``RuntimeError`` (not a bare ``assert`` -- see
+    ``schemas._check_message_type_literal_matches_schemas``'s docstring for
+    why this codebase avoids asserts for fail-loud invariants) if the
+    registry's keys don't exactly match
+    ``schemas.DOC_BACKED_INSTRUCTION_KINDS``. Factored out from the
+    file-loading call below so a test can exercise the drift guard against a
+    deliberately-broken dict without touching the real file on disk.
+    """
+    registry_kinds = frozenset(raw)
+    if registry_kinds != DOC_BACKED_INSTRUCTION_KINDS:
+        raise RuntimeError(
+            "instruction_registry.json's keys and "
+            "schemas.DOC_BACKED_INSTRUCTION_KINDS have drifted out of sync -- "
+            f"registry-only: {registry_kinds - DOC_BACKED_INSTRUCTION_KINDS}, "
+            f"kinds-only: {DOC_BACKED_INSTRUCTION_KINDS - registry_kinds}"
+        )
+    return {kind: entry["sha256"] for kind, entry in raw.items()}
+
+
+def _read_instruction_registry() -> dict[str, str]:
+    with INSTRUCTION_REGISTRY_PATH.open("r", encoding="utf-8") as f:
+        raw = json.load(f)
+    return _load_instruction_registry_hashes(raw)
+
+
+# Loaded and drift-checked at import time (module-level call right below),
+# same fail-loud-at-boot posture as
+# ``schemas._check_message_type_literal_matches_schemas`` -- a missing or
+# out-of-sync registry entry must break the process at startup, not silently
+# leave a doc-backed kind unverifiable downstream.
+INSTRUCTION_TEXT_HASHES: dict[str, str] = _read_instruction_registry()
 
 
 class RiskVerdict(NamedTuple):
@@ -761,6 +814,8 @@ __all__ = [
     "DEFAULT_APPROVAL_NOTIFIER",
     "DEFAULT_AUTO_APPROVER",
     "DEFAULT_RISK_SCORER",
+    "INSTRUCTION_REGISTRY_PATH",
+    "INSTRUCTION_TEXT_HASHES",
     "RISK_SCORERS",
     "RISK_SCORER_ENV_VAR",
     "ActiveChecker",
