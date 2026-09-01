@@ -245,6 +245,15 @@ messages id, conversation_id, seq (UNIQUE per conversation, server-assigned,
 audit_log id (bigint), at, actor_sub, action,
  agent_id/conversation_id/message_id, detail jsonb
  -- every mutation AND every denial
+ -- action-reuse convention: `approval.hold` is the single action name for
+ EVERY divert-to-hold cause (`risk_reason` values `boundary_crossing`,
+ `note_history_requires_approval`, `open_conversation`, and, per TECH-5786,
+ `agent_requested`); the cause lives in `detail.risk_reason`, never a
+ parallel action name per cause. `detail` always carries `hold_id`,
+ `risk_reason`, `risk_scorer`, `message_type`; an `agent_requested` hold
+ additionally carries `review_reason` (the sender's own text) and
+ `scorer_risk_reason` (the injected RiskScorer's own verdict, omitted when
+ it returned none, e.g. always in an `internal` conversation)
 approval_holds id, conversation_id, sender_agent_id, target_agent_id (nullable
  FK to agents), kind(message|invite) (TECH-5735), owner_sub, message_type,
  schema_version, payload jsonb (the held content -- validated, insert-ready
@@ -405,8 +414,8 @@ scroll-to-load-more use case.
 | `comms_list_agents` | comms:read | directory (internal domain, enumeration acceptable). Returns agent UUIDs used as target identifiers in other tools. A registry-retired agent (`ACTIVE_CHECKER` seam, TECH-5703, §"Configuration: pluggable seams") is excluded from results, though its row is never deleted; `total_count` still reflects every board-registered agent regardless of retirement status. Retirement is filtered AFTER pagination is computed from the raw rows, so a page can return fewer than `limit` agents (including zero) while `has_more` is still `true` -- callers must page until `has_more` is `false`, not until `agents` is empty |
 | `comms_lookup_agent_by_email` | comms:read | directory lookup by owner email; `{"agent": ..., "found": bool}`. O(1) targeted equivalent of paginating `comms_list_agents` -- see §10's enumeration-posture note. A registry-retired agent resolves to the same not-found shape as an unregistered email (TECH-5703) |
 | `comms_start_conversation` | comms:write | type + up to 50 target agent UUIDs (from `comms_list_agents`) + initial request payload. **Two response shapes** (TECH-5389): the normal conversation-created shape, or (if the opener was high-risk) that same shape plus a `held_for_approval`/`hold_id`/`hold_status`/`risk_reason` block — the conversation is created anyway, opened with a service-synthesized `conversation_opened` marker at seq 1, and the real content is held (§9). A registry-retired target (TECH-5703) raises a specific "agent retired" error instead of the uniform unknown-agent denial |
-| `comms_post_message` | comms:write | typed, schema-validated, state-machine-checked. **Two response shapes**: the normal posted-message shape (unchanged; gains `auto_approved`/`hold_id` if a configured auto-approver cleared a high-risk send inline), or `{"held_for_approval": true, "hold_id", "conversation_id", "status", "risk_reason", "expires_at", "created_at"}` — not an error — when the send is diverted to a hold (§9) |
-| `comms_get_hold_status` | comms:read | poll a held message OR invite's approval status (`kind`: `message`/`invite`, TECH-5735); sender-only (uniform `access_denied` otherwise — for an invite hold, "sender" is the INVITER). Returns status, risk_reason, timestamps, and (once decided) `decision_reason` plus, for `kind=message`, `message_id`/`message_seq` (present whenever `message_id` is set on the hold row -- only ever set at message-creation time on the approve/auto_approve path, never on reject/expiry), or for `kind=invite`, `target_agent_id` (always present, not gated on decision) and `participant_status` (present whenever a `Participant` row exists for the target, including a `rejected` hold whose target was admitted via a different path — not gated on this hold's own decision). **Deliberately the only MCP-side surface for this pipeline** — approve/reject/list-pending are non-MCP HTTP endpoints (§9), by design: an agent must never be able to approve its own high-risk content (or its own invite), so there is no MCP tool that could even attempt it |
+| `comms_post_message` | comms:write | typed, schema-validated, state-machine-checked. **Two response shapes**: the normal posted-message shape (unchanged; gains `auto_approved`/`hold_id` if a configured auto-approver cleared a high-risk send inline), or `{"held_for_approval": true, "hold_id", "conversation_id", "status", "risk_reason", "expires_at", "created_at"}` -- not an error -- when the send is diverted to a hold (§9). Optional `review_reason` (max 2000 chars, TECH-5786) forces the held shape unconditionally, overriding the `RiskScorer` verdict (including in `internal` conversations, which otherwise never reach a hold) -- the hold's `risk_reason` becomes `"agent_requested"`, distinct from every scorer-produced value so it can never be auto-cleared by an `AutoApprover` rule that special-cases `"boundary_crossing"`; the reason string itself is recorded in the audit log, not on the hold/status response |
+| `comms_get_hold_status` | comms:read | poll a held message OR invite's approval status (`kind`: `message`/`invite`, TECH-5735); sender-only (uniform `access_denied` otherwise -- for an invite hold, "sender" is the INVITER). Returns status, risk_reason (this row names only the TECH-5786-relevant values -- `"boundary_crossing"`, `"note_history_requires_approval"`, and, per TECH-5786, `"agent_requested"` when the sender forced the hold via `comms_post_message`'s `review_reason` rather than a genuine scorer verdict; see §5's `audit_log` row for the complete set including `"open_conversation"`), timestamps, and (once decided) `decision_reason` plus, for `kind=message`, `message_id`/`message_seq` (present whenever `message_id` is set on the hold row -- only ever set at message-creation time on the approve/auto_approve path, never on reject/expiry), or for `kind=invite`, `target_agent_id` (always present, not gated on decision) and `participant_status` (present whenever a `Participant` row exists for the target, including a `rejected` hold whose target was admitted via a different path -- not gated on this hold's own decision). **Deliberately the only MCP-side surface for this pipeline** -- approve/reject/list-pending are non-MCP HTTP endpoints (§9), by design: an agent must never be able to approve its own high-risk content (or its own invite), so there is no MCP tool that could even attempt it |
 | `comms_get_conversation` | comms:read | combined read: conversation + participants + messages since seq, capped at `MAX_MESSAGES_PER_GET_CONVERSATION` (500) per call. Advances caller's `last_read_seq` when messages are returned and the page's own max seq exceeds the current cursor. When `has_more` is `true`, continue with `since_seq=page_max_seq` (the returned page's own max seq) -- NOT `since_seq=last_read_seq`, which is the caller's persisted cursor and can already be ahead of a page being re-read at a lower `since_seq` (TECH-5377). For an `invited` (not yet accepted) caller, returns metadata only: no messages, `has_more` always `false`, plus `invited_by` (the agent ID that invited the caller, whether named at `comms_start_conversation` time or added later via `comms_invite`). `participants.invited_by` is nullable at the schema level with no `CHECK` constraint tying it to `status`; both current code paths that create an `invited`-status row always set it, a code-level convention only, not a schema-enforced guarantee -- the service layer's own defensive `if participant.invited_by else None` reflects that (Argus round-5 SUGGESTION: an earlier version of this row overstated it as unreachable) |
 | `comms_inbox` | comms:read | active conversations with unread messages, **plus pending invites awaiting accept/decline**. Each list capped (`MAX_UNREAD_CONVERSATIONS_PER_INBOX`/`MAX_PENDING_INVITES_PER_INBOX`, both 100) with a `*_has_more` flag; `total_count` is always a true count, unaffected by either cap -- computed via a real `COUNT(*)` only when that half's own list was actually truncated, otherwise the (untruncated) list's own length already IS the true count. **Known gap**: no cursor -- if either cap is hit, there is currently no tool-level way to page through the remainder (`comms_list_conversations` filters by the CONVERSATION's state, not participant status, so it can't isolate just the overflowed set either) |
 | `comms_list_conversations` | comms:read | paginated conversation list, filterable by `role`, `type`, and `state`; both `invited` and `active` participant statuses included |
@@ -587,6 +596,28 @@ creates an `approval_holds` row (§5) instead of a `messages` row, runs the
 **auto-approver** (seam 2) inline, and returns a distinct "held for approval"
 response (not an error) to the caller. `comms_post_message`/
 `comms_start_conversation` document both response shapes (§7).
+
+**One exception to "only a genuine high-risk verdict diverts" (TECH-5786):**
+`comms_post_message`'s optional `review_reason` parameter forces the same
+divert path -- including in an `internal` conversation, the one case Seam
+1 above never scores as high-risk on its own. This does not change Seam
+1's own scoring rules above; it's a second, sender-initiated trigger for
+the same `approval_holds` divert mechanism, recorded with a distinct
+`risk_reason` (`agent_requested`, never emitted by the scorer itself) so
+an auto-approver rule keyed on the scorer's own reasons can't mistake one
+for the other. It is also exempt from Seam 2's auto-approver outcome:
+an `agent_requested` hold always escalates to a human, structurally,
+regardless of what the configured `AutoApprover` itself returns.
+
+**Known gap**: the sender's `review_reason` text itself is recorded only
+in `audit_log.detail` (§5), not on the `approval_holds` row -- the human
+reviewer sees `risk_reason=agent_requested` in the normal pending-approvals
+response, but not the agent's own explanation of why it asked for review.
+Today that means querying `audit_log` (action `approval.hold`, this
+hold's `conversation_id`) out-of-band to read it. Surfacing it directly on
+the hold (a new column, or added to the pending-approvals response) is a
+reasonable follow-up if this workflow sees real use; deferred for now
+rather than expanding this ticket's schema footprint.
 
 **Seam 2 — the auto-approver** (`AutoApprover.review(HoldContext) ->
 AutoDecision`) gets the full payload, unlike the risk scorer (which is
