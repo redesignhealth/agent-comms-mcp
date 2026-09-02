@@ -28,8 +28,9 @@
    ```
 
 3. **Wait for CI to pass** on the version bump commit before creating the release.
-   `deploy.yml` checks for a successful CI run on the exact release SHA — creating a
-   release before CI finishes causes the deploy job to fail immediately.
+   Both `publish.yml` and `deploy.yml` check for a successful CI run on the exact
+   release SHA — creating a release before CI finishes causes both jobs to fail
+   immediately.
    ```bash
    RELEASE_SHA=$(git rev-parse HEAD)
    gh run watch \
@@ -69,6 +70,9 @@
 
 Pre-releases (GitHub "Set as a pre-release" flag) trigger `publish.yml` but **not** `deploy.yml`.
 Use pre-releases to publish a wheel to PyPI for testing without touching ECS.
+`publish.yml` still requires a successful push-triggered CI run on `main` for the exact
+release SHA (same gate `deploy.yml` uses) — a pre-release from a commit without one fails
+before publishing.
 
 ## Versioning
 
@@ -79,8 +83,8 @@ Follow [SemVer](https://semver.org/):
 
 ## Hotfix
 
-`deploy.yml` requires a successful **push-triggered** CI run for the exact release SHA.
-Hotfixes must be merged to main before cutting a release.
+Both `publish.yml` and `deploy.yml` require a successful **push-triggered** CI run for
+the exact release SHA. Hotfixes must be merged to main before cutting a release.
 
 ```bash
 # 1. Branch from the last release tag

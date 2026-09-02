@@ -625,6 +625,15 @@ class TestInstructionShareV1:
             "data:text/html,x",
             "file:///etc/passwd",
             "http://x.com",
+        ],
+    )
+    def test_rejects_non_https_link_schemes(self, link: str) -> None:
+        with pytest.raises(ValidationError):
+            InstructionShareV1.model_validate({"kind": "setup_skill_via_link", "link": link})
+
+    @pytest.mark.parametrize(
+        "link",
+        [
             # Argus round 2, TECH-5822 BLOCKING: the un-anchored r"^https://"
             # pattern from round 1 passed this via re.search (string starts
             # with https://) while smuggling a javascript: payload after an
@@ -644,9 +653,13 @@ class TestInstructionShareV1:
             # individually.
             "https://safe.example.com\t.evil.com/path",
             "https://safe.example.com\x0b.evil.com/path",
+            # Argus round 5 SUGGESTION: DEL (\x7f) is excluded by the
+            # broadened [^\x00-\x20\x7f]+ pattern but was never itself
+            # exercised by a test case.
+            "https://safe.example.com\x7f.evil.com/path",
         ],
     )
-    def test_rejects_non_https_link_schemes(self, link: str) -> None:
+    def test_rejects_link_with_embedded_control_characters(self, link: str) -> None:
         with pytest.raises(ValidationError):
             InstructionShareV1.model_validate({"kind": "setup_skill_via_link", "link": link})
 
