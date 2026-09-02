@@ -6830,6 +6830,195 @@ class TestInbox:
         assert result["pending_invites"][0]["conversation_id"] == str(pending_conversation.id)
         assert result["total_count"] == 2
 
+    async def test_own_message_excluded_from_unread_by_default(self, session: AsyncSession) -> None:
+        """post_message never advances the sender's own last_read_seq, so
+        without the include_own_messages filter, the caller's own
+        just-posted reply would echo back as "unread" on their own next
+        inbox() call -- nothing new for them to act on."""
+        agent = await _register(session, "inbox-self-1")
+        peer = await _register(session, "inbox-self-peer-1")
+        conversation = await start_conversation(
+            session,
+            actor_sub=peer.sub,
+            initiator_agent_id=peer.id,
+            conversation_type="open",
+            target_agent_ids=[agent.id],
+            initial_message=_request_payload(),
+        )
+        await accept_invite(
+            session, actor_sub=agent.sub, agent_id=agent.id, conversation_id=conversation.id
+        )
+        # Catch up on `peer`'s initial message, then post a reply of its
+        # own -- only `agent`'s own message is now ahead of its cursor.
+        await get_conversation(
+            session,
+            actor_sub=agent.sub,
+            caller_agent_id=agent.id,
+            conversation_id=conversation.id,
+        )
+        await post_message(
+            session,
+            actor_sub=agent.sub,
+            sender_agent_id=agent.id,
+            conversation_id=conversation.id,
+            message_type="counter_proposal",
+            payload=_counter_proposal_payload(),
+        )
+
+        default_result = await inbox(session, caller_agent_id=agent.id)
+        assert default_result["unread"] == []
+        assert default_result["total_count"] == 0
+
+        with_own = await inbox(session, caller_agent_id=agent.id, include_own_messages=True)
+        assert len(with_own["unread"]) == 1
+        assert with_own["unread"][0]["conversation_id"] == str(conversation.id)
+        assert with_own["unread"][0]["unread_count"] == 1
+        assert with_own["unread"][0]["latest_message"]["type"] == "counter_proposal"
+
+    async def test_own_message_does_not_mask_peer_unread(self, session: AsyncSession) -> None:
+        """A conversation stays in the default unread list when a PEER's
+        message is unread, and `latest_message` surfaces that peer message
+        -- not a later self-authored reply that never advanced the
+        caller's own cursor."""
+        agent = await _register(session, "inbox-self-2")
+        peer = await _register(session, "inbox-self-peer-2")
+        conversation = await start_conversation(
+            session,
+            actor_sub=peer.sub,
+            initiator_agent_id=peer.id,
+            conversation_type="open",
+            target_agent_ids=[agent.id],
+            initial_message=_request_payload(),
+        )
+        await accept_invite(
+            session, actor_sub=agent.sub, agent_id=agent.id, conversation_id=conversation.id
+        )
+        # `agent` never calls get_conversation -- the peer's initial
+        # message is still unread -- then posts its own reply on top.
+        await post_message(
+            session,
+            actor_sub=agent.sub,
+            sender_agent_id=agent.id,
+            conversation_id=conversation.id,
+            message_type="counter_proposal",
+            payload=_counter_proposal_payload(),
+        )
+
+        default_result = await inbox(session, caller_agent_id=agent.id)
+        assert len(default_result["unread"]) == 1
+        entry = default_result["unread"][0]
+        assert entry["conversation_id"] == str(conversation.id)
+        assert entry["unread_count"] == 1
+        assert entry["latest_message"]["sender_sub"] == peer.sub
+
+        with_own = await inbox(session, caller_agent_id=agent.id, include_own_messages=True)
+        with_own_entry = with_own["unread"][0]
+        assert with_own_entry["unread_count"] == 2
+        assert with_own_entry["latest_message"]["sender_sub"] == agent.sub
+
+    async def test_include_read_surfaces_fully_read_conversation(
+        self, session: AsyncSession
+    ) -> None:
+        agent = await _register(session, "inbox-read-1")
+        peer = await _register(session, "inbox-read-peer-1")
+        conversation = await start_conversation(
+            session,
+            actor_sub=peer.sub,
+            initiator_agent_id=peer.id,
+            conversation_type="open",
+            target_agent_ids=[agent.id],
+            initial_message=_request_payload(),
+        )
+        await accept_invite(
+            session, actor_sub=agent.sub, agent_id=agent.id, conversation_id=conversation.id
+        )
+        await get_conversation(
+            session,
+            actor_sub=agent.sub,
+            caller_agent_id=agent.id,
+            conversation_id=conversation.id,
+        )
+
+        default_result = await inbox(session, caller_agent_id=agent.id)
+        assert default_result["unread"] == []
+        assert default_result["total_count"] == 0
+
+        read_result = await inbox(session, caller_agent_id=agent.id, include_read=True)
+        assert len(read_result["unread"]) == 1
+        entry = read_result["unread"][0]
+        assert entry["conversation_id"] == str(conversation.id)
+        assert entry["unread_count"] == 0
+        assert entry["latest_message"]["sender_sub"] == peer.sub
+        # total_count must reflect the include_read=True-widened set too --
+        # not just the default (unread-only) count asserted above.
+        assert read_result["total_count"] == 1
+
+    async def test_both_flags_least_filtered_mode(self, session: AsyncSession) -> None:
+        """include_own_messages=True + include_read=True together is the
+        LEAST-filtered mode -- a strict superset of this tool's original
+        (pre-filter) behavior, not a reproduction of it: every active
+        conversation with any message ahead of the caller's cursor (any
+        sender) counts as unread same as originally, but an
+        already-fully-read conversation with no unread messages at all
+        (any sender) is ALSO surfaced here with unread_count=0 -- something
+        the original tool never returned. (The faithful reproduction of
+        the original is include_own_messages=True with include_read left
+        at its default False -- see test_own_message_excluded_from_unread_by_default's
+        `with_own` case.)"""
+        agent = await _register(session, "inbox-both-flags-1")
+        peer = await _register(session, "inbox-both-flags-peer-1")
+        read_peer = await _register(session, "inbox-both-flags-read-peer-1")
+
+        unread_conversation = await start_conversation(
+            session,
+            actor_sub=peer.sub,
+            initiator_agent_id=peer.id,
+            conversation_type="open",
+            target_agent_ids=[agent.id],
+            initial_message=_request_payload(),
+        )
+        await accept_invite(
+            session, actor_sub=agent.sub, agent_id=agent.id, conversation_id=unread_conversation.id
+        )
+        # `agent` never reads the peer's message -- only posts its own
+        # reply on top, so both flags are needed to see the ORIGINAL
+        # (any-sender) unread_count of 2 here.
+        await post_message(
+            session,
+            actor_sub=agent.sub,
+            sender_agent_id=agent.id,
+            conversation_id=unread_conversation.id,
+            message_type="counter_proposal",
+            payload=_counter_proposal_payload(),
+        )
+
+        read_conversation = await start_conversation(
+            session,
+            actor_sub=read_peer.sub,
+            initiator_agent_id=read_peer.id,
+            conversation_type="open",
+            target_agent_ids=[agent.id],
+            initial_message=_request_payload(),
+        )
+        await accept_invite(
+            session, actor_sub=agent.sub, agent_id=agent.id, conversation_id=read_conversation.id
+        )
+        await get_conversation(
+            session,
+            actor_sub=agent.sub,
+            caller_agent_id=agent.id,
+            conversation_id=read_conversation.id,
+        )
+
+        both_flags = await inbox(
+            session, caller_agent_id=agent.id, include_own_messages=True, include_read=True
+        )
+        by_id = {u["conversation_id"]: u for u in both_flags["unread"]}
+        assert by_id[str(unread_conversation.id)]["unread_count"] == 2
+        assert by_id[str(unread_conversation.id)]["latest_message"]["sender_sub"] == agent.sub
+        assert by_id[str(read_conversation.id)]["unread_count"] == 0
+        assert by_id[str(read_conversation.id)]["latest_message"]["sender_sub"] == read_peer.sub
+
     async def _seed_unread_conversation(
         self, session: AsyncSession, *, sender: Agent, agent: Agent, created_at: datetime
     ) -> None:

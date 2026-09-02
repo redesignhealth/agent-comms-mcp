@@ -159,7 +159,7 @@ from collections.abc import Set as AbstractSet
 from datetime import UTC, datetime, timedelta
 from typing import Any, NoReturn, Protocol
 
-from sqlalchemy import func, literal, or_, select, tuple_
+from sqlalchemy import and_, func, literal, or_, select, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -5425,15 +5425,54 @@ async def get_conversation(
     }
 
 
-async def inbox(session: AsyncSession, *, caller_agent_id: uuid.UUID) -> dict[str, Any]:
+async def inbox(
+    session: AsyncSession,
+    *,
+    caller_agent_id: uuid.UUID,
+    include_own_messages: bool = False,
+    include_read: bool = False,
+) -> dict[str, Any]:
     """Unread-first inbox for the caller's agent: unread + pending invites.
 
-    ``unread``: every conversation where the caller is an ``active``
-    participant and ``max(seq) > last_read_seq`` — regardless of
-    conversation state, so a completion/cancelation message still
-    surfaces once. ``pending_invites``: every conversation where the
-    caller has a pending ``invited`` row (metadata only — no message
-    peek, matching ``get_conversation``'s invited-caller behavior).
+    ``unread``: by default, every conversation where the caller is an
+    ``active`` participant and at least one message from ANOTHER sender
+    has ``seq > last_read_seq`` — regardless of conversation state, so a
+    completion/cancelation message still surfaces once. ``pending_invites``:
+    every conversation where the caller has a pending ``invited`` row
+    (metadata only — no message peek, matching ``get_conversation``'s
+    invited-caller behavior).
+
+    Two default-on filters, each independently opt-outable:
+
+    - ``include_own_messages`` (default ``False``): the caller's own
+      posted messages don't, by themselves, make a conversation "unread"
+      for the caller, and don't count toward ``unread_count`` or get
+      chosen as ``latest_message``. Rationale: ``post_message`` never
+      advances the sender's own ``last_read_seq`` (only ``get_conversation``
+      does), so without this filter, posting into a conversation and then
+      immediately calling ``inbox`` again would echo the caller's own
+      just-sent message back as "unread" -- there is nothing new for the
+      caller to act on. Pass ``True`` to restore counting/showing the
+      caller's own messages (matches this tool's pre-filter behavior).
+    - ``include_read`` (default ``False``): only conversations with
+      qualifying unread activity (per ``include_own_messages`` above) are
+      returned. Pass ``True`` to also include the caller's active
+      conversations that have NO qualifying unread messages -- e.g. to see
+      recent activity across every active conversation regardless of read
+      state. ``unread_count`` may be ``0`` for such an entry, and
+      ``latest_message`` falls back to the conversation's true latest
+      message (even a self-authored or already-read one) when there is no
+      qualifying unread message to show instead.
+
+    ``include_own_messages=True`` with ``include_read=False`` (the default)
+    is the faithful reproduction of this tool's original (pre-filter)
+    behavior: the original unconditionally required
+    ``max(seq) > last_read_seq`` (any sender), which is exactly what
+    ``include_own_messages=True`` alone restores. Setting
+    ``include_read=True`` as well is NOT equivalent to the original --
+    it additionally surfaces already-fully-read conversations the
+    original never returned, making both-``True`` a strict superset of
+    the original behavior rather than identical to it.
 
     Explicit empty state: always returns the same keys, even when both
     lists are empty, so a tools layer can render "nothing needs your
@@ -5469,25 +5508,34 @@ async def inbox(session: AsyncSession, *, caller_agent_id: uuid.UUID) -> dict[st
     ``"state": "expired"`` for a past-``expires_at`` row, since that's a
     pure display computation with no DB write.
     """
-    unread_rows = (
-        await session.execute(
-            select(
-                Conversation,
-                Participant.last_read_seq,
-                func.max(Message.seq).label("max_seq"),
-                func.count(Message.id)
-                .filter(Message.seq > Participant.last_read_seq)
-                .label("unread"),
-            )
-            .join(Participant, Participant.conversation_id == Conversation.id)
-            .join(Message, Message.conversation_id == Conversation.id)
-            .where(Participant.agent_id == caller_agent_id, Participant.status == "active")
-            .group_by(Conversation.id, Participant.last_read_seq)
-            .having(func.max(Message.seq) > Participant.last_read_seq)
-            .order_by(func.max(Message.created_at).desc())
-            .limit(MAX_UNREAD_CONVERSATIONS_PER_INBOX + 1)
+    # The set of messages that count as "new" to the caller: unread by
+    # cursor position, and (by default) not authored by the caller
+    # themselves. `include_own_messages=True` drops the second condition,
+    # restoring the original all-senders-count behavior.
+    relevant_conditions = [Message.seq > Participant.last_read_seq]
+    if not include_own_messages:
+        relevant_conditions.append(Message.sender_id != caller_agent_id)
+    relevant_filter = and_(*relevant_conditions)
+
+    unread_query = (
+        select(
+            Conversation,
+            Participant.last_read_seq,
+            func.max(Message.seq).label("max_seq"),
+            func.count(Message.id).filter(relevant_filter).label("unread"),
+            func.max(Message.seq).filter(relevant_filter).label("latest_relevant_seq"),
         )
-    ).all()
+        .join(Participant, Participant.conversation_id == Conversation.id)
+        .join(Message, Message.conversation_id == Conversation.id)
+        .where(Participant.agent_id == caller_agent_id, Participant.status == "active")
+        .group_by(Conversation.id, Participant.last_read_seq)
+        .order_by(func.max(Message.created_at).desc())
+    )
+    if not include_read:
+        unread_query = unread_query.having(func.count(Message.id).filter(relevant_filter) > 0)
+    unread_query = unread_query.limit(MAX_UNREAD_CONVERSATIONS_PER_INBOX + 1)
+
+    unread_rows = (await session.execute(unread_query)).all()
     unread_has_more = len(unread_rows) > MAX_UNREAD_CONVERSATIONS_PER_INBOX
     unread_rows = unread_rows[:MAX_UNREAD_CONVERSATIONS_PER_INBOX]
 
@@ -5502,26 +5550,36 @@ async def inbox(session: AsyncSession, *, caller_agent_id: uuid.UUID) -> dict[st
     # total_count entirely) -- inbox shouldn't pay it unconditionally on
     # every call when it only matters in the truncated case.
     if unread_has_more:
-        unread_total_stmt = select(func.count()).select_from(
+        unread_total_query = (
             select(Conversation.id)
             .join(Participant, Participant.conversation_id == Conversation.id)
             .join(Message, Message.conversation_id == Conversation.id)
             .where(Participant.agent_id == caller_agent_id, Participant.status == "active")
             .group_by(Conversation.id, Participant.last_read_seq)
-            .having(func.max(Message.seq) > Participant.last_read_seq)
-            .subquery()
         )
+        if not include_read:
+            unread_total_query = unread_total_query.having(
+                func.count(Message.id).filter(relevant_filter) > 0
+            )
+        unread_total_stmt = select(func.count()).select_from(unread_total_query.subquery())
         unread_total = (await session.execute(unread_total_stmt)).scalar_one()
     else:
         unread_total = len(unread_rows)
 
     # Fetch every unread conversation's latest message + sender sub in a
     # single round trip (instead of one SELECT per conversation in a Python
-    # loop): join Message/Agent against the exact (conversation_id, max_seq)
-    # pairs already computed above via a composite-tuple IN.
+    # loop): join Message/Agent against the exact (conversation_id, seq)
+    # pairs already computed above via a composite-tuple IN. The seq used
+    # per conversation is `latest_relevant_seq` (the latest message that
+    # counts as "new" under the current filters) when one exists, falling
+    # back to `max_seq` (the conversation's true latest message) when it
+    # doesn't -- e.g. an `include_read=True` conversation with nothing
+    # qualifying, or an all-self-authored conversation surfaced only via
+    # `include_read=True`.
     latest_by_conversation_id: dict[uuid.UUID, tuple[Message, str]] = {}
     conversation_seq_pairs = [
-        (conversation.id, max_seq) for conversation, _, max_seq, _ in unread_rows
+        (conversation.id, latest_relevant_seq if latest_relevant_seq is not None else max_seq)
+        for conversation, _, max_seq, _, latest_relevant_seq in unread_rows
     ]
     if conversation_seq_pairs:
         latest_rows = (
@@ -5536,7 +5594,7 @@ async def inbox(session: AsyncSession, *, caller_agent_id: uuid.UUID) -> dict[st
         }
 
     unread: list[dict[str, Any]] = []
-    for conversation, last_read_seq, _max_seq, unread_count in unread_rows:
+    for conversation, last_read_seq, _max_seq, unread_count, _latest_relevant_seq in unread_rows:
         latest, sender_sub = latest_by_conversation_id[conversation.id]
         unread.append(
             {

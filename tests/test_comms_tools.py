@@ -1476,6 +1476,123 @@ class TestAxiShapes:
             "total_count": 0,
         }
 
+    async def test_inbox_excludes_own_message_by_default(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """comms_post_message never advances the sender's own read cursor,
+        so B's own reply -- posted without B ever reading anything via
+        comms_get_conversation -- must not echo back as "unread" on B's
+        own next comms_inbox call, unless B opts back in via
+        include_own_messages=True."""
+        await _register(main, test_session_factory, "inbox-tool-a")
+        await _register(main, test_session_factory, "inbox-tool-b")
+        token_a = _token("inbox-tool-a")
+        token_b = _token("inbox-tool-b")
+
+        list_result = await _call(main, test_session_factory, token_a, "comms_list_agents")
+        b_id = next(a["agent_id"] for a in list_result["agents"] if a["sub"] == "inbox-tool-b")
+
+        started = await _call(
+            main,
+            test_session_factory,
+            token_a,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [b_id],
+                "initial_message": _availability_request(),
+            },
+        )
+        conversation_id = started["conversation_id"]
+
+        await _call(
+            main,
+            test_session_factory,
+            token_b,
+            "comms_accept",
+            {"conversation_id": conversation_id},
+        )
+        # B reads A's initial message, then posts its own reply on top --
+        # only B's own message is now ahead of B's cursor.
+        await _call(
+            main,
+            test_session_factory,
+            token_b,
+            "comms_get_conversation",
+            {"conversation_id": conversation_id},
+        )
+        await _call(
+            main,
+            test_session_factory,
+            token_b,
+            "comms_post_message",
+            {
+                "conversation_id": conversation_id,
+                "message_type": "availability_response",
+                "payload": _availability_response(),
+            },
+        )
+
+        default_result = await _call(main, test_session_factory, token_b, "comms_inbox")
+        assert default_result["unread"] == []
+        assert default_result["total_count"] == 0
+
+        with_own = await _call(
+            main, test_session_factory, token_b, "comms_inbox", {"include_own_messages": True}
+        )
+        assert len(with_own["unread"]) == 1
+        assert with_own["unread"][0]["conversation_id"] == conversation_id
+        assert with_own["unread"][0]["unread_count"] == 1
+
+    async def test_inbox_include_read_surfaces_fully_read_conversation(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        await _register(main, test_session_factory, "inbox-tool-read-a")
+        await _register(main, test_session_factory, "inbox-tool-read-b")
+        token_a = _token("inbox-tool-read-a")
+        token_b = _token("inbox-tool-read-b")
+
+        list_result = await _call(main, test_session_factory, token_a, "comms_list_agents")
+        b_id = next(a["agent_id"] for a in list_result["agents"] if a["sub"] == "inbox-tool-read-b")
+
+        started = await _call(
+            main,
+            test_session_factory,
+            token_a,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [b_id],
+                "initial_message": _availability_request(),
+            },
+        )
+        conversation_id = started["conversation_id"]
+
+        await _call(
+            main,
+            test_session_factory,
+            token_b,
+            "comms_accept",
+            {"conversation_id": conversation_id},
+        )
+        await _call(
+            main,
+            test_session_factory,
+            token_b,
+            "comms_get_conversation",
+            {"conversation_id": conversation_id},
+        )
+
+        default_result = await _call(main, test_session_factory, token_b, "comms_inbox")
+        assert default_result["unread"] == []
+
+        read_result = await _call(
+            main, test_session_factory, token_b, "comms_inbox", {"include_read": True}
+        )
+        assert len(read_result["unread"]) == 1
+        assert read_result["unread"][0]["conversation_id"] == conversation_id
+        assert read_result["unread"][0]["unread_count"] == 0
+
     async def test_list_agents_includes_total_count(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
