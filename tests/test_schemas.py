@@ -364,9 +364,13 @@ class TestNoteV1:
         with pytest.raises(ValidationError):
             NoteV1.model_validate({"text": ""})
 
+    def test_accepts_text_at_max_length(self) -> None:
+        model = NoteV1.model_validate({"text": "x" * 50000})
+        assert len(model.text) == 50000
+
     def test_rejects_overlong_text(self) -> None:
         with pytest.raises(ValidationError):
-            NoteV1.model_validate({"text": "x" * 4001})
+            NoteV1.model_validate({"text": "x" * 50001})
 
     def test_rejects_extra_field(self) -> None:
         with pytest.raises(ValidationError):

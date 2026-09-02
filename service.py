@@ -88,7 +88,7 @@ sees one uniform message), ``denied.unknown_agent``,
 violation), ``denied.bad_schema`` (payload validation),
 ``denied.rate_limited`` (limit names: ``conversation_starts_per_hour``,
 ``messages_per_conversation_per_hour``, ``messages_per_sender_per_hour``,
-and — TECH-5389 PR2 — ``approval_holds_per_hour``),
+and — TECH-5389 PR2 — ``approval_holds_per_minute``),
 ``denied.ownership_unverified`` (Axis 1 admission — conversation open, or
 invite owner-freeze's empty-owner-set case — fail closed) /
 ``denied.ownership_lookup_failed`` (invite owner-freeze ONLY, when the
@@ -316,7 +316,7 @@ MAX_PENDING_INVITES_PER_INBOX = 100
 # per sender -- same table-count pattern as every other rate limit in this
 # module (no Redis).
 APPROVAL_HOLD_TTL = timedelta(days=7)
-MAX_APPROVAL_HOLDS_PER_HOUR = 10
+MAX_APPROVAL_HOLDS_PER_MINUTE = 2
 
 # RFC 5321 4.5.3.1.3 total-address cap. Hoisted here (Argus round 2,
 # TECH-5786 PR follow-up) rather than left as two independently-drifting
@@ -775,26 +775,34 @@ async def _deny_rate_limited_holds(
     """Hold-creation rate limit (TECH-5389 PR2) -- distinct from every
     other rate limit in this module: it counts ``approval_holds`` rows, not
     ``messages``/``conversations`` rows. Never part of the divert-don't-deny
-    reversal -- a sender flooding the human approval queue is still capped."""
-    one_hour_ago = _now() - timedelta(hours=1)
+    reversal -- a sender flooding the human approval queue is still capped.
+
+    At MAX_APPROVAL_HOLDS_PER_MINUTE=2 (Argus round-2), the sustained rate
+    this permits (120/hour) equals MAX_MESSAGES_PER_SENDER_PER_HOUR exactly,
+    so this cap only shapes bursts (at most 2 holds back-to-back); it no
+    longer provides an independent sustained-flood ceiling below the global
+    per-sender message cap."""
+    one_minute_ago = _now() - timedelta(minutes=1)
     count = (
         await session.execute(
             select(func.count())
             .select_from(ApprovalHold)
             .where(
                 ApprovalHold.sender_agent_id == sender_agent_id,
-                ApprovalHold.created_at > one_hour_ago,
+                ApprovalHold.created_at > one_minute_ago,
             )
         )
     ).scalar_one()
-    if count >= MAX_APPROVAL_HOLDS_PER_HOUR:
+    if count >= MAX_APPROVAL_HOLDS_PER_MINUTE:
         await _deny_rate_limited(
             session,
             actor_sub=actor_sub,
             agent_id=sender_agent_id,
             conversation_id=None,
-            limit_name="approval_holds_per_hour",
-            message=f"rate_limited: at most {MAX_APPROVAL_HOLDS_PER_HOUR} approval holds per hour",
+            limit_name="approval_holds_per_minute",
+            message=(
+                f"rate_limited: at most {MAX_APPROVAL_HOLDS_PER_MINUTE} approval holds per minute"
+            ),
         )
 
 
@@ -6084,7 +6092,7 @@ __all__ = [
     "CONVERSATION_TTL",
     "DEFAULT_OWNERSHIP_CLIENT",
     "DEFAULT_RECONCILIATION_BATCH_SIZE",
-    "MAX_APPROVAL_HOLDS_PER_HOUR",
+    "MAX_APPROVAL_HOLDS_PER_MINUTE",
     "MAX_CONVERSATION_STARTS_PER_HOUR",
     "MAX_LOOKUP_EMAIL_LENGTH",
     "MAX_MESSAGES_PER_CONVERSATION_PER_HOUR",

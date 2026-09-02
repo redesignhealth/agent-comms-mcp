@@ -62,7 +62,7 @@ from schemas import (
 from service import (
     AGENT_REQUESTED_RISK_SCORER_LABEL,
     CONVERSATION_TTL,
-    MAX_APPROVAL_HOLDS_PER_HOUR,
+    MAX_APPROVAL_HOLDS_PER_MINUTE,
     MAX_CONVERSATION_STARTS_PER_HOUR,
     MAX_CONVERSATION_TTL,
     MAX_MESSAGES_PER_CONVERSATION_PER_HOUR,
@@ -4330,7 +4330,7 @@ class TestPostMessage:
 
     async def test_payload_exceeding_max_bytes_denied(self, session: AsyncSession) -> None:
         """A payload whose JSON encoding exceeds ``schemas.MAX_PAYLOAD_BYTES``
-        (65536) is rejected with ``PayloadValidationError`` before schema
+        (1048576) is rejected with ``PayloadValidationError`` before schema
         validation even runs — ``_check_payload_size`` is the first check
         ``validate_payload`` performs."""
         owner, target, conversation = await self._active_pair(session, "sz-owner-1", "sz-target-1")
@@ -4345,7 +4345,7 @@ class TestPostMessage:
                 message_type="decline",
                 payload=oversized_payload,
             )
-        assert "exceeding the 65536-byte cap" in str(exc_info.value)
+        assert f"exceeding the {MAX_PAYLOAD_BYTES}-byte cap" in str(exc_info.value)
 
         actions = await _audit_actions(session, conversation.id)
         assert "denied.bad_schema" in actions
@@ -6209,13 +6209,19 @@ class TestRateLimits:
         assert conversation_rows == []
 
     async def test_approval_hold_rate_limit_under_limit_creates_holds(
-        self, session: AsyncSession
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """MAX_APPROVAL_HOLDS_PER_HOUR (Argus round-1: no coverage existed
+        """MAX_APPROVAL_HOLDS_PER_MINUTE (Argus round-1: no coverage existed
         for this rate limit at all). Every `note` posted into an `open`
         conversation diverts unconditionally (boundary_crossing), so each
         call below creates one more approval_holds row for the same
-        sender."""
+        sender.
+
+        Argus round-2: the 1-minute window (vs. the old 1-hour one) makes
+        wall-clock timing meaningfully tighter, so freeze `_now` rather than
+        rely on the loop completing within the same real-world minute."""
+        frozen_now = datetime.now(UTC)
+        monkeypatch.setattr(_service, "_now", lambda: frozen_now)
         owner = await _register(session, "rl-hold-owner-1")
         target = await _register(session, "rl-hold-target-1")
         conversation = await start_conversation(
@@ -6229,7 +6235,7 @@ class TestRateLimits:
         await accept_invite(
             session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
         )
-        for _ in range(MAX_APPROVAL_HOLDS_PER_HOUR):
+        for _ in range(MAX_APPROVAL_HOLDS_PER_MINUTE):
             result = await post_message(
                 session,
                 actor_sub=owner.sub,
@@ -6248,9 +6254,17 @@ class TestRateLimits:
             .scalars()
             .all()
         )
-        assert len(holds) == MAX_APPROVAL_HOLDS_PER_HOUR
+        assert len(holds) == MAX_APPROVAL_HOLDS_PER_MINUTE
 
-    async def test_approval_hold_rate_limit_over_limit_denied(self, session: AsyncSession) -> None:
+    async def test_approval_hold_rate_limit_over_limit_denied(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Argus round-2: freeze time for the same reason as the sibling
+        # under-limit test above -- a 1-minute window is tight enough that
+        # a slow CI runner could otherwise let the first hold's created_at
+        # drift outside the window before the denial assertion fires.
+        frozen_now = datetime.now(UTC)
+        monkeypatch.setattr(_service, "_now", lambda: frozen_now)
         owner = await _register(session, "rl-hold-owner-2")
         target = await _register(session, "rl-hold-target-2")
         conversation = await start_conversation(
@@ -6264,7 +6278,7 @@ class TestRateLimits:
         await accept_invite(
             session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
         )
-        for _ in range(MAX_APPROVAL_HOLDS_PER_HOUR):
+        for _ in range(MAX_APPROVAL_HOLDS_PER_MINUTE):
             await post_message(
                 session,
                 actor_sub=owner.sub,
@@ -6285,12 +6299,22 @@ class TestRateLimits:
         # The hold-rate-limit denial audits with conversation_id=None (it
         # counts approval_holds across all of the sender's conversations,
         # not one) -- query by agent_id, not conversation_id, to see it.
-        agent_actions = (
-            (await session.execute(select(AuditLog.action).where(AuditLog.agent_id == owner.id)))
+        agent_audit_rows = (
+            (
+                await session.execute(
+                    select(AuditLog).where(
+                        AuditLog.agent_id == owner.id, AuditLog.action == "denied.rate_limited"
+                    )
+                )
+            )
             .scalars()
             .all()
         )
-        assert "denied.rate_limited" in agent_actions
+        assert len(agent_audit_rows) == 1
+        # Argus round-2: pin the renamed limit string itself, not just the
+        # generic denial action -- a typo in the rename would otherwise
+        # still pass every test.
+        assert agent_audit_rows[0].detail == {"limit": "approval_holds_per_minute"}
         holds = (
             (
                 await session.execute(
@@ -6300,8 +6324,8 @@ class TestRateLimits:
             .scalars()
             .all()
         )
-        # The refused call must not have created an (MAX_APPROVAL_HOLDS_PER_HOUR + 1)th hold.
-        assert len(holds) == MAX_APPROVAL_HOLDS_PER_HOUR
+        # The refused call must not have created an (MAX_APPROVAL_HOLDS_PER_MINUTE + 1)th hold.
+        assert len(holds) == MAX_APPROVAL_HOLDS_PER_MINUTE
 
 
 # --- list_pending_approval_holds ---------------------------------------------------

@@ -1201,7 +1201,7 @@ async def post_message(
       May cancel the conversation if all members have declined.
     - ``needs_clarification``: ``about_seq`` (int ≥ 1, references a prior
       message seq).
-    - ``note``: ``text`` (str 1-4000 chars). Boundary-sensitive: posts
+    - ``note``: ``text`` (str 1-50000 chars). Boundary-sensitive: posts
       immediately in ``internal`` conversations, or in ``asymmetric``
       conversations where it doesn't cross an ownership boundary for the
       sender. Where it WOULD cross a boundary (including always under
