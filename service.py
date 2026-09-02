@@ -775,7 +775,13 @@ async def _deny_rate_limited_holds(
     """Hold-creation rate limit (TECH-5389 PR2) -- distinct from every
     other rate limit in this module: it counts ``approval_holds`` rows, not
     ``messages``/``conversations`` rows. Never part of the divert-don't-deny
-    reversal -- a sender flooding the human approval queue is still capped."""
+    reversal -- a sender flooding the human approval queue is still capped.
+
+    At MAX_APPROVAL_HOLDS_PER_MINUTE=2 (Argus round-2), the sustained rate
+    this permits (120/hour) equals MAX_MESSAGES_PER_SENDER_PER_HOUR exactly,
+    so this cap only shapes bursts (at most 2 holds back-to-back); it no
+    longer provides an independent sustained-flood ceiling below the global
+    per-sender message cap."""
     one_minute_ago = _now() - timedelta(minutes=1)
     count = (
         await session.execute(

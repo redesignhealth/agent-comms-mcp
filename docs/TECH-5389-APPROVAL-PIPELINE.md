@@ -640,7 +640,7 @@ aggregation read-path any company approval UI (e.g. RH's Slack + list view) cons
 | `approval.notify_failed` | sender agent's sub (the request whose post-commit hook failed) | notifier raised (detail: notifier name, error type) |
 | `message.post` (existing) | approver / system actor / initiator | approval-time insert (detail gains `hold_id`); the synthesized opener's row carries `system_synthesized: true` |
 | `denied.risk_unscored` | sender's sub | scorer infrastructure failure — hard deny (detail: cause) |
-| `denied.rate_limited` (`approval_holds_per_minute`) | sender's sub | hold spam cap |
+| `denied.rate_limited` (`approval_holds_per_minute`) | sender's sub | hold burst cap (2/min; sustained rate equals `MAX_MESSAGES_PER_SENDER_PER_HOUR`, so this is burst-shaping only, not an independent sustained-flood ceiling — Argus round-2) |
 | `denied.system_message_type` | sender's sub | agent tried to post `conversation_opened` directly |
 | `denied.approval_requires_interactive` | endpoint caller identity | non-interactive (agent) token hit a decide/list endpoint — bearer failed interactive-provider verification; the agent chain is consulted for attribution only (§9) |
 | `denied.unknown_hold` / `denied.hold_not_owner` / `denied.hold_not_sender` | caller | uniform-denial pairs (endpoint 404s; tool uniform error) |
