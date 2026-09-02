@@ -366,7 +366,7 @@ class TestNoteV1:
 
     def test_rejects_overlong_text(self) -> None:
         with pytest.raises(ValidationError):
-            NoteV1.model_validate({"text": "x" * 4001})
+            NoteV1.model_validate({"text": "x" * 50001})
 
     def test_rejects_extra_field(self) -> None:
         with pytest.raises(ValidationError):

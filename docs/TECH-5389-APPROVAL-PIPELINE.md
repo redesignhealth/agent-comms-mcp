@@ -386,7 +386,7 @@ there is no other way for one to exist there. Reader-visible provenance
 
 ### Constants (confirmed)
 
-`APPROVAL_HOLD_TTL = timedelta(days=7)`; `MAX_APPROVAL_HOLDS_PER_HOUR = 10` (counted
+`APPROVAL_HOLD_TTL = timedelta(days=7)`; `MAX_APPROVAL_HOLDS_PER_MINUTE = 2` (counted
 from `approval_holds.created_at` per sender — table-count pattern, no Redis).
 
 ## 6. Seq-1 high-risk opener: auto-post a safe system opener (ratified, decision 1)
@@ -466,7 +466,7 @@ initiator knows the conversation exists but the content does not yet.
    with the shell. No cleanup mechanism in v1.
 2. The marker counts toward the initiator's global sender rate limit (it is a real
    seq-1 message on the existing enforcement path). Accepted — one message per
-   diverted open, bounded further by `MAX_APPROVAL_HOLDS_PER_HOUR`.
+   diverted open, bounded further by `MAX_APPROVAL_HOLDS_PER_MINUTE`.
 3. `conversation_opened` appears in `MESSAGE_TYPES` (derived from the registry), so
    agents *can* list it in `accepted_types` at registration. Harmless — the gate
    exemption makes the declaration inert.
@@ -481,7 +481,7 @@ including the capability gate (all unchanged):
 2. `high_risk=False` → insert message exactly as today. Zero change to the happy path
    or its response shape.
 3. `high_risk=True` →
-   - Hold rate limit (`denied.rate_limited`, `limit="approval_holds_per_hour"` — rate
+   - Hold rate limit (`denied.rate_limited`, `limit="approval_holds_per_minute"` — rate
      limiting was never part of the divert-don't-deny reversal).
    - Insert hold (`pending_auto`; `owner_sub` snapshotted from the sender's verified
      claim per §15.4, passed down from the tools layer as a parameter — the existing
@@ -640,7 +640,7 @@ aggregation read-path any company approval UI (e.g. RH's Slack + list view) cons
 | `approval.notify_failed` | sender agent's sub (the request whose post-commit hook failed) | notifier raised (detail: notifier name, error type) |
 | `message.post` (existing) | approver / system actor / initiator | approval-time insert (detail gains `hold_id`); the synthesized opener's row carries `system_synthesized: true` |
 | `denied.risk_unscored` | sender's sub | scorer infrastructure failure — hard deny (detail: cause) |
-| `denied.rate_limited` (`approval_holds_per_hour`) | sender's sub | hold spam cap |
+| `denied.rate_limited` (`approval_holds_per_minute`) | sender's sub | hold spam cap |
 | `denied.system_message_type` | sender's sub | agent tried to post `conversation_opened` directly |
 | `denied.approval_requires_interactive` | endpoint caller identity | non-interactive (agent) token hit a decide/list endpoint — bearer failed interactive-provider verification; the agent chain is consulted for attribution only (§9) |
 | `denied.unknown_hold` / `denied.hold_not_owner` / `denied.hold_not_sender` | caller | uniform-denial pairs (endpoint 404s; tool uniform error) |

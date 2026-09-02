@@ -62,7 +62,7 @@ from schemas import (
 from service import (
     AGENT_REQUESTED_RISK_SCORER_LABEL,
     CONVERSATION_TTL,
-    MAX_APPROVAL_HOLDS_PER_HOUR,
+    MAX_APPROVAL_HOLDS_PER_MINUTE,
     MAX_CONVERSATION_STARTS_PER_HOUR,
     MAX_CONVERSATION_TTL,
     MAX_MESSAGES_PER_CONVERSATION_PER_HOUR,
@@ -4330,7 +4330,7 @@ class TestPostMessage:
 
     async def test_payload_exceeding_max_bytes_denied(self, session: AsyncSession) -> None:
         """A payload whose JSON encoding exceeds ``schemas.MAX_PAYLOAD_BYTES``
-        (65536) is rejected with ``PayloadValidationError`` before schema
+        (1048576) is rejected with ``PayloadValidationError`` before schema
         validation even runs — ``_check_payload_size`` is the first check
         ``validate_payload`` performs."""
         owner, target, conversation = await self._active_pair(session, "sz-owner-1", "sz-target-1")
@@ -4345,7 +4345,7 @@ class TestPostMessage:
                 message_type="decline",
                 payload=oversized_payload,
             )
-        assert "exceeding the 65536-byte cap" in str(exc_info.value)
+        assert "exceeding the 1048576-byte cap" in str(exc_info.value)
 
         actions = await _audit_actions(session, conversation.id)
         assert "denied.bad_schema" in actions
@@ -6211,7 +6211,7 @@ class TestRateLimits:
     async def test_approval_hold_rate_limit_under_limit_creates_holds(
         self, session: AsyncSession
     ) -> None:
-        """MAX_APPROVAL_HOLDS_PER_HOUR (Argus round-1: no coverage existed
+        """MAX_APPROVAL_HOLDS_PER_MINUTE (Argus round-1: no coverage existed
         for this rate limit at all). Every `note` posted into an `open`
         conversation diverts unconditionally (boundary_crossing), so each
         call below creates one more approval_holds row for the same
@@ -6229,7 +6229,7 @@ class TestRateLimits:
         await accept_invite(
             session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
         )
-        for _ in range(MAX_APPROVAL_HOLDS_PER_HOUR):
+        for _ in range(MAX_APPROVAL_HOLDS_PER_MINUTE):
             result = await post_message(
                 session,
                 actor_sub=owner.sub,
@@ -6248,7 +6248,7 @@ class TestRateLimits:
             .scalars()
             .all()
         )
-        assert len(holds) == MAX_APPROVAL_HOLDS_PER_HOUR
+        assert len(holds) == MAX_APPROVAL_HOLDS_PER_MINUTE
 
     async def test_approval_hold_rate_limit_over_limit_denied(self, session: AsyncSession) -> None:
         owner = await _register(session, "rl-hold-owner-2")
@@ -6264,7 +6264,7 @@ class TestRateLimits:
         await accept_invite(
             session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
         )
-        for _ in range(MAX_APPROVAL_HOLDS_PER_HOUR):
+        for _ in range(MAX_APPROVAL_HOLDS_PER_MINUTE):
             await post_message(
                 session,
                 actor_sub=owner.sub,
@@ -6300,8 +6300,8 @@ class TestRateLimits:
             .scalars()
             .all()
         )
-        # The refused call must not have created an (MAX_APPROVAL_HOLDS_PER_HOUR + 1)th hold.
-        assert len(holds) == MAX_APPROVAL_HOLDS_PER_HOUR
+        # The refused call must not have created an (MAX_APPROVAL_HOLDS_PER_MINUTE + 1)th hold.
+        assert len(holds) == MAX_APPROVAL_HOLDS_PER_MINUTE
 
 
 # --- list_pending_approval_holds ---------------------------------------------------

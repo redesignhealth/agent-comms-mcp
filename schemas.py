@@ -97,7 +97,7 @@ MAX_ACCEPTED_TYPES = 20
 # back verbatim in UnknownConversationTypeError's message. Every real
 # MESSAGE_TYPES value is under 30 characters; 100 is a generous margin.
 MAX_ACCEPTED_TYPE_LENGTH = 100
-MAX_PAYLOAD_BYTES = 65536
+MAX_PAYLOAD_BYTES = 1048576
 
 # Caller-supplied suffix a caller may append to its own verified identity to
 # register multiple distinct agent rows under one token (providers/comms.py
@@ -452,7 +452,7 @@ class NoteV1(_StrictModel):
     """
 
     type: Literal["note"] = "note"
-    text: str = Field(min_length=1, max_length=4000)
+    text: str = Field(min_length=1, max_length=50000)
 
 
 class ConversationOpenedV1(_StrictModel):
