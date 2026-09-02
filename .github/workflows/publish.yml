@@ -42,6 +42,10 @@ jobs:
           echo "CI check passed for $GH_SHA."
 
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          # Pinned to match ci.yml/Dockerfile -- otherwise the wheel published
+          # to PyPI is built by a different uv version than the one CI verified.
+          version: "0.11.28"
       - run: uv build
 
       - name: Verify package-data is included in the built wheel
@@ -49,8 +53,13 @@ jobs:
         # included" step -- the published artifact is a separate build (not
         # reused from CI), so ci.yml passing doesn't guarantee this build's
         # wheel also has instruction_registry.json bundled.
+        # Uses plain python3 (not `uv run python`): this job has no prior
+        # `uv sync` step, so `uv run` would trigger a full dependency sync
+        # after the GitHub release already exists just to run a stdlib-only
+        # script -- a sync failure here would leave a broken release (exists
+        # on GitHub, never published to PyPI) for no benefit.
         run: |
-          uv run python -c "
+          python3 -c "
           import glob, zipfile
           wheels = glob.glob('dist/*.whl')
           if len(wheels) != 1:

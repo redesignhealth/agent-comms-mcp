@@ -70,9 +70,9 @@
 
 Pre-releases (GitHub "Set as a pre-release" flag) trigger `publish.yml` but **not** `deploy.yml`.
 Use pre-releases to publish a wheel to PyPI for testing without touching ECS.
-`publish.yml` still requires a successful push-triggered CI run on `main` for the exact
-release SHA (same gate `deploy.yml` uses) — a pre-release from a commit without one fails
-before publishing.
+`publish.yml` still requires a successful push-triggered CI run on the `main` branch for
+the exact release SHA (same gate `deploy.yml` uses) — a pre-release from a feature-branch
+commit, or any commit without such a CI run, fails before publishing.
 
 ## Versioning
 
@@ -112,4 +112,5 @@ gh release create vX.Y.Z --target "$HOTFIX_SHA" --title "vX.Y.Z" --notes "..."
 > **Important:** Use `--target "$HOTFIX_SHA"` with the merge commit OID from `gh pr view`.
 > The `// empty` filter surfaces a null OID (PR not yet merged) as an error rather than
 > silently creating a release targeting the wrong SHA.
-> If no successful push-triggered CI run is found for the release SHA, the deploy job will fail.
+> If no successful push-triggered CI run is found for the release SHA, both the publish
+> and deploy jobs will fail.
