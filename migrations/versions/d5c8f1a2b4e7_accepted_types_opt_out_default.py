@@ -53,14 +53,31 @@ This revision does two things:
    already includes one of the two new TECH-5822 types) is likewise left
    alone for the same reason.
 
-DEPLOYMENT: same posture as ``e1db7c2e6b70`` -- the UPDATE only widens
-existing values on a column no currently-running container (old or new)
-reads or writes differently because of it; the ``ALTER COLUMN ...
-SET DEFAULT`` is equally non-blocking. No stop-then-start required for
-this revision considered alone, but as always ``entrypoint.sh`` runs
-``alembic upgrade head`` atomically, so a deploy carrying this revision
-alongside any still-pending parent is governed by that parent's own
-requirements.
+DEPLOYMENT WARNING (Argus round-1 finding -- this section previously and
+WRONGLY claimed the same safe-under-both-versions posture as
+``e1db7c2e6b70``; that equivalence does not hold and the failure mode is
+actually inverted): ``entrypoint.sh`` runs ``alembic upgrade head`` in the
+new container BEFORE the old container drains (no expand/contract split
+exists in this pipeline today). Pre-PR enforcement
+(``service._enforce_message_type_accepted``, before this same PR's own
+code change) is ``if message_type not in accepted`` -- an OLD container
+still serving traffic during the drain window reads a row this migration
+just backfilled to ``'{}'`` and evaluates ``message_type not in []`` ->
+always ``True`` -> denies EVERY message to that agent, the exact opposite
+of the "accept everything" meaning the NEW code (already deployed in the
+new container, same PR) assigns to that same value. ``e1db7c2e6b70``'s
+widening was safe under old code specifically because old code did not
+enforce ``accepted_types`` at all yet -- there is no such safety margin
+here, since old code in THIS case already enforces it, just with the
+opposite sentinel meaning.
+
+This PR must ship as a stop-then-start deploy (every old container fully
+stopped, THEN the new container -- carrying both the enforcement code
+change and this migration -- starts), or during a confirmed-idle traffic
+window. A standard rolling/blue-green deploy of this image is NOT safe for
+this specific revision: every currently-registered agent whose row this
+migration backfills would have all incoming messages denied for the
+entire drain window.
 """
 
 from __future__ import annotations
@@ -103,9 +120,36 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Argus round-1 finding: a no-op downgrade() here is not merely lossy
+    # (e1db7c2e6b70's downgrade posture) -- it is actively unsafe. Before
+    # this migration, no row could ever be '{}' (register_agent's
+    # validator rejected an empty accepted_types outright), so any row
+    # found at '{}' post-downgrade is a row this migration itself
+    # backfilled, never a legitimate pre-existing value. Left at '{}',
+    # rolled-back application code (which enforces `if message_type not in
+    # accepted`, no opt-out-empty-list carve-out) would treat every one of
+    # those agents as accepting NOTHING, and -- because the rolled-back
+    # validator also still rejects an empty accepted_types -- that agent
+    # cannot even self-recover by calling comms_register again; only a
+    # manual UPDATE restoring a non-empty accepted_types unblocks it. This
+    # restores the exact frozen 12-type set e1db7c2e6b70 established, so a
+    # downgrade run promptly after this migration (before any new
+    # registration under the new opt-out semantics has landed) is precise,
+    # not a guess: every row it touches is one this migration itself just
+    # backfilled.
+    #
+    # KNOWN LIMITATION, not fixable after the fact: once even one new
+    # registration/re-registration has legitimately opted into the new
+    # accept-everything sentinel (an ordinary '{}' write under the NEW
+    # semantics, unrelated to this migration's backfill), this downgrade
+    # can no longer tell that row apart from one it backfilled, and will
+    # incorrectly "restore" it to the 12-type set too. This is an inherent
+    # limitation of rolling back a live semantic flip, not something this
+    # migration can detect -- downgrading long after this ships should be
+    # treated as data-lossy for any agent that adopted the new default in
+    # the interim, and reviewed manually rather than trusted blindly.
+    op.execute(
+        f"UPDATE public.agents SET accepted_types = ARRAY[{_OLD_DEFAULT_TWELVE}]::text[], "
+        "updated_at = now() WHERE accepted_types = ARRAY[]::text[]"
+    )
     op.execute("ALTER TABLE public.agents ALTER COLUMN accepted_types DROP DEFAULT")
-    # Not reversed: same lossy-downgrade posture as e1db7c2e6b70 -- there is
-    # no way to recover which rows were widened to '{}' by this migration
-    # versus already empty for some other reason. Downgrading this revision
-    # leaves any widened row at '{}' rather than restoring the old 12-type
-    # default.

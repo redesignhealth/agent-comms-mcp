@@ -148,3 +148,40 @@ async def test_backfill_widens_only_rows_matching_old_default_exactly(
         [*_OLD_DEFAULT_TWELVE, "instruction_request"]
     )
     assert after["mig-already-empty"] == []
+
+
+async def test_downgrade_restores_backfilled_rows_to_old_default(
+    database_url: str, engine: AsyncEngine
+) -> None:
+    """Argus round-1 finding: a no-op downgrade() here would be actively
+    unsafe, not just lossy -- pre-PR application code enforces
+    ``accepted_types`` and treats '{}' as accept-NOTHING, and its
+    validator also rejects an empty accepted_types outright, so an agent
+    left at '{}' post-downgrade could not even self-recover via
+    comms_register. downgrade() must restore the frozen 12-type default
+    for exactly the rows this migration itself backfilled."""
+    _run_alembic(database_url, "downgrade", "base")
+    _run_alembic(database_url, "upgrade", "head")
+
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO agents "
+                "(sub, owner_sub, owner_email, display_name, accepted_types, status) "
+                "VALUES ('mig-downgrade-empty', 'mig-downgrade-empty', "
+                "'mig-downgrade-empty@example.com', 'mig-downgrade-empty', "
+                "ARRAY[]::text[], 'active')"
+            )
+        )
+
+    _run_alembic(database_url, "downgrade", "-1")
+
+    async with engine.connect() as conn:
+        result = await conn.execute(
+            text("SELECT accepted_types FROM agents WHERE sub = 'mig-downgrade-empty'")
+        )
+        restored = list(result.scalar_one())
+
+    assert sorted(restored) == sorted(_OLD_DEFAULT_TWELVE)
+
+    _run_alembic(database_url, "upgrade", "head")

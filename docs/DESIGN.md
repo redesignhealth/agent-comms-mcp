@@ -507,7 +507,7 @@ scroll-to-load-more use case.
 | Tool | Scope | Notes |
 |---|---|---|
 | `comms_whoami` | comms:read | caller identity/scopes; also returns this identity's registered min/max_schema_version via a best-effort DB lookup if already `comms_register`'d -- omitted if not yet registered or the DB is unreachable (this tool remains usable as an auth-only diagnostic either way) |
-| `comms_register` | comms:write | idempotent self-provisioning: display_name, accepted_types (optional, max 20/100 chars each; omitted/empty defaults to accepting every message type including future ones -- see §9's "Capability gate" section), min/max_schema_version (default 1/1, for schema-version capability negotiation); `is_shared=True` on first registration additionally requires comms:admin (see §5); rejects a new sibling row under the same base identity (`identity_fork_detected`) unless `confirm_new_identity=True`, and rejects a new row whose `display_name` collides with an existing active agent's (`display_name_collision`, not bypassable by `confirm_new_identity` -- DB-enforced race-free via a `UNIQUE` partial index, see §5) |
+| `comms_register` | comms:write | idempotent self-provisioning: display_name, accepted_types (optional, max 20/100 chars each; `[]`/omitted-on-first-registration accepts every message type including future ones, but omitted-on-RE-registration preserves the agent's current value instead of resetting it -- see §9's "Capability gate" section for the full three-way semantics), min/max_schema_version (default 1/1, for schema-version capability negotiation); `is_shared=True` on first registration additionally requires comms:admin (see §5); rejects a new sibling row under the same base identity (`identity_fork_detected`) unless `confirm_new_identity=True`, and rejects a new row whose `display_name` collides with an existing active agent's (`display_name_collision`, not bypassable by `confirm_new_identity` -- DB-enforced race-free via a `UNIQUE` partial index, see §5) |
 | `comms_set_agent_shared` | comms:write | admin override of an existing agent's `is_shared`, since `comms_register` freezes it against the agent's own re-registration; additionally requires comms:admin OR an interactive/Okta caller (see §5) |
 | `comms_deregister_agent` | comms:write | sets an existing agent's `status="suspended"`; additionally requires comms:admin OR an interactive/Okta caller (see §5); one-directional by design -- no reactivate tool. Because it is one-directional, suspending an identity here is exactly what makes the sibling-fork check's "all siblings count, not just active ones" condition (see §5) trigger permanently for that base identity -- there is no reactivation path to undo it. This is intentional, to prevent kill-switch bypasses |
 | `comms_admin_register` | comms:write | on-behalf-of FIRST registration for a `sub` other than the caller's own -- additionally requires comms:admin OR an interactive/Okta caller (see §5's "On-behalf-of registration" note). Distinct from `comms_register` (always self, idempotent) and `comms_set_agent_shared` (corrects `is_shared` on an agent that already exists): this is a genuine new-identity registration path for a `sub` that has never registered itself. Never an upsert -- fails with `already_registered` if `sub` already has a board row (any status) |
@@ -1109,9 +1109,30 @@ downstream from default-verified ones. Full design and rationale:
 knows about, including any added in the future" — not "accept nothing".
 Passing a non-empty list is how an agent deliberately RESTRICTS itself to
 that narrower, explicit set going forward; that is the exception, not the
-default every agent must maintain. `comms_register`/`comms_admin_register`'s
-`accepted_types` parameter is optional for exactly this reason — omitting it
-(or passing `None`/`[]`) is the normal, common case.
+default every agent must maintain.
+
+`comms_register`'s `accepted_types` parameter is optional, but omitting it
+does NOT mean the same thing on every call — this distinction is
+security-relevant, not cosmetic:
+
+- **First registration, omitted or explicit `[]`**: accept-everything.
+- **Re-registration, explicit `[]`**: accept-everything — an agent that
+  wants to deliberately widen itself back from a prior restriction passes
+  this.
+- **Re-registration, omitted**: PRESERVES the agent's current
+  `accepted_types` unchanged. This is the one field `comms_register`
+  does NOT reset to a default on omission (unlike
+  `min_schema_version`/`max_schema_version`, which do reset when omitted
+  — see §5's tool table): those carry no capability-restriction meaning,
+  so resetting them is harmless, but silently widening an
+  already-restricted agent's `accepted_types` to accept-everything just
+  because a routine re-registration call (e.g. a startup health check)
+  omitted the parameter would be a real, silent capability escalation for
+  that agent, not a convenience default.
+
+`comms_admin_register` has no re-registration path (`AgentAlreadyRegisteredError`
+denies re-use of an existing `sub` outright), so for it, omitted and
+explicit `[]` are always equivalent — accept-everything.
 
 Independent of, and checked alongside (and BEFORE — see the ordering note in
 Axis 2 above), the risk-scoring rule above: every other **active**
@@ -1375,6 +1396,20 @@ audit-log write, task-scoped or otherwise, from any still-running old container
 for the entire drain window. This PR must ship as a stop-then-start deploy, or
 during a confirmed-idle traffic window: see that migration file's own
 deployment-warning docstring.
+
+### Known gap: rolling-deploy safety of the `accepted_types` opt-out migration
+
+`migrations/versions/d5c8f1a2b4e7_accepted_types_opt_out_default.py`
+backfills some existing agents' `accepted_types` to `'{}'`, the new
+accept-everything sentinel — but pre-PR enforcement code
+(`if message_type not in accepted`, no opt-out-empty-list carve-out)
+treats that exact same value as accept-NOTHING. Same rolling-deploy hazard
+as the `tasks`-drop migration above, and the same fix: this PR (migration
++ the `_enforce_message_type_accepted` code change together) must ship as
+a stop-then-start deploy, or during a confirmed-idle traffic window, never
+a standard rolling/blue-green deploy — see that migration file's own
+deployment-warning docstring for the full failure mode and why it is the
+inverse of `e1db7c2e6b70`'s (safe) widening.
 
 ## 10. Known extensions (explicitly deferred)
 

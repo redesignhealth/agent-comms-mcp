@@ -5648,6 +5648,104 @@ class TestAcceptedTypesOptOutSentinel:
             )
         assert exc_info.value.reason == "denied.message_type_not_accepted"
 
+    async def test_first_registration_with_omitted_accepted_types_accepts_everything(
+        self, session: AsyncSession
+    ) -> None:
+        """``accepted_types=None`` (the tool-layer's "omitted" shape) on a
+        FIRST registration has no existing row to preserve, so it resolves
+        to the same accept-everything default as an explicit ``[]``."""
+        agent = await register_agent(
+            session,
+            sub="optout-first-omitted",
+            base_sub="optout-first-omitted",
+            owner_sub="owner-optout-first-omitted",
+            owner_email="optout-first-omitted@example.com",
+            display_name="optout-first-omitted",
+            accepted_types=None,
+        )
+        assert agent.accepted_types == []
+
+    async def test_reregistration_with_omitted_accepted_types_preserves_existing_value(
+        self, session: AsyncSession
+    ) -> None:
+        """Argus round-1 BLOCKING finding: making accepted_types optional
+        must not let a routine re-registration call (e.g. a startup
+        health-check re-register) that omits the parameter silently widen
+        an already-restricted agent to accept-everything. ``None`` on
+        RE-registration must leave the existing declared set untouched."""
+        sub = "optout-reregister-preserve"
+        first = await register_agent(
+            session,
+            sub=sub,
+            base_sub=sub,
+            owner_sub=f"owner-{sub}",
+            owner_email=f"{sub}@example.com",
+            display_name=sub,
+            accepted_types=["confirm", "note"],
+        )
+        assert first.accepted_types == ["confirm", "note"]
+
+        again = await register_agent(
+            session,
+            sub=sub,
+            base_sub=sub,
+            owner_sub=f"owner-{sub}",
+            owner_email=f"{sub}@example.com",
+            display_name=sub,
+            accepted_types=None,
+        )
+        assert again.id == first.id
+        assert again.accepted_types == ["confirm", "note"]
+
+    async def test_reregistration_with_explicit_empty_widens_to_accept_everything(
+        self, session: AsyncSession
+    ) -> None:
+        """Unlike omitting the parameter, an EXPLICIT ``[]`` on
+        re-registration always applies -- this is how an operator
+        deliberately widens an already-restricted agent back to
+        accept-everything."""
+        sub = "optout-reregister-widen"
+        first = await register_agent(
+            session,
+            sub=sub,
+            base_sub=sub,
+            owner_sub=f"owner-{sub}",
+            owner_email=f"{sub}@example.com",
+            display_name=sub,
+            accepted_types=["confirm"],
+        )
+        assert first.accepted_types == ["confirm"]
+
+        widened = await register_agent(
+            session,
+            sub=sub,
+            base_sub=sub,
+            owner_sub=f"owner-{sub}",
+            owner_email=f"{sub}@example.com",
+            display_name=sub,
+            accepted_types=[],
+        )
+        assert widened.id == first.id
+        assert widened.accepted_types == []
+
+    async def test_admin_register_with_omitted_accepted_types_accepts_everything(
+        self, session: AsyncSession
+    ) -> None:
+        """``admin_register_agent`` has no re-registration path (it only
+        ever creates), so ``None`` always resolves to the accept-everything
+        default there, the same as a first ``register_agent`` call."""
+        agent = await admin_register_agent(
+            session,
+            actor_sub="optout-admin-actor",
+            admin_authorized=True,
+            sub="optout-admin-omitted",
+            owner_sub="owner-optout-admin-omitted",
+            owner_email="optout-admin-omitted@example.com",
+            display_name="optout-admin-omitted",
+            accepted_types=None,
+        )
+        assert agent.accepted_types == []
+
 
 class TestTaskLifecycleMessages:
     """ "tasks-as-conversations": task_assign opens a conversation (assigner
