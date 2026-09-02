@@ -188,13 +188,44 @@ never logged.
 
 The service is a standard Python HTTP process backed by PostgreSQL.
 
-**Production (ECS):** creating a GitHub release triggers `.github/workflows/deploy.yml`,
-which builds the Docker image and pushes it to dev ECR, then promotes the same image to prod
-ECR. That workflow does not deploy to ECS itself -- its last step dispatches
-`redesignhealth/rh-data-platform`'s `deploy-reclaw-comms.yml`, whose Terraform-driven deploy is
-the only thing that ever updates the ECS service (issue #7795: this used to be a second,
-independent deploy path direct to ECS, which is why it's been removed). See
-[docs/RELEASING.md](docs/RELEASING.md) for the full release process.
+**Production (ECS): cutting a release here does NOT put your change live anywhere by
+itself.** Creating a GitHub release triggers `.github/workflows/deploy.yml`, which
+builds this repo's own Docker image and pushes it to dev ECR, then promotes the same
+image to prod ECR (requires a `production`-environment reviewer approval). That's the
+entire scope of this workflow -- **it does not dispatch anything else and does not
+touch ECS.** (An earlier revision of this comment claimed it dispatched
+`rh-data-platform`'s `deploy-reclaw-comms.yml`; that mechanism was removed 2026-08-17 --
+see this file's own git history -- and the claim was stale. Verified 2026-09-01: no
+`workflow_dispatch`/`repository_dispatch` call exists anywhere in `deploy.yml` today.)
+
+**The image this repo builds is not the image the live board actually runs.** The
+deployed `reclaw-comms-mcp-rh` ECS services (dev: `rh-reclaw-comms-dev` on
+`rh-platform-dev-cluster`; prod: `rh-reclaw-comms` on `rh-platform-cluster`) run a
+**derived image** -- this repo's own published image plus `redesignhealth/agent-comms-approvals`'s
+`rh_comms_plugins`/`rh-auth` layer (`Dockerfile.board-derived` in that repo) -- pinned
+to a specific `sha-<hex>` tag from this repo's image, not tracking any floating tag.
+Getting a merged/released change here actually live requires, in order:
+
+1. Cut the release as above (base image only, per [docs/RELEASING.md](docs/RELEASING.md)).
+2. Manually trigger `agent-comms-approvals`' `deploy.yml` via `workflow_dispatch`,
+   passing `base_image` = the new `sha-<hex>` tag from step 1. This builds and pushes
+   the derived board image to dev ECR, then promotes it to prod ECR, in one dispatch
+   (no gate between dev and prod in this step -- see that repo's own workflow
+   comments). The base image's commit must be at or after `agent-comms-mcp` commit
+   `5e9a375` (`AGENT_TOKEN_VERIFIERS`) or the dispatch fails closed (TECH-5689).
+3. Open a Terraform PR against `redesignhealth/rh-data-platform` bumping the pinned
+   image tag/floor SHA in `infrastructure/environments/{dev,prod}/reclaw_comms.tf`'s
+   `tfvars` (mirroring PR #8407's pattern for that same file). Get it through CI/Argus.
+4. Merge -- `dev`'s Terraform apply runs automatically on push to `main`. **Prod's
+   apply does not** -- it's `workflow_dispatch`-only with `dry_run=false`, run manually.
+
+Full step-by-step walkthrough, including why deploying the plain base image alone
+already changes live message-holding behavior (before any of the wiring above lands):
+`agent-comms-approvals`' [docs/TECH-5389-ROLLOUT-RUNBOOK.md](https://github.com/redesignhealth/agent-comms-approvals/blob/main/docs/TECH-5389-ROLLOUT-RUNBOOK.md)
+(written for the initial TECH-5389 rollout specifically -- re-verify its "current
+state" table before trusting it, it's an explicit point-in-time snapshot, not a live
+dashboard -- but §2-§5's mechanics are the general, still-current pattern for any
+future change here too).
 
 **Local / self-hosted (Docker Compose):**
 
