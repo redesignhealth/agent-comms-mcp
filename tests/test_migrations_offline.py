@@ -198,3 +198,20 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
         "CREATE INDEX IF NOT EXISTS idx_messages_conversation_id_free_text "
         "ON messages (conversation_id) WHERE type IN ('note', 'instruction_share')" in result.stdout
     )
+    # d5c8f1a2b4e7 (TECH-5822 follow-up): accepted_types opt-out default --
+    # new-row server default, and the targeted backfill of pre-existing rows
+    # still at e1db7c2e6b70's frozen old-default 12-type set.
+    assert (
+        "ALTER TABLE public.agents ALTER COLUMN accepted_types SET DEFAULT '{}'::text[]"
+        in result.stdout
+    )
+    assert (
+        "UPDATE public.agents SET accepted_types = ARRAY[]::text[], updated_at = now() "
+        "WHERE accepted_types <@ ARRAY['availability_request', 'availability_response', "
+        "'confirm', 'counter_proposal', 'decline', 'needs_clarification', 'note', "
+        "'task_assign', 'task_cancel', 'task_complete', 'task_decline', 'task_report']::text[] "
+        "AND accepted_types @> ARRAY['availability_request', 'availability_response', "
+        "'confirm', 'counter_proposal', 'decline', 'needs_clarification', 'note', "
+        "'task_assign', 'task_cancel', 'task_complete', 'task_decline', 'task_report']::text[];"
+        in result.stdout
+    )

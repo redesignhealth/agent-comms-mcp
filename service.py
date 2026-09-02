@@ -1260,8 +1260,8 @@ def _agent_key_from_sub(sub: str, base_sub: str) -> str | None:
 
 
 def _validate_display_name_and_accepted_types(
-    display_name: str, accepted_types: list[str]
-) -> tuple[str, list[str]]:
+    display_name: str, accepted_types: list[str] | None
+) -> tuple[str, list[str] | None]:
     """Shared input validation for ``display_name``/``accepted_types``,
     factored out of ``register_agent`` so ``admin_register_agent`` (the
     on-behalf-of path) enforces the identical rules rather than a
@@ -1272,16 +1272,47 @@ def _validate_display_name_and_accepted_types(
     docstring for the full validation-order rationale (cap checks run
     BEFORE computing ``unknown_types``, so an over-sized/over-long input
     can never get echoed back verbatim in the error message).
+
+    Three distinct shapes now (TECH-5822 follow-up: opt-out
+    accepted_types), not two -- this is the one place all three are
+    resolved, so ``register_agent``/``admin_register_agent`` never have to
+    duplicate this distinction:
+
+    - ``None`` (the caller omitted the parameter entirely): passed straight
+      through as ``None``, with NO validation performed at all. This is
+      not "accept everything" by itself -- it means "no change requested",
+      and it is ``register_agent``'s job (not this function's) to resolve
+      that into either "use the accept-everything default" (first
+      registration) or "leave the existing row's accepted_types alone"
+      (re-registration). Collapsing ``None`` into ``[]`` here would erase
+      that distinction before the caller who actually needs it ever sees it.
+    - ``[]`` (explicitly passed empty): the opt-out "accept every message
+      type" sentinel itself -- returned as-is, no per-entry/unknown-type
+      checks (there is nothing to check).
+    - non-empty list: goes through the full count/length/known-type
+      validation and is narrowed to that explicit, restricting set,
+      exactly as before this follow-up.
+
+    See ``_enforce_message_type_accepted`` for the corresponding
+    enforcement-side change, and this module's own docstring / DESIGN.md's
+    "Capability gate: accepted_types" section for why empty-list-means-
+    everything (rather than a wildcard string literal like ``"*"``) was
+    chosen: it requires no addition to ``MESSAGE_TYPES``' vocabulary, needs
+    no carve-out in the unknown-types check below, and automatically
+    covers any FUTURE message type with zero code change here when one
+    ships.
     """
     display_name = display_name.strip()
     if not display_name:
         raise ValueError("display_name must be non-empty")
     if len(display_name) > MAX_DISPLAY_NAME_LENGTH:
         raise ValueError(f"display_name exceeds {MAX_DISPLAY_NAME_LENGTH} characters")
+    if accepted_types is None:
+        return display_name, None
     if len(accepted_types) > MAX_ACCEPTED_TYPES:
         raise ValueError(f"accepted_types exceeds {MAX_ACCEPTED_TYPES} entries")
     if not accepted_types:
-        raise ValueError("accepted_types must be non-empty")
+        return display_name, []
     if any(len(t) > MAX_ACCEPTED_TYPE_LENGTH for t in accepted_types):
         raise ValueError(
             f"accepted_types entries must not exceed {MAX_ACCEPTED_TYPE_LENGTH} characters"
@@ -1289,7 +1320,7 @@ def _validate_display_name_and_accepted_types(
     unknown_types = sorted(set(accepted_types) - MESSAGE_TYPES)
     if unknown_types:
         raise UnknownConversationTypeError(
-            "accepted_types must be a non-empty subset of "
+            "accepted_types must be a subset of "
             f"{sorted(MESSAGE_TYPES)} (got unknown: {unknown_types})"
         )
     normalized_types = sorted(set(accepted_types))
@@ -1335,7 +1366,7 @@ async def admin_register_agent(
     owner_sub: str,
     owner_email: str,
     display_name: str,
-    accepted_types: list[str],
+    accepted_types: list[str] | None,
     is_shared: bool = False,
     min_schema_version: int = 1,
     max_schema_version: int = 1,
@@ -1512,6 +1543,13 @@ async def admin_register_agent(
     display_name, normalized_types = _validate_display_name_and_accepted_types(
         display_name, accepted_types
     )
+    # admin_register_agent has no re-registration path (AgentAlreadyRegisteredError
+    # below denies that outright) -- every call here is a first registration,
+    # so None ("no change requested") resolves the same way it does for
+    # register_agent's OWN first-registration branch: the accept-everything
+    # default, never "leave unset" (there is no existing row to leave alone).
+    if normalized_types is None:
+        normalized_types = []
 
     if not admin_authorized:
         await _deny(
@@ -1691,7 +1729,7 @@ async def register_agent(
     owner_sub: str,
     owner_email: str,
     display_name: str,
-    accepted_types: list[str],
+    accepted_types: list[str] | None,
     min_schema_version: int = 1,
     max_schema_version: int = 1,
     is_shared: bool = False,
@@ -1766,20 +1804,46 @@ async def register_agent(
     has already confirmed came from a trusted, registry-backed verifier,
     never from this function's own untrusted-by-default parameters.
 
+    ``accepted_types`` (TECH-5822 follow-up) now has three distinct
+    meanings, resolved by ``_validate_display_name_and_accepted_types``
+    and this function together -- security-relevant, so read carefully:
+
+    - ``[]`` (explicitly passed empty): the opt-out "accept every message
+      type, including any added in the future" sentinel. Applies on BOTH
+      first registration and re-registration -- a caller that explicitly
+      wants to widen an existing narrower agent back to accept-everything
+      passes this.
+    - a non-empty list: an explicit, deliberate restriction to exactly
+      that set. Applies on both first registration and re-registration,
+      same as before this follow-up.
+    - ``None`` (the parameter omitted entirely): the accept-everything
+      default on FIRST registration (equivalent to ``[]`` there) -- but on
+      RE-registration, ``None`` leaves the existing row's ``accepted_types``
+      COMPLETELY UNCHANGED rather than resetting it. This is deliberately
+      NOT the same "omitting resets to the default" posture
+      ``min_schema_version``/``max_schema_version`` use below: those two
+      have no capability-restriction meaning, so resetting them to the
+      default on every omitted call is harmless, but silently resetting
+      an agent's deliberately-narrowed ``accepted_types`` to
+      accept-everything just because a later re-registration call omitted
+      the parameter would be a real, silent capability widening for that
+      agent -- not merely a convenience default. A caller that wants to
+      preserve its current declared set on a routine re-registration
+      (e.g. a startup health-check re-register call) should omit the
+      parameter; a caller that wants to actually change it must pass
+      either an explicit non-empty list or an explicit ``[]``.
+
     Raises ``ValueError`` (not ``AccessDeniedError``) for malformed input --
     this is a data-validation failure, not an authorization decision (the
     caller has not claimed a resource yet). In validation order: empty ``sub``;
     empty or over-length (``schemas.MAX_DISPLAY_NAME_LENGTH``) ``display_name``;
-    empty ``accepted_types``; over-count (``schemas.MAX_ACCEPTED_TYPES``)
-    ``accepted_types``; or any entry over-length
-    (``schemas.MAX_ACCEPTED_TYPE_LENGTH``) within ``accepted_types``. NOTE: an
-    empty ``accepted_types`` previously raised ``UnknownConversationTypeError``
-    with an empty "got unknown" list; it now raises this plain ``ValueError``
-    instead (a deliberate breaking change to the ToolError shape for that one
-    input -- there is no unknown value to usefully name for an empty list).
-    An ``accepted_types`` containing a value outside ``MESSAGE_TYPES``
-    instead raises ``UnknownConversationTypeError`` (exceptions.py) --
-    specific and client-safe by design, unlike the cases above.
+    over-count (``schemas.MAX_ACCEPTED_TYPES``) ``accepted_types``; or (for a
+    non-empty ``accepted_types``) any entry over-length
+    (``schemas.MAX_ACCEPTED_TYPE_LENGTH``). An ``accepted_types`` containing a
+    value outside ``MESSAGE_TYPES`` raises ``UnknownConversationTypeError``
+    (exceptions.py) -- specific and client-safe by design, unlike the cases
+    above; this check (like the per-entry length check) is skipped entirely
+    for an empty list, since there is nothing to check.
 
     ``min_schema_version``/``max_schema_version`` (both default
     to ``1``, today's only version) declare the wire-schema version range
@@ -1933,12 +1997,18 @@ async def register_agent(
             detail={"display_name": display_name},
         )
     if existing is None:
+        # First registration: None ("omitted") resolves to the
+        # accept-everything default here -- there is no existing row's
+        # accepted_types to preserve, so "no change requested" and "use
+        # the default" are the same thing (see this function's own
+        # docstring for why that equivalence does NOT hold on
+        # re-registration, below).
         agent = Agent(
             sub=sub,
             owner_sub=owner_sub,
             owner_email=owner_email,
             display_name=display_name,
-            accepted_types=normalized_types,
+            accepted_types=normalized_types if normalized_types is not None else [],
             status="active",
             is_shared=is_shared,
             bound_at=now,
@@ -2011,7 +2081,13 @@ async def register_agent(
         # caller-supplied, unverified claim this comment is about.
         agent.owner_email = owner_email
         agent.display_name = display_name
-        agent.accepted_types = normalized_types
+        # Re-registration: unlike every other field here, `None` ("omitted")
+        # is NOT resolved to a default -- it leaves the existing row's
+        # accepted_types untouched (security-relevant: see this function's
+        # docstring). Only an explicit `[]` (accept-everything) or explicit
+        # non-empty list (a deliberate restriction) overwrites it.
+        if normalized_types is not None:
+            agent.accepted_types = normalized_types
         agent.status = "active"
         agent.bound_at = now
         agent.min_schema_version = min_schema_version
@@ -3856,6 +3932,13 @@ async def _enforce_message_type_accepted(
     (each of ``other_agents`` individually), not aggregated, since
     ``accepted_types`` is a per-agent fact, not a per-owner one.
 
+    An empty ``accepted_types`` list is the opt-out "accept everything"
+    sentinel (TECH-5822 follow-up), not "accept nothing" — a recipient
+    with an empty list never fails this check, for any ``message_type``,
+    including one that doesn't exist yet in ``schemas.MESSAGE_TYPES`` at
+    the time this recipient registered. A non-empty list still restricts
+    to exactly that explicit set, same as before.
+
     Takes already-resolved ``(agent_id, accepted_types)`` pairs rather than
     IDs to look up itself: every caller already has this data from a query
     that's fail-closed by construction (``_resolve_targets`` for
@@ -3875,7 +3958,7 @@ async def _enforce_message_type_accepted(
     not leaking a target's declared state to the sender.
     """
     for _agent_id, accepted in sorted(other_agents, key=lambda pair: str(pair[0])):
-        if message_type not in accepted:
+        if accepted and message_type not in accepted:
             await _deny(
                 session,
                 actor_sub=actor_sub,

@@ -480,7 +480,7 @@ class TestRegister:
         for why this is deliberately not folded into the uniform-denial
         posture used for authorization failures."""
         token = _token("agent-probes-valid-types")
-        with pytest.raises(ToolError, match=r"accepted_types must be a non-empty subset of"):
+        with pytest.raises(ToolError, match=r"accepted_types must be a subset of"):
             await _call(
                 main,
                 test_session_factory,
@@ -489,24 +489,34 @@ class TestRegister:
                 {"display_name": "Prober", "accepted_types": ["__probe_invalid_type__"]},
             )
 
-    async def test_register_empty_accepted_types_generic_tool_error(
+    async def test_register_empty_accepted_types_is_accept_everything_sentinel(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
         """Boundary-level counterpart to
-        ``test_service.test_empty_accepted_types_raises_plain_value_error``:
-        an empty ``accepted_types`` list is a bare ``ValueError`` at the
-        service layer, which ``_map_service_errors`` maps to the generic
-        ``invalid_request`` ``ToolError`` shape (not the specific
-        ``UnknownConversationTypeError`` message) at the MCP boundary."""
+        ``test_service.test_empty_accepted_types_is_accept_everything_sentinel``:
+        an empty (or omitted) ``accepted_types`` is the opt-out "accept
+        everything" sentinel (TECH-5822 follow-up), not a validation
+        failure -- both shapes must round-trip through the MCP tool
+        boundary as an empty list, not raise."""
         token = _token("agent-empty-types-boundary")
-        with pytest.raises(ToolError, match="invalid_request"):
-            await _call(
-                main,
-                test_session_factory,
-                token,
-                "comms_register",
-                {"display_name": "Empty Types", "accepted_types": []},
-            )
+        result = await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {"display_name": "Empty Types", "accepted_types": []},
+        )
+        assert result["accepted_types"] == []
+
+        token2 = _token("agent-omitted-types-boundary")
+        result2 = await _call(
+            main,
+            test_session_factory,
+            token2,
+            "comms_register",
+            {"display_name": "Omitted Types"},
+        )
+        assert result2["accepted_types"] == []
 
     async def test_register_over_count_accepted_types_generic_tool_error(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
