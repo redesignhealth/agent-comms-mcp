@@ -1412,20 +1412,19 @@ async def inbox(
       (only ``comms_get_conversation`` does), so without this filter your
       own just-sent message would echo back as "unread" on your very next
       ``comms_inbox`` call even though there's nothing new for you to act
-      on. Pass ``True`` to see your own messages counted/shown again
-      (this tool's original behavior).
+      on. Pass ``True`` (with ``include_read`` left at its default
+      ``False``) to restore this tool's original behavior exactly.
     - ``include_read`` (default ``False``): only conversations with
       qualifying unread messages (per ``include_own_messages`` above) are
       returned. Pass ``True`` to also include active conversations with
       no qualifying unread messages -- ``unread_count`` may be ``0`` for
       those, and ``latest_message`` falls back to the conversation's true
       latest message (even if it's already read or self-authored) when
-      there's no qualifying message to show instead.
-
-    Passing ``include_own_messages=True`` together with
-    ``include_read=True`` reproduces this tool's original, unfiltered
-    behavior exactly -- useful for a caller that wants everything,
-    including what it already knows about.
+      there's no qualifying message to show instead. This surfaces
+      conversations the original tool never returned, so combining it
+      with ``include_own_messages=True`` is a strict SUPERSET of the
+      original behavior, not a reproduction of it -- for that, use
+      ``include_own_messages=True`` alone.
 
     **No cursor/pagination for this tool**: if either ``*_has_more`` flag
     is ``True``, there is no way to page through the remainder from

@@ -6949,15 +6949,22 @@ class TestInbox:
         assert entry["conversation_id"] == str(conversation.id)
         assert entry["unread_count"] == 0
         assert entry["latest_message"]["sender_sub"] == peer.sub
+        # total_count must reflect the include_read=True-widened set too --
+        # not just the default (unread-only) count asserted above.
+        assert read_result["total_count"] == 1
 
-    async def test_both_flags_reproduce_original_behavior(self, session: AsyncSession) -> None:
-        """include_own_messages=True + include_read=True together must
-        reproduce this tool's pre-filter contract: every active
-        conversation with any message ahead of the caller's cursor
-        (any sender) counts as unread, and an already-fully-read
-        conversation with no unread messages at all (any sender) is
-        still surfaced with unread_count=0 -- the union of what the two
-        flags each unlock individually."""
+    async def test_both_flags_least_filtered_mode(self, session: AsyncSession) -> None:
+        """include_own_messages=True + include_read=True together is the
+        LEAST-filtered mode -- a strict superset of this tool's original
+        (pre-filter) behavior, not a reproduction of it: every active
+        conversation with any message ahead of the caller's cursor (any
+        sender) counts as unread same as originally, but an
+        already-fully-read conversation with no unread messages at all
+        (any sender) is ALSO surfaced here with unread_count=0 -- something
+        the original tool never returned. (The faithful reproduction of
+        the original is include_own_messages=True with include_read left
+        at its default False -- see test_own_message_excluded_from_unread_by_default's
+        `with_own` case.)"""
         agent = await _register(session, "inbox-both-flags-1")
         peer = await _register(session, "inbox-both-flags-peer-1")
         read_peer = await _register(session, "inbox-both-flags-read-peer-1")

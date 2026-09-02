@@ -5464,8 +5464,15 @@ async def inbox(
       message (even a self-authored or already-read one) when there is no
       qualifying unread message to show instead.
 
-    Passing both ``include_own_messages=True`` and ``include_read=True``
-    reproduces this tool's original (pre-filter) behavior exactly.
+    ``include_own_messages=True`` with ``include_read=False`` (the default)
+    is the faithful reproduction of this tool's original (pre-filter)
+    behavior: the original unconditionally required
+    ``max(seq) > last_read_seq`` (any sender), which is exactly what
+    ``include_own_messages=True`` alone restores. Setting
+    ``include_read=True`` as well is NOT equivalent to the original --
+    it additionally surfaces already-fully-read conversations the
+    original never returned, making both-``True`` a strict superset of
+    the original behavior rather than identical to it.
 
     Explicit empty state: always returns the same keys, even when both
     lists are empty, so a tools layer can render "nothing needs your
