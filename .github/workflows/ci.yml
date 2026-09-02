@@ -63,15 +63,20 @@ jobs:
         # file moving out of `providers/`, or the pyproject.toml
         # package-data stanza being dropped) before it reaches PyPI.
         run: |
+          rm -rf dist/
           uv build --wheel
-          python -c "
+          uv run python -c "
           import glob, zipfile
-          whl = glob.glob('dist/*.whl')[0]
+          wheels = glob.glob('dist/*.whl')
+          if len(wheels) != 1:
+              raise RuntimeError(f'expected exactly one wheel in dist/, found {wheels}')
+          whl = wheels[0]
           names = zipfile.ZipFile(whl).namelist()
-          assert any('instruction_registry.json' in n for n in names), (
-              f'instruction_registry.json missing from wheel {whl}: {names}'
-          )
-          print(f'OK: instruction_registry.json present in {whl}')
+          if 'providers/instruction_registry.json' not in names:
+              raise RuntimeError(
+                  f'providers/instruction_registry.json missing from wheel {whl}: {names}'
+              )
+          print(f'OK: providers/instruction_registry.json present in {whl}')
           "
 
   test:

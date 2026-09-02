@@ -637,11 +637,32 @@ class TestInstructionShareV1:
             "https://safe.example.com\r\njavascript:alert(1)",
             # Argus round 3 SUGGESTION: NUL-byte host-truncation smuggling.
             "https://safe.example.com\x00.evil.com/path",
+            # Argus round 4 SUGGESTION: tab is silently stripped by
+            # urllib.parse (WHATWG behavior) -- same host-confusion class
+            # as the NUL case above, now closed by the broader
+            # [^\x00-\x20\x7f]+ exclusion rather than enumerating \r\n\x00
+            # individually.
+            "https://safe.example.com\t.evil.com/path",
+            "https://safe.example.com\x0b.evil.com/path",
         ],
     )
     def test_rejects_non_https_link_schemes(self, link: str) -> None:
         with pytest.raises(ValidationError):
             InstructionShareV1.model_validate({"kind": "setup_skill_via_link", "link": link})
+
+    def test_rejects_well_formed_url_with_trailing_newline(self) -> None:
+        # Argus round 4 SUGGESTION: every other rejection case above trips
+        # the [^\x00-\x20\x7f] character-class exclusion before the $
+        # anchor is ever reached, so the $ anchor's own contribution was
+        # never independently verified. An otherwise well-formed URL with
+        # ONLY a trailing newline appended isolates it: the trailing \n
+        # itself is excluded by the char class, but a regex engine whose
+        # `$` matched just before a trailing newline (Python's `re`
+        # semantics, not pydantic-core's) would incorrectly accept this.
+        with pytest.raises(ValidationError):
+            InstructionShareV1.model_validate(
+                {"kind": "setup_skill_via_link", "link": "https://example.com/path\n"}
+            )
 
 
 class TestInstructionKindPartitionGuard:

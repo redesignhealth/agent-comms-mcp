@@ -377,30 +377,41 @@ class InstructionShareV1(_StrictModel):
     # https:// only -- a javascript:/data:/file:// value would otherwise
     # pass schema validation and be stored/forwarded verbatim (XSS/SSRF
     # surface for any consumer that renders or fetches it downstream).
-    # Argus round 2, TECH-5822 BLOCKING: r"^https://" alone had no end
-    # anchor -- pydantic-core's Field(pattern=...) uses search semantics,
-    # but `^` was already anchoring the start correctly; the bug was
-    # specifically the missing `$`, which let
-    # "https://safe.example.com\njavascript:alert(1)" pass (still starts
-    # with https://, and nothing constrained what followed) while storing
-    # an embedded javascript: payload verbatim after a newline, defeating
-    # the whole point of this restriction for any consumer that splits on
-    # lines. [^\r\n]+ excludes embedded line terminators, and $ anchors to
-    # true end-of-string here: pydantic-core's regex engine (Rust's `regex`
-    # crate, not Python's `re`) has no "also matches just before a trailing
-    # newline" special case for `$` outside `(?m)` mode -- verified
-    # directly (a trailing "\n" after the URL is correctly rejected) --
-    # so `$` alone is sufficient and `\Z` (a Python re-only escape) is
-    # neither needed nor valid in this engine.
     #
-    # Argus round 3 SUGGESTION: also exclude NUL (\x00) -- RFC 3986-illegal
-    # in a URL, and some C-backed HTTP clients truncate at it while
-    # Python's urllib.parse does not, so a crafted
-    # "https://allowlisted.example.com\x00.evil.com/path" could pass this
-    # validator and a prefix-style allowlist check downstream while a
-    # truncating consumer resolves a different effective host.
+    # Current pattern excludes every C0 control character and space
+    # (\x00-\x20) plus DEL (\x7f), and anchors both ends -- history below,
+    # kept because each round closed a distinct, concretely-exploitable
+    # class rather than being pure paranoia:
+    # - round 2 (BLOCKING): the original r"^https://" had no end anchor --
+    #   pydantic-core's Field(pattern=...) uses search semantics, but `^`
+    #   was already anchoring the start correctly; the bug was specifically
+    #   the missing `$`, which let
+    #   "https://safe.example.com\njavascript:alert(1)" pass (still starts
+    #   with https://, nothing constrained what followed) while storing an
+    #   embedded javascript: payload verbatim after a newline. `$` anchors
+    #   to true end-of-string here: pydantic-core's regex engine (Rust's
+    #   `regex` crate, not Python's `re`) has no "also matches just before
+    #   a trailing newline" special case for `$` outside `(?m)` mode --
+    #   verified directly -- so `$` alone is sufficient and `\Z` (a Python
+    #   re-only escape) is neither needed nor valid in this engine.
+    # - round 3: NUL (\x00) -- RFC 3986-illegal in a URL, and some
+    #   C-backed HTTP clients truncate at it while Python's urllib.parse
+    #   does not, so a crafted
+    #   "https://allowlisted.example.com\x00.evil.com/path" could pass a
+    #   prefix-style allowlist check downstream while a truncating
+    #   consumer resolves a different effective host.
+    # - round 4: broadened from enumerating \r\n\x00 individually to the
+    #   full \x00-\x20 (all C0 controls, tab, space) + \x7f (DEL) range in
+    #   one shot -- Python's urllib.parse silently strips \t (WHATWG
+    #   behavior), so the same host-confusion attack round 3 closed for
+    #   NUL applied equally to tab and was previously still open.
+    # Deliberately NOT extended to non-ASCII confusables (e.g. U+2028/
+    # U+2029 JS line separators): those matter for a URL rendered into a
+    # JS/browser context, which no consumer of this field does today --
+    # tracked as a documented, deferred concern rather than chased further
+    # here (TECH-5829).
     link: str | None = Field(
-        default=None, min_length=1, max_length=2048, pattern=r"^https://[^\r\n\x00]+$"
+        default=None, min_length=1, max_length=2048, pattern=r"^https://[^\x00-\x20\x7f]+$"
     )
 
     @model_validator(mode="after")

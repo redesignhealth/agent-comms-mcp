@@ -624,7 +624,7 @@ class TestInstructionRegistryDriftGuard:
         # branch specifically -- key-presence alone wouldn't catch this.
         raw = {kind: self._entry() for kind in schemas.DOC_BACKED_INSTRUCTION_KINDS}
         bad_kind = next(iter(schemas.DOC_BACKED_INSTRUCTION_KINDS))
-        raw[bad_kind] = {"text": None, "sha256": "0" * 64}
+        raw[bad_kind] = {"text": 42, "sha256": "0" * 64}
         with pytest.raises(RuntimeError, match="malformed"):
             plugins._load_instruction_registry_hashes(raw)
 

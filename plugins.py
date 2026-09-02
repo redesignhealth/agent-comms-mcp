@@ -42,6 +42,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from importlib.resources import files
+from importlib.resources.abc import Traversable
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
 import httpx
@@ -117,7 +118,7 @@ BARRIER_SENSITIVE_TYPES: frozenset[str] = frozenset({"note", "instruction_share"
 # not a live issue today: agent-comms-approvals vendors its own copy of the
 # registry rather than importing this constant (see that repo's
 # rh_comms_plugins/instruction_registry.py module docstring).
-INSTRUCTION_REGISTRY_PATH = files("providers").joinpath("instruction_registry.json")
+INSTRUCTION_REGISTRY_PATH: Traversable = files("providers").joinpath("instruction_registry.json")
 
 
 def normalize_instruction_text(text: str) -> str:

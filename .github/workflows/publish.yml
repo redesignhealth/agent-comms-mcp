@@ -10,8 +10,37 @@ jobs:
     environment: pypi
     permissions:
       id-token: write
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v4
+
+      - name: Verify CI passed for this SHA
+        # Requires a successful push-triggered CI run on the exact commit being published.
+        # Uses the workflow filename (ci.yml) rather than the display name to avoid
+        # silently breaking if the workflow's `name:` field is ever renamed.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          GH_SHA: ${{ github.sha }}
+        run: |
+          count=$(gh run list \
+            --repo "$GH_REPO" \
+            --commit "$GH_SHA" \
+            --workflow ci.yml \
+            --status success \
+            --event push \
+            --branch main \
+            --limit 1 \
+            --json databaseId \
+            --jq 'length')
+          if [ "$count" -eq 0 ]; then
+            echo "ERROR: No successful push-triggered CI run found for $GH_SHA — refusing to publish." >&2
+            echo "Ensure the commit is merged to main and CI has passed before creating a release." >&2
+            exit 1
+          fi
+          echo "CI check passed for $GH_SHA."
+
       - uses: astral-sh/setup-uv@v5
       - run: uv build
       - uses: pypa/gh-action-pypi-publish@release/v1
