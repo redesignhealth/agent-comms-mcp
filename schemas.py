@@ -377,21 +377,30 @@ class InstructionShareV1(_StrictModel):
     # https:// only -- a javascript:/data:/file:// value would otherwise
     # pass schema validation and be stored/forwarded verbatim (XSS/SSRF
     # surface for any consumer that renders or fetches it downstream).
-    # Argus round 2, TECH-5822 BLOCKING: r"^https://" alone has no end
-    # anchor, and pattern matching here searches for the regex anywhere in
-    # the string -- "https://safe.example.com\njavascript:alert(1)" would
-    # pass (the string STARTS with https://) while storing an embedded
-    # javascript: payload verbatim after a newline, defeating the whole
-    # point of this restriction for any consumer that splits on lines.
-    # [^\r\n]+ excludes embedded line terminators, and $ anchors to true
-    # end-of-string here: pydantic-core's regex engine (Rust's `regex`
+    # Argus round 2, TECH-5822 BLOCKING: r"^https://" alone had no end
+    # anchor -- pydantic-core's Field(pattern=...) uses search semantics,
+    # but `^` was already anchoring the start correctly; the bug was
+    # specifically the missing `$`, which let
+    # "https://safe.example.com\njavascript:alert(1)" pass (still starts
+    # with https://, and nothing constrained what followed) while storing
+    # an embedded javascript: payload verbatim after a newline, defeating
+    # the whole point of this restriction for any consumer that splits on
+    # lines. [^\r\n]+ excludes embedded line terminators, and $ anchors to
+    # true end-of-string here: pydantic-core's regex engine (Rust's `regex`
     # crate, not Python's `re`) has no "also matches just before a trailing
     # newline" special case for `$` outside `(?m)` mode -- verified
     # directly (a trailing "\n" after the URL is correctly rejected) --
     # so `$` alone is sufficient and `\Z` (a Python re-only escape) is
     # neither needed nor valid in this engine.
+    #
+    # Argus round 3 SUGGESTION: also exclude NUL (\x00) -- RFC 3986-illegal
+    # in a URL, and some C-backed HTTP clients truncate at it while
+    # Python's urllib.parse does not, so a crafted
+    # "https://allowlisted.example.com\x00.evil.com/path" could pass this
+    # validator and a prefix-style allowlist check downstream while a
+    # truncating consumer resolves a different effective host.
     link: str | None = Field(
-        default=None, min_length=1, max_length=2048, pattern=r"^https://[^\r\n]+$"
+        default=None, min_length=1, max_length=2048, pattern=r"^https://[^\r\n\x00]+$"
     )
 
     @model_validator(mode="after")

@@ -104,6 +104,19 @@ BARRIER_SENSITIVE_TYPES: frozenset[str] = frozenset({"note", "instruction_share"
 # installed from a wheel, run from a Docker `COPY . .` checkout, or run
 # in-place from a git clone -- unlike `Path(__file__)`, which only ever
 # worked for the last two.
+#
+# Argus round 3 SUGGESTION: this is a public export (see __all__) whose
+# type changed from `pathlib.Path` (round 1) to
+# `importlib.resources.abc.Traversable` (round 2) -- Traversable supports
+# only `.open()`/`.read_text()`/`.read_bytes()`/`.is_file()`/`.joinpath()`/
+# `.name`, NOT `.exists()`, `.parent`, `os.fspath()`, or filesystem-path
+# `str()`. Nothing in THIS repo calls those (only `.open()`, in
+# `_read_instruction_registry` below), but any downstream consumer (e.g. a
+# future agent-comms-approvals import) that assumes `Path` semantics will
+# get an `AttributeError` at runtime with no import-time warning. Confirmed
+# not a live issue today: agent-comms-approvals vendors its own copy of the
+# registry rather than importing this constant (see that repo's
+# rh_comms_plugins/instruction_registry.py module docstring).
 INSTRUCTION_REGISTRY_PATH = files("providers").joinpath("instruction_registry.json")
 
 

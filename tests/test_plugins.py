@@ -610,6 +610,24 @@ class TestInstructionRegistryDriftGuard:
         with pytest.raises(RuntimeError, match="malformed"):
             plugins._load_instruction_registry_hashes(raw)
 
+    def test_loader_raises_on_malformed_entry_non_string_sha256(self) -> None:
+        # Argus round 3 SUGGESTION: exercise the isinstance(sha256, str)
+        # branch specifically -- key-presence alone wouldn't catch this.
+        raw = {kind: self._entry() for kind in schemas.DOC_BACKED_INSTRUCTION_KINDS}
+        bad_kind = next(iter(schemas.DOC_BACKED_INSTRUCTION_KINDS))
+        raw[bad_kind] = {"text": "foo", "sha256": 42}
+        with pytest.raises(RuntimeError, match="malformed"):
+            plugins._load_instruction_registry_hashes(raw)
+
+    def test_loader_raises_on_malformed_entry_non_string_text(self) -> None:
+        # Argus round 3 SUGGESTION: exercise the isinstance(text, str)
+        # branch specifically -- key-presence alone wouldn't catch this.
+        raw = {kind: self._entry() for kind in schemas.DOC_BACKED_INSTRUCTION_KINDS}
+        bad_kind = next(iter(schemas.DOC_BACKED_INSTRUCTION_KINDS))
+        raw[bad_kind] = {"text": None, "sha256": "0" * 64}
+        with pytest.raises(RuntimeError, match="malformed"):
+            plugins._load_instruction_registry_hashes(raw)
+
     def test_loader_raises_on_hash_mismatch(self) -> None:
         # Argus round 1, TECH-5822 BLOCKING: the loader must verify
         # hash(normalize(text)) == stored sha256 at boot, not just trust it.

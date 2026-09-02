@@ -52,6 +52,28 @@ jobs:
       - name: Mypy (strict)
         run: uv run mypy .
 
+      - name: Build wheel and verify package-data is included
+        # Argus round 3, TECH-5822 SUGGESTION: this is the exact regression
+        # class that shipped in round 1 -- instruction_registry.json was
+        # silently dropped from the built wheel (a JSON file sitting next
+        # to plugins.py, a bare py-module, has no setuptools package-data
+        # mechanism), invisible to every other CI job here since neither
+        # Docker (COPY . .) nor pytest (runs against the source tree)
+        # installs from a wheel. Catches a future regression (e.g. the
+        # file moving out of `providers/`, or the pyproject.toml
+        # package-data stanza being dropped) before it reaches PyPI.
+        run: |
+          uv build --wheel
+          python -c "
+          import glob, zipfile
+          whl = glob.glob('dist/*.whl')[0]
+          names = zipfile.ZipFile(whl).namelist()
+          assert any('instruction_registry.json' in n for n in names), (
+              f'instruction_registry.json missing from wheel {whl}: {names}'
+          )
+          print(f'OK: instruction_registry.json present in {whl}')
+          "
+
   test:
     name: Tests
     runs-on: ubuntu-latest

@@ -630,6 +630,13 @@ class TestInstructionShareV1:
             # with https://) while smuggling a javascript: payload after an
             # embedded newline.
             "https://safe.example.com\njavascript:alert(1)",
+            # Argus round 3 SUGGESTION: the CR-alone and CRLF variants of
+            # the same injection -- [^\r\n] excludes both, but only \n was
+            # exercised above.
+            "https://safe.example.com\rjavascript:alert(1)",
+            "https://safe.example.com\r\njavascript:alert(1)",
+            # Argus round 3 SUGGESTION: NUL-byte host-truncation smuggling.
+            "https://safe.example.com\x00.evil.com/path",
         ],
     )
     def test_rejects_non_https_link_schemes(self, link: str) -> None:
