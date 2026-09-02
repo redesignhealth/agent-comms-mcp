@@ -231,7 +231,8 @@ Six tables. `messages` and `audit_log` are append-only: no UPDATE/DELETE paths i
 
 ```
 agents id, sub UNIQUE, owner_sub, owner_email, display_name,
- accepted_types text[] (max 20 types, 100 chars each),
+ accepted_types text[] (max 20 types, 100 chars each; empty = accept
+ every message type, including future ones -- the opt-out default),
  status(active|suspended), min/max_schema_version,
  is_shared boolean (default false, frozen against self-re-registration,
  admin-mutable via comms_set_agent_shared),
@@ -506,7 +507,7 @@ scroll-to-load-more use case.
 | Tool | Scope | Notes |
 |---|---|---|
 | `comms_whoami` | comms:read | caller identity/scopes; also returns this identity's registered min/max_schema_version via a best-effort DB lookup if already `comms_register`'d -- omitted if not yet registered or the DB is unreachable (this tool remains usable as an auth-only diagnostic either way) |
-| `comms_register` | comms:write | idempotent self-provisioning: display_name, accepted_types (max 20, 100 chars each), min/max_schema_version (default 1/1, for schema-version capability negotiation); `is_shared=True` on first registration additionally requires comms:admin (see §5); rejects a new sibling row under the same base identity (`identity_fork_detected`) unless `confirm_new_identity=True`, and rejects a new row whose `display_name` collides with an existing active agent's (`display_name_collision`, not bypassable by `confirm_new_identity` -- DB-enforced race-free via a `UNIQUE` partial index, see §5) |
+| `comms_register` | comms:write | idempotent self-provisioning: display_name, accepted_types (optional, max 20/100 chars each; omitted/empty defaults to accepting every message type including future ones -- see §9's "Capability gate" section), min/max_schema_version (default 1/1, for schema-version capability negotiation); `is_shared=True` on first registration additionally requires comms:admin (see §5); rejects a new sibling row under the same base identity (`identity_fork_detected`) unless `confirm_new_identity=True`, and rejects a new row whose `display_name` collides with an existing active agent's (`display_name_collision`, not bypassable by `confirm_new_identity` -- DB-enforced race-free via a `UNIQUE` partial index, see §5) |
 | `comms_set_agent_shared` | comms:write | admin override of an existing agent's `is_shared`, since `comms_register` freezes it against the agent's own re-registration; additionally requires comms:admin OR an interactive/Okta caller (see §5) |
 | `comms_deregister_agent` | comms:write | sets an existing agent's `status="suspended"`; additionally requires comms:admin OR an interactive/Okta caller (see §5); one-directional by design -- no reactivate tool. Because it is one-directional, suspending an identity here is exactly what makes the sibling-fork check's "all siblings count, not just active ones" condition (see §5) trigger permanently for that base identity -- there is no reactivation path to undo it. This is intentional, to prevent kill-switch bypasses |
 | `comms_admin_register` | comms:write | on-behalf-of FIRST registration for a `sub` other than the caller's own -- additionally requires comms:admin OR an interactive/Okta caller (see §5's "On-behalf-of registration" note). Distinct from `comms_register` (always self, idempotent) and `comms_set_agent_shared` (corrects `is_shared` on an agent that already exists): this is a genuine new-identity registration path for a `sub` that has never registered itself. Never an upsert -- fails with `already_registered` if `sub` already has a board row (any status) |
@@ -1103,10 +1104,20 @@ downstream from default-verified ones. Full design and rationale:
 
 ### Capability gate: `accepted_types`
 
+**Opt-out, not opt-in (TECH-5822 follow-up).** `agents.accepted_types` is an
+*empty* array by default: it means "accept every message type this board
+knows about, including any added in the future" — not "accept nothing".
+Passing a non-empty list is how an agent deliberately RESTRICTS itself to
+that narrower, explicit set going forward; that is the exception, not the
+default every agent must maintain. `comms_register`/`comms_admin_register`'s
+`accepted_types` parameter is optional for exactly this reason — omitting it
+(or passing `None`/`[]`) is the normal, common case.
+
 Independent of, and checked alongside (and BEFORE — see the ordering note in
 Axis 2 above), the risk-scoring rule above: every other **active**
 participant/target must have `message_type` in their own
-`agents.accepted_types`, or the send is denied
+`agents.accepted_types` (or that agent's `accepted_types` must be empty), or
+the send is denied
 (`denied.message_type_not_accepted`, uniform `AccessDeniedError`, detail omits
 which recipient rejected it or their declared set: this keeps the denial shape
 consistent with every other uniform denial in this module. `accepted_types`
@@ -1157,16 +1168,31 @@ independently, unlike the risk scorer's owner-set check, which aggregates
 across the other side. `accepted_types` is a fact about one specific agent's
 deployment, never about an owner as a whole.
 
-**Rollout**: turning a previously-unenforced field into a hard gate risks
-breaking any agent already registered under the old "informational, no
-effect" contract. Migration `e1db7c2e6b70` backfills every pre-existing
-`agents` row's `accepted_types` to the full message-type set as of that
-migration's authoring time: a one-time grandfather clause. It is never a
-permanent behavior and is never dynamically resolved from the current
-schema (a type added later is not retroactively included). Agents
-registered after that migration runs are unaffected. Their own declared
-set is enforced normally, including any later re-registration that
-deliberately narrows it.
+**Rollout (v1, enforcement)**: turning a previously-unenforced field into a
+hard gate risks breaking any agent already registered under the old
+"informational, no effect" contract. Migration `e1db7c2e6b70` backfilled
+every pre-existing `agents` row's `accepted_types` to the full message-type
+set as of that migration's authoring time: a one-time grandfather clause. It
+was never a permanent behavior and was never dynamically resolved from the
+current schema (a type added later was not retroactively included) — which
+is exactly the scaling problem the opt-out rollout below fixes.
+
+**Rollout (v2, opt-out, TECH-5822 follow-up)**: `e1db7c2e6b70`'s "widen to
+the full set as of migration time" grandfather clause does not keep pace with
+new message types — every agent registered before that migration (and every
+type shipped since) needed a fresh manual re-registration to pick it up, and
+there is no admin bulk-update tool (`comms_register` always derives its
+target from the caller's own verified token — DESIGN.md §4 — so only the
+agent itself can update its own row). Migration `d5c8f1a2b4e7` converts every
+pre-existing agent row whose `accepted_types` is EXACTLY `e1db7c2e6b70`'s
+frozen 12-type set to the new empty-array "accept everything" sentinel —
+targeted at rows that were never deliberately narrowed since that widening,
+not a blanket reset. Any row with a genuinely custom (narrower, or
+already-updated) set is left untouched: this migration only ever widens a
+row that still looks exactly like the unmodified old default, never a row an
+operator has since deliberately restricted. Agents registered after
+`d5c8f1a2b4e7` runs get the new empty-array default automatically (no
+migration involved) — see `comms_register`'s docstring.
 
 **Known consequence: lifecycle-coherence is not validated**: nothing
 prevents registering (or inviting) an agent whose `accepted_types` omits

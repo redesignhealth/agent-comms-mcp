@@ -472,7 +472,7 @@ async def whoami(agent_key: str | None = None) -> dict[str, Any]:
 @comms_server.tool
 async def register(
     display_name: str,
-    accepted_types: list[str],
+    accepted_types: list[str] | None = None,
     min_schema_version: int = 1,
     max_schema_version: int = 1,
     agent_key: str | None = None,
@@ -487,14 +487,20 @@ async def register(
     Parameters:
 
     - ``display_name``: human-readable label, max 255 chars.
-    - ``accepted_types``: message types this agent will handle. Must be a
-      subset of the 14 known types (see ``schemas.MessageType``):
-      ``availability_request``, ``availability_response``,
-      ``counter_proposal``, ``confirm``, ``decline``,
-      ``needs_clarification``, ``note``, ``instruction_request``,
-      ``instruction_share``, ``task_assign``, ``task_report``,
-      ``task_complete``, ``task_decline``, ``task_cancel``.
-      Each entry capped at 100 chars; list capped at 20 entries.
+    - ``accepted_types``: message types this agent will handle. Optional --
+      omit it (or pass ``None``/``[]``) to accept EVERY message type,
+      including any added to the board in the future, with no need to
+      ever re-register just because a new type shipped. This is the
+      opt-out default: most agents should leave this unset. Pass a
+      non-empty list only to deliberately RESTRICT this agent to that
+      narrower, explicit set -- it must then be a subset of the known
+      types (see ``schemas.MessageType``): ``availability_request``,
+      ``availability_response``, ``counter_proposal``, ``confirm``,
+      ``decline``, ``needs_clarification``, ``note``,
+      ``instruction_request``, ``instruction_share``, ``task_assign``,
+      ``task_report``, ``task_complete``, ``task_decline``,
+      ``task_cancel``. Each entry capped at 100 chars; list capped at 20
+      entries.
     - ``min_schema_version``/``max_schema_version``: the range
       of wire-schema versions this agent's own code can correctly
       interpret. Both default to ``1`` — the only version that exists
@@ -605,12 +611,14 @@ async def register(
     tool, so re-registration must not undo it.
 
     ``accepted_types`` is enforced, not just declarative (DESIGN.md §9's
-    capability gate): a message type omitted here causes any message of
-    that type directed at THIS agent to be denied for the SENDER, not for
-    you — you get no direct feedback when this happens, since the failure
-    surfaces on someone else's call, not yours. Declare every message type
-    your implementation actually handles, not just enough to pass whatever
-    you're testing right now.
+    capability gate): if you DO pass a non-empty, explicit list, a message
+    type omitted from it causes any message of that type directed at THIS
+    agent to be denied for the SENDER, not for you — you get no direct
+    feedback when this happens, since the failure surfaces on someone
+    else's call, not yours. Only restrict yourself to an explicit list if
+    your implementation genuinely cannot handle every other type; leaving
+    it unset (accept-everything) is safe by default and needs no upkeep as
+    new message types ship.
 
     Identity (``owner_sub``, ``owner_email``) derives from verified token
     claims only — never accepted as parameters.
@@ -623,6 +631,10 @@ async def register(
 
     agent_key = _validate_agent_key(agent_key)
     sub = _compose_sub(base_sub, agent_key)
+    # None (the "omitted" default) and [] are the same "accept everything"
+    # opt-out sentinel (TECH-5822 follow-up) -- normalized to [] here so
+    # service.register_agent only ever has one falsy shape to handle.
+    accepted_types = accepted_types or []
 
     # Shared with service.register_agent's own guard
     # (service.validate_schema_version_range) so tightening the rule in one
@@ -785,7 +797,7 @@ async def admin_register(
     owner_sub: str,
     owner_email: str,
     display_name: str,
-    accepted_types: list[str],
+    accepted_types: list[str] | None = None,
     is_shared: bool = False,
     min_schema_version: int = 1,
     max_schema_version: int = 1,
@@ -838,7 +850,9 @@ async def admin_register(
       token-derived equivalents.
     - ``display_name``/``accepted_types``/``min_schema_version``/
       ``max_schema_version``: identical validation and semantics to
-      ``comms_register`` — see that tool's docstring.
+      ``comms_register`` — see that tool's docstring. In particular,
+      ``accepted_types`` is optional and defaults to the "accept every
+      message type" opt-out sentinel when omitted/``None``/``[]``.
     - ``is_shared``: set ``True`` if this agent spans ownership boundaries.
       No separate authorization check on this parameter (unlike
       ``comms_register``'s ``is_shared=True`` gate) — the entire
@@ -872,6 +886,8 @@ async def admin_register(
     token = _require_token()
     actor_sub = _require_identity(token)
     admin_authorized = is_interactive_token(token) or "comms:admin" in scopes_for_token(token)
+    # Same None/[] "accept everything" normalization as comms_register.
+    accepted_types = accepted_types or []
 
     try:
         service.validate_schema_version_range(min_schema_version, max_schema_version)

@@ -299,11 +299,13 @@ mcp: FastMCP[Any] = FastMCP(
         "comms_lookup_agent_by_email finds a board-active agent by owner "
         "email ({'agent': ..., 'found': bool}). comms_get_hold_status polls "
         "the status of a message held for human approval (sender-only). "
-        "accepted_types in comms_register declares which message types an "
-        "agent accepts (e.g. 'task_assign', 'availability_request') and is "
-        "enforced: a message of a type you haven't declared is denied on "
-        "the sender's call, with no direct feedback to you, so declare "
-        "every type you actually handle."
+        "accepted_types in comms_register is optional and defaults to "
+        "accepting every message type, including ones added in the future; "
+        "pass an explicit, non-empty list only to deliberately restrict "
+        "yourself to that narrower set (e.g. ['task_assign', "
+        "'availability_request']). A restricted agent's declared list is "
+        "enforced: a message of a type it hasn't declared is denied on the "
+        "sender's call, with no direct feedback to the recipient."
     ),
     auth=_auth_provider,
 )

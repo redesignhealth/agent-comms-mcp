@@ -1272,6 +1272,21 @@ def _validate_display_name_and_accepted_types(
     docstring for the full validation-order rationale (cap checks run
     BEFORE computing ``unknown_types``, so an over-sized/over-long input
     can never get echoed back verbatim in the error message).
+
+    ``accepted_types == []`` is the opt-out "accept every message type"
+    sentinel (TECH-5822 follow-up: opt-out accepted_types) -- it is no
+    longer rejected as "must be non-empty". An empty list skips every
+    per-entry/unknown-type check below (there is nothing to check) and is
+    returned as-is; a non-empty list still goes through the full
+    count/length/known-type validation and is narrowed to that explicit
+    set, exactly as before. See ``_enforce_message_type_accepted`` for the
+    corresponding enforcement-side change, and this module's own
+    docstring / DESIGN.md's "Capability gate: accepted_types" section for
+    why empty-list-means-everything (rather than a wildcard string
+    literal like ``"*"``) was chosen: it requires no addition to
+    ``MESSAGE_TYPES``' vocabulary, needs no carve-out in the unknown-types
+    check below, and automatically covers any FUTURE message type with
+    zero code change here when one ships.
     """
     display_name = display_name.strip()
     if not display_name:
@@ -1281,7 +1296,7 @@ def _validate_display_name_and_accepted_types(
     if len(accepted_types) > MAX_ACCEPTED_TYPES:
         raise ValueError(f"accepted_types exceeds {MAX_ACCEPTED_TYPES} entries")
     if not accepted_types:
-        raise ValueError("accepted_types must be non-empty")
+        return display_name, []
     if any(len(t) > MAX_ACCEPTED_TYPE_LENGTH for t in accepted_types):
         raise ValueError(
             f"accepted_types entries must not exceed {MAX_ACCEPTED_TYPE_LENGTH} characters"
@@ -1289,7 +1304,7 @@ def _validate_display_name_and_accepted_types(
     unknown_types = sorted(set(accepted_types) - MESSAGE_TYPES)
     if unknown_types:
         raise UnknownConversationTypeError(
-            "accepted_types must be a non-empty subset of "
+            "accepted_types must be a subset of "
             f"{sorted(MESSAGE_TYPES)} (got unknown: {unknown_types})"
         )
     normalized_types = sorted(set(accepted_types))
@@ -1766,20 +1781,22 @@ async def register_agent(
     has already confirmed came from a trusted, registry-backed verifier,
     never from this function's own untrusted-by-default parameters.
 
+    ``accepted_types == []`` is the opt-out "accept every message type,
+    including any added in the future" sentinel (TECH-5822 follow-up) --
+    it is NOT rejected as invalid. Pass a non-empty list only to
+    deliberately restrict this agent to that narrower, explicit set.
+
     Raises ``ValueError`` (not ``AccessDeniedError``) for malformed input --
     this is a data-validation failure, not an authorization decision (the
     caller has not claimed a resource yet). In validation order: empty ``sub``;
     empty or over-length (``schemas.MAX_DISPLAY_NAME_LENGTH``) ``display_name``;
-    empty ``accepted_types``; over-count (``schemas.MAX_ACCEPTED_TYPES``)
-    ``accepted_types``; or any entry over-length
-    (``schemas.MAX_ACCEPTED_TYPE_LENGTH``) within ``accepted_types``. NOTE: an
-    empty ``accepted_types`` previously raised ``UnknownConversationTypeError``
-    with an empty "got unknown" list; it now raises this plain ``ValueError``
-    instead (a deliberate breaking change to the ToolError shape for that one
-    input -- there is no unknown value to usefully name for an empty list).
-    An ``accepted_types`` containing a value outside ``MESSAGE_TYPES``
-    instead raises ``UnknownConversationTypeError`` (exceptions.py) --
-    specific and client-safe by design, unlike the cases above.
+    over-count (``schemas.MAX_ACCEPTED_TYPES``) ``accepted_types``; or (for a
+    non-empty ``accepted_types``) any entry over-length
+    (``schemas.MAX_ACCEPTED_TYPE_LENGTH``). An ``accepted_types`` containing a
+    value outside ``MESSAGE_TYPES`` raises ``UnknownConversationTypeError``
+    (exceptions.py) -- specific and client-safe by design, unlike the cases
+    above; this check (like the per-entry length check) is skipped entirely
+    for an empty list, since there is nothing to check.
 
     ``min_schema_version``/``max_schema_version`` (both default
     to ``1``, today's only version) declare the wire-schema version range
@@ -3856,6 +3873,13 @@ async def _enforce_message_type_accepted(
     (each of ``other_agents`` individually), not aggregated, since
     ``accepted_types`` is a per-agent fact, not a per-owner one.
 
+    An empty ``accepted_types`` list is the opt-out "accept everything"
+    sentinel (TECH-5822 follow-up), not "accept nothing" — a recipient
+    with an empty list never fails this check, for any ``message_type``,
+    including one that doesn't exist yet in ``schemas.MESSAGE_TYPES`` at
+    the time this recipient registered. A non-empty list still restricts
+    to exactly that explicit set, same as before.
+
     Takes already-resolved ``(agent_id, accepted_types)`` pairs rather than
     IDs to look up itself: every caller already has this data from a query
     that's fail-closed by construction (``_resolve_targets`` for
@@ -3875,7 +3899,7 @@ async def _enforce_message_type_accepted(
     not leaking a target's declared state to the sender.
     """
     for _agent_id, accepted in sorted(other_agents, key=lambda pair: str(pair[0])):
-        if message_type not in accepted:
+        if accepted and message_type not in accepted:
             await _deny(
                 session,
                 actor_sub=actor_sub,

@@ -72,6 +72,7 @@ from service import (
     MAX_UNREAD_CONVERSATIONS_PER_INBOX,
     AgentTableOwnershipClient,
     OwnershipClient,
+    _enforce_message_type_accepted,
     accept_invite,
     admin_register_agent,
     decline_invite,
@@ -461,22 +462,18 @@ class TestRegisterAgent:
                 accepted_types=[f"bogus-{i}" for i in range(21)],
             )
 
-    async def test_empty_accepted_types_raises_plain_value_error(
+    async def test_empty_accepted_types_is_accept_everything_sentinel(
         self, session: AsyncSession
     ) -> None:
-        """An empty ``accepted_types`` list is a distinct failure from
-        "contains an unknown type": there is no unknown
-        value to usefully enumerate, so this stays a bare ``ValueError``
-        rather than ``UnknownConversationTypeError`` -- the prior behavior
-        raised the latter with the confusing message
-        ``"... (got unknown: [])"``, naming zero unknown values while still
-        claiming something was unknown."""
-        with pytest.raises(ValueError, match="accepted_types must be non-empty"):
-            await _register(
-                session,
-                "agent-empty-types",
-                accepted_types=[],
-            )
+        """An empty ``accepted_types`` list is the opt-out "accept every
+        message type" sentinel (TECH-5822 follow-up), not a validation
+        failure -- it must persist as an empty list, not raise."""
+        agent = await _register(
+            session,
+            "agent-empty-types",
+            accepted_types=[],
+        )
+        assert agent.accepted_types == []
 
     async def test_oversized_single_accepted_type_entry_rejected(
         self, session: AsyncSession
@@ -5563,6 +5560,91 @@ class TestMessageTypeAcceptedCapability:
                 conversation_id=conversation.id,
                 message_type="confirm",
                 payload=_confirm_payload(),
+            )
+        assert exc_info.value.reason == "denied.message_type_not_accepted"
+
+
+class TestAcceptedTypesOptOutSentinel:
+    """Opt-out accepted_types (TECH-5822 follow-up): an empty
+    ``accepted_types`` is "accept every message type", not "accept
+    nothing" -- both at registration time (schema validation) and at
+    enforcement time (``_enforce_message_type_accepted``)."""
+
+    async def test_recipient_with_empty_accepted_types_receives_every_current_type(
+        self, session: AsyncSession
+    ) -> None:
+        """Generic against ``schemas.MESSAGE_TYPES`` (not a hardcoded
+        list), so this test needs no update when a future type ships --
+        exactly the scaling property the opt-out model is for. Exercises
+        the enforcement gate directly (the same seam every real call site
+        goes through) rather than driving each type's own
+        state-machine/sender-role/payload rules through ``start_conversation``/
+        ``post_message``, which is orthogonal to what this test is checking."""
+        target = await _register(session, "optout-target-empty", accepted_types=[])
+        for message_type in sorted(MESSAGE_TYPES):
+            await _enforce_message_type_accepted(
+                session,
+                actor_sub="optout-sender",
+                sender_agent_id=uuid.uuid4(),
+                conversation_id=None,
+                other_agents=[(target.id, target.accepted_types)],
+                message_type=message_type,
+            )  # does not raise, for every registered type
+
+    async def test_recipient_with_empty_accepted_types_receives_a_hypothetical_future_type(
+        self, session: AsyncSession
+    ) -> None:
+        """The opt-out sentinel is not "every type known today" resolved
+        eagerly at registration -- it is "no restriction at all", so it
+        covers a message type that doesn't exist in ``MESSAGE_TYPES`` yet,
+        exercising the enforcement gate directly (schema validation of a
+        real payload isn't the point of this test)."""
+        sender = await _register(session, "optout-future-sender")
+        target_accepts_all = await _register(session, "optout-target-future", accepted_types=[])
+        target_restricted = await _register(
+            session, "optout-target-narrow", accepted_types=["note"]
+        )
+        await _enforce_message_type_accepted(
+            session,
+            actor_sub=sender.sub,
+            sender_agent_id=sender.id,
+            conversation_id=None,
+            other_agents=[
+                (target_accepts_all.id, target_accepts_all.accepted_types),
+            ],
+            message_type="some_future_message_type_v2",
+        )  # does not raise
+
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await _enforce_message_type_accepted(
+                session,
+                actor_sub=sender.sub,
+                sender_agent_id=sender.id,
+                conversation_id=None,
+                other_agents=[
+                    (target_restricted.id, target_restricted.accepted_types),
+                ],
+                message_type="some_future_message_type_v2",
+            )
+        assert exc_info.value.reason == "denied.message_type_not_accepted"
+
+    async def test_explicit_restriction_still_restricts(self, session: AsyncSession) -> None:
+        """An agent that opts INTO a narrower explicit list is still
+        restricted exactly as before -- the opt-out default doesn't weaken
+        the restriction path for agents that deliberately choose one."""
+        initiator = await _register(session, "optout-restrict-initiator")
+        narrow_target = await _register(
+            session, "optout-restrict-target", accepted_types=["confirm"]
+        )
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await start_conversation(
+                session,
+                actor_sub=initiator.sub,
+                initiator_agent_id=initiator.id,
+                conversation_type="open",
+                target_agent_ids=[narrow_target.id],
+                initial_message=_request_payload(),
+                message_type="availability_request",
             )
         assert exc_info.value.reason == "denied.message_type_not_accepted"
 

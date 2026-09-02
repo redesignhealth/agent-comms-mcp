@@ -227,7 +227,19 @@ class Agent(Base):
     owner_sub: Mapped[str] = mapped_column(Text, nullable=False)
     owner_email: Mapped[str] = mapped_column(Text, nullable=False)
     display_name: Mapped[str] = mapped_column(String(MAX_DISPLAY_NAME_LENGTH), nullable=False)
-    accepted_types: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False)
+    # Opt-out capability declaration (TECH-5822 follow-up): an EMPTY array is
+    # the "accept every message type" sentinel, not "accept nothing" -- it is
+    # the default for a caller that omits accepted_types at registration
+    # (service._validate_display_name_and_accepted_types), and it
+    # automatically covers any message type added to schemas.MESSAGE_TYPES in
+    # the future with no row update needed. A non-empty array is an explicit,
+    # deliberate restriction to exactly that set (service.
+    # _enforce_message_type_accepted). Stays NOT NULL -- the sentinel is an
+    # empty array, never NULL, so no column carries three-valued (NULL vs.
+    # empty vs. populated) ambiguity.
+    accepted_types: Mapped[list[str]] = mapped_column(
+        ARRAY(Text), nullable=False, server_default=text("'{}'")
+    )
     status: Mapped[str] = mapped_column(Text, nullable=False)
     # Wire-schema version range this agent declares it can
     # correctly interpret. Both default to 1 (today's only version) via a
