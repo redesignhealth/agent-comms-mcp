@@ -1381,7 +1381,11 @@ async def get_conversation(
 
 
 @comms_server.tool
-async def inbox(agent_key: str | None = None) -> dict[str, Any]:
+async def inbox(
+    agent_key: str | None = None,
+    include_own_messages: bool = False,
+    include_read: bool = False,
+) -> dict[str, Any]:
     """Return the caller's unread active conversations plus pending invites.
 
     Always returns the same five keys, even when both lists are empty --
@@ -1398,6 +1402,30 @@ async def inbox(agent_key: str | None = None) -> dict[str, Any]:
       beyond that cap.
     - ``total_count``: the TRUE total across both lists, unaffected by
       either cap above (a real count, not a page size).
+
+    **Default filtering (both opt-outable):**
+
+    - ``include_own_messages`` (default ``False``): the caller's own
+      posted messages are excluded when deciding whether a conversation
+      is "unread", from ``unread_count``, and from ``latest_message`` --
+      posting into a conversation doesn't advance your own read cursor
+      (only ``comms_get_conversation`` does), so without this filter your
+      own just-sent message would echo back as "unread" on your very next
+      ``comms_inbox`` call even though there's nothing new for you to act
+      on. Pass ``True`` to see your own messages counted/shown again
+      (this tool's original behavior).
+    - ``include_read`` (default ``False``): only conversations with
+      qualifying unread messages (per ``include_own_messages`` above) are
+      returned. Pass ``True`` to also include active conversations with
+      no qualifying unread messages -- ``unread_count`` may be ``0`` for
+      those, and ``latest_message`` falls back to the conversation's true
+      latest message (even if it's already read or self-authored) when
+      there's no qualifying message to show instead.
+
+    Passing ``include_own_messages=True`` together with
+    ``include_read=True`` reproduces this tool's original, unfiltered
+    behavior exactly -- useful for a caller that wants everything,
+    including what it already knows about.
 
     **No cursor/pagination for this tool**: if either ``*_has_more`` flag
     is ``True``, there is no way to page through the remainder from
@@ -1417,7 +1445,12 @@ async def inbox(agent_key: str | None = None) -> dict[str, Any]:
 
     async with get_session_factory()() as session:
         caller = await _resolve_caller_agent(session, sub, token)
-        return await service.inbox(session, caller_agent_id=caller.id)
+        return await service.inbox(
+            session,
+            caller_agent_id=caller.id,
+            include_own_messages=include_own_messages,
+            include_read=include_read,
+        )
 
 
 @comms_server.tool

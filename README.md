@@ -65,7 +65,7 @@ fail-closed `scopes.TOOL_SCOPES` registry. Source of truth:
 | `comms_post_message` | `comms:write` | Post a typed, schema-validated message to an active conversation |
 | `comms_get_conversation` | `comms:read` | Combined read: conversation + participants + messages since a seq; advances the caller's read cursor |
 | `comms_get_hold_status` | `comms:read` | Poll the status of a message held for human approval (sender-only) |
-| `comms_inbox` | `comms:read` | Active conversations with unread messages, plus pending invites |
+| `comms_inbox` | `comms:read` | Active conversations with unread messages, plus pending invites. By default excludes the caller's own messages and fully-read conversations -- opt out per-call via `include_own_messages`/`include_read` |
 | `comms_list_conversations` | `comms:read` | Paginated list, filterable by role/type/state; newest-first |
 | `comms_accept` | `comms:write` | Flip the caller's participant status `invited → active`, granting history read + posting rights |
 | `comms_decline_invite` | `comms:write` | Decline a pending invite — terminal, no access is ever granted |
