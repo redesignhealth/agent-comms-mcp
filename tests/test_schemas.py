@@ -10,6 +10,8 @@ from pydantic import ValidationError
 
 import schemas
 from schemas import (
+    DOC_BACKED_INSTRUCTION_KINDS,
+    LINK_BACKED_INSTRUCTION_KINDS,
     MAX_ACCEPTED_TYPES,
     MESSAGE_TYPES,
     AvailabilityRequestV1,
@@ -17,6 +19,8 @@ from schemas import (
     ConfirmV1,
     CounterProposalV1,
     DeclineV1,
+    InstructionRequestV1,
+    InstructionShareV1,
     NeedsClarificationV1,
     NoteV1,
     PayloadValidationError,
@@ -507,6 +511,194 @@ class TestTaskCancelV1:
     def test_rejects_missing_reason(self) -> None:
         with pytest.raises(ValidationError):
             TaskCancelV1.model_validate({})
+
+
+class TestInstructionRequestV1:
+    def test_accepts_doc_backed_kind(self) -> None:
+        model = InstructionRequestV1.model_validate({"kind": "onboarding_welcome"})
+        assert model.type == "instruction_request"
+        assert model.kind == "onboarding_welcome"
+
+    def test_accepts_link_backed_kind(self) -> None:
+        model = InstructionRequestV1.model_validate({"kind": "setup_skill_via_link"})
+        assert model.kind == "setup_skill_via_link"
+
+    def test_rejects_unknown_kind(self) -> None:
+        with pytest.raises(ValidationError):
+            InstructionRequestV1.model_validate({"kind": "not_a_real_kind"})
+
+    def test_rejects_missing_kind(self) -> None:
+        with pytest.raises(ValidationError):
+            InstructionRequestV1.model_validate({})
+
+    def test_rejects_extra_field(self) -> None:
+        with pytest.raises(ValidationError):
+            InstructionRequestV1.model_validate({"kind": "onboarding_welcome", "text": "hi"})
+
+
+class TestInstructionShareV1:
+    @pytest.mark.parametrize("kind", sorted(DOC_BACKED_INSTRUCTION_KINDS))
+    def test_accepts_doc_backed_kind_with_text(self, kind: str) -> None:
+        model = InstructionShareV1.model_validate({"kind": kind, "text": "hello there"})
+        assert model.type == "instruction_share"
+        assert model.text == "hello there"
+        assert model.link is None
+
+    @pytest.mark.parametrize("kind", sorted(LINK_BACKED_INSTRUCTION_KINDS))
+    def test_accepts_link_backed_kind_with_link(self, kind: str) -> None:
+        model = InstructionShareV1.model_validate(
+            {"kind": kind, "link": "https://example.com/setup"}
+        )
+        assert model.link == "https://example.com/setup"
+        assert model.text is None
+
+    def test_rejects_doc_backed_kind_with_link_instead_of_text(self) -> None:
+        with pytest.raises(ValidationError):
+            InstructionShareV1.model_validate(
+                {"kind": "onboarding_welcome", "link": "https://example.com/setup"}
+            )
+
+    def test_rejects_doc_backed_kind_with_both_text_and_link(self) -> None:
+        with pytest.raises(ValidationError):
+            InstructionShareV1.model_validate(
+                {
+                    "kind": "onboarding_welcome",
+                    "text": "hello",
+                    "link": "https://example.com/setup",
+                }
+            )
+
+    def test_rejects_doc_backed_kind_missing_text(self) -> None:
+        with pytest.raises(ValidationError):
+            InstructionShareV1.model_validate({"kind": "onboarding_welcome"})
+
+    def test_rejects_link_backed_kind_with_text_instead_of_link(self) -> None:
+        with pytest.raises(ValidationError):
+            InstructionShareV1.model_validate({"kind": "setup_skill_via_link", "text": "hello"})
+
+    def test_rejects_link_backed_kind_missing_link(self) -> None:
+        with pytest.raises(ValidationError):
+            InstructionShareV1.model_validate({"kind": "setup_skill_via_link"})
+
+    def test_rejects_unknown_kind(self) -> None:
+        with pytest.raises(ValidationError):
+            InstructionShareV1.model_validate({"kind": "not_a_real_kind", "text": "hello"})
+
+    def test_rejects_extra_field(self) -> None:
+        with pytest.raises(ValidationError):
+            InstructionShareV1.model_validate(
+                {"kind": "onboarding_welcome", "text": "hello", "other": 1}
+            )
+
+    def test_rejects_empty_text(self) -> None:
+        with pytest.raises(ValidationError):
+            InstructionShareV1.model_validate({"kind": "onboarding_welcome", "text": ""})
+
+    def test_rejects_overlong_text(self) -> None:
+        with pytest.raises(ValidationError):
+            InstructionShareV1.model_validate({"kind": "onboarding_welcome", "text": "x" * 20001})
+
+    def test_rejects_empty_link(self) -> None:
+        with pytest.raises(ValidationError):
+            InstructionShareV1.model_validate({"kind": "setup_skill_via_link", "link": ""})
+
+    def test_rejects_overlong_link(self) -> None:
+        with pytest.raises(ValidationError):
+            InstructionShareV1.model_validate(
+                {"kind": "setup_skill_via_link", "link": "https://x/" + "y" * 2048}
+            )
+
+    def test_rejects_link_backed_kind_with_both_text_and_link(self) -> None:
+        with pytest.raises(ValidationError):
+            InstructionShareV1.model_validate(
+                {
+                    "kind": "setup_skill_via_link",
+                    "text": "hello",
+                    "link": "https://example.com/setup",
+                }
+            )
+
+    @pytest.mark.parametrize(
+        "link",
+        [
+            "javascript:alert(1)",
+            "data:text/html,x",
+            "file:///etc/passwd",
+            "http://x.com",
+        ],
+    )
+    def test_rejects_non_https_link_schemes(self, link: str) -> None:
+        with pytest.raises(ValidationError):
+            InstructionShareV1.model_validate({"kind": "setup_skill_via_link", "link": link})
+
+    @pytest.mark.parametrize(
+        "link",
+        [
+            # Argus round 2, TECH-5822 BLOCKING: the un-anchored r"^https://"
+            # pattern from round 1 passed this via re.search (string starts
+            # with https://) while smuggling a javascript: payload after an
+            # embedded newline.
+            "https://safe.example.com\njavascript:alert(1)",
+            # Argus round 3 SUGGESTION: the CR-alone and CRLF variants of
+            # the same injection -- [^\r\n] excludes both, but only \n was
+            # exercised above.
+            "https://safe.example.com\rjavascript:alert(1)",
+            "https://safe.example.com\r\njavascript:alert(1)",
+            # Argus round 3 SUGGESTION: NUL-byte host-truncation smuggling.
+            "https://safe.example.com\x00.evil.com/path",
+            # Argus round 4 SUGGESTION: tab is silently stripped by
+            # urllib.parse (WHATWG behavior) -- same host-confusion class
+            # as the NUL case above, now closed by the broader
+            # [^\x00-\x20\x7f]+ exclusion rather than enumerating \r\n\x00
+            # individually.
+            "https://safe.example.com\t.evil.com/path",
+            "https://safe.example.com\x0b.evil.com/path",
+            # Argus round 5 SUGGESTION: DEL (\x7f) is excluded by the
+            # broadened [^\x00-\x20\x7f]+ pattern but was never itself
+            # exercised by a test case.
+            "https://safe.example.com\x7f.evil.com/path",
+        ],
+    )
+    def test_rejects_link_with_embedded_control_characters(self, link: str) -> None:
+        with pytest.raises(ValidationError):
+            InstructionShareV1.model_validate({"kind": "setup_skill_via_link", "link": link})
+
+    def test_rejects_well_formed_url_with_trailing_newline(self) -> None:
+        # Argus round 4 SUGGESTION: every other rejection case above trips
+        # the [^\x00-\x20\x7f] character-class exclusion before the $
+        # anchor is ever reached, so the $ anchor's own contribution was
+        # never independently verified. An otherwise well-formed URL with
+        # ONLY a trailing newline appended isolates it: the trailing \n
+        # itself is excluded by the char class, but a regex engine whose
+        # `$` matched just before a trailing newline (Python's `re`
+        # semantics, not pydantic-core's) would incorrectly accept this.
+        with pytest.raises(ValidationError):
+            InstructionShareV1.model_validate(
+                {"kind": "setup_skill_via_link", "link": "https://example.com/path\n"}
+            )
+
+
+class TestInstructionKindPartitionGuard:
+    """Argus round 1, TECH-5822 SUGGESTION: exercise
+    _check_instruction_kind_partition directly, the same monkeypatch style
+    TestMessageTypeDriftGuard below uses for its own drift guard."""
+
+    def test_passes_on_the_real_current_values(self) -> None:
+        schemas._check_instruction_kind_partition()
+
+    def test_raises_on_overlap(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        overlapping = DOC_BACKED_INSTRUCTION_KINDS | {next(iter(LINK_BACKED_INSTRUCTION_KINDS))}
+        monkeypatch.setattr(schemas, "DOC_BACKED_INSTRUCTION_KINDS", overlapping)
+        with pytest.raises(RuntimeError, match="no longer exactly partition"):
+            schemas._check_instruction_kind_partition()
+
+    def test_raises_on_gap(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        missing = next(iter(DOC_BACKED_INSTRUCTION_KINDS))
+        monkeypatch.setattr(
+            schemas, "DOC_BACKED_INSTRUCTION_KINDS", DOC_BACKED_INSTRUCTION_KINDS - {missing}
+        )
+        with pytest.raises(RuntimeError, match="no longer exactly partition"):
+            schemas._check_instruction_kind_partition()
 
 
 class TestMessageTypeDriftGuard:

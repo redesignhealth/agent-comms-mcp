@@ -488,10 +488,11 @@ async def register(
 
     - ``display_name``: human-readable label, max 255 chars.
     - ``accepted_types``: message types this agent will handle. Must be a
-      subset of the 12 known types (see ``schemas.MessageType``):
+      subset of the 14 known types (see ``schemas.MessageType``):
       ``availability_request``, ``availability_response``,
       ``counter_proposal``, ``confirm``, ``decline``,
-      ``needs_clarification``, ``note``, ``task_assign``, ``task_report``,
+      ``needs_clarification``, ``note``, ``instruction_request``,
+      ``instruction_share``, ``task_assign``, ``task_report``,
       ``task_complete``, ``task_decline``, ``task_cancel``.
       Each entry capped at 100 chars; list capped at 20 entries.
     - ``min_schema_version``/``max_schema_version``: the range
@@ -993,8 +994,9 @@ async def start_conversation(
     - ``message_type``: type of the opening message. Default:
       ``availability_request``. All valid types: ``availability_request``,
       ``availability_response``, ``counter_proposal``, ``confirm``,
-      ``decline``, ``needs_clarification``, ``note``, ``task_assign``,
-      ``task_report``, ``task_complete``, ``task_decline``, ``task_cancel``.
+      ``decline``, ``needs_clarification``, ``note``, ``instruction_request``,
+      ``instruction_share``, ``task_assign``, ``task_report``,
+      ``task_complete``, ``task_decline``, ``task_cancel``.
       See ``comms_post_message`` for payload shapes per type.
     - ``initial_message``: payload dict for the opening message. Must match
       the schema for ``message_type`` (see ``comms_post_message``).
@@ -1167,6 +1169,21 @@ async def post_message(
       ``open``), it is held for human approval instead of denied — the
       response has ``held_for_approval: true`` (no ``seq``); poll
       ``comms_get_hold_status`` with the returned ``hold_id``.
+    - ``instruction_request``: ``kind`` (a closed ``InstructionKind`` enum
+      value — see ``instruction_share`` below for the two groups). No
+      content; not boundary-sensitive.
+    - ``instruction_share``: ``kind`` (same ``InstructionKind`` enum) plus
+      exactly one of ``text`` or ``link``, chosen by which group ``kind``
+      belongs to — never both, never neither:
+      doc-backed kinds (``onboarding_welcome``, ``handoff_context_summary``,
+      ``role_boundaries_reminder``, ``escalation_procedure``,
+      ``safety_and_compliance_briefing``) require ``text`` (str 1-20000
+      chars, verified downstream against a canonical hash for that kind);
+      link-backed kinds (``setup_skill_via_link``, ``setup_job_via_link``)
+      require ``link`` (an ``https://`` URL, str 1-2048 chars, checked
+      downstream against a deployment-side allowlist). Boundary-sensitive
+      like ``note`` — same held-for-approval behavior across a crossing
+      boundary.
     - ``task_assign``: ``action`` enum:
       gather_availability/schedule_meeting/reschedule_meeting/cancel_meeting/
       confirm_slot/report_status. ``gather_availability``,
@@ -1192,7 +1209,8 @@ async def post_message(
       ``payload``, ``created_at``. If a (test-injected or future)
       auto-approver cleared a high-risk post inline, this same shape gains
       ``auto_approved: true`` and ``hold_id``.
-    - High-risk, escalated (v1's default outcome for a crossing ``note``):
+    - High-risk, escalated (v1's default outcome for a crossing ``note`` or
+      ``instruction_share``):
       ``{"held_for_approval": true, "hold_id", "conversation_id",
       "status", "risk_reason", "expires_at", "created_at"}``, plus
       ``decision_url`` when ``DECISION_PAGE_BASE_URL`` is configured — no
@@ -1539,7 +1557,8 @@ async def invite(
       invite hold inline rather than this being the ordinary no-hold path)
       ``auto_approved: true`` and ``hold_id``, mirroring
       ``comms_post_message``'s equivalent fields.
-    - The conversation already has ``note`` history (TECH-5735): admitting
+    - The conversation already has ``note`` or ``instruction_share`` history
+      (``BARRIER_SENSITIVE_TYPES``, TECH-5735/TECH-5822): admitting
       a new participant would grant it full retroactive read access to
       that history the moment it accepts, so the invite is held for human
       approval instead -- ``{"held_for_approval": true, "hold_id",

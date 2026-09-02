@@ -38,6 +38,17 @@ RUN chmod +x /app/entrypoint.sh
 # the container never re-contacts a package index at startup.
 ENV PATH="/app/.venv/bin:$PATH"
 
+# Argus round 3, TECH-5822 SUGGESTION: makes explicit what was previously
+# an implicit side effect of entrypoint.sh's `exec python main.py` running
+# from WORKDIR /app (which Python prepends to sys.path[0]) -- plugins.py's
+# `importlib.resources.files("providers")` (a flat py-modules layout, never
+# installed into site-packages via --no-install-project) depends on
+# `providers` being importable. Without this, a switch to a console-script
+# entrypoint or a different working directory would fail at boot with
+# `ModuleNotFoundError: No module named 'providers'` instead of this
+# dependency being visible here.
+ENV PYTHONPATH="/app"
+
 USER app
 
 # EXPOSE is documentation-only and reflects only the DEFAULT MCP_PORT

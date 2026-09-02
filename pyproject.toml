@@ -79,6 +79,17 @@ py-modules = [
 ]
 packages = ["providers", "migrations", "migrations.versions"]
 
+# TECH-5822, Argus round 2 BLOCKING: instruction_registry.json lives inside
+# the `providers` package specifically so it can be declared here -- a bare
+# py-module (the round-1 shape, a JSON file sitting next to plugins.py) has
+# no setuptools package-data mechanism at all, so it was silently dropped
+# from the built wheel. plugins.py loads it via
+# importlib.resources.files("providers"), which resolves correctly against
+# this package-data declaration in an installed wheel too, not just a
+# Docker COPY . . or in-place git clone.
+[tool.setuptools.package-data]
+providers = ["instruction_registry.json"]
+
 [tool.uv]
 # Supply-chain defense: refuse packages published in the last 7 days.
 exclude-newer = "7 days"

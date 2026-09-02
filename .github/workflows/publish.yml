@@ -10,8 +10,67 @@ jobs:
     environment: pypi
     permissions:
       id-token: write
+      contents: read
+      actions: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Verify CI passed for this SHA
+        # Requires a successful push-triggered CI run on the exact commit being published.
+        # Uses the workflow filename (ci.yml) rather than the display name to avoid
+        # silently breaking if the workflow's `name:` field is ever renamed.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          GH_SHA: ${{ github.sha }}
+        run: |
+          count=$(gh run list \
+            --repo "$GH_REPO" \
+            --commit "$GH_SHA" \
+            --workflow ci.yml \
+            --status success \
+            --event push \
+            --branch main \
+            --limit 1 \
+            --json databaseId \
+            --jq 'length') || { echo "ERROR: gh run list failed -- unable to verify CI status for $GH_SHA." >&2; exit 1; }
+          if [ "$count" -eq 0 ]; then
+            echo "ERROR: No successful push-triggered CI run found for $GH_SHA -- refusing to publish." >&2
+            echo "Ensure the commit is merged to main and CI has passed before creating a release." >&2
+            exit 1
+          fi
+          echo "CI check passed for $GH_SHA."
+
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          # Pinned to match ci.yml/Dockerfile -- otherwise the wheel published
+          # to PyPI is built by a different uv version than the one CI verified.
+          version: "0.11.28"
       - run: uv build
-      - uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: Verify package-data is included in the built wheel
+        # Same guard as ci.yml's "Build wheel and verify package-data is
+        # included" step -- the published artifact is a separate build (not
+        # reused from CI), so ci.yml passing doesn't guarantee this build's
+        # wheel also has instruction_registry.json bundled.
+        # Uses plain python3 (not `uv run python`): this job has no prior
+        # `uv sync` step, so `uv run` would trigger a full dependency sync
+        # after the GitHub release already exists just to run a stdlib-only
+        # script -- a sync failure here would leave a broken release (exists
+        # on GitHub, never published to PyPI) for no benefit.
+        run: |
+          python3 -c "
+          import glob, zipfile
+          wheels = glob.glob('dist/*.whl')
+          if len(wheels) != 1:
+              raise RuntimeError(f'expected exactly one wheel in dist/, found {wheels}')
+          whl = wheels[0]
+          names = zipfile.ZipFile(whl).namelist()
+          if 'providers/instruction_registry.json' not in names:
+              raise RuntimeError(
+                  f'providers/instruction_registry.json missing from wheel {whl}: {names}'
+              )
+          print(f'OK: providers/instruction_registry.json present in {whl}')
+          "
+
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1, resolved 2026-09-01
