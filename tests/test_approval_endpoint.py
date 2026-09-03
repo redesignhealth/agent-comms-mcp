@@ -15,14 +15,11 @@ about re-proving FastMCP's/JWTVerifier's own token verification.
 
 from __future__ import annotations
 
-import asyncio
 import os
-import subprocess
 import sys
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -30,12 +27,7 @@ import httpx
 import pytest
 import pytest_asyncio
 from sqlalchemy import select, text
-from sqlalchemy.ext.asyncio import (
-    AsyncEngine,
-    AsyncSession,
-    async_sessionmaker,
-    create_async_engine,
-)
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from starlette.applications import Starlette
 from starlette.routing import Route
 
@@ -43,58 +35,10 @@ from exceptions import AgentRetiredError, ConversationArchivedError
 from models import ApprovalHold, AuditLog, Conversation, Participant
 from service import register_agent
 
-SERVICE_ROOT = Path(__file__).parent.parent
-_DEFAULT_TEST_DATABASE_URL = "postgresql://postgres:postgres@localhost:55432/agent_comms"
-
-
-def _test_database_url() -> str:
-    url = os.environ.get("DATABASE_URL", _DEFAULT_TEST_DATABASE_URL)
-    if url.startswith("postgresql://"):
-        return url.replace("postgresql://", "postgresql+asyncpg://", 1)
-    return url
-
-
-async def _can_connect(url: str) -> bool:
-    try:
-        engine = create_async_engine(url)
-        async with engine.connect() as conn:
-            await conn.execute(text("SELECT 1"))
-        await engine.dispose()
-        return True
-    except Exception:
-        return False
-
-
-@pytest.fixture(scope="module")
-def database_url() -> str:
-    url = _test_database_url()
-    if not asyncio.run(_can_connect(url)):
-        pytest.skip(
-            f"Postgres unreachable at {url!r} — run `docker compose up -d postgres` "
-            "(or set DATABASE_URL) to exercise the approval-endpoint tests."
-        )
-    return url
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _migrated_schema(database_url: str) -> None:
-    env = {**os.environ, "DATABASE_URL": database_url.replace("+asyncpg", "")}
-    for args in (["downgrade", "base"], ["upgrade", "head"]):
-        subprocess.run(
-            [sys.executable, "-m", "alembic", *args],
-            cwd=SERVICE_ROOT,
-            env=env,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-
-
-@pytest_asyncio.fixture
-async def engine(database_url: str) -> AsyncIterator[AsyncEngine]:
-    eng = create_async_engine(database_url)
-    yield eng
-    await eng.dispose()
+# Real-Postgres fixtures (database_url, _migrated_schema, engine) are shared
+# via tests/conftest.py (Argus review S15) -- this module opts in explicitly
+# since conftest's `_migrated_schema` is deliberately not autouse globally.
+pytestmark = pytest.mark.usefixtures("_migrated_schema")
 
 
 @pytest_asyncio.fixture(autouse=True)

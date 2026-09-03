@@ -5,8 +5,10 @@ from __future__ import annotations
 import re
 from unittest.mock import MagicMock, patch
 
+import mint_token
 from auth import AGENT_TOKEN_VERIFIER_CLAIM, DEFAULT_AGENT_TOKEN_VERIFIER
 from scopes import (
+    PROPOSAL_SUBMIT_SCOPE,
     TOOL_SCOPES,
     is_interactive_token,
     is_registry_backed_agent_token,
@@ -57,6 +59,19 @@ class TestToolScopesRegistry:
 
     def test_whoami_uses_comms_read(self) -> None:
         assert TOOL_SCOPES["comms_whoami"] == "comms:read"
+
+    def test_every_defined_scope_constant_is_mintable(self) -> None:
+        """Argus review B3: every scope constant this codebase defines
+        (every TOOL_SCOPES value, plus the two standalone constants that
+        gate something OTHER than a TOOL_SCOPES-enrolled tool --
+        ``comms:admin`` and ``PROPOSAL_SUBMIT_SCOPE``) must be mintable via
+        ``mint_token``'s CLI. A scope missing from ``mint_token._VALID_
+        SCOPES`` can never legitimately be minted, making whatever it
+        gates permanently unreachable by any agent-jwt caller -- this is
+        exactly the hole B3 found for ``PROPOSAL_SUBMIT_SCOPE``."""
+        every_defined_scope = set(TOOL_SCOPES.values()) | {"comms:admin", PROPOSAL_SUBMIT_SCOPE}
+        missing = every_defined_scope - mint_token._VALID_SCOPES
+        assert not missing, f"scope(s) defined but not mintable: {missing}"
 
     def test_get_hold_status_uses_comms_read(self) -> None:
         """TECH-5389 PR2: comms_get_hold_status is a pure read (sender-only
