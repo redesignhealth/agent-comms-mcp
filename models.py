@@ -67,6 +67,19 @@ APPROVAL_HOLD_AUTO_DECISIONS = ("cleared", "escalated")
 # every pre-existing row); "invite" is new.
 APPROVAL_HOLD_KINDS = ("message", "invite")
 
+# proposal_holds lifecycle (TECH-5871): pending -> approved|rejected, then
+# (approved only) -> applied|apply_failed. `stale` is a terminal outcome a
+# future apply-time re-check can set when `target_fingerprint` no longer
+# matches the target's current state at apply time (see ProposalHold's
+# class docstring) -- reachable from `approved` (or `pending`, if staleness
+# is ever checked pre-decision), not just `applied`.
+PROPOSAL_HOLD_STATUSES = ("pending", "approved", "rejected", "applied", "apply_failed", "stale")
+PROPOSAL_HOLD_DECISION_SOURCES = ("human", "auto")
+# Shared closed vocabulary for the three self-reported, advisory-only axes
+# (confidence/importance/impact) AND the server-derived `priority` -- same
+# three levels, different provenance (see ProposalHold.priority).
+PROPOSAL_HOLD_LEVELS = ("low", "medium", "high")
+
 
 class Base(DeclarativeBase):
     type_annotation_map = {  # noqa: RUF012 — SQLAlchemy declarative config, not mutable state
@@ -572,6 +585,111 @@ class ApprovalHold(Base):
     updated_at: Mapped[datetime] = _updated_at()
 
 
+class ProposalHold(Base):
+    """A generalized bot-action human-approval escape hatch (TECH-5871).
+
+    A sibling table to ``approval_holds``, not a variant of it --
+    ``approval_holds`` is specifically the message/invite-diversion
+    pipeline for THIS board's own comms traffic (TECH-5389/TECH-5735).
+    ``proposal_holds`` generalizes the same "propose, hold for a human,
+    decide, apply" shape to any autonomous bot's arbitrary action
+    (starting with a Linear tech-team progress bot on ReClaw), independent
+    of whether the proposer is a board-registered ``agents`` row at all --
+    hence ``proposed_by_bot_id``/``decided_by_actor_id`` are plain opaque
+    identifiers here, not FKs to ``agents``.
+
+    ``kind`` is an OPEN vocabulary (e.g. ``"arc_board_change"``,
+    ``"linear_progress_update"``), deliberately NOT CHECK-constrained --
+    same convention as ``conversations.type``/``messages.type`` (see this
+    module's docstring): adding a new bot/action kind is a code change in
+    whatever validates ``action``'s shape for that kind, not a migration.
+
+    ``owner_sub`` is snapshotted at creation time from the proposing bot's
+    verified owner claim (falling back to the agent-owner registry, same
+    pattern as ``ApprovalHold.owner_sub`` -- see that class's docstring),
+    not read live at decide time.
+
+    ``confidence``/``importance``/``impact`` are self-reported by the
+    proposing bot and purely advisory -- nothing in this schema or its
+    constraints acts on them. ``priority`` looks identical (same
+    ``PROPOSAL_HOLD_LEVELS`` vocabulary) but is a DIFFERENT column with a
+    different contract: it is always derived server-side from ``kind`` +
+    ``action`` by whatever service code creates the row, and a caller-
+    supplied value for it must never be trusted or persisted as-is.
+
+    ``target_fingerprint`` is a sha256 hex digest of the target's state at
+    proposal-submission time, for detecting staleness (the target changed
+    between proposal and decision/apply) -- compared, not stored as, a
+    later re-fingerprint by whatever service code applies the action.
+
+    The two CHECK constraints below enforce that ``decided_at``/
+    ``decided_by_actor_id``/``decision_source`` are set if AND ONLY IF
+    ``status`` has left ``"pending"``, and that ``applied_at`` is never set
+    for any status other than ``"applied"``.
+    """
+
+    __tablename__ = "proposal_holds"
+    __table_args__ = (
+        CheckConstraint(f"status IN {PROPOSAL_HOLD_STATUSES!r}", name="ck_proposal_holds_status"),
+        CheckConstraint(
+            f"decision_source IS NULL OR decision_source IN {PROPOSAL_HOLD_DECISION_SOURCES!r}",
+            name="ck_proposal_holds_decision_source",
+        ),
+        CheckConstraint(
+            f"confidence IN {PROPOSAL_HOLD_LEVELS!r}", name="ck_proposal_holds_confidence"
+        ),
+        CheckConstraint(
+            f"importance IN {PROPOSAL_HOLD_LEVELS!r}", name="ck_proposal_holds_importance"
+        ),
+        CheckConstraint(f"impact IN {PROPOSAL_HOLD_LEVELS!r}", name="ck_proposal_holds_impact"),
+        CheckConstraint(f"priority IN {PROPOSAL_HOLD_LEVELS!r}", name="ck_proposal_holds_priority"),
+        # decided_at/decided_by_actor_id/decision_source are null iff status
+        # is still "pending" -- a decision (human or auto) always stamps all
+        # three together, and none of them is ever set while pending.
+        CheckConstraint(
+            "(status = 'pending' AND decided_at IS NULL AND decided_by_actor_id IS NULL "
+            "AND decision_source IS NULL) "
+            "OR (status != 'pending' AND decided_at IS NOT NULL "
+            "AND decided_by_actor_id IS NOT NULL AND decision_source IS NOT NULL)",
+            name="ck_proposal_holds_decision_consistency",
+        ),
+        CheckConstraint(
+            "status = 'applied' OR applied_at IS NULL",
+            name="ck_proposal_holds_applied_at_consistency",
+        ),
+        # Backs a pending-queue listing (a future PR's endpoint/tool), same
+        # shape as approval_holds' sender-scoped index -- ordered by
+        # created_at within a status.
+        Index("idx_proposal_holds_status_created_at", "status", "created_at"),
+        # Backs an owner-filtered pending listing, same convention as
+        # idx_approval_holds_owner_sub_status_created_at.
+        Index(
+            "idx_proposal_holds_owner_sub_status_created_at", "owner_sub", "status", "created_at"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    proposed_by_bot_id: Mapped[str] = mapped_column(Text, nullable=False)
+    owner_sub: Mapped[str] = mapped_column(Text, nullable=False)
+    action: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    rationale: Mapped[str] = mapped_column(Text, nullable=False)
+    confidence: Mapped[str] = mapped_column(Text, nullable=False)
+    importance: Mapped[str] = mapped_column(Text, nullable=False)
+    impact: Mapped[str] = mapped_column(Text, nullable=False)
+    priority: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'pending'"))
+    decision_source: Mapped[str | None] = mapped_column(Text, nullable=True)
+    decided_by_actor_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    decided_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    decision_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    target_fingerprint: Mapped[str] = mapped_column(Text, nullable=False)
+    applied_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    apply_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _updated_at()
+
+
 __all__ = [
     "AGENT_STATUSES",
     "APPROVAL_HOLD_AUTO_DECISIONS",
@@ -580,6 +698,9 @@ __all__ = [
     "CONVERSATION_STATES",
     "PARTICIPANT_ROLES",
     "PARTICIPANT_STATUSES",
+    "PROPOSAL_HOLD_DECISION_SOURCES",
+    "PROPOSAL_HOLD_LEVELS",
+    "PROPOSAL_HOLD_STATUSES",
     "Agent",
     "ApprovalHold",
     "AuditLog",
@@ -587,4 +708,5 @@ __all__ = [
     "Conversation",
     "Message",
     "Participant",
+    "ProposalHold",
 ]

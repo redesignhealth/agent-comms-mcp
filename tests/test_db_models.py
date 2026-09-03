@@ -600,3 +600,171 @@ class TestApprovalHoldsSchema:
                 text("DELETE FROM conversations WHERE id = :id"), {"id": conversation_row.id}
             )
             await conn.execute(text("DELETE FROM agents WHERE id = :id"), {"id": agent_row.id})
+
+
+class TestProposalHoldsSchema:
+    """proposal_holds table (TECH-5871, migration d23b37d4e187).
+
+    A sibling table to approval_holds -- not a variant of it. This class
+    never touches approval_holds or any of its rows.
+    """
+
+    async def test_proposal_holds_columns(self, engine: AsyncEngine) -> None:
+        cols = await _columns(engine, "proposal_holds")
+        for expected in (
+            "id",
+            "kind",
+            "proposed_by_bot_id",
+            "owner_sub",
+            "action",
+            "rationale",
+            "confidence",
+            "importance",
+            "impact",
+            "priority",
+            "status",
+            "decision_source",
+            "decided_by_actor_id",
+            "decided_at",
+            "decision_note",
+            "target_fingerprint",
+            "applied_at",
+            "apply_error",
+            "created_at",
+            "updated_at",
+        ):
+            assert expected in cols, f"proposal_holds.{expected} missing"
+        assert cols["action"] == "jsonb"
+
+    async def test_status_defaults_to_pending(self, engine: AsyncEngine) -> None:
+        async with engine.connect() as conn:
+            default = (
+                await conn.execute(
+                    text(
+                        "SELECT column_default FROM information_schema.columns "
+                        "WHERE table_schema = 'public' AND table_name = 'proposal_holds' "
+                        "AND column_name = 'status'"
+                    )
+                )
+            ).scalar_one_or_none()
+        assert default is not None
+        assert "pending" in default
+
+    async def test_status_check_constraint(self, engine: AsyncEngine) -> None:
+        async with engine.connect() as conn:
+            constraint_def = (
+                await conn.execute(
+                    text(
+                        "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                        "WHERE conrelid = 'proposal_holds'::regclass "
+                        "AND conname = 'ck_proposal_holds_status'"
+                    )
+                )
+            ).scalar_one_or_none()
+        assert constraint_def is not None
+        for status in ("pending", "approved", "rejected", "applied", "apply_failed", "stale"):
+            assert status in constraint_def
+
+    async def test_level_check_constraints(self, engine: AsyncEngine) -> None:
+        async with engine.connect() as conn:
+            for column in ("confidence", "importance", "impact", "priority"):
+                constraint_def = (
+                    await conn.execute(
+                        text(
+                            "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                            "WHERE conrelid = 'proposal_holds'::regclass "
+                            f"AND conname = 'ck_proposal_holds_{column}'"
+                        )
+                    )
+                ).scalar_one_or_none()
+                assert constraint_def is not None, f"missing CHECK for {column}"
+                for level in ("low", "medium", "high"):
+                    assert level in constraint_def
+
+    async def test_indexes_exist(self, engine: AsyncEngine) -> None:
+        indexes = await _indexes(engine, "proposal_holds")
+        assert "idx_proposal_holds_status_created_at" in indexes
+        assert "idx_proposal_holds_owner_sub_status_created_at" in indexes
+
+    async def test_decision_consistency_check_constraint_rejects_pending_with_decision(
+        self, engine: AsyncEngine
+    ) -> None:
+        async with engine.connect() as conn:
+            with pytest.raises(Exception, match="ck_proposal_holds_decision_consistency"):
+                async with conn.begin():
+                    await conn.execute(
+                        text(
+                            "INSERT INTO proposal_holds "
+                            "(kind, proposed_by_bot_id, owner_sub, action, rationale, "
+                            "confidence, importance, impact, priority, status, "
+                            "decision_source, decided_by_actor_id, decided_at, "
+                            "target_fingerprint) "
+                            "VALUES ('linear_progress_update', 'test-bot', 'test-owner', "
+                            "'{}'::jsonb, 'rationale', 'low', 'low', 'low', 'low', 'pending', "
+                            "'human', 'test-actor', now(), 'deadbeef')"
+                        )
+                    )
+
+    async def test_applied_at_consistency_check_constraint_rejects_non_applied(
+        self, engine: AsyncEngine
+    ) -> None:
+        async with engine.connect() as conn:
+            with pytest.raises(Exception, match="ck_proposal_holds_applied_at_consistency"):
+                async with conn.begin():
+                    await conn.execute(
+                        text(
+                            "INSERT INTO proposal_holds "
+                            "(kind, proposed_by_bot_id, owner_sub, action, rationale, "
+                            "confidence, importance, impact, priority, status, "
+                            "decision_source, decided_by_actor_id, decided_at, "
+                            "applied_at, target_fingerprint) "
+                            "VALUES ('linear_progress_update', 'test-bot', 'test-owner', "
+                            "'{}'::jsonb, 'rationale', 'low', 'low', 'low', 'low', 'approved', "
+                            "'human', 'test-actor', now(), now(), 'deadbeef')"
+                        )
+                    )
+
+    async def test_round_trip_insert_and_read(self, engine: AsyncEngine) -> None:
+        """Full round-trip through raw SQL (this module never mocks the
+        database): insert a minimal pending proposal hold, decide it, and
+        read it back -- no FK to agents/conversations at all, unlike
+        approval_holds."""
+        async with engine.begin() as conn:
+            hold_row = (
+                await conn.execute(
+                    text(
+                        "INSERT INTO proposal_holds "
+                        "(kind, proposed_by_bot_id, owner_sub, action, rationale, "
+                        "confidence, importance, impact, priority, status, "
+                        "target_fingerprint) "
+                        "VALUES ('linear_progress_update', 'test-bot', 'test-owner', "
+                        "'{\"issue\": \"TECH-5871\"}'::jsonb, 'because it needs doing', "
+                        "'medium', 'high', 'low', 'high', 'pending', 'deadbeef') "
+                        "RETURNING id, status, decided_at, applied_at"
+                    )
+                )
+            ).one()
+            assert hold_row.status == "pending"
+            assert hold_row.decided_at is None
+            assert hold_row.applied_at is None
+
+            await conn.execute(
+                text(
+                    "UPDATE proposal_holds SET status = 'approved', decision_source = 'human', "
+                    "decided_by_actor_id = 'test-actor', decided_at = now() WHERE id = :id"
+                ),
+                {"id": hold_row.id},
+            )
+            decided_row = (
+                await conn.execute(
+                    text("SELECT status, decision_source FROM proposal_holds WHERE id = :id"),
+                    {"id": hold_row.id},
+                )
+            ).one()
+            assert decided_row.status == "approved"
+            assert decided_row.decision_source == "human"
+
+            # Cleanup: this module has no autouse table-truncation fixture.
+            await conn.execute(
+                text("DELETE FROM proposal_holds WHERE id = :id"), {"id": hold_row.id}
+            )
