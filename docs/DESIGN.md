@@ -240,7 +240,7 @@ agents id, sub UNIQUE, owner_sub, owner_email, display_name,
  bound_at, timestamps
 conversations id, type, state(active|completed|canceled|expired),
  created_by, expires_at, owner_snapshot jsonb (nullable),
- timestamps
+ archived_at (nullable timestamptz, TECH-5887 -- see below), timestamps
 participants (conversation_id, agent_id) UNIQUE, role(owner|member),
  status(invited|active|left|declined), invited_by, invited_at,
  joined_at (set on accept), last_read_seq
@@ -397,6 +397,49 @@ Design notes:
  own agent happens to be suspended can still deregister someone else; it is a
  deliberate, narrow exception (admin authorization here rides on the token's scope/
  interactive-caller status, not on the admin's own `agents.status`), not a bug.
+- **Archiving a conversation (`comms_archive_conversation`, TECH-5887)**: sets
+ `conversations.archived_at`, a whole-conversation action symmetric across
+ every CURRENTLY `active` participant -- not gated to the conversation's
+ `owner` role or its `created_by` agent, unlike, say, tightenable `invite`
+ policy (§10/`may_invite`). Deliberately orthogonal to `state`/
+ `CONVERSATION_STATES`, not a fifth state value in that CHECK constraint: a
+ conversation can be archived while `active`, `completed`, `canceled`, or
+ `expired`, and archiving never runs a `resulting_conversation_state`
+ transition or interacts with `is_message_legal` (§4's state machine).
+ Only two things key off `archived_at`:
+
+  - `comms_invite`, `comms_post_message`, and `comms_accept` all deny with
+    the specific `ConversationArchivedError` (`conversation_archived`) once
+    it is set -- not the uniform `AccessDeniedError`, and not folded into
+    `InvalidConversationStateError`, since the caller already has
+    legitimate read access to the conversation and there is nothing to
+    enumerate by naming the real cause (same non-enumeration reasoning as
+    `InvalidConversationStateError` itself, exceptions.py). `comms_accept`
+    is included alongside the two write tools by deliberate judgment call:
+    accepting a pending invite admits a brand-new ACTIVE participant with
+    full retroactive history read, the same kind of event a fresh invite
+    is, just completed by the invitee -- so a pending invite sent BEFORE
+    archiving becomes permanently un-acceptable once the conversation is
+    archived. `comms_decline_invite` is deliberately UNAFFECTED (declining
+    only ever narrows access, never grants it), so a stale pending invite
+    on an archived conversation can still be cleanly declined, just not
+    accepted.
+  - Every read path (`comms_get_conversation`, `comms_inbox`,
+    `comms_list_conversations`, via the shared `service._conversation_dict`
+    projection) is completely UNAFFECTED -- archiving is not a delete or a
+    redaction; every past message stays exactly as readable as before, and
+    every projection gains `"archived"`/`"archived_at"` fields so a caller
+    can always tell.
+
+ Idempotent: archiving an already-archived conversation succeeds silently
+ (no error, no audit row, `archived_at` NOT bumped to now) rather than
+ raising -- the simplest, safest default given archiving takes no
+ parameters and has no state to disagree about across two callers. One-
+ directional by design, mirroring `comms_deregister_agent`'s own
+ one-directional shape (§5 above): there is no "unarchive" tool in v1, so a
+ mistaken archive has no in-band recovery -- add a reactivation path later,
+ with its own authorization gate, if a real need for one arises.
+
 - **On-behalf-of registration (`comms_admin_register`)**: `comms_register` always
  derives `sub` from the CALLING token's own verified identity (§4's "owner
  identity ... never accepted as a parameter" invariant) -- by design, nothing can
@@ -550,6 +593,7 @@ scroll-to-load-more use case.
 | `comms_decline_invite` | comms:write | declines a pending invite: terminal, no access is ever granted. Requires caller to currently be `invited`. Distinct from `comms_leave` (which covers already-`active` members), keeping the audit trail clean |
 | `comms_invite` | comms:write | adds a target as `invited` (not `active`); a registry-retired target (TECH-5703) raises the same specific "agent retired" error `comms_start_conversation` does. `internal` additionally never admits an `is_shared` target (TECH-5735, §9 Axis 1). **Two response shapes**, same convention as `comms_post_message`: the normal invited-participant shape (`conversation_id`, `target_agent_id`, `status`, `invited_by`, plus `auto_approved: true` + `hold_id` when an `AutoApprover` cleared an invite hold inline rather than this being the ordinary no-hold path), or — if the conversation already has any `note` or `instruction_share` history (`plugins.BARRIER_SENSITIVE_TYPES`, TECH-5735/TECH-5822) — `{"held_for_approval": true, "hold_id", "conversation_id", "status", "risk_reason", "expires_at", "created_at"}` (plus `decision_url` when `DECISION_PAGE_BASE_URL` is configured) (§9 Axis 1's free-text invite-approval rule) — admitting a new participant grants it full retroactive history read the moment it accepts, so that requires human approval first, same as a high-risk message does |
 | `comms_leave` | comms:write | leave: covers already-active members |
+| `comms_archive_conversation` | comms:write | archive a conversation (TECH-5887): sets `archived_at`, permanently. Any CURRENT `active` participant may trigger it (symmetric across the whole conversation, not gated to owner/creator) -- distinct from `comms_leave`, which only ever changes the CALLER's own participant row. Once archived: `comms_invite`/`comms_post_message`/`comms_accept` all reject with the specific `conversation_archived` error (not the uniform denial); every read path (`comms_get_conversation`/`comms_inbox`/`comms_list_conversations`) is completely unaffected -- archiving is not a delete or a redaction, every past message stays fully readable. Idempotent (re-archiving is a silent no-op, `archived_at` unchanged); one-directional -- no unarchive tool |
 
 ## 8. Security invariants
 
@@ -1391,6 +1435,16 @@ participant, or a join-time history filter — both larger changes than this
 ticket's scope; not yet implemented.
 
 ### Known gap: no retention/archival policy for terminal or expired conversations
+
+**Not resolved by `comms_archive_conversation` (TECH-5887, §5/§7):** that
+tool's "archive" is a per-conversation, participant-triggered VISIBILITY
+flag (`archived_at`) with zero effect on storage -- an archived
+conversation's rows are retained exactly as long as an unarchived one's,
+forever, with full read access preserved. It answers "can this
+conversation still be written to" (no, once archived), never "should this
+data still exist" or "should this be moved to cold storage" -- the
+retention/purge/deletion gap described below is completely orthogonal and
+remains fully open.
 
 Expiry is lazy-only: `_maybe_expire` flips `Conversation.state` to `"expired"`
 only when `get_conversation`/`post_message` next touches that row. A

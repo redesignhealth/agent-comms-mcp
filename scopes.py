@@ -91,6 +91,9 @@ TOOL_SCOPES: dict[str, str] = {
     "comms_decline_invite": "comms:write",
     "comms_invite": "comms:write",
     "comms_leave": "comms:write",
+    # TECH-5887: symmetric across every current participant, same as
+    # comms_leave -- no elevated scope, no owner-only gate.
+    "comms_archive_conversation": "comms:write",
 }
 
 

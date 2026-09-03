@@ -54,6 +54,7 @@ from exceptions import (
     AgentAlreadyRegisteredError,
     AgentRetiredError,
     AgentSuspendedError,
+    ConversationArchivedError,
     DisplayNameCollisionError,
     InvalidConversationStateError,
     RateLimitExceededError,
@@ -327,6 +328,10 @@ async def _map_service_errors() -> AsyncIterator[None]:
     story again: the caller is a privileged admin who supplied the target
     ``sub`` explicitly, so confirming it's already registered discloses
     nothing new -- see its own docstring.
+    ``ConversationArchivedError`` (TECH-5887, ``comms_archive_conversation``)
+    is the same story as ``InvalidConversationStateError``: the caller
+    already has legitimate read access to the conversation's archived
+    status.
 
     A bare ``ValueError`` is different: the service layer raises it for
     internal parameter-shape problems (e.g. an empty ``display_name`` or
@@ -352,6 +357,7 @@ async def _map_service_errors() -> AsyncIterator[None]:
         DisplayNameCollisionError,
         AgentSuspendedError,
         AgentAlreadyRegisteredError,
+        ConversationArchivedError,
     ) as exc:
         raise ToolError(str(exc)) from None
     except (ValueError, RuntimeError):
@@ -1127,6 +1133,12 @@ async def start_conversation(
         "target_agent_ids": [str(t) for t in target_uuids],
         "expires_at": _iso(conversation.expires_at),
         "created_at": _iso(conversation.created_at),
+        # Always False at creation time -- a brand-new conversation can
+        # never already be archived. Included for shape parity with every
+        # other conversation projection (comms_get_conversation,
+        # comms_list_conversations, comms_inbox), which all surface this
+        # field via service._conversation_dict.
+        "archived": False,
         # The actually-negotiated version (see
         # service.start_conversation's transient
         # `conversation.negotiated_schema_version` attribute), NOT
@@ -1169,6 +1181,9 @@ async def post_message(
     """Post a typed, schema-validated message to an active conversation.
 
     Caller must be an ``active`` participant (uniform denial otherwise).
+    Rejects with a specific ``conversation_archived`` error (TECH-5887) if
+    the conversation has been archived via ``comms_archive_conversation`` --
+    checked before every other gate.
 
     ``review_reason``: optional, max 2000 chars, enforced at this tool
     boundary BEFORE any whitespace stripping (so a >2000-char all-whitespace
@@ -1545,7 +1560,12 @@ async def accept(conversation_id: str, agent_key: str | None = None) -> dict[str
 
     Grants full history read and posting rights from this point forward.
     Requires the caller to currently be ``invited`` on this conversation
-    (uniform denial otherwise).
+    (uniform denial otherwise). Also rejects with a specific
+    ``conversation_archived`` error (TECH-5887) if the conversation has
+    since been archived via ``comms_archive_conversation`` -- accepting
+    would admit a new active participant, which archiving is meant to
+    block just like a fresh invite; use ``comms_decline_invite`` instead,
+    which remains available since it only narrows access.
     """
     token = _require_token()
     base_sub = _require_identity(token)
@@ -1607,6 +1627,8 @@ async def invite(
     """Invite another board agent into an active conversation.
 
     Caller must be ``active``. Any active member may invite (not just owner).
+    Rejects with a specific ``conversation_archived`` error (TECH-5887) if
+    the conversation has been archived via ``comms_archive_conversation``.
 
     - ``target_agent_id``: UUID string from ``comms_list_agents``. Target
       must be board-active and have no existing participant row (any status).
@@ -1717,3 +1739,69 @@ async def leave(conversation_id: str, agent_key: str | None = None) -> dict[str,
             )
 
     return {"conversation_id": conversation_id, "agent_id": str(caller.id), "status": "left"}
+
+
+@comms_server.tool
+async def archive_conversation(
+    conversation_id: str, agent_key: str | None = None
+) -> dict[str, Any]:
+    """Archive a conversation (TECH-5887): sets ``archived_at``, permanently.
+
+    Any CURRENTLY ``active`` participant may archive -- not just the
+    conversation's ``owner`` role or its original ``created_by`` agent.
+    This is a whole-conversation action, symmetric across every current
+    member, unlike ``comms_leave`` (which only ever changes the calling
+    participant's own row). Requires the caller to currently be ``active``
+    on this conversation (uniform ``access_denied`` otherwise, identical
+    whether the caller was never a participant, is still ``invited``, or
+    has ``left``/``declined`` -- same precondition every other
+    conversation-scoped write tool shares).
+
+    Effects, once archived:
+
+    - ``comms_invite`` and ``comms_post_message`` against this conversation
+      both reject with the specific ``conversation_archived`` error (not
+      the uniform denial) -- no new invites, no new messages.
+    - ``comms_accept`` against this conversation is ALSO rejected the same
+      way, including for an invite that was sent before archiving:
+      accepting admits a brand-new active participant with full
+      retroactive history read, the same outcome archiving is meant to
+      close off. ``comms_decline_invite`` is unaffected (declining only
+      narrows access).
+    - Every read path is completely unaffected: ``comms_get_conversation``,
+      ``comms_inbox``, and ``comms_list_conversations`` keep returning this
+      conversation and every one of its past messages exactly as before.
+      Archiving is not a delete or a redaction.
+
+    Idempotent: archiving an already-archived conversation succeeds
+    silently and returns the SAME ``archived_at`` timestamp from the first
+    archive, rather than erroring or bumping it to now.
+
+    One-directional -- there is no "unarchive" tool (mirrors
+    ``comms_deregister_agent``'s own one-directional design). Archiving is
+    also independent of ``state``: it works (and makes sense) on a
+    conversation in any state, including one already ``completed``/
+    ``canceled``/``expired``.
+    """
+    token = _require_token()
+    base_sub = _require_identity(token)
+    agent_key = _validate_agent_key(agent_key)
+    sub = _compose_sub(base_sub, agent_key)
+    conv_id = _parse_uuid("conversation_id", conversation_id)
+
+    async with get_session_factory()() as session:
+        caller = await _resolve_caller_agent(session, sub, token)
+        async with _map_service_errors():
+            conversation = await service.archive_conversation(
+                session,
+                actor_sub=sub,
+                agent_id=caller.id,
+                conversation_id=conv_id,
+            )
+
+    return {
+        "conversation_id": conversation_id,
+        "agent_id": str(caller.id),
+        "archived": True,
+        "archived_at": _iso(conversation.archived_at),
+    }

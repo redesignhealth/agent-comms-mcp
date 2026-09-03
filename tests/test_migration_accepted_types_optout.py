@@ -176,9 +176,9 @@ async def test_downgrade_restores_backfilled_rows_to_old_default(
 
     # Target this migration's own down_revision explicitly, not a relative
     # "-1" from head -- head has since gained later migrations (e.g.
-    # d23b37d4e187) stacked on top of d5c8f1a2b4e7, and "-1" from head would
-    # silently undo one of those instead of exercising THIS migration's
-    # downgrade().
+    # d23b37d4e187, f1a2b3c4d5e6/TECH-5887) stacked on top of d5c8f1a2b4e7,
+    # and "-1" from head would silently undo one of those instead of
+    # exercising THIS migration's downgrade().
     _run_alembic(database_url, "downgrade", "c1a2b3d4e5f6")
 
     async with engine.connect() as conn:

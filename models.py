@@ -308,6 +308,18 @@ class Conversation(Base):
         CheckConstraint(f"state IN {CONVERSATION_STATES!r}", name="ck_conversations_state"),
         Index("idx_conversations_state_expires_at", "state", "expires_at"),
         Index("idx_conversations_created_by_created_at", "created_by", "created_at"),
+        # Sparse partial index over archived rows only -- there is no
+        # read path today that lists "all archived conversations" (archiving
+        # is a per-conversation flag, not a filter comms_list_conversations
+        # exposes), but this mirrors every other nullable-timestamp column's
+        # declared-index convention in this file (see owner_reconciled_at
+        # above) rather than leaving a plausible future query with no index
+        # to land on.
+        Index(
+            "idx_conversations_archived_at",
+            "archived_at",
+            postgresql_where=text("archived_at IS NOT NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -324,6 +336,24 @@ class Conversation(Base):
     # participants (which would let a later invite retroactively loosen
     # admission for prior messages).
     owner_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    # NULL = not archived (the default/common case); a timestamp = archived
+    # at that instant (TECH-5887, comms_archive_conversation). Deliberately
+    # NOT folded into ``state``/``CONVERSATION_STATES``: archiving is an
+    # orthogonal, symmetric-permission flag layered on top of the existing
+    # state machine, not a new state in it -- a conversation can be
+    # archived while ``active``, ``completed``, ``canceled``, or ``expired``,
+    # and archiving never runs a ``resulting_conversation_state`` transition
+    # or interacts with ``is_message_legal``. Only two things key off this
+    # column: ``service.invite``/``service.post_message`` (and
+    # ``service.accept_invite`` -- see that function's own docstring for why
+    # accept is treated the same as a new invite here) deny with the
+    # specific ``ConversationArchivedError`` when it is set; every read path
+    # (``get_conversation``, ``inbox``, ``list_conversations``) is
+    # completely unaffected -- past messages remain fully readable forever,
+    # archiving is not a delete or a redaction. Archiving has no undo path
+    # (no "unarchive" tool) -- see ``service.archive_conversation``'s
+    # docstring.
+    archived_at: Mapped[datetime | None] = mapped_column(nullable=True)
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _updated_at()
 

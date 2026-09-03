@@ -38,6 +38,12 @@ service/tools boundary:
   is already an authorized member with legitimate access to the current
   state via ``get_conversation``, so there is nothing to enumerate here.
 
+- ``ConversationArchivedError`` (TECH-5887): ``comms_invite``/
+  ``comms_post_message``/``comms_accept`` targeted a conversation that has
+  been archived (``comms_archive_conversation``). Kept distinct and
+  specific for the same reason as ``InvalidConversationStateError`` — the
+  caller already has legitimate read access to the conversation.
+
 - ``RateLimitExceededError``: a sender exceeded a per-hour cap. Specific by
   design — DESIGN.md does not treat rate limiting as an enumeration risk.
 
@@ -104,6 +110,33 @@ class InvalidConversationStateError(Exception):
     """A state-machine transition is not legal in the current state — either
     a message type disallowed by the conversation's state, or a
     task-status transition attempted from a terminal status."""
+
+
+class ConversationArchivedError(Exception):
+    """``comms_invite``/``comms_post_message`` (and ``comms_accept`` -- see
+    below) targeted a conversation with ``archived_at`` set (TECH-5887,
+    ``comms_archive_conversation``).
+
+    Kept distinct and specific, same reasoning as
+    ``InvalidConversationStateError``: the caller is already an authorized
+    member with legitimate access to the conversation's current archived
+    status via ``comms_get_conversation``/``comms_list_conversations``, so
+    there is nothing to enumerate by naming the real cause here.
+
+    ``comms_accept`` is deliberately included in this denial, not just
+    ``comms_invite``/``comms_post_message``: accepting a pending invite
+    admits a new ACTIVE participant into the conversation (``invited`` ->
+    ``active``, immediately granting full retroactive history read and
+    posting rights) -- the same kind of "new participant joins" event an
+    invite is, just completed by the invitee instead of the inviter. An
+    archived conversation must not gain new active participants any more
+    than it may gain new invites, so both are blocked the same way. A
+    pending invite sent before archiving is therefore left permanently
+    un-acceptable (and un-declinable is NOT true -- ``comms_decline_invite``
+    is unaffected, since declining only ever narrows access, never grants
+    it) -- see ``service.archive_conversation``'s docstring for the full
+    reasoning and the alternatives considered.
+    """
 
 
 class RateLimitExceededError(Exception):
@@ -328,6 +361,7 @@ __all__ = [
     "AgentAlreadyRegisteredError",
     "AgentRetiredError",
     "AgentSuspendedError",
+    "ConversationArchivedError",
     "DisplayNameCollisionError",
     "HoldAlreadyDecidedError",
     "HoldAwaitingAutoReviewError",

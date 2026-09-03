@@ -168,6 +168,7 @@ from exceptions import (
     AgentAlreadyRegisteredError,
     AgentRetiredError,
     AgentSuspendedError,
+    ConversationArchivedError,
     DisplayNameCollisionError,
     HoldAlreadyDecidedError,
     HoldAwaitingAutoReviewError,
@@ -599,6 +600,40 @@ async def _deny_bad_state(
     await session.commit()
     raise InvalidConversationStateError(
         f"message type '{message_type}' is not legal while the conversation is '{current_state}'"
+    )
+
+
+async def _deny_archived(
+    session: AsyncSession,
+    *,
+    actor_sub: str,
+    agent_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    action: str,
+) -> NoReturn:
+    """Audit + raise the specific (non-uniform) archived-conversation
+    denial (TECH-5887) -- see ``exceptions.ConversationArchivedError``'s
+    docstring for why this gets its own message rather than the uniform
+    ``AccessDeniedError`` or the state-machine's own
+    ``InvalidConversationStateError``. ``action`` distinguishes the call
+    site in the audit log (``denied.archived.invite`` /
+    ``denied.archived.post_message`` / ``denied.archived.accept``) --
+    unlike ``_deny_bad_state``, which records the blocked message TYPE in
+    ``detail`` instead of varying the action name, there is no message type
+    to vary on for ``invite``/``accept``, so the action name itself carries
+    which tool was blocked.
+    """
+    _audit(
+        session,
+        actor_sub=actor_sub,
+        action=action,
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+    )
+    await session.commit()
+    raise ConversationArchivedError(
+        "conversation_archived: this conversation has been archived and no longer "
+        "accepts new invites, messages, or invite acceptances"
     )
 
 
@@ -1218,6 +1253,14 @@ def _conversation_dict(conversation: Conversation) -> dict[str, Any]:
         "created_by": str(conversation.created_by),
         "expires_at": _iso(conversation.expires_at),
         "created_at": _iso(conversation.created_at),
+        # TECH-5887: independent of `state` above -- see
+        # models.Conversation.archived_at's docstring. Included in every
+        # projection that uses this helper (get_conversation,
+        # list_conversations, inbox), so a caller can always tell an
+        # archived conversation apart from an active one without a
+        # dedicated lookup.
+        "archived": conversation.archived_at is not None,
+        "archived_at": _iso(conversation.archived_at),
     }
 
 
@@ -3266,6 +3309,18 @@ async def accept_invite(
     outcome (a participant may still accept an invite that expired after
     it was sent — they simply can't post afterward, same as any other
     already-``active`` member of an expired conversation).
+
+    Also denied, with the specific ``ConversationArchivedError`` (TECH-5887),
+    if the conversation has been archived (``comms_archive_conversation``)
+    since this invite was sent. Judgment call, documented here rather than
+    left implicit: an invite accepted after archiving would admit a brand
+    new ACTIVE participant with full retroactive history read -- the exact
+    outcome archiving a conversation is meant to close off, same as a fresh
+    ``comms_invite`` -- so accept is blocked the same way rather than left
+    as a loophole. This does leave a pending invite sent before archiving
+    permanently un-acceptable (there is no path to convert it into anything
+    else); ``comms_decline_invite`` remains available since declining only
+    narrows access, never grants it.
     """
     conversation, participant = await _load_participant_for_transition(
         session,
@@ -3274,6 +3329,14 @@ async def accept_invite(
         conversation_id=conversation_id,
         required_status="invited",
     )
+    if conversation.archived_at is not None:
+        await _deny_archived(
+            session,
+            actor_sub=actor_sub,
+            agent_id=agent_id,
+            conversation_id=conversation.id,
+            action="denied.archived.accept",
+        )
     if conversation.state in ("completed", "canceled"):
         await _deny(
             session,
@@ -3527,6 +3590,14 @@ async def invite(
     ``SchemaVersionMismatchError`` if the target can't correctly interpret
     it -- closing the gap where invite could otherwise admit a participant
     incompatible with every message already in the conversation.
+
+    Raises ``ConversationArchivedError`` (TECH-5887) if the conversation has
+    been archived (``comms_archive_conversation``) -- checked before the
+    ordinary ``state != "active"`` check, and given its own specific
+    message rather than folding into ``InvalidConversationStateError``, so
+    a caller can tell "this conversation is archived" apart from "this
+    conversation reached a terminal state" even though both currently
+    block every new invite the same way.
     """
     conversation, inviter_participant = await _load_participant_for_transition(
         session,
@@ -3551,6 +3622,14 @@ async def invite(
             action="denied.invite_not_allowed",
             agent_id=inviter_agent_id,
             conversation_id=conversation.id,
+        )
+    if conversation.archived_at is not None:
+        await _deny_archived(
+            session,
+            actor_sub=actor_sub,
+            agent_id=inviter_agent_id,
+            conversation_id=conversation.id,
+            action="denied.archived.invite",
         )
     if conversation.state != "active":
         await _deny_bad_state(
@@ -3726,6 +3805,89 @@ async def leave(
     )
     await session.commit()
     return None
+
+
+async def archive_conversation(
+    session: AsyncSession,
+    *,
+    actor_sub: str,
+    agent_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+) -> Conversation:
+    """Archive a conversation: sets ``archived_at``, a whole-conversation,
+    symmetric-permission action (TECH-5887) -- distinct from ``leave``,
+    which only ever affects the CALLING participant's own row.
+
+    Any CURRENTLY ``active`` participant may archive the conversation, not
+    just its ``owner`` role or its ``created_by`` agent -- "any agent in the
+    chain" per the feature ask. Requires ``required_status="active"``, the
+    same precondition ``leave``/``post_message``/``invite`` all share: an
+    ``invited``-but-not-yet-accepted, ``left``, or ``declined`` participant
+    (or a non-participant) gets the uniform ``AccessDeniedError``, exactly
+    as any other write against this conversation would.
+
+    Idempotent: archiving an already-archived conversation is a no-op that
+    succeeds silently (returns the conversation unchanged, does NOT bump
+    ``archived_at`` to now, and writes no additional
+    ``conversation.archive`` audit row) rather than raising. This is a
+    deliberate simplicity choice, not an oversight: archiving carries no
+    parameters and has no observable side effect beyond "this conversation
+    is now archived", so a second call from a different (or the same)
+    participant discovering it's already archived has nothing useful to
+    report as an error, and an idempotent success is what lets a client
+    retry blindly on a timeout without first checking current state. A
+    denial here would also be a mild enumeration/state leak for no
+    corresponding safety benefit -- unlike, say, ``comms_invite``'s
+    ``denied.already_participant``, there is no "wrong actor" case being
+    guarded against.
+
+    No transition out of ``archived_at`` is supported (no "unarchive" tool)
+    -- v1 keeps archiving strictly one-directional, mirroring
+    ``comms_deregister_agent``'s own one-directional design (see that
+    tool's docstring). Add a reactivation path later, with its own
+    authorization gate, if a real need for one arises. A mistaken archive
+    has no in-band recovery today: every still-``invited`` participant's
+    pending invite becomes permanently un-acceptable too (see
+    ``accept_invite``'s own docstring) -- the only path forward is a fresh
+    ``comms_start_conversation``.
+
+    Deliberately does NOT touch ``conversation.state`` -- archiving is
+    orthogonal to the state machine (see ``models.Conversation.archived_at``'s
+    own docstring): an ``active`` conversation stays stored as ``active``
+    after being archived (``comms_invite``/``comms_post_message`` block on
+    ``archived_at`` directly, not by forcing a terminal state), and an
+    already-``completed``/``canceled``/``expired`` conversation may also be
+    archived (there is no precondition on ``state`` at all) since archiving
+    is purely about hiding a conversation from active use, not describing
+    how it ended.
+
+    Read paths (``comms_get_conversation``, ``comms_inbox``,
+    ``comms_list_conversations``) are completely unaffected by this call --
+    archiving is not a delete or a redaction, every past message remains
+    exactly as readable as before.
+    """
+    conversation, _participant = await _load_participant_for_transition(
+        session,
+        actor_sub=actor_sub,
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+        required_status="active",
+    )
+    if conversation.archived_at is not None:
+        # Idempotent no-op (see docstring) -- no audit row, no archived_at
+        # bump, just hand back the already-archived row.
+        await session.commit()
+        return conversation
+    conversation.archived_at = _now()
+    _audit(
+        session,
+        actor_sub=actor_sub,
+        action="conversation.archive",
+        agent_id=agent_id,
+        conversation_id=conversation.id,
+    )
+    await session.commit()
+    return conversation
 
 
 async def _enforce_message_rate_limit(
@@ -5170,7 +5332,10 @@ async def post_message(
     restricted and the sender's role doesn't match;
     ``schemas.PayloadValidationError`` if ``payload`` fails schema
     validation, or if a ``needs_clarification``'s ``about_seq`` does not
-    reference an existing prior message.
+    reference an existing prior message; ``ConversationArchivedError``
+    (TECH-5887) if the conversation has been archived
+    (``comms_archive_conversation``) -- checked first, before every other
+    gate.
     """
     sender = await _require_active_agent(session, actor_sub=actor_sub, agent_id=sender_agent_id)
     conversation, participant = await _load_participant_for_transition(
@@ -5181,6 +5346,20 @@ async def post_message(
         required_status="active",
         for_update=True,
     )
+
+    # TECH-5887: an archived conversation accepts no new messages at all --
+    # checked before every other gate (system-message-type, rate limits,
+    # state-machine legality) so a post into an archived conversation always
+    # surfaces the specific, actionable ConversationArchivedError rather
+    # than being folded into (or masked by) any of those other denials.
+    if conversation.archived_at is not None:
+        await _deny_archived(
+            session,
+            actor_sub=actor_sub,
+            agent_id=sender_agent_id,
+            conversation_id=conversation.id,
+            action="denied.archived.post_message",
+        )
 
     # An agent may never post the service-synthesized marker type directly
     # (TECH-5389 PR2 §6) -- checked early, before rate limits, so forging
@@ -6103,6 +6282,7 @@ __all__ = [
     "OwnershipClient",
     "OwnershipClientFactory",
     "accept_invite",
+    "archive_conversation",
     "audit_denied_approval_requires_interactive",
     "decide_hold",
     "decline_invite",
