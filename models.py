@@ -648,11 +648,18 @@ class ProposalHold(Base):
     hence ``proposed_by_bot_id``/``decided_by_actor_id`` are plain opaque
     identifiers here, not FKs to ``agents``.
 
-    ``kind`` is an OPEN vocabulary (e.g. ``"arc_board_change"``,
-    ``"linear_progress_update"``), deliberately NOT CHECK-constrained --
-    same convention as ``conversations.type``/``messages.type`` (see this
-    module's docstring): adding a new bot/action kind is a code change in
-    whatever validates ``action``'s shape for that kind, not a migration.
+    ``kind`` is, at the DB level, an OPEN TEXT column -- deliberately NOT
+    CHECK-constrained -- same convention as ``conversations.type``/
+    ``messages.type`` (see this module's docstring): adding a new
+    bot/action kind is a code change, not a migration.
+
+    That DB-level openness is broader than what the *service* currently
+    accepts, though: ``service._derive_proposal_priority`` raises for any
+    ``kind`` other than ``"linear_progress_update"`` -- e.g. a proposal
+    with ``kind="arc_board_change"`` will 422 at submission time even
+    though the column would happily store it. Adding a new kind requires
+    both a new ``_derive_proposal_priority`` branch and a registered judge
+    in ``_PROPOSAL_JUDGES``, not just writing the row.
 
     ``owner_sub`` is snapshotted at creation time from the proposing bot's
     verified owner claim (falling back to the agent-owner registry, same

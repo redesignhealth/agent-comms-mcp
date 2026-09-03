@@ -46,13 +46,6 @@ async def _clean_tables(engine: AsyncEngine) -> AsyncIterator[None]:
     yield
 
 
-@pytest_asyncio.fixture
-async def session(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    async with factory() as sess:
-        yield sess
-
-
 @pytest.fixture
 def session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
     return async_sessionmaker(engine, expire_on_commit=False)
@@ -338,7 +331,7 @@ class TestJudgeIntegration:
         staying pending with no judge -- this replaces the pre-S7 version
         of this test, which asserted that stays-pending-with-no-judge
         fallback."""
-        with pytest.raises(ValueError, match="no branch for kind"):
+        with pytest.raises(ValueError, match="unsupported kind"):
             await _submit(
                 session,
                 kind="arc_board_change",

@@ -460,6 +460,25 @@ class TestSubmitProposal:
         assert resp.status_code == 422
         assert "exceeds" in resp.json()["detail"]
 
+    async def test_unsupported_kind_returns_422_not_500(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        """``kind`` is an open TEXT column at the DB level, but the service
+        only admits "linear_progress_update" today (``_derive_proposal_priority``
+        raises for anything else). DESIGN.md/models.py previously advertised
+        "arc_board_change" as a valid example kind even though the service
+        never actually accepted it -- a caller following that (incorrect)
+        documentation must get a client-error 422, not an unhandled 500."""
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        body = {**_PROPOSAL_BODY, "kind": "arc_board_change"}
+        resp = await http_client.post(
+            "/proposals", json=body, headers={"Authorization": "Bearer bot-token"}
+        )
+        assert resp.status_code == 422
+
     async def test_interactive_token_with_proposal_scope_still_returns_403(
         self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
     ) -> None:

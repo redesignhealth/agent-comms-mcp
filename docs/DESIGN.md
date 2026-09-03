@@ -281,9 +281,13 @@ approval_holds id, conversation_id, sender_agent_id, target_agent_id (nullable
  `target_agent_id` is the agent being invited; approval creates a
  `participants` row instead of a `messages` row (see §9 Axis 1's free-text
  invite-approval rule and models.ApprovalHold's class docstring)
-proposal_holds id, kind (open vocabulary, e.g. "arc_board_change",
- "linear_progress_update" -- NOT CHECK-constrained, same convention as
- conversations.type/messages.type), proposed_by_bot_id (opaque, NOT an FK
+proposal_holds id, kind (at the DB level an open TEXT column -- NOT
+ CHECK-constrained, same convention as conversations.type/messages.type --
+ but narrower in practice: the service currently only admits
+ kind="linear_progress_update"; `service._derive_proposal_priority` raises
+ 422 for any other kind, so adding a new kind requires both a new
+ `_derive_proposal_priority` branch and a registered judge in
+ `_PROPOSAL_JUDGES`, not just a row insert), proposed_by_bot_id (opaque, NOT an FK
  to agents -- proposers need not be board-registered), owner_sub
  (snapshotted at creation, same convention as approval_holds.owner_sub),
  action jsonb, rationale, confidence/importance/impact(low|medium|high,
@@ -1031,8 +1035,11 @@ citation" means an `http(s)` URL whose host is `github.com` or a
 `*.slack.com` subdomain -- presence of any non-empty string is
 deliberately NOT sufficient (that gap would let a bot self-approve by
 writing an arbitrary string, including a URL on a host it fully controls,
-into either field). A `kind` with no registered judge always stays
-`"pending"`. Because dedup is scoped to the submitting bot, a bot
+into either field). Every kind that reaches the judge lookup is guaranteed
+to be `"linear_progress_update"` -- `_derive_proposal_priority` already
+raised 422 for anything else earlier in the request -- so the judge
+lookup itself can never miss; there is no live "kind with no registered
+judge" path today. Because dedup is scoped to the submitting bot, a bot
 progressively refining its OWN pending proposal by adding a valid citation
 on resubmission is expected to auto-approve on that pass -- this is a
 bot completing its own proposal, not a new escalation path.

@@ -5391,17 +5391,27 @@ async def _deny_rate_limited_proposals(session: AsyncSession, *, proposed_by_bot
     serialization, N concurrent submissions from the SAME bot that all
     observe ``count == MAX - 1`` can all pass, yielding an effective burst
     cap of ``MAX + N - 1`` instead of ``MAX``. ``pg_advisory_xact_lock``,
-    keyed via the two-argument form with a fixed namespace tag (``1``) plus
-    a hash of ``proposed_by_bot_id`` -- extremely unlikely to collide with
-    any other advisory-lock use, e.g. migrations/env.py's
-    migration-serialization lock, which uses the single-argument form and
-    therefore a disjoint keyspace -- is held for the rest of THIS
-    transaction -- i.e. through the count-check and the attempt-marker
+    keyed via the single-argument form with a hash of
+    ``proposed_by_bot_id`` -- extremely unlikely to collide with any other
+    advisory-lock use, e.g. migrations/env.py's migration-serialization
+    lock, which uses a fixed key (``0x5245434C``) -- is held for the rest of
+    THIS transaction -- i.e. through the count-check and the attempt-marker
     commit that follows it -- so concurrent submissions from the same bot
     serialize around the rate-limit check instead of racing it. Different
-    bots never contend with each other (different hash keys)."""
+    bots never contend with each other (different hash keys).
+
+    A two-argument form (``pg_advisory_xact_lock(1, hashtext(...))``) was
+    considered in an earlier round, on the theory that it would avoid a
+    keyspace collision with the migration's lock. That collision never
+    actually existed -- the migration's key is disjoint regardless of which
+    form this uses -- and the two-argument form changes the internal
+    Postgres LOCKTAG, so during a rolling deploy an old-code instance and a
+    new-code instance acquire genuinely different locks for the same
+    ``proposed_by_bot_id``, reopening this exact TOCTOU race for the whole
+    deploy window. Rejected for that reason; stick with the single-argument
+    form."""
     await session.execute(
-        text("SELECT pg_advisory_xact_lock(1, hashtext('proposal_rate_limit:' || :bot_id))"),
+        text("SELECT pg_advisory_xact_lock(hashtext('proposal_rate_limit:' || :bot_id))"),
         {"bot_id": proposed_by_bot_id},
     )
     window_start = _now() - PROPOSAL_RATE_LIMIT_WINDOW
@@ -5468,7 +5478,8 @@ def _derive_proposal_priority(kind: str, action: dict[str, Any]) -> str:
         if action_type == "open_ticket":
             return "medium"
         return "low"
-    raise ValueError(f"_derive_proposal_priority: no branch for kind={kind!r}")
+    logger.warning("_derive_proposal_priority: no branch for kind=%r", kind)
+    raise ValueError(f"unsupported kind: {kind!r}")
 
 
 # TECH-5877: exactly two auto-approval rules, scoped to
@@ -5769,8 +5780,12 @@ async def create_proposal(
     or elsewhere is never trusted or persisted as ``priority``.
 
     Immediately after the row is inserted/updated, runs the TECH-5877
-    kind-scoped judge (``_PROPOSAL_JUDGES``) exactly once. A ``kind`` with
-    no registered judge stays ``"pending"``. The judge only ever sets
+    kind-scoped judge (``_PROPOSAL_JUDGES``) exactly once. Every ``kind``
+    that reaches this point is guaranteed to be ``"linear_progress_update"``
+    -- ``_derive_proposal_priority`` above already raised (422) for any
+    other kind, so the judge lookup here can never miss; there is no live
+    "kind with no registered judge stays pending" path today. The judge
+    only ever sets
     ``status``/``decision_source``/``decided_by_actor_id``/``decided_at``/
     ``decision_note`` -- it never executes the underlying write (that is
     TECH-5873's concern, not yet built). Note: once B1 lands, a SAME-bot
@@ -5810,15 +5825,17 @@ async def create_proposal(
         target_fingerprint=target_fingerprint,
     )
 
-    judge = _PROPOSAL_JUDGES.get(kind)
-    if judge is not None:
-        judged_status, decision_note = judge(hold.action)
-        if judged_status == "approved" and hold.status == "pending":
-            hold.status = "approved"
-            hold.decision_source = "auto"
-            hold.decided_by_actor_id = _PROPOSAL_JUDGE_DECIDED_BY
-            hold.decided_at = _now()
-            hold.decision_note = decision_note
+    # Reaching this point guarantees kind == "linear_progress_update":
+    # _derive_proposal_priority above already raised for every other kind,
+    # so the lookup below is guaranteed to hit (no "kind with no registered
+    # judge" path is actually reachable -- see this function's docstring).
+    judged_status, decision_note = _PROPOSAL_JUDGES[kind](hold.action)
+    if judged_status == "approved" and hold.status == "pending":
+        hold.status = "approved"
+        hold.decision_source = "auto"
+        hold.decided_by_actor_id = _PROPOSAL_JUDGE_DECIDED_BY
+        hold.decided_at = _now()
+        hold.decision_note = decision_note
 
     await session.commit()
     # Refresh so server-defaulted columns (created_at/updated_at on a fresh
