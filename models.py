@@ -469,6 +469,14 @@ class AuditLog(Base):
     __table_args__ = (
         Index("idx_audit_log_conversation_id", "conversation_id"),
         Index("idx_audit_log_at", "at"),
+        # Backs service._deny_rate_limited_proposals's per-bot rate-limit
+        # COUNT query -- see migration 9a1c2d3e4f5b's docstring for why the
+        # rate-limit count lives on this append-only log rather than on
+        # proposal_holds itself. Built CONCURRENTLY in that migration (B2);
+        # declared here as a normal Index like every other index in this
+        # file -- postgresql_concurrently is a migration-time build detail,
+        # not part of the index's identity that autogenerate compares on.
+        Index("idx_audit_log_actor_sub_action_at", "actor_sub", "action", "at"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -706,6 +714,24 @@ class ProposalHold(Base):
         Index(
             "idx_proposal_holds_owner_sub_status_created_at", "owner_sub", "status", "created_at"
         ),
+        # DB-level backstop for the create-time dedup app-level SELECT in
+        # service.create_proposal / service._proposal_dedup_where uses --
+        # see migration 9a1c2d3e4f5b's own docstring for the full B1/B2
+        # rationale. Declared here too so a future
+        # `alembic revision --autogenerate` doesn't propose dropping it.
+        Index(
+            "idx_proposal_holds_pending_dedup",
+            text("kind"),
+            text("proposed_by_bot_id"),
+            text("action->>'target_id'"),
+            text("action->>'action_type'"),
+            postgresql_where=text("status = 'pending'"),
+            unique=True,
+        ),
+        # Backs proposed_by_bot_id-scoped lookups (an ops/observability
+        # query, or a future per-bot listing) -- see migration
+        # 9a1c2d3e4f5b's docstring (S1).
+        Index("idx_proposal_holds_bot_id_created_at", "proposed_by_bot_id", "created_at"),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()

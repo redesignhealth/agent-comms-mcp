@@ -308,7 +308,7 @@ proposal_holds id, kind (open vocabulary, e.g. "arc_board_change",
  TECH-5871; `POST /proposals` (submission), `GET /proposals/pending`
  (listing), per-bot rate limiting, and the deterministic auto-approval
  judge shipped as the follow-on TECH-5872/TECH-5875/TECH-5877 (see "The
- proposal submission endpoint" below)
+ proposal submission pipeline" below)
 ```
 
 Design notes:

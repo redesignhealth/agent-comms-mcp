@@ -149,7 +149,7 @@ class ConversationArchivedError(Exception):
 
 
 class RateLimitExceededError(Exception):
-    """A sender exceeded a per-hour rate limit. Message is specific by design."""
+    """A sender exceeded a rolling-window rate limit. Message is specific by design."""
 
     def __init__(self, message: str, *, reason: str) -> None:
         super().__init__(message)

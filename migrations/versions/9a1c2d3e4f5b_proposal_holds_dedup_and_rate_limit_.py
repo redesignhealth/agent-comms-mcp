@@ -1,7 +1,7 @@
 """proposal_holds dedup unique index + rate-limit indexes
 
 Revision ID: 9a1c2d3e4f5b
-Revises: d23b37d4e187
+Revises: f1a2b3c4d5e6
 Create Date: 2026-09-03 00:00:00.000001
 
 TECH-5872/5875 (Argus review, B1/B2/S1): closes two gaps in the create-time
@@ -43,14 +43,37 @@ revision (only ``conversation_id`` and ``at``), so
 ``_deny_rate_limited_proposals`` would otherwise full-scan a table every
 mutation and denial in the service ever writes to.
 
-DEPLOYMENT: safe for a normal rolling deploy -- purely additive (two new
-indexes on an existing, currently-empty-in-production table; one new index
-on ``audit_log``), same reasoning as every other purely-additive migration
-in this directory. The partial unique index CAN fail to build if
-``proposal_holds`` already has a real duplicate under the new key by the
-time this runs in a real deployment -- vanishingly unlikely (this table has
-no readers/writers on `main` before this PR), but see a45f344c9c00's own
-DEPLOYMENT note for the general shape of that risk.
+DEPLOYMENT: NOT safe for a simultaneous/rolling deploy of migration+app
+together. ``idx_proposal_holds_pending_dedup`` is the DB-level backstop
+that ``POST /proposals`` (``service.create_proposal`` /
+``_dedup_or_insert_proposal``) depends on for its race-safety guarantee --
+if application containers capable of serving ``POST /proposals`` are
+rolled out before (or concurrently with) this migration, duplicate
+pending rows can be inserted while the index doesn't yet exist, and the
+later ``CREATE UNIQUE INDEX`` will then fail permanently on those
+duplicates (requiring a manual data fixup before it can ever build). This
+migration MUST run to completion BEFORE any application container that
+can serve ``POST /proposals`` is deployed.
+
+The two ``proposal_holds`` indexes and the ``audit_log`` index are
+otherwise purely additive (no column/table changes), but the
+``idx_audit_log_actor_sub_action_at`` index is built with
+``postgresql_concurrently=True`` (see ``upgrade()``) specifically because
+``audit_log`` is written on every tool call/mutation/denial in this
+service -- a plain, lock-taking ``CREATE INDEX`` would hold
+``ACCESS EXCLUSIVE`` for the full build and stall all of those writes for
+the deploy window. Concurrent index builds cannot run inside a
+transaction, so ``upgrade()`` drops out of the ambient migration
+transaction via ``op.get_context().autocommit_block()`` for that one
+statement, mirroring the only non-transactional pattern this repo's
+migration history has needed so far. Building a concurrent index while
+holding ``migrations/env.py``'s ``pg_advisory_xact_lock`` is inherently
+awkward: the autocommit block's implicit ``COMMIT`` releases that lock for
+its duration, so a second ``alembic upgrade head`` invocation started at
+exactly the wrong moment is not fully serialized against this one for
+this specific statement. Acceptable here because Alembic migrations are
+run from a single deploy step, not from arbitrarily many concurrent
+callers, but worth knowing if this pattern is copied elsewhere.
 """
 
 from __future__ import annotations
@@ -61,7 +84,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "9a1c2d3e4f5b"
-down_revision: str | None = "d23b37d4e187"
+down_revision: str | None = "f1a2b3c4d5e6"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -87,17 +110,28 @@ def upgrade() -> None:
         unique=False,
         if_not_exists=True,
     )
-    op.create_index(
-        "idx_audit_log_actor_sub_action_at",
-        "audit_log",
-        ["actor_sub", "action", "at"],
-        unique=False,
-        if_not_exists=True,
-    )
+    # CONCURRENTLY cannot run inside a transaction; drop out of the ambient
+    # migration transaction for this one statement (see DEPLOYMENT note
+    # above) and let Alembic re-open a transaction afterward.
+    with op.get_context().autocommit_block():
+        op.create_index(
+            "idx_audit_log_actor_sub_action_at",
+            "audit_log",
+            ["actor_sub", "action", "at"],
+            unique=False,
+            if_not_exists=True,
+            postgresql_concurrently=True,
+        )
 
 
 def downgrade() -> None:
-    op.drop_index("idx_audit_log_actor_sub_action_at", table_name="audit_log", if_exists=True)
+    with op.get_context().autocommit_block():
+        op.drop_index(
+            "idx_audit_log_actor_sub_action_at",
+            table_name="audit_log",
+            if_exists=True,
+            postgresql_concurrently=True,
+        )
     op.drop_index(
         "idx_proposal_holds_bot_id_created_at", table_name="proposal_holds", if_exists=True
     )

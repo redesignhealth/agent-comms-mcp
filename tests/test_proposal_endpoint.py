@@ -19,10 +19,12 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 import pytest_asyncio
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from starlette.applications import Starlette
 from starlette.routing import Route
+
+from models import AuditLog
 
 # Real-Postgres fixtures (database_url, _migrated_schema, engine) are shared
 # via tests/conftest.py (Argus review S15) -- this module opts in explicitly
@@ -42,6 +44,13 @@ async def _clean_tables(engine: AsyncEngine) -> AsyncIterator[None]:
 @pytest.fixture
 def test_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
     return async_sessionmaker(engine, expire_on_commit=False)
+
+
+@pytest_asyncio.fixture
+async def session(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with factory() as sess:
+        yield sess
 
 
 _MOCK_OIDC_CONFIG = MagicMock()
@@ -199,6 +208,35 @@ class TestSubmitAuthGate:
             "/proposals", json=_PROPOSAL_BODY, headers={"Authorization": "Bearer human-token"}
         )
         assert resp.status_code == 403
+
+    async def test_interactive_token_rejection_is_audited(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        """Mirrors test_approval_endpoint.py's
+        test_agent_jwt_rejection_is_audited, for the opposite gate: an
+        interactive/Okta caller on the bot-submission-only POST /proposals
+        route is denied and the denial is audited (Argus review S4)."""
+        http_client, provider = client
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+        resp = await http_client.post(
+            "/proposals", json=_PROPOSAL_BODY, headers={"Authorization": "Bearer human-token"}
+        )
+        assert resp.status_code == 403
+
+        rows = (
+            (
+                await session.execute(
+                    select(AuditLog.action).where(
+                        AuditLog.action == "denied.proposal_submit_not_agent_token"
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert rows
 
     async def test_agent_jwt_without_required_scope_returns_403(
         self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
@@ -392,6 +430,50 @@ class TestSubmitProposal:
         )
         assert resp.status_code == 429
 
+    async def test_rate_limit_exceeded_is_audited(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        import service
+
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        for i in range(service.MAX_PROPOSALS_PER_BOT_PER_WINDOW):
+            body = {
+                **_PROPOSAL_BODY,
+                "action": {**_PROPOSAL_BODY["action"], "target_id": f"TECH-{i}"},
+            }
+            resp = await http_client.post(
+                "/proposals", json=body, headers={"Authorization": "Bearer bot-token"}
+            )
+            assert resp.status_code == 200
+
+        body = {
+            **_PROPOSAL_BODY,
+            "action": {
+                **_PROPOSAL_BODY["action"],
+                "target_id": f"TECH-{service.MAX_PROPOSALS_PER_BOT_PER_WINDOW}",
+            },
+        }
+        resp = await http_client.post(
+            "/proposals", json=body, headers={"Authorization": "Bearer bot-token"}
+        )
+        assert resp.status_code == 429
+
+        rows = (
+            (
+                await session.execute(
+                    select(AuditLog.action).where(AuditLog.action == "denied.proposal_rate_limited")
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert rows
+
 
 class TestListPendingAuthGate:
     async def test_missing_token_returns_401(
@@ -414,6 +496,34 @@ class TestListPendingAuthGate:
             "/proposals/pending", headers={"Authorization": "Bearer agent-token"}
         )
         assert resp.status_code == 403
+
+    async def test_agent_jwt_rejection_is_audited(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        """Mirrors test_approval_endpoint.py's own test of the same name
+        (Argus review S4): a bot's agent-jwt token on the interactive-only
+        GET /proposals/pending route is denied and the denial is audited."""
+        http_client, provider = client
+        provider.tokens["agent-token"] = _agent_jwt_token("some-bot")
+        resp = await http_client.get(
+            "/proposals/pending", headers={"Authorization": "Bearer agent-token"}
+        )
+        assert resp.status_code == 403
+
+        rows = (
+            (
+                await session.execute(
+                    select(AuditLog.action).where(
+                        AuditLog.action == "denied.proposals_requires_interactive"
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert rows
 
 
 class TestListPendingProposals:

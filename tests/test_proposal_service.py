@@ -15,10 +15,12 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
 from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from exceptions import RateLimitExceededError
@@ -49,6 +51,11 @@ async def session(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
     factory = async_sessionmaker(engine, expire_on_commit=False)
     async with factory() as sess:
         yield sess
+
+
+@pytest.fixture
+def session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
+    return async_sessionmaker(engine, expire_on_commit=False)
 
 
 def _action(
@@ -182,6 +189,68 @@ class TestDedup:
     async def test_missing_action_type_raises_value_error(self, session: AsyncSession) -> None:
         with pytest.raises(ValueError):
             await _submit(session, action={"target_id": "TECH-1"})
+
+    async def test_integrity_error_race_falls_back_to_select_and_update(
+        self,
+        session: AsyncSession,
+        session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """B2's race-recovery path (Argus review S5): a concurrent bot wins
+        the INSERT for the same dedup key between this session's initial
+        SELECT (miss) and its own INSERT attempt, so ``session.flush()``
+        raises ``IntegrityError`` on ``idx_proposal_holds_pending_dedup``.
+        Mocks ``session.flush`` to simulate exactly that race (inserting
+        and committing the "winning" row via a second, real session inside
+        the mock, then raising the same shape of ``IntegrityError``
+        ``_is_constraint_violation`` inspects) rather than relying on
+        genuine concurrency timing, so this test is deterministic."""
+        winning_row_id: dict[str, Any] = {}
+
+        async def _insert_via_second_session() -> ProposalHold:
+            async with session_factory() as other:
+                winner = await create_proposal(
+                    other,
+                    kind="linear_progress_update",
+                    proposed_by_bot_id="bot-1",
+                    owner_sub="owner-a@example.com",
+                    action=_action(target_id="TECH-race"),
+                    rationale="winning rationale",
+                    confidence="medium",
+                    importance="medium",
+                    impact="medium",
+                    target_fingerprint="fp-winner",
+                )
+                return winner
+
+        real_flush = session.flush
+        call_count = {"n": 0}
+
+        async def _flush_raising_once() -> None:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                winner = await _insert_via_second_session()
+                winning_row_id["id"] = winner["proposal_id"]
+                cause = Exception()
+                cause.constraint_name = "idx_proposal_holds_pending_dedup"  # type: ignore[attr-defined]
+                orig = Exception()
+                orig.__cause__ = cause
+                raise IntegrityError("duplicate key", params=None, orig=orig)
+            await real_flush()
+
+        monkeypatch.setattr(session, "flush", AsyncMock(side_effect=_flush_raising_once))
+
+        result = await _submit(
+            session,
+            action=_action(target_id="TECH-race"),
+            rationale="loser rationale",
+            target_fingerprint="fp-loser",
+        )
+
+        assert result["proposal_id"] == winning_row_id["id"]
+        assert result["rationale"] == "loser rationale"
+        rows = (await session.execute(select(ProposalHold))).scalars().all()
+        assert len(rows) == 1
 
 
 class TestServerDerivedPriority:

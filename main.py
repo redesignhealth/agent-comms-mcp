@@ -420,6 +420,15 @@ async def _authenticate_approval_caller(
 
 
 _MAX_PROPOSAL_STRING_FIELD_LENGTH = 4000
+# Argus review S1: `kind` is a category label (e.g. "linear_progress_update"),
+# not free text -- a much lower cap than the general string-field cap above.
+_MAX_PROPOSAL_KIND_LENGTH = 200
+# Argus review S2: `action` is an arbitrary JSONB payload with no size/depth
+# limit otherwise -- bound its serialized size, and separately cap the two
+# sub-fields used as dedup keys (target_id/action_type) since an oversized
+# value there would otherwise flow straight into the DB-level dedup index.
+_MAX_PROPOSAL_ACTION_BYTES = 16_384
+_MAX_PROPOSAL_ACTION_FIELD_LENGTH = 500
 
 
 async def _verify_agent_token(token_str: str) -> Any | None:
@@ -437,6 +446,7 @@ async def _verify_agent_token(token_str: str) -> Any | None:
         try:
             result = await verifier.verify_token(token_str)
         except Exception:
+            logger.warning("agent token verifier %r raised unexpectedly", verifier, exc_info=True)
             continue
         if result is not None:
             return result
@@ -531,11 +541,13 @@ def _resolve_proposal_owner_sub(token: Any) -> str | None:
     return value
 
 
-def _validate_proposal_string_field(name: str, value: Any) -> str:
+def _validate_proposal_string_field(
+    name: str, value: Any, *, max_length: int = _MAX_PROPOSAL_STRING_FIELD_LENGTH
+) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{name} is required and must be a non-empty string")
-    if len(value) > _MAX_PROPOSAL_STRING_FIELD_LENGTH:
-        raise ValueError(f"{name} exceeds {_MAX_PROPOSAL_STRING_FIELD_LENGTH} characters")
+    if len(value) > max_length:
+        raise ValueError(f"{name} exceeds {max_length} characters")
     return value
 
 
@@ -555,8 +567,12 @@ async def submit_proposal(request: Request) -> Response:
 
     Rate-limited per bot (TECH-5875, 429 on rejection, logged for
     operational visibility). Deduplicates against an existing
-    ``status='pending'`` row matching ``(kind, target_id, action_type)`` by
-    updating it in place instead of inserting a duplicate (TECH-5872).
+    ``status='pending'`` row matching ``(kind, proposed_by_bot_id,
+    target_id, action_type)`` by updating it in place instead of inserting
+    a duplicate (TECH-5872) -- scoped to the submitting bot (Argus review
+    B1): a different bot proposing the same ``(kind, target_id,
+    action_type)`` gets its own row, never silently overwrites another
+    bot's pending proposal.
     Immediately judged by the TECH-5877 kind-scoped deterministic rules
     engine -- ``priority`` is always server-derived, never caller-supplied.
     """
@@ -571,19 +587,28 @@ async def submit_proposal(request: Request) -> Response:
     if not isinstance(body, dict):
         return JSONResponse({"error": "invalid_body"}, status_code=422)
 
-    kind = body.get("kind")
     action = body.get("action")
-    if not isinstance(kind, str) or not kind:
-        return JSONResponse(
-            {
-                "error": "invalid_request",
-                "detail": "kind is required and must be a non-empty string",
-            },
-            status_code=422,
+    try:
+        kind = _validate_proposal_string_field(
+            "kind", body.get("kind"), max_length=_MAX_PROPOSAL_KIND_LENGTH
         )
+    except ValueError as exc:
+        return JSONResponse({"error": "invalid_request", "detail": str(exc)}, status_code=422)
     if not isinstance(action, dict):
         return JSONResponse(
             {"error": "invalid_request", "detail": "action is required and must be an object"},
+            status_code=422,
+        )
+    # Argus review S2: `action` is an arbitrary caller-supplied JSONB blob
+    # with no size/depth limit otherwise -- bound its serialized size, and
+    # separately cap target_id/action_type since they flow straight into
+    # the DB-level dedup index (idx_proposal_holds_pending_dedup).
+    if len(json.dumps(action)) > _MAX_PROPOSAL_ACTION_BYTES:
+        return JSONResponse(
+            {
+                "error": "invalid_request",
+                "detail": f"action exceeds {_MAX_PROPOSAL_ACTION_BYTES} bytes serialized",
+            },
             status_code=422,
         )
     try:
@@ -591,6 +616,13 @@ async def submit_proposal(request: Request) -> Response:
         target_fingerprint = _validate_proposal_string_field(
             "target_fingerprint", body.get("target_fingerprint")
         )
+        for action_field in ("target_id", "action_type"):
+            if action_field in action:
+                _validate_proposal_string_field(
+                    f"action.{action_field}",
+                    action.get(action_field),
+                    max_length=_MAX_PROPOSAL_ACTION_FIELD_LENGTH,
+                )
     except ValueError as exc:
         return JSONResponse({"error": "invalid_request", "detail": str(exc)}, status_code=422)
 

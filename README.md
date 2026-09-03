@@ -284,10 +284,15 @@ agent-comms-mcp-mint-token --sub ea-agent-svc --scopes "comms:read comms:write" 
 # Self-owned agent (no human principal)
 agent-comms-mcp-mint-token --sub notifier-bot --scopes comms:write --self-owned
 
-# A bot submitting proposals via POST /proposals (TECH-5872) -- self-owned
-# here, but --owner-email works the same way for a human-owned proposer.
+# A bot submitting proposals via POST /proposals (TECH-5872) -- MUST be
+# human-owned via --owner-email, NOT --self-owned. --self-owned leaves
+# owner_sub unresolvable (POST /proposals returns 422), and even for an
+# already-registered self-owned bot, its proposals would be permanently
+# invisible via GET /proposals/pending, which scopes to the CALLER's own
+# Okta sub, not to a bot's -- a proposal-submitting bot's owner_sub must
+# resolve to an Okta identity that can actually call that endpoint.
 agent-comms-mcp-mint-token --sub linear-progress-bot \
-  --scopes comms:proposals:write --self-owned
+  --scopes comms:proposals:write --owner-email alice@example.com
 ```
 
 `--owner-email`/`--self-owned` are mutually exclusive and one is required:

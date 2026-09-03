@@ -160,7 +160,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, NoReturn, Protocol
 from urllib.parse import urlsplit
 
-from sqlalchemy import and_, func, literal, or_, select, tuple_
+from sqlalchemy import and_, func, literal, or_, select, text, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -4766,6 +4766,17 @@ async def audit_denied_approval_requires_interactive(
     await session.commit()
 
 
+# Argus review S10: ``reason`` is interpolated directly into the audit
+# action string below, and this function is exported in __all__, so an
+# unchecked arbitrary str could write an arbitrary ``denied.proposal_submit_*``
+# action name into the audit log. Allowlisted the same way
+# ``validate_hold_level`` allowlists its own membership check --
+# "not_agent_token"/"missing_scope" are the two 403 causes in
+# ``main._authenticate_proposal_submitter``; "rate_limited" covers the
+# rate-limit denial path for callers that route through this function.
+ALLOWED_DENIAL_REASONS = frozenset({"not_agent_token", "missing_scope", "rate_limited"})
+
+
 async def audit_denied_proposal_submission(
     session: AsyncSession, *, actor_sub: str, reason: str
 ) -> None:
@@ -4778,6 +4789,7 @@ async def audit_denied_proposal_submission(
     ``audit_denied_approval_requires_interactive`` above -- there is nothing
     to raise, only an audit row to persist.
     """
+    assert reason in ALLOWED_DENIAL_REASONS, f"unexpected denial reason: {reason!r}"
     _audit(session, actor_sub=actor_sub, action=f"denied.proposal_submit_{reason}")
     await session.commit()
 
@@ -5367,7 +5379,25 @@ async def _deny_rate_limited_proposals(session: AsyncSession, *, proposed_by_bot
     (``AuditLog.agent_id`` is a real FK), so the denial audit row carries
     only ``actor_sub`` -- no ``agent_id`` (Argus review S5: this denial
     previously wasn't audited at all, only logged in main.py's route
-    handler, which still happens for operational visibility)."""
+    handler, which still happens for operational visibility).
+
+    Argus review S6 (TOCTOU): the COUNT below and the attempt-marker INSERT
+    (``create_proposal``'s caller-side ``_audit`` + ``commit`` immediately
+    after this returns) happen in separate statements -- without
+    serialization, N concurrent submissions from the SAME bot that all
+    observe ``count == MAX - 1`` can all pass, yielding an effective burst
+    cap of ``MAX + N - 1`` instead of ``MAX``. ``pg_advisory_xact_lock``,
+    keyed on a hash of ``proposed_by_bot_id`` (namespaced so it can't
+    collide with any other advisory-lock use, e.g. migrations/env.py's
+    migration-serialization lock), is held for the rest of THIS
+    transaction -- i.e. through the count-check and the attempt-marker
+    commit that follows it -- so concurrent submissions from the same bot
+    serialize around the rate-limit check instead of racing it. Different
+    bots never contend with each other (different hash keys)."""
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(hashtext('proposal_rate_limit:' || :bot_id))"),
+        {"bot_id": proposed_by_bot_id},
+    )
     window_start = _now() - PROPOSAL_RATE_LIMIT_WINDOW
     count = (
         await session.execute(
@@ -5428,6 +5458,9 @@ def _derive_proposal_priority(kind: str, action: dict[str, Any]) -> str:
         if action_type == "open_ticket":
             return "medium"
         return "low"
+    logger.warning(
+        "_derive_proposal_priority: no explicit branch for kind=%r, defaulting to medium", kind
+    )
     return "medium"
 
 
@@ -5743,13 +5776,16 @@ async def create_proposal(
     validate_hold_level(confidence, "confidence")
     validate_hold_level(importance, "importance")
     validate_hold_level(impact, "impact")
+    # Argus review S3: pure validation must happen BEFORE the rate-limit
+    # attempt marker is audited + committed below -- otherwise a malformed
+    # (but authenticated) request that fails here still burns a rate-limit
+    # slot before ever reaching a 422.
+    target_id, action_type = _extract_proposal_target(action)
+    priority = _derive_proposal_priority(kind, action)
 
     await _deny_rate_limited_proposals(session, proposed_by_bot_id=proposed_by_bot_id)
     _audit(session, actor_sub=proposed_by_bot_id, action=_PROPOSAL_SUBMISSION_ATTEMPT_ACTION)
     await session.commit()
-
-    target_id, action_type = _extract_proposal_target(action)
-    priority = _derive_proposal_priority(kind, action)
 
     hold = await _dedup_or_insert_proposal(
         session,
@@ -6817,6 +6853,7 @@ async def reconcile_agent_ownership(
 
 
 __all__ = [
+    "ALLOWED_DENIAL_REASONS",
     "APPROVAL_HOLD_TTL",
     "CONVERSATION_TTL",
     "DEFAULT_OWNERSHIP_CLIENT",
