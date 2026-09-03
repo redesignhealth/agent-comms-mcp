@@ -240,7 +240,7 @@ agents id, sub UNIQUE, owner_sub, owner_email, display_name,
  bound_at, timestamps
 conversations id, type, state(active|completed|canceled|expired),
  created_by, expires_at, owner_snapshot jsonb (nullable),
- timestamps
+ archived_at (nullable timestamptz, TECH-5887 -- see below), timestamps
 participants (conversation_id, agent_id) UNIQUE, role(owner|member),
  status(invited|active|left|declined), invited_by, invited_at,
  joined_at (set on accept), last_read_seq
@@ -397,6 +397,49 @@ Design notes:
  own agent happens to be suspended can still deregister someone else; it is a
  deliberate, narrow exception (admin authorization here rides on the token's scope/
  interactive-caller status, not on the admin's own `agents.status`), not a bug.
+- **Archiving a conversation (`comms_archive_conversation`, TECH-5887)**: sets
+ `conversations.archived_at`, a whole-conversation action symmetric across
+ every CURRENTLY `active` participant -- not gated to the conversation's
+ `owner` role or its `created_by` agent, unlike, say, tightenable `invite`
+ policy (§10/`may_invite`). Deliberately orthogonal to `state`/
+ `CONVERSATION_STATES`, not a fifth state value in that CHECK constraint: a
+ conversation can be archived while `active`, `completed`, `canceled`, or
+ `expired`, and archiving never runs a `resulting_conversation_state`
+ transition or interacts with `is_message_legal` (§4's state machine).
+ Only two things key off `archived_at`:
+
+  - `comms_invite`, `comms_post_message`, and `comms_accept` all deny with
+    the specific `ConversationArchivedError` (`conversation_archived`) once
+    it is set -- not the uniform `AccessDeniedError`, and not folded into
+    `InvalidConversationStateError`, since the caller already has
+    legitimate read access to the conversation and there is nothing to
+    enumerate by naming the real cause (same non-enumeration reasoning as
+    `InvalidConversationStateError` itself, exceptions.py). `comms_accept`
+    is included alongside the two write tools by deliberate judgment call:
+    accepting a pending invite admits a brand-new ACTIVE participant with
+    full retroactive history read, the same kind of event a fresh invite
+    is, just completed by the invitee -- so a pending invite sent BEFORE
+    archiving becomes permanently un-acceptable once the conversation is
+    archived. `comms_decline_invite` is deliberately UNAFFECTED (declining
+    only ever narrows access, never grants it), so a stale pending invite
+    on an archived conversation can still be cleanly declined, just not
+    accepted.
+  - Every read path (`comms_get_conversation`, `comms_inbox`,
+    `comms_list_conversations`, via the shared `service._conversation_dict`
+    projection) is completely UNAFFECTED -- archiving is not a delete or a
+    redaction; every past message stays exactly as readable as before, and
+    every projection gains `"archived"`/`"archived_at"` fields so a caller
+    can always tell.
+
+ Idempotent: archiving an already-archived conversation succeeds silently
+ (no error, no audit row, `archived_at` NOT bumped to now) rather than
+ raising -- the simplest, safest default given archiving takes no
+ parameters and has no state to disagree about across two callers. One-
+ directional by design, mirroring `comms_deregister_agent`'s own
+ one-directional shape (§5 above): there is no "unarchive" tool in v1, so a
+ mistaken archive has no in-band recovery -- add a reactivation path later,
+ with its own authorization gate, if a real need for one arises.
+
 - **On-behalf-of registration (`comms_admin_register`)**: `comms_register` always
  derives `sub` from the CALLING token's own verified identity (§4's "owner
  identity ... never accepted as a parameter" invariant) -- by design, nothing can
@@ -541,15 +584,16 @@ scroll-to-load-more use case.
 | `comms_list_agents` | comms:read | directory (internal domain, enumeration acceptable). Returns agent UUIDs used as target identifiers in other tools. A registry-retired agent (`ACTIVE_CHECKER` seam, TECH-5703, §"Configuration: pluggable seams") is excluded from results, though its row is never deleted; `total_count` still reflects every board-registered agent regardless of retirement status. Retirement is filtered AFTER pagination is computed from the raw rows, so a page can return fewer than `limit` agents (including zero) while `has_more` is still `true` -- callers must page until `has_more` is `false`, not until `agents` is empty |
 | `comms_lookup_agent_by_email` | comms:read | directory lookup by owner email; `{"agent": ..., "found": bool}`. O(1) targeted equivalent of paginating `comms_list_agents` -- see §10's enumeration-posture note. A registry-retired agent resolves to the same not-found shape as an unregistered email (TECH-5703) |
 | `comms_start_conversation` | comms:write | type + up to 50 target agent UUIDs (from `comms_list_agents`) + initial request payload. **Two response shapes** (TECH-5389): the normal conversation-created shape, or (if the opener was high-risk) that same shape plus a `held_for_approval`/`hold_id`/`hold_status`/`risk_reason` block (plus `decision_url` when `DECISION_PAGE_BASE_URL` is configured) — the conversation is created anyway, opened with a service-synthesized `conversation_opened` marker at seq 1, and the real content is held (§9). A registry-retired target (TECH-5703) raises a specific "agent retired" error instead of the uniform unknown-agent denial |
-| `comms_post_message` | comms:write | typed, schema-validated, state-machine-checked. **Two response shapes**: the normal posted-message shape (unchanged; gains `auto_approved`/`hold_id` if a configured auto-approver cleared a high-risk send inline), or `{"held_for_approval": true, "hold_id", "conversation_id", "status", "risk_reason", "expires_at", "created_at"}` (plus `decision_url` when `DECISION_PAGE_BASE_URL` is configured) -- not an error -- when the send is diverted to a hold (§9). Optional `review_reason` (max 2000 chars, TECH-5786) forces the held shape unconditionally, overriding the `RiskScorer` verdict (including in `internal` conversations, which otherwise never reach a hold) -- the hold's `risk_reason` becomes `"agent_requested"`, distinct from every scorer-produced value so it can never be auto-cleared by an `AutoApprover` rule that special-cases `"boundary_crossing"`; the reason string itself is recorded in the audit log, not on the hold/status response |
+| `comms_post_message` | comms:write | typed, schema-validated, state-machine-checked. **Two response shapes**: the normal posted-message shape (unchanged; gains `auto_approved`/`hold_id` if a configured auto-approver cleared a high-risk send inline), or `{"held_for_approval": true, "hold_id", "conversation_id", "status", "risk_reason", "expires_at", "created_at"}` (plus `decision_url` when `DECISION_PAGE_BASE_URL` is configured) -- not an error -- when the send is diverted to a hold (§9). Optional `review_reason` (max 2000 chars, TECH-5786) forces the held shape unconditionally, overriding the `RiskScorer` verdict (including in `internal` conversations, which otherwise never reach a hold) -- the hold's `risk_reason` becomes `"agent_requested"`, distinct from every scorer-produced value so it can never be auto-cleared by an `AutoApprover` rule that special-cases `"boundary_crossing"`; the reason string itself is recorded in the audit log, not on the hold/status response. Rejects with the specific `conversation_archived` error (TECH-5887, see `comms_archive_conversation`'s own row) if the conversation has been archived, checked before every conversation-level gate (state, rate limits, message legality) |
 | `comms_get_hold_status` | comms:read | poll a held message OR invite's approval status (`kind`: `message`/`invite`, TECH-5735); sender-only (uniform `access_denied` otherwise -- for an invite hold, "sender" is the INVITER). Returns status, risk_reason (this row names only the TECH-5786-relevant values -- `"boundary_crossing"`, `"note_history_requires_approval"`, and, per TECH-5786, `"agent_requested"` when the sender forced the hold via `comms_post_message`'s `review_reason` rather than a genuine scorer verdict; see §5's `audit_log` row for the complete set including `"open_conversation"`), timestamps, and (once decided) `decision_reason` plus, for `kind=message`, `message_id`/`message_seq` (present whenever `message_id` is set on the hold row -- only ever set at message-creation time on the approve/auto_approve path, never on reject/expiry), or for `kind=invite`, `target_agent_id` (always present, not gated on decision) and `participant_status` (present whenever a `Participant` row exists for the target, including a `rejected` hold whose target was admitted via a different path -- not gated on this hold's own decision). **Deliberately the only MCP-side surface for this pipeline** -- approve/reject/list-pending are non-MCP HTTP endpoints (§9), by design: an agent must never be able to approve its own high-risk content (or its own invite), so there is no MCP tool that could even attempt it |
 | `comms_get_conversation` | comms:read | combined read: conversation + participants + messages since seq, capped at `MAX_MESSAGES_PER_GET_CONVERSATION` (500) per call. Advances caller's `last_read_seq` when messages are returned and the page's own max seq exceeds the current cursor. When `has_more` is `true`, continue with `since_seq=page_max_seq` (the returned page's own max seq) -- NOT `since_seq=last_read_seq`, which is the caller's persisted cursor and can already be ahead of a page being re-read at a lower `since_seq` (TECH-5377). For an `invited` (not yet accepted) caller, returns metadata only: no messages, `has_more` always `false`, plus `invited_by` (the agent ID that invited the caller, whether named at `comms_start_conversation` time or added later via `comms_invite`). `participants.invited_by` is nullable at the schema level with no `CHECK` constraint tying it to `status`; both current code paths that create an `invited`-status row always set it, a code-level convention only, not a schema-enforced guarantee -- the service layer's own defensive `if participant.invited_by else None` reflects that (Argus round-5 SUGGESTION: an earlier version of this row overstated it as unreachable) |
 | `comms_inbox` | comms:read | active conversations with unread messages, **plus pending invites awaiting accept/decline**. Each list capped (`MAX_UNREAD_CONVERSATIONS_PER_INBOX`/`MAX_PENDING_INVITES_PER_INBOX`, both 100) with a `*_has_more` flag; `total_count` is always a true count, unaffected by either cap -- computed via a real `COUNT(*)` only when that half's own list was actually truncated, otherwise the (untruncated) list's own length already IS the true count. **Default filtering, both opt-outable per call**: `include_own_messages` (default `false`) excludes the caller's own posted messages from counting toward "unread"/`unread_count`/`latest_message` -- `comms_post_message` never advances the sender's own `last_read_seq` (only `comms_get_conversation` does), so without this filter a caller's own just-sent message would echo back as "unread" on its very next `comms_inbox` call; `include_read` (default `false`) additionally surfaces active conversations with no qualifying unread message at all (`unread_count=0`, `latest_message` falls back to the conversation's true latest message) -- these are conversations the original tool never returned, so `include_own_messages=true` ALONE (not combined with `include_read=true`) is the faithful reproduction of this tool's original, unfiltered behavior; adding `include_read=true` is a strict superset of it. **Known gap**: no cursor -- if either cap is hit, there is currently no tool-level way to page through the remainder (`comms_list_conversations` filters by the CONVERSATION's state, not participant status, so it can't isolate just the overflowed set either) |
 | `comms_list_conversations` | comms:read | paginated conversation list, filterable by `role`, `type`, and `state`; both `invited` and `active` participant statuses included |
-| `comms_accept` | comms:write | flips caller's participant status `invited → active`. Grants history read and posting rights from this point |
+| `comms_accept` | comms:write | flips caller's participant status `invited → active`. Grants history read and posting rights from this point. Rejects with the specific `conversation_archived` error (TECH-5887, see `comms_archive_conversation`'s own row) if the conversation has been archived, even for an invite sent before archiving -- accepting admits a brand-new active participant with full retroactive history read, the same outcome archiving is meant to close off; `comms_decline_invite` is unaffected |
 | `comms_decline_invite` | comms:write | declines a pending invite: terminal, no access is ever granted. Requires caller to currently be `invited`. Distinct from `comms_leave` (which covers already-`active` members), keeping the audit trail clean |
-| `comms_invite` | comms:write | adds a target as `invited` (not `active`); a registry-retired target (TECH-5703) raises the same specific "agent retired" error `comms_start_conversation` does. `internal` additionally never admits an `is_shared` target (TECH-5735, §9 Axis 1). **Two response shapes**, same convention as `comms_post_message`: the normal invited-participant shape (`conversation_id`, `target_agent_id`, `status`, `invited_by`, plus `auto_approved: true` + `hold_id` when an `AutoApprover` cleared an invite hold inline rather than this being the ordinary no-hold path), or — if the conversation already has any `note` or `instruction_share` history (`plugins.BARRIER_SENSITIVE_TYPES`, TECH-5735/TECH-5822) — `{"held_for_approval": true, "hold_id", "conversation_id", "status", "risk_reason", "expires_at", "created_at"}` (plus `decision_url` when `DECISION_PAGE_BASE_URL` is configured) (§9 Axis 1's free-text invite-approval rule) — admitting a new participant grants it full retroactive history read the moment it accepts, so that requires human approval first, same as a high-risk message does |
+| `comms_invite` | comms:write | adds a target as `invited` (not `active`); a registry-retired target (TECH-5703) raises the same specific "agent retired" error `comms_start_conversation` does. `internal` additionally never admits an `is_shared` target (TECH-5735, §9 Axis 1). **Two response shapes**, same convention as `comms_post_message`: the normal invited-participant shape (`conversation_id`, `target_agent_id`, `status`, `invited_by`, plus `auto_approved: true` + `hold_id` when an `AutoApprover` cleared an invite hold inline rather than this being the ordinary no-hold path), or — if the conversation already has any `note` or `instruction_share` history (`plugins.BARRIER_SENSITIVE_TYPES`, TECH-5735/TECH-5822) — `{"held_for_approval": true, "hold_id", "conversation_id", "status", "risk_reason", "expires_at", "created_at"}` (plus `decision_url` when `DECISION_PAGE_BASE_URL` is configured) (§9 Axis 1's free-text invite-approval rule) — admitting a new participant grants it full retroactive history read the moment it accepts, so that requires human approval first, same as a high-risk message does. Rejects with the specific `conversation_archived` error (TECH-5887, see `comms_archive_conversation`'s own row) if the conversation has been archived |
 | `comms_leave` | comms:write | leave: covers already-active members |
+| `comms_archive_conversation` | comms:write | archive a conversation (TECH-5887): sets `archived_at`, permanently. Any CURRENT `active` participant may trigger it (symmetric across the whole conversation, not gated to owner/creator) -- distinct from `comms_leave`, which only ever changes the CALLER's own participant row. Once archived: `comms_invite`/`comms_post_message`/`comms_accept` all reject with the specific `conversation_archived` error (not the uniform denial); also blocks approving a pending hold via the HTTP approval endpoint's `decide_hold` (the hold stays `pending_human`, a human can still reject it) -- the only one of the four blocked surfaces that isn't an MCP tool. Every read path (`comms_get_conversation`/`comms_inbox`/`comms_list_conversations`, and `comms_get_hold_status`) is completely unaffected -- archiving is not a delete or a redaction, every past message stays fully readable. Idempotent (re-archiving is a silent no-op, `archived_at` unchanged); one-directional -- no unarchive tool |
 
 ## 8. Security invariants
 
@@ -881,7 +925,17 @@ active participants (closing the gap where a participant added after the
 hold was created never had a chance to reject the held type) and is one
 atomic transaction: conversation `SELECT ... FOR UPDATE`, insert the message
 under its ORIGINAL type/schema_version/payload, flip the hold, single commit.
-Reject stores the decision and posts no message.
+Reject stores the decision and posts no message. Approve additionally
+raises the specific `conversation_archived` error (TECH-5887, same
+`ConversationArchivedError` `comms_invite`/`comms_post_message`/
+`comms_accept` raise, see `comms_archive_conversation`'s §7 row) if the
+conversation has since been archived -- a hold can sit `pending_human` for
+up to `APPROVAL_HOLD_TTL` (7 days), so without this check, approving a
+message- or invite-kind hold after archiving would still insert a new
+message or admit a new participant, bypassing archiving's guarantee. The
+hold stays `pending_human` in that case (same as the pre-existing
+`state != "active"` check just above it) -- the human can still reject it
+with a reason.
 
 **The optional human `reason` and its trust argument.** The decide body may
 carry `{"reason": "<free text, max 2000 chars>"}` (either direction — approve
@@ -1391,6 +1445,16 @@ participant, or a join-time history filter — both larger changes than this
 ticket's scope; not yet implemented.
 
 ### Known gap: no retention/archival policy for terminal or expired conversations
+
+**Not resolved by `comms_archive_conversation` (TECH-5887, §5/§7):** that
+tool's "archive" is a per-conversation, participant-triggered VISIBILITY
+flag (`archived_at`) with zero effect on storage -- an archived
+conversation's rows are retained exactly as long as an unarchived one's,
+forever, with full read access preserved. It answers "can this
+conversation still be written to" (no, once archived), never "should this
+data still exist" or "should this be moved to cold storage" -- the
+retention/purge/deletion gap described below is completely orthogonal and
+remains fully open.
 
 Expiry is lazy-only: `_maybe_expire` flips `Conversation.state` to `"expired"`
 only when `get_conversation`/`post_message` next touches that row. A

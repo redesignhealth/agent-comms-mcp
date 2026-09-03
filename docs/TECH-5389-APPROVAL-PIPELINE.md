@@ -592,8 +592,11 @@ sub (`identity.try_resolve_email`) must equal the hold's `owner_sub` snapshot
 (§15.4 — no longer the frozen `agents.owner_sub`);
 **uniform 404** for unknown-hold and not-your-hold (audit distinguishes
 `denied.unknown_hold` / `denied.hold_not_owner`); 409 already-decided
-(`denied.hold_wrong_state.<status>`); 410 lazily-expired (`approval.expire`); 422 bad
-body; no endpoint rate limiting (interactive-human-only by construction).
+(`denied.hold_wrong_state.<status>`); 409 `conversation_archived` (TECH-5887 — the
+hold's conversation was archived while it sat `pending_human`; hold stays
+`pending_human`, the human can still reject it with a reason); 410 lazily-expired
+(`approval.expire`); 422 bad body; no endpoint rate limiting (interactive-human-only
+by construction).
 
 Deltas for the ratified design:
 
@@ -606,7 +609,15 @@ Deltas for the ratified design:
 - Human decide acts only on `pending_human` (`pending_auto` → 409
   `awaiting_auto_review`; unreachable in v1, specified for the async future).
 - **Approve is one atomic transaction**: conversation `SELECT ... FOR UPDATE` +
-  `_maybe_expire`; if the conversation is no longer `active` →
+  `_maybe_expire`; **archived check runs BEFORE the state check** (TECH-5887) — if
+  `conversation.archived_at` is set → `ConversationArchivedError` (audited
+  `denied.archived.decide_hold`) → 409 `conversation_archived`, hold stays
+  `pending_human`; checking archived first matters because `_maybe_expire` above can
+  flip `state` to `expired` on this same call if the deadline just passed, and a
+  state-first check would raise `InvalidConversationStateError` before the archived
+  check ever ran, surfacing the wrong error/audit row (a conversation that is both
+  terminal and archived therefore surfaces `conversation_archived`, not
+  `conversation_not_active`). Otherwise, if the conversation is no longer `active` →
   `InvalidConversationStateError` (audited `denied.bad_state`), hold stays
   `pending_human` (the human can still reject with a reason) → 409 distinct body.
   Re-run the `accepted_types` capability gate against current active participants.

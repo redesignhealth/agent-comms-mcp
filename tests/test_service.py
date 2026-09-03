@@ -41,6 +41,7 @@ from exceptions import (
     AgentAlreadyRegisteredError,
     AgentRetiredError,
     AgentSuspendedError,
+    ConversationArchivedError,
     DisplayNameCollisionError,
     HoldAlreadyDecidedError,
     HoldAwaitingAutoReviewError,
@@ -75,6 +76,7 @@ from service import (
     _enforce_message_type_accepted,
     accept_invite,
     admin_register_agent,
+    archive_conversation,
     decline_invite,
     deregister_agent,
     get_conversation,
@@ -3833,6 +3835,415 @@ class TestInviteRequiresApprovalForNoteHistory:
             )
         ).scalar_one_or_none()
         assert participant is None
+
+
+class TestArchiveConversation:
+    """Service-layer coverage for ``archive_conversation``/``_deny_archived``
+    and the ``archived_at is not None`` guard blocks in ``invite``,
+    ``accept_invite``, and ``post_message`` (TECH-5887). The tool-layer
+    equivalents in ``tests/test_comms_tools.py``'s ``TestArchiveConversation``
+    cover the same behavior end-to-end through the MCP surface; these are
+    the unit-level counterpart every other comparable write path already
+    has a dedicated class for."""
+
+    async def _start(self, session: AsyncSession, owner_sub: str, target_sub: str) -> Any:
+        owner = await _register(session, owner_sub)
+        target = await _register(session, target_sub)
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        return owner, target, conversation
+
+    async def test_archive_is_idempotent_no_op(self, session: AsyncSession) -> None:
+        owner, _target, conversation = await self._start(
+            session, "arch-svc-owner-1", "arch-svc-target-1"
+        )
+        first = await archive_conversation(
+            session, actor_sub=owner.sub, agent_id=owner.id, conversation_id=conversation.id
+        )
+        assert first.archived_at is not None
+
+        second = await archive_conversation(
+            session, actor_sub=owner.sub, agent_id=owner.id, conversation_id=conversation.id
+        )
+        assert second.archived_at == first.archived_at
+
+        rows = (
+            (
+                await session.execute(
+                    select(AuditLog.action).where(
+                        AuditLog.conversation_id == conversation.id,
+                        AuditLog.action == "conversation.archive",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1
+
+    async def test_concurrent_archive_writes_exactly_one_audit_row(
+        self, session: AsyncSession, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """The FOR UPDATE lock in archive_conversation (TECH-5887 round-1
+        fix) is the stated defense against two concurrent callers both
+        observing archived_at IS NULL and both emitting an audit row --
+        the sequential idempotency test above passes identically with or
+        without that lock, so it can't catch a regression that drops it."""
+        owner, _target, conversation = await self._start(
+            session, "arch-svc-owner-concurrent-1", "arch-svc-target-concurrent-1"
+        )
+
+        async def _archive() -> None:
+            async with session_factory() as sess:
+                await archive_conversation(
+                    sess, actor_sub=owner.sub, agent_id=owner.id, conversation_id=conversation.id
+                )
+
+        await asyncio.gather(*[_archive() for _ in range(5)])
+
+        rows = (
+            (
+                await session.execute(
+                    select(AuditLog.action).where(
+                        AuditLog.conversation_id == conversation.id,
+                        AuditLog.action == "conversation.archive",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1
+
+    async def test_archive_denies_non_active_participant(self, session: AsyncSession) -> None:
+        _owner, target, conversation = await self._start(
+            session, "arch-svc-owner-2", "arch-svc-target-2"
+        )
+        await leave(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        with pytest.raises(AccessDeniedError):
+            await archive_conversation(
+                session,
+                actor_sub=target.sub,
+                agent_id=target.id,
+                conversation_id=conversation.id,
+            )
+
+    async def test_invite_denied_on_archived_conversation(self, session: AsyncSession) -> None:
+        owner, _target, conversation = await self._start(
+            session, "arch-svc-owner-3", "arch-svc-target-3"
+        )
+        new_agent = await _register(session, "arch-svc-invitee-3")
+        await archive_conversation(
+            session, actor_sub=owner.sub, agent_id=owner.id, conversation_id=conversation.id
+        )
+        with pytest.raises(ConversationArchivedError):
+            await invite(
+                session,
+                actor_sub=owner.sub,
+                inviter_agent_id=owner.id,
+                conversation_id=conversation.id,
+                target_agent_id=new_agent.id,
+            )
+
+    async def test_post_message_denied_on_archived_conversation(
+        self, session: AsyncSession
+    ) -> None:
+        owner, _target, conversation = await self._start(
+            session, "arch-svc-owner-4", "arch-svc-target-4"
+        )
+        await archive_conversation(
+            session, actor_sub=owner.sub, agent_id=owner.id, conversation_id=conversation.id
+        )
+        with pytest.raises(ConversationArchivedError):
+            await post_message(
+                session,
+                actor_sub=owner.sub,
+                sender_agent_id=owner.id,
+                conversation_id=conversation.id,
+                message_type="availability_response",
+                payload={"available": True},
+            )
+
+    async def test_accept_invite_denied_on_archived_conversation(
+        self, session: AsyncSession
+    ) -> None:
+        owner = await _register(session, "arch-svc-owner-5")
+        target = await _register(session, "arch-svc-target-5")
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+        )
+        # Target is still only `invited` (never accepted) when the owner
+        # archives -- accepting afterward would admit a brand-new active
+        # participant, the same outcome archiving is meant to close off.
+        await archive_conversation(
+            session, actor_sub=owner.sub, agent_id=owner.id, conversation_id=conversation.id
+        )
+        with pytest.raises(ConversationArchivedError):
+            await accept_invite(
+                session,
+                actor_sub=target.sub,
+                agent_id=target.id,
+                conversation_id=conversation.id,
+            )
+        # comms_decline_invite's service counterpart still works --
+        # declining only narrows access, never grants it. decline_invite
+        # returns None; assert on the persisted row instead.
+        await decline_invite(
+            session,
+            actor_sub=target.sub,
+            agent_id=target.id,
+            conversation_id=conversation.id,
+        )
+        participant = (
+            await session.execute(
+                select(Participant).where(
+                    Participant.conversation_id == conversation.id,
+                    Participant.agent_id == target.id,
+                )
+            )
+        ).scalar_one()
+        assert participant.status == "declined"
+
+    async def test_decide_hold_approve_denied_on_archived_conversation(
+        self, session: AsyncSession
+    ) -> None:
+        """A message-kind hold created before archiving cannot be approved
+        afterward -- approving would still insert a new message via
+        ``_insert_message_for_hold``, bypassing the archive guarantee. The
+        hold stays ``pending_human`` (same as the pre-existing
+        ``state != "active"`` check), so a human can still reject it."""
+        owner = await _register(session, "arch-svc-hold-owner-1")
+        target = await _register(session, "arch-svc-hold-target-1")
+        target_owner_agent = await _register(session, "arch-svc-hold-third-1")
+        client = _FakeOwnershipClient(
+            {
+                owner.id: {"is_shared": False, "owners": ["dan"]},
+                target.id: {"is_shared": True, "owners": ["dan", "priya"]},
+                target_owner_agent.id: {"is_shared": False, "owners": ["dan"]},
+            }
+        )
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="asymmetric",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            ownership_client=client,
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        hold = await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="note",
+            payload={"text": "hello"},
+            ownership_client=client,
+        )
+        assert isinstance(hold, ApprovalHold)
+
+        await archive_conversation(
+            session, actor_sub=owner.sub, agent_id=owner.id, conversation_id=conversation.id
+        )
+
+        with pytest.raises(ConversationArchivedError):
+            await decide_hold(
+                session,
+                approver_sub=owner.owner_sub,
+                hold_id=hold.id,
+                decision="approve",
+                reason=None,
+                ownership_client=client,
+            )
+
+        await session.refresh(hold)
+        assert hold.status == "pending_human"
+
+        # The human can still reject it with a reason.
+        rejected = await decide_hold(
+            session,
+            approver_sub=owner.owner_sub,
+            hold_id=hold.id,
+            decision="reject",
+            reason="conversation archived",
+        )
+        assert rejected["status"] == "rejected"
+
+    async def test_decide_hold_approve_denied_on_archived_conversation_invite_kind(
+        self, session: AsyncSession
+    ) -> None:
+        """Same guard as the message-kind test above, but for kind="invite"
+        holds -- decide_hold's approve path admits a Participant instead of
+        inserting a Message for this kind, a meaningfully different branch
+        that the archived check must still block before it's reached."""
+        owner = await _register(session, "arch-svc-hold-owner-2")
+        target = await _register(session, "arch-svc-hold-target-2")
+        new_agent = await _register(session, "arch-svc-hold-new-2")
+        client = _FakeOwnershipClient(
+            {
+                owner.id: {"is_shared": False, "owners": ["dan"]},
+                target.id: {"is_shared": False, "owners": ["dan"]},
+                new_agent.id: {"is_shared": False, "owners": ["dan"]},
+            }
+        )
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="internal",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            ownership_client=client,
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        # A prior note establishes note history, which diverts any further
+        # invite into a kind="invite" hold rather than admitting it inline.
+        await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="note",
+            payload={"text": "hello"},
+            ownership_client=client,
+        )
+        hold = await invite(
+            session,
+            actor_sub=owner.sub,
+            inviter_agent_id=owner.id,
+            conversation_id=conversation.id,
+            target_agent_id=new_agent.id,
+            ownership_client=client,
+        )
+        assert isinstance(hold, ApprovalHold)
+        assert hold.kind == "invite"
+
+        await archive_conversation(
+            session, actor_sub=owner.sub, agent_id=owner.id, conversation_id=conversation.id
+        )
+
+        with pytest.raises(ConversationArchivedError):
+            await decide_hold(
+                session,
+                approver_sub=owner.owner_sub,
+                hold_id=hold.id,
+                decision="approve",
+                reason=None,
+                ownership_client=client,
+            )
+
+        await session.refresh(hold)
+        assert hold.status == "pending_human"
+
+        existing = (
+            await session.execute(
+                select(Participant).where(
+                    Participant.conversation_id == conversation.id,
+                    Participant.agent_id == new_agent.id,
+                )
+            )
+        ).scalar_one_or_none()
+        assert existing is None
+
+    async def test_decide_hold_approve_archived_check_precedes_expiry_check(
+        self, session: AsyncSession
+    ) -> None:
+        """Pins the ordering invariant added alongside the archived guard:
+        the archived_at check in decide_hold's approve path must run
+        BEFORE _maybe_expire can flip conversation.state to "expired" --
+        otherwise a hold on a conversation that is both archived AND past
+        its expiry deadline would raise InvalidConversationStateError
+        instead of ConversationArchivedError, surfacing the wrong error
+        and audit row. The other two tests in this class archive an
+        `active` conversation, so _maybe_expire is a no-op there and a
+        regression reverting the ordering would pass them identically."""
+        owner = await _register(session, "arch-svc-hold-owner-3")
+        target = await _register(session, "arch-svc-hold-target-3")
+        client = _FakeOwnershipClient(
+            {
+                owner.id: {"is_shared": False, "owners": ["dan"]},
+                target.id: {"is_shared": True, "owners": ["dan", "priya"]},
+            }
+        )
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="asymmetric",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            ownership_client=client,
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        hold = await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="note",
+            payload={"text": "hello"},
+            ownership_client=client,
+        )
+        assert isinstance(hold, ApprovalHold)
+
+        await archive_conversation(
+            session, actor_sub=owner.sub, agent_id=owner.id, conversation_id=conversation.id
+        )
+        # Safe to mutate post-commit: this module's session fixture is
+        # built with expire_on_commit=False (see test_unread_reflects_
+        # expired_state's own comment on this idiom).
+        conversation.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+
+        with pytest.raises(ConversationArchivedError):
+            await decide_hold(
+                session,
+                approver_sub=owner.owner_sub,
+                hold_id=hold.id,
+                decision="approve",
+                reason=None,
+                ownership_client=client,
+            )
+
+        await session.refresh(hold)
+        assert hold.status == "pending_human"
+
+        rows = (
+            (
+                await session.execute(
+                    select(AuditLog.action).where(
+                        AuditLog.conversation_id == conversation.id,
+                        AuditLog.action == "denied.archived.decide_hold",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1
 
 
 # --- get_conversation ----------------------------------------------------------

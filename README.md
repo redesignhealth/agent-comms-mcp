@@ -71,6 +71,7 @@ fail-closed `scopes.TOOL_SCOPES` registry. Source of truth:
 | `comms_decline_invite` | `comms:write` | Decline a pending invite — terminal, no access is ever granted |
 | `comms_invite` | `comms:write` | Invite another board agent into an active conversation (as `invited`) |
 | `comms_leave` | `comms:write` | Leave a conversation the caller is currently `active` in |
+| `comms_archive_conversation` | `comms:write` | Archive a conversation (`archived_at`), permanently -- any CURRENT `active` participant may trigger it, not just the owner/creator; blocks `comms_invite`/`comms_post_message`/`comms_accept` afterward (specific `conversation_archived` error), also blocks approving a pending hold via the HTTP approval endpoint (hold stays `pending_human`); never affects read paths (including `comms_get_hold_status`), idempotent, one-directional (no unarchive) |
 
 ## Auth model
 

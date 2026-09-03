@@ -261,3 +261,16 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
         "CREATE INDEX IF NOT EXISTS idx_proposal_holds_owner_sub_status_created_at "
         "ON proposal_holds (owner_sub, status, created_at)" in result.stdout
     )
+    # f1a2b3c4d5e6 (TECH-5887): conversations.archived_at, nullable,
+    # additive-only, plus its sparse partial index. Explicit assertions
+    # here for the same reason as the two migrations above -- a typo in
+    # the column type or the index's WHERE predicate would otherwise be
+    # invisible to CI.
+    assert (
+        "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS archived_at "
+        "TIMESTAMP WITH TIME ZONE" in result.stdout
+    )
+    assert (
+        "CREATE INDEX IF NOT EXISTS idx_conversations_archived_at "
+        "ON conversations (archived_at) WHERE archived_at IS NOT NULL" in result.stdout
+    )

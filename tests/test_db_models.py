@@ -306,11 +306,25 @@ class TestSchema:
             "created_by",
             "expires_at",
             "owner_snapshot",
+            "archived_at",
             "created_at",
             "updated_at",
         ):
             assert expected in cols, f"conversations.{expected} missing"
         assert cols["owner_snapshot"] == "jsonb"
+
+    async def test_conversations_archived_at_nullable(self, engine: AsyncEngine) -> None:
+        """TECH-5887: ``archived_at`` is nullable -- NULL means "not
+        archived", the only value every pre-existing row can have."""
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                text(
+                    "SELECT is_nullable FROM information_schema.columns "
+                    "WHERE table_schema = 'public' AND table_name = 'conversations' "
+                    "AND column_name = 'archived_at'"
+                )
+            )
+            assert result.scalar_one() == "YES"
 
     async def test_participants_columns_and_invite_accept_model(self, engine: AsyncEngine) -> None:
         cols = await _columns(engine, "participants")
@@ -402,6 +416,7 @@ class TestSchema:
         conversation_indexes = await _indexes(engine, "conversations")
         assert "idx_conversations_state_expires_at" in conversation_indexes
         assert "idx_conversations_created_by_created_at" in conversation_indexes
+        assert "idx_conversations_archived_at" in conversation_indexes
 
         audit_indexes = await _indexes(engine, "audit_log")
         assert "idx_audit_log_conversation_id" in audit_indexes

@@ -2288,6 +2288,12 @@ class TestRateLimitAndSchemaErrors:
             },
         )
         assert started["schema_version"] == 1
+        # TECH-5887 round-2: archived/archived_at are hand-maintained on
+        # this one response (every other projection flows through
+        # service._conversation_dict) -- assert both explicitly so drift
+        # here is caught rather than only defended against by comment.
+        assert started["archived"] is False
+        assert started["archived_at"] is None
 
 
 class TestOwnershipClientSeamIntegration:
@@ -2716,6 +2722,511 @@ class TestMembershipTools:
             )
 
 
+class TestArchiveConversation:
+    """TECH-5887: ``comms_archive_conversation`` end-to-end coverage through
+    the real mounted tool stack (mirrors ``TestMembershipTools``'s idiom)."""
+
+    async def _start_open_conversation(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        *,
+        owner_sub: str,
+        member_sub: str,
+    ) -> tuple[str, dict[str, str]]:
+        await _register(main, test_session_factory, owner_sub)
+        await _register(main, test_session_factory, member_sub)
+        token_owner = _token(owner_sub)
+        list_result = await _call(main, test_session_factory, token_owner, "comms_list_agents")
+        ids = {a["sub"]: a["agent_id"] for a in list_result["agents"]}
+        started = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [ids[member_sub]],
+                "initial_message": _availability_request(),
+            },
+        )
+        return started["conversation_id"], ids
+
+    async def test_non_owner_participant_can_archive(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Any CURRENT active member may archive -- not just the
+        conversation's owner/created_by agent (the feature's core symmetric-
+        permission requirement)."""
+        conversation_id, _ids = await self._start_open_conversation(
+            main,
+            test_session_factory,
+            owner_sub="arc-owner-1",
+            member_sub="arc-member-1",
+        )
+        token_member = _token("arc-member-1")
+        await _call(
+            main,
+            test_session_factory,
+            token_member,
+            "comms_accept",
+            {"conversation_id": conversation_id},
+        )
+
+        result = await _call(
+            main,
+            test_session_factory,
+            token_member,
+            "comms_archive_conversation",
+            {"conversation_id": conversation_id},
+        )
+        assert result["archived"] is True
+        assert result["archived_at"] is not None
+
+        conv = await _call(
+            main,
+            test_session_factory,
+            token_member,
+            "comms_get_conversation",
+            {"conversation_id": conversation_id},
+        )
+        assert conv["conversation"]["archived"] is True
+        assert conv["conversation"]["archived_at"] == result["archived_at"]
+
+    async def test_archived_conversation_rejects_invite(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        conversation_id, _ids = await self._start_open_conversation(
+            main,
+            test_session_factory,
+            owner_sub="arc-owner-2",
+            member_sub="arc-member-2",
+        )
+        await _register(main, test_session_factory, "arc-target-2")
+        list_result = await _call(
+            main, test_session_factory, _token("arc-owner-2"), "comms_list_agents"
+        )
+        ids = {a["sub"]: a["agent_id"] for a in list_result["agents"]}
+        token_owner = _token("arc-owner-2")
+
+        await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_archive_conversation",
+            {"conversation_id": conversation_id},
+        )
+
+        with pytest.raises(ToolError, match="conversation_archived"):
+            await _call(
+                main,
+                test_session_factory,
+                token_owner,
+                "comms_invite",
+                {"conversation_id": conversation_id, "target_agent_id": ids["arc-target-2"]},
+            )
+
+    async def test_archived_conversation_rejects_post_message(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        conversation_id, _ids = await self._start_open_conversation(
+            main,
+            test_session_factory,
+            owner_sub="arc-owner-3",
+            member_sub="arc-member-3",
+        )
+        token_member = _token("arc-member-3")
+        await _call(
+            main,
+            test_session_factory,
+            token_member,
+            "comms_accept",
+            {"conversation_id": conversation_id},
+        )
+        await _call(
+            main,
+            test_session_factory,
+            token_member,
+            "comms_archive_conversation",
+            {"conversation_id": conversation_id},
+        )
+
+        with pytest.raises(ToolError, match="conversation_archived"):
+            await _call(
+                main,
+                test_session_factory,
+                token_member,
+                "comms_post_message",
+                {
+                    "conversation_id": conversation_id,
+                    "message_type": "availability_response",
+                    "payload": _availability_response(),
+                },
+            )
+
+    async def test_archived_conversation_rejects_pending_accept(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """A pending (not-yet-accepted) invite sent BEFORE archiving can no
+        longer be accepted afterward -- accepting admits a new active
+        participant, treated the same as a fresh invite (documented policy
+        decision, see service.accept_invite's docstring)."""
+        conversation_id, _ids = await self._start_open_conversation(
+            main,
+            test_session_factory,
+            owner_sub="arc-owner-4",
+            member_sub="arc-member-4",
+        )
+        token_owner = _token("arc-owner-4")
+        token_member = _token("arc-member-4")
+
+        # Member is still only `invited` (never called comms_accept) when
+        # the owner archives.
+        await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_archive_conversation",
+            {"conversation_id": conversation_id},
+        )
+
+        with pytest.raises(ToolError, match="conversation_archived"):
+            await _call(
+                main,
+                test_session_factory,
+                token_member,
+                "comms_accept",
+                {"conversation_id": conversation_id},
+            )
+
+        # comms_decline_invite still works -- declining only narrows access.
+        decline_result = await _call(
+            main,
+            test_session_factory,
+            token_member,
+            "comms_decline_invite",
+            {"conversation_id": conversation_id},
+        )
+        assert decline_result["status"] == "declined"
+
+    async def test_archive_is_idempotent(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        conversation_id, _ids = await self._start_open_conversation(
+            main,
+            test_session_factory,
+            owner_sub="arc-owner-5",
+            member_sub="arc-member-5",
+        )
+        token_owner = _token("arc-owner-5")
+        token_member = _token("arc-member-5")
+        await _call(
+            main,
+            test_session_factory,
+            token_member,
+            "comms_accept",
+            {"conversation_id": conversation_id},
+        )
+
+        first = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_archive_conversation",
+            {"conversation_id": conversation_id},
+        )
+        # A second archive, by a DIFFERENT active participant, is a
+        # silent no-op that returns the SAME archived_at -- not an error,
+        # and not a bumped timestamp.
+        second = await _call(
+            main,
+            test_session_factory,
+            token_member,
+            "comms_archive_conversation",
+            {"conversation_id": conversation_id},
+        )
+        assert second["archived"] is True
+        assert second["archived_at"] == first["archived_at"]
+
+        async with test_session_factory() as session:
+            row_count = (
+                await session.execute(
+                    text(
+                        "SELECT COUNT(*) FROM audit_log "
+                        "WHERE action = 'conversation.archive' AND conversation_id = :cid"
+                    ),
+                    {"cid": conversation_id},
+                )
+            ).scalar_one()
+        assert row_count == 1
+
+    async def test_archive_orthogonal_to_terminal_conversation_state(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Archiving has no precondition on conversation.state -- an
+        already-completed/canceled/expired conversation may still be
+        archived, per archive_conversation's own docstring."""
+        conversation_id, _ids = await self._start_open_conversation(
+            main,
+            test_session_factory,
+            owner_sub="arc-owner-10",
+            member_sub="arc-member-10",
+        )
+        token_owner = _token("arc-owner-10")
+        token_member = _token("arc-member-10")
+        await _call(
+            main,
+            test_session_factory,
+            token_member,
+            "comms_accept",
+            {"conversation_id": conversation_id},
+        )
+        async with test_session_factory() as session:
+            await session.execute(
+                text("UPDATE conversations SET state = 'completed' WHERE id = :cid"),
+                {"cid": conversation_id},
+            )
+            await session.commit()
+
+        result = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_archive_conversation",
+            {"conversation_id": conversation_id},
+        )
+        assert result["archived"] is True
+        assert result["archived_at"] is not None
+
+    async def test_archiving_does_not_hide_history_from_reads(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Past messages remain fully readable via comms_get_conversation,
+        comms_inbox, and comms_list_conversations after archiving -- this is
+        not a delete or a redaction."""
+        conversation_id, _ids = await self._start_open_conversation(
+            main,
+            test_session_factory,
+            owner_sub="arc-owner-6",
+            member_sub="arc-member-6",
+        )
+        token_owner = _token("arc-owner-6")
+        token_member = _token("arc-member-6")
+        await _call(
+            main,
+            test_session_factory,
+            token_member,
+            "comms_accept",
+            {"conversation_id": conversation_id},
+        )
+        await _call(
+            main,
+            test_session_factory,
+            token_member,
+            "comms_post_message",
+            {
+                "conversation_id": conversation_id,
+                "message_type": "availability_response",
+                "payload": _availability_response(),
+            },
+        )
+
+        before = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_get_conversation",
+            {"conversation_id": conversation_id},
+        )
+        assert len(before["messages"]) == 2  # seq 1 (opener) + the response above
+
+        await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_archive_conversation",
+            {"conversation_id": conversation_id},
+        )
+
+        after = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_get_conversation",
+            {"conversation_id": conversation_id, "since_seq": 0},
+        )
+        assert after["conversation"]["archived"] is True
+        assert len(after["messages"]) == 2
+        assert [m["seq"] for m in after["messages"]] == [m["seq"] for m in before["messages"]]
+
+        listed = await _call(
+            main, test_session_factory, token_owner, "comms_list_conversations", {}
+        )
+        listed_ids = {c["conversation_id"] for c in listed["conversations"]}
+        assert conversation_id in listed_ids
+        listed_conv = next(
+            c for c in listed["conversations"] if c["conversation_id"] == conversation_id
+        )
+        assert listed_conv["archived"] is True
+
+        inbox = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_inbox",
+            {"include_own_messages": True, "include_read": True},
+        )
+        inbox_conv = next(
+            (c for c in inbox["unread"] if c["conversation_id"] == conversation_id), None
+        )
+        assert inbox_conv is not None
+        assert inbox_conv["archived"] is True
+        assert inbox_conv["archived_at"] is not None
+
+    async def test_archive_requires_active_membership(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """A caller who was never a participant gets the uniform denial,
+        same precondition every other conversation-scoped write shares."""
+        conversation_id, _ids = await self._start_open_conversation(
+            main,
+            test_session_factory,
+            owner_sub="arc-owner-7",
+            member_sub="arc-member-7",
+        )
+        await _register(main, test_session_factory, "arc-outsider-7")
+        token_outsider = _token("arc-outsider-7")
+
+        with pytest.raises(
+            ToolError, match=re.escape("access_denied: not authorized for this resource")
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                token_outsider,
+                "comms_archive_conversation",
+                {"conversation_id": conversation_id},
+            )
+
+    async def test_archive_denied_for_invited_not_yet_accepted_participant(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """An `invited` participant (hasn't called comms_accept yet) is not
+        `active` and gets the same uniform denial as a non-participant --
+        archive_conversation's `required_status="active"` check applies
+        just as strictly to a pending invite as to a total stranger."""
+        conversation_id, _ids = await self._start_open_conversation(
+            main,
+            test_session_factory,
+            owner_sub="arc-owner-8",
+            member_sub="arc-member-8",
+        )
+        token_member = _token("arc-member-8")
+        with pytest.raises(
+            ToolError, match=re.escape("access_denied: not authorized for this resource")
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                token_member,
+                "comms_archive_conversation",
+                {"conversation_id": conversation_id},
+            )
+
+    async def test_archive_denied_for_left_participant(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """A participant who accepted and then left is no longer `active`
+        and gets the same uniform denial -- leaving revokes archive
+        eligibility just like every other write path."""
+        conversation_id, _ids = await self._start_open_conversation(
+            main,
+            test_session_factory,
+            owner_sub="arc-owner-9",
+            member_sub="arc-member-9",
+        )
+        token_member = _token("arc-member-9")
+        await _call(
+            main,
+            test_session_factory,
+            token_member,
+            "comms_accept",
+            {"conversation_id": conversation_id},
+        )
+        await _call(
+            main,
+            test_session_factory,
+            token_member,
+            "comms_leave",
+            {"conversation_id": conversation_id},
+        )
+        with pytest.raises(
+            ToolError, match=re.escape("access_denied: not authorized for this resource")
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                token_member,
+                "comms_archive_conversation",
+                {"conversation_id": conversation_id},
+            )
+
+    async def test_get_hold_status_unaffected_by_archiving(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """comms_get_hold_status is a read path, unlike comms_invite/
+        comms_post_message/comms_accept/decide_hold's approve path -- it
+        must keep working normally on an archived conversation's existing
+        holds. Not explicitly gated on archived_at anywhere, but unverified
+        until now; a future change accidentally adding that gate would go
+        undetected without this test."""
+        conversation_id, _ids = await self._start_open_conversation(
+            main,
+            test_session_factory,
+            owner_sub="arc-owner-10",
+            member_sub="arc-member-10",
+        )
+        token_owner = _token("arc-owner-10")
+        token_member = _token("arc-member-10")
+        await _call(
+            main,
+            test_session_factory,
+            token_member,
+            "comms_accept",
+            {"conversation_id": conversation_id},
+        )
+        held = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_post_message",
+            {
+                "conversation_id": conversation_id,
+                "message_type": "note",
+                "payload": {"text": "secret cross-boundary note"},
+            },
+        )
+        assert held["held_for_approval"] is True
+
+        await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_archive_conversation",
+            {"conversation_id": conversation_id},
+        )
+
+        status = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_get_hold_status",
+            {"hold_id": held["hold_id"]},
+        )
+        assert status["hold_id"] == held["hold_id"]
+        assert status["status"] == "pending_human"
+
+
 class TestTaskLifecycleToolLayer:
     """End-to-end coverage for tasks-as-conversations: task_assign opens a
     conversation, task_report/task_complete/task_decline/task_cancel drive
@@ -2978,6 +3489,7 @@ class TestScopesUnaffected:
             "comms_decline_invite",
             "comms_invite",
             "comms_leave",
+            "comms_archive_conversation",
             "comms_get_hold_status",
             "comms_admin_register",
         }

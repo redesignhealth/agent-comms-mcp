@@ -39,7 +39,7 @@ from sqlalchemy.ext.asyncio import (
 from starlette.applications import Starlette
 from starlette.routing import Route
 
-from exceptions import AgentRetiredError
+from exceptions import AgentRetiredError, ConversationArchivedError
 from models import ApprovalHold, AuditLog, Conversation, Participant
 from service import register_agent
 
@@ -569,6 +569,42 @@ class TestDecideEndpoint:
             "error": "agent_retired",
             "detail": "agent retired: this agent has been retired and is no longer reachable",
         }
+
+    async def test_conversation_archived_returns_409(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        main: Any,
+        session: AsyncSession,
+    ) -> None:
+        """TECH-5887: decide_hold's approve path raises
+        ConversationArchivedError when the hold's conversation was
+        archived while it sat pending_human. Mocked the same way as
+        test_agent_retired_returns_409 -- no DB fixture needed, since
+        main.py performs no pre-check of its own before calling into the
+        service layer, and this endpoint-layer test only needs to verify
+        the except-branch's status code and body shape, not the archived
+        guard's own logic (already covered in test_service.py)."""
+        http_client, provider = client
+        _sender, hold = await _make_hold(session, sender_owner_sub="owner-archived@example.com")
+        provider.tokens["human-token"] = _interactive_token("owner-archived@example.com")
+
+        with patch.object(
+            main.service,
+            "decide_hold",
+            AsyncMock(
+                side_effect=ConversationArchivedError(
+                    "conversation_archived: this conversation has been archived and no "
+                    "longer accepts write operations"
+                )
+            ),
+        ):
+            resp = await http_client.post(
+                f"/approvals/{hold.id}/decide",
+                headers={"Authorization": "Bearer human-token"},
+                json={"decision": "approve"},
+            )
+        assert resp.status_code == 409
+        assert resp.json() == {"error": "conversation_archived"}
 
     async def test_awaiting_auto_review_returns_409(
         self,
