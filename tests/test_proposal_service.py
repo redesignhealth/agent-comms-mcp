@@ -196,14 +196,23 @@ class TestDedup:
         assert len(rows) == 1
 
     async def test_non_pending_row_is_not_deduped_against(self, session: AsyncSession) -> None:
-        """A previously auto-approved row (same kind/target_id/action_type)
-        must not be updated in place -- dedup only ever matches a currently
-        ``pending`` row."""
-        first = await _submit(
-            session,
-            action=_action(source_message_url="https://redesignhealth.slack.com/archives/C1/p1"),
-        )
-        assert first["status"] == "approved"
+        """A previously auto-approved (now auto-applied) row (same
+        kind/target_id/action_type) must not be updated in place -- dedup
+        only ever matches a currently ``pending`` row."""
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(return_value="deadbeef"),
+            ),
+            patch("service.linear_client.apply_progress_update", AsyncMock()),
+        ):
+            first = await _submit(
+                session,
+                action=_action(
+                    source_message_url="https://redesignhealth.slack.com/archives/C1/p1"
+                ),
+            )
+        assert first["status"] == "applied"
 
         second = await _submit(session, target_fingerprint="fp-new")
         rows = (await session.execute(select(ProposalHold))).scalars().all()
@@ -310,16 +319,27 @@ class TestServerDerivedPriority:
 
 class TestJudgeIntegration:
     async def test_open_ticket_with_citation_is_auto_approved(self, session: AsyncSession) -> None:
-        result = await _submit(
-            session,
-            action=_action(
-                action_type="open_ticket",
-                source_message_url="https://redesignhealth.slack.com/archives/C1/p1",
+        """TECH-5873 Argus review B1: the judge's "approved" verdict is
+        never itself persisted -- it resolves synchronously to "applied"
+        here (matching fingerprint, successful Linear write)."""
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(return_value="deadbeef"),
             ),
-        )
-        assert result["status"] == "approved"
+            patch("service.linear_client.apply_progress_update", AsyncMock()) as mock_apply,
+        ):
+            result = await _submit(
+                session,
+                action=_action(
+                    action_type="open_ticket",
+                    source_message_url="https://redesignhealth.slack.com/archives/C1/p1",
+                ),
+            )
+        assert result["status"] == "applied"
         assert result["decision_source"] == "auto"
         assert result["decided_by_actor_id"] == "system:judge"
+        mock_apply.assert_awaited_once()
 
     async def test_open_ticket_without_citation_stays_pending(self, session: AsyncSession) -> None:
         result = await _submit(session, action=_action(action_type="open_ticket"))
@@ -358,16 +378,23 @@ class TestJudgeIntegration:
         )
         assert first["status"] == "pending"
 
-        second = await _submit(
-            session,
-            action=_action(
-                action_type="open_ticket",
-                target_id="TECH-99",
-                source_message_url="https://redesignhealth.slack.com/archives/C1/p1",
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(return_value="deadbeef"),
             ),
-        )
+            patch("service.linear_client.apply_progress_update", AsyncMock()),
+        ):
+            second = await _submit(
+                session,
+                action=_action(
+                    action_type="open_ticket",
+                    target_id="TECH-99",
+                    source_message_url="https://redesignhealth.slack.com/archives/C1/p1",
+                ),
+            )
         assert second["proposal_id"] == first["proposal_id"]
-        assert second["status"] == "approved"
+        assert second["status"] == "applied"
         assert second["decision_source"] == "auto"
 
         rows = (await session.execute(select(ProposalHold))).scalars().all()
@@ -407,11 +434,23 @@ class TestOwnerSubVisibility:
     async def test_approved_proposals_are_excluded_from_pending_listing(
         self, session: AsyncSession
     ) -> None:
-        await _submit(
-            session,
-            owner_sub="owner-a@example.com",
-            action=_action(source_message_url="https://redesignhealth.slack.com/archives/C1/p1"),
-        )
+        """Name predates TECH-5873 B1: a well-cited proposal now resolves
+        past "approved" straight to "applied", but the assertion under
+        test -- it's gone from the pending listing -- still holds."""
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(return_value="deadbeef"),
+            ),
+            patch("service.linear_client.apply_progress_update", AsyncMock()),
+        ):
+            await _submit(
+                session,
+                owner_sub="owner-a@example.com",
+                action=_action(
+                    source_message_url="https://redesignhealth.slack.com/archives/C1/p1"
+                ),
+            )
         result = await list_pending_proposal_holds(session, owner_sub="owner-a@example.com")
         assert result["proposals"] == []
 

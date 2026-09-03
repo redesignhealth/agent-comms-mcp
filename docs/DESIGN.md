@@ -1041,9 +1041,12 @@ auth postures:
   same hard interactive-only gate the decide endpoint uses, threading a
   `surface="proposals"` parameter through so its denial audit action
   (`denied.proposals_requires_interactive`) is distinguishable from
-  `/approvals/*`'s own (`denied.approval_requires_interactive`) in the
-  trail, even though the client sees a uniform `unauthorized` body either
-  way.
+  `/approvals/*`'s own (`denied.approval_requires_interactive`) and from
+  `POST /proposals/{id}/decide`'s own (`surface="proposals_decide"`, see
+  below) in the trail, even though the client sees a uniform `unauthorized`
+  body either way. `service.ALLOWED_SURFACES` enumerates the three valid
+  values so an arbitrary caller-supplied string can never become an audit
+  action name.
 
 **Create-time dedup key: `(kind, proposed_by_bot_id, target_id,
 action_type)`** -- scoped to the SUBMITTING BOT. A resubmission matching an

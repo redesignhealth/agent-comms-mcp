@@ -689,11 +689,21 @@ class TestListPendingProposals:
                 "source_message_url": "https://redesignhealth.slack.com/archives/C1/p1",
             },
         }
-        submit_resp = await http_client.post(
-            "/proposals", json=body, headers={"Authorization": "Bearer bot-token"}
-        )
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(return_value=_PROPOSAL_BODY["target_fingerprint"]),
+            ),
+            patch("service.linear_client.apply_progress_update", AsyncMock()),
+        ):
+            submit_resp = await http_client.post(
+                "/proposals", json=body, headers={"Authorization": "Bearer bot-token"}
+            )
         assert submit_resp.status_code == 200
-        assert submit_resp.json()["status"] == "approved"
+        # TECH-5873 Argus review B1: the auto-judge's "approved" verdict is
+        # never itself persisted -- it resolves synchronously to "applied"
+        # here (matching fingerprint, successful Linear write).
+        assert submit_resp.json()["status"] == "applied"
 
         pending = await http_client.get(
             "/proposals/pending", headers={"Authorization": "Bearer human-token"}

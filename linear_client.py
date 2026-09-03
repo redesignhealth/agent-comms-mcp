@@ -80,7 +80,9 @@ def _require_api_token() -> str:
 async def _post_graphql(query: str, variables: dict[str, Any]) -> dict[str, Any]:
     token = _require_api_token()
     try:
-        async with httpx.AsyncClient(timeout=_LINEAR_REQUEST_TIMEOUT_SECONDS) as client:
+        async with httpx.AsyncClient(
+            timeout=_LINEAR_REQUEST_TIMEOUT_SECONDS, follow_redirects=False
+        ) as client:
             response = await client.post(
                 _LINEAR_API_URL,
                 json={"query": query, "variables": variables},
@@ -88,10 +90,14 @@ async def _post_graphql(query: str, variables: dict[str, Any]) -> dict[str, Any]
             )
             response.raise_for_status()
             payload = response.json()
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, ValueError) as exc:
         raise LinearAPIError(f"Linear API request failed: {exc}") from exc
     if payload.get("errors"):
-        raise LinearAPIError(f"Linear API returned errors: {payload['errors']}")
+        messages = "; ".join(
+            error.get("message", str(error)) if isinstance(error, dict) else str(error)
+            for error in payload["errors"]
+        )
+        raise LinearAPIError(f"Linear API returned errors: {messages}")
     data = payload.get("data")
     if not isinstance(data, dict):
         raise LinearAPIError("Linear API response missing 'data'")
@@ -137,6 +143,12 @@ async def fetch_current_fingerprint(target_id: str) -> str:
 
 
 def _progress_comment_body(action: dict[str, Any]) -> str:
+    # Argus review S3: re-validate URL fields with the same allowlist
+    # `service._is_valid_citation_url` uses at judging time. A proposal can
+    # reach here via manual human approval (not just the auto-approve judge
+    # path), so a non-allowlisted URL must not silently reach Linear.
+    import service
+
     action_type = action.get("action_type", "update")
     lines = [f"Progress update: {action_type}"]
     rationale = action.get("rationale")
@@ -145,6 +157,8 @@ def _progress_comment_body(action: dict[str, Any]) -> str:
     for label, key in (("Source", "source_message_url"), ("Resolved by", "resolving_pr_url")):
         value = action.get(key)
         if isinstance(value, str) and value:
+            if not service._is_valid_citation_url(value):
+                raise LinearAPIError(f"{key} failed citation-URL validation: {value!r}")
             lines.append(f"{label}: {value}")
     return "\n\n".join(lines)
 
@@ -158,7 +172,9 @@ async def apply_progress_update(action: dict[str, Any]) -> None:
     """
     target_id = action["target_id"]
     body = _progress_comment_body(action)
-    await _post_graphql(_COMMENT_MUTATION, {"issueId": target_id, "body": body})
+    result = await _post_graphql(_COMMENT_MUTATION, {"issueId": target_id, "body": body})
+    if not result.get("commentCreate", {}).get("success"):
+        raise LinearAPIError("commentCreate returned success=false")
 
 
 __all__ = [

@@ -454,11 +454,13 @@ async def _authenticate_approval_caller(
     inspected and rejected it rather than merely failing to authenticate).
 
     ``surface`` (Argus review S6) distinguishes the denial audit action
-    across the two HTTP surfaces sharing this same gate: ``"approval"``
-    (default -- ``/approvals/*``) and ``"proposals"`` (``GET
-    /proposals/pending``) -- passed straight through to
-    ``service.audit_denied_approval_requires_interactive`` so the two
-    surfaces' denials are no longer indistinguishable in the audit trail.
+    across the three HTTP surfaces sharing this same gate: ``"approval"``
+    (default -- ``/approvals/*``), ``"proposals"`` (``GET
+    /proposals/pending``), and ``"proposals_decide"`` (``POST
+    /proposals/{hold_id}/decide``) -- passed straight through to
+    ``service.audit_denied_approval_requires_interactive`` (validated there
+    against ``ALLOWED_SURFACES``) so the surfaces' denials are no longer
+    indistinguishable in the audit trail.
 
     Structural gate, deliberately with NO scope escape hatch, and now
     structural by VERIFICATION PATH, not claim inspection (plan doc §9/§15):
@@ -874,8 +876,9 @@ async def decide_proposal_route(request: Request) -> Response:
             return JSONResponse(_UNIFORM_HOLD_NOT_FOUND, status_code=404)
         except HoldAlreadyDecidedError as exc:
             return JSONResponse({"error": "already_decided", "status": exc.status}, status_code=409)
-        except ValueError as exc:
-            return JSONResponse({"error": "invalid_request", "detail": str(exc)}, status_code=400)
+        except Exception:
+            logger.exception("decide_proposal invariant violation for hold_id=%s", hold_id)
+            return JSONResponse({"error": "internal_error"}, status_code=500)
 
     return JSONResponse(result, status_code=200)
 

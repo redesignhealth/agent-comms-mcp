@@ -67,16 +67,31 @@ APPROVAL_HOLD_AUTO_DECISIONS = ("cleared", "escalated")
 # every pre-existing row); "invite" is new.
 APPROVAL_HOLD_KINDS = ("message", "invite")
 
-# proposal_holds lifecycle (TECH-5871): pending -> approved|rejected, then
-# (approved only) -> applied|apply_failed|stale. `stale` is a terminal
-# outcome a future apply-time re-check can set when `target_fingerprint`
-# no longer matches the target's current state at apply time (see
-# ProposalHold's class docstring) -- reachable only from `approved`
-# (post-decision), never directly from `pending`: staleness is only ever
-# detected at apply/decide time, which is after decision fields
-# (`decided_at`/`decided_by_actor_id`/`decision_source`) are already
-# stamped, and `ck_proposal_holds_decision_consistency` requires those
-# fields whenever `status != 'pending'`.
+# proposal_holds lifecycle (TECH-5871, transitions finalized TECH-5873
+# Argus review B1): `pending` is the only persisted non-terminal status.
+# A "pending" row resolves to:
+#   - `applied` | `apply_failed` | `stale`, via EITHER the TECH-5877
+#     auto-judge's immediate synchronous apply at submission time
+#     (service.create_proposal) OR a human's `approve` decision
+#     (service.decide_proposal) -- both paths funnel through the same
+#     service._apply_or_finalize_proposal_hold helper.
+#   - `rejected`, via a human's `reject` decision only (decide_proposal) --
+#     the auto-judge never rejects on a bot's behalf (see
+#     evaluate_linear_progress_update_judge's docstring).
+# `approved` is a value this CHECK still accepts (see the "frozen
+# migration" note below) but is NEVER actually persisted: it is a
+# transient in-memory verdict inside create_proposal/decide_proposal that
+# resolves to one of the three apply-outcomes above before either
+# function returns control to its caller -- a hold is never left sitting
+# at rest in `approved`, because `decide_proposal` treats any non-
+# `pending` status as already-decided and `list_pending_proposal_holds`
+# only surfaces `status='pending'`, which would strand it. `stale` is
+# reachable only via that apply-time fingerprint re-check (see
+# ProposalHold's class docstring), never directly from `pending`: it is
+# detected after decision fields (`decided_at`/`decided_by_actor_id`/
+# `decision_source`) are already stamped, and
+# `ck_proposal_holds_decision_consistency` requires those fields whenever
+# `status != 'pending'`.
 # NOTE: these three tuples are mirrored as literal SQL in migration
 # d23b37d4e187's CHECK constraints (migrations are frozen once applied, so
 # they cannot import from this module). Editing any of these tuples requires
