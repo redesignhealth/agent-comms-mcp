@@ -101,13 +101,46 @@ first check for an active builder:
 .. code-block:: sql
 
     SELECT pid, query, state FROM pg_stat_activity
-    WHERE query ILIKE '%idx_audit_log_actor_sub_action_at%' AND state != 'idle';
+    WHERE query ILIKE '%CREATE INDEX%idx_audit_log_actor_sub_action_at%'
+      AND state != 'idle'
+      AND pid != pg_backend_pid();
 
-If this returns a row, an index build is still in flight -- wait for it to
-finish (and confirm the ECS task running ``entrypoint.sh`` that started it
-has since exited cleanly) and re-run the health-check query rather than
-remediating. Only proceed to remediation below once this query returns zero
-rows AND the health check still reports INVALID.
+The ``pid != pg_backend_pid()`` clause is required, not optional: without
+it, the query always returns at least one row -- the operator's own
+backend connection running this very query -- which would make the "wait
+until this returns zero rows" instruction below impossible to ever
+satisfy, even for a genuinely stuck build with no other active builder.
+The narrowed ``ILIKE`` pattern (matching the ``CREATE INDEX`` statement
+text, not just the index name) also reduces accidental matches against
+unrelated queries that merely mention the index name in passing (e.g. a
+health-check query like the one above).
+
+This query also requires elevated privileges to be trustworthy: a
+non-superuser without the ``pg_monitor`` (or ``pg_read_all_stats``) role
+can only see rows for their OWN session in ``pg_stat_activity`` -- so a
+zero-row result from an under-privileged operator does NOT prove no build
+is running; it may simply mean the operator can't see another session's
+row. Before trusting a zero-row result, confirm the operator has the
+necessary visibility, e.g.:
+
+.. code-block:: sql
+
+    SELECT pg_has_role(current_user, 'pg_monitor', 'USAGE');
+
+If this returns ``false``, either re-run as a role with ``pg_monitor``/
+``pg_read_all_stats``/superuser, or ask someone who has it to run the
+check -- don't proceed on an unprivileged zero-row result.
+
+If the (privilege-confirmed) query above returns a row, an index build is
+still in flight -- wait for it to finish and confirm via the ``/health``
+endpoint rather than ECS task state: on success, ``entrypoint.sh`` execs
+into ``main.py`` (replacing the process), so the ECS task remains RUNNING
+-- that is the expected, healthy end state, not a sign of failure. A
+STOPPED or restarting task is the actual failure signal here, not
+confirmation of a clean migration. Once the build finishes, re-run the
+health-check query rather than remediating. Only proceed to remediation
+below once the pre-check query returns zero rows (from a
+privilege-confirmed check) AND the health check still reports INVALID.
 
 REMEDIATION if the health check reports INVALID (or you're diagnosing by
 hand): query
