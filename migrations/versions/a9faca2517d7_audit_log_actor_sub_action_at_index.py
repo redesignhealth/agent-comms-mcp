@@ -89,6 +89,26 @@ The ``CASE`` wrapper below sidesteps that:
 ``true`` means INVALID (rebuild needed), ``false`` means healthy, and
 ``NULL`` means the index was never created.
 
+PRE-CHECK before any remediation: the health-check query above reports the
+same "needs attention" result (``true``) whether the index build is
+genuinely stuck/failed OR is simply still actively running -- a concurrent
+build's row is present-but-INVALID for the entire duration of the build,
+not just after a failure. Jumping straight to remediation against a
+still-building index would ``DROP INDEX CONCURRENTLY`` out from under a
+healthy, in-progress build. Before concluding the index is genuinely stuck,
+first check for an active builder:
+
+.. code-block:: sql
+
+    SELECT pid, query, state FROM pg_stat_activity
+    WHERE query ILIKE '%idx_audit_log_actor_sub_action_at%' AND state != 'idle';
+
+If this returns a row, an index build is still in flight -- wait for it to
+finish (and confirm the ECS task running ``entrypoint.sh`` that started it
+has since exited cleanly) and re-run the health-check query rather than
+remediating. Only proceed to remediation below once this query returns zero
+rows AND the health check still reports INVALID.
+
 REMEDIATION if the health check reports INVALID (or you're diagnosing by
 hand): query
 ``SELECT indexrelid::regclass, indisvalid FROM pg_index WHERE indexrelid = to_regclass('idx_audit_log_actor_sub_action_at');``

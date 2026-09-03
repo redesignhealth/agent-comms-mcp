@@ -8,7 +8,20 @@ Postgres fixture needed.
 
 from __future__ import annotations
 
-from service import evaluate_linear_progress_update_judge
+import pytest
+
+from models import PROPOSAL_HOLD_LEVELS
+from service import (
+    _PROPOSAL_JUDGES,
+    _derive_proposal_priority,
+    evaluate_linear_progress_update_judge,
+)
+
+# Kind -> a representative ``action`` dict for that kind, used only to drive
+# _derive_proposal_priority's branch for the kind (not the judge itself).
+_REPRESENTATIVE_ACTIONS: dict[str, dict[str, object]] = {
+    "linear_progress_update": {"action_type": "open_ticket", "target_id": "TECH-1234"},
+}
 
 
 class TestOpenTicket:
@@ -172,3 +185,22 @@ class TestOtherActionTypes:
     def test_missing_action_type_stays_pending(self) -> None:
         status, _note = evaluate_linear_progress_update_judge({"target_id": "TECH-1234"})
         assert status == "pending"
+
+
+class TestPriorityRegistryParity:
+    """Argus review: guards against ``_PROPOSAL_JUDGES`` and
+    ``_derive_proposal_priority`` drifting apart. Every ``kind`` registered
+    as a judge must also have a working priority-derivation branch -- if a
+    future kind is added to ``_PROPOSAL_JUDGES`` without a matching branch,
+    this test fails immediately (via the ``AssertionError`` guard in
+    ``_derive_proposal_priority``) instead of that gap surfacing as an
+    unhandled 500 in production. Trivially passes today since only
+    ``linear_progress_update`` is registered; a missing entry in
+    ``_REPRESENTATIVE_ACTIONS`` for a new kind is itself a signal this test
+    needs updating alongside the new registration."""
+
+    @pytest.mark.parametrize("kind", sorted(_PROPOSAL_JUDGES.keys()))
+    def test_every_registered_kind_derives_a_valid_priority(self, kind: str) -> None:
+        action = _REPRESENTATIVE_ACTIONS[kind]
+        priority = _derive_proposal_priority(kind, action)
+        assert priority in PROPOSAL_HOLD_LEVELS
