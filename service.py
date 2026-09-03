@@ -158,6 +158,7 @@ from collections.abc import Callable, Sequence
 from collections.abc import Set as AbstractSet
 from datetime import UTC, datetime, timedelta
 from typing import Any, NoReturn, Protocol
+from urllib.parse import urlsplit
 
 from sqlalchemy import and_, func, literal, or_, select, tuple_
 from sqlalchemy.exc import IntegrityError
@@ -4745,18 +4746,39 @@ async def _fire_approval_notifier(
 
 
 async def audit_denied_approval_requires_interactive(
-    session: AsyncSession, *, actor_sub: str
+    session: AsyncSession, *, actor_sub: str, surface: str = "approval"
 ) -> None:
-    """Audit + commit ``denied.approval_requires_interactive`` -- the hard
-    interactive-token-only gate on ``main.py``'s decide/list-pending HTTP
-    endpoints. Unlike every other denial in this module, the caller here
-    (``main.py``, a non-MCP ``mcp.custom_route`` handler) has no board
-    ``Agent``/conversation context at all -- there is nothing to raise
-    (the HTTP handler decides its own 403 response), only an audit row to
-    persist so the denial is still recorded per this module's "every
-    denial is audited" invariant.
+    """Audit + commit ``denied.<surface>_requires_interactive`` -- the hard
+    interactive-token-only gate ``main.py`` reuses across two distinct HTTP
+    surfaces: ``/approvals/*`` (``surface="approval"``, the default) and
+    ``GET /proposals/pending`` (``surface="proposals"``). Argus review S6:
+    both surfaces used to write the SAME action name
+    (``denied.approval_requires_interactive``), making them indistinguishable
+    in the audit trail even though they gate different resources -- the
+    caller now threads its own surface through. Unlike every other denial
+    in this module, the caller here (``main.py``, a non-MCP
+    ``mcp.custom_route`` handler) has no board ``Agent``/conversation
+    context at all -- there is nothing to raise (the HTTP handler decides
+    its own 403 response), only an audit row to persist so the denial is
+    still recorded per this module's "every denial is audited" invariant.
     """
-    _audit(session, actor_sub=actor_sub, action="denied.approval_requires_interactive")
+    _audit(session, actor_sub=actor_sub, action=f"denied.{surface}_requires_interactive")
+    await session.commit()
+
+
+async def audit_denied_proposal_submission(
+    session: AsyncSession, *, actor_sub: str, reason: str
+) -> None:
+    """Audit + commit a ``POST /proposals`` submission denial (TECH-5872,
+    Argus review S5) -- the two 403 causes in ``main._authenticate_
+    proposal_submitter`` (``reason="not_agent_token"`` for an
+    interactive/unverifiable-as-agent caller, ``reason="missing_scope"`` for
+    a verified agent-jwt token lacking ``PROPOSAL_SUBMIT_SCOPE``). Same "no
+    board Agent/conversation context" shape as
+    ``audit_denied_approval_requires_interactive`` above -- there is nothing
+    to raise, only an audit row to persist.
+    """
+    _audit(session, actor_sub=actor_sub, action=f"denied.proposal_submit_{reason}")
     await session.commit()
 
 
@@ -5319,32 +5341,53 @@ async def decide_hold(
 # non-MCP ``POST /proposals`` route) from the submitting bot's verified
 # token claims, not from ``service.get_agent_by_sub``.
 
-# TECH-5875: per-bot submission rate limit. Same table-count-per-window
-# pattern as ``_deny_rate_limited_holds`` (no Redis) -- counts EVERY
-# proposal_holds row created by this bot in the window, not just currently-
-# pending ones, since a submission-spam control must count attempts.
+# TECH-5875: per-bot submission rate limit. Counts ``audit_log`` rows
+# tagged ``_PROPOSAL_SUBMISSION_ATTEMPT_ACTION``, NOT ``proposal_holds``
+# rows (Argus review S2 fix): a create-time dedup match (TECH-5872, B1)
+# UPDATEs an existing pending row in place instead of inserting a new one,
+# so counting ``proposal_holds`` rows created in the window would never
+# increment for a bot repeatedly resubmitting against its own already-
+# pending dedup key -- letting it call this endpoint at unlimited
+# frequency. ``audit_log`` is append-only, so one row is written per
+# attempt regardless of whether the attempt goes on to INSERT or UPDATE
+# (see the call site in ``create_proposal``, which commits this marker
+# immediately -- before the dedup lookup -- so it survives the
+# rollback-and-retry ``_dedup_or_insert_proposal`` performs on the B2
+# unique-index race below).
 PROPOSAL_RATE_LIMIT_WINDOW = timedelta(minutes=1)
 MAX_PROPOSALS_PER_BOT_PER_WINDOW = 5
+_PROPOSAL_SUBMISSION_ATTEMPT_ACTION = "proposal.submission_attempt"
 
 
 async def _deny_rate_limited_proposals(session: AsyncSession, *, proposed_by_bot_id: str) -> None:
-    """Raise ``RateLimitExceededError`` (mapped to HTTP 429 by main.py) if
-    ``proposed_by_bot_id`` has submitted too many proposals in the rolling
-    window. No audit_log row here -- unlike approval_holds' sender, a
-    proposing bot is not necessarily a board ``Agent`` (``AuditLog.agent_id``
-    is a real FK), so this is logged instead (see main.py's route handler)."""
+    """Audit + commit a denial, then raise ``RateLimitExceededError``
+    (mapped to HTTP 429 by main.py) if ``proposed_by_bot_id`` has submitted
+    too many proposals in the rolling window. Unlike approval_holds' sender,
+    a proposing bot is not necessarily a board ``Agent``
+    (``AuditLog.agent_id`` is a real FK), so the denial audit row carries
+    only ``actor_sub`` -- no ``agent_id`` (Argus review S5: this denial
+    previously wasn't audited at all, only logged in main.py's route
+    handler, which still happens for operational visibility)."""
     window_start = _now() - PROPOSAL_RATE_LIMIT_WINDOW
     count = (
         await session.execute(
             select(func.count())
-            .select_from(ProposalHold)
+            .select_from(AuditLog)
             .where(
-                ProposalHold.proposed_by_bot_id == proposed_by_bot_id,
-                ProposalHold.created_at > window_start,
+                AuditLog.actor_sub == proposed_by_bot_id,
+                AuditLog.action == _PROPOSAL_SUBMISSION_ATTEMPT_ACTION,
+                AuditLog.at > window_start,
             )
         )
     ).scalar_one()
     if count >= MAX_PROPOSALS_PER_BOT_PER_WINDOW:
+        _audit(
+            session,
+            actor_sub=proposed_by_bot_id,
+            action="denied.proposal_rate_limited",
+            detail={"limit": "proposals_per_bot_per_window"},
+        )
+        await session.commit()
         raise RateLimitExceededError(
             f"rate_limited: at most {MAX_PROPOSALS_PER_BOT_PER_WINDOW} proposals per "
             f"{int(PROPOSAL_RATE_LIMIT_WINDOW.total_seconds())}s per bot",
@@ -5397,6 +5440,36 @@ def _derive_proposal_priority(kind: str, action: dict[str, Any]) -> str:
 _LINEAR_OPEN_TICKET_ACTION_TYPES = frozenset({"open_ticket"})
 _LINEAR_CLOSE_TICKET_ACTION_TYPES = frozenset({"close_ticket"})
 
+# Argus review B4: presence of a non-empty string was NOT sufficient to
+# treat a citation as real -- a bot could self-approve by writing ANY
+# string (including whitespace-shaped junk, or a URL to a host it fully
+# controls) into ``source_message_url``/``resolving_pr_url``. A citation
+# must now be an http(s) URL whose host is one of these two families:
+# Slack message permalinks (``*.slack.com``) and GitHub PR/commit links
+# (``github.com``) -- the two citation shapes this judge is documented to
+# accept.
+_ALLOWED_CITATION_HOST_EXACT = frozenset({"github.com"})
+_ALLOWED_CITATION_HOST_SUFFIXES = (".slack.com",)
+
+
+def _is_allowed_citation_host(host: str) -> bool:
+    host = host.lower()
+    if host in _ALLOWED_CITATION_HOST_EXACT:
+        return True
+    return any(host.endswith(suffix) for suffix in _ALLOWED_CITATION_HOST_SUFFIXES)
+
+
+def _is_valid_citation_url(value: Any) -> bool:
+    """Argus review B4: a citation must be an http(s) URL on an allowlisted
+    host (see ``_ALLOWED_CITATION_HOST_EXACT``/``_ALLOWED_CITATION_HOST_SUFFIXES``
+    above), not merely a non-empty string."""
+    if not isinstance(value, str) or not value.strip():
+        return False
+    parsed = urlsplit(value)
+    if parsed.scheme not in ("http", "https"):
+        return False
+    return parsed.hostname is not None and _is_allowed_citation_host(parsed.hostname)
+
 
 def evaluate_linear_progress_update_judge(action: dict[str, Any]) -> tuple[str, str | None]:
     """Pure decision function for kind="linear_progress_update" (TECH-5877).
@@ -5411,29 +5484,28 @@ def evaluate_linear_progress_update_judge(action: dict[str, Any]) -> tuple[str, 
     docstring):
 
     1. ``action_type`` opens a ticket: auto-approve ONLY if
-       ``action["source_message_url"]`` is a non-empty string citing the
-       human message that originated the request. A bare confidence score
-       or free-text rationale is never sufficient.
+       ``action["source_message_url"]`` is a valid citation URL (see
+       ``_is_valid_citation_url``) citing the human message that originated
+       the request. A bare confidence score, free-text rationale, or an
+       unlisted-host/non-http(s) URL is never sufficient.
     2. ``action_type`` closes a ticket: auto-approve if EITHER
        ``action["source_message_url"]`` (a human confirming completion) OR
        ``action["resolving_pr_url"]`` (a merged PR that plausibly resolves
-       it) is a non-empty string.
+       it) is a valid citation URL.
     3. Everything else (status changes short of closing, project
-       reassignment, priority changes, or open/close with no citation)
-       stays ``"pending"``.
+       reassignment, priority changes, or open/close with no valid
+       citation) stays ``"pending"``.
 
     Independent of the HTTP layer and the DB (takes/returns plain dicts) so
     it is unit-testable as a pure function."""
     action_type = action.get("action_type")
-    source_message_url = action.get("source_message_url")
-    has_source_message = isinstance(source_message_url, str) and bool(source_message_url)
+    has_source_message = _is_valid_citation_url(action.get("source_message_url"))
     if action_type in _LINEAR_OPEN_TICKET_ACTION_TYPES:
         if has_source_message:
             return "approved", "auto-approved: open-ticket proposal cites source_message_url"
         return "pending", None
     if action_type in _LINEAR_CLOSE_TICKET_ACTION_TYPES:
-        resolving_pr_url = action.get("resolving_pr_url")
-        has_resolving_pr = isinstance(resolving_pr_url, str) and bool(resolving_pr_url)
+        has_resolving_pr = _is_valid_citation_url(action.get("resolving_pr_url"))
         if has_source_message or has_resolving_pr:
             return "approved", "auto-approved: close-ticket proposal cites a valid citation"
         return "pending", None
@@ -5477,6 +5549,157 @@ def _proposal_dict(hold: ProposalHold) -> dict[str, Any]:
     return result
 
 
+def validate_hold_level(value: str, name: str) -> str:
+    """Shared ``confidence``/``importance``/``impact`` membership check
+    (Argus review S14) -- ``PROPOSAL_HOLD_LEVELS`` is the single source of
+    truth, and this is the only place that checks membership in it. Used by
+    both ``main.py``'s HTTP-layer pre-validation (``submit_proposal``) and
+    this module's own defense-in-depth re-check in ``create_proposal``, so
+    the two can never drift onto different accepted vocabularies."""
+    if value not in PROPOSAL_HOLD_LEVELS:
+        raise ValueError(f"{name} must be one of {PROPOSAL_HOLD_LEVELS!r}")
+    return value
+
+
+def _proposal_dedup_where(
+    *, kind: str, proposed_by_bot_id: str, target_id: str, action_type: str
+) -> tuple[Any, ...]:
+    """Shared create-time dedup predicate (TECH-5872, Argus review B1 fix):
+    ``(kind, proposed_by_bot_id, target_id, action_type)`` against any
+    currently ``status='pending'`` row. Scoped to the SAME submitting bot
+    deliberately -- a different bot targeting the same ``(kind, target_id,
+    action_type)`` must get its own fresh row, never silently overwrite (and
+    get auto-approved under) another bot's pending proposal. This predicate
+    is shared between ``_dedup_or_insert_proposal``'s app-level SELECT
+    (used both for the common case and to re-query after losing the B2
+    race below) and must use the SAME key as the DB-level partial unique
+    index backing it, ``idx_proposal_holds_pending_dedup`` (migration
+    9a1c2d3e4f5b) -- the two must never drift onto different keys, or they
+    will fight each other."""
+    return (
+        ProposalHold.kind == kind,
+        ProposalHold.proposed_by_bot_id == proposed_by_bot_id,
+        ProposalHold.status == "pending",
+        ProposalHold.action["target_id"].astext == target_id,
+        ProposalHold.action["action_type"].astext == action_type,
+    )
+
+
+def _apply_proposal_resubmission(
+    hold: ProposalHold,
+    *,
+    action: dict[str, Any],
+    rationale: str,
+    confidence: str,
+    importance: str,
+    impact: str,
+    priority: str,
+    target_fingerprint: str,
+) -> None:
+    """Mutate an existing pending ``ProposalHold`` in place for a dedup
+    match. Deliberately does NOT set ``hold.updated_at`` itself (Argus
+    review S3) -- ``models._updated_at()``'s ORM-managed ``onupdate`` fires
+    on this same flush/commit once any column changes, so a second,
+    Python-clock write here would just race the DB's own ``now()`` for no
+    benefit."""
+    hold.action = action
+    hold.rationale = rationale
+    hold.confidence = confidence
+    hold.importance = importance
+    hold.impact = impact
+    hold.priority = priority
+    hold.target_fingerprint = target_fingerprint
+
+
+async def _dedup_or_insert_proposal(
+    session: AsyncSession,
+    *,
+    kind: str,
+    proposed_by_bot_id: str,
+    owner_sub: str,
+    action: dict[str, Any],
+    rationale: str,
+    confidence: str,
+    importance: str,
+    impact: str,
+    target_id: str,
+    action_type: str,
+    priority: str,
+    target_fingerprint: str,
+) -> ProposalHold:
+    """INSERT a new ``proposal_holds`` row, or UPDATE an existing pending
+    dedup match in place (TECH-5872 B1/B2).
+
+    The app-level SELECT below is the common case. ``idx_proposal_holds_
+    pending_dedup`` (migration 9a1c2d3e4f5b) is the DB-level backstop for
+    the race the SELECT-then-INSERT pattern can't close alone: two
+    concurrent submissions for the same dedup key can both miss the SELECT
+    and both attempt an INSERT. The loser's INSERT raises ``IntegrityError``
+    on flush; this rolls back ONLY that failed INSERT attempt (not the
+    caller's already-committed rate-limit attempt marker -- see
+    ``create_proposal``) and re-queries to perform the UPDATE instead."""
+    where = _proposal_dedup_where(
+        kind=kind,
+        proposed_by_bot_id=proposed_by_bot_id,
+        target_id=target_id,
+        action_type=action_type,
+    )
+    existing = (await session.execute(select(ProposalHold).where(*where))).scalar_one_or_none()
+    if existing is not None:
+        _apply_proposal_resubmission(
+            existing,
+            action=action,
+            rationale=rationale,
+            confidence=confidence,
+            importance=importance,
+            impact=impact,
+            priority=priority,
+            target_fingerprint=target_fingerprint,
+        )
+        return existing
+
+    hold = ProposalHold(
+        kind=kind,
+        proposed_by_bot_id=proposed_by_bot_id,
+        owner_sub=owner_sub,
+        action=action,
+        rationale=rationale,
+        confidence=confidence,
+        importance=importance,
+        impact=impact,
+        priority=priority,
+        status="pending",
+        target_fingerprint=target_fingerprint,
+    )
+    session.add(hold)
+    try:
+        await session.flush()
+    except IntegrityError as exc:
+        await session.rollback()
+        if not _is_constraint_violation(exc, "idx_proposal_holds_pending_dedup"):
+            raise
+        existing_after_race = (
+            await session.execute(select(ProposalHold).where(*where))
+        ).scalar_one_or_none()
+        if existing_after_race is None:
+            # Vanishingly unlikely (the race winner's row was deleted again
+            # before this re-read) -- nothing sane to update; surface the
+            # original DB error rather than silently proceeding.
+            raise
+        _apply_proposal_resubmission(
+            existing_after_race,
+            action=action,
+            rationale=rationale,
+            confidence=confidence,
+            importance=importance,
+            impact=impact,
+            priority=priority,
+            target_fingerprint=target_fingerprint,
+        )
+        return existing_after_race
+    return hold
+
+
 async def create_proposal(
     session: AsyncSession,
     *,
@@ -5492,11 +5715,16 @@ async def create_proposal(
 ) -> dict[str, Any]:
     """``POST /proposals`` (main.py, non-MCP, bot-submission-gated).
 
-    Enforces the TECH-5875 per-bot rate limit, then either UPDATEs an
-    existing ``status='pending'`` row matching ``(kind, target_id,
-    action_type)`` in place (TECH-5872 create-time dedup -- ``target_id``/
-    ``action_type`` derived from ``action`` via ``_extract_proposal_target``)
-    or INSERTs a new one. ``priority`` is always server-derived
+    Enforces the TECH-5875 per-bot rate limit (recording this attempt in
+    ``audit_log`` and committing immediately -- see
+    ``_deny_rate_limited_proposals``'s docstring for why this must survive
+    a later rollback-and-retry), then delegates to
+    ``_dedup_or_insert_proposal``, which either UPDATEs an existing
+    ``status='pending'`` row matching ``(kind, proposed_by_bot_id,
+    target_id, action_type)`` in place (TECH-5872 create-time dedup --
+    ``target_id``/``action_type`` derived from ``action`` via
+    ``_extract_proposal_target``; scoped to the submitting bot, Argus
+    review B1) or INSERTs a new one. ``priority`` is always server-derived
     (``_derive_proposal_priority``) -- a caller-supplied value in ``action``
     or elsewhere is never trusted or persisted as ``priority``.
 
@@ -5505,57 +5733,39 @@ async def create_proposal(
     no registered judge stays ``"pending"``. The judge only ever sets
     ``status``/``decision_source``/``decided_by_actor_id``/``decided_at``/
     ``decision_note`` -- it never executes the underlying write (that is
-    TECH-5873's concern, not yet built).
+    TECH-5873's concern, not yet built). Note: once B1 lands, a SAME-bot
+    resubmission that adds a valid citation to an already-pending row is
+    expected to auto-approve on this pass -- a bot progressively refining
+    its own proposal, not a new escalation path (see
+    ``tests/test_proposal_service.py::TestJudgeIntegration::
+    test_resubmit_with_citation_auto_approves_pending_row``).
     """
-    if confidence not in PROPOSAL_HOLD_LEVELS:
-        raise ValueError(f"confidence must be one of {PROPOSAL_HOLD_LEVELS!r}")
-    if importance not in PROPOSAL_HOLD_LEVELS:
-        raise ValueError(f"importance must be one of {PROPOSAL_HOLD_LEVELS!r}")
-    if impact not in PROPOSAL_HOLD_LEVELS:
-        raise ValueError(f"impact must be one of {PROPOSAL_HOLD_LEVELS!r}")
+    validate_hold_level(confidence, "confidence")
+    validate_hold_level(importance, "importance")
+    validate_hold_level(impact, "impact")
 
     await _deny_rate_limited_proposals(session, proposed_by_bot_id=proposed_by_bot_id)
+    _audit(session, actor_sub=proposed_by_bot_id, action=_PROPOSAL_SUBMISSION_ATTEMPT_ACTION)
+    await session.commit()
 
     target_id, action_type = _extract_proposal_target(action)
     priority = _derive_proposal_priority(kind, action)
 
-    existing = (
-        await session.execute(
-            select(ProposalHold).where(
-                ProposalHold.kind == kind,
-                ProposalHold.status == "pending",
-                ProposalHold.action["target_id"].astext == target_id,
-                ProposalHold.action["action_type"].astext == action_type,
-            )
-        )
-    ).scalar_one_or_none()
-
-    if existing is not None:
-        hold = existing
-        hold.action = action
-        hold.rationale = rationale
-        hold.confidence = confidence
-        hold.importance = importance
-        hold.impact = impact
-        hold.priority = priority
-        hold.target_fingerprint = target_fingerprint
-        hold.updated_at = _now()
-    else:
-        hold = ProposalHold(
-            kind=kind,
-            proposed_by_bot_id=proposed_by_bot_id,
-            owner_sub=owner_sub,
-            action=action,
-            rationale=rationale,
-            confidence=confidence,
-            importance=importance,
-            impact=impact,
-            priority=priority,
-            status="pending",
-            target_fingerprint=target_fingerprint,
-        )
-        session.add(hold)
-        await session.flush()
+    hold = await _dedup_or_insert_proposal(
+        session,
+        kind=kind,
+        proposed_by_bot_id=proposed_by_bot_id,
+        owner_sub=owner_sub,
+        action=action,
+        rationale=rationale,
+        confidence=confidence,
+        importance=importance,
+        impact=impact,
+        target_id=target_id,
+        action_type=action_type,
+        priority=priority,
+        target_fingerprint=target_fingerprint,
+    )
 
     judge = _PROPOSAL_JUDGES.get(kind)
     if judge is not None:
@@ -6627,6 +6837,7 @@ __all__ = [
     "accept_invite",
     "archive_conversation",
     "audit_denied_approval_requires_interactive",
+    "audit_denied_proposal_submission",
     "create_proposal",
     "decide_hold",
     "decline_invite",
@@ -6650,6 +6861,7 @@ __all__ = [
     "reconcile_agent_ownership",
     "register_agent",
     "start_conversation",
+    "validate_hold_level",
     "validate_ownership_client_configuration",
     "write_through_ownership",
 ]

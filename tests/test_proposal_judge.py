@@ -65,6 +65,46 @@ class TestOpenTicket:
         )
         assert status == "pending"
 
+    def test_open_ticket_with_whitespace_only_citation_stays_pending(self) -> None:
+        """Argus review B4: a whitespace-shaped string must not be
+        treated as a real citation -- presence of ANY non-empty string
+        was the exact hole B4 closes."""
+        status, _note = evaluate_linear_progress_update_judge(
+            {
+                "action_type": "open_ticket",
+                "target_id": "TECH-1234",
+                "source_message_url": "   ",
+            }
+        )
+        assert status == "pending"
+
+    def test_open_ticket_with_non_http_scheme_citation_stays_pending(self) -> None:
+        """Argus review B4: a non-http(s) scheme (e.g. a bot writing its
+        own internal ``bot://`` pointer) must not satisfy the citation
+        check even though it is a well-formed, non-empty URL string."""
+        status, _note = evaluate_linear_progress_update_judge(
+            {
+                "action_type": "open_ticket",
+                "target_id": "TECH-1234",
+                "source_message_url": "ftp://redesignhealth.slack.com/archives/C1/p123",
+            }
+        )
+        assert status == "pending"
+
+    def test_open_ticket_with_non_allowlisted_host_citation_stays_pending(self) -> None:
+        """Argus review B4: an http(s) URL on a host OUTSIDE the
+        slack.com/github.com allowlist (e.g. a bot's own fully-controlled
+        domain) must not satisfy the citation check -- this is the exact
+        self-approval hole presence-only checking left open."""
+        status, _note = evaluate_linear_progress_update_judge(
+            {
+                "action_type": "open_ticket",
+                "target_id": "TECH-1234",
+                "source_message_url": "https://not-slack-or-github.example/p123",
+            }
+        )
+        assert status == "pending"
+
 
 class TestCloseTicket:
     def test_close_ticket_with_source_message_url_is_approved(self) -> None:

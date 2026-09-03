@@ -10,12 +10,9 @@ block and fake-auth-provider idiom. Auth is exercised against
 
 from __future__ import annotations
 
-import asyncio
 import os
-import subprocess
 import sys
 from collections.abc import AsyncIterator
-from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -23,73 +20,22 @@ import httpx
 import pytest
 import pytest_asyncio
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import (
-    AsyncEngine,
-    AsyncSession,
-    async_sessionmaker,
-    create_async_engine,
-)
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from starlette.applications import Starlette
 from starlette.routing import Route
 
-SERVICE_ROOT = Path(__file__).parent.parent
-_DEFAULT_TEST_DATABASE_URL = "postgresql://postgres:postgres@localhost:55432/agent_comms"
-
-
-def _test_database_url() -> str:
-    url = os.environ.get("DATABASE_URL", _DEFAULT_TEST_DATABASE_URL)
-    if url.startswith("postgresql://"):
-        return url.replace("postgresql://", "postgresql+asyncpg://", 1)
-    return url
-
-
-async def _can_connect(url: str) -> bool:
-    try:
-        engine = create_async_engine(url)
-        async with engine.connect() as conn:
-            await conn.execute(text("SELECT 1"))
-        await engine.dispose()
-        return True
-    except Exception:
-        return False
-
-
-@pytest.fixture(scope="module")
-def database_url() -> str:
-    url = _test_database_url()
-    if not asyncio.run(_can_connect(url)):
-        pytest.skip(
-            f"Postgres unreachable at {url!r} — run `docker compose up -d postgres` "
-            "(or set DATABASE_URL) to exercise the proposal-endpoint tests."
-        )
-    return url
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _migrated_schema(database_url: str) -> None:
-    env = {**os.environ, "DATABASE_URL": database_url.replace("+asyncpg", "")}
-    for args in (["downgrade", "base"], ["upgrade", "head"]):
-        subprocess.run(
-            [sys.executable, "-m", "alembic", *args],
-            cwd=SERVICE_ROOT,
-            env=env,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-
-
-@pytest_asyncio.fixture
-async def engine(database_url: str) -> AsyncIterator[AsyncEngine]:
-    eng = create_async_engine(database_url)
-    yield eng
-    await eng.dispose()
+# Real-Postgres fixtures (database_url, _migrated_schema, engine) are shared
+# via tests/conftest.py (Argus review S15) -- this module opts in explicitly
+# since conftest's `_migrated_schema` is deliberately not autouse globally.
+pytestmark = pytest.mark.usefixtures("_migrated_schema")
 
 
 @pytest_asyncio.fixture(autouse=True)
 async def _clean_tables(engine: AsyncEngine) -> AsyncIterator[None]:
     async with engine.begin() as conn:
-        await conn.execute(text("TRUNCATE TABLE proposal_holds RESTART IDENTITY CASCADE"))
+        await conn.execute(
+            text("TRUNCATE TABLE proposal_holds, audit_log RESTART IDENTITY CASCADE")
+        )
     yield
 
 
@@ -140,10 +86,30 @@ class _FakeInteractiveOnlyProvider:
         return found
 
 
+class _FakeAgentOnlyVerifier:
+    """Stands in for one of ``MultiAuth.verifiers`` (real code: the default
+    ``agent_jwt_hs256`` ``JWTVerifier``) -- verifies ONLY agent-jwt-issued
+    tokens, mirroring ``_FakeInteractiveOnlyProvider``'s opposite restriction
+    for ``.server``. Needed so ``main._verify_agent_token`` (Argus review
+    S4's structural fix) has something real to iterate: it walks
+    ``_auth_provider.verifiers`` directly, bypassing ``.server`` (Okta)
+    entirely."""
+
+    def __init__(self, outer: _FakeAuthProvider) -> None:
+        self._outer = outer
+
+    async def verify_token(self, token: str) -> _FakeAccessToken | None:
+        found = self._outer.tokens.get(token)
+        if found is None or found.claims.get("iss") != "agent-jwt":
+            return None
+        return found
+
+
 class _FakeAuthProvider:
     def __init__(self) -> None:
         self.tokens: dict[str, _FakeAccessToken] = {}
         self.server = _FakeInteractiveOnlyProvider(self)
+        self.verifiers = [_FakeAgentOnlyVerifier(self)]
 
     async def verify_token(self, token: str) -> _FakeAccessToken | None:
         return self.tokens.get(token)
@@ -299,6 +265,82 @@ class TestSubmitProposal:
         )
         assert resp.status_code == 422
 
+    async def test_non_json_body_returns_invalid_json_422(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        resp = await http_client.post(
+            "/proposals",
+            content=b"not json at all",
+            headers={
+                "Authorization": "Bearer bot-token",
+                "Content-Type": "application/json",
+            },
+        )
+        assert resp.status_code == 422
+        assert resp.json()["error"] == "invalid_json"
+
+    async def test_non_dict_body_returns_invalid_body_422(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        resp = await http_client.post(
+            "/proposals", json=[], headers={"Authorization": "Bearer bot-token"}
+        )
+        assert resp.status_code == 422
+        assert resp.json()["error"] == "invalid_body"
+
+    async def test_rationale_exceeding_max_length_returns_field_too_long(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        body = {**_PROPOSAL_BODY, "rationale": "x" * 4001}
+        resp = await http_client.post(
+            "/proposals", json=body, headers={"Authorization": "Bearer bot-token"}
+        )
+        assert resp.status_code == 422
+        assert "exceeds" in resp.json()["detail"]
+
+    async def test_target_fingerprint_exceeding_max_length_returns_field_too_long(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        body = {**_PROPOSAL_BODY, "target_fingerprint": "x" * 4001}
+        resp = await http_client.post(
+            "/proposals", json=body, headers={"Authorization": "Bearer bot-token"}
+        )
+        assert resp.status_code == 422
+        assert "exceeds" in resp.json()["detail"]
+
+    async def test_interactive_token_with_proposal_scope_still_returns_403(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        """An interactive/Okta token carrying (an irrelevant, since Okta
+        tokens never carry agent-jwt scopes in practice) `scopes` claim
+        with `comms:proposals:write` still can't submit -- the structural
+        gate (Argus review S4) rejects it by VERIFICATION PATH, never by
+        inspecting what scope claim it happens to carry."""
+        http_client, provider = client
+        token = _interactive_token("owner-a@example.com")
+        token.claims["scopes"] = ["comms:proposals:write"]
+        provider.tokens["human-token"] = token
+        resp = await http_client.post(
+            "/proposals", json=_PROPOSAL_BODY, headers={"Authorization": "Bearer human-token"}
+        )
+        assert resp.status_code == 403
+
     async def test_priority_in_body_is_ignored(
         self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
     ) -> None:
@@ -415,7 +457,7 @@ class TestListPendingProposals:
             **_PROPOSAL_BODY,
             "action": {
                 **_PROPOSAL_BODY["action"],
-                "source_message_url": "https://slack.example/p1",
+                "source_message_url": "https://redesignhealth.slack.com/archives/C1/p1",
             },
         }
         submit_resp = await http_client.post(
@@ -428,3 +470,49 @@ class TestListPendingProposals:
             "/proposals/pending", headers={"Authorization": "Bearer human-token"}
         )
         assert pending.json()["proposals"] == []
+
+    async def test_invalid_limit_returns_422(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+
+        resp = await http_client.get(
+            "/proposals/pending?limit=abc", headers={"Authorization": "Bearer human-token"}
+        )
+        assert resp.status_code == 422
+        assert resp.json()["error"] == "invalid_limit"
+
+    async def test_has_more_true_when_more_than_limit_pending(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        """Mirrors ``test_service.py``'s
+        ``TestListPendingApprovalHolds::test_all_expired_page_reports_has_more_false``
+        family: inserting ``limit + 1`` pending proposals and requesting
+        exactly ``limit`` must report ``has_more=True`` and return only
+        ``limit`` rows -- not silently return everything."""
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+
+        limit = 2
+        for i in range(limit + 1):
+            body = {
+                **_PROPOSAL_BODY,
+                "action": {**_PROPOSAL_BODY["action"], "target_id": f"TECH-{i}"},
+            }
+            resp = await http_client.post(
+                "/proposals", json=body, headers={"Authorization": "Bearer bot-token"}
+            )
+            assert resp.status_code == 200
+
+        pending = await http_client.get(
+            f"/proposals/pending?limit={limit}",
+            headers={"Authorization": "Bearer human-token"},
+        )
+        assert pending.status_code == 200
+        body = pending.json()
+        assert len(body["proposals"]) == limit
+        assert body["has_more"] is True

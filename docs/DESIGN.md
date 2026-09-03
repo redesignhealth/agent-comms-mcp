@@ -305,8 +305,10 @@ proposal_holds id, kind (open vocabulary, e.g. "arc_board_change",
  detected at apply/decide time, by which point decision fields are already
  stamped (see models.ProposalHold's class docstring and the
  `ck_proposal_holds_decision_consistency` CHECK). Migration only in
- TECH-5871 -- no endpoints/routes/business logic ship yet (follow-on work,
- separate tickets/PRs)
+ TECH-5871; `POST /proposals` (submission), `GET /proposals/pending`
+ (listing), per-bot rate limiting, and the deterministic auto-approval
+ judge shipped as the follow-on TECH-5872/TECH-5875/TECH-5877 (see "The
+ proposal submission endpoint" below)
 ```
 
 Design notes:
@@ -967,6 +969,73 @@ conversation creation outright, same as before this PR.
 **Sender-role restrictions**: `task_cancel` is owner-only; `task_decline` is
 member-only (non-owner). These map directly to `participants.role` and are checked
 before the state-machine transition.
+
+### The proposal submission pipeline (`POST /proposals`, `GET /proposals/pending`) [TECH-5872/TECH-5875/TECH-5877]
+
+A sibling pipeline to the approval-holds one above, generalized to
+`proposal_holds` (§5) for autonomous bots' arbitrary actions rather than
+this board's own comms traffic. Two non-MCP `mcp.custom_route`s, opposite
+auth postures:
+
+- **`POST /proposals`** is submitted BY BOTS, not humans -- the reverse of
+  the decide endpoint's gate. The bearer token must verify structurally
+  against the agent-token verifier chain ONLY (never Okta -- `main.
+  _verify_agent_token`, mirroring `_okta_provider`'s structural isolation
+  for the opposite gate) and carry `comms:proposals:write`
+  (`scopes.PROPOSAL_SUBMIT_SCOPE`) in its `scopes` claim. This scope is
+  self-checked by the route directly, like `/approvals/*` self-checks
+  interactivity -- it is deliberately NOT in `TOOL_SCOPES` (never
+  dispatched through `ScopeEnforcementMiddleware`), but IS unioned into
+  `mint_token.py`'s `_VALID_SCOPES` so it remains mintable.
+- **`GET /proposals/pending`** reuses `_authenticate_approval_caller`'s
+  same hard interactive-only gate the decide endpoint uses, threading a
+  `surface="proposals"` parameter through so its denial audit action
+  (`denied.proposals_requires_interactive`) is distinguishable from
+  `/approvals/*`'s own (`denied.approval_requires_interactive`) in the
+  trail, even though the client sees a uniform `unauthorized` body either
+  way.
+
+**Create-time dedup key: `(kind, proposed_by_bot_id, target_id,
+action_type)`** -- scoped to the SUBMITTING BOT. A resubmission matching an
+existing `status='pending'` row under this key UPDATEs it in place instead
+of inserting a duplicate; a DIFFERENT bot proposing the same
+`(kind, target_id, action_type)` always gets its own fresh row, never a
+silent overwrite of (and potential auto-approval under) another bot's
+identity. The app-level SELECT (`service._proposal_dedup_where`) and a
+DB-level partial UNIQUE index, `idx_proposal_holds_pending_dedup` (`(kind,
+proposed_by_bot_id, action->>'target_id', action->>'action_type') WHERE
+status = 'pending'`), share this exact key so the two cannot drift apart.
+The index is also the race-closing backstop for two concurrent submissions
+that both miss the SELECT and both attempt an INSERT: the loser's INSERT
+raises `IntegrityError`, which `service._dedup_or_insert_proposal` catches
+and turns into the UPDATE path instead.
+
+**Per-bot rate limit** (TECH-5875, `MAX_PROPOSALS_PER_BOT_PER_WINDOW=5` per
+`PROPOSAL_RATE_LIMIT_WINDOW=1 minute`) counts `audit_log` rows tagged
+`proposal.submission_attempt`, not `proposal_holds` rows -- a dedup-UPDATE
+never inserts a new `proposal_holds` row, so counting that table would
+never catch a bot resubmitting against its own already-pending dedup key
+at unlimited frequency. The attempt marker is written and committed
+immediately, before the dedup lookup, so it survives a later
+rollback-and-retry on the unique-index race above.
+
+**The auto-approval judge** (TECH-5877, `service._PROPOSAL_JUDGES`, keyed
+by `kind`) is a deterministic rules engine, not an LLM, run once
+immediately after every insert/update: write intent must be judged outside
+the proposing agent, so a bot can never self-approve its own proposal. The
+one registered judge today, `evaluate_linear_progress_update_judge`
+(`kind="linear_progress_update"`), auto-approves opening a ticket only if
+`action.source_message_url` is a valid citation, and closing a ticket if
+EITHER `source_message_url` or `action.resolving_pr_url` is. "Valid
+citation" means an `http(s)` URL whose host is `github.com` or a
+`*.slack.com` subdomain -- presence of any non-empty string is
+deliberately NOT sufficient (that gap would let a bot self-approve by
+writing an arbitrary string, including a URL on a host it fully controls,
+into either field). A `kind` with no registered judge always stays
+`"pending"`. Because dedup is scoped to the submitting bot, a bot
+progressively refining its OWN pending proposal by adding a valid citation
+on resubmission is expected to auto-approve on that pass -- this is a
+bot completing its own proposal, not a new escalation path.
 
 ### Configuration: pluggable seams
 

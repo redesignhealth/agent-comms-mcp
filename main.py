@@ -354,8 +354,10 @@ def _extract_bearer_token(request: Request) -> str | None:
     return token_str or None
 
 
-async def _authenticate_approval_caller(request: Request) -> tuple[str | None, int]:
-    """Self-verify the bearer token for a non-MCP approval route
+async def _authenticate_approval_caller(
+    request: Request, *, surface: str = "approval"
+) -> tuple[str | None, int]:
+    """Self-verify the bearer token for a non-MCP approval-shaped route
     (``mcp.custom_route`` runs outside MultiAuth). Returns
     ``(approver_sub, 200)`` on success, or ``(None, 401 | 403)`` on
     failure — 401 for a missing/malformed/unverifiable token, 403 for a
@@ -363,6 +365,13 @@ async def _authenticate_approval_caller(request: Request) -> tuple[str | None, i
     the load-bearing distinction: an agent-jwt token, even one carrying
     ``comms:admin``, must get 403, never 401, to prove the gate actually
     inspected and rejected it rather than merely failing to authenticate).
+
+    ``surface`` (Argus review S6) distinguishes the denial audit action
+    across the two HTTP surfaces sharing this same gate: ``"approval"``
+    (default -- ``/approvals/*``) and ``"proposals"`` (``GET
+    /proposals/pending``) -- passed straight through to
+    ``service.audit_denied_approval_requires_interactive`` so the two
+    surfaces' denials are no longer indistinguishable in the audit trail.
 
     Structural gate, deliberately with NO scope escape hatch, and now
     structural by VERIFICATION PATH, not claim inspection (plan doc §9/§15):
@@ -404,11 +413,34 @@ async def _authenticate_approval_caller(request: Request) -> tuple[str | None, i
         return None, 401
     rejected_sub = try_resolve_email(agent_checked_token) or "unknown"
     async with get_session_factory()() as session:
-        await service.audit_denied_approval_requires_interactive(session, actor_sub=rejected_sub)
+        await service.audit_denied_approval_requires_interactive(
+            session, actor_sub=rejected_sub, surface=surface
+        )
     return None, 403
 
 
 _MAX_PROPOSAL_STRING_FIELD_LENGTH = 4000
+
+
+async def _verify_agent_token(token_str: str) -> Any | None:
+    """Verify ``token_str`` against ONLY the agent-token verifier chain
+    (``_auth_provider.verifiers`` -- ``agent_jwt_hs256`` by default, or a
+    future TECH-5396 plugin), NEVER the Okta server. Structural mirror of
+    ``_okta_provider`` (which is ``_auth_provider.server``) for the opposite
+    gate.
+
+    Each source is tried in order; the first non-``None`` result wins --
+    same "each source tried independently" contract ``MultiAuth.verify_
+    token`` documents for the full chain.
+    """
+    for verifier in _auth_provider.verifiers:
+        try:
+            result = await verifier.verify_token(token_str)
+        except Exception:
+            continue
+        if result is not None:
+            return result
+    return None
 
 
 async def _authenticate_proposal_submitter(
@@ -417,15 +449,28 @@ async def _authenticate_proposal_submitter(
     """Self-verify the bearer token for ``POST /proposals`` (TECH-5872).
 
     Structural mirror of ``_authenticate_approval_caller``, but the OPPOSITE
-    gate: proposals are submitted BY BOTS, not humans, so this REJECTS an
-    interactive (Okta) caller rather than requiring one -- an interactive
-    token here gets 403, same "prove the gate actually inspected and
-    rejected it" posture ``_authenticate_approval_caller`` uses for the
-    reverse case. The token must verify against the full ``_auth_provider``
-    chain (agent-jwt or a future TECH-5396 plugin verifier) and carry
-    ``scopes.PROPOSAL_SUBMIT_SCOPE`` in its ``scopes`` claim -- this route is
-    a non-MCP ``mcp.custom_route``, so ``ScopeEnforcementMiddleware`` never
-    sees it; the scope check has to happen here instead.
+    gate: proposals are submitted BY BOTS, not humans. Argus review S4: this
+    used to verify against the FULL ``_auth_provider`` chain (which tries
+    the Okta server FIRST) and then reject via ``is_interactive_token`` --
+    a claim-inspection check on the result, not a structural one. A token
+    with a missing/malformed ``iss`` claim would misclassify as
+    non-interactive (a bot) and slip past that check. This now verifies
+    directly against ``_verify_agent_token`` (the agent-verifier chain
+    ONLY, bypassing the Okta source entirely) -- an Okta-issued token cannot
+    verify here at all, regardless of what claims it carries, the same
+    structural posture ``_authenticate_approval_caller`` uses for its own
+    (opposite) gate. The full ``_auth_provider`` chain is consulted ONLY on
+    the failure path below, solely to distinguish "no identity at all"
+    (401) from "this IS a legitimately verified interactive caller,
+    structurally rejected" (403) and to attribute that denial's audit row
+    -- never for authorization.
+
+    A verified agent token must carry ``scopes.PROPOSAL_SUBMIT_SCOPE`` in
+    its ``scopes`` claim -- this route is a non-MCP ``mcp.custom_route``, so
+    ``ScopeEnforcementMiddleware`` never sees it; the scope check has to
+    happen here instead. Every 403 here is now audited (Argus review S5,
+    ``service.audit_denied_proposal_submission``) -- previously logged
+    server-side only via ``logger.warning``.
 
     Returns ``(bot_sub, token, 200)`` on success, or ``(None, None, 401 |
     403)`` on failure. ``bot_sub`` is the verified agent-jwt ``sub`` claim
@@ -440,17 +485,34 @@ async def _authenticate_proposal_submitter(
     token_str = _extract_bearer_token(request)
     if token_str is None:
         return None, None, 401
-    token = await _auth_provider.verify_token(token_str)
-    if token is None:
+
+    token = await _verify_agent_token(token_str)
+    if token is not None:
+        if PROPOSAL_SUBMIT_SCOPE not in scopes_for_token(token):
+            audit_sub = try_resolve_email(token) or "unknown"
+            async with get_session_factory()() as session:
+                await service.audit_denied_proposal_submission(
+                    session, actor_sub=audit_sub, reason="missing_scope"
+                )
+            return None, None, 403
+        bot_sub = try_resolve_email(token)
+        if bot_sub is None:
+            return None, None, 401
+        return bot_sub, token, 200
+
+    # Not verifiable as an agent-jwt token at all -- fall back to the full
+    # chain (including Okta) SOLELY to distinguish 401 from 403 and
+    # attribute the denial audit row; this result is never used for
+    # authorization.
+    full_chain_token = await _auth_provider.verify_token(token_str)
+    if full_chain_token is None:
         return None, None, 401
-    if is_interactive_token(token):
-        return None, None, 403
-    if PROPOSAL_SUBMIT_SCOPE not in scopes_for_token(token):
-        return None, None, 403
-    bot_sub = try_resolve_email(token)
-    if bot_sub is None:
-        return None, None, 401
-    return bot_sub, token, 200
+    rejected_sub = try_resolve_email(full_chain_token) or "unknown"
+    async with get_session_factory()() as session:
+        await service.audit_denied_proposal_submission(
+            session, actor_sub=rejected_sub, reason="not_agent_token"
+        )
+    return None, None, 403
 
 
 def _resolve_proposal_owner_sub(token: Any) -> str | None:
@@ -535,20 +597,20 @@ async def submit_proposal(request: Request) -> Response:
     confidence = body.get("confidence")
     importance = body.get("importance")
     impact = body.get("impact")
-    if (
-        not isinstance(confidence, str)
-        or not isinstance(importance, str)
-        or not isinstance(impact, str)
-        or not all(v in service.PROPOSAL_HOLD_LEVELS for v in (confidence, importance, impact))
-    ):
-        levels = service.PROPOSAL_HOLD_LEVELS
-        return JSONResponse(
-            {
-                "error": "invalid_request",
-                "detail": f"confidence/importance/impact must each be one of {levels!r}",
-            },
-            status_code=422,
-        )
+    try:
+        if not isinstance(confidence, str) or not isinstance(importance, str):
+            raise ValueError("confidence/importance must each be a string")
+        if not isinstance(impact, str):
+            raise ValueError("impact must be a string")
+        # Argus review S14: membership-check logic lives in exactly one
+        # place (service.validate_hold_level), shared with this module's
+        # own defense-in-depth re-check in service.create_proposal, rather
+        # than duplicated here.
+        service.validate_hold_level(confidence, "confidence")
+        service.validate_hold_level(importance, "importance")
+        service.validate_hold_level(impact, "impact")
+    except ValueError as exc:
+        return JSONResponse({"error": "invalid_request", "detail": str(exc)}, status_code=422)
 
     owner_sub = _resolve_proposal_owner_sub(bot_token)
     if owner_sub is None:
@@ -599,7 +661,7 @@ async def list_pending_proposals(request: Request) -> Response:
     ``GET /approvals/pending`` (``_authenticate_approval_caller``): a human
     reviewing what's awaiting their decision, not a bot.
     """
-    owner_sub, status = await _authenticate_approval_caller(request)
+    owner_sub, status = await _authenticate_approval_caller(request, surface="proposals")
     if owner_sub is None:
         return JSONResponse({"error": "unauthorized"}, status_code=status)
 

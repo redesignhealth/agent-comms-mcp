@@ -13,23 +13,13 @@ judge's verdict end-to-end.
 
 from __future__ import annotations
 
-import asyncio
-import os
-import subprocess
-import sys
 from collections.abc import AsyncIterator
-from pathlib import Path
 from typing import Any
 
 import pytest
 import pytest_asyncio
 from sqlalchemy import select, text
-from sqlalchemy.ext.asyncio import (
-    AsyncEngine,
-    AsyncSession,
-    async_sessionmaker,
-    create_async_engine,
-)
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from exceptions import RateLimitExceededError
 from models import ProposalHold
@@ -39,64 +29,18 @@ from service import (
     list_pending_proposal_holds,
 )
 
-SERVICE_ROOT = Path(__file__).parent.parent
-_DEFAULT_TEST_DATABASE_URL = "postgresql://postgres:postgres@localhost:55432/agent_comms"
-
-
-def _test_database_url() -> str:
-    url = os.environ.get("DATABASE_URL", _DEFAULT_TEST_DATABASE_URL)
-    if url.startswith("postgresql://"):
-        return url.replace("postgresql://", "postgresql+asyncpg://", 1)
-    return url
-
-
-async def _can_connect(url: str) -> bool:
-    try:
-        engine = create_async_engine(url)
-        async with engine.connect() as conn:
-            await conn.execute(text("SELECT 1"))
-        await engine.dispose()
-        return True
-    except Exception:
-        return False
-
-
-@pytest.fixture(scope="module")
-def database_url() -> str:
-    url = _test_database_url()
-    if not asyncio.run(_can_connect(url)):
-        pytest.skip(
-            f"Postgres unreachable at {url!r} — run `docker compose up -d postgres` "
-            "(or set DATABASE_URL) to exercise the proposal-holds service tests."
-        )
-    return url
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _migrated_schema(database_url: str) -> None:
-    env = {**os.environ, "DATABASE_URL": database_url.replace("+asyncpg", "")}
-    for args in (["downgrade", "base"], ["upgrade", "head"]):
-        subprocess.run(
-            [sys.executable, "-m", "alembic", *args],
-            cwd=SERVICE_ROOT,
-            env=env,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-
-
-@pytest_asyncio.fixture
-async def engine(database_url: str) -> AsyncIterator[AsyncEngine]:
-    eng = create_async_engine(database_url)
-    yield eng
-    await eng.dispose()
+# Real-Postgres fixtures (database_url, _migrated_schema, engine) are shared
+# via tests/conftest.py (Argus review S15) -- this module opts in explicitly
+# since conftest's `_migrated_schema` is deliberately not autouse globally.
+pytestmark = pytest.mark.usefixtures("_migrated_schema")
 
 
 @pytest_asyncio.fixture(autouse=True)
 async def _clean_tables(engine: AsyncEngine) -> AsyncIterator[None]:
     async with engine.begin() as conn:
-        await conn.execute(text("TRUNCATE TABLE proposal_holds RESTART IDENTITY CASCADE"))
+        await conn.execute(
+            text("TRUNCATE TABLE proposal_holds, audit_log RESTART IDENTITY CASCADE")
+        )
     yield
 
 
@@ -177,12 +121,52 @@ class TestDedup:
         rows = (await session.execute(select(ProposalHold))).scalars().all()
         assert len(rows) == 2
 
+    async def test_cross_bot_dedup_blocked(self, session: AsyncSession) -> None:
+        """TECH-5872 Argus review B1: two DIFFERENT bots proposing the same
+        ``(kind, target_id, action_type)`` must each get their own pending
+        row -- a different bot must never silently overwrite (and
+        potentially get auto-approved under) another bot's proposal."""
+        first = await _submit(
+            session, proposed_by_bot_id="bot-a", action=_action(target_id="TECH-42")
+        )
+        second = await _submit(
+            session, proposed_by_bot_id="bot-b", action=_action(target_id="TECH-42")
+        )
+
+        assert first["proposal_id"] != second["proposal_id"]
+        rows = (await session.execute(select(ProposalHold))).scalars().all()
+        assert len(rows) == 2
+        bot_ids = {row.proposed_by_bot_id for row in rows}
+        assert bot_ids == {"bot-a", "bot-b"}
+
+    async def test_same_bot_still_dedups_against_own_pending_row(
+        self, session: AsyncSession
+    ) -> None:
+        """Companion to ``test_cross_bot_dedup_blocked``: the SAME bot
+        resubmitting the same ``(kind, target_id, action_type)`` must still
+        dedup in place -- B1 narrows the key, it does not remove dedup for
+        the submitting bot's own repeat submissions."""
+        first = await _submit(
+            session, proposed_by_bot_id="bot-a", action=_action(target_id="TECH-42")
+        )
+        second = await _submit(
+            session,
+            proposed_by_bot_id="bot-a",
+            action=_action(target_id="TECH-42"),
+            target_fingerprint="fp-updated",
+        )
+
+        assert first["proposal_id"] == second["proposal_id"]
+        rows = (await session.execute(select(ProposalHold))).scalars().all()
+        assert len(rows) == 1
+
     async def test_non_pending_row_is_not_deduped_against(self, session: AsyncSession) -> None:
         """A previously auto-approved row (same kind/target_id/action_type)
         must not be updated in place -- dedup only ever matches a currently
         ``pending`` row."""
         first = await _submit(
-            session, action=_action(source_message_url="https://slack.example/p1")
+            session,
+            action=_action(source_message_url="https://redesignhealth.slack.com/archives/C1/p1"),
         )
         assert first["status"] == "approved"
 
@@ -232,7 +216,8 @@ class TestJudgeIntegration:
         result = await _submit(
             session,
             action=_action(
-                action_type="open_ticket", source_message_url="https://slack.example/p1"
+                action_type="open_ticket",
+                source_message_url="https://redesignhealth.slack.com/archives/C1/p1",
             ),
         )
         assert result["status"] == "approved"
@@ -248,9 +233,39 @@ class TestJudgeIntegration:
         result = await _submit(
             session,
             kind="arc_board_change",
-            action=_action(source_message_url="https://slack.example/p1"),
+            action=_action(source_message_url="https://redesignhealth.slack.com/archives/C1/p1"),
         )
         assert result["status"] == "pending"
+
+    async def test_resubmit_with_citation_auto_approves_pending_row(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-5872 decision #2 (Argus review B5): once the dedup fix (B1)
+        scopes the dedup match to the SAME submitting bot, a bot
+        progressively refining its own proposal by adding a citation on
+        resubmission is expected to auto-approve the existing pending row
+        in place -- this is not a new escalation path, so no additional
+        guard is added for it; this test is the explicit regression
+        coverage the review asked for instead."""
+        first = await _submit(
+            session, action=_action(action_type="open_ticket", target_id="TECH-99")
+        )
+        assert first["status"] == "pending"
+
+        second = await _submit(
+            session,
+            action=_action(
+                action_type="open_ticket",
+                target_id="TECH-99",
+                source_message_url="https://redesignhealth.slack.com/archives/C1/p1",
+            ),
+        )
+        assert second["proposal_id"] == first["proposal_id"]
+        assert second["status"] == "approved"
+        assert second["decision_source"] == "auto"
+
+        rows = (await session.execute(select(ProposalHold))).scalars().all()
+        assert len(rows) == 1
 
 
 class TestRateLimit:
@@ -289,7 +304,7 @@ class TestOwnerSubVisibility:
         await _submit(
             session,
             owner_sub="owner-a@example.com",
-            action=_action(source_message_url="https://slack.example/p1"),
+            action=_action(source_message_url="https://redesignhealth.slack.com/archives/C1/p1"),
         )
         result = await list_pending_proposal_holds(session, owner_sub="owner-a@example.com")
         assert result["proposals"] == []
