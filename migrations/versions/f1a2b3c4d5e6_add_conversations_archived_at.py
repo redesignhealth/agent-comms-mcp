@@ -1,8 +1,13 @@
 """add conversations.archived_at
 
 Revision ID: f1a2b3c4d5e6
-Revises: d5c8f1a2b4e7
+Revises: d23b37d4e187
 Create Date: 2026-09-03 00:00:00.000000
+
+Rebased onto d23b37d4e187 (TECH-5871, proposal_holds table): both this
+migration and d23b37d4e187 were originally authored against d5c8f1a2b4e7
+concurrently; d23b37d4e187 merged to main first, so this one is re-chained
+on top of it rather than left as a second head off the same parent.
 
 TECH-5887: adds ``conversations.archived_at`` -- NULL means "not archived"
 (the default, and the only value every pre-existing row can have, so this
@@ -37,7 +42,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "f1a2b3c4d5e6"
-down_revision: str | None = "d5c8f1a2b4e7"
+down_revision: str | None = "d23b37d4e187"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
