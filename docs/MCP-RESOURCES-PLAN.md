@@ -151,10 +151,16 @@ Critical: these handlers bypass all FastMCP middleware, so each handler must do 
    `get_http_request()` directly.
 2. Interactive bypass / `required_scope_for_resource(uri)` / `scopes_for_token` — extract the
    shared check from `on_read_resource` into a helper both paths call so they can't drift.
-3. Resolve caller agent (short DB session) and authorize against the target: conversation URI →
-   admitted participant; inbox URI → self-only. Uniform denial (`McpError` with the fixed
-   `access_denied` string) on any failure — unknown URI, non-member, and malformed UUID all look
-   identical.
+3. Resolve caller agent (short DB session) and authorize against the target using the **same
+   membership check the read handler uses** (§1's resolved decision: subscribe authz directly
+   follows read authz, not a separate bespoke rule), plus one additional gate: the caller's
+   participant status must be `active` — an `invited` (not-yet-accepted) participant can read
+   conversation metadata but cannot subscribe, since even a content-free ping leaks message
+   cadence pre-accept. Concretely: call the same helper `on_read_resource` uses to resolve
+   "is this caller an admitted participant / does inbox resolve to self," then additionally
+   check `status == "active"` before registering the subscription. Uniform denial (`McpError`
+   with the fixed `access_denied` string) on any failure — unknown URI, non-member,
+   invited-but-not-active, and malformed UUID all look identical.
 4. Get the current session via `ll.request_context.session`; register/unregister in the registry.
 5. Audit rows `resource.subscribe` / `resource.unsubscribe` (+ denials), matching the existing
    mutations-and-denials audit convention.
@@ -249,10 +255,12 @@ non-test code)
 5. **Notification-timing side channel.** URI-only pings still reveal *that* activity occurred.
    Fire-time membership re-check closes the departed-member case; residual (admitted members learn
    timing they were already entitled to) is accepted.
-6. **Open question for the team:** should an `invited` (not-yet-accepted) participant be allowed
-   to *subscribe* to a conversation? Reads give them metadata-only, but an updated-ping per message
-   leaks message cadence pre-accept. Recommendation: subscribe requires `active` status (stricter
-   than read).
+6. ~~**Open question for the team:**~~ **Resolved:** subscribe requires `active` participant
+   status (stricter than read, which allows `invited` for metadata-only access) — an
+   `invited`-not-yet-accepted participant can read conversation metadata but cannot subscribe,
+   since an updated-ping per message would leak message cadence pre-accept. Subscribe authz
+   otherwise directly reuses the read-authz check (§3.2 step 3), not a separately maintained
+   rule.
 
 ## 7. Effort sizing
 
