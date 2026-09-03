@@ -40,7 +40,12 @@ service/tools boundary:
 
 - ``ConversationArchivedError`` (TECH-5887): ``comms_invite``/
   ``comms_post_message``/``comms_accept`` targeted a conversation that has
-  been archived (``comms_archive_conversation``). Kept distinct and
+  been archived (``comms_archive_conversation``). Also raised by the HTTP
+  approval endpoint's ``decide_hold`` approve path when a pending hold's
+  conversation was archived while it sat ``pending_human`` -- there the
+  hold simply stays ``pending_human`` (a human can still reject it)
+  rather than being denied outright, since there's no "hold" to leave
+  behind for the three MCP-tool callers above. Kept distinct and
   specific for the same reason as ``InvalidConversationStateError`` -- the
   caller already has legitimate read access to the conversation.
 
@@ -115,7 +120,11 @@ class InvalidConversationStateError(Exception):
 class ConversationArchivedError(Exception):
     """``comms_invite``/``comms_post_message`` (and ``comms_accept`` -- see
     below) targeted a conversation with ``archived_at`` set (TECH-5887,
-    ``comms_archive_conversation``).
+    ``comms_archive_conversation``). Also raised by ``service.decide_hold``'s
+    approve path (the HTTP approval endpoint, not an MCP tool) when the
+    hold's conversation was archived while it sat ``pending_human`` -- see
+    ``decide_hold``'s own docstring for that path's distinct handling (the
+    hold stays ``pending_human`` rather than being denied outright).
 
     Kept distinct and specific, same reasoning as
     ``InvalidConversationStateError``: the caller is already an authorized

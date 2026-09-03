@@ -30,6 +30,7 @@ from db import database_url, get_session_factory
 from exceptions import (
     AccessDeniedError,
     AgentRetiredError,
+    ConversationArchivedError,
     HoldAlreadyDecidedError,
     HoldAwaitingAutoReviewError,
     HoldExpiredError,
@@ -474,6 +475,8 @@ async def decide_approval(request: Request) -> Response:
             return JSONResponse({"error": "already_decided", "status": exc.status}, status_code=409)
         except InvalidConversationStateError:
             return JSONResponse({"error": "conversation_not_active"}, status_code=409)
+        except ConversationArchivedError:
+            return JSONResponse({"error": "conversation_archived"}, status_code=409)
         except RuntimeError:
             logger.exception("decide_hold invariant violation for hold_id=%s", hold_id)
             return JSONResponse({"error": "internal_error"}, status_code=500)

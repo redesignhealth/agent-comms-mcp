@@ -2288,6 +2288,12 @@ class TestRateLimitAndSchemaErrors:
             },
         )
         assert started["schema_version"] == 1
+        # TECH-5887 round-2: archived/archived_at are hand-maintained on
+        # this one response (every other projection flows through
+        # service._conversation_dict) -- assert both explicitly so drift
+        # here is caught rather than only defended against by comment.
+        assert started["archived"] is False
+        assert started["archived_at"] is None
 
 
 class TestOwnershipClientSeamIntegration:
@@ -3070,7 +3076,10 @@ class TestArchiveConversation:
             "comms_inbox",
             {"include_own_messages": True, "include_read": True},
         )
-        inbox_conv = next(c for c in inbox["unread"] if c["conversation_id"] == conversation_id)
+        inbox_conv = next(
+            (c for c in inbox["unread"] if c["conversation_id"] == conversation_id), None
+        )
+        assert inbox_conv is not None
         assert inbox_conv["archived"] is True
         assert inbox_conv["archived_at"] is not None
 
@@ -3161,6 +3170,61 @@ class TestArchiveConversation:
                 "comms_archive_conversation",
                 {"conversation_id": conversation_id},
             )
+
+    async def test_get_hold_status_unaffected_by_archiving(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """comms_get_hold_status is a read path, unlike comms_invite/
+        comms_post_message/comms_accept/decide_hold's approve path -- it
+        must keep working normally on an archived conversation's existing
+        holds. Not explicitly gated on archived_at anywhere, but unverified
+        until now; a future change accidentally adding that gate would go
+        undetected without this test."""
+        conversation_id, _ids = await self._start_open_conversation(
+            main,
+            test_session_factory,
+            owner_sub="arc-owner-10",
+            member_sub="arc-member-10",
+        )
+        token_owner = _token("arc-owner-10")
+        token_member = _token("arc-member-10")
+        await _call(
+            main,
+            test_session_factory,
+            token_member,
+            "comms_accept",
+            {"conversation_id": conversation_id},
+        )
+        held = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_post_message",
+            {
+                "conversation_id": conversation_id,
+                "message_type": "note",
+                "payload": {"text": "secret cross-boundary note"},
+            },
+        )
+        assert held["held_for_approval"] is True
+
+        await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_archive_conversation",
+            {"conversation_id": conversation_id},
+        )
+
+        status = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_get_hold_status",
+            {"hold_id": held["hold_id"]},
+        )
+        assert status["hold_id"] == held["hold_id"]
+        assert status["status"] == "pending_human"
 
 
 class TestTaskLifecycleToolLayer:

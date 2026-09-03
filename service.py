@@ -617,7 +617,8 @@ async def _deny_archived(
     ``AccessDeniedError`` or the state-machine's own
     ``InvalidConversationStateError``. ``action`` distinguishes the call
     site in the audit log (``denied.archived.invite`` /
-    ``denied.archived.post_message`` / ``denied.archived.accept``) --
+    ``denied.archived.post_message`` / ``denied.archived.accept`` /
+    ``denied.archived.decide_hold``) --
     unlike ``_deny_bad_state``, which records the blocked message TYPE in
     ``detail`` instead of varying the action name, there is no message type
     to vary on for ``invite``/``accept``, so the action name itself carries
@@ -4983,6 +4984,9 @@ async def decide_hold(
     ``InvalidConversationStateError`` (audited ``denied.bad_state``) if the
     conversation is no longer ``active`` -- the hold stays ``pending_human``
     in that case (the human can still reject with a reason).
+    ``ConversationArchivedError`` (audited ``denied.archived.decide_hold``,
+    TECH-5887) if the conversation has been archived -- checked before the
+    state check above, same "hold stays pending_human" behavior.
 
     The risk scorer is deliberately NOT re-run here — the human decision
     IS the override. Approve DOES re-run the ``accepted_types`` capability
@@ -5037,15 +5041,6 @@ async def decide_hold(
     if conversation is None:
         raise RuntimeError(f"invariant violation: hold {hold_id} references a missing conversation")
     _maybe_expire(session, approver_sub, conversation)
-    if conversation.state != "active":
-        await _deny_bad_state(
-            session,
-            actor_sub=approver_sub,
-            agent_id=hold.sender_agent_id,
-            conversation_id=conversation.id,
-            current_state=conversation.state,
-            message_type=hold.message_type,
-        )
     if conversation.archived_at is not None:
         # TECH-5887: a hold can sit pending_human for up to
         # APPROVAL_HOLD_TTL (7 days) -- without this check, approving a
@@ -5054,18 +5049,32 @@ async def decide_hold(
         # approving an invite-kind hold would still admit a new
         # Participant, both directly violating archive_conversation's "no
         # new invites, no new messages" guarantee. Same pattern as the
-        # state != "active" check above: the hold stays pending_human (the
+        # state != "active" check below: the hold stays pending_human (the
         # human can still reject it with a reason), it just can't be
         # approved into an archived conversation. Applies to both
         # hold.kind == "message" and hold.kind == "invite" -- checked here,
         # before the kind-specific branches below, rather than duplicated
-        # in each.
+        # in each. Checked BEFORE the state check (matching invite/
+        # post_message/accept_invite's ordering): _maybe_expire above can
+        # flip conversation.state to "expired" on this same call if the
+        # deadline just passed, and if the state check ran first it would
+        # raise InvalidConversationStateError before this archived check
+        # ever got a chance to run, surfacing the wrong error/audit row.
         await _deny_archived(
             session,
             actor_sub=approver_sub,
             agent_id=hold.sender_agent_id,
             conversation_id=conversation.id,
             action="denied.archived.decide_hold",
+        )
+    if conversation.state != "active":
+        await _deny_bad_state(
+            session,
+            actor_sub=approver_sub,
+            agent_id=hold.sender_agent_id,
+            conversation_id=conversation.id,
+            current_state=conversation.state,
+            message_type=hold.message_type,
         )
 
     if hold.kind == "invite":
