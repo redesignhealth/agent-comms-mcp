@@ -5400,16 +5400,17 @@ async def _deny_rate_limited_proposals(session: AsyncSession, *, proposed_by_bot
     serialize around the rate-limit check instead of racing it. Different
     bots never contend with each other (different hash keys).
 
-    A two-argument form (``pg_advisory_xact_lock(1, hashtext(...))``) was
-    considered in an earlier round, on the theory that it would avoid a
-    keyspace collision with the migration's lock. That collision never
-    actually existed -- the migration's key is disjoint regardless of which
-    form this uses -- and the two-argument form changes the internal
-    Postgres LOCKTAG, so during a rolling deploy an old-code instance and a
-    new-code instance acquire genuinely different locks for the same
-    ``proposed_by_bot_id``, reopening this exact TOCTOU race for the whole
-    deploy window. Rejected for that reason; stick with the single-argument
-    form."""
+    The single-argument form used here shares the ``classid=0`` keyspace
+    with the migration lock above -- a hash collision between a given
+    ``proposed_by_bot_id`` and the migration's fixed key is theoretically
+    possible (~1/2^31 per bot_id) but operationally negligible. A two-
+    argument form (``pg_advisory_xact_lock(1, hashtext(...))``) would be
+    structurally disjoint from the migration's lock (``classid=1`` vs.
+    ``classid=0``), and was tried in an earlier round of this same
+    unmerged branch -- but it was reverted in favor of keeping the lock
+    key form stable, since the two-argument form never actually shipped
+    to production and there was no rolling-deploy scenario to protect
+    against. Stick with the single-argument form."""
     await session.execute(
         text("SELECT pg_advisory_xact_lock(hashtext('proposal_rate_limit:' || :bot_id))"),
         {"bot_id": proposed_by_bot_id},
@@ -5466,11 +5467,23 @@ def _derive_proposal_priority(kind: str, action: dict[str, Any]) -> str:
     caller-supplied value (TECH-5872). Deliberately simple for the one
     ``kind`` this repo currently understands; a future kind needing a
     richer derivation adds its own branch here rather than a generic
-    fallback silently misclassifying it -- an unrecognized ``kind`` raises
-    instead of falling through to a default, and per the call-site ordering
-    in ``create_proposal`` (validation runs before the rate-limit attempt
-    marker is audited + committed), this failing loudly doesn't waste a
-    rate-limit slot either (Argus review S7)."""
+    fallback silently misclassifying it.
+
+    Kind-admission is checked directly against ``_PROPOSAL_JUDGES`` (defined
+    below) rather than a parallel enumeration here, so the two cannot drift
+    apart -- a ``kind`` with no registered judge can never reach the
+    priority branches below and instead raises immediately. This matters
+    because a ``kind`` that passed this function but had no judge entry
+    would otherwise hit an unhandled ``KeyError`` at judge dispatch time in
+    ``create_proposal``, which only catches ``ValueError``/
+    ``RateLimitExceededError`` and would surface as an unhandled 500. An
+    unrecognized ``kind`` instead raises ``ValueError`` (422) here, and per
+    the call-site ordering in ``create_proposal`` (validation runs before
+    the rate-limit attempt marker is audited + committed), this failing
+    loudly doesn't waste a rate-limit slot either (Argus review S7)."""
+    if kind not in _PROPOSAL_JUDGES:
+        logger.warning("_derive_proposal_priority: no branch for kind=%r", kind)
+        raise ValueError(f"unsupported kind: {kind!r}")
     if kind == "linear_progress_update":
         action_type = action.get("action_type")
         if action_type == "close_ticket":
@@ -5478,8 +5491,13 @@ def _derive_proposal_priority(kind: str, action: dict[str, Any]) -> str:
         if action_type == "open_ticket":
             return "medium"
         return "low"
-    logger.warning("_derive_proposal_priority: no branch for kind=%r", kind)
-    raise ValueError(f"unsupported kind: {kind!r}")
+    # Unreachable: every kind registered in _PROPOSAL_JUDGES must have a
+    # matching priority branch above. If this fires, a new judge was
+    # registered without a corresponding priority derivation.
+    raise AssertionError(
+        f"kind {kind!r} is registered in _PROPOSAL_JUDGES but has no priority branch "
+        "in _derive_proposal_priority"
+    )
 
 
 # TECH-5877: exactly two auto-approval rules, scoped to
@@ -5564,9 +5582,13 @@ def evaluate_linear_progress_update_judge(action: dict[str, Any]) -> tuple[str, 
 
 
 # Registry keyed by ``kind`` -- deliberately not a shared/generic judge (see
-# ``evaluate_linear_progress_update_judge``'s docstring). A ``kind`` with no
-# entry here is never auto-approved; it is left ``"pending"`` by
-# ``create_proposal`` below.
+# ``evaluate_linear_progress_update_judge``'s docstring). This is the single
+# source of truth for which kinds are supported: ``_derive_proposal_priority``
+# checks membership in this dict directly and raises ``ValueError`` (-> 422)
+# for any kind not present here, before judge dispatch ever runs. A kind
+# reaching judge dispatch below is therefore guaranteed to have an entry --
+# there is no "stays pending" fallback for an unregistered kind, because an
+# unregistered kind never gets this far.
 _PROPOSAL_JUDGES: dict[str, Callable[[dict[str, Any]], tuple[str, str | None]]] = {
     "linear_progress_update": evaluate_linear_progress_update_judge,
 }

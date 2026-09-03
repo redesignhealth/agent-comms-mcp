@@ -37,10 +37,14 @@ covered by ``migrations/env.py``'s advisory lock for its full duration (see
 above). ``entrypoint.sh`` runs ``alembic upgrade head`` on every ECS
 container start, so two containers CAN race this build against the same
 database during a rolling deploy. The actual safety net is NOT deploy
-discipline -- it's ``if_not_exists=True``: whichever container's
-``CREATE INDEX CONCURRENTLY`` names the index first wins, and every other
-container's run sees the name already exists and no-ops, rather than
-raising a duplicate-name error.
+discipline -- it's ``if_not_exists=True``, which reduces the race window but
+does not fully eliminate it: it checks whether the index name exists BEFORE
+inserting the catalog row, so two containers that both pass that check
+before either one commits can still race into a duplicate-name conflict.
+That conflict is a loud container startup failure -- recoverable, since the
+container simply fails to start and gets restarted/replaced by ECS, rather
+than corrupting data or silently degrading -- not the guaranteed single-
+winner outcome the naive reading of ``if_not_exists`` suggests.
 
 That guard has a gap, though: ``if_not_exists`` only checks whether the
 name exists, not whether the existing index is *valid*. If a build is
@@ -54,14 +58,36 @@ rate-limit COUNT query in ``service._deny_rate_limited_proposals`` just
 keeps full-scanning ``audit_log`` indefinitely as a silent perf
 regression, not a deploy failure.
 
-POST-DEPLOY HEALTH CHECK: run this after every deploy that touches this
-migration (a good candidate for a CI/CD post-migration step, so INVALID
-state fails the deploy instead of degrading silently):
-``SELECT NOT indisvalid FROM pg_index WHERE indexrelid = to_regclass('idx_audit_log_actor_sub_action_at');``
--- ``to_regclass`` returns ``NULL`` (rather than raising) if the index was
-never created at all, so this also doubles as a "does it exist" check; a
-result of ``true`` means INVALID, ``false`` means healthy, and ``NULL``
-means "never built."
+POST-DEPLOY HEALTH CHECK -- Operator runbook: this repo's deploy pipeline
+(``.github/workflows/deploy.yml``) has no DB access -- migrations run
+inside containers via ``entrypoint.sh``, and the workflow only builds and
+pushes ECR images -- so this is NOT wired into CI/CD today. After deploying
+a change that touches this migration, run the query below by hand against
+the production DB to confirm the index is valid before considering the
+deploy complete. (Wiring this into an automated check -- e.g. a
+``/health?check_indexes`` variant, since the ``Dockerfile`` already defines
+a plain ``/health`` check -- would be a reasonable follow-up, but does not
+exist yet; don't assume it runs automatically.)
+
+The query is written so it ALWAYS returns exactly one row, to avoid an
+ambiguous NULL-vs-zero-rows read: naively querying
+``SELECT NOT indisvalid FROM pg_index WHERE indexrelid = to_regclass(...)``
+returns ZERO ROWS (not a row containing NULL) when the index doesn't exist,
+because ``WHERE indexrelid = NULL`` is never true under SQL's three-valued
+logic -- a caller checking ``result[0] is None`` would actually be checking
+"no row came back" and would silently pass on a genuinely missing index.
+The ``CASE`` wrapper below sidesteps that:
+
+.. code-block:: sql
+
+    SELECT CASE WHEN to_regclass('idx_audit_log_actor_sub_action_at') IS NULL
+                THEN NULL
+                ELSE (SELECT NOT indisvalid FROM pg_index
+                      WHERE indexrelid = 'idx_audit_log_actor_sub_action_at'::regclass)
+           END;
+
+``true`` means INVALID (rebuild needed), ``false`` means healthy, and
+``NULL`` means the index was never created.
 
 REMEDIATION if the health check reports INVALID (or you're diagnosing by
 hand): query
