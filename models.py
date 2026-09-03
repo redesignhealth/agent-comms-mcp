@@ -472,10 +472,12 @@ class AuditLog(Base):
         # Backs service._deny_rate_limited_proposals's per-bot rate-limit
         # COUNT query -- see migration 9a1c2d3e4f5b's docstring for why the
         # rate-limit count lives on this append-only log rather than on
-        # proposal_holds itself. Built CONCURRENTLY in that migration (B2);
-        # declared here as a normal Index like every other index in this
-        # file -- postgresql_concurrently is a migration-time build detail,
-        # not part of the index's identity that autogenerate compares on.
+        # proposal_holds itself. Built CONCURRENTLY in the follow-on
+        # migration a9faca2517d7 (split out from 9a1c2d3e4f5b per Argus
+        # review B1, round 3); declared here as a normal Index like every
+        # other index in this file -- postgresql_concurrently is a
+        # migration-time build detail, not part of the index's identity
+        # that autogenerate compares on.
         Index("idx_audit_log_actor_sub_action_at", "actor_sub", "action", "at"),
     )
 
@@ -721,10 +723,10 @@ class ProposalHold(Base):
         # `alembic revision --autogenerate` doesn't propose dropping it.
         Index(
             "idx_proposal_holds_pending_dedup",
-            text("kind"),
-            text("proposed_by_bot_id"),
-            text("action->>'target_id'"),
-            text("action->>'action_type'"),
+            "kind",
+            "proposed_by_bot_id",
+            text("(action ->> 'target_id')"),
+            text("(action ->> 'action_type')"),
             postgresql_where=text("status = 'pending'"),
             unique=True,
         ),

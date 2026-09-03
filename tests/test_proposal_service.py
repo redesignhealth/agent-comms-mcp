@@ -123,8 +123,40 @@ class TestDedup:
         assert len(rows) == 2
 
     async def test_different_kind_does_not_dedup(self, session: AsyncSession) -> None:
-        await _submit(session, kind="linear_progress_update")
-        await _submit(session, kind="arc_board_change")
+        """``idx_proposal_holds_pending_dedup`` scopes on ``kind`` too --
+        two rows with the same ``(proposed_by_bot_id, target_id,
+        action_type)`` but different ``kind`` must both persist as
+        separate pending rows. Exercised directly against ``ProposalHold``
+        (bypassing ``create_proposal``/``_submit``) rather than through
+        ``kind="arc_board_change"`` as this test used pre-Argus-review-S7:
+        ``models.ProposalHold``'s own docstring documents ``"arc_board_change"``
+        as a legitimate OPEN-vocabulary ``kind`` value at the DB layer, but
+        ``_derive_proposal_priority`` only has a branch for
+        ``"linear_progress_update"`` today and now raises fast for anything
+        else (S7) rather than silently defaulting -- so a second literal
+        ``kind`` can no longer flow through the public service function in
+        this test without tripping that guard. Constructing the rows
+        directly is the correct level for this assertion anyway: it is the
+        index's scoping, not the service's kind support, being tested."""
+        action = _action()
+        common = {
+            "proposed_by_bot_id": "bot-1",
+            "owner_sub": "owner-a@example.com",
+            "action": action,
+            "rationale": "because reasons",
+            "confidence": "medium",
+            "importance": "medium",
+            "impact": "medium",
+            "priority": "medium",
+            "target_fingerprint": "deadbeef",
+        }
+        session.add_all(
+            [
+                ProposalHold(kind="linear_progress_update", **common),
+                ProposalHold(kind="arc_board_change", **common),
+            ]
+        )
+        await session.commit()
         rows = (await session.execute(select(ProposalHold))).scalars().all()
         assert len(rows) == 2
 
@@ -298,13 +330,22 @@ class TestJudgeIntegration:
         assert result["status"] == "pending"
         assert "decision_source" not in result
 
-    async def test_unregistered_kind_stays_pending(self, session: AsyncSession) -> None:
-        result = await _submit(
-            session,
-            kind="arc_board_change",
-            action=_action(source_message_url="https://redesignhealth.slack.com/archives/C1/p1"),
-        )
-        assert result["status"] == "pending"
+    async def test_unregistered_kind_raises(self, session: AsyncSession) -> None:
+        """Argus review S7: an unrecognized ``kind`` now fails fast in
+        ``_derive_proposal_priority`` (raising ``ValueError``, well before
+        the ``_PROPOSAL_JUDGES`` lookup this class otherwise covers) rather
+        than silently defaulting to a generic ``"medium"`` priority and
+        staying pending with no judge -- this replaces the pre-S7 version
+        of this test, which asserted that stays-pending-with-no-judge
+        fallback."""
+        with pytest.raises(ValueError, match="no branch for kind"):
+            await _submit(
+                session,
+                kind="arc_board_change",
+                action=_action(
+                    source_message_url="https://redesignhealth.slack.com/archives/C1/p1"
+                ),
+            )
 
     async def test_resubmit_with_citation_auto_approves_pending_row(
         self, session: AsyncSession

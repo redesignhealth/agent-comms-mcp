@@ -274,3 +274,33 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
         "CREATE INDEX IF NOT EXISTS idx_conversations_archived_at "
         "ON conversations (archived_at) WHERE archived_at IS NOT NULL" in result.stdout
     )
+    # 9a1c2d3e4f5b (TECH-5872/5875, Argus review B1/B2/S1): the partial
+    # UNIQUE dedup index on proposal_holds and the plain per-bot lookup
+    # index -- both plain transactional CREATE INDEX statements (see that
+    # migration's own docstring for why no CONCURRENTLY is needed here).
+    assert (
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_proposal_holds_pending_dedup "
+        "ON proposal_holds (kind, proposed_by_bot_id, (action ->> 'target_id'), "
+        "(action ->> 'action_type')) WHERE status = 'pending'" in result.stdout
+    )
+    assert (
+        "CREATE INDEX IF NOT EXISTS idx_proposal_holds_bot_id_created_at "
+        "ON proposal_holds (proposed_by_bot_id, created_at)" in result.stdout
+    )
+    # a9faca2517d7 (Argus review B1, round 3): the audit_log rate-limit
+    # index, split into its own revision so it's the only step in that
+    # migration that needs to drop out of the ambient transaction. Assert
+    # the autocommit_block's COMMIT/BEGIN sequence brackets the CONCURRENTLY
+    # build -- this is the exact non-transactional shape the B1 fix depends
+    # on: alembic_version for 9a1c2d3e4f5b (and everything before it) is
+    # committed BEFORE the CONCURRENTLY statement runs, and a fresh
+    # transaction is reopened after it for a9faca2517d7's own stamp.
+    dedup_pos = result.stdout.index("idx_proposal_holds_pending_dedup")
+    commit_pos = result.stdout.index("COMMIT;", dedup_pos)
+    concurrently_pos = result.stdout.index(
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_audit_log_actor_sub_action_at "
+        "ON audit_log (actor_sub, action, at);",
+        commit_pos,
+    )
+    begin_pos = result.stdout.index("BEGIN;", concurrently_pos)
+    assert dedup_pos < commit_pos < concurrently_pos < begin_pos

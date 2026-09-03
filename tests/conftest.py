@@ -4,9 +4,9 @@
 Extracted from ``test_approval_endpoint.py``/``test_proposal_endpoint.py``/
 ``test_proposal_service.py``, which each carried an identical ~80-line copy
 of this block (``_test_database_url``, ``_can_connect``, ``database_url``,
-``_migrated_schema``, ``engine``). ``_clean_tables`` is deliberately NOT
-here -- which table(s) to truncate between tests differs per module, so
-each module keeps its own.
+``_migrated_schema``, ``engine``, ``session``). ``_clean_tables`` is
+deliberately NOT here -- which table(s) to truncate between tests differs
+per module, so each module keeps its own.
 """
 
 from __future__ import annotations
@@ -21,7 +21,12 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 SERVICE_ROOT = Path(__file__).parent.parent
 _DEFAULT_TEST_DATABASE_URL = "postgresql://postgres:postgres@localhost:55432/agent_comms"
@@ -82,3 +87,10 @@ async def engine(database_url: str) -> AsyncIterator[AsyncEngine]:
     eng = create_async_engine(database_url)
     yield eng
     await eng.dispose()
+
+
+@pytest_asyncio.fixture
+async def session(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with factory() as sess:
+        yield sess

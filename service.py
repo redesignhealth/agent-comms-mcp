@@ -4772,9 +4772,12 @@ async def audit_denied_approval_requires_interactive(
 # action name into the audit log. Allowlisted the same way
 # ``validate_hold_level`` allowlists its own membership check --
 # "not_agent_token"/"missing_scope" are the two 403 causes in
-# ``main._authenticate_proposal_submitter``; "rate_limited" covers the
-# rate-limit denial path for callers that route through this function.
-ALLOWED_DENIAL_REASONS = frozenset({"not_agent_token", "missing_scope", "rate_limited"})
+# ``main._authenticate_proposal_submitter``. Only reasons that actually flow
+# through ``audit_denied_proposal_submission`` belong here: the rate-limit
+# denial path (``_deny_rate_limited_proposals``) audits
+# ``"denied.proposal_rate_limited"`` directly via ``_audit()`` and never
+# calls this function, so ``"rate_limited"`` is deliberately NOT listed.
+ALLOWED_DENIAL_REASONS = frozenset({"not_agent_token", "missing_scope"})
 
 
 async def audit_denied_proposal_submission(
@@ -4789,7 +4792,8 @@ async def audit_denied_proposal_submission(
     ``audit_denied_approval_requires_interactive`` above -- there is nothing
     to raise, only an audit row to persist.
     """
-    assert reason in ALLOWED_DENIAL_REASONS, f"unexpected denial reason: {reason!r}"
+    if reason not in ALLOWED_DENIAL_REASONS:
+        raise ValueError(f"unexpected denial reason: {reason!r}")
     _audit(session, actor_sub=actor_sub, action=f"denied.proposal_submit_{reason}")
     await session.commit()
 
@@ -5387,15 +5391,17 @@ async def _deny_rate_limited_proposals(session: AsyncSession, *, proposed_by_bot
     serialization, N concurrent submissions from the SAME bot that all
     observe ``count == MAX - 1`` can all pass, yielding an effective burst
     cap of ``MAX + N - 1`` instead of ``MAX``. ``pg_advisory_xact_lock``,
-    keyed on a hash of ``proposed_by_bot_id`` (namespaced so it can't
-    collide with any other advisory-lock use, e.g. migrations/env.py's
-    migration-serialization lock), is held for the rest of THIS
+    keyed via the two-argument form with a fixed namespace tag (``1``) plus
+    a hash of ``proposed_by_bot_id`` -- extremely unlikely to collide with
+    any other advisory-lock use, e.g. migrations/env.py's
+    migration-serialization lock, which uses the single-argument form and
+    therefore a disjoint keyspace -- is held for the rest of THIS
     transaction -- i.e. through the count-check and the attempt-marker
     commit that follows it -- so concurrent submissions from the same bot
     serialize around the rate-limit check instead of racing it. Different
     bots never contend with each other (different hash keys)."""
     await session.execute(
-        text("SELECT pg_advisory_xact_lock(hashtext('proposal_rate_limit:' || :bot_id))"),
+        text("SELECT pg_advisory_xact_lock(1, hashtext('proposal_rate_limit:' || :bot_id))"),
         {"bot_id": proposed_by_bot_id},
     )
     window_start = _now() - PROPOSAL_RATE_LIMIT_WINDOW
@@ -5450,7 +5456,11 @@ def _derive_proposal_priority(kind: str, action: dict[str, Any]) -> str:
     caller-supplied value (TECH-5872). Deliberately simple for the one
     ``kind`` this repo currently understands; a future kind needing a
     richer derivation adds its own branch here rather than a generic
-    fallback silently misclassifying it."""
+    fallback silently misclassifying it -- an unrecognized ``kind`` raises
+    instead of falling through to a default, and per the call-site ordering
+    in ``create_proposal`` (validation runs before the rate-limit attempt
+    marker is audited + committed), this failing loudly doesn't waste a
+    rate-limit slot either (Argus review S7)."""
     if kind == "linear_progress_update":
         action_type = action.get("action_type")
         if action_type == "close_ticket":
@@ -5458,10 +5468,7 @@ def _derive_proposal_priority(kind: str, action: dict[str, Any]) -> str:
         if action_type == "open_ticket":
             return "medium"
         return "low"
-    logger.warning(
-        "_derive_proposal_priority: no explicit branch for kind=%r, defaulting to medium", kind
-    )
-    return "medium"
+    raise ValueError(f"_derive_proposal_priority: no branch for kind={kind!r}")
 
 
 # TECH-5877: exactly two auto-approval rules, scoped to

@@ -46,11 +46,8 @@ def test_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession
     return async_sessionmaker(engine, expire_on_commit=False)
 
 
-@pytest_asyncio.fixture
-async def session(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    async with factory() as sess:
-        yield sess
+# ``session`` fixture lives in tests/conftest.py (Argus review S10 -- this
+# was the 5th byte-identical copy across the test suite).
 
 
 _MOCK_OIDC_CONFIG = MagicMock()
@@ -250,6 +247,38 @@ class TestSubmitAuthGate:
         )
         assert resp.status_code == 403
 
+    async def test_agent_jwt_missing_scope_is_audited(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        """Mirrors test_interactive_token_rejection_is_audited /
+        test_rate_limit_exceeded_is_audited for the third
+        ``ALLOWED_DENIAL_REASONS`` entry: a verified agent-jwt token missing
+        ``PROPOSAL_SUBMIT_SCOPE`` is denied and the denial is audited as
+        ``denied.proposal_submit_missing_scope``."""
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:write"], owner_sub="owner-a@example.com"
+        )
+        resp = await http_client.post(
+            "/proposals", json=_PROPOSAL_BODY, headers={"Authorization": "Bearer bot-token"}
+        )
+        assert resp.status_code == 403
+
+        rows = (
+            (
+                await session.execute(
+                    select(AuditLog.action).where(
+                        AuditLog.action == "denied.proposal_submit_missing_scope"
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert rows
+
     async def test_agent_jwt_with_required_scope_is_allowed(
         self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
     ) -> None:
@@ -356,6 +385,75 @@ class TestSubmitProposal:
             "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
         )
         body = {**_PROPOSAL_BODY, "target_fingerprint": "x" * 4001}
+        resp = await http_client.post(
+            "/proposals", json=body, headers={"Authorization": "Bearer bot-token"}
+        )
+        assert resp.status_code == 422
+        assert "exceeds" in resp.json()["detail"]
+
+    async def test_kind_exceeding_max_length_returns_field_too_long(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        body = {**_PROPOSAL_BODY, "kind": "x" * 201}
+        resp = await http_client.post(
+            "/proposals", json=body, headers={"Authorization": "Bearer bot-token"}
+        )
+        assert resp.status_code == 422
+        assert "exceeds" in resp.json()["detail"]
+
+    async def test_action_exceeding_max_bytes_returns_422(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        body = {
+            **_PROPOSAL_BODY,
+            "action": {
+                "action_type": "open_ticket",
+                "target_id": "TECH-1",
+                "padding": "x" * 16_384,
+            },
+        }
+        resp = await http_client.post(
+            "/proposals", json=body, headers={"Authorization": "Bearer bot-token"}
+        )
+        assert resp.status_code == 422
+        assert "exceeds" in resp.json()["detail"]
+
+    async def test_action_target_id_exceeding_max_length_returns_422(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        body = {
+            **_PROPOSAL_BODY,
+            "action": {"action_type": "open_ticket", "target_id": "x" * 501},
+        }
+        resp = await http_client.post(
+            "/proposals", json=body, headers={"Authorization": "Bearer bot-token"}
+        )
+        assert resp.status_code == 422
+        assert "exceeds" in resp.json()["detail"]
+
+    async def test_action_action_type_exceeding_max_length_returns_422(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        body = {
+            **_PROPOSAL_BODY,
+            "action": {"action_type": "x" * 501, "target_id": "TECH-1"},
+        }
         resp = await http_client.post(
             "/proposals", json=body, headers={"Authorization": "Bearer bot-token"}
         )
