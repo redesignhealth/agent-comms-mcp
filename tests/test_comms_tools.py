@@ -645,36 +645,38 @@ class TestRegister:
         assert "min_schema_version" not in whoami
         assert "max_schema_version" not in whoami
 
-    async def test_register_is_shared_true_requires_admin_scope(
+    async def test_register_is_shared_true_baseline_scope_succeeds(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
-        """A caller with only the baseline ``comms:write`` scope cannot
-        self-declare ``is_shared=True`` on first registration -- it is an
-        admission-decision input (DESIGN.md §9), so unscoped self-escalation
-        would be a privilege escalation. See ``scopes.py``'s ``comms:admin``
-        entry and ``service.register_agent``'s ``is_shared_authorized``."""
-        token = _token("agent-is-shared-unauthorized", scopes=["comms:read", "comms:write"])
-        with pytest.raises(
-            ToolError, match=re.escape("access_denied: not authorized for this resource")
-        ) as exc_info:
-            await _call(
-                main,
-                test_session_factory,
-                token,
-                "comms_register",
-                {
-                    "display_name": "Unauthorized Shared",
-                    "accepted_types": ["availability_request"],
-                    "is_shared": True,
-                },
-            )
-        assert "is_shared" not in str(exc_info.value)
+        """A caller with only the baseline ``comms:write`` scope CAN
+        self-declare ``is_shared=True`` on its own first registration (as of
+        2026-09-03, confirmed product decision, DESIGN.md §5): an agent
+        declaring its own ``is_shared`` isn't a privilege escalation, since
+        it only affects admission/risk-scoring checks involving that same
+        agent. This is unrelated to ``comms_set_agent_shared`` and
+        ``comms_admin_register``, which still require elevated scope because
+        they act on a `sub` other than the caller's own."""
+        token = _token("agent-is-shared-self-declare", scopes=["comms:read", "comms:write"])
+        result = await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {
+                "display_name": "Self Declared Shared",
+                "accepted_types": ["availability_request"],
+                "is_shared": True,
+            },
+        )
+        assert result["is_shared"] is True
 
     async def test_register_is_shared_true_with_admin_scope_succeeds(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
-        """The ``comms:admin`` scope is what lets a caller mint a shared
-        agent on first registration; the response echoes ``is_shared``."""
+        """An elevated ``comms:admin`` scope also succeeds for self-registration
+        with ``is_shared=True`` (it was the only path before 2026-09-03, and
+        remains a valid, non-minimal path now that baseline ``comms:write``
+        alone suffices too); the response echoes ``is_shared``."""
         token = _token(
             "agent-is-shared-authorized", scopes=["comms:read", "comms:write", "comms:admin"]
         )

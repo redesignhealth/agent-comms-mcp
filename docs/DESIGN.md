@@ -395,12 +395,20 @@ Design notes:
  `comms_register` call, including re-registration).
 - `is_shared` marks an agent that spans ownership boundaries (e.g. a bot serving
  multiple users). It is an admission-decision input (see §9), so it is frozen
- at first registration (re-registering with a different value has no effect),
- and self-declaring `True` at first registration requires the caller's token
- to carry an elevated `comms:admin` scope (or be an interactive/Okta caller).
- Without it, `comms_register` denies with `denied.is_shared_requires_elevated_scope`
- (this is the audit-log reason key only: the caller receives the generic
- `access_denied` message).
+ at first registration (re-registering with a different value has no effect).
+ As of 2026-09-03 (confirmed product decision), self-declaring `True` at
+ first registration via `comms_register` requires no elevated scope beyond
+ the tool's baseline `comms:write` -- an agent declaring its OWN `is_shared`
+ is a self-service choice about itself, not a privilege escalation, since the
+ only thing it affects is admission/risk-scoring checks involving that same
+ agent. (Earlier revisions of this doc required an elevated `comms:admin`
+ scope here and denied with `denied.is_shared_requires_elevated_scope`; that
+ gate was removed from `comms_register`'s self-registration path only.) This
+ is a separate question from `comms_set_agent_shared` and
+ `comms_admin_register` below, both of which still require elevated
+ authorization -- because both act on a `sub` other than the acting caller's
+ own, an unauthorized caller there really would be granting or altering
+ someone/something else's privilege.
  `comms_register` itself never overwrites an existing agent's `is_shared` on
  re-registration (a re-registration presenting a different value is a no-op,
  audited as `agent.reregister_is_shared_ignored`) -- the freeze holds against
@@ -536,9 +544,12 @@ Design notes:
  `denied.agent_already_registered`, `actor_sub` the PRIVILEGED CALLER); unlike
  `comms_set_agent_shared`, it is a genuine first registration, not a correction to
  an agent that already exists. Because the entire call already requires elevated
- authorization, `is_shared` itself needs no separate authorization check the way
- `comms_register`'s `is_shared=True` gate does -- there is no less-privileged path
- through this tool for it to escalate past.
+ authorization, `is_shared` itself needs no separate authorization check --
+ unlike `comms_set_agent_shared`'s own gate, there is no less-privileged path
+ through this tool for it to escalate past. (`comms_register`'s self-registration
+ path has no `is_shared=True` gate of its own either, as of 2026-09-03 -- but for
+ the opposite reason: there, the caller and the `sub` being registered are the
+ same identity, so there is nothing to escalate past in the first place.)
 
  The sibling-identity-fork guard applies here too (Argus round 1, TECH-5786 PR
  follow-up) -- deliberately not omitted just because this is an on-behalf-of
@@ -647,7 +658,7 @@ scroll-to-load-more use case.
 | Tool | Scope | Notes |
 |---|---|---|
 | `comms_whoami` | comms:read | caller identity/scopes; also returns this identity's registered min/max_schema_version via a best-effort DB lookup if already `comms_register`'d -- omitted if not yet registered or the DB is unreachable (this tool remains usable as an auth-only diagnostic either way) |
-| `comms_register` | comms:write | idempotent self-provisioning: display_name, accepted_types (optional, max 20/100 chars each; `[]`/omitted-on-first-registration accepts every message type including future ones, but omitted-on-RE-registration preserves the agent's current value instead of resetting it -- see §9's "Capability gate" section for the full three-way semantics), min/max_schema_version (default 1/1, for schema-version capability negotiation); `is_shared=True` on first registration additionally requires comms:admin (see §5); rejects a new sibling row under the same base identity (`identity_fork_detected`) unless `confirm_new_identity=True`, and rejects a new row whose `display_name` collides with an existing active agent's (`display_name_collision`, not bypassable by `confirm_new_identity` -- DB-enforced race-free via a `UNIQUE` partial index, see §5) |
+| `comms_register` | comms:write | idempotent self-provisioning: display_name, accepted_types (optional, max 20/100 chars each; `[]`/omitted-on-first-registration accepts every message type including future ones, but omitted-on-RE-registration preserves the agent's current value instead of resetting it -- see §9's "Capability gate" section for the full three-way semantics), min/max_schema_version (default 1/1, for schema-version capability negotiation); `is_shared=True` on first registration requires no additional scope, since it's the caller declaring its OWN `is_shared` (see §5); rejects a new sibling row under the same base identity (`identity_fork_detected`) unless `confirm_new_identity=True`, and rejects a new row whose `display_name` collides with an existing active agent's (`display_name_collision`, not bypassable by `confirm_new_identity` -- DB-enforced race-free via a `UNIQUE` partial index, see §5) |
 | `comms_set_agent_shared` | comms:write | admin override of an existing agent's `is_shared`, since `comms_register` freezes it against the agent's own re-registration; additionally requires comms:admin OR an interactive/Okta caller (see §5) |
 | `comms_deregister_agent` | comms:write | sets an existing agent's `status="suspended"`; additionally requires comms:admin OR an interactive/Okta caller (see §5); one-directional by design -- no reactivate tool. Because it is one-directional, suspending an identity here is exactly what makes the sibling-fork check's "all siblings count, not just active ones" condition (see §5) trigger permanently for that base identity -- there is no reactivation path to undo it. This is intentional, to prevent kill-switch bypasses |
 | `comms_admin_register` | comms:write | on-behalf-of FIRST registration for a `sub` other than the caller's own -- additionally requires comms:admin OR an interactive/Okta caller (see §5's "On-behalf-of registration" note). Distinct from `comms_register` (always self, idempotent) and `comms_set_agent_shared` (corrects `is_shared` on an agent that already exists): this is a genuine new-identity registration path for a `sub` that has never registered itself. Never an upsert -- fails with `already_registered` if `sub` already has a board row (any status) |

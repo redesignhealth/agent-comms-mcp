@@ -1838,22 +1838,24 @@ async def register_agent(
     verification of its own; it persists exactly what it is given. Never
     call it with owner_sub/owner_email taken from untrusted tool arguments.
 
-    SECURITY: ``is_shared_authorized`` gates ``is_shared=True`` on FIRST
+    ``is_shared_authorized`` gates ``is_shared=True`` on FIRST
     registration only (a re-registration can never change the already-frozen
     ``is_shared`` value, so the gate is a no-op there). ``is_shared`` is an
     admission-decision input — it lets its holder skip the pairwise
     ownership-boundary check in ``_authorize_conversation_open`` and the
-    risk scorer's ownership lookups (``_score_message_risk``) — so
-    self-declaring it at registration
-    with only the baseline write scope would be a privilege escalation.
-    Callers MUST compute this from the caller's own verified token (e.g. an
-    elevated ``comms:admin`` scope or platform-provisioning identity) and
-    pass ``True`` only when that check passes. Defaults to ``False``
-    (fail-closed): an admission-decision-input gate must never silently
-    grant its privilege to a caller that forgets the kwarg. Direct
-    service-layer callers that need the convenience of a permissive
-    default (e.g. tests) should set it in their own helper, not rely on
-    this signature's default.
+    risk scorer's ownership lookups (``_score_message_risk``). As of
+    2026-09-03 (confirmed with Dan), self-registration deliberately no
+    longer requires elevated scope for this — ``providers/comms.py``'s
+    ``register_agent`` tool (this function's only caller) now always
+    passes ``True`` here, since an agent declaring ITS OWN ``is_shared``
+    is a self-service product decision, not a privilege escalation. The
+    parameter and its fail-closed ``False`` default are kept rather than
+    removed: it's still the mechanism that would gate this for any FUTURE
+    caller of this function that isn't plain self-registration, and
+    removing it would silently make this function's own default trust
+    everyone. Direct service-layer callers that need the convenience of a
+    permissive default (e.g. tests) should set it in their own helper, not
+    rely on this signature's default.
 
     Idempotent: calling again with the same ``sub`` updates
     ``display_name``/``accepted_types``/``owner_email`` in place (unique on
