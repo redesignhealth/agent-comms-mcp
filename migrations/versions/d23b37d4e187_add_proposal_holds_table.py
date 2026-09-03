@@ -1,7 +1,7 @@
 """add proposal_holds table
 
 Revision ID: d23b37d4e187
-Revises: b2bb6ccde02e
+Revises: d5c8f1a2b4e7
 Create Date: 2026-09-03 00:00:00.000000
 
 TECH-5871: a new, sibling table to ``approval_holds`` -- NOT a modification
@@ -22,8 +22,9 @@ other purely-additive migration in this directory (f4a9c1d2b3e7, etc.) --
 a brand-new table with no readers/writers anywhere in this codebase yet.
 
 Uses ``if_not_exists``/``if_exists`` guards for indexes (matching this
-directory's convention), but not for ``create_table`` (Postgres has no
-``CREATE TABLE IF NOT EXISTS`` that Alembic can still manage).
+directory's convention), but not for ``create_table`` -- Postgres itself
+supports ``CREATE TABLE IF NOT EXISTS``, but Alembic's ``op.create_table()``
+has no ``if_not_exists`` parameter to emit it.
 """
 
 from __future__ import annotations
@@ -35,13 +36,9 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision: str = "d23b37d4e187"
-down_revision: str | None = "b2bb6ccde02e"
+down_revision: str | None = "d5c8f1a2b4e7"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
-
-_LEVELS = ("low", "medium", "high")
-_STATUSES = ("pending", "approved", "rejected", "applied", "apply_failed", "stale")
-_DECISION_SOURCES = ("human", "auto")
 
 
 def upgrade() -> None:
@@ -89,15 +86,24 @@ def upgrade() -> None:
             server_default=sa.text("now()"),
             nullable=False,
         ),
-        sa.CheckConstraint(f"status IN {_STATUSES!r}", name="ck_proposal_holds_status"),
         sa.CheckConstraint(
-            f"decision_source IS NULL OR decision_source IN {_DECISION_SOURCES!r}",
+            "status IN ('pending', 'approved', 'rejected', 'applied', 'apply_failed', 'stale')",
+            name="ck_proposal_holds_status",
+        ),
+        sa.CheckConstraint(
+            "decision_source IS NULL OR decision_source IN ('human', 'auto')",
             name="ck_proposal_holds_decision_source",
         ),
-        sa.CheckConstraint(f"confidence IN {_LEVELS!r}", name="ck_proposal_holds_confidence"),
-        sa.CheckConstraint(f"importance IN {_LEVELS!r}", name="ck_proposal_holds_importance"),
-        sa.CheckConstraint(f"impact IN {_LEVELS!r}", name="ck_proposal_holds_impact"),
-        sa.CheckConstraint(f"priority IN {_LEVELS!r}", name="ck_proposal_holds_priority"),
+        sa.CheckConstraint(
+            "confidence IN ('low', 'medium', 'high')", name="ck_proposal_holds_confidence"
+        ),
+        sa.CheckConstraint(
+            "importance IN ('low', 'medium', 'high')", name="ck_proposal_holds_importance"
+        ),
+        sa.CheckConstraint("impact IN ('low', 'medium', 'high')", name="ck_proposal_holds_impact"),
+        sa.CheckConstraint(
+            "priority IN ('low', 'medium', 'high')", name="ck_proposal_holds_priority"
+        ),
         sa.CheckConstraint(
             "(status = 'pending' AND decided_at IS NULL AND decided_by_actor_id IS NULL "
             "AND decision_source IS NULL) "

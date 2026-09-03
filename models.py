@@ -68,11 +68,21 @@ APPROVAL_HOLD_AUTO_DECISIONS = ("cleared", "escalated")
 APPROVAL_HOLD_KINDS = ("message", "invite")
 
 # proposal_holds lifecycle (TECH-5871): pending -> approved|rejected, then
-# (approved only) -> applied|apply_failed. `stale` is a terminal outcome a
-# future apply-time re-check can set when `target_fingerprint` no longer
-# matches the target's current state at apply time (see ProposalHold's
-# class docstring) -- reachable from `approved` (or `pending`, if staleness
-# is ever checked pre-decision), not just `applied`.
+# (approved only) -> applied|apply_failed|stale. `stale` is a terminal
+# outcome a future apply-time re-check can set when `target_fingerprint`
+# no longer matches the target's current state at apply time (see
+# ProposalHold's class docstring) -- reachable only from `approved`
+# (post-decision), never directly from `pending`: staleness is only ever
+# detected at apply/decide time, which is after decision fields
+# (`decided_at`/`decided_by_actor_id`/`decision_source`) are already
+# stamped, and `ck_proposal_holds_decision_consistency` requires those
+# fields whenever `status != 'pending'`.
+# NOTE: these three tuples are mirrored as literal SQL in migration
+# d23b37d4e187's CHECK constraints (migrations are frozen once applied, so
+# they cannot import from this module). Editing any of these tuples requires
+# a NEW migration to ALTER the corresponding CHECK constraint(s) in the
+# database -- there is no drift detection between this file and the DB
+# schema, so keep them in sync by hand.
 PROPOSAL_HOLD_STATUSES = ("pending", "approved", "rejected", "applied", "apply_failed", "stale")
 PROPOSAL_HOLD_DECISION_SOURCES = ("human", "auto")
 # Shared closed vocabulary for the three self-reported, advisory-only axes

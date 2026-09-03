@@ -225,9 +225,10 @@ agent-token access gate. It never gates human users.
 
 ## 5. Data model (Postgres)
 
-Six tables. `messages` and `audit_log` are append-only: no UPDATE/DELETE paths in code.
-`approval_holds` (TECH-5389) is the one MUTABLE table besides `conversations`/
-`participants`/`agents`: a hold's `status` flips as it moves through its lifecycle.
+Seven tables. `messages` and `audit_log` are append-only: no UPDATE/DELETE paths in code.
+`approval_holds` (TECH-5389) and `proposal_holds` (TECH-5871) are the two MUTABLE
+tables besides `conversations`/`participants`/`agents`: each hold's `status` flips
+as it moves through its own lifecycle.
 
 ```
 agents id, sub UNIQUE, owner_sub, owner_email, display_name,
@@ -280,6 +281,32 @@ approval_holds id, conversation_id, sender_agent_id, target_agent_id (nullable
  `target_agent_id` is the agent being invited; approval creates a
  `participants` row instead of a `messages` row (see §9 Axis 1's free-text
  invite-approval rule and models.ApprovalHold's class docstring)
+proposal_holds id, kind (open vocabulary, e.g. "arc_board_change",
+ "linear_progress_update" -- NOT CHECK-constrained, same convention as
+ conversations.type/messages.type), proposed_by_bot_id (opaque, NOT an FK
+ to agents -- proposers need not be board-registered), owner_sub
+ (snapshotted at creation, same convention as approval_holds.owner_sub),
+ action jsonb, rationale, confidence/importance/impact(low|medium|high,
+ self-reported, advisory only), priority(low|medium|high, server-derived
+ from kind+action -- never caller-supplied, despite sharing a vocabulary
+ with the three self-reported columns), status(pending|approved|rejected|
+ applied|apply_failed|stale), decision_source(human|auto),
+ decided_by_actor_id, decided_at, decision_note, target_fingerprint
+ (sha256 hex digest of the target's state at proposal time, for detecting
+ staleness at apply time), applied_at, apply_error, timestamps
+ -- MUTABLE (status flips). A sibling table to approval_holds, not a
+ variant of it: approval_holds stays the message/invite-diversion pipeline
+ for this board's own comms traffic (TECH-5389/TECH-5735); proposal_holds
+ generalizes the same "propose, hold for a human, decide, apply" shape to
+ any autonomous bot's arbitrary action, keyed by an open `kind`
+ discriminator. Lifecycle: pending -> approved|rejected, then (approved
+ only) -> applied|apply_failed|stale -- `stale` is reachable only from
+ `approved` (never directly from `pending`), since staleness is only ever
+ detected at apply/decide time, by which point decision fields are already
+ stamped (see models.ProposalHold's class docstring and the
+ `ck_proposal_holds_decision_consistency` CHECK). Migration only in
+ TECH-5871 -- no endpoints/routes/business logic ship yet (follow-on work,
+ separate tickets/PRs)
 ```
 
 Design notes:
