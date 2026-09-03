@@ -105,6 +105,22 @@ class TestRequiredScopeForResource:
         uri = "comms://comms/conversations/abc/extra"
         assert required_scope_for_resource(uri) is None
 
+    def test_every_registered_resource_scope_is_comms_read(self) -> None:
+        """main.py's `_LIST_RESOURCES_REQUIRED_SCOPE` hardcodes a single
+        flat `comms:read` requirement for resources/list and
+        resources/templates/list (Argus round-1 SUGGESTION) on the
+        assumption that every individually-enrolled resource ALSO requires
+        `comms:read` -- nothing else enforces that invariant, so check it
+        explicitly here. If a future resource legitimately needs a
+        different scope, `_gate_resource_listing` must become per-item
+        filtering, not just a registry-table edit."""
+        from scopes import RESOURCE_SCOPES, RESOURCE_TEMPLATE_SCOPES
+
+        all_resource_scopes = set(RESOURCE_SCOPES.values()) | set(
+            RESOURCE_TEMPLATE_SCOPES.values()
+        )
+        assert all_resource_scopes == {"comms:read"}
+
 
 class TestIsInteractiveToken:
     def test_none_token_is_not_interactive(self) -> None:

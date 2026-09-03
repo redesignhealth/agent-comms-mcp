@@ -311,7 +311,7 @@ class TestReadResourceMiddleware:
         call_next.assert_not_called()
 
     def test_unenrolled_resource_is_rejected_fail_closed(self) -> None:
-        """No resource is in ``RESOURCE_SCOPES`` today — every agent-jwt read
+        """Resources not enrolled in RESOURCE_SCOPES/RESOURCE_TEMPLATE_SCOPES
         must be denied by default, even with a broadly-scoped token."""
         middleware = self._middleware()
         context = self._make_context("resource://not-enrolled-anywhere")
@@ -433,6 +433,38 @@ class TestResourceScopeRegistryParity:
             f"(agent-jwt callers would be denied fail-closed): {sorted(unenrolled)}"
         )
 
+    def test_registry_has_no_stale_entries(self) -> None:
+        """Reverse direction of the two tests above (Argus round-1
+        SUGGESTION): every ``RESOURCE_SCOPES``/``RESOURCE_TEMPLATE_SCOPES``
+        key must correspond to an actually-mounted resource/template — a
+        stale entry left behind after a rename would otherwise silently
+        gate nothing (it would never be consulted, since
+        ``required_scope_for_resource`` is only ever called with a REAL
+        URI from an incoming request), giving a false sense that the
+        registry is complete."""
+        from scopes import RESOURCE_SCOPES, RESOURCE_TEMPLATE_SCOPES
+
+        main = _import_main()
+        okta_token = MagicMock()
+        okta_token.claims = {"iss": "https://example.okta.com/oauth2/default"}
+        with _OIDC_PATCH, _ENV_PATCH, patch("main.get_access_token", return_value=okta_token):
+            resources = asyncio.run(main.mcp.list_resources())  # type: ignore[attr-defined]
+            templates = asyncio.run(main.mcp.list_resource_templates())  # type: ignore[attr-defined]
+
+        mounted_uris = {str(r.uri) for r in resources}
+        mounted_templates = {t.uri_template for t in templates}
+
+        stale_exact = set(RESOURCE_SCOPES) - mounted_uris
+        assert not stale_exact, (
+            f"RESOURCE_SCOPES entries with no matching mounted resource "
+            f"(stale after a rename?): {sorted(stale_exact)}"
+        )
+        stale_templates = set(RESOURCE_TEMPLATE_SCOPES) - mounted_templates
+        assert not stale_templates, (
+            f"RESOURCE_TEMPLATE_SCOPES entries with no matching mounted "
+            f"template (stale after a rename?): {sorted(stale_templates)}"
+        )
+
 
 def _example_uri(template: str) -> str:
     """Substitute a placeholder concrete value for every ``{param}`` segment.
@@ -544,6 +576,16 @@ class TestListResourcesMiddleware:
         with patch("main.get_access_token", return_value=None):
             with pytest.raises(ResourceError, match="requires elevated permissions"):
                 asyncio.run(middleware.on_list_resources(self._make_context(), call_next))
+
+        call_next.assert_not_called()
+
+    def test_missing_token_is_denied_list_resource_templates(self) -> None:
+        middleware = self._middleware()
+        call_next = AsyncMock()
+
+        with patch("main.get_access_token", return_value=None):
+            with pytest.raises(ResourceError, match="requires elevated permissions"):
+                asyncio.run(middleware.on_list_resource_templates(self._make_context(), call_next))
 
         call_next.assert_not_called()
 

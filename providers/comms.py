@@ -962,7 +962,9 @@ async def admin_register(
 
 
 @comms_server.tool
-async def list_agents(limit: int = 50, cursor: str | None = None) -> dict[str, Any]:
+async def list_agents(
+    limit: int = service.DEFAULT_LIST_AGENTS_LIMIT, cursor: str | None = None
+) -> dict[str, Any]:
     """List the board directory (paginated, keyset on ``sub``).
 
     Internal domain — enumeration is acceptable per DESIGN.md §10. Pass the
@@ -1862,10 +1864,22 @@ async def conversation_resource(conversation_id: str) -> dict[str, Any]:
     Second transport over the same authz core as the tool (DESIGN.md's
     membership-is-visibility rule): an ``invited`` (not yet accepted) caller
     gets metadata only, a non-member gets the uniform ``access_denied``
-    error, and an ``active`` caller gets up to the same 500-message cap.
-    Because this is a *template*, ``resources/list`` never enumerates actual
-    conversation IDs — no new enumeration surface beyond what
-    ``comms_list_conversations`` already exposes to a participant.
+    error, and an ``active`` caller gets up to the same
+    ``MAX_MESSAGES_PER_GET_CONVERSATION`` (500) message cap as the tool --
+    a conversation longer than that cap is permanently truncated from this
+    resource's perspective (no ``since_seq``/pagination parameter exists on
+    the URI template to page further; the tool remains the way to read
+    past this cap). Because this is a *template*, ``resources/list`` never
+    enumerates actual conversation IDs — no new enumeration surface beyond
+    what ``comms_list_conversations`` already exposes to a participant.
+
+    Unlike the tool, this resource is passed ``mark_read=False`` --
+    reading it never advances the caller's ``last_read_seq`` (see
+    ``service.get_conversation``'s docstring for why: an MCP resource read
+    is conventionally idempotent/cacheable and may be silently re-fetched
+    by a client, so it must not have the write-shaped side effect of
+    marking messages read and dropping the conversation out of
+    ``comms_inbox`` on every such re-fetch).
 
     No ``agent_key`` parameter (resource URIs can't carry the extra
     argument every tool above takes) — the caller's identity here is always
@@ -1886,6 +1900,7 @@ async def conversation_resource(conversation_id: str) -> dict[str, Any]:
                     caller_agent_id=caller.id,
                     conversation_id=conv_id,
                     since_seq=0,
+                    mark_read=False,
                 )
 
     if "messages_in_page" in result:
@@ -1914,13 +1929,34 @@ async def agent_inbox_resource(agent_id: str) -> dict[str, Any]:
     "wrong owner" distinction, matching this module's anti-enumeration
     posture elsewhere).
 
+    The self-or-sibling check itself is delegated to the public
+    ``service.resolve_inbox_target`` (TECH-5903 Argus round-1 BLOCKING
+    fix) rather than done here against a private ``service._find_agent_by_id``
+    lookup with a raw ``AccessDeniedError`` raise: that would both cross
+    the provider/service layering boundary (every other provider call goes
+    through a public service function) and skip the ``audit_log`` row
+    DESIGN.md §5 requires for every denial (``service._deny`` is the only
+    code path that writes one). ``service.resolve_inbox_target`` performs
+    the identical check but denies through ``_deny`` so the audit trail
+    stays complete.
+
     Once ``agent_id`` is confirmed self/sibling, the identity is re-resolved
     through ``_resolve_caller_agent`` (rather than using the looked-up row's
     ``id`` directly) so this path gets the exact same suspension check and
     ownership write-through every tool's caller-resolution gets — a
     suspended agent must not be able to read its own inbox through this
     resource just because the tool-layer's ``agent_suspended`` check lives
-    in a helper this handler would otherwise bypass.
+    in a helper this handler would otherwise bypass. Note that
+    ``_resolve_caller_agent``'s ``agent_suspended`` ``ToolError`` escapes
+    ``_map_service_errors(ResourceError)`` unchanged (that mapper only
+    catches ``AccessDeniedError`` and the other named service exceptions,
+    never a bare ``ToolError``) and is converted to ``ResourceError`` by
+    the enclosing ``_resource_boundary()`` instead -- this is a
+    DELIBERATELY non-uniform, specific denial (it tells a suspended caller
+    exactly why), the same tradeoff the tool path already makes, and must
+    not be confused with the anti-enumeration-safe uniform ``access_denied``
+    string ``resolve_inbox_target`` raises for self/sibling mismatches
+    above.
     """
     async with _resource_boundary():
         token = _require_token()
@@ -1928,11 +1964,12 @@ async def agent_inbox_resource(agent_id: str) -> dict[str, Any]:
         target_id = _parse_uuid("agent_id", agent_id)
 
         async with get_session_factory()() as session, _map_service_errors(ResourceError):
-            target = await service._find_agent_by_id(session, target_id)
-            if target is None or not (
-                target.sub == base_sub or target.sub.startswith(f"{base_sub}::")
-            ):
-                raise AccessDeniedError(reason="denied.inbox_not_self_or_sibling")
+            target = await service.resolve_inbox_target(
+                session,
+                actor_sub=base_sub,
+                base_sub=base_sub,
+                target_agent_id=target_id,
+            )
             caller = await _resolve_caller_agent(session, target.sub, token)
             return await service.inbox(session, caller_agent_id=caller.id)
 
@@ -1941,17 +1978,28 @@ async def agent_inbox_resource(agent_id: str) -> dict[str, Any]:
 async def agents_directory_resource() -> dict[str, Any]:
     """Read the board directory: identical shape to ``comms_list_agents``' first page.
 
-    Static resource, no parameters — always the first page (``limit=50``,
-    matching that tool's own default). Same internal-domain trust posture
-    as ``comms_list_agents`` (DESIGN.md §10): pure directory read, no
-    per-caller filtering.
+    Static resource, no parameters — always the first page
+    (``service.DEFAULT_LIST_AGENTS_LIMIT``, matching that tool's own
+    default via one shared constant so the two can't drift apart). Same
+    internal-domain trust posture as ``comms_list_agents`` (DESIGN.md §10:
+    directory enumeration is acceptable within the current internal-domain
+    perimeter, until a grants/consent layer for external counterparties
+    exists): pure directory read, no per-caller filtering.
     """
     async with _resource_boundary():
+        # Deliberately `_require_token()` only, not `_resolve_caller_agent`
+        # -- unlike `conversation_resource`/`agent_inbox_resource`, this
+        # mirrors `comms_list_agents` itself, which never resolves the
+        # caller's OWN agent row at all (DESIGN.md §10's directory-is-public
+        # posture: this is a caller-independent read, so a suspended
+        # agent's still-unexpired token reading the public directory is not
+        # the same kill-switch gap `_resolve_caller_agent`'s suspension
+        # check closes for tools that act AS that agent).
         _require_token()
         async with get_session_factory()() as session:
             return await service.list_agents(
                 session,
-                limit=50,
+                limit=service.DEFAULT_LIST_AGENTS_LIMIT,
                 cursor=None,
                 active_checker=plugins.get_active_checker(),
             )

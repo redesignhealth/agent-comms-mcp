@@ -310,16 +310,79 @@ class TestConversationResource:
         conversation_id, _ids = await _start_open_conversation(
             main, test_session_factory, "conv-res-inv-owner", "conv-res-inv-target"
         )
-        result = await _read_resource(
+        invited_token = _token("conv-res-inv-target")
+
+        tool_result = await _call(
             main,
             test_session_factory,
-            _token("conv-res-inv-target"),
+            invited_token,
+            "comms_get_conversation",
+            {"conversation_id": conversation_id, "since_seq": 0},
+        )
+        resource_result = await _read_resource(
+            main,
+            test_session_factory,
+            invited_token,
             f"comms://comms/conversations/{conversation_id}",
         )
-        assert result["invited"] is True
-        assert result["messages"] == []
-        assert result["has_more"] is False
-        assert "invited_by" in result
+        # Full parity with the tool, not just the hand-picked fields below
+        # (Argus round-1 SUGGESTION: the active-caller test above already
+        # asserts full equality; the invited path deserves the same rigor).
+        assert resource_result == tool_result
+        assert resource_result["invited"] is True
+        assert resource_result["messages"] == []
+        assert resource_result["has_more"] is False
+        assert "invited_by" in resource_result
+
+    async def test_read_does_not_advance_read_cursor(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Argus round-1 BLOCKING fix: unlike comms_get_conversation, reading
+        this resource must never advance the caller's last_read_seq --
+        otherwise a client silently re-fetching the resource (or, once
+        Phase B lands, re-fetching on every subscription notification)
+        would mark messages read as a side effect of what looks like a
+        passive read, and the conversation would drop out of comms_inbox
+        results on every such re-fetch."""
+        conversation_id, _ids = await _start_open_conversation(
+            main, test_session_factory, "conv-res-mr-owner", "conv-res-mr-member"
+        )
+        member_token = _token("conv-res-mr-member")
+        await _call(
+            main,
+            test_session_factory,
+            member_token,
+            "comms_accept",
+            {"conversation_id": conversation_id},
+        )
+
+        before = await _call(main, test_session_factory, member_token, "comms_inbox")
+        assert before["total_count"] >= 1
+
+        # Read the resource (repeatedly, as a client refetching would) --
+        # must not mark the conversation read.
+        for _ in range(2):
+            await _read_resource(
+                main,
+                test_session_factory,
+                member_token,
+                f"comms://comms/conversations/{conversation_id}",
+            )
+
+        after = await _call(main, test_session_factory, member_token, "comms_inbox")
+        assert after == before
+
+        # The tool itself is unaffected -- it still advances the cursor
+        # exactly as before this fix.
+        await _call(
+            main,
+            test_session_factory,
+            member_token,
+            "comms_get_conversation",
+            {"conversation_id": conversation_id, "since_seq": 0},
+        )
+        after_tool_read = await _call(main, test_session_factory, member_token, "comms_inbox")
+        assert after_tool_read["total_count"] < before["total_count"]
 
     async def test_non_member_gets_uniform_denial(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
@@ -426,6 +489,38 @@ class TestAgentInboxResource:
                 _token("inbox-res-a"),
                 f"comms://comms/agents/{ids['inbox-res-b']}/inbox",
             )
+
+    async def test_denial_writes_audit_row(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        session: AsyncSession,
+    ) -> None:
+        """Argus round-1 BLOCKING fix: the self-or-sibling denial must go
+        through service._deny (via service.resolve_inbox_target), not a
+        raw AccessDeniedError raised in the provider layer, or the
+        DESIGN.md §5 audit-every-denial invariant silently breaks for this
+        one denial path."""
+        _conversation_id, ids = await _start_open_conversation(
+            main, test_session_factory, "inbox-res-audit-a", "inbox-res-audit-b"
+        )
+        with pytest.raises(McpError):
+            await _read_resource(
+                main,
+                test_session_factory,
+                _token("inbox-res-audit-a"),
+                f"comms://comms/agents/{ids['inbox-res-audit-b']}/inbox",
+            )
+
+        row_count = (
+            await session.execute(
+                text(
+                    "SELECT COUNT(*) FROM audit_log "
+                    "WHERE action = 'denied.inbox_not_self_or_sibling'"
+                )
+            )
+        ).scalar_one()
+        assert row_count == 1
 
     async def test_unknown_agent_id_is_uniformly_denied(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]

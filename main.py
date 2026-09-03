@@ -217,6 +217,13 @@ class ScopeEnforcementMiddleware(Middleware):
             ScopeEnforcementMiddleware._deny_resource(
                 pseudo_uri, reason="missing_token", client_id=None
             )
+        # Argus round-1 SUGGESTION: `_deny_resource` is `NoReturn`, so this
+        # is unreachable in practice -- but that guarantee lives entirely
+        # in a separate function's annotation, not in this branch's own
+        # control flow. Making it explicit means a future change that
+        # weakens `_deny_resource`'s NoReturn contract fails loudly here
+        # instead of silently passing `None` into `scopes_for_token` below.
+        assert token is not None
 
         if _LIST_RESOURCES_REQUIRED_SCOPE not in scopes_for_token(token):
             ScopeEnforcementMiddleware._deny_resource(
@@ -272,6 +279,16 @@ class ObservabilityMiddleware(Middleware):
     forged email claims cannot poison ``log_user_active``; Okta tokens
     prefer the canonical ``upstream_claims.email`` threaded through the
     OIDCProxy, falling back to the shared resolver.
+
+    Known gap (TECH-5903 Argus round-1 SUGGESTION, tracked as backlog
+    before Phase B ships): this only hooks ``on_call_tool``. Resource
+    *denials* are observable via ``ScopeEnforcementMiddleware``'s own
+    ``scope_denial`` event (``_deny_resource``), but a successful resource
+    read or list emits no equivalent of this class's ``tool_call`` event --
+    that surface is invisible in metrics today. Not addressed in this PR;
+    add ``on_read_resource``/``on_list_resources``/``on_list_resource_templates``
+    hooks here before Phase B's subscription notifications make resource
+    traffic volume-relevant.
     """
 
     async def on_call_tool(
