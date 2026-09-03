@@ -115,6 +115,15 @@ TOOL_SCOPES: dict[str, str] = {
 RESOURCE_SCOPES: dict[str, str] = {}
 
 
+# Not in TOOL_SCOPES: ``POST /proposals`` (TECH-5872) is a non-MCP
+# ``mcp.custom_route`` in main.py, not a tool dispatched through
+# ``ScopeEnforcementMiddleware`` -- that route self-checks this scope
+# directly (see main.py's ``_authenticate_proposal_submitter``), the same
+# way ``/approvals/*``'s routes self-check interactivity rather than going
+# through this module's tool-dispatch machinery.
+PROPOSAL_SUBMIT_SCOPE = "comms:proposals:write"
+
+
 def is_interactive_token(token: AccessToken | None) -> bool:
     """Return True if ``token`` was issued by the Okta OIDC path.
 
@@ -256,6 +265,7 @@ def scopes_for_token(token: AccessToken) -> list[str]:
 
 
 __all__ = [
+    "PROPOSAL_SUBMIT_SCOPE",
     "RESOURCE_SCOPES",
     "TOOL_SCOPES",
     "is_interactive_token",

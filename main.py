@@ -35,6 +35,7 @@ from exceptions import (
     HoldAwaitingAutoReviewError,
     HoldExpiredError,
     InvalidConversationStateError,
+    RateLimitExceededError,
 )
 from identity import AGENT_JWT_ISSUER, try_resolve_email
 from observability import (
@@ -46,6 +47,7 @@ from observability import (
 from plugins import validate_configuration as validate_plugin_configuration
 from providers.comms import comms_server
 from scopes import (
+    PROPOSAL_SUBMIT_SCOPE,
     is_interactive_token,
     required_scope_for,
     required_scope_for_resource,
@@ -404,6 +406,214 @@ async def _authenticate_approval_caller(request: Request) -> tuple[str | None, i
     async with get_session_factory()() as session:
         await service.audit_denied_approval_requires_interactive(session, actor_sub=rejected_sub)
     return None, 403
+
+
+_MAX_PROPOSAL_STRING_FIELD_LENGTH = 4000
+
+
+async def _authenticate_proposal_submitter(
+    request: Request,
+) -> tuple[str | None, Any | None, int]:
+    """Self-verify the bearer token for ``POST /proposals`` (TECH-5872).
+
+    Structural mirror of ``_authenticate_approval_caller``, but the OPPOSITE
+    gate: proposals are submitted BY BOTS, not humans, so this REJECTS an
+    interactive (Okta) caller rather than requiring one -- an interactive
+    token here gets 403, same "prove the gate actually inspected and
+    rejected it" posture ``_authenticate_approval_caller`` uses for the
+    reverse case. The token must verify against the full ``_auth_provider``
+    chain (agent-jwt or a future TECH-5396 plugin verifier) and carry
+    ``scopes.PROPOSAL_SUBMIT_SCOPE`` in its ``scopes`` claim -- this route is
+    a non-MCP ``mcp.custom_route``, so ``ScopeEnforcementMiddleware`` never
+    sees it; the scope check has to happen here instead.
+
+    Returns ``(bot_sub, token, 200)`` on success, or ``(None, None, 401 |
+    403)`` on failure. ``bot_sub`` is the verified agent-jwt ``sub`` claim
+    (via ``try_resolve_email``, same resolver every other agent-jwt identity
+    in this service uses) -- the bot's own opaque identifier, used as
+    ``proposal_holds.proposed_by_bot_id``. Not resolved through
+    ``service.get_agent_by_sub``: a proposing bot need not be a
+    board-registered ``agents`` row at all (see
+    ``models.ProposalHold``'s docstring). The verified ``token`` is returned
+    too so the caller can extract ``owner_sub`` without re-verifying.
+    """
+    token_str = _extract_bearer_token(request)
+    if token_str is None:
+        return None, None, 401
+    token = await _auth_provider.verify_token(token_str)
+    if token is None:
+        return None, None, 401
+    if is_interactive_token(token):
+        return None, None, 403
+    if PROPOSAL_SUBMIT_SCOPE not in scopes_for_token(token):
+        return None, None, 403
+    bot_sub = try_resolve_email(token)
+    if bot_sub is None:
+        return None, None, 401
+    return bot_sub, token, 200
+
+
+def _resolve_proposal_owner_sub(token: Any) -> str | None:
+    """Best-effort ``owner_sub`` extraction from a verified bot token's
+    claims (TECH-5872) -- same "trust only a registry-backed verifier's
+    claim shape" posture as ``providers.comms._string_claim``, duplicated
+    here rather than imported since that helper is private to
+    ``providers.comms`` and takes a FastMCP ``AccessToken`` from a
+    different call site's variable naming, not because the logic differs.
+    """
+    value = token.claims.get("owner_sub")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        return None
+    return value
+
+
+def _validate_proposal_string_field(name: str, value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{name} is required and must be a non-empty string")
+    if len(value) > _MAX_PROPOSAL_STRING_FIELD_LENGTH:
+        raise ValueError(f"{name} exceeds {_MAX_PROPOSAL_STRING_FIELD_LENGTH} characters")
+    return value
+
+
+@mcp.custom_route("/proposals", methods=["POST"])
+async def submit_proposal(request: Request) -> Response:
+    """Bot-submission endpoint for a generalized action-approval proposal
+    (TECH-5872/5875/5877). Body:
+    ``{"kind": str, "action": {..., "target_id": str, "action_type": str},
+    "rationale": str, "confidence": "low"|"medium"|"high",
+    "importance": "low"|"medium"|"high", "impact": "low"|"medium"|"high",
+    "target_fingerprint": str}``.
+
+    Auth: agent-jwt bearer token carrying ``comms:proposals:write`` (see
+    ``_authenticate_proposal_submitter``) -- NOT the interactive-only gate
+    the ``/approvals/*`` decide/list routes use, since this is the
+    submission side, not the human-decide side.
+
+    Rate-limited per bot (TECH-5875, 429 on rejection, logged for
+    operational visibility). Deduplicates against an existing
+    ``status='pending'`` row matching ``(kind, target_id, action_type)`` by
+    updating it in place instead of inserting a duplicate (TECH-5872).
+    Immediately judged by the TECH-5877 kind-scoped deterministic rules
+    engine -- ``priority`` is always server-derived, never caller-supplied.
+    """
+    bot_sub, bot_token, status = await _authenticate_proposal_submitter(request)
+    if bot_sub is None or bot_token is None:
+        return JSONResponse({"error": "unauthorized"}, status_code=status)
+
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "invalid_json"}, status_code=422)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "invalid_body"}, status_code=422)
+
+    kind = body.get("kind")
+    action = body.get("action")
+    if not isinstance(kind, str) or not kind:
+        return JSONResponse(
+            {
+                "error": "invalid_request",
+                "detail": "kind is required and must be a non-empty string",
+            },
+            status_code=422,
+        )
+    if not isinstance(action, dict):
+        return JSONResponse(
+            {"error": "invalid_request", "detail": "action is required and must be an object"},
+            status_code=422,
+        )
+    try:
+        rationale = _validate_proposal_string_field("rationale", body.get("rationale"))
+        target_fingerprint = _validate_proposal_string_field(
+            "target_fingerprint", body.get("target_fingerprint")
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": "invalid_request", "detail": str(exc)}, status_code=422)
+
+    confidence = body.get("confidence")
+    importance = body.get("importance")
+    impact = body.get("impact")
+    if (
+        not isinstance(confidence, str)
+        or not isinstance(importance, str)
+        or not isinstance(impact, str)
+        or not all(v in service.PROPOSAL_HOLD_LEVELS for v in (confidence, importance, impact))
+    ):
+        levels = service.PROPOSAL_HOLD_LEVELS
+        return JSONResponse(
+            {
+                "error": "invalid_request",
+                "detail": f"confidence/importance/impact must each be one of {levels!r}",
+            },
+            status_code=422,
+        )
+
+    owner_sub = _resolve_proposal_owner_sub(bot_token)
+    if owner_sub is None:
+        async with get_session_factory()() as session:
+            agent = await service.get_agent_by_sub(session, bot_sub)
+        owner_sub = agent.owner_sub if agent is not None else None
+    if owner_sub is None:
+        return JSONResponse(
+            {
+                "error": "owner_sub_unresolvable",
+                "detail": (
+                    "no owner_sub claim on the bot's token, and no registered "
+                    "board agent to fall back to"
+                ),
+            },
+            status_code=422,
+        )
+
+    async with get_session_factory()() as session:
+        try:
+            result = await service.create_proposal(
+                session,
+                kind=kind,
+                proposed_by_bot_id=bot_sub,
+                owner_sub=owner_sub,
+                action=action,
+                rationale=rationale,
+                confidence=confidence,
+                importance=importance,
+                impact=impact,
+                target_fingerprint=target_fingerprint,
+            )
+        except RateLimitExceededError as exc:
+            # TECH-5875: rejection is operationally visible via this WARNING
+            # log (proposal_holds has no dedicated metrics pipeline yet).
+            logger.warning("proposal submission rate-limited for proposed_by_bot_id=%s", bot_sub)
+            return JSONResponse({"error": "rate_limited", "detail": str(exc)}, status_code=429)
+        except ValueError as exc:
+            return JSONResponse({"error": "invalid_request", "detail": str(exc)}, status_code=422)
+
+    return JSONResponse(result, status_code=200)
+
+
+@mcp.custom_route("/proposals/pending", methods=["GET"])
+async def list_pending_proposals(request: Request) -> Response:
+    """List the caller's pending proposal holds (TECH-5872) -- same
+    interactive-only, owner_sub-scoped auth gate as
+    ``GET /approvals/pending`` (``_authenticate_approval_caller``): a human
+    reviewing what's awaiting their decision, not a bot.
+    """
+    owner_sub, status = await _authenticate_approval_caller(request)
+    if owner_sub is None:
+        return JSONResponse({"error": "unauthorized"}, status_code=status)
+
+    limit_str = request.query_params.get("limit")
+    try:
+        limit = int(limit_str) if limit_str is not None else 50
+    except ValueError:
+        return JSONResponse({"error": "invalid_limit"}, status_code=422)
+
+    async with get_session_factory()() as session:
+        result = await service.list_pending_proposal_holds(
+            session, owner_sub=owner_sub, limit=limit
+        )
+    return JSONResponse(result, status_code=200)
 
 
 @mcp.custom_route("/approvals/{hold_id}/decide", methods=["POST"])

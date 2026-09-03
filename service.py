@@ -179,7 +179,16 @@ from exceptions import (
     SiblingIdentityExistsError,
     UnknownConversationTypeError,
 )
-from models import Agent, ApprovalHold, AuditLog, Conversation, Message, Participant
+from models import (
+    PROPOSAL_HOLD_LEVELS,
+    Agent,
+    ApprovalHold,
+    AuditLog,
+    Conversation,
+    Message,
+    Participant,
+    ProposalHold,
+)
 from plugins import (
     BARRIER_SENSITIVE_TYPES,
     ActiveChecker,
@@ -5300,6 +5309,296 @@ async def decide_hold(
     return _hold_dict(hold)
 
 
+# --- Proposal holds (TECH-5871/5872/5875/5877) --------------------------------
+#
+# ``proposal_holds`` generalizes the same "propose, hold for a human, decide"
+# shape approval_holds already gives comms traffic, to arbitrary bot actions
+# (see models.ProposalHold's class docstring). Unlike approval_holds, a
+# proposer here is not necessarily a board-registered ``agents`` row --
+# ``proposed_by_bot_id``/``owner_sub`` are resolved by the caller (main.py's
+# non-MCP ``POST /proposals`` route) from the submitting bot's verified
+# token claims, not from ``service.get_agent_by_sub``.
+
+# TECH-5875: per-bot submission rate limit. Same table-count-per-window
+# pattern as ``_deny_rate_limited_holds`` (no Redis) -- counts EVERY
+# proposal_holds row created by this bot in the window, not just currently-
+# pending ones, since a submission-spam control must count attempts.
+PROPOSAL_RATE_LIMIT_WINDOW = timedelta(minutes=1)
+MAX_PROPOSALS_PER_BOT_PER_WINDOW = 5
+
+
+async def _deny_rate_limited_proposals(session: AsyncSession, *, proposed_by_bot_id: str) -> None:
+    """Raise ``RateLimitExceededError`` (mapped to HTTP 429 by main.py) if
+    ``proposed_by_bot_id`` has submitted too many proposals in the rolling
+    window. No audit_log row here -- unlike approval_holds' sender, a
+    proposing bot is not necessarily a board ``Agent`` (``AuditLog.agent_id``
+    is a real FK), so this is logged instead (see main.py's route handler)."""
+    window_start = _now() - PROPOSAL_RATE_LIMIT_WINDOW
+    count = (
+        await session.execute(
+            select(func.count())
+            .select_from(ProposalHold)
+            .where(
+                ProposalHold.proposed_by_bot_id == proposed_by_bot_id,
+                ProposalHold.created_at > window_start,
+            )
+        )
+    ).scalar_one()
+    if count >= MAX_PROPOSALS_PER_BOT_PER_WINDOW:
+        raise RateLimitExceededError(
+            f"rate_limited: at most {MAX_PROPOSALS_PER_BOT_PER_WINDOW} proposals per "
+            f"{int(PROPOSAL_RATE_LIMIT_WINDOW.total_seconds())}s per bot",
+            reason="proposals_per_bot_per_window",
+        )
+
+
+def _extract_proposal_target(action: dict[str, Any]) -> tuple[str, str]:
+    """Derive ``(target_id, action_type)`` from a proposal's free-form
+    ``action`` JSONB payload (TECH-5872 create-time dedup key).
+
+    ``action``'s shape is free-form per ``kind`` (models.ProposalHold's
+    docstring), but every kind is required to carry at least these two
+    string fields -- ``target_id`` (what real-world thing this action
+    targets, e.g. a Linear issue id) and ``action_type`` (what kind of
+    mutation, e.g. ``"open_ticket"``/``"close_ticket"``) -- so dedup and the
+    kind-scoped judge (see ``_PROPOSAL_JUDGES`` below) have a stable key
+    without needing to understand every kind's full shape."""
+    target_id = action.get("target_id")
+    action_type = action.get("action_type")
+    if not isinstance(target_id, str) or not target_id:
+        raise ValueError("action.target_id is required and must be a non-empty string")
+    if not isinstance(action_type, str) or not action_type:
+        raise ValueError("action.action_type is required and must be a non-empty string")
+    return target_id, action_type
+
+
+def _derive_proposal_priority(kind: str, action: dict[str, Any]) -> str:
+    """Server-derive ``priority`` from ``kind``/``action`` -- NEVER trust a
+    caller-supplied value (TECH-5872). Deliberately simple for the one
+    ``kind`` this repo currently understands; a future kind needing a
+    richer derivation adds its own branch here rather than a generic
+    fallback silently misclassifying it."""
+    if kind == "linear_progress_update":
+        action_type = action.get("action_type")
+        if action_type == "close_ticket":
+            return "high"
+        if action_type == "open_ticket":
+            return "medium"
+        return "low"
+    return "medium"
+
+
+# TECH-5877: exactly two auto-approval rules, scoped to
+# kind="linear_progress_update" only -- a deterministic rules engine, not an
+# LLM judge, because write intent must be judged outside the proposing
+# agent (a bot must never self-approve its own proposal). A future kind
+# needs its OWN judge function registered in ``_PROPOSAL_JUDGES`` below --
+# deliberately not a shared/generic judge across kinds.
+_LINEAR_OPEN_TICKET_ACTION_TYPES = frozenset({"open_ticket"})
+_LINEAR_CLOSE_TICKET_ACTION_TYPES = frozenset({"close_ticket"})
+
+
+def evaluate_linear_progress_update_judge(action: dict[str, Any]) -> tuple[str, str | None]:
+    """Pure decision function for kind="linear_progress_update" (TECH-5877).
+
+    Returns ``(status, decision_note)`` where ``status`` is either
+    ``"approved"`` or ``"pending"`` -- never anything else, and never
+    ``"rejected"`` (this judge only ever clears a proposal for auto-apply
+    or leaves it for a human; it does not reject on a bot's behalf).
+
+    Rules (self-reported ``confidence``/``importance``/``impact`` are
+    advisory only and are NOT inputs here -- see models.ProposalHold's
+    docstring):
+
+    1. ``action_type`` opens a ticket: auto-approve ONLY if
+       ``action["source_message_url"]`` is a non-empty string citing the
+       human message that originated the request. A bare confidence score
+       or free-text rationale is never sufficient.
+    2. ``action_type`` closes a ticket: auto-approve if EITHER
+       ``action["source_message_url"]`` (a human confirming completion) OR
+       ``action["resolving_pr_url"]`` (a merged PR that plausibly resolves
+       it) is a non-empty string.
+    3. Everything else (status changes short of closing, project
+       reassignment, priority changes, or open/close with no citation)
+       stays ``"pending"``.
+
+    Independent of the HTTP layer and the DB (takes/returns plain dicts) so
+    it is unit-testable as a pure function."""
+    action_type = action.get("action_type")
+    source_message_url = action.get("source_message_url")
+    has_source_message = isinstance(source_message_url, str) and bool(source_message_url)
+    if action_type in _LINEAR_OPEN_TICKET_ACTION_TYPES:
+        if has_source_message:
+            return "approved", "auto-approved: open-ticket proposal cites source_message_url"
+        return "pending", None
+    if action_type in _LINEAR_CLOSE_TICKET_ACTION_TYPES:
+        resolving_pr_url = action.get("resolving_pr_url")
+        has_resolving_pr = isinstance(resolving_pr_url, str) and bool(resolving_pr_url)
+        if has_source_message or has_resolving_pr:
+            return "approved", "auto-approved: close-ticket proposal cites a valid citation"
+        return "pending", None
+    return "pending", None
+
+
+# Registry keyed by ``kind`` -- deliberately not a shared/generic judge (see
+# ``evaluate_linear_progress_update_judge``'s docstring). A ``kind`` with no
+# entry here is never auto-approved; it is left ``"pending"`` by
+# ``create_proposal`` below.
+_PROPOSAL_JUDGES: dict[str, Callable[[dict[str, Any]], tuple[str, str | None]]] = {
+    "linear_progress_update": evaluate_linear_progress_update_judge,
+}
+
+_PROPOSAL_JUDGE_DECIDED_BY = "system:judge"
+
+
+def _proposal_dict(hold: ProposalHold) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "proposal_id": str(hold.id),
+        "kind": hold.kind,
+        "proposed_by_bot_id": hold.proposed_by_bot_id,
+        "action": hold.action,
+        "rationale": hold.rationale,
+        "confidence": hold.confidence,
+        "importance": hold.importance,
+        "impact": hold.impact,
+        "priority": hold.priority,
+        "status": hold.status,
+        "created_at": _iso(hold.created_at),
+        "updated_at": _iso(hold.updated_at),
+    }
+    if hold.decision_source is not None:
+        result["decision_source"] = hold.decision_source
+    if hold.decided_by_actor_id is not None:
+        result["decided_by_actor_id"] = hold.decided_by_actor_id
+    if hold.decided_at is not None:
+        result["decided_at"] = _iso(hold.decided_at)
+    if hold.decision_note is not None:
+        result["decision_note"] = hold.decision_note
+    return result
+
+
+async def create_proposal(
+    session: AsyncSession,
+    *,
+    kind: str,
+    proposed_by_bot_id: str,
+    owner_sub: str,
+    action: dict[str, Any],
+    rationale: str,
+    confidence: str,
+    importance: str,
+    impact: str,
+    target_fingerprint: str,
+) -> dict[str, Any]:
+    """``POST /proposals`` (main.py, non-MCP, bot-submission-gated).
+
+    Enforces the TECH-5875 per-bot rate limit, then either UPDATEs an
+    existing ``status='pending'`` row matching ``(kind, target_id,
+    action_type)`` in place (TECH-5872 create-time dedup -- ``target_id``/
+    ``action_type`` derived from ``action`` via ``_extract_proposal_target``)
+    or INSERTs a new one. ``priority`` is always server-derived
+    (``_derive_proposal_priority``) -- a caller-supplied value in ``action``
+    or elsewhere is never trusted or persisted as ``priority``.
+
+    Immediately after the row is inserted/updated, runs the TECH-5877
+    kind-scoped judge (``_PROPOSAL_JUDGES``) exactly once. A ``kind`` with
+    no registered judge stays ``"pending"``. The judge only ever sets
+    ``status``/``decision_source``/``decided_by_actor_id``/``decided_at``/
+    ``decision_note`` -- it never executes the underlying write (that is
+    TECH-5873's concern, not yet built).
+    """
+    if confidence not in PROPOSAL_HOLD_LEVELS:
+        raise ValueError(f"confidence must be one of {PROPOSAL_HOLD_LEVELS!r}")
+    if importance not in PROPOSAL_HOLD_LEVELS:
+        raise ValueError(f"importance must be one of {PROPOSAL_HOLD_LEVELS!r}")
+    if impact not in PROPOSAL_HOLD_LEVELS:
+        raise ValueError(f"impact must be one of {PROPOSAL_HOLD_LEVELS!r}")
+
+    await _deny_rate_limited_proposals(session, proposed_by_bot_id=proposed_by_bot_id)
+
+    target_id, action_type = _extract_proposal_target(action)
+    priority = _derive_proposal_priority(kind, action)
+
+    existing = (
+        await session.execute(
+            select(ProposalHold).where(
+                ProposalHold.kind == kind,
+                ProposalHold.status == "pending",
+                ProposalHold.action["target_id"].astext == target_id,
+                ProposalHold.action["action_type"].astext == action_type,
+            )
+        )
+    ).scalar_one_or_none()
+
+    if existing is not None:
+        hold = existing
+        hold.action = action
+        hold.rationale = rationale
+        hold.confidence = confidence
+        hold.importance = importance
+        hold.impact = impact
+        hold.priority = priority
+        hold.target_fingerprint = target_fingerprint
+        hold.updated_at = _now()
+    else:
+        hold = ProposalHold(
+            kind=kind,
+            proposed_by_bot_id=proposed_by_bot_id,
+            owner_sub=owner_sub,
+            action=action,
+            rationale=rationale,
+            confidence=confidence,
+            importance=importance,
+            impact=impact,
+            priority=priority,
+            status="pending",
+            target_fingerprint=target_fingerprint,
+        )
+        session.add(hold)
+        await session.flush()
+
+    judge = _PROPOSAL_JUDGES.get(kind)
+    if judge is not None:
+        judged_status, decision_note = judge(hold.action)
+        if judged_status == "approved" and hold.status == "pending":
+            hold.status = "approved"
+            hold.decision_source = "auto"
+            hold.decided_by_actor_id = _PROPOSAL_JUDGE_DECIDED_BY
+            hold.decided_at = _now()
+            hold.decision_note = decision_note
+
+    await session.commit()
+    # Refresh so server-defaulted columns (created_at/updated_at on a fresh
+    # INSERT; updated_at's onupdate on the dedup UPDATE path) are populated
+    # from the DB before _proposal_dict reads them -- neither is fetched
+    # automatically via RETURNING on flush for this mapper, so skipping this
+    # would try to lazy-load them post-commit, which asyncpg's AsyncSession
+    # cannot do outside an explicit await.
+    await session.refresh(hold)
+    return _proposal_dict(hold)
+
+
+async def list_pending_proposal_holds(
+    session: AsyncSession, *, owner_sub: str, limit: int = 50
+) -> dict[str, Any]:
+    """``GET /proposals/pending`` (main.py, non-MCP, interactive+owner-gated):
+    every ``status='pending'`` proposal whose ``owner_sub`` snapshot matches
+    the caller, oldest first -- same owner_sub-scoped visibility pattern as
+    ``list_pending_approval_holds``."""
+    limit = max(1, min(limit, 200))
+    stmt = (
+        select(ProposalHold)
+        .where(ProposalHold.owner_sub == owner_sub, ProposalHold.status == "pending")
+        .order_by(ProposalHold.created_at.asc())
+        .limit(limit + 1)
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    proposals = [_proposal_dict(hold) for hold in rows]
+    return {"proposals": proposals, "has_more": has_more}
+
+
 async def post_message(
     session: AsyncSession,
     *,
@@ -6316,18 +6615,23 @@ __all__ = [
     "MAX_CONVERSATION_STARTS_PER_HOUR",
     "MAX_LOOKUP_EMAIL_LENGTH",
     "MAX_MESSAGES_PER_CONVERSATION_PER_HOUR",
+    "MAX_PROPOSALS_PER_BOT_PER_WINDOW",
     "MAX_RECONCILIATION_BATCH_SIZE",
     "OWNERSHIP_CLIENTS",
     "OWNERSHIP_CLIENT_ENV_VAR",
+    "PROPOSAL_HOLD_LEVELS",
+    "PROPOSAL_RATE_LIMIT_WINDOW",
     "AgentTableOwnershipClient",
     "OwnershipClient",
     "OwnershipClientFactory",
     "accept_invite",
     "archive_conversation",
     "audit_denied_approval_requires_interactive",
+    "create_proposal",
     "decide_hold",
     "decline_invite",
     "deregister_agent",
+    "evaluate_linear_progress_update_judge",
     "get_agent_by_sub",
     "get_conversation",
     "get_hold_status",
@@ -6338,6 +6642,7 @@ __all__ = [
     "list_agents",
     "list_conversations",
     "list_pending_approval_holds",
+    "list_pending_proposal_holds",
     "lookup_agent_by_email",
     "may_assign",
     "may_invite",
