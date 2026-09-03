@@ -28,7 +28,7 @@ import jwt
 
 from auth import require_env
 from identity import AGENT_JWT_ISSUER, validate_sub_shape
-from scopes import TOOL_SCOPES
+from scopes import PROPOSAL_SUBMIT_SCOPE, TOOL_SCOPES
 
 # Matches DESIGN.md's MAX_CONVERSATION_TTL ceiling (ninety days) — no other
 # token-lifetime precedent exists in this repo, and reusing that number
@@ -43,7 +43,15 @@ _MAX_EXPIRES_SECONDS = 90 * 24 * 60 * 60
 # comms:admin gates providers.comms.register/set_agent_shared directly (see
 # scopes.py) but never appears as a TOOL_SCOPES value since it isn't itself
 # a per-tool requirement — union it in explicitly so it remains mintable.
-_VALID_SCOPES = set(TOOL_SCOPES.values()) | {"comms:admin"}
+# PROPOSAL_SUBMIT_SCOPE (comms:proposals:write) is the same story for the
+# non-MCP `POST /proposals` route (TECH-5872): it self-checks this scope
+# directly rather than going through TOOL_SCOPES/ScopeEnforcementMiddleware
+# (see scopes.py's own docstring), so it likewise never appears as a
+# TOOL_SCOPES value. Without unioning it in here too (Argus review B3), no
+# token minted by this CLI could ever legitimately carry it --
+# `_validate_scopes` would reject every `--scopes comms:proposals:write`
+# request, making the route permanently unreachable by any agent.
+_VALID_SCOPES = set(TOOL_SCOPES.values()) | {"comms:admin", PROPOSAL_SUBMIT_SCOPE}
 
 
 def _parse_scopes(raw: str) -> list[str]:

@@ -73,6 +73,22 @@ fail-closed `scopes.TOOL_SCOPES` registry. Source of truth:
 | `comms_leave` | `comms:write` | Leave a conversation the caller is currently `active` in |
 | `comms_archive_conversation` | `comms:write` | Archive a conversation (`archived_at`), permanently -- any CURRENT `active` participant may trigger it, not just the owner/creator; blocks `comms_invite`/`comms_post_message`/`comms_accept` afterward (specific `conversation_archived` error), also blocks approving a pending hold via the HTTP approval endpoint (hold stays `pending_human`); never affects read paths (including `comms_get_hold_status`), idempotent, one-directional (no unarchive) |
 
+## Non-MCP HTTP routes
+
+A few routes are plain Starlette routes (`mcp.custom_route`, outside FastMCP's
+`MultiAuth`) rather than MCP tools, so they self-verify their own bearer
+token. `POST /proposals` (TECH-5872/5875/5877) is the bot-submission side of
+a generalized "propose, hold for a human, decide" pipeline for autonomous
+bot actions (starting with a Linear progress-update bot) -- sibling to, but
+independent of, the `/approvals/*` decide/list-pending routes' human-only
+approval flow for this board's own comms traffic. It requires an agent-jwt
+token carrying `comms:proposals:write`, which -- like `comms:admin` --
+gates a non-MCP route directly rather than appearing in the `TOOL_SCOPES`
+table above; `GET /proposals/pending` reuses `/approvals/pending`'s
+hard interactive-only gate. See docs/DESIGN.md's "The proposal submission
+pipeline" section for the create-time dedup key, per-bot rate limit, and
+the deterministic auto-approval judge.
+
 ## Auth model
 
 Both humans and machines POST to the same `/mcp` endpoint; FastMCP
@@ -267,6 +283,20 @@ agent-comms-mcp-mint-token --sub ea-agent-svc --scopes "comms:read comms:write" 
 
 # Self-owned agent (no human principal)
 agent-comms-mcp-mint-token --sub notifier-bot --scopes comms:write --self-owned
+
+# A bot submitting proposals via POST /proposals (TECH-5872) -- MUST be
+# human-owned via --owner-email, NOT --self-owned. What --self-owned does
+# depends on whether the bot is already registered:
+#   - UNregistered self-owned bot: owner_sub is unresolvable, so
+#     POST /proposals returns 422.
+#   - Already-registered self-owned bot: POST /proposals returns 200 and
+#     silently stores the proposal with owner_sub = bot_sub -- but it is
+#     then permanently invisible via GET /proposals/pending, which scopes
+#     to the CALLER's own Okta sub, not to a bot's.
+# Either way, a proposal-submitting bot's owner_sub must resolve to an
+# Okta identity that can actually call GET /proposals/pending.
+agent-comms-mcp-mint-token --sub linear-progress-bot \
+  --scopes comms:proposals:write --owner-email alice@example.com
 ```
 
 `--owner-email`/`--self-owned` are mutually exclusive and one is required:
