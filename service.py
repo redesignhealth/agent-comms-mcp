@@ -634,7 +634,7 @@ async def _deny_archived(
     await session.commit()
     raise ConversationArchivedError(
         "conversation_archived: this conversation has been archived and no longer "
-        "accepts new invites, messages, or invite acceptances"
+        "accepts write operations"
     )
 
 
@@ -5060,6 +5060,10 @@ async def decide_hold(
         # deadline just passed, and if the state check ran first it would
         # raise InvalidConversationStateError before this archived check
         # ever got a chance to run, surfacing the wrong error/audit row.
+        # Note: a conversation that is both terminal (completed/canceled)
+        # and archived surfaces conversation_archived rather than
+        # conversation_not_active -- archived is the more actionable
+        # signal.
         await _deny_archived(
             session,
             actor_sub=approver_sub,

@@ -4166,6 +4166,85 @@ class TestArchiveConversation:
         ).scalar_one_or_none()
         assert existing is None
 
+    async def test_decide_hold_approve_archived_check_precedes_expiry_check(
+        self, session: AsyncSession
+    ) -> None:
+        """Pins the ordering invariant added alongside the archived guard:
+        the archived_at check in decide_hold's approve path must run
+        BEFORE _maybe_expire can flip conversation.state to "expired" --
+        otherwise a hold on a conversation that is both archived AND past
+        its expiry deadline would raise InvalidConversationStateError
+        instead of ConversationArchivedError, surfacing the wrong error
+        and audit row. The other two tests in this class archive an
+        `active` conversation, so _maybe_expire is a no-op there and a
+        regression reverting the ordering would pass them identically."""
+        owner = await _register(session, "arch-svc-hold-owner-3")
+        target = await _register(session, "arch-svc-hold-target-3")
+        client = _FakeOwnershipClient(
+            {
+                owner.id: {"is_shared": False, "owners": ["dan"]},
+                target.id: {"is_shared": True, "owners": ["dan", "priya"]},
+            }
+        )
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="asymmetric",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            ownership_client=client,
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        hold = await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="note",
+            payload={"text": "hello"},
+            ownership_client=client,
+        )
+        assert isinstance(hold, ApprovalHold)
+
+        await archive_conversation(
+            session, actor_sub=owner.sub, agent_id=owner.id, conversation_id=conversation.id
+        )
+        # Safe to mutate post-commit: this module's session fixture is
+        # built with expire_on_commit=False (see test_unread_reflects_
+        # expired_state's own comment on this idiom).
+        conversation.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+
+        with pytest.raises(ConversationArchivedError):
+            await decide_hold(
+                session,
+                approver_sub=owner.owner_sub,
+                hold_id=hold.id,
+                decision="approve",
+                reason=None,
+                ownership_client=client,
+            )
+
+        await session.refresh(hold)
+        assert hold.status == "pending_human"
+
+        rows = (
+            (
+                await session.execute(
+                    select(AuditLog.action).where(
+                        AuditLog.conversation_id == conversation.id,
+                        AuditLog.action == "denied.archived.decide_hold",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1
+
 
 # --- get_conversation ----------------------------------------------------------
 
