@@ -1913,6 +1913,14 @@ async def agent_inbox_resource(agent_id: str) -> dict[str, Any]:
     uniform ``access_denied`` error an unknown ``agent_id`` gets (no
     "wrong owner" distinction, matching this module's anti-enumeration
     posture elsewhere).
+
+    Once ``agent_id`` is confirmed self/sibling, the identity is re-resolved
+    through ``_resolve_caller_agent`` (rather than using the looked-up row's
+    ``id`` directly) so this path gets the exact same suspension check and
+    ownership write-through every tool's caller-resolution gets — a
+    suspended agent must not be able to read its own inbox through this
+    resource just because the tool-layer's ``agent_suspended`` check lives
+    in a helper this handler would otherwise bypass.
     """
     async with _resource_boundary():
         token = _require_token()
@@ -1925,7 +1933,8 @@ async def agent_inbox_resource(agent_id: str) -> dict[str, Any]:
                 target.sub == base_sub or target.sub.startswith(f"{base_sub}::")
             ):
                 raise AccessDeniedError(reason="denied.inbox_not_self_or_sibling")
-            return await service.inbox(session, caller_agent_id=target.id)
+            caller = await _resolve_caller_agent(session, target.sub, token)
+            return await service.inbox(session, caller_agent_id=caller.id)
 
 
 @comms_server.resource("comms://agents")

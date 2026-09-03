@@ -361,6 +361,38 @@ class TestConversationResource:
 
 
 class TestAgentInboxResource:
+    async def test_suspended_agent_own_inbox_resource_is_denied(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Mirrors tests/test_comms_tools.py's
+        test_suspended_agent_loses_read_path_access: a suspended agent's
+        still-unexpired token must not be able to read its own inbox
+        through this resource, the same as it can't via comms_inbox --
+        the resource handler resolves through the same
+        _resolve_caller_agent suspension check, not a hand-rolled copy of
+        the self-only sub match alone."""
+        registered = await _register(main, test_session_factory, "inbox-res-suspended")
+        agent_id = registered["agent_id"]
+
+        admin_token = _token(
+            "inbox-res-suspend-admin", scopes=["comms:read", "comms:write", "comms:admin"]
+        )
+        await _call(
+            main,
+            test_session_factory,
+            admin_token,
+            "comms_deregister_agent",
+            {"agent_id": agent_id},
+        )
+
+        with pytest.raises(McpError, match="agent_suspended"):
+            await _read_resource(
+                main,
+                test_session_factory,
+                _token("inbox-res-suspended"),
+                f"comms://comms/agents/{agent_id}/inbox",
+            )
+
     async def test_self_inbox_matches_inbox_tool(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
