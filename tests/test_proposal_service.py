@@ -13,9 +13,10 @@ judge's verdict end-to-end.
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import AsyncIterator
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
@@ -23,11 +24,13 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from exceptions import RateLimitExceededError
+from exceptions import AccessDeniedError, HoldAlreadyDecidedError, RateLimitExceededError
+from linear_client import LinearAPIError
 from models import ProposalHold
 from service import (
     MAX_PROPOSALS_PER_BOT_PER_WINDOW,
     create_proposal,
+    decide_proposal,
     list_pending_proposal_holds,
 )
 
@@ -416,3 +419,171 @@ class TestOwnerSubVisibility:
         await _submit(session, owner_sub="owner-a@example.com")
         result = await list_pending_proposal_holds(session, owner_sub="owner-nobody@example.com")
         assert result["proposals"] == []
+
+
+class TestDecideProposal:
+    """Service-layer coverage for ``decide_proposal`` (TECH-5873):
+    approve/reject, ownership/anti-enumeration, staleness, apply failure,
+    and applied-hold idempotency. Linear is mocked at the module-qualified
+    ``service.linear_client`` names -- this file never touches the network.
+    """
+
+    async def test_unknown_hold_raises_access_denied(self, session: AsyncSession) -> None:
+        with pytest.raises(AccessDeniedError):
+            await decide_proposal(
+                session,
+                approver_sub="owner-a@example.com",
+                hold_id=uuid.uuid4(),
+                decision="approve",
+                decision_note=None,
+            )
+
+    async def test_not_owner_raises_access_denied(self, session: AsyncSession) -> None:
+        submitted = await _submit(session, owner_sub="owner-a@example.com")
+        with pytest.raises(AccessDeniedError):
+            await decide_proposal(
+                session,
+                approver_sub="owner-b@example.com",
+                hold_id=uuid.UUID(submitted["proposal_id"]),
+                decision="approve",
+                decision_note=None,
+            )
+
+    async def test_reject_without_decision_note_raises_value_error(
+        self, session: AsyncSession
+    ) -> None:
+        submitted = await _submit(session)
+        with pytest.raises(ValueError):
+            await decide_proposal(
+                session,
+                approver_sub="owner-a@example.com",
+                hold_id=uuid.UUID(submitted["proposal_id"]),
+                decision="reject",
+                decision_note=None,
+            )
+
+    async def test_reject_with_note_sets_rejected(self, session: AsyncSession) -> None:
+        submitted = await _submit(session)
+        decided = await decide_proposal(
+            session,
+            approver_sub="owner-a@example.com",
+            hold_id=uuid.UUID(submitted["proposal_id"]),
+            decision="reject",
+            decision_note="not appropriate",
+        )
+        assert decided["status"] == "rejected"
+        assert decided["decision_note"] == "not appropriate"
+        assert decided["decision_source"] == "human"
+        assert decided["decided_by_actor_id"] == "owner-a@example.com"
+
+    async def test_approve_matching_fingerprint_applies_and_calls_linear_once(
+        self, session: AsyncSession
+    ) -> None:
+        submitted = await _submit(session, target_fingerprint="fp-match")
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(return_value="fp-match"),
+            ),
+            patch("service.linear_client.apply_progress_update", AsyncMock()) as mock_apply,
+        ):
+            decided = await decide_proposal(
+                session,
+                approver_sub="owner-a@example.com",
+                hold_id=uuid.UUID(submitted["proposal_id"]),
+                decision="approve",
+                decision_note=None,
+            )
+        assert decided["status"] == "applied"
+        assert "applied_at" in decided
+        mock_apply.assert_awaited_once_with(submitted["action"])
+
+    async def test_approve_stale_fingerprint_skips_apply(self, session: AsyncSession) -> None:
+        submitted = await _submit(session, target_fingerprint="fp-original")
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(return_value="fp-drifted"),
+            ),
+            patch("service.linear_client.apply_progress_update", AsyncMock()) as mock_apply,
+        ):
+            decided = await decide_proposal(
+                session,
+                approver_sub="owner-a@example.com",
+                hold_id=uuid.UUID(submitted["proposal_id"]),
+                decision="approve",
+                decision_note=None,
+            )
+        assert decided["status"] == "stale"
+        mock_apply.assert_not_awaited()
+
+    async def test_approve_linear_failure_sets_apply_failed(self, session: AsyncSession) -> None:
+        submitted = await _submit(session, target_fingerprint="fp-match")
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(return_value="fp-match"),
+            ),
+            patch(
+                "service.linear_client.apply_progress_update",
+                AsyncMock(side_effect=LinearAPIError("linear is down")),
+            ),
+        ):
+            decided = await decide_proposal(
+                session,
+                approver_sub="owner-a@example.com",
+                hold_id=uuid.UUID(submitted["proposal_id"]),
+                decision="approve",
+                decision_note=None,
+            )
+        assert decided["status"] == "apply_failed"
+        assert decided["apply_error"] == "linear is down"
+        assert "applied_at" not in decided
+
+    async def test_retrying_applied_hold_is_idempotent_no_op(self, session: AsyncSession) -> None:
+        submitted = await _submit(session, target_fingerprint="fp-match")
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(return_value="fp-match"),
+            ),
+            patch("service.linear_client.apply_progress_update", AsyncMock()) as mock_apply,
+        ):
+            first = await decide_proposal(
+                session,
+                approver_sub="owner-a@example.com",
+                hold_id=uuid.UUID(submitted["proposal_id"]),
+                decision="approve",
+                decision_note=None,
+            )
+            second = await decide_proposal(
+                session,
+                approver_sub="owner-a@example.com",
+                hold_id=uuid.UUID(submitted["proposal_id"]),
+                decision="approve",
+                decision_note=None,
+            )
+        assert first["status"] == "applied"
+        assert second["status"] == "applied"
+        assert second["applied_at"] == first["applied_at"]
+        mock_apply.assert_awaited_once()
+
+    async def test_deciding_already_rejected_hold_raises_already_decided(
+        self, session: AsyncSession
+    ) -> None:
+        submitted = await _submit(session)
+        await decide_proposal(
+            session,
+            approver_sub="owner-a@example.com",
+            hold_id=uuid.UUID(submitted["proposal_id"]),
+            decision="reject",
+            decision_note="no thanks",
+        )
+        with pytest.raises(HoldAlreadyDecidedError):
+            await decide_proposal(
+                session,
+                approver_sub="owner-a@example.com",
+                hold_id=uuid.UUID(submitted["proposal_id"]),
+                decision="approve",
+                decision_note=None,
+            )

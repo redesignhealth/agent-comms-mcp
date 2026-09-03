@@ -164,6 +164,7 @@ from sqlalchemy import and_, func, literal, or_, select, text, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import linear_client
 from exceptions import (
     AccessDeniedError,
     AgentAlreadyRegisteredError,
@@ -5626,6 +5627,10 @@ def _proposal_dict(hold: ProposalHold) -> dict[str, Any]:
         result["decided_at"] = _iso(hold.decided_at)
     if hold.decision_note is not None:
         result["decision_note"] = hold.decision_note
+    if hold.applied_at is not None:
+        result["applied_at"] = _iso(hold.applied_at)
+    if hold.apply_error is not None:
+        result["apply_error"] = hold.apply_error
     return result
 
 
@@ -5896,6 +5901,193 @@ async def list_pending_proposal_holds(
     rows = rows[:limit]
     proposals = [_proposal_dict(hold) for hold in rows]
     return {"proposals": proposals, "has_more": has_more}
+
+
+async def _find_proposal_hold(
+    session: AsyncSession, hold_id: uuid.UUID, *, for_update: bool = False
+) -> ProposalHold | None:
+    """Mirror of ``_find_hold`` (approval_holds) for ``proposal_holds`` --
+    same ``FOR UPDATE`` + ``populate_existing`` rationale (TOCTOU on
+    concurrent decides of the SAME hold; stale in-identity-map object on a
+    re-fetch within the same session -- see ``_find_hold``'s docstring)."""
+    stmt = select(ProposalHold).where(ProposalHold.id == hold_id)
+    if for_update:
+        stmt = stmt.with_for_update().execution_options(populate_existing=True)
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
+# Kind-scoped appliers for a decided ``linear_progress_update`` proposal
+# (TECH-5873) -- same registry shape as ``_PROPOSAL_JUDGES``, and for the
+# same reason: a kind reaching ``decide_proposal``'s approve path is
+# guaranteed (by ``_derive_proposal_priority`` at submission time) to be
+# ``"linear_progress_update"`` today, but a future kind adds its own entry
+# here rather than a generic dispatcher silently no-op'ing on it.
+#
+# Stores attribute NAMES on the ``linear_client`` module, not the function
+# objects themselves -- tests patch ``service.linear_client.<name>``
+# (``service.linear_client`` IS the ``linear_client`` module, so this is
+# the same object `main.py` would import), and binding the function object
+# into this dict at module-import time would freeze the ORIGINAL,
+# unpatched function in here forever.
+_PROPOSAL_APPLIER_NAMES: dict[str, str] = {
+    "linear_progress_update": "apply_progress_update",
+}
+_PROPOSAL_FINGERPRINTER_NAMES: dict[str, str] = {
+    "linear_progress_update": "fetch_current_fingerprint",
+}
+
+
+async def decide_proposal(
+    session: AsyncSession,
+    *,
+    approver_sub: str,
+    hold_id: uuid.UUID,
+    decision: str,
+    decision_note: str | None,
+) -> dict[str, Any]:
+    """``POST /proposals/{hold_id}/decide`` (main.py, non-MCP,
+    interactive+owner-gated -- TECH-5873). ``decision`` is ``"approve"`` or
+    ``"reject"``.
+
+    Auth/ownership/anti-enumeration posture is a direct mirror of
+    ``decide_hold``: unknown hold or a caller whose verified sub doesn't
+    match the hold's own ``owner_sub`` snapshot both raise the uniform
+    ``AccessDeniedError`` (-> 404 at the HTTP layer) -- never a distinct
+    error for one vs. the other. Bots can never reach this at all: the
+    HTTP layer gates this route on the same interactive-only token check
+    ``decide_hold`` uses (``main._authenticate_approval_caller``), which
+    structurally rejects every agent-jwt token regardless of scope -- this
+    is what makes a bot self-approving its own proposal impossible, not a
+    same-sub comparison here (a bot has no interactive identity to match
+    ``owner_sub`` with in the first place).
+
+    Idempotent on an already-``"applied"`` hold: returns the existing
+    applied state as-is, without re-running the judge/apply/decision
+    logic, and without a second Linear write -- a retried decide call
+    (client timeout + retry, double-click, etc.) must never double-apply.
+    Any OTHER non-``"pending"`` status (``"rejected"``/``"applied"``
+    already handled above/``"apply_failed"``/``"stale"``) raises
+    ``HoldAlreadyDecidedError`` -- those are terminal-but-not-safely-
+    retryable outcomes; a fresh proposal resubmission is required to
+    retry them, not a second decide call on the same hold (out of scope
+    for this ticket).
+
+    ``reject`` requires a non-empty ``decision_note`` (enforced here too,
+    defense-in-depth against the HTTP-layer check in
+    ``main.decide_proposal_route``) and never touches the target system.
+
+    ``approve`` re-fetches the target's current state via the kind-scoped
+    fingerprinter (``_PROPOSAL_FINGERPRINTERS``) and compares it against
+    ``hold.target_fingerprint`` (the fingerprint the proposing bot computed
+    at submission time) BEFORE writing anything. A mismatch means the
+    target drifted since submission -- sets ``status="stale"`` and returns
+    without ever calling the kind-scoped applier (``_PROPOSAL_APPLIERS``).
+    A match proceeds to the actual write; success sets ``status="applied"``
+    (and ``applied_at``), a raised ``linear_client.LinearAPIError`` sets
+    ``status="apply_failed"`` with ``apply_error`` populated instead of
+    propagating -- both are normal, queryable outcomes of this endpoint,
+    not exceptions raised to the caller.
+    """
+    hold = await _find_proposal_hold(session, hold_id, for_update=True)
+    if hold is None:
+        await _deny(
+            session,
+            actor_sub=approver_sub,
+            action="denied.unknown_proposal_hold",
+            detail={"attempted_hold_id": str(hold_id)},
+        )
+    if hold.owner_sub != approver_sub:
+        await _deny(
+            session,
+            actor_sub=approver_sub,
+            action="denied.proposal_hold_not_owner",
+            detail={"attempted_hold_id": str(hold_id)},
+        )
+
+    if hold.status == "applied":
+        # Idempotent no-op: a retry of an already-successful apply must
+        # never re-run the write, let alone double-write.
+        await session.commit()
+        return _proposal_dict(hold)
+    if hold.status != "pending":
+        await session.commit()
+        raise HoldAlreadyDecidedError(hold.status)
+
+    if decision == "reject":
+        if not isinstance(decision_note, str) or not decision_note.strip():
+            raise ValueError("decision_note is required and must be non-empty to reject")
+        hold.status = "rejected"
+        hold.decision_source = "human"
+        hold.decided_by_actor_id = approver_sub
+        hold.decided_at = _now()
+        hold.decision_note = decision_note
+        _audit(
+            session,
+            actor_sub=approver_sub,
+            action="proposal.reject",
+            detail={"hold_id": str(hold_id)},
+        )
+        await session.commit()
+        await session.refresh(hold)
+        return _proposal_dict(hold)
+
+    # decision == "approve" (main.py's route already restricts `decision`
+    # to these two values before calling in).
+    target_id, _action_type = _extract_proposal_target(hold.action)
+    fingerprinter = getattr(linear_client, _PROPOSAL_FINGERPRINTER_NAMES[hold.kind])
+    current_fingerprint = await fingerprinter(target_id)
+    if current_fingerprint != hold.target_fingerprint:
+        hold.status = "stale"
+        hold.decision_source = "human"
+        hold.decided_by_actor_id = approver_sub
+        hold.decided_at = _now()
+        hold.decision_note = decision_note
+        _audit(
+            session,
+            actor_sub=approver_sub,
+            action="proposal.stale",
+            detail={"hold_id": str(hold_id), "target_id": target_id},
+        )
+        await session.commit()
+        await session.refresh(hold)
+        return _proposal_dict(hold)
+
+    applier = getattr(linear_client, _PROPOSAL_APPLIER_NAMES[hold.kind])
+    try:
+        await applier(hold.action)
+    except linear_client.LinearAPIError as exc:
+        hold.status = "apply_failed"
+        hold.decision_source = "human"
+        hold.decided_by_actor_id = approver_sub
+        hold.decided_at = _now()
+        hold.decision_note = decision_note
+        hold.apply_error = str(exc)
+        _audit(
+            session,
+            actor_sub=approver_sub,
+            action="proposal.apply_failed",
+            detail={"hold_id": str(hold_id), "target_id": target_id, "error": str(exc)},
+        )
+        await session.commit()
+        await session.refresh(hold)
+        return _proposal_dict(hold)
+
+    hold.status = "applied"
+    hold.decision_source = "human"
+    hold.decided_by_actor_id = approver_sub
+    hold.decided_at = _now()
+    hold.decision_note = decision_note
+    hold.applied_at = _now()
+    hold.apply_error = None
+    _audit(
+        session,
+        actor_sub=approver_sub,
+        action="proposal.applied",
+        detail={"hold_id": str(hold_id), "target_id": target_id},
+    )
+    await session.commit()
+    await session.refresh(hold)
+    return _proposal_dict(hold)
 
 
 async def post_message(
@@ -7007,6 +7199,7 @@ __all__ = [
     "audit_denied_proposal_submission",
     "create_proposal",
     "decide_hold",
+    "decide_proposal",
     "decline_invite",
     "deregister_agent",
     "evaluate_linear_progress_update_judge",

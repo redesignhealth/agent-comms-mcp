@@ -1020,7 +1020,7 @@ conversation creation outright, same as before this PR.
 member-only (non-owner). These map directly to `participants.role` and are checked
 before the state-machine transition.
 
-### The proposal submission pipeline (`POST /proposals`, `GET /proposals/pending`) [TECH-5872/TECH-5875/TECH-5877]
+### The proposal submission pipeline (`POST /proposals`, `GET /proposals/pending`, `POST /proposals/{id}/decide`) [TECH-5872/TECH-5875/TECH-5877/TECH-5873]
 
 A sibling pipeline to the approval-holds one above, generalized to
 `proposal_holds` (§5) for autonomous bots' arbitrary actions rather than
@@ -1089,6 +1089,66 @@ judge" path today. Because dedup is scoped to the submitting bot, a bot
 progressively refining its OWN pending proposal by adding a valid citation
 on resubmission is expected to auto-approve on that pass -- this is a
 bot completing its own proposal, not a new escalation path.
+
+**`POST /proposals/{id}/decide`** (TECH-5873, `service.decide_proposal`) is
+the human decide-and-synchronously-apply endpoint for a still-`"pending"`
+proposal. Same hard interactive-only gate and uniform-404
+unknown-hold-or-not-your-hold posture as `/approvals/{id}/decide`
+(`_authenticate_approval_caller`, `surface="proposals_decide"`) -- a bot can
+never reach this route at all regardless of scope, which is what makes a bot
+self-approving its own proposal structurally impossible here too, same as
+the submission-side judge's "never trusts the proposer" posture above.
+
+Status transitions from `"pending"`: `"rejected"` (requires a non-empty
+`decision_note`, 400/`ValueError` otherwise, never touches the target
+system), or on `"approve"`:
+
+1. Re-fetch the target's CURRENT state via a kind-scoped fingerprinter
+   (`service._PROPOSAL_FINGERPRINTER_NAMES`, looked up by attribute name on
+   `linear_client` rather than a bound function reference -- see that
+   dict's own comment for why) and compare against `hold.target_fingerprint`
+   (computed by whatever submitted the proposal, at submission time).
+   Mismatch -> `"stale"`, no write attempted.
+2. Match -> the kind-scoped applier (`_PROPOSAL_APPLIER_NAMES`,
+   `linear_client.apply_progress_update` for
+   `kind="linear_progress_update"`) executes the real write. Success ->
+   `"applied"` (+ `applied_at`). A raised `linear_client.LinearAPIError` ->
+   `"apply_failed"` (+ `apply_error` populated with the failure detail) --
+   this is a normal 200 response, not a raised exception, since the DECIDE
+   itself succeeded even though the apply did not; the hold stays
+   queryable for a human to retry via a fresh proposal resubmission.
+
+Idempotent on an already-`"applied"` hold: a retried decide call (timeout +
+client retry, double-click) returns the existing applied state verbatim,
+without re-running the judge/fingerprint/apply logic and without a second
+write. Any OTHER non-`"pending"` status (`"rejected"`/`"apply_failed"`/
+`"stale"`) is NOT retryable through this same call -- it raises
+`HoldAlreadyDecidedError` (-> 409); recovering from `"apply_failed"`/
+`"stale"` requires a fresh `POST /proposals` resubmission, out of scope for
+this ticket.
+
+**Linear write, called directly, not proxied through Prefect** -- by decide
+time the Prefect flow run that originally submitted the proposal is long
+gone, so `linear_client.py` calls the Linear GraphQL API directly from
+agent-comms-mcp using the `LINEAR_API_TOKEN` env var (SSM
+`/reclaw-comms/{env}/linear-api-token`, TECH-5874), the same
+"Terraform-injected env var, never fetched from SSM by application code"
+convention as `OKTA_CLIENT_SECRET`/`MCP_JWT_SECRET`/`AGENT_JWT_SECRET`. The
+actual write for `kind="linear_progress_update"` is a comment posted to the
+target issue (`linear_client.apply_progress_update`) -- a design choice, not
+fully specified by the ticket: this is a progress-REPORTING bot, and the
+two action_types the judge understands read as "report that a ticket was
+opened/closed", not "mutate this issue's workflow state" (which would
+additionally require resolving a team-specific workflow-state id the action
+payload doesn't carry).
+
+**Fingerprint scheme is a cross-repo contract**
+(`linear_client.compute_target_fingerprint`): a sha256 hex digest over a
+fixed, sorted set of Linear issue fields (state id/name, priority, assignee
+id, `updatedAt`). Whatever submits the original proposal (the Prefect flow)
+MUST compute `target_fingerprint` the same way over the same fields, or
+every decide will spuriously come back `"stale"` -- this function is the
+single source of truth for that scheme on the agent-comms-mcp side.
 
 ### Configuration: pluggable seams
 

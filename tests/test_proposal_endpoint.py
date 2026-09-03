@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import os
 import sys
+import uuid
 from collections.abc import AsyncIterator
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -152,6 +153,7 @@ async def client(
         routes=[
             Route("/proposals", main.submit_proposal, methods=["POST"]),
             Route("/proposals/pending", main.list_pending_proposals, methods=["GET"]),
+            Route("/proposals/{hold_id}/decide", main.decide_proposal_route, methods=["POST"]),
         ]
     )
     with (
@@ -743,3 +745,246 @@ class TestListPendingProposals:
         body = pending.json()
         assert len(body["proposals"]) == limit
         assert body["has_more"] is True
+
+
+async def _submit_via_http(
+    http_client: httpx.AsyncClient,
+    provider: _FakeAuthProvider,
+    *,
+    owner_sub: str = "owner-a@example.com",
+    target_id: str = "TECH-1",
+) -> str:
+    provider.tokens["bot-token"] = _agent_jwt_token(
+        "bot-1", scopes=["comms:proposals:write"], owner_sub=owner_sub
+    )
+    body = {**_PROPOSAL_BODY, "action": {**_PROPOSAL_BODY["action"], "target_id": target_id}}
+    resp = await http_client.post(
+        "/proposals", json=body, headers={"Authorization": "Bearer bot-token"}
+    )
+    assert resp.status_code == 200
+    proposal_id: str = resp.json()["proposal_id"]
+    return proposal_id
+
+
+class TestDecideProposalEndpoint:
+    async def test_uniform_404_for_unknown_hold(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+        resp = await http_client.post(
+            f"/proposals/{uuid.uuid4()}/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={"decision": "approve"},
+        )
+        assert resp.status_code == 404
+        assert resp.json() == {"error": "not_found"}
+
+    async def test_uniform_404_for_malformed_hold_id(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+        resp = await http_client.post(
+            "/proposals/not-a-uuid/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={"decision": "approve"},
+        )
+        assert resp.status_code == 404
+        assert resp.json() == {"error": "not_found"}
+
+    async def test_uniform_404_for_not_your_hold(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider, owner_sub="owner-a@example.com")
+        provider.tokens["human-token"] = _interactive_token("owner-b@example.com")
+
+        resp = await http_client.post(
+            f"/proposals/{proposal_id}/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={"decision": "approve"},
+        )
+        assert resp.status_code == 404
+        assert resp.json() == {"error": "not_found"}
+
+    async def test_bot_token_cannot_decide(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        """A bot can never self-approve its own proposal: the decide route
+        is gated on the same interactive-only check as ``/approvals/*``,
+        so an agent-jwt token is rejected structurally, even with every
+        scope."""
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider, owner_sub="owner-a@example.com")
+        provider.tokens["agent-token"] = _agent_jwt_token(
+            "bot-1",
+            scopes=["comms:admin", "comms:proposals:write"],
+            owner_sub="owner-a@example.com",
+        )
+        resp = await http_client.post(
+            f"/proposals/{proposal_id}/decide",
+            headers={"Authorization": "Bearer agent-token"},
+            json={"decision": "approve"},
+        )
+        assert resp.status_code == 403
+
+    async def test_reject_without_decision_note_returns_400(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider, owner_sub="owner-a@example.com")
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+
+        resp = await http_client.post(
+            f"/proposals/{proposal_id}/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={"decision": "reject"},
+        )
+        assert resp.status_code == 400
+        assert resp.json()["error"] == "decision_note_required"
+
+    async def test_reject_with_decision_note_returns_rejected(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider, owner_sub="owner-a@example.com")
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+
+        resp = await http_client.post(
+            f"/proposals/{proposal_id}/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={"decision": "reject", "decision_note": "not needed"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "rejected"
+        assert body["decision_note"] == "not needed"
+
+    async def test_approve_matching_fingerprint_applies(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider, owner_sub="owner-a@example.com")
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(return_value="fp1"),
+            ),
+            patch("service.linear_client.apply_progress_update", AsyncMock()) as mock_apply,
+        ):
+            resp = await http_client.post(
+                f"/proposals/{proposal_id}/decide",
+                headers={"Authorization": "Bearer human-token"},
+                json={"decision": "approve"},
+            )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "applied"
+        mock_apply.assert_awaited_once()
+
+    async def test_approve_stale_fingerprint_returns_stale_without_calling_linear_apply(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider, owner_sub="owner-a@example.com")
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(return_value="a-completely-different-fingerprint"),
+            ),
+            patch("service.linear_client.apply_progress_update", AsyncMock()) as mock_apply,
+        ):
+            resp = await http_client.post(
+                f"/proposals/{proposal_id}/decide",
+                headers={"Authorization": "Bearer human-token"},
+                json={"decision": "approve"},
+            )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "stale"
+        mock_apply.assert_not_awaited()
+
+    async def test_approve_linear_failure_returns_apply_failed(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        from linear_client import LinearAPIError
+
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider, owner_sub="owner-a@example.com")
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(return_value="fp1"),
+            ),
+            patch(
+                "service.linear_client.apply_progress_update",
+                AsyncMock(side_effect=LinearAPIError("linear unavailable")),
+            ),
+        ):
+            resp = await http_client.post(
+                f"/proposals/{proposal_id}/decide",
+                headers={"Authorization": "Bearer human-token"},
+                json={"decision": "approve"},
+            )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "apply_failed"
+        assert body["apply_error"] == "linear unavailable"
+
+    async def test_retrying_applied_hold_does_not_double_call_linear(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider, owner_sub="owner-a@example.com")
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(return_value="fp1"),
+            ),
+            patch("service.linear_client.apply_progress_update", AsyncMock()) as mock_apply,
+        ):
+            first = await http_client.post(
+                f"/proposals/{proposal_id}/decide",
+                headers={"Authorization": "Bearer human-token"},
+                json={"decision": "approve"},
+            )
+            second = await http_client.post(
+                f"/proposals/{proposal_id}/decide",
+                headers={"Authorization": "Bearer human-token"},
+                json={"decision": "approve"},
+            )
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert first.json()["status"] == "applied"
+        assert second.json()["status"] == "applied"
+        mock_apply.assert_awaited_once()
+
+    async def test_deciding_already_rejected_hold_returns_409(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider, owner_sub="owner-a@example.com")
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+
+        reject_resp = await http_client.post(
+            f"/proposals/{proposal_id}/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={"decision": "reject", "decision_note": "no thanks"},
+        )
+        assert reject_resp.status_code == 200
+
+        resp = await http_client.post(
+            f"/proposals/{proposal_id}/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={"decision": "approve"},
+        )
+        assert resp.status_code == 409
+        assert resp.json()["status"] == "rejected"

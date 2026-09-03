@@ -797,6 +797,89 @@ async def list_pending_proposals(request: Request) -> Response:
     return JSONResponse(result, status_code=200)
 
 
+@mcp.custom_route("/proposals/{hold_id}/decide", methods=["POST"])
+async def decide_proposal_route(request: Request) -> Response:
+    """Human decide endpoint for a pending proposal hold (TECH-5873).
+
+    Body: ``{"decision": "approve" | "reject", "decision_note": "<required
+    for reject, optional for approve, max 2000 chars>"}``. Same hard
+    interactive-token gate as ``/approvals/{hold_id}/decide``
+    (``_authenticate_approval_caller``) -- a bot can never reach this
+    route at all, which is what makes a bot self-approving its own
+    proposal structurally impossible (see ``service.decide_proposal``'s
+    docstring). Unknown-hold and not-your-hold are a UNIFORM 404
+    (anti-enumeration, same as ``/approvals/*``).
+
+    ``approve`` re-fetches the target's live state and compares its
+    fingerprint against the one recorded at submission time before
+    writing anything; a mismatch resolves the hold as ``"stale"`` rather
+    than applying a write against drifted state. A write failure resolves
+    the hold as ``"apply_failed"`` (with ``apply_error`` populated) rather
+    than raising -- both are 200 responses, not errors, since the hold
+    itself was successfully decided.
+    """
+    approver_sub, status = await _authenticate_approval_caller(request, surface="proposals_decide")
+    if approver_sub is None:
+        return JSONResponse({"error": "unauthorized"}, status_code=status)
+
+    hold_id_str = request.path_params["hold_id"]
+    try:
+        hold_id = uuid.UUID(hold_id_str)
+    except ValueError:
+        return JSONResponse(_UNIFORM_HOLD_NOT_FOUND, status_code=404)
+
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "invalid_json"}, status_code=422)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "invalid_body"}, status_code=422)
+    decision = body.get("decision")
+    if decision not in ("approve", "reject"):
+        return JSONResponse(
+            {"error": "invalid_decision", "detail": "decision must be 'approve' or 'reject'"},
+            status_code=422,
+        )
+    decision_note = body.get("decision_note")
+    if decision_note is not None:
+        if not isinstance(decision_note, str):
+            return JSONResponse({"error": "invalid_decision_note"}, status_code=422)
+        if len(decision_note) > _MAX_DECISION_REASON_LENGTH:
+            return JSONResponse(
+                {
+                    "error": "invalid_decision_note",
+                    "detail": f"decision_note exceeds {_MAX_DECISION_REASON_LENGTH} characters",
+                },
+                status_code=422,
+            )
+    if decision == "reject" and (not isinstance(decision_note, str) or not decision_note.strip()):
+        return JSONResponse(
+            {
+                "error": "decision_note_required",
+                "detail": "decision_note is required and must be non-empty to reject",
+            },
+            status_code=400,
+        )
+
+    async with get_session_factory()() as session:
+        try:
+            result = await service.decide_proposal(
+                session,
+                approver_sub=approver_sub,
+                hold_id=hold_id,
+                decision=decision,
+                decision_note=decision_note,
+            )
+        except AccessDeniedError:
+            return JSONResponse(_UNIFORM_HOLD_NOT_FOUND, status_code=404)
+        except HoldAlreadyDecidedError as exc:
+            return JSONResponse({"error": "already_decided", "status": exc.status}, status_code=409)
+        except ValueError as exc:
+            return JSONResponse({"error": "invalid_request", "detail": str(exc)}, status_code=400)
+
+    return JSONResponse(result, status_code=200)
+
+
 @mcp.custom_route("/approvals/{hold_id}/decide", methods=["POST"])
 async def decide_approval(request: Request) -> Response:
     """Human decide endpoint for a held message (TECH-5389 PR2 §9).

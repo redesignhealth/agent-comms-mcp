@@ -108,9 +108,17 @@ approval flow for this board's own comms traffic. It requires an agent-jwt
 token carrying `comms:proposals:write`, which -- like `comms:admin` --
 gates a non-MCP route directly rather than appearing in the `TOOL_SCOPES`
 table above; `GET /proposals/pending` reuses `/approvals/pending`'s
-hard interactive-only gate. See docs/DESIGN.md's "The proposal submission
-pipeline" section for the create-time dedup key, per-bot rate limit, and
-the deterministic auto-approval judge.
+hard interactive-only gate. `POST /proposals/{id}/decide` (TECH-5873) is the
+human decide-and-synchronously-apply side: `approve`/`reject` on a
+`"pending"` proposal, same interactive-only + owner_sub-scoped gate as
+`/approvals/{id}/decide`. Approving re-checks the target hasn't drifted
+since submission (`"stale"` if it has) before calling out to Linear
+directly (`linear_client.py`, credential via `LINEAR_API_TOKEN`); a Linear
+failure resolves to `"apply_failed"` rather than an error response, and
+retrying an already-`"applied"` hold is a no-op. See docs/DESIGN.md's "The
+proposal submission pipeline" section for the create-time dedup key,
+per-bot rate limit, deterministic auto-approval judge, and the full
+decide/apply status-transition and fingerprint-contract details.
 
 ## Auth model
 
