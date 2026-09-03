@@ -255,28 +255,47 @@ class TestProgressCommentBody:
         )
         assert body == f"Progress update: close_ticket\n\nResolved by: {_VALID_PR_URL}"
 
-    def test_non_allowlisted_source_url_raises(self) -> None:
-        """Argus review S3: the citation-URL allowlist must be re-checked
-        here too -- a proposal that skipped auto-approval (judge left it
-        'pending') can still reach ``apply_progress_update`` via manual
-        human approval, and an arbitrary URL must not silently land in a
-        Linear comment."""
-        with pytest.raises(LinearAPIError):
-            _progress_comment_body(
-                {
-                    "action_type": "open_ticket",
-                    "source_message_url": "https://not-allowlisted.example/p123",
-                }
-            )
+    def test_non_allowlisted_source_url_is_omitted_not_raised(self) -> None:
+        """Argus review S3 (re-validate) + round-2 B3 (skip, don't raise):
+        a proposal that skipped auto-approval (judge left it 'pending')
+        can still reach ``apply_progress_update`` via manual human
+        approval, and an arbitrary URL must not silently land in a Linear
+        comment -- but a present-but-invalid field must not block the
+        whole apply either, since the judge's close-ticket rule only
+        requires ONE of the two URL fields to be valid (OR), not both."""
+        body = _progress_comment_body(
+            {
+                "action_type": "open_ticket",
+                "source_message_url": "https://not-allowlisted.example/p123",
+            }
+        )
+        assert "not-allowlisted.example" not in body
+        assert body == "Progress update: open_ticket"
 
-    def test_non_allowlisted_resolving_pr_url_raises(self) -> None:
-        with pytest.raises(LinearAPIError):
-            _progress_comment_body(
-                {
-                    "action_type": "close_ticket",
-                    "resolving_pr_url": "https://not-allowlisted.example/pull/1",
-                }
-            )
+    def test_non_allowlisted_resolving_pr_url_is_omitted_not_raised(self) -> None:
+        body = _progress_comment_body(
+            {
+                "action_type": "close_ticket",
+                "resolving_pr_url": "https://not-allowlisted.example/pull/1",
+            }
+        )
+        assert "not-allowlisted.example" not in body
+        assert body == "Progress update: close_ticket"
+
+    def test_valid_source_url_kept_when_resolving_pr_url_is_invalid(self) -> None:
+        """The exact round-2 B3 scenario: judge auto-approved on a valid
+        `source_message_url` alone; `resolving_pr_url` is present but
+        invalid. The invalid field must be dropped, not block the apply
+        of the valid one."""
+        body = _progress_comment_body(
+            {
+                "action_type": "close_ticket",
+                "source_message_url": _VALID_SOURCE_URL,
+                "resolving_pr_url": "https://not-allowlisted.example/pull/1",
+            }
+        )
+        assert f"Source: {_VALID_SOURCE_URL}" in body
+        assert "not-allowlisted.example" not in body
 
 
 class TestApplyProgressUpdate:
@@ -315,22 +334,32 @@ class TestApplyProgressUpdate:
                 }
             )
 
-    async def test_invalid_url_prevents_the_write(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The URL re-validation in ``_progress_comment_body`` must run
-        (and raise) BEFORE the GraphQL mutation is ever sent."""
+    async def test_invalid_url_is_omitted_write_still_proceeds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Argus review round-2 B3: the URL re-validation in
+        ``_progress_comment_body`` OMITS a non-allowlisted URL, it does not
+        block the write -- the judge's OR semantics mean the OTHER
+        citation field (or, as here, no citation field at all if this is
+        the only one and it's invalid) is what got this proposal approved,
+        not this specific field."""
         monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        captured: dict[str, Any] = {}
 
-        async def _fail_if_called(
+        success_body = b'{"data": {"commentCreate": {"success": true}}}'
+
+        async def _capture(
             self: httpx.AsyncClient, url: str, *, json: dict[str, object], headers: dict[str, str]
         ) -> httpx.Response:
-            raise AssertionError("must not POST when the URL fails validation")
+            captured["json"] = json
+            return httpx.Response(200, content=success_body, request=httpx.Request("POST", url))
 
-        monkeypatch.setattr(httpx.AsyncClient, "post", _fail_if_called)
-        with pytest.raises(LinearAPIError):
-            await apply_progress_update(
-                {
-                    "target_id": "TECH-1234",
-                    "action_type": "open_ticket",
-                    "source_message_url": "https://not-allowlisted.example/p123",
-                }
-            )
+        monkeypatch.setattr(httpx.AsyncClient, "post", _capture)
+        await apply_progress_update(
+            {
+                "target_id": "TECH-1234",
+                "action_type": "open_ticket",
+                "source_message_url": "https://not-allowlisted.example/p123",
+            }
+        )
+        assert "not-allowlisted.example" not in captured["json"]["variables"]["body"]

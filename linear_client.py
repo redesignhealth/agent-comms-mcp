@@ -22,10 +22,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from typing import Any
 
 import httpx
+
+import citation_urls
+
+logger = logging.getLogger(__name__)
 
 _LINEAR_API_URL = "https://api.linear.app/graphql"
 _LINEAR_API_TOKEN_ENV_VAR = "LINEAR_API_TOKEN"
@@ -144,11 +149,24 @@ async def fetch_current_fingerprint(target_id: str) -> str:
 
 def _progress_comment_body(action: dict[str, Any]) -> str:
     # Argus review S3: re-validate URL fields with the same allowlist
-    # `service._is_valid_citation_url` uses at judging time. A proposal can
-    # reach here via manual human approval (not just the auto-approve judge
-    # path), so a non-allowlisted URL must not silently reach Linear.
-    import service
-
+    # `citation_urls.is_valid_citation_url` uses at judging time (extracted
+    # to a neutral shared module in Argus review round-2 S2, so this no
+    # longer needs a lazy `import service` to reach it). A proposal can
+    # reach here via manual human approval (not just the auto-approve
+    # judge path), so a non-allowlisted URL must not silently reach Linear.
+    #
+    # Argus review round-2 B3: SKIP a non-allowlisted URL rather than
+    # raising. The judge's close-ticket rule auto-approves when EITHER
+    # `source_message_url` OR `resolving_pr_url` is valid (OR semantics --
+    # the other field can be present-but-invalid, or simply absent, and
+    # the judge doesn't care). Raising here on ANY present-but-invalid
+    # field enforced AND semantics instead, so a judge-approved proposal
+    # with exactly one valid + one invalid URL would deterministically
+    # fail apply with no retry path through decide. Omitting the invalid
+    # field (rather than writing it verbatim, which the pre-round-2 S3 fix
+    # already ruled out) keeps the security property -- no
+    # non-allowlisted URL ever reaches the Linear comment -- while
+    # matching what actually got this proposal approved.
     action_type = action.get("action_type", "update")
     lines = [f"Progress update: {action_type}"]
     rationale = action.get("rationale")
@@ -157,8 +175,11 @@ def _progress_comment_body(action: dict[str, Any]) -> str:
     for label, key in (("Source", "source_message_url"), ("Resolved by", "resolving_pr_url")):
         value = action.get(key)
         if isinstance(value, str) and value:
-            if not service._is_valid_citation_url(value):
-                raise LinearAPIError(f"{key} failed citation-URL validation: {value!r}")
+            if not citation_urls.is_valid_citation_url(value):
+                logger.warning(
+                    "Omitting %s from Linear comment: failed citation-URL validation", key
+                )
+                continue
             lines.append(f"{label}: {value}")
     return "\n\n".join(lines)
 

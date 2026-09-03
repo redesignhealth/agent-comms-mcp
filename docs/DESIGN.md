@@ -1088,10 +1088,44 @@ into either field). Every kind that reaches the judge lookup is guaranteed
 to be `"linear_progress_update"` -- `_derive_proposal_priority` already
 raised 422 for anything else earlier in the request -- so the judge
 lookup itself can never miss; there is no live "kind with no registered
-judge" path today. Because dedup is scoped to the submitting bot, a bot
+judge" path today. The judge's OR semantics for closing a ticket (EITHER
+field valid is sufficient) are matched at apply time in
+`linear_client._progress_comment_body`: a present-but-invalid URL field
+is OMITTED from the Linear comment, not treated as a reason to fail the
+whole apply (Argus review round-2 B3) -- the applier previously
+enforced AND semantics (raising if ANY present field failed validation),
+which meant a judge-approved proposal with one valid and one invalid URL
+would deterministically hit `"apply_failed"` with no retry path through
+decide. Because dedup is scoped to the submitting bot, a bot
 progressively refining its OWN pending proposal by adding a valid citation
 on resubmission is expected to auto-approve on that pass -- this is a
 bot completing its own proposal, not a new escalation path.
+
+**An auto-approved verdict is applied synchronously, at submission time,
+by `create_proposal` itself** (Argus review round-2 B1 -- a behavior
+change from the judge landing in TECH-5877; the judge originally only
+set `status="approved"` with nothing downstream to ever apply it, which
+Argus caught as leaving every auto-approved hold permanently stranded and
+invisible). `"approved"` is a value the DB CHECK constraint still
+accepts but is NEVER actually persisted: `create_proposal` immediately
+CLAIMS the row (writes `status="applying"` under a fresh row lock and
+commits, releasing the lock before any external call) and then runs the
+SAME fingerprint-check-then-apply-or-stale helper
+(`service._apply_or_finalize_proposal_hold`) that `POST /proposals/{id}/decide`'s
+human-approve path uses, resolving the hold to `"applied"`/
+`"apply_failed"`/`"stale"` before `POST /proposals` returns. The
+`"applying"` claim exists specifically to prevent a double Linear write:
+without it, a human decide call racing the auto-judge for the SAME
+just-inserted hold could observe `status="pending"` under its own lock,
+release that lock, and reach the applier a second time before either
+call's terminal write landed -- the DB-level dedup on the terminal write
+alone stops a double DB row update, but not a duplicate Linear API call
+already in flight. A second caller that acquires the lock after the
+claim observes `"applying"`, not `"pending"`, and raises
+`HoldAlreadyDecidedError` (`decide_proposal`) or reloads and returns the
+now-current state (`create_proposal`, which never "decides" anything --
+it just reports the hold's already-resolved status) instead of ever
+reaching the fingerprinter/applier itself.
 
 **`POST /proposals/{id}/decide`** (TECH-5873, `service.decide_proposal`) is
 the human decide-and-synchronously-apply endpoint for a still-`"pending"`
@@ -1106,12 +1140,23 @@ Status transitions from `"pending"`: `"rejected"` (requires a non-empty
 `decision_note`, 400/`ValueError` otherwise, never touches the target
 system), or on `"approve"`:
 
+0. CLAIM the row: write `status="applying"` (+ decision fields) under the
+   row lock acquired for the initial status check, and commit -- releasing
+   that lock before either of the two external calls below (Argus review
+   S1), and closing the double-Linear-write race described above (Argus
+   review round-2 B1).
 1. Re-fetch the target's CURRENT state via a kind-scoped fingerprinter
    (`service._PROPOSAL_FINGERPRINTER_NAMES`, looked up by attribute name on
    `linear_client` rather than a bound function reference -- see that
    dict's own comment for why) and compare against `hold.target_fingerprint`
    (computed by whatever submitted the proposal, at submission time).
-   Mismatch -> `"stale"`, no write attempted.
+   Mismatch -> `"stale"`, no write attempted. A `linear_client.LinearAPIError`
+   raised BY THE FINGERPRINTER ITSELF (missing `LINEAR_API_TOKEN`, transport
+   failure, Linear-side error) is caught the same way as an applier failure
+   below (Argus review round-2 B2 -- originally only the applier call was
+   wrapped, so a fingerprinter failure propagated past this endpoint
+   entirely into a generic 500, instead of the documented graceful
+   `"apply_failed"` degradation).
 2. Match -> the kind-scoped applier (`_PROPOSAL_APPLIER_NAMES`,
    `linear_client.apply_progress_update` for
    `kind="linear_progress_update"`) executes the real write. Success ->
@@ -1124,11 +1169,15 @@ system), or on `"approve"`:
 Idempotent on an already-`"applied"` hold: a retried decide call (timeout +
 client retry, double-click) returns the existing applied state verbatim,
 without re-running the judge/fingerprint/apply logic and without a second
-write. Any OTHER non-`"pending"` status (`"rejected"`/`"apply_failed"`/
-`"stale"`) is NOT retryable through this same call -- it raises
-`HoldAlreadyDecidedError` (-> 409); recovering from `"apply_failed"`/
-`"stale"` requires a fresh `POST /proposals` resubmission, out of scope for
-this ticket.
+write. Any OTHER non-`"pending"` status (`"rejected"`/`"applying"`/
+`"apply_failed"`/`"stale"`) is NOT retryable through this same call -- it
+raises `HoldAlreadyDecidedError` (-> 409), including in the (normally
+unreachable, since the claim above already serializes access) case where
+something else resolves the SAME hold between this call's own claim and
+its terminal write (Argus review round-2 S4 -- this call never got to
+decide anything, so it must not report the concurrent winner's result as
+its own 200). Recovering from `"apply_failed"`/`"stale"` requires a fresh
+`POST /proposals` resubmission, out of scope for this ticket.
 
 **Linear write, called directly, not proxied through Prefect** -- by decide
 time the Prefect flow run that originally submitted the proposal is long

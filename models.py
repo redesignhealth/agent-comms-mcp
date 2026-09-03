@@ -68,37 +68,63 @@ APPROVAL_HOLD_AUTO_DECISIONS = ("cleared", "escalated")
 APPROVAL_HOLD_KINDS = ("message", "invite")
 
 # proposal_holds lifecycle (TECH-5871, transitions finalized TECH-5873
-# Argus review B1): `pending` is the only persisted non-terminal status.
-# A "pending" row resolves to:
+# Argus review B1, race fix Argus review round-2 B1): `pending` is the
+# only persisted non-terminal status a caller can observe at rest before
+# any decision. A "pending" row resolves to:
 #   - `applied` | `apply_failed` | `stale`, via EITHER the TECH-5877
 #     auto-judge's immediate synchronous apply at submission time
 #     (service.create_proposal) OR a human's `approve` decision
 #     (service.decide_proposal) -- both paths funnel through the same
-#     service._apply_or_finalize_proposal_hold helper.
+#     service._apply_or_finalize_proposal_hold helper, and both first
+#     claim the row by writing `applying` (below) under the initial
+#     `FOR UPDATE` before releasing that lock for the ~10s external
+#     Linear call.
 #   - `rejected`, via a human's `reject` decision only (decide_proposal) --
 #     the auto-judge never rejects on a bot's behalf (see
 #     evaluate_linear_progress_update_judge's docstring).
+# `applying` is a transient, PERSISTED sentinel (unlike `approved`, see
+# below): the claiming caller writes it (plus decided_at/
+# decided_by_actor_id/decision_source, to satisfy
+# `ck_proposal_holds_decision_consistency` below) and commits, releasing
+# the row lock, BEFORE calling the kind-scoped fingerprinter/applier. A
+# second concurrent caller that acquires the lock while this is in flight
+# reads `applying` (not `pending`), takes the already-decided branch, and
+# never reaches the applier a second time -- this is what actually closes
+# the double-Linear-write race; the DB-level dedup on the terminal write
+# alone was not enough; see `_apply_or_finalize_proposal_hold`'s docstring.
 # `approved` is a value this CHECK still accepts (see the "frozen
-# migration" note below) but is NEVER actually persisted: it is a
-# transient in-memory verdict inside create_proposal/decide_proposal that
-# resolves to one of the three apply-outcomes above before either
-# function returns control to its caller -- a hold is never left sitting
-# at rest in `approved`, because `decide_proposal` treats any non-
-# `pending` status as already-decided and `list_pending_proposal_holds`
-# only surfaces `status='pending'`, which would strand it. `stale` is
-# reachable only via that apply-time fingerprint re-check (see
-# ProposalHold's class docstring), never directly from `pending`: it is
-# detected after decision fields (`decided_at`/`decided_by_actor_id`/
-# `decision_source`) are already stamped, and
+# migration" note below) but is NEVER actually persisted: it is the
+# in-memory verdict the auto-judge returns, immediately converted to a
+# claiming `applying` write (see above) before any commit a concurrent
+# reader could observe -- a hold is never left sitting at rest in
+# `approved`, because `decide_proposal` treats any non-`pending` status as
+# already-decided and `list_pending_proposal_holds` only surfaces
+# `status='pending'`, which would strand it. `stale` is reachable only via
+# that apply-time fingerprint re-check (see ProposalHold's class
+# docstring), never directly from `pending`: it is detected after decision
+# fields (`decided_at`/`decided_by_actor_id`/`decision_source`) are
+# already stamped (at the `applying` claim), and
 # `ck_proposal_holds_decision_consistency` requires those fields whenever
 # `status != 'pending'`.
 # NOTE: these three tuples are mirrored as literal SQL in migration
 # d23b37d4e187's CHECK constraints (migrations are frozen once applied, so
-# they cannot import from this module). Editing any of these tuples requires
-# a NEW migration to ALTER the corresponding CHECK constraint(s) in the
-# database -- there is no drift detection between this file and the DB
-# schema, so keep them in sync by hand.
-PROPOSAL_HOLD_STATUSES = ("pending", "approved", "rejected", "applied", "apply_failed", "stale")
+# they cannot import from this module) -- `applying` specifically was
+# added later, via migration e2f7a91c5b34's ALTER of
+# ck_proposal_holds_status only (the other CHECK constraints in
+# d23b37d4e187 already accommodate it, see that migration's docstring).
+# Editing any of these tuples requires a NEW migration to ALTER the
+# corresponding CHECK constraint(s) in the database -- there is no drift
+# detection between this file and the DB schema, so keep them in sync by
+# hand.
+PROPOSAL_HOLD_STATUSES = (
+    "pending",
+    "approved",
+    "applying",
+    "rejected",
+    "applied",
+    "apply_failed",
+    "stale",
+)
 PROPOSAL_HOLD_DECISION_SOURCES = ("human", "auto")
 # Shared closed vocabulary for the three self-reported, advisory-only axes
 # (confidence/importance/impact) AND the server-derived `priority` -- same

@@ -298,7 +298,7 @@ docker compose up --build
 | Variable | Purpose |
 |---|---|
 | `DECISION_PAGE_BASE_URL` | Base URL of the separate `agent-comms-approvals-decision-page` service. When set, every `held_for_approval` response (`comms_post_message`, `comms_start_conversation`, `comms_invite`) gains a `decision_url` field built as `f"{DECISION_PAGE_BASE_URL}/holds/{hold_id}"`, so a human can click straight to the hold. Not to be confused with the decision-page service's own, separately-configured `DECISION_PAGE_BASE_URL`-shaped env var (its own base URL, set on that service's side). Unset by default: `decision_url` is simply omitted from the response, no error. |
-| `LINEAR_API_TOKEN` | Credential for `linear_client.py`'s direct Linear API calls, used when a `POST /proposals/{id}/decide` approval applies a `linear_progress_update` proposal. The server runs without it, but any such approve resolves to `apply_failed` if it's unset. |
+| `LINEAR_API_TOKEN` | A Linear **personal API token** (not an OAuth workspace token -- see `.env.example`; the client sends it unprefixed, without a `Bearer` prefix) for `linear_client.py`'s direct Linear API calls, used when a `POST /proposals/{id}/decide` approval or an auto-approved submission applies a `linear_progress_update` proposal. The server runs without it, but any such apply resolves to `apply_failed` if it's unset. |
 
 `entrypoint.sh` runs `alembic upgrade head` automatically on every container
 start, so migrations apply before the server accepts traffic.

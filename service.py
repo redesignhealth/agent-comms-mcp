@@ -158,12 +158,12 @@ from collections.abc import Callable, Sequence
 from collections.abc import Set as AbstractSet
 from datetime import UTC, datetime, timedelta
 from typing import Any, NoReturn, Protocol
-from urllib.parse import urlsplit
 
 from sqlalchemy import and_, func, literal, or_, select, text, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import citation_urls
 import linear_client
 from exceptions import (
     AccessDeniedError,
@@ -5529,31 +5529,12 @@ _LINEAR_CLOSE_TICKET_ACTION_TYPES = frozenset({"close_ticket"})
 # treat a citation as real -- a bot could self-approve by writing ANY
 # string (including whitespace-shaped junk, or a URL to a host it fully
 # controls) into ``source_message_url``/``resolving_pr_url``. A citation
-# must now be an http(s) URL whose host is one of these two families:
-# Slack message permalinks (``*.slack.com``) and GitHub PR/commit links
-# (``github.com``) -- the two citation shapes this judge is documented to
-# accept.
-_ALLOWED_CITATION_HOST_EXACT = frozenset({"github.com"})
-_ALLOWED_CITATION_HOST_SUFFIXES = (".slack.com",)
-
-
-def _is_allowed_citation_host(host: str) -> bool:
-    host = host.lower()
-    if host in _ALLOWED_CITATION_HOST_EXACT:
-        return True
-    return any(host.endswith(suffix) for suffix in _ALLOWED_CITATION_HOST_SUFFIXES)
-
-
-def _is_valid_citation_url(value: Any) -> bool:
-    """Argus review B4: a citation must be an http(s) URL on an allowlisted
-    host (see ``_ALLOWED_CITATION_HOST_EXACT``/``_ALLOWED_CITATION_HOST_SUFFIXES``
-    above), not merely a non-empty string."""
-    if not isinstance(value, str) or not value.strip():
-        return False
-    parsed = urlsplit(value)
-    if parsed.scheme not in ("http", "https"):
-        return False
-    return parsed.hostname is not None and _is_allowed_citation_host(parsed.hostname)
+# must now be an http(s) URL whose host is one of two allowlisted families
+# (Slack message permalinks, GitHub PR/commit links) -- see
+# ``citation_urls`` (extracted there in Argus review round-2 S2 so
+# ``linear_client.py`` can re-validate at apply time without a circular
+# import back into this module).
+_is_valid_citation_url = citation_urls.is_valid_citation_url
 
 
 def evaluate_linear_progress_update_judge(action: dict[str, Any]) -> tuple[str, str | None]:
@@ -5896,26 +5877,48 @@ async def create_proposal(
     # Argus review B1: resolve the auto-judge's "approved" verdict to a
     # terminal status synchronously, right here, instead of persisting a
     # hold at rest in a status nothing else can ever reach (see this
-    # function's docstring). Reuses the same helper (and the same
-    # ``expected_status="pending"`` guard) ``decide_proposal``'s
-    # human-approve path uses.
+    # function's docstring). First CLAIM the row (Argus review round-2
+    # B1) by writing status="applying" under a fresh FOR UPDATE and
+    # committing -- this is what stops a concurrent human decide call
+    # (racing the auto-judge for this SAME still-pending hold) from also
+    # reaching the applier. Only then call the shared apply-or-finalize
+    # helper ``decide_proposal``'s human-approve path also uses.
+    claimed = await _claim_proposal_hold_for_applying(
+        session,
+        hold_id=hold.id,
+        decided_by_actor_id=_PROPOSAL_JUDGE_DECIDED_BY,
+        decision_source="auto",
+        decision_note=decision_note,
+    )
+    if not claimed:
+        # Something else (e.g. a human decide call) claimed this SAME
+        # hold between the commit above and this claim attempt, in the
+        # brief window before any caller could plausibly have learned
+        # this hold's id. Reload and return its current state rather
+        # than raising on a race this function did not cause.
+        resolved = await _find_proposal_hold(session, hold.id)
+        if resolved is None:
+            raise AssertionError("invariant violation: hold vanished after its own commit")
+        await session.commit()
+        return _proposal_dict(resolved)
+
     result = await _apply_or_finalize_proposal_hold(
         session,
         hold_id=hold.id,
-        expected_status="pending",
+        expected_status="applying",
         decided_by_actor_id=_PROPOSAL_JUDGE_DECIDED_BY,
         decision_source="auto",
         decision_note=decision_note,
     )
     if result is not None:
         return result
-    # Vanishingly unlikely: something else (e.g. a human decide call)
-    # resolved this SAME hold between the commit above and the helper's
-    # own re-check, in the brief window before any caller could plausibly
-    # have learned this hold's id. Reload and return its current state
-    # rather than raising on a race this function did not cause.
+    # Vanishingly unlikely given the claim above already serializes
+    # access to this hold_id, but the helper's own re-check is the
+    # authoritative guard, not this comment -- reload and return current
+    # state rather than raising on a race this function did not cause.
     resolved = await _find_proposal_hold(session, hold.id)
-    assert resolved is not None, "invariant violation: hold vanished after its own commit"
+    if resolved is None:
+        raise AssertionError("invariant violation: hold vanished after its own commit")
     await session.commit()
     return _proposal_dict(resolved)
 
@@ -5947,10 +5950,22 @@ async def _find_proposal_hold(
     """Mirror of ``_find_hold`` (approval_holds) for ``proposal_holds`` --
     same ``FOR UPDATE`` + ``populate_existing`` rationale (TOCTOU on
     concurrent decides of the SAME hold; stale in-identity-map object on a
-    re-fetch within the same session -- see ``_find_hold``'s docstring)."""
-    stmt = select(ProposalHold).where(ProposalHold.id == hold_id)
+    re-fetch within the same session -- see ``_find_hold``'s docstring).
+
+    ``populate_existing=True`` always, not just under ``for_update``
+    (Argus review round-2 S6): ``_apply_or_finalize_proposal_hold`` does a
+    non-locking read of this SAME hold_id first (to drive the ~10s
+    external fingerprinter/applier calls), then a locking re-read to
+    write the terminal status -- without this, the non-locking read could
+    return a stale identity-mapped object if anything else in the same
+    session touched this row first."""
+    stmt = (
+        select(ProposalHold)
+        .where(ProposalHold.id == hold_id)
+        .execution_options(populate_existing=True)
+    )
     if for_update:
-        stmt = stmt.with_for_update().execution_options(populate_existing=True)
+        stmt = stmt.with_for_update()
     return (await session.execute(stmt)).scalar_one_or_none()
 
 
@@ -5973,6 +5988,53 @@ _PROPOSAL_APPLIER_NAMES: dict[str, str] = {
 _PROPOSAL_FINGERPRINTER_NAMES: dict[str, str] = {
     "linear_progress_update": "fetch_current_fingerprint",
 }
+
+
+async def _claim_proposal_hold_for_applying(
+    session: AsyncSession,
+    *,
+    hold_id: uuid.UUID,
+    decided_by_actor_id: str,
+    decision_source: str,
+    decision_note: str | None,
+) -> bool:
+    """Claims a still-``"pending"`` hold for synchronous apply by writing
+    ``status="applying"`` under a fresh ``FOR UPDATE`` and committing
+    (Argus review round-2 B1) -- this is the write that closes the
+    double-Linear-write race: it happens BEFORE any external I/O, so a
+    second concurrent caller (a human decide racing the auto-judge, or
+    two decide calls racing each other) that acquires the lock after this
+    commits sees ``"applying"``, not ``"pending"``, and takes the
+    already-decided branch instead of ever reaching the fingerprinter/
+    applier for this SAME hold.
+
+    Sets ``decided_at``/``decided_by_actor_id``/``decision_source`` here
+    too (not just at the eventual terminal write in
+    ``_apply_or_finalize_proposal_hold``) because
+    ``ck_proposal_holds_decision_consistency`` requires all three
+    whenever ``status != 'pending'`` -- ``"applying"`` is such a status.
+    ``_apply_or_finalize_proposal_hold`` re-stamps ``decided_at`` at the
+    terminal write; that's a monotonic no-op overwrite, not a
+    correctness issue.
+
+    Returns ``True`` if this call claimed the row (caller should proceed
+    to ``_apply_or_finalize_proposal_hold`` with
+    ``expected_status="applying"``), ``False`` if the row was no longer
+    ``"pending"`` when re-checked under the lock (caller should reload
+    and return the hold's current state instead)."""
+    hold = await _find_proposal_hold(session, hold_id, for_update=True)
+    if hold is None:
+        raise AssertionError("invariant violation: hold vanished before it could be claimed")
+    if hold.status != "pending":
+        await session.commit()
+        return False
+    hold.status = "applying"
+    hold.decision_source = decision_source
+    hold.decided_by_actor_id = decided_by_actor_id
+    hold.decided_at = _now()
+    hold.decision_note = decision_note
+    await session.commit()
+    return True
 
 
 async def _apply_or_finalize_proposal_hold(
@@ -6007,30 +6069,53 @@ async def _apply_or_finalize_proposal_hold(
     caller-held ORM object: the fingerprinter/applier calls above are
     ~10s external HTTP round-trips, and the row lock this function itself
     takes is scoped ONLY to the final write below, not held across those
-    calls (Argus review S1). Returns ``None`` if the row is no longer
-    ``expected_status`` by the time this re-acquires it with
-    ``FOR UPDATE`` -- a concurrent decide/auto-apply already resolved it
-    while the HTTP round-trip above was in flight -- and the caller is
-    responsible for reloading and returning the now-current state instead
-    of this function double-writing over it.
+    calls (Argus review S1). ``expected_status`` is ``"applying"`` from
+    both call sites (Argus review round-2 B1): the caller must have
+    already claimed the row by writing ``status="applying"`` under its
+    OWN initial ``FOR UPDATE`` and committed BEFORE calling this function
+    -- that claiming write is what makes a second concurrent caller
+    observe a non-``"pending"`` status and bail out via
+    ``HoldAlreadyDecidedError`` instead of ever reaching the fingerprinter/
+    applier a second time for the same hold. Returns ``None`` if the row
+    is no longer ``expected_status`` by the time this re-acquires it with
+    ``FOR UPDATE`` -- something else (in practice, only a hand-authored
+    test faking a race, since the claiming write above should make this
+    unreachable in production) resolved it while the HTTP round-trip
+    above was in flight -- and the caller is responsible for reloading
+    and returning the now-current state instead of this function
+    double-writing over it.
+
+    The fingerprinter call is wrapped in the SAME ``LinearAPIError``
+    handling as the applier call (Argus review round-2 B2): a transport
+    failure, missing ``LINEAR_API_TOKEN``, or Linear-side error while
+    fetching the current fingerprint must resolve the hold to
+    ``"apply_failed"`` like any other Linear failure, not propagate past
+    this function to main.py's generic 500 handler.
     """
     hold = await _find_proposal_hold(session, hold_id)
-    assert hold is not None, "invariant violation: hold vanished between commit and re-read"
+    if hold is None:
+        raise AssertionError("invariant violation: hold vanished between commit and re-read")
     target_id, _action_type = _extract_proposal_target(hold.action)
-    fingerprinter = getattr(linear_client, _PROPOSAL_FINGERPRINTER_NAMES[hold.kind])
-    current_fingerprint = await fingerprinter(target_id)
-    is_stale = current_fingerprint != hold.target_fingerprint
 
+    is_stale = False
     apply_error: str | None = None
-    if not is_stale:
-        applier = getattr(linear_client, _PROPOSAL_APPLIER_NAMES[hold.kind])
-        try:
-            await applier(hold.action)
-        except linear_client.LinearAPIError as exc:
-            apply_error = str(exc)
+    try:
+        fingerprinter = getattr(linear_client, _PROPOSAL_FINGERPRINTER_NAMES[hold.kind])
+        current_fingerprint = await fingerprinter(target_id)
+        is_stale = current_fingerprint != hold.target_fingerprint
+    except linear_client.LinearAPIError as exc:
+        apply_error = str(exc)
+    else:
+        if not is_stale:
+            applier = getattr(linear_client, _PROPOSAL_APPLIER_NAMES[hold.kind])
+            try:
+                await applier(hold.action)
+            except linear_client.LinearAPIError as exc:
+                apply_error = str(exc)
 
     hold = await _find_proposal_hold(session, hold_id, for_update=True)
-    assert hold is not None, "invariant violation: hold vanished between commit and re-read"
+    if hold is None:
+        raise AssertionError("invariant violation: hold vanished between commit and re-read")
     if hold.status != expected_status:
         await session.commit()
         return None
@@ -6121,21 +6206,30 @@ async def decide_proposal(
     defense-in-depth against the HTTP-layer check in
     ``main.decide_proposal_route``) and never touches the target system.
 
-    ``approve`` delegates to ``_apply_or_finalize_proposal_hold``, which
-    re-fetches the target's current state via the kind-scoped
+    ``approve`` first CLAIMS the row by writing ``status="applying"``
+    (plus decision fields) and committing -- releasing the `FOR UPDATE`
+    lock acquired above BEFORE the ~10s external Linear calls (Argus
+    review S1), while also closing a double-Linear-write race a second
+    concurrent decide call could otherwise hit (Argus review round-2 B1):
+    once claimed, a second caller sees ``"applying"``, not ``"pending"``,
+    and raises ``HoldAlreadyDecidedError`` itself without ever reaching
+    the applier. It then delegates to ``_apply_or_finalize_proposal_hold``,
+    which re-fetches the target's current state via the kind-scoped
     fingerprinter (``_PROPOSAL_FINGERPRINTERS``) and compares it against
     ``hold.target_fingerprint`` (the fingerprint the proposing bot computed
     at submission time) BEFORE writing anything. A mismatch means the
     target drifted since submission -- sets ``status="stale"`` and returns
     without ever calling the kind-scoped applier (``_PROPOSAL_APPLIERS``).
     A match proceeds to the actual write; success sets ``status="applied"``
-    (and ``applied_at``), a raised ``linear_client.LinearAPIError`` sets
+    (and ``applied_at``), a raised ``linear_client.LinearAPIError`` from
+    EITHER the fingerprinter or the applier (Argus review round-2 B2) sets
     ``status="apply_failed"`` with ``apply_error`` populated instead of
     propagating -- both are normal, queryable outcomes of this endpoint,
-    not exceptions raised to the caller. That helper's fingerprint/apply
-    calls run with the row's `FOR UPDATE` lock released (Argus review S1)
-    -- see its own docstring for why and how the terminal write re-checks
-    the hold is still in the expected state before committing.
+    not exceptions raised to the caller. In the vanishingly unlikely event
+    something else resolves the hold between this call's claim and the
+    helper's own re-check, this raises ``HoldAlreadyDecidedError`` (409)
+    rather than returning the concurrent winner's result as a 200 (Argus
+    review round-2 S4) -- this call never got to decide anything.
     """
     hold = await _find_proposal_hold(session, hold_id, for_update=True)
     if hold is None:
@@ -6190,12 +6284,22 @@ async def decide_proposal(
     # to release the `FOR UPDATE` lock acquired above BEFORE
     # ``_apply_or_finalize_proposal_hold``'s ~10s external HTTP calls --
     # holding a row lock across those would let a handful of concurrent
-    # slow approves saturate the whole connection pool.
+    # slow approves saturate the whole connection pool. Argus review
+    # round-2 B1: rather than just committing the read-only ``"pending"``
+    # state, CLAIM the row (write ``status="applying"``) before
+    # releasing the lock -- this is what stops a second concurrent
+    # decide call (or the auto-judge, in principle) for this SAME hold
+    # from also reaching the applier before either call's terminal write.
+    hold.status = "applying"
+    hold.decision_source = "human"
+    hold.decided_by_actor_id = approver_sub
+    hold.decided_at = _now()
+    hold.decision_note = decision_note
     await session.commit()
     result = await _apply_or_finalize_proposal_hold(
         session,
         hold_id=hold_id,
-        expected_status="pending",
+        expected_status="applying",
         decided_by_actor_id=approver_sub,
         decision_source="human",
         decision_note=decision_note,
@@ -6204,12 +6308,16 @@ async def decide_proposal(
         return result
     # Another decide call (or, in principle, an auto-judge re-approval)
     # already resolved this hold while the Linear round-trip above was in
-    # flight -- reload and return its current terminal state rather than
-    # double-writing over it.
+    # flight. Argus review round-2 S4: the design/docstring above say a
+    # non-"pending" terminal status raises 409, so route this the same
+    # way rather than silently returning 200 with the concurrent winner's
+    # result -- the CALLER (this decide call) never got to decide
+    # anything; someone else already did.
     resolved = await _find_proposal_hold(session, hold_id)
-    assert resolved is not None, "invariant violation: hold vanished between decide calls"
+    if resolved is None:
+        raise AssertionError("invariant violation: hold vanished between decide calls")
     await session.commit()
-    return _proposal_dict(resolved)
+    raise HoldAlreadyDecidedError(resolved.status)
 
 
 async def post_message(

@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -400,6 +400,33 @@ class TestJudgeIntegration:
         rows = (await session.execute(select(ProposalHold))).scalars().all()
         assert len(rows) == 1
 
+    async def test_auto_apply_fingerprinter_failure_sets_apply_failed(
+        self, session: AsyncSession
+    ) -> None:
+        """Argus review round-2 B2: a ``LinearAPIError`` from the
+        fingerprinter (not just the applier) during the auto-judge's
+        synchronous apply must resolve to ``apply_failed``, not propagate
+        past ``create_proposal`` into a generic 500 -- the auto-apply
+        path shares the same fingerprinter-wrapping bug the human-decide
+        path had."""
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(side_effect=LinearAPIError("LINEAR_API_TOKEN is not configured")),
+            ),
+            patch("service.linear_client.apply_progress_update", AsyncMock()) as mock_apply,
+        ):
+            result = await _submit(
+                session,
+                action=_action(
+                    action_type="open_ticket",
+                    source_message_url="https://redesignhealth.slack.com/archives/C1/p1",
+                ),
+            )
+        assert result["status"] == "apply_failed"
+        assert result["apply_error"] == "LINEAR_API_TOKEN is not configured"
+        mock_apply.assert_not_awaited()
+
 
 class TestRateLimit:
     async def test_exceeding_per_bot_window_limit_raises(self, session: AsyncSession) -> None:
@@ -626,3 +653,76 @@ class TestDecideProposal:
                 decision="approve",
                 decision_note=None,
             )
+
+    async def test_approve_fingerprinter_failure_sets_apply_failed(
+        self, session: AsyncSession
+    ) -> None:
+        """Argus review round-2 B2: a ``LinearAPIError`` from the
+        fingerprinter must resolve the hold to ``apply_failed`` the same
+        way an applier failure does -- previously only the applier call
+        was wrapped, so this propagated past ``decide_proposal`` into a
+        generic 500 instead of the documented graceful degradation."""
+        submitted = await _submit(session, target_fingerprint="fp-match")
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(side_effect=LinearAPIError("linear is down")),
+            ),
+            patch("service.linear_client.apply_progress_update", AsyncMock()) as mock_apply,
+        ):
+            decided = await decide_proposal(
+                session,
+                approver_sub="owner-a@example.com",
+                hold_id=uuid.UUID(submitted["proposal_id"]),
+                decision="approve",
+                decision_note=None,
+            )
+        assert decided["status"] == "apply_failed"
+        assert decided["apply_error"] == "linear is down"
+        mock_apply.assert_not_awaited()
+
+    async def test_hold_resolved_during_apply_window_raises_already_decided(
+        self, session: AsyncSession
+    ) -> None:
+        """Argus review round-2 B1/S4: this decide call CLAIMS the hold
+        (status="applying") before releasing the row lock, so a second
+        caller can no longer reach the applier for the SAME hold -- but if
+        something outside this call's own claim still manages to change
+        the hold's status during the ~10s external round-trip (simulated
+        here via the fingerprinter mock's side effect), this call must
+        raise 409, not silently return the concurrent state as its own
+        200 (S4): this call never got to decide anything."""
+        submitted = await _submit(session, target_fingerprint="fp-match")
+        hold_id = uuid.UUID(submitted["proposal_id"])
+
+        async def _mutate_then_fingerprint(_target_id: str) -> str:
+            await session.execute(
+                update(ProposalHold)
+                .where(ProposalHold.id == hold_id)
+                .values(
+                    status="rejected",
+                    decision_source="human",
+                    decided_by_actor_id="someone-else@example.com",
+                    decided_at=text("now()"),
+                )
+            )
+            await session.commit()
+            return "fp-match"
+
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(side_effect=_mutate_then_fingerprint),
+            ),
+            patch("service.linear_client.apply_progress_update", AsyncMock()) as mock_apply,
+        ):
+            with pytest.raises(HoldAlreadyDecidedError) as exc_info:
+                await decide_proposal(
+                    session,
+                    approver_sub="owner-a@example.com",
+                    hold_id=hold_id,
+                    decision="approve",
+                    decision_note=None,
+                )
+        assert exc_info.value.status == "rejected"
+        mock_apply.assert_awaited_once()
