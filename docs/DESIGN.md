@@ -597,7 +597,7 @@ scroll-to-load-more use case.
 
 ### MCP resource surface (TECH-5903 Phase A)
 
-Read-only companion to the tool surface above -- same `comms_server` provider, same
+Read-only companion to the tool surface above — same `comms_server` provider, same
 underlying `service.py` functions, a second MCP transport (`resources/list`,
 `resources/templates/list`, `resources/read`) rather than a new authorization model.
 Phase A is reads only; subscribe/unsubscribe (MCP's `resources/subscribe`) is
@@ -605,7 +605,7 @@ explicitly deferred to a later phase and does not exist yet.
 
 **Mount-prefix URI rewrite**: a resource registered in `providers/comms.py` as
 `comms://agents` is exposed by the ROOT server (after `mcp.mount(comms_server,
-namespace="comms")`) as `comms://comms/agents` -- FastMCP inserts the mount
+namespace="comms")`) as `comms://comms/agents` — FastMCP inserts the mount
 namespace as the URI host and shifts the original host into the path. All URIs
 below are the post-mount, canonical form actually reachable by a client. The
 `TestResourceScopeRegistryParity` test suite exists specifically to catch this
@@ -614,14 +614,14 @@ unreachable for every agent-jwt caller).
 
 | Resource (post-mount URI) | Scope | Notes |
 |---|---|---|
-| `comms://comms/conversations/{conversation_id}` | comms:read | Templated. Identical read shape to `comms_get_conversation` with `since_seq=0`, including the invited-caller-gets-metadata-only rule -- **except** it is called with `mark_read=False`: reading it never advances the caller's `last_read_seq`, unlike the tool. An MCP resource read is conventionally idempotent/cacheable and may be silently re-fetched by a client (and, once a subscribe/unsubscribe phase lands, re-fetched on every notification); advancing the read cursor as a side effect of a passive read would silently mark messages read and drop the conversation out of `comms_inbox` on every such re-fetch. No pagination parameter on the URI -- a conversation longer than `MAX_MESSAGES_PER_GET_CONVERSATION` (500) is permanently truncated from this resource's perspective; use the tool to page past that cap |
-| `comms://comms/agents/{agent_id}/inbox` | comms:read | Templated, self-only. `agent_id` must resolve to the CALLER's own board identity -- either its bare base sub or one of its own `{base_sub}::`-prefixed sibling identities (the same multi-agent-per-token convention `_compose_sub` establishes for every tool). Identity-qualified rather than caller-relative (`comms://comms/inbox`) because one token can host multiple sibling agents via `agent_key`, and a resource URI has no `agent_key` parameter the way a tool call does. The self-or-sibling check is performed by the public `service.resolve_inbox_target`, which denies via `service._deny` (audited) on a mismatch or unknown `agent_id` -- the resource layer must never reach into a private `service._find_agent_by_id`-style helper or raise `AccessDeniedError` directly itself, or the denial silently skips the `audit_log` row §5 requires. Once resolved, the target's identity is re-resolved through `providers.comms._resolve_caller_agent`, so a suspended agent gets the exact same (deliberately non-uniform, specific) `agent_suspended` denial reading this resource that it gets calling `comms_inbox` |
-| `comms://comms/agents` | comms:read | Static. First page of the board directory (`service.DEFAULT_LIST_AGENTS_LIMIT`, shared with `comms_list_agents`' own default). Same internal-domain trust posture as the tool (§10): pure directory read, no per-caller filtering -- deliberately does NOT call `_resolve_caller_agent`, so a suspended agent's still-unexpired token can still read the public directory, matching `comms_list_agents` exactly |
+| `comms://comms/conversations/{conversation_id}` | comms:read | Templated. Identical read shape to `comms_get_conversation` with `since_seq=0`, including the invited-caller-gets-metadata-only rule — **except** it is called with `mark_read=False`: reading it never advances the caller's `last_read_seq`, unlike the tool for an active-membership caller (neither path advances it for an `invited` caller either way, since there is nothing to mark read). An MCP resource read is conventionally idempotent/cacheable and may be silently re-fetched by a client (and, once a subscribe/unsubscribe phase lands, re-fetched on every notification); advancing the read cursor as a side effect of a passive read would silently mark messages read and drop the conversation out of `comms_inbox` on every such re-fetch. `mark_read=False` only gates the cursor advance — lazy conversation expiry (`_maybe_expire`) still runs and commits unconditionally, exactly as it does for every other read path. No pagination parameter on the URI — a conversation longer than `MAX_MESSAGES_PER_GET_CONVERSATION` (500) is permanently truncated from this resource's perspective; use the tool to page past that cap |
+| `comms://comms/agents/{agent_id}/inbox` | comms:read | Templated, self-only. `agent_id` must resolve to the CALLER's own board identity — either its bare base sub or one of its own `{base_sub}::`-prefixed sibling identities (the same multi-agent-per-token convention `_compose_sub` establishes for every tool). Identity-qualified rather than caller-relative (`comms://comms/inbox`) because one token can host multiple sibling agents via `agent_key`, and a resource URI has no `agent_key` parameter the way a tool call does. The self-or-sibling check is performed by the public `service.resolve_inbox_target`, which denies via `service._deny` (audited) on a mismatch or unknown `agent_id` — the resource layer must never reach into a private `service._find_agent_by_id`-style helper or raise `AccessDeniedError` directly itself, or the denial silently skips the `audit_log` row §5 requires. Once resolved, the target's identity is re-resolved through `providers.comms._resolve_caller_agent`, so a suspended agent gets the exact same (deliberately non-uniform, specific) `agent_suspended` denial reading this resource that it gets calling `comms_inbox` |
+| `comms://comms/agents` | comms:read | Static. First page of the board directory (`service.DEFAULT_LIST_AGENTS_LIMIT`, shared with `comms_list_agents`' own default). Same internal-domain trust posture as the tool (§10): pure directory read, no per-caller filtering — deliberately does NOT call `_resolve_caller_agent`, so a suspended agent's still-unexpired token can still read the public directory, matching `comms_list_agents` exactly |
 
 **Scope enforcement**: `scopes.RESOURCE_SCOPES` (exact URI -> scope) and
 `scopes.RESOURCE_TEMPLATE_SCOPES` (templated URI -> scope, matched via regexes
 compiled once at import time, one `[^/]+` wildcard per `{param}` segment) are the
-resource-surface analogue of `TOOL_SCOPES` -- fail-closed for agent-jwt callers,
+resource-surface analogue of `TOOL_SCOPES` — fail-closed for agent-jwt callers,
 same as an unenrolled tool. `main.ScopeEnforcementMiddleware` additionally gates
 `resources/list`/`resources/templates/list` (`on_list_resources`/
 `on_list_resource_templates`) on a single flat `comms:read` requirement, since
@@ -633,7 +633,7 @@ all-or-nothing check.
 body in this helper, which converts a stray `ToolError` raised by the
 tool-shaped helpers it reuses (`_require_token`, `_require_identity`,
 `_parse_uuid`, and `_resolve_caller_agent`'s suspension check) into
-`fastmcp.exceptions.ResourceError` -- a resource read must never raise
+`fastmcp.exceptions.ResourceError` — a resource read must never raise
 `ToolError`, since `main.ScopeEnforcementMiddleware`'s own resource-path denial
 (`_deny_resource`) already established `ResourceError` as this surface's error
 type. Service-layer exceptions (`AccessDeniedError` and friends) are mapped

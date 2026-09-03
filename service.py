@@ -2396,7 +2396,7 @@ async def deregister_agent(
 
 
 # Shared between the comms_list_agents tool's own default and the
-# comms://agents resource's static first-page read (TECH-5903) -- a single
+# comms://agents resource's static first-page read (TECH-5903) — a single
 # source of truth so the two can't silently drift apart the way two
 # independently hardcoded `50`s could.
 DEFAULT_LIST_AGENTS_LIMIT = 50
@@ -5646,20 +5646,26 @@ async def get_conversation(
     would skip everything between this page's actual end and that cursor.
     ``last_read_seq`` itself is advanced to the max seq actually returned
     in THIS page (only if any messages were returned, and only forward --
-    never regresses on an older-history re-read) -- UNLESS ``mark_read`` is
+    never regresses on an older-history re-read) — UNLESS ``mark_read`` is
     ``False`` (default ``True``, preserving every existing caller's
-    behavior unchanged), in which case the read cursor is never touched at
-    all. ``mark_read=False`` exists for
+    behavior unchanged), in which case the read cursor is never ADVANCED.
+    ``mark_read=False`` exists for
     ``providers.comms.conversation_resource`` (TECH-5903): an MCP resource
     read is conventionally idempotent/cacheable and may be silently
     re-fetched by a client (and, once Phase B subscriptions land,
-    re-fetched on every notification) -- advancing the read cursor as a
+    re-fetched on every notification) — advancing the read cursor as a
     side effect of what looks like a passive read would silently mark
     messages read and drop the conversation out of ``comms_inbox`` results
     on every such re-fetch. Every other aspect of the response (message
     content, ``has_more``, ``page_max_seq``) is unaffected; the returned
     ``last_read_seq`` still reflects the caller's persisted cursor as of
-    before this call. A caller who is not a
+    before this call. Note ``mark_read`` gates ONLY the cursor advance
+    below — it has no effect on ``_load_participant_for_read``'s
+    unconditional lazy-expiry check (Argus round-2 SUGGESTION): if the
+    conversation's deadline has already passed, ``conversation.state``
+    still flips to ``"expired"`` and is committed by this call regardless
+    of ``mark_read``, exactly as it already does for every other read path
+    in this module. A caller who is not a
     participant, or who previously left/declined, gets the uniform
     ``AccessDeniedError`` — identical to a non-existent conversation
     (DESIGN.md §4/§8).
@@ -5760,8 +5766,7 @@ async def get_conversation(
 async def resolve_inbox_target(
     session: AsyncSession,
     *,
-    actor_sub: str,
-    base_sub: str,
+    sub: str,
     target_agent_id: uuid.UUID,
 ) -> Agent:
     """Resolve ``target_agent_id`` for a self-or-sibling inbox read (TECH-5903).
@@ -5770,36 +5775,48 @@ async def resolve_inbox_target(
     resource (``providers.comms.agent_inbox_resource``): the resource layer
     must not reach into ``_find_agent_by_id`` (private) or raise
     ``AccessDeniedError`` directly itself, since neither path writes the
-    ``audit_log`` row DESIGN.md §5 requires for every denial -- this
+    ``audit_log`` row DESIGN.md §5 requires for every denial — this
     function is the one authorized place that check happens, exactly like
     every other authorization gate in this module.
 
-    ``base_sub`` is the caller's verified token-derived base identity
-    (pre-``_compose_sub``, see ``providers.comms``) -- the target is only
-    resolvable if its ``sub`` equals ``base_sub`` or is one of its own
-    ``{base_sub}::``-prefixed sibling identities, the same
-    multi-agent-per-token convention every tool enforces. An unknown
-    ``target_agent_id`` and a real-but-not-self/sibling agent both hit the
-    identical uniform ``AccessDeniedError`` (anti-enumeration) via
-    ``_deny`` (audited, committed).
+    ``sub`` is the caller's verified token-derived base identity
+    (pre-``_compose_sub``, see ``providers.comms``), used for BOTH roles a
+    single-identity-boundary check like this one has: it is the sibling-
+    match root (the target is only resolvable if its ``sub`` equals it or
+    is one of its own ``{base_sub}::``-prefixed sibling identities, the
+    same multi-agent-per-token convention every tool enforces) AND the
+    ``actor_sub`` attributed on the audit row if this denies (Argus round-2
+    SUGGESTION: a prior revision took these as two separate parameters even
+    though the one call site always passed the same value for both — since
+    nothing enforced that equality, a future caller could pass them
+    differently and silently mis-attribute an audit row to the wrong
+    identity; collapsing to one parameter makes that impossible instead of
+    merely undocumented). An unknown ``target_agent_id`` and a
+    real-but-not-self/sibling agent both hit the identical uniform
+    ``AccessDeniedError`` (anti-enumeration) via ``_deny`` (audited,
+    committed).
 
-    Does NOT check ``target.status`` -- the caller (``agent_inbox_resource``)
+    Does NOT check ``target.status`` — the caller (``agent_inbox_resource``)
     re-resolves the returned agent's ``sub`` through
     ``providers.comms._resolve_caller_agent`` afterward, which applies the
     same suspension check every read-path tool gets; duplicating that check
     here would be a second, driftable copy of the same rule.
     """
     target = await _find_agent_by_id(session, target_agent_id)
-    if target is None or not (
-        target.sub == base_sub or target.sub.startswith(f"{base_sub}::")
-    ):
+    if target is None or not (target.sub == sub or target.sub.startswith(f"{sub}::")):
         await _deny(
             session,
-            actor_sub=actor_sub,
+            actor_sub=sub,
             action="denied.inbox_not_self_or_sibling",
             agent_id=target.id if target is not None else None,
             detail={"target_agent_id": str(target_agent_id)},
         )
+        # Argus round-2 SUGGESTION: `_deny` is `NoReturn`, so this is
+        # genuinely unreachable — unlike main.py's stripped-under-`-O`
+        # `assert` anti-pattern this same round flagged, this one is a
+        # plain `raise` (never optimized away) documenting an impossible
+        # state, not standing in for a security check that must always run.
+        raise AssertionError("unreachable: _deny must have raised")
     return target
 
 

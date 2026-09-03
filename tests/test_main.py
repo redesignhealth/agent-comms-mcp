@@ -447,6 +447,15 @@ class TestResourceScopeRegistryParity:
         main = _import_main()
         okta_token = MagicMock()
         okta_token.claims = {"iss": "https://example.okta.com/oauth2/default"}
+        # Two sequential `asyncio.run()` calls in one `with` block, unlike
+        # the sibling tests above (each of which only calls one list_*
+        # method) -- confirmed safe (Argus round-2 SUGGESTION asked this be
+        # verified, not assumed): `FastMCP.list_resources`/
+        # `list_resource_templates` hold no live event-loop-bound state
+        # between calls (pure metadata introspection over the already-
+        # mounted, synchronously-constructed resource registry), so a
+        # fresh event loop per call via `asyncio.run()` is not a problem
+        # the way it would be for e.g. a held DB connection or session.
         with _OIDC_PATCH, _ENV_PATCH, patch("main.get_access_token", return_value=okta_token):
             resources = asyncio.run(main.mcp.list_resources())  # type: ignore[attr-defined]
             templates = asyncio.run(main.mcp.list_resource_templates())  # type: ignore[attr-defined]
@@ -584,9 +593,21 @@ class TestListResourcesMiddleware:
         call_next = AsyncMock()
 
         with patch("main.get_access_token", return_value=None):
-            with pytest.raises(ResourceError, match="requires elevated permissions"):
-                asyncio.run(middleware.on_list_resource_templates(self._make_context(), call_next))
+            with patch("main.log_scope_denial") as mock_denial:
+                with pytest.raises(ResourceError, match="requires elevated permissions"):
+                    asyncio.run(
+                        middleware.on_list_resource_templates(self._make_context(), call_next)
+                    )
 
+        # Argus round-2 SUGGESTION: assert the structured scope_denial event,
+        # matching the sibling on_call_tool/on_read_resource tests above
+        # rather than just the raised exception.
+        mock_denial.assert_called_once_with(
+            tool="resources/templates/list",
+            reason="missing_token",
+            client_id="unknown",
+            required_scope=None,
+        )
         call_next.assert_not_called()
 
 

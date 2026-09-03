@@ -1828,7 +1828,7 @@ async def archive_conversation(
 # Phase A (TECH-5903): plain reads, no subscribe/unsubscribe. Every resource
 # below follows the tool shape from this module's own docstring
 # (_require_token -> _require_identity -> _resolve_caller_agent -> one
-# session -> one service call), but must never raise ToolError -- a resource
+# session -> one service call), but must never raise ToolError — a resource
 # read is a distinct MCP request type from a tool call, and
 # ScopeEnforcementMiddleware's resource-path denial
 # (main._deny_resource) already established ResourceError as this path's
@@ -1865,7 +1865,7 @@ async def conversation_resource(conversation_id: str) -> dict[str, Any]:
     membership-is-visibility rule): an ``invited`` (not yet accepted) caller
     gets metadata only, a non-member gets the uniform ``access_denied``
     error, and an ``active`` caller gets up to the same
-    ``MAX_MESSAGES_PER_GET_CONVERSATION`` (500) message cap as the tool --
+    ``MAX_MESSAGES_PER_GET_CONVERSATION`` (500) message cap as the tool —
     a conversation longer than that cap is permanently truncated from this
     resource's perspective (no ``since_seq``/pagination parameter exists on
     the URI template to page further; the tool remains the way to read
@@ -1873,7 +1873,7 @@ async def conversation_resource(conversation_id: str) -> dict[str, Any]:
     enumerates actual conversation IDs — no new enumeration surface beyond
     what ``comms_list_conversations`` already exposes to a participant.
 
-    Unlike the tool, this resource is passed ``mark_read=False`` --
+    Unlike the tool, this resource is passed ``mark_read=False`` —
     reading it never advances the caller's ``last_read_seq`` (see
     ``service.get_conversation``'s docstring for why: an MCP resource read
     is conventionally idempotent/cacheable and may be silently re-fetched
@@ -1951,7 +1951,7 @@ async def agent_inbox_resource(agent_id: str) -> dict[str, Any]:
     ``_map_service_errors(ResourceError)`` unchanged (that mapper only
     catches ``AccessDeniedError`` and the other named service exceptions,
     never a bare ``ToolError``) and is converted to ``ResourceError`` by
-    the enclosing ``_resource_boundary()`` instead -- this is a
+    the enclosing ``_resource_boundary()`` instead — this is a
     DELIBERATELY non-uniform, specific denial (it tells a suspended caller
     exactly why), the same tradeoff the tool path already makes, and must
     not be confused with the anti-enumeration-safe uniform ``access_denied``
@@ -1966,8 +1966,7 @@ async def agent_inbox_resource(agent_id: str) -> dict[str, Any]:
         async with get_session_factory()() as session, _map_service_errors(ResourceError):
             target = await service.resolve_inbox_target(
                 session,
-                actor_sub=base_sub,
-                base_sub=base_sub,
+                sub=base_sub,
                 target_agent_id=target_id,
             )
             caller = await _resolve_caller_agent(session, target.sub, token)
@@ -1988,7 +1987,7 @@ async def agents_directory_resource() -> dict[str, Any]:
     """
     async with _resource_boundary():
         # Deliberately `_require_token()` only, not `_resolve_caller_agent`
-        # -- unlike `conversation_resource`/`agent_inbox_resource`, this
+        # — unlike `conversation_resource`/`agent_inbox_resource`, this
         # mirrors `comms_list_agents` itself, which never resolves the
         # caller's OWN agent row at all (DESIGN.md §10's directory-is-public
         # posture: this is a caller-independent read, so a suspended

@@ -372,7 +372,7 @@ class TestConversationResource:
         after = await _call(main, test_session_factory, member_token, "comms_inbox")
         assert after == before
 
-        # The tool itself is unaffected -- it still advances the cursor
+        # The tool itself is unaffected — it still advances the cursor
         # exactly as before this fix.
         await _call(
             main,
@@ -512,12 +512,18 @@ class TestAgentInboxResource:
                 f"comms://comms/agents/{ids['inbox-res-audit-b']}/inbox",
             )
 
+        # Argus round-2 SUGGESTION: scoped to this test's own actor_sub, not
+        # a bare action-name count -- an unscoped count would be
+        # non-deterministic if any other test in the same DB session ever
+        # triggers this same denial action.
         row_count = (
             await session.execute(
                 text(
                     "SELECT COUNT(*) FROM audit_log "
-                    "WHERE action = 'denied.inbox_not_self_or_sibling'"
-                )
+                    "WHERE action = 'denied.inbox_not_self_or_sibling' "
+                    "AND actor_sub = :actor_sub"
+                ),
+                {"actor_sub": "inbox-res-audit-a"},
             )
         ).scalar_one()
         assert row_count == 1

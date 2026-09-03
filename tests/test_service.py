@@ -85,6 +85,7 @@ from service import (
     list_conversations,
     reconcile_agent_ownership,
     register_agent,
+    resolve_inbox_target,
     set_agent_shared,
     write_through_ownership,
 )
@@ -4550,6 +4551,165 @@ class TestGetConversation:
             since_seq=0,
         )
         assert [m["seq"] for m in follow_up["messages"]] == [1]
+
+    async def test_mark_read_false_does_not_advance_cursor(self, session: AsyncSession) -> None:
+        """TECH-5903 Argus round-1 BLOCKING fix: ``mark_read=False`` (used by
+        ``providers.comms.conversation_resource``) must leave the caller's
+        persisted read cursor untouched even though messages ARE returned
+        and their max seq exceeds the current cursor -- the exact condition
+        that otherwise triggers the advance."""
+        _owner, target, conversation = await self._start(session, "gc-mr-owner", "gc-mr-target")
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+
+        result = await get_conversation(
+            session,
+            actor_sub=target.sub,
+            caller_agent_id=target.id,
+            conversation_id=conversation.id,
+            mark_read=False,
+        )
+        assert result["invited"] is False
+        assert [m["seq"] for m in result["messages"]] == [1]
+        # The response's own last_read_seq reflects the pre-call persisted
+        # value (0), not the page's max seq (1) -- distinct from the
+        # mark_read=True test above, which asserts the opposite.
+        assert result["last_read_seq"] == 0
+
+        row = await session.get(Participant, (conversation.id, target.id))
+        assert row is not None
+        assert row.last_read_seq == 0, "mark_read=False must never advance the persisted cursor"
+
+    async def test_mark_read_false_then_mark_read_true_still_advances(
+        self, session: AsyncSession
+    ) -> None:
+        """A mark_read=False read must not permanently disable the cursor --
+        a subsequent ordinary (mark_read=True, the tool's default) read
+        still advances it normally."""
+        _owner, target, conversation = await self._start(
+            session, "gc-mr2-owner", "gc-mr2-target"
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+
+        await get_conversation(
+            session,
+            actor_sub=target.sub,
+            caller_agent_id=target.id,
+            conversation_id=conversation.id,
+            mark_read=False,
+        )
+        row = await session.get(Participant, (conversation.id, target.id))
+        assert row is not None
+        assert row.last_read_seq == 0
+
+        await get_conversation(
+            session,
+            actor_sub=target.sub,
+            caller_agent_id=target.id,
+            conversation_id=conversation.id,
+        )
+        await session.refresh(row)
+        assert row.last_read_seq == 1
+
+
+# --- resolve_inbox_target -------------------------------------------------------
+
+
+class TestResolveInboxTarget:
+    """TECH-5903 Argus round-1 BLOCKING fix: ``resolve_inbox_target`` is the
+    public, audited entry point ``providers.comms.agent_inbox_resource``
+    uses instead of a private ``_find_agent_by_id`` lookup + a raw
+    ``AccessDeniedError`` raise."""
+
+    async def test_unknown_target_denied(self, session: AsyncSession) -> None:
+        caller = await _register(session, "rit-unknown-caller")
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await resolve_inbox_target(
+                session,
+                sub=caller.sub,
+                target_agent_id=uuid.uuid4(),
+            )
+        assert str(exc_info.value) == "access_denied: not authorized for this resource"
+
+    async def test_non_sibling_target_denied_with_uniform_message(
+        self, session: AsyncSession
+    ) -> None:
+        """A real, registered agent that is neither the caller's own bare
+        base sub nor a `{base_sub}::`-prefixed sibling gets the identical
+        uniform denial an unknown agent_id gets -- no distinguishing detail
+        leaked to the caller (anti-enumeration)."""
+        caller = await _register(session, "rit-caller")
+        stranger = await _register(session, "rit-stranger")
+
+        with pytest.raises(AccessDeniedError) as unknown_exc:
+            await resolve_inbox_target(
+                session,
+                sub=caller.sub,
+                target_agent_id=uuid.uuid4(),
+            )
+        with pytest.raises(AccessDeniedError) as stranger_exc:
+            await resolve_inbox_target(
+                session,
+                sub=caller.sub,
+                target_agent_id=stranger.id,
+            )
+        assert (
+            str(unknown_exc.value)
+            == str(stranger_exc.value)
+            == "access_denied: not authorized for this resource"
+        )
+
+    async def test_valid_self_returns_the_agent(self, session: AsyncSession) -> None:
+        caller = await _register(session, "rit-self-caller")
+
+        resolved = await resolve_inbox_target(
+            session,
+            sub=caller.sub,
+            target_agent_id=caller.id,
+        )
+        assert resolved.id == caller.id
+        assert resolved.sub == caller.sub
+
+    async def test_valid_sibling_returns_the_agent(self, session: AsyncSession) -> None:
+        """A `{base_sub}::agent_key` sibling of the caller's base sub is
+        resolvable, not just the bare base sub itself -- the multi-agent-
+        per-token convention every tool enforces via `_compose_sub`."""
+        base_sub = "rit-sibling-base"
+        sibling = await _register(session, f"{base_sub}::secondary")
+
+        resolved = await resolve_inbox_target(
+            session,
+            sub=base_sub,
+            target_agent_id=sibling.id,
+        )
+        assert resolved.id == sibling.id
+        assert resolved.sub == f"{base_sub}::secondary"
+
+    async def test_denial_is_audited(self, session: AsyncSession) -> None:
+        caller = await _register(session, "rit-audit-caller")
+        stranger = await _register(session, "rit-audit-stranger")
+
+        with pytest.raises(AccessDeniedError):
+            await resolve_inbox_target(
+                session,
+                sub=caller.sub,
+                target_agent_id=stranger.id,
+            )
+
+        row_count = (
+            await session.execute(
+                text(
+                    "SELECT COUNT(*) FROM audit_log "
+                    "WHERE action = 'denied.inbox_not_self_or_sibling' "
+                    "AND actor_sub = :actor_sub"
+                ),
+                {"actor_sub": caller.sub},
+            )
+        ).scalar_one()
+        assert row_count == 1
 
 
 # --- post_message --------------------------------------------------------------

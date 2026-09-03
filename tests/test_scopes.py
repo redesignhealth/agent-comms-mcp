@@ -110,7 +110,7 @@ class TestRequiredScopeForResource:
         flat `comms:read` requirement for resources/list and
         resources/templates/list (Argus round-1 SUGGESTION) on the
         assumption that every individually-enrolled resource ALSO requires
-        `comms:read` -- nothing else enforces that invariant, so check it
+        `comms:read` — nothing else enforces that invariant, so check it
         explicitly here. If a future resource legitimately needs a
         different scope, `_gate_resource_listing` must become per-item
         filtering, not just a registry-table edit."""

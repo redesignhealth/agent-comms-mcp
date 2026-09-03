@@ -217,13 +217,16 @@ class ScopeEnforcementMiddleware(Middleware):
             ScopeEnforcementMiddleware._deny_resource(
                 pseudo_uri, reason="missing_token", client_id=None
             )
-        # Argus round-1 SUGGESTION: `_deny_resource` is `NoReturn`, so this
-        # is unreachable in practice -- but that guarantee lives entirely
-        # in a separate function's annotation, not in this branch's own
-        # control flow. Making it explicit means a future change that
-        # weakens `_deny_resource`'s NoReturn contract fails loudly here
-        # instead of silently passing `None` into `scopes_for_token` below.
-        assert token is not None
+        if token is None:
+            # Not an `assert` (Argus round-2 BLOCKING catch, same reasoning
+            # as the `_okta_server is None` check above): assertions are
+            # stripped under `python -O`/`-OO`, which would silently let
+            # `None` flow into `scopes_for_token` below instead of failing
+            # loudly here. `_deny_resource` is `NoReturn` so this branch is
+            # unreachable in practice — but that guarantee lives entirely
+            # in a separate function's annotation, not in this branch's own
+            # control flow.
+            raise RuntimeError("_deny_resource must have raised: token should be non-None here")
 
         if _LIST_RESOURCES_REQUIRED_SCOPE not in scopes_for_token(token):
             ScopeEnforcementMiddleware._deny_resource(
@@ -280,8 +283,8 @@ class ObservabilityMiddleware(Middleware):
     prefer the canonical ``upstream_claims.email`` threaded through the
     OIDCProxy, falling back to the shared resolver.
 
-    Known gap (TECH-5903 Argus round-1 SUGGESTION, tracked as backlog
-    before Phase B ships): this only hooks ``on_call_tool``. Resource
+    Known gap (TECH-5965, filed from a TECH-5903 Argus round-1 SUGGESTION):
+    this only hooks ``on_call_tool``. Resource
     *denials* are observable via ``ScopeEnforcementMiddleware``'s own
     ``scope_denial`` event (``_deny_resource``), but a successful resource
     read or list emits no equivalent of this class's ``tool_call`` event --

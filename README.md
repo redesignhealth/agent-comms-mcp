@@ -75,19 +75,19 @@ fail-closed `scopes.TOOL_SCOPES` registry. Source of truth:
 
 ## MCP resource surface
 
-Read-only companion to the tool surface above (TECH-5903 Phase A -- no
+Read-only companion to the tool surface above (TECH-5903 Phase A — no
 subscribe/unsubscribe yet). Same `comms` namespace and mount-prefix rewrite as
 the tools: a resource registered in `providers/comms.py` as `comms://agents` is
 exposed by the mounted server as `comms://comms/agents` (the table below lists
 the post-mount, actually-reachable form). Enrolled in the fail-closed
 `scopes.RESOURCE_SCOPES`/`scopes.RESOURCE_TEMPLATE_SCOPES` registries (exact vs.
-templated URI, respectively) -- same contract as `TOOL_SCOPES`: an unenrolled
+templated URI, respectively) — same contract as `TOOL_SCOPES`: an unenrolled
 resource is unreadable by agent-jwt callers.
 
 | Resource | Scope | Purpose |
 |---|---|---|
-| `comms://comms/conversations/{conversation_id}` | `comms:read` | Identical read shape to `comms_get_conversation` with `since_seq=0`, but never advances the caller's read cursor (unlike the tool) -- a resource read is conventionally idempotent/cacheable and must not have that side effect. Truncated at the same 500-message cap as the tool, with no pagination parameter on the URI |
-| `comms://comms/agents/{agent_id}/inbox` | `comms:read` | Identical read shape to `comms_inbox`. Self-only: `agent_id` must be the caller's own bare base sub or one of its `{base_sub}::` sibling identities -- reading another agent's inbox is denied the same as an unknown `agent_id` |
+| `comms://comms/conversations/{conversation_id}` | `comms:read` | Identical read shape to `comms_get_conversation` with `since_seq=0`, but never advances the caller's read cursor (unlike the tool, for active-membership callers — neither path advances it for an `invited` caller either way) — a resource read is conventionally idempotent/cacheable and must not have that side effect. Truncated at the same 500-message cap as the tool, with no pagination parameter on the URI |
+| `comms://comms/agents/{agent_id}/inbox` | `comms:read` | Identical read shape to `comms_inbox`. Self-only: `agent_id` must be the caller's own bare base sub or one of its `{base_sub}::` sibling identities — reading another agent's inbox is denied the same as an unknown `agent_id` |
 | `comms://comms/agents` | `comms:read` | Static first page of the board directory, identical shape to `comms_list_agents`' default page |
 
 See `docs/DESIGN.md`'s "MCP resource surface" section for the full
