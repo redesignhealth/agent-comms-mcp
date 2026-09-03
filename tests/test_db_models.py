@@ -673,6 +673,23 @@ class TestProposalHoldsSchema:
         for status in ("pending", "approved", "rejected", "applied", "apply_failed", "stale"):
             assert status in constraint_def
 
+    async def test_status_check_constraint_rejects_invalid_value(self, engine: AsyncEngine) -> None:
+        async with engine.connect() as conn:
+            with pytest.raises(IntegrityError, match="ck_proposal_holds_status"):
+                async with conn.begin():
+                    await conn.execute(
+                        text(
+                            "INSERT INTO proposal_holds "
+                            "(kind, proposed_by_bot_id, owner_sub, action, rationale, "
+                            "confidence, importance, impact, priority, status, "
+                            "decision_source, decided_by_actor_id, decided_at, "
+                            "target_fingerprint) "
+                            "VALUES ('linear_progress_update', 'test-bot', 'test-owner', "
+                            "'{}'::jsonb, 'rationale', 'low', 'low', 'low', 'low', 'bogus_status', "
+                            "'human', 'test-actor', now(), 'deadbeef')"
+                        )
+                    )
+
     async def test_level_check_constraints(self, engine: AsyncEngine) -> None:
         async with engine.connect() as conn:
             for column in ("confidence", "importance", "impact", "priority"):
@@ -689,6 +706,33 @@ class TestProposalHoldsSchema:
                 assert constraint_def is not None, f"missing CHECK for {column}"
                 for level in ("low", "medium", "high"):
                     assert level in constraint_def
+
+    @pytest.mark.parametrize("column", ["confidence", "importance", "impact", "priority"])
+    async def test_level_check_constraints_reject_invalid_value(
+        self, engine: AsyncEngine, column: str
+    ) -> None:
+        levels = {"confidence": "low", "importance": "low", "impact": "low", "priority": "low"}
+        levels[column] = "bogus_level"
+        async with engine.connect() as conn:
+            with pytest.raises(IntegrityError, match=f"ck_proposal_holds_{column}"):
+                async with conn.begin():
+                    await conn.execute(
+                        text(
+                            "INSERT INTO proposal_holds "
+                            "(kind, proposed_by_bot_id, owner_sub, action, rationale, "
+                            "confidence, importance, impact, priority, status, "
+                            "target_fingerprint) "
+                            "VALUES ('linear_progress_update', 'test-bot', 'test-owner', "
+                            "'{}'::jsonb, 'rationale', :confidence, :importance, :impact, "
+                            ":priority, 'pending', 'deadbeef')"
+                        ),
+                        {
+                            "confidence": levels["confidence"],
+                            "importance": levels["importance"],
+                            "impact": levels["impact"],
+                            "priority": levels["priority"],
+                        },
+                    )
 
     async def test_decision_source_check_constraint(self, engine: AsyncEngine) -> None:
         async with engine.connect() as conn:
@@ -880,6 +924,61 @@ class TestProposalHoldsSchema:
                 assert fetched.status == "stale"
                 assert fetched.owner_sub == "test-owner"
             finally:
+                # Roll back first: if a commit above failed partway through,
+                # the session is left in a pending-rollback state and the
+                # delete below would raise PendingRollbackError instead of
+                # cleaning up, masking the real failure.
+                await session.rollback()
+                # Cleanup: this module has no autouse table-truncation fixture.
+                await session.delete(hold)
+                await session.commit()
+
+    async def test_orm_round_trip_approved_applied(self, engine: AsyncEngine) -> None:
+        """Exercise the ``approved -> applied`` transition through the ORM,
+        confirming ``applied_at`` persists and the row re-reads correctly --
+        the mirror image of ``test_applied_at_consistency_check_constraint_
+        rejects_non_applied``'s negative case."""
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        session: AsyncSession
+        async with session_factory() as session:
+            hold = ProposalHold(
+                kind="linear_progress_update",
+                proposed_by_bot_id="test-bot",
+                owner_sub="test-owner",
+                action={"issue": "TECH-5871"},
+                rationale="because it needs doing",
+                confidence="medium",
+                importance="high",
+                impact="low",
+                priority="high",
+                status="approved",
+                decision_source="human",
+                decided_by_actor_id="test-actor",
+                decided_at=datetime.now(UTC),
+                target_fingerprint="deadbeef",
+            )
+            session.add(hold)
+            await session.commit()
+            await session.refresh(hold)
+            try:
+                assert hold.status == "approved"
+                assert hold.applied_at is None
+
+                # approved -> applied (terminal success state).
+                applied_at = datetime.now(UTC)
+                hold.status = "applied"
+                hold.applied_at = applied_at
+                await session.commit()
+                await session.refresh(hold)
+                assert hold.status == "applied"
+                assert hold.applied_at is not None
+
+                fetched = await session.get(ProposalHold, hold.id)
+                assert fetched is not None
+                assert fetched.status == "applied"
+                assert fetched.applied_at is not None
+            finally:
+                await session.rollback()
                 # Cleanup: this module has no autouse table-truncation fixture.
                 await session.delete(hold)
                 await session.commit()

@@ -17,9 +17,16 @@ column-by-column rationale.
 Migration only -- no endpoints/routes/business logic ship in this
 revision (follow-on work, separate tickets/PRs).
 
-DEPLOYMENT: safe for a normal rolling deploy, same reasoning as every
-other purely-additive migration in this directory (f4a9c1d2b3e7, etc.) --
-a brand-new table with no readers/writers anywhere in this codebase yet.
+DEPLOYMENT: this migration alone is safe for a normal rolling deploy, same
+reasoning as every other purely-additive migration in this directory
+(f4a9c1d2b3e7, etc.) -- a brand-new table with no readers/writers anywhere
+in this codebase yet. However, its parent revision, d5c8f1a2b4e7, requires
+a stop-then-start deploy (every old container fully stopped before any new
+one starts -- see that revision's own DEPLOYMENT WARNING). If this
+migration runs in the same deploy as d5c8f1a2b4e7 -- e.g. both are still
+unapplied and get picked up together -- the combined deploy inherits that
+stop-then-start requirement; a standard rolling/blue-green deploy is only
+safe once d5c8f1a2b4e7 has already been applied on its own.
 
 Uses ``if_not_exists``/``if_exists`` guards for indexes (matching this
 directory's convention), but not for ``create_table`` -- Postgres itself
