@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -252,10 +253,10 @@ class TestScopeEnforcementMiddleware:
 class TestReadResourceMiddleware:
     """Fail-closed behavior of ScopeEnforcementMiddleware.on_read_resource.
 
-    Mirrors ``TestScopeEnforcementMiddleware``'s tool-path tests. This
-    service registers no resources today (``scopes.RESOURCE_SCOPES`` is
-    empty), so every URI is "unenrolled" by default — a real exercise of
-    the fail-closed default rather than a contrived case.
+    Mirrors ``TestScopeEnforcementMiddleware``'s tool-path tests, using
+    arbitrary, never-enrolled URIs (or a patched ``required_scope_for_resource``)
+    to exercise the fail-closed default independently of which real
+    resources ``providers.comms`` happens to register.
     """
 
     def _make_context(self, uri: str) -> MagicMock:
@@ -366,6 +367,185 @@ class TestReadResourceMiddleware:
             client_id="ea-agent-svc",
             required_scope=None,
         )
+
+
+class TestResourceScopeRegistryParity:
+    """The actual mounted resources/templates must resolve against the scope
+    registry — mirrors ``TestScopeRegistryParity`` for tools.
+
+    Catches URI drift (e.g. the mount-prefix rewrite: ``comms://agents``
+    registered in ``providers.comms`` is exposed as ``comms://comms/agents``
+    by the root server) the same way the tool-name parity test catches a
+    ``comms_`` prefix drift — a resource registered under one URI shape but
+    enrolled in ``RESOURCE_SCOPES``/``RESOURCE_TEMPLATE_SCOPES`` under
+    another is silently unreachable for every agent-jwt caller.
+    """
+
+    def test_all_mounted_resources_are_enrolled(self) -> None:
+        from scopes import required_scope_for_resource
+
+        main = _import_main()
+        okta_token = MagicMock()
+        okta_token.claims = {"iss": "https://example.okta.com/oauth2/default"}
+        # This test is about registry correctness (does every mounted
+        # resource resolve a scope), not the listing hook's own enforcement
+        # (covered by TestListResourcesMiddleware) -- an interactive token
+        # bypasses on_list_resources so the underlying list isn't itself
+        # denied for lack of a scoped token.
+        with _OIDC_PATCH, _ENV_PATCH, patch("main.get_access_token", return_value=okta_token):
+            resources = asyncio.run(main.mcp.list_resources())  # type: ignore[attr-defined]
+
+        assert "comms://comms/agents" in {str(r.uri) for r in resources}, (
+            "comms://comms/agents is not a mounted resource URI — registration "
+            "drifted (mount-prefix rewrite?)"
+        )
+        unenrolled = [
+            str(r.uri) for r in resources if required_scope_for_resource(str(r.uri)) is None
+        ]
+        assert not unenrolled, (
+            f"Mounted resources missing from RESOURCE_SCOPES (agent-jwt callers "
+            f"would be denied fail-closed): {sorted(unenrolled)}"
+        )
+
+    def test_all_mounted_resource_templates_are_enrolled(self) -> None:
+        from scopes import required_scope_for_resource
+
+        main = _import_main()
+        okta_token = MagicMock()
+        okta_token.claims = {"iss": "https://example.okta.com/oauth2/default"}
+        with _OIDC_PATCH, _ENV_PATCH, patch("main.get_access_token", return_value=okta_token):
+            templates = asyncio.run(main.mcp.list_resource_templates())  # type: ignore[attr-defined]
+
+        template_uris = {t.uri_template for t in templates}
+        assert "comms://comms/conversations/{conversation_id}" in template_uris, (
+            "comms://comms/conversations/{conversation_id} is not a mounted "
+            f"resource template — registration drifted. Mounted: {sorted(template_uris)}"
+        )
+        assert "comms://comms/agents/{agent_id}/inbox" in template_uris, (
+            "comms://comms/agents/{agent_id}/inbox is not a mounted resource "
+            f"template — registration drifted. Mounted: {sorted(template_uris)}"
+        )
+        unenrolled = [
+            uri for uri in template_uris if required_scope_for_resource(_example_uri(uri)) is None
+        ]
+        assert not unenrolled, (
+            f"Mounted resource templates missing from RESOURCE_TEMPLATE_SCOPES "
+            f"(agent-jwt callers would be denied fail-closed): {sorted(unenrolled)}"
+        )
+
+
+def _example_uri(template: str) -> str:
+    """Substitute a placeholder concrete value for every ``{param}`` segment.
+
+    ``required_scope_for_resource`` matches concrete URIs, not template
+    strings themselves — this produces a stand-in concrete URI to feed it,
+    e.g. ``comms://comms/conversations/{conversation_id}`` ->
+    ``comms://comms/conversations/example``.
+    """
+    return re.sub(r"\{[^/{}]+\}", "example", template)
+
+
+class TestListResourcesMiddleware:
+    """Fail-closed behavior of the resources/list and resources/templates/list hooks."""
+
+    def _make_context(self) -> MagicMock:
+        return MagicMock()
+
+    def _make_token(
+        self,
+        *,
+        iss: str | None,
+        scopes: list[str] | None,
+        client_id: str = "test-client",
+        sub: str = "test-svc",
+    ) -> MagicMock:
+        token = MagicMock()
+        claims: dict[str, object] = {}
+        if iss is not None:
+            claims["iss"] = iss
+        if iss == "agent-jwt":
+            claims["sub"] = sub
+        claims["scopes"] = scopes or []
+        token.claims = claims
+        token.scopes = []
+        token.client_id = client_id
+        return token
+
+    def _middleware(self) -> object:
+        main = _import_main()
+        return main.ScopeEnforcementMiddleware()  # type: ignore[attr-defined]
+
+    def test_interactive_token_bypasses_list_resources(self) -> None:
+        middleware = self._middleware()
+        call_next = AsyncMock(return_value=MagicMock())
+        okta_token = self._make_token(iss="https://example.okta.com/oauth2/default", scopes=[])
+
+        with patch("main.get_access_token", return_value=okta_token):
+            asyncio.run(middleware.on_list_resources(self._make_context(), call_next))
+
+        call_next.assert_awaited_once()
+
+    def test_interactive_token_bypasses_list_resource_templates(self) -> None:
+        middleware = self._middleware()
+        call_next = AsyncMock(return_value=MagicMock())
+        okta_token = self._make_token(iss="https://example.okta.com/oauth2/default", scopes=[])
+
+        with patch("main.get_access_token", return_value=okta_token):
+            asyncio.run(middleware.on_list_resource_templates(self._make_context(), call_next))
+
+        call_next.assert_awaited_once()
+
+    def test_agent_jwt_with_comms_read_can_list_resources(self) -> None:
+        middleware = self._middleware()
+        call_next = AsyncMock(return_value=MagicMock())
+        bot_token = self._make_token(iss="agent-jwt", scopes=["comms:read"])
+
+        with patch("main.get_access_token", return_value=bot_token):
+            asyncio.run(middleware.on_list_resources(self._make_context(), call_next))
+
+        call_next.assert_awaited_once()
+
+    def test_agent_jwt_with_comms_read_can_list_resource_templates(self) -> None:
+        middleware = self._middleware()
+        call_next = AsyncMock(return_value=MagicMock())
+        bot_token = self._make_token(iss="agent-jwt", scopes=["comms:read"])
+
+        with patch("main.get_access_token", return_value=bot_token):
+            asyncio.run(middleware.on_list_resource_templates(self._make_context(), call_next))
+
+        call_next.assert_awaited_once()
+
+    def test_agent_jwt_without_comms_read_is_denied_list_resources(self) -> None:
+        middleware = self._middleware()
+        call_next = AsyncMock()
+        bot_token = self._make_token(iss="agent-jwt", scopes=["comms:write"])
+
+        with patch("main.get_access_token", return_value=bot_token):
+            with pytest.raises(ResourceError, match="requires elevated permissions"):
+                asyncio.run(middleware.on_list_resources(self._make_context(), call_next))
+
+        call_next.assert_not_called()
+
+    def test_agent_jwt_without_comms_read_is_denied_list_resource_templates(self) -> None:
+        middleware = self._middleware()
+        call_next = AsyncMock()
+        bot_token = self._make_token(iss="agent-jwt", scopes=["comms:write"])
+
+        with patch("main.get_access_token", return_value=bot_token):
+            with pytest.raises(ResourceError, match="requires elevated permissions"):
+                asyncio.run(middleware.on_list_resource_templates(self._make_context(), call_next))
+
+        call_next.assert_not_called()
+
+    def test_missing_token_is_denied_list_resources(self) -> None:
+        middleware = self._middleware()
+        call_next = AsyncMock()
+
+        with patch("main.get_access_token", return_value=None):
+            with pytest.raises(ResourceError, match="requires elevated permissions"):
+                asyncio.run(middleware.on_list_resources(self._make_context(), call_next))
+
+        call_next.assert_not_called()
 
 
 class TestObservabilityMiddleware:

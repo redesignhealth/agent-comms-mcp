@@ -78,9 +78,32 @@ class TestRequiredScopeFor:
         assert required_scope_for("definitely_not_a_real_tool") is None
 
     def test_unmapped_resource_returns_none(self) -> None:
-        # RESOURCE_SCOPES is empty today — every resource URI is unmapped
-        # and therefore fail-closed for agent-jwt callers.
+        # An unrecognized URI matches neither RESOURCE_SCOPES nor
+        # RESOURCE_TEMPLATE_SCOPES and is therefore fail-closed for
+        # agent-jwt callers.
         assert required_scope_for_resource("schema://anything") is None
+
+
+class TestRequiredScopeForResource:
+    def test_exact_match_static_resource(self) -> None:
+        assert required_scope_for_resource("comms://comms/agents") == "comms:read"
+
+    def test_template_match_concrete_conversation_uri(self) -> None:
+        uri = "comms://comms/conversations/11111111-1111-1111-1111-111111111111"
+        assert required_scope_for_resource(uri) == "comms:read"
+
+    def test_template_match_concrete_inbox_uri(self) -> None:
+        uri = "comms://comms/agents/22222222-2222-2222-2222-222222222222/inbox"
+        assert required_scope_for_resource(uri) == "comms:read"
+
+    def test_unknown_uri_returns_none(self) -> None:
+        assert required_scope_for_resource("comms://comms/conversations") is None
+
+    def test_template_does_not_match_across_path_segments(self) -> None:
+        # The wildcard segment must not swallow a `/` — a URI with an extra
+        # path component must not accidentally satisfy the template.
+        uri = "comms://comms/conversations/abc/extra"
+        assert required_scope_for_resource(uri) is None
 
 
 class TestIsInteractiveToken:

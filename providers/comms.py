@@ -27,7 +27,10 @@ Every tool below follows the same shape:
 Registration reminder (fail-closed ``TOOL_SCOPES``, see scopes.py): every
 tool added here MUST be enrolled in ``scopes.TOOL_SCOPES`` under its
 mounted name (``comms_<tool>``) in the same change, or agent-jwt callers can
-never reach it.
+never reach it. The same applies to every resource added here and
+``scopes.RESOURCE_SCOPES``/``scopes.RESOURCE_TEMPLATE_SCOPES`` (exact vs.
+templated URI, respectively) — an unenrolled resource is unreadable by
+agent-jwt callers the same way an unenrolled tool is uncallable.
 """
 
 from __future__ import annotations
@@ -41,7 +44,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 from fastmcp import FastMCP
-from fastmcp.exceptions import ToolError
+from fastmcp.exceptions import ResourceError, ToolError
 from fastmcp.server.auth import AccessToken
 from fastmcp.server.dependencies import get_access_token
 from sqlalchemy.exc import InterfaceError, OperationalError
@@ -298,8 +301,14 @@ def _string_claim(token: AccessToken, key: str) -> str | None:
 
 
 @asynccontextmanager
-async def _map_service_errors() -> AsyncIterator[None]:
-    """Translate the service layer's exception shapes into ``ToolError``.
+async def _map_service_errors(error_cls: type[Exception] = ToolError) -> AsyncIterator[None]:
+    """Translate the service layer's exception shapes into ``error_cls``.
+
+    ``error_cls`` defaults to ``ToolError`` (every tool above). Resource
+    handlers pass ``fastmcp.exceptions.ResourceError`` instead — the
+    resource-path error type ``main.ScopeEnforcementMiddleware._deny_resource``
+    already established — since a resource read must never raise a
+    ``ToolError``.
 
     ``AccessDeniedError``'s message is the fixed, uniform, anti-enumeration
     string (exceptions.py) and is passed through verbatim — no prefix, no
@@ -345,7 +354,7 @@ async def _map_service_errors() -> AsyncIterator[None]:
     try:
         yield
     except AccessDeniedError as exc:
-        raise ToolError(str(exc)) from None
+        raise error_cls(str(exc)) from None
     except (
         InvalidConversationStateError,
         RateLimitExceededError,
@@ -359,9 +368,9 @@ async def _map_service_errors() -> AsyncIterator[None]:
         AgentAlreadyRegisteredError,
         ConversationArchivedError,
     ) as exc:
-        raise ToolError(str(exc)) from None
+        raise error_cls(str(exc)) from None
     except (ValueError, RuntimeError):
-        raise ToolError("invalid_request: the request could not be processed") from None
+        raise error_cls("invalid_request: the request could not be processed") from None
 
 
 # --- Parsing helpers --------------------------------------------------------------
@@ -1810,3 +1819,130 @@ async def archive_conversation(
         "archived": True,
         "archived_at": _iso(conversation.archived_at),
     }
+
+
+# --- Resources (reads-only mirror of a subset of the tools above) -----------------
+#
+# Phase A (TECH-5903): plain reads, no subscribe/unsubscribe. Every resource
+# below follows the tool shape from this module's own docstring
+# (_require_token -> _require_identity -> _resolve_caller_agent -> one
+# session -> one service call), but must never raise ToolError -- a resource
+# read is a distinct MCP request type from a tool call, and
+# ScopeEnforcementMiddleware's resource-path denial
+# (main._deny_resource) already established ResourceError as this path's
+# error type. Registration reminder: every resource added here MUST be
+# enrolled in scopes.RESOURCE_SCOPES (exact URI) or
+# scopes.RESOURCE_TEMPLATE_SCOPES (templated URI) in the same change, same
+# fail-closed contract as TOOL_SCOPES.
+
+
+@asynccontextmanager
+async def _resource_boundary() -> AsyncIterator[None]:
+    """Convert a stray ``ToolError`` into ``ResourceError`` inside a resource handler.
+
+    ``_require_token``/``_require_identity``/``_parse_uuid`` are shared with
+    every tool above and raise ``ToolError`` unconditionally — reused here
+    as-is (duplicating them for a ``ResourceError``-raising variant would be
+    the kind of drift this module's docstring warns against), with this
+    boundary converting whatever they raise into the resource-path error
+    type. Service-layer exceptions are handled separately, by passing
+    ``ResourceError`` into ``_map_service_errors`` at the call site — this
+    boundary exists only for the identity/parsing helpers upstream of that.
+    """
+    try:
+        yield
+    except ToolError as exc:
+        raise ResourceError(str(exc)) from None
+
+
+@comms_server.resource("comms://conversations/{conversation_id}")
+async def conversation_resource(conversation_id: str) -> dict[str, Any]:
+    """Read a conversation: identical shape to ``comms_get_conversation`` with ``since_seq=0``.
+
+    Second transport over the same authz core as the tool (DESIGN.md's
+    membership-is-visibility rule): an ``invited`` (not yet accepted) caller
+    gets metadata only, a non-member gets the uniform ``access_denied``
+    error, and an ``active`` caller gets up to the same 500-message cap.
+    Because this is a *template*, ``resources/list`` never enumerates actual
+    conversation IDs — no new enumeration surface beyond what
+    ``comms_list_conversations`` already exposes to a participant.
+
+    No ``agent_key`` parameter (resource URIs can't carry the extra
+    argument every tool above takes) — the caller's identity here is always
+    its bare base sub, same value ``comms_whoami``/``comms_register`` would
+    resolve for a caller that never passes ``agent_key``.
+    """
+    async with _resource_boundary():
+        token = _require_token()
+        base_sub = _require_identity(token)
+        conv_id = _parse_uuid("conversation_id", conversation_id)
+
+        async with get_session_factory()() as session:
+            caller = await _resolve_caller_agent(session, base_sub, token)
+            async with _map_service_errors(ResourceError):
+                result = await service.get_conversation(
+                    session,
+                    actor_sub=base_sub,
+                    caller_agent_id=caller.id,
+                    conversation_id=conv_id,
+                    since_seq=0,
+                )
+
+    if "messages_in_page" in result:
+        result["messages_returned"] = result.pop("messages_in_page")
+    return result
+
+
+@comms_server.resource("comms://agents/{agent_id}/inbox")
+async def agent_inbox_resource(agent_id: str) -> dict[str, Any]:
+    """Read an agent's inbox: identical shape to ``comms_inbox`` with default filters.
+
+    Self-only, by design (plan doc TECH-5903 §1): ``agent_id`` must resolve
+    to the CALLER's own board identity — either its bare base sub or one of
+    its own ``{base_sub}::``-prefixed sibling identities (the same
+    multi-agent-per-token convention ``_compose_sub`` establishes for every
+    tool above). This is identity-qualified rather than caller-relative
+    (``comms://comms/inbox``) because one token can host multiple sibling
+    agents via ``agent_key``, and a resource URI has no ``agent_key``
+    parameter the way a tool call does — ``agent_id`` (a UUID the caller
+    already has from ``comms_whoami``/``comms_register``) is the only
+    unambiguous way to name which of the caller's own identities' inboxes
+    this is.
+
+    Reading another agent's inbox — sibling or not — gets the identical
+    uniform ``access_denied`` error an unknown ``agent_id`` gets (no
+    "wrong owner" distinction, matching this module's anti-enumeration
+    posture elsewhere).
+    """
+    async with _resource_boundary():
+        token = _require_token()
+        base_sub = _require_identity(token)
+        target_id = _parse_uuid("agent_id", agent_id)
+
+        async with get_session_factory()() as session, _map_service_errors(ResourceError):
+            target = await service._find_agent_by_id(session, target_id)
+            if target is None or not (
+                target.sub == base_sub or target.sub.startswith(f"{base_sub}::")
+            ):
+                raise AccessDeniedError(reason="denied.inbox_not_self_or_sibling")
+            return await service.inbox(session, caller_agent_id=target.id)
+
+
+@comms_server.resource("comms://agents")
+async def agents_directory_resource() -> dict[str, Any]:
+    """Read the board directory: identical shape to ``comms_list_agents``' first page.
+
+    Static resource, no parameters — always the first page (``limit=50``,
+    matching that tool's own default). Same internal-domain trust posture
+    as ``comms_list_agents`` (DESIGN.md §10): pure directory read, no
+    per-caller filtering.
+    """
+    async with _resource_boundary():
+        _require_token()
+        async with get_session_factory()() as session:
+            return await service.list_agents(
+                session,
+                limit=50,
+                cursor=None,
+                active_checker=plugins.get_active_checker(),
+            )
