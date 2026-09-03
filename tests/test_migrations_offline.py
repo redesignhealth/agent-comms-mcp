@@ -215,3 +215,49 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
         "'task_assign', 'task_cancel', 'task_complete', 'task_decline', 'task_report']::text[];"
         in result.stdout
     )
+    # d23b37d4e187 (TECH-5871): proposal_holds table -- all six CHECKs, both
+    # indexes. A new, sibling table to approval_holds (see that migration's
+    # own assertions above for the pattern this mirrors).
+    assert "CREATE TABLE proposal_holds" in result.stdout
+    assert (
+        "CONSTRAINT ck_proposal_holds_status CHECK (status IN "
+        "('pending', 'approved', 'rejected', 'applied', 'apply_failed', 'stale'))" in result.stdout
+    )
+    assert (
+        "CONSTRAINT ck_proposal_holds_decision_source CHECK "
+        "(decision_source IS NULL OR decision_source IN ('human', 'auto'))" in result.stdout
+    )
+    assert (
+        "CONSTRAINT ck_proposal_holds_confidence CHECK (confidence IN "
+        "('low', 'medium', 'high'))" in result.stdout
+    )
+    assert (
+        "CONSTRAINT ck_proposal_holds_importance CHECK (importance IN "
+        "('low', 'medium', 'high'))" in result.stdout
+    )
+    assert (
+        "CONSTRAINT ck_proposal_holds_impact CHECK (impact IN ('low', 'medium', 'high'))"
+        in result.stdout
+    )
+    assert (
+        "CONSTRAINT ck_proposal_holds_priority CHECK (priority IN ('low', 'medium', 'high'))"
+        in result.stdout
+    )
+    assert (
+        "CONSTRAINT ck_proposal_holds_decision_consistency CHECK "
+        "((status = 'pending' AND decided_at IS NULL AND decided_by_actor_id IS NULL "
+        "AND decision_source IS NULL) OR (status != 'pending' AND decided_at IS NOT NULL "
+        "AND decided_by_actor_id IS NOT NULL AND decision_source IS NOT NULL))" in result.stdout
+    )
+    assert (
+        "CONSTRAINT ck_proposal_holds_applied_at_consistency CHECK "
+        "(status = 'applied' OR applied_at IS NULL)" in result.stdout
+    )
+    assert (
+        "CREATE INDEX IF NOT EXISTS idx_proposal_holds_status_created_at "
+        "ON proposal_holds (status, created_at)" in result.stdout
+    )
+    assert (
+        "CREATE INDEX IF NOT EXISTS idx_proposal_holds_owner_sub_status_created_at "
+        "ON proposal_holds (owner_sub, status, created_at)" in result.stdout
+    )
