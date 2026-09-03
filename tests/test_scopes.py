@@ -131,9 +131,7 @@ class TestRequiredScopeForResource:
         filtering, not just a registry-table edit."""
         from scopes import RESOURCE_SCOPES, RESOURCE_TEMPLATE_SCOPES
 
-        all_resource_scopes = set(RESOURCE_SCOPES.values()) | set(
-            RESOURCE_TEMPLATE_SCOPES.values()
-        )
+        all_resource_scopes = set(RESOURCE_SCOPES.values()) | set(RESOURCE_TEMPLATE_SCOPES.values())
         assert all_resource_scopes == {"comms:read"}
 
 

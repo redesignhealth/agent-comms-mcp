@@ -192,9 +192,7 @@ class ScopeEnforcementMiddleware(Middleware):
         call_next: CallNext[mt.ListResourceTemplatesRequest, Any],
     ) -> Any:
         """Gate ``resources/templates/list`` on ``comms:read`` — see ``on_list_resources``."""
-        return await self._gate_resource_listing(
-            "resources/templates/list", call_next, context
-        )
+        return await self._gate_resource_listing("resources/templates/list", call_next, context)
 
     @staticmethod
     async def _gate_resource_listing(

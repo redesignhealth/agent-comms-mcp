@@ -4587,9 +4587,7 @@ class TestGetConversation:
         """A mark_read=False read must not permanently disable the cursor --
         a subsequent ordinary (mark_read=True, the tool's default) read
         still advances it normally."""
-        _owner, target, conversation = await self._start(
-            session, "gc-mr2-owner", "gc-mr2-target"
-        )
+        _owner, target, conversation = await self._start(session, "gc-mr2-owner", "gc-mr2-target")
         await accept_invite(
             session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
         )
