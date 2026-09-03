@@ -41,7 +41,7 @@ service/tools boundary:
 - ``ConversationArchivedError`` (TECH-5887): ``comms_invite``/
   ``comms_post_message``/``comms_accept`` targeted a conversation that has
   been archived (``comms_archive_conversation``). Kept distinct and
-  specific for the same reason as ``InvalidConversationStateError`` — the
+  specific for the same reason as ``InvalidConversationStateError`` -- the
   caller already has legitimate read access to the conversation.
 
 - ``RateLimitExceededError``: a sender exceeded a per-hour cap. Specific by

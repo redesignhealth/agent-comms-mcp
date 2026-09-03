@@ -92,7 +92,18 @@ TOOL_SCOPES: dict[str, str] = {
     "comms_invite": "comms:write",
     "comms_leave": "comms:write",
     # TECH-5887: symmetric across every current participant, same as
-    # comms_leave -- no elevated scope, no owner-only gate.
+    # comms_leave -- no elevated scope, no owner-only gate. Unlike
+    # comms_leave (which only ever narrows the CALLER's own access),
+    # archiving is conversation-wide and irreversible (no unarchive tool),
+    # and -- unlike comms_post_message/comms_start_conversation/
+    # comms_invite -- has no rate limit. Threat model: a compromised
+    # comms:write token active in N conversations could archive all N
+    # without throttling; accepted for v1 because the blast radius is
+    # "conversation becomes read-only" (no data loss, no content
+    # disclosure), not comparable to comms_deregister_agent/
+    # comms_set_agent_shared/comms_admin_register's elevated-scope class of
+    # damage. Revisit if a rate limit consistent with the other mutating
+    # tools' pattern is ever added.
     "comms_archive_conversation": "comms:write",
 }
 

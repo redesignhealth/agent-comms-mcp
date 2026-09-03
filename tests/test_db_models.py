@@ -320,7 +320,8 @@ class TestSchema:
             result = await conn.execute(
                 text(
                     "SELECT is_nullable FROM information_schema.columns "
-                    "WHERE table_name = 'conversations' AND column_name = 'archived_at'"
+                    "WHERE table_schema = 'public' AND table_name = 'conversations' "
+                    "AND column_name = 'archived_at'"
                 )
             )
             assert result.scalar_one() == "YES"

@@ -1133,12 +1133,15 @@ async def start_conversation(
         "target_agent_ids": [str(t) for t in target_uuids],
         "expires_at": _iso(conversation.expires_at),
         "created_at": _iso(conversation.created_at),
-        # Always False at creation time -- a brand-new conversation can
-        # never already be archived. Included for shape parity with every
-        # other conversation projection (comms_get_conversation,
-        # comms_list_conversations, comms_inbox), which all surface this
-        # field via service._conversation_dict.
+        # Always False/None at creation time -- a brand-new conversation
+        # can never already be archived. Both keys included for shape
+        # parity with every other conversation projection
+        # (comms_get_conversation, comms_list_conversations, comms_inbox),
+        # which all surface archived/archived_at via
+        # service._conversation_dict -- a client reading archived_at
+        # unconditionally would otherwise KeyError only on this response.
         "archived": False,
+        "archived_at": None,
         # The actually-negotiated version (see
         # service.start_conversation's transient
         # `conversation.negotiated_schema_version` attribute), NOT
@@ -1183,7 +1186,9 @@ async def post_message(
     Caller must be an ``active`` participant (uniform denial otherwise).
     Rejects with a specific ``conversation_archived`` error (TECH-5887) if
     the conversation has been archived via ``comms_archive_conversation`` --
-    checked before every other gate.
+    checked before every conversation-level gate (state, rate limits,
+    message legality); a non-member or suspended caller is still denied by
+    the earlier participant/agent-status checks first.
 
     ``review_reason``: optional, max 2000 chars, enforced at this tool
     boundary BEFORE any whitespace stripping (so a >2000-char all-whitespace

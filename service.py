@@ -3872,6 +3872,13 @@ async def archive_conversation(
         agent_id=agent_id,
         conversation_id=conversation_id,
         required_status="active",
+        # TECH-5887: locks the conversation row for the duration of this
+        # call so two concurrent archivers can't both observe
+        # `archived_at IS NULL`, both write it, and both emit a
+        # `conversation.archive` audit row -- which would violate the
+        # idempotent-no-op guarantee documented above. Same pattern as
+        # `invite`'s TECH-5735 lock above.
+        for_update=True,
     )
     if conversation.archived_at is not None:
         # Idempotent no-op (see docstring) -- no audit row, no archived_at
@@ -5038,6 +5045,27 @@ async def decide_hold(
             conversation_id=conversation.id,
             current_state=conversation.state,
             message_type=hold.message_type,
+        )
+    if conversation.archived_at is not None:
+        # TECH-5887: a hold can sit pending_human for up to
+        # APPROVAL_HOLD_TTL (7 days) -- without this check, approving a
+        # message-kind hold after the conversation was archived would
+        # still insert a new message via _insert_message_for_hold, and
+        # approving an invite-kind hold would still admit a new
+        # Participant, both directly violating archive_conversation's "no
+        # new invites, no new messages" guarantee. Same pattern as the
+        # state != "active" check above: the hold stays pending_human (the
+        # human can still reject it with a reason), it just can't be
+        # approved into an archived conversation. Applies to both
+        # hold.kind == "message" and hold.kind == "invite" -- checked here,
+        # before the kind-specific branches below, rather than duplicated
+        # in each.
+        await _deny_archived(
+            session,
+            actor_sub=approver_sub,
+            agent_id=hold.sender_agent_id,
+            conversation_id=conversation.id,
+            action="denied.archived.decide_hold",
         )
 
     if hold.kind == "invite":
