@@ -6116,6 +6116,19 @@ def _sanitize_apply_error(exc: Exception) -> str:
     return _APPLY_ERROR_GENERIC_MESSAGE
 
 
+def _cancellation_apply_error(exc: asyncio.CancelledError) -> str:
+    """Build the ``apply_error``/log message for a cancellation caught
+    mid-apply (Argus review round-7 suggestion): a bare
+    ``asyncio.CancelledError()`` usually carries no message, but
+    ``task.cancel(msg=...)`` (Python 3.9+) can attach one, and discarding
+    it in favor of a hardcoded literal throws away debugging context a
+    caller may have deliberately provided (e.g. a watchdog's own timeout
+    reason). Falls back to the fixed literal when ``str(exc)`` is empty."""
+    detail = str(exc)
+    base = "apply cancelled before completion (request disconnected or task cancelled)"
+    return f"{base}: {detail}" if detail else base
+
+
 async def _apply_or_finalize_proposal_hold(
     session: AsyncSession,
     *,
@@ -6234,9 +6247,7 @@ async def _apply_or_finalize_proposal_hold(
         raw_apply_error = str(exc)
         apply_error = _sanitize_apply_error(exc)
     except asyncio.CancelledError as exc:
-        raw_apply_error = (
-            "apply cancelled before completion (request disconnected or task cancelled)"
-        )
+        raw_apply_error = _cancellation_apply_error(exc)
         apply_error = raw_apply_error
         cancelled_exc = exc
     else:
@@ -6248,9 +6259,7 @@ async def _apply_or_finalize_proposal_hold(
                 raw_apply_error = str(exc)
                 apply_error = _sanitize_apply_error(exc)
             except asyncio.CancelledError as exc:
-                raw_apply_error = (
-                    "apply cancelled before completion (request disconnected or task cancelled)"
-                )
+                raw_apply_error = _cancellation_apply_error(exc)
                 apply_error = raw_apply_error
                 cancelled_exc = exc
 
@@ -6301,7 +6310,12 @@ async def _apply_or_finalize_proposal_hold(
             session,
             actor_sub=decided_by_actor_id,
             action="proposal.apply_failed",
-            detail={"hold_id": str(hold_id), "target_id": target_id, "error": apply_error},
+            # Argus review round-7 suggestion: the audit log is internal-
+            # only, with none of the caller-safety argument that justifies
+            # narrowing the API response -- record raw_apply_error here,
+            # not the sanitized constant, or this internal record loses
+            # the same debugging detail the round-6 B1 fix was about.
+            detail={"hold_id": str(hold_id), "target_id": target_id, "error": raw_apply_error},
         )
     else:
         hold.status = "applied"

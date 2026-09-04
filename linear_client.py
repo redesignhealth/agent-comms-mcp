@@ -235,23 +235,29 @@ def _progress_comment_body(action: dict[str, Any], rationale: str) -> str:
         value = action.get(key)
         if isinstance(value, str) and value:
             if not citation_urls.is_valid_citation_url(value):
+                # Argus review round-7 suggestion: log/raise only a
+                # redacted form of a REJECTED URL (scheme+host+path), never
+                # the raw value -- a URL that already failed the citation
+                # allowlist check is, by definition, from an untrusted or
+                # unexpected source, and its query string/fragment may
+                # carry a token or other secret a legitimate caller
+                # embedded for its own (non-Linear) purposes. This applies
+                # uniformly to BOTH the omit-and-continue path and the
+                # raise path below -- round-6's fix added the value to the
+                # omit path's log line unredacted, matching the raise
+                # path's pre-existing `value!r`, which had the same
+                # exposure and needed the same fix.
+                redacted_value = citation_urls.redact_url_for_logging(value)
                 if _omit_invalid_url_instead_of_raising(action_type, key):
-                    # Argus review round-6 suggestion: include the rejected
-                    # URL value itself, not just the field name -- the
-                    # raise path a few lines below already includes it
-                    # (`value!r`), and with multiple proposals in flight
-                    # against the same target_id, the value is what lets an
-                    # operator actually identify which proposal's omission
-                    # this log line is about.
                     logger.warning(
-                        "Omitting %s=%r from Linear comment for target_id=%r: "
+                        "Omitting %s=%s from Linear comment for target_id=%r: "
                         "failed citation-URL validation",
                         key,
-                        value,
+                        redacted_value,
                         action.get("target_id"),
                     )
                     continue
-                raise LinearAPIError(f"{key} failed citation-URL validation: {value!r}")
+                raise LinearAPIError(f"{key} failed citation-URL validation: {redacted_value}")
             lines.append(f"{label}: {value}")
     return "\n\n".join(lines)
 

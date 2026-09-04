@@ -744,7 +744,7 @@ class TestDecideProposal:
             patch(
                 "service.linear_client.apply_progress_update",
                 AsyncMock(side_effect=asyncio.CancelledError()),
-            ),
+            ) as mock_apply,
         ):
             with pytest.raises(asyncio.CancelledError):
                 await decide_proposal(
@@ -754,6 +754,12 @@ class TestDecideProposal:
                     decision="approve",
                     decision_note=None,
                 )
+        # Argus review round-7 suggestion: without this, a regression that
+        # took the fingerprinter-cancelled path (which never calls the
+        # applier at all) instead of the applier-cancelled path this test
+        # is meant to cover would still pass on the status/apply_error
+        # assertions alone.
+        mock_apply.assert_awaited_once()
         row = (
             await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
         ).scalar_one()

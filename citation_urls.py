@@ -68,3 +68,20 @@ def is_valid_citation_url(value: Any) -> bool:
     if "@" in parsed.netloc:
         return False
     return parsed.hostname is not None and is_allowed_citation_host(parsed.hostname)
+
+
+def redact_url_for_logging(value: str) -> str:
+    """Scheme + host + path only, for logging/error text about a URL that
+    FAILED ``is_valid_citation_url`` (Argus review round-7 suggestion): a
+    rejected URL is by definition from an untrusted or unexpected source,
+    and its query string or fragment may carry a token or other secret a
+    caller embedded for its own (non-Linear) purpose -- neither belongs in
+    a log line or an exception message, both of which can end up in
+    less-trusted sinks (log aggregators, error-tracking services) than the
+    Linear comment this validation exists to protect in the first place.
+    Falls back to a fixed placeholder if the value doesn't even parse as a
+    URL with a netloc, rather than logging the raw string in that case."""
+    parsed = urlsplit(value)
+    if not parsed.scheme or not parsed.netloc:
+        return "<unparseable-url>"
+    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"

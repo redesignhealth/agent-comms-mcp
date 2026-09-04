@@ -323,19 +323,36 @@ proposal_holds id, kind (at the DB level an open TEXT column -- NOT
  suggestion -- a prior version of this note said the ONLY recovery was
  manual DB intervention, which stopped being true once round-5 B1 added
  cooperative cancellation handling):
- - **Cancellation (client disconnect, task cancelled) IS auto-recovered**:
-   `service._apply_or_finalize_proposal_hold` catches
-   `asyncio.CancelledError` around both the fingerprinter and applier
-   awaits, still performs the SAME terminal write every other path takes
-   (setting `"apply_failed"` with a distinguishable `apply_error`), and
-   only re-raises the cancellation afterward -- the row reaches a real
-   terminal status, it is not left stuck. This does NOT cover a second
-   cancellation landing during the terminal write itself (re-fetch through
-   commit/refresh) -- that narrower window is still a residual gap,
-   documented at that code's own comment rather than closed via
-   `asyncio.shield` (sharing a single `AsyncSession` across a shielded
-   Task is its own hazard -- see that comment for why the trade-off wasn't
-   taken).
+ - **Cancellation landing during the fingerprinter or applier await IS
+   auto-recovered** (narrowed, Argus review round-7 suggestion -- a prior
+   version of this bullet implied ALL cancellations during this function
+   are covered, which overstates it): `service._apply_or_finalize_proposal_hold`
+   catches `asyncio.CancelledError` specifically around the fingerprinter
+   and applier awaits, still performs the SAME terminal write every other
+   path takes (setting `"apply_failed"` with a distinguishable
+   `apply_error`), and only re-raises the cancellation afterward -- for
+   THAT window, the row reaches a real terminal status, it is not left
+   stuck. Two windows outside that coverage remain, both undocumented
+   gaps rather than closed:
+   - **Pre-`try:` awaits** -- the initial `_find_proposal_hold` re-fetch
+     and its `session.commit()`, which run BEFORE the try/except block, are
+     not wrapped at all; a cancellation landing there propagates
+     immediately with no terminal write, functionally identical to the
+     hard-process-death case below (the row was already `"applying"`
+     before this function was ever called, so nothing new is stranded,
+     but nothing recovers it either).
+   - **A second cancellation during the terminal write itself** (the
+     re-fetch through commit/refresh AFTER the try/except block) -- that
+     narrower window is a residual gap, documented at that code's own
+     comment rather than closed via `asyncio.shield` (sharing a single
+     `AsyncSession` across a shielded Task is its own hazard -- see that
+     comment for why the trade-off wasn't taken).
+   - **The concurrent-resolution early-return path** (`hold.status !=
+     expected_status` on re-fetch) deliberately does NOT attempt a
+     terminal write of its own -- something else already resolved the row,
+     so there is nothing for this call to strand; a cancellation observed
+     there just re-raises after the (already-resolved) row's own no-op
+     commit.
  - **A hard process death** (the container itself dies mid-apply, not a
    cooperative cancellation) still has no background reaper AND no in-app
    recovery path -- an earlier version of this note claimed a fresh
@@ -1267,21 +1284,15 @@ payload doesn't carry).
 fixed, sorted set of Linear issue fields (state id/name, priority, assignee
 id, `updatedAt`). Whatever submits the original proposal (the Prefect flow)
 MUST compute `target_fingerprint` the same way over the same fields, or
-every decide will spuriously come back `"stale"` -- this function is the
-single source of truth for that scheme on the agent-comms-mcp side.
-
-The field set alone is NOT the whole contract (Argus review round-6
-suggestion -- these serialization details previously lived only in
-`compute_target_fingerprint`'s own docstring, not here, where a cross-repo
-implementer is more likely to look): the fields are serialized via
-`json.dumps(..., sort_keys=True)` with the library's DEFAULT `separators`
-(`", "` / `": "`, i.e. a space after both `,` and `:`) and DEFAULT
-`ensure_ascii=True`; `updated_at` is Linear's raw `updatedAt` string
-exactly as the GraphQL API returns it (an ISO-8601 timestamp), never
-re-parsed or re-formatted. A same-inputs-different-bytes mismatch in any
-of these choices produces the same spurious `"stale"` symptom as a
-field-set mismatch, just harder to spot -- match all of it, not only the
-field names.
+every decide will spuriously come back `"stale"` -- this function's own
+docstring is the single source of truth for the EXACT byte-level scheme
+(field set AND serialization: `json.dumps` args, `updated_at` format),
+not duplicated here (Argus review round-7 suggestion -- an earlier
+version of this section duplicated that docstring's serialization detail
+in prose, which is exactly the kind of copy that can silently drift from
+the one true source it claims to defer to). See
+`test_pinned_digest_for_fixed_input` in `tests/test_linear_client.py` for
+the exact digest this scheme produces for a fixed input.
 
 ### Configuration: pluggable seams
 

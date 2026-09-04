@@ -18,6 +18,8 @@ import pytest
 import linear_client
 from linear_client import (
     LinearAPIError,
+    LinearTokenMissingError,
+    LinearTransportError,
     _post_graphql,
     _progress_comment_body,
     _require_api_token,
@@ -40,8 +42,13 @@ def _set_fake_post(monkeypatch: pytest.MonkeyPatch, response: httpx.Response) ->
 
 class TestRequireApiToken:
     def test_missing_token_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Argus review round-7 suggestion: assert the typed subclass, not
+        # just the base `LinearAPIError` -- `service._sanitize_apply_error`
+        # dispatches on this exact type, so a regression back to a bare
+        # `LinearAPIError` here would silently misclassify every
+        # missing-token failure as the generic message.
         monkeypatch.delenv(_TOKEN_ENV_VAR, raising=False)
-        with pytest.raises(LinearAPIError, match=_TOKEN_ENV_VAR):
+        with pytest.raises(LinearTokenMissingError, match=_TOKEN_ENV_VAR):
             _require_api_token()
 
     def test_present_token_returned(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -61,7 +68,10 @@ class TestPostGraphql:
             raise httpx.ConnectError("boom")
 
         monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
-        with pytest.raises(LinearAPIError):
+        # Argus review round-7 suggestion: assert the typed
+        # `LinearTransportError` subclass -- see the same rationale on
+        # `test_missing_token_raises` above.
+        with pytest.raises(LinearTransportError):
             await _post_graphql("query {}", {})
 
     async def test_non_2xx_status_wrapped_as_linear_api_error(
@@ -70,7 +80,7 @@ class TestPostGraphql:
         monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
         response = httpx.Response(500, request=httpx.Request("POST", linear_client._LINEAR_API_URL))
         _set_fake_post(monkeypatch, response)
-        with pytest.raises(LinearAPIError):
+        with pytest.raises(LinearTransportError):
             await _post_graphql("query {}", {})
 
     async def test_json_decode_error_wrapped_as_linear_api_error(
@@ -87,7 +97,7 @@ class TestPostGraphql:
             request=httpx.Request("POST", linear_client._LINEAR_API_URL),
         )
         _set_fake_post(monkeypatch, response)
-        with pytest.raises(LinearAPIError):
+        with pytest.raises(LinearTransportError):
             await _post_graphql("query {}", {})
 
     async def test_graphql_errors_payload_extracts_message_only(
