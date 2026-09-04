@@ -1110,7 +1110,9 @@ async def withdraw_proposal_route(request: Request) -> Response:
     proposal is stale or simply wrong and wants it retracted before a
     human can decide it. A resubmission for the SAME ``target_id``/
     ``action_type`` doesn't need this at all -- dedup already updates a
-    matching pending row in place.
+    matching PENDING row in place. An ``'applying'`` match is not mutated
+    that way, though (see ``service.withdraw_proposal``'s docstring) -- a
+    fresh submission after that claim resolves is the retry path.
 
     Body: ``{"reason": "<optional string, max 2000 chars>"}``. Auth: same
     bot-only gate as submission/``GET /proposals/{id}`` -- a human can

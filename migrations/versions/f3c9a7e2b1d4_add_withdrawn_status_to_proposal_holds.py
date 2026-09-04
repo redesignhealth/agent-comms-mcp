@@ -5,11 +5,14 @@ Revises: e2f7a91c5b34
 Create Date: 2026-09-04 00:00:00.000000
 
 TECH-6018: lets the SUBMITTING bot retire its own still-``pending``
-proposal via a new ``POST /proposals/{id}/withdraw`` route, so it can
-either drop a proposal outright or replace it with a different
-``target_id``/``action_type`` that the existing create-time dedup (keyed
-on the OLD target/action_type) would never match. Not the TTL-based lazy
-expiry ``approval_holds`` uses for its own, differently-named ``expired``
+proposal via a new ``POST /proposals/{id}/withdraw`` route -- most useful
+when the bot has since determined the proposal is stale or simply wrong
+and wants it retracted before a human can decide it. NOT for freeing up
+the create-time dedup key: a resubmission for the SAME ``(kind,
+proposed_by_bot_id, target_id, action_type)`` key already updates the
+existing pending row in place at create time, and a DIFFERENT key was
+never blocked to begin with. Not the TTL-based lazy expiry
+``approval_holds`` uses for its own, differently-named ``expired``
 status -- ``proposal_holds`` has no ``expires_at`` column or sweep
 mechanism; this is a caller-initiated retraction, always immediate.
 

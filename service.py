@@ -6026,6 +6026,18 @@ async def create_proposal(
         decision_note=decision_note,
     )
     if result is not None:
+        # `_apply_or_finalize_proposal_hold` returns a dict, not a
+        # `ProposalHold` (it re-fetches and discards the ORM object
+        # internally), so `_bot_facing_proposal_dict` -- which takes a
+        # `ProposalHold` -- doesn't apply directly here. Its
+        # `decision_source` is always ``"auto"`` on THIS call (the only
+        # other caller, `decide_proposal`, passes `"human"`), so this is a
+        # no-op today, not an actual leak -- but redact anyway (Argus
+        # review round-3 suggestion) so every bot-facing return path in
+        # this function uses the SAME redaction rule, not one relying on
+        # this call site's argument happening to be `"auto"`.
+        if result.get("decision_source") == "human":
+            result.pop("decided_by_actor_id", None)
         return result
     # Vanishingly unlikely given the claim above already serializes
     # access to this hold_id, but the helper's own re-check is the
@@ -6110,10 +6122,7 @@ async def get_proposal_for_bot(
             action="denied.proposal_hold_not_submitter",
             detail={"attempted_hold_id": str(hold_id)},
         )
-    result = _proposal_dict(hold)
-    if hold.decision_source == "human":
-        result.pop("decided_by_actor_id", None)
-    return result
+    return _bot_facing_proposal_dict(hold)
 
 
 async def withdraw_proposal(
@@ -6129,8 +6138,13 @@ async def withdraw_proposal(
     is stale or simply wrong (e.g. the situation it was reacting to changed)
     and wants it retracted before a human can decide it, rather than a
     resubmission for the SAME ``target_id``/``action_type``, which the
-    create-time dedup already handles by updating the existing pending row
-    in place -- no withdraw needed for that case.
+    create-time dedup already handles by updating the existing PENDING row
+    in place -- no withdraw needed for THAT case. An ``'applying'`` match
+    (claimed by a concurrent decide/auto-judge) is NOT mutated in place by
+    that same dedup, though (see ``_dedup_or_insert_proposal``'s own
+    docstring) -- it's returned as-is -- and this function's own 409 below
+    means neither resubmit nor withdraw is an escape hatch during that
+    window; a fresh submission after the claim resolves is the retry path.
 
     Sender-only, same uniform-404 anti-enumeration posture as
     ``get_proposal_for_bot``/``decide_proposal``: unknown hold and
@@ -6184,7 +6198,7 @@ async def withdraw_proposal(
     # know the server-computed value without a refresh -- see
     # `decide_proposal`'s reject branch for the same pattern/reasoning.
     await session.refresh(hold)
-    return _proposal_dict(hold)
+    return _bot_facing_proposal_dict(hold)
 
 
 async def _find_proposal_hold(

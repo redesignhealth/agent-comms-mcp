@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import select, text, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -225,6 +225,45 @@ class TestDedup:
         rows = (await session.execute(select(ProposalHold))).scalars().all()
         assert len(rows) == 2
         assert second["proposal_id"] != first["proposal_id"]
+
+    async def test_resubmission_against_applying_row_redacts_human_decider(
+        self, session: AsyncSession
+    ) -> None:
+        """Argus review round-3 suggestion: the exact scenario the round-2
+        BLOCKING fix (``_bot_facing_proposal_dict``) was written for --
+        seed an ``'applying'`` row a HUMAN concurrently claimed (dedup's
+        partial index covers ``'applying'`` too, per this module's own
+        docstring), resubmit against the SAME dedup key, and confirm the
+        submitting bot's response never discloses that human's identity.
+        Without the round-2 fix, every one of the three converted
+        ``create_proposal`` return sites could regress to a bare
+        ``_proposal_dict`` call and this test would still pass green if it
+        only checked ``status`` -- it must assert the REDACTION itself."""
+        action = _action(target_id="TECH-77")
+        applying_hold = ProposalHold(
+            kind="linear_progress_update",
+            proposed_by_bot_id="bot-1",
+            owner_sub="owner-a@example.com",
+            action=action,
+            rationale="because reasons",
+            confidence="medium",
+            importance="medium",
+            impact="medium",
+            priority="medium",
+            target_fingerprint="deadbeef",
+            status="applying",
+            decision_source="human",
+            decided_by_actor_id="owner-a@example.com",
+            decided_at=func.now(),
+        )
+        session.add(applying_hold)
+        await session.commit()
+
+        result = await _submit(session, action=action, target_fingerprint="fp-new")
+
+        assert result["status"] == "applying"
+        assert result["proposal_id"] == str(applying_hold.id)
+        assert "decided_by_actor_id" not in result
 
     async def test_missing_target_id_raises_value_error(self, session: AsyncSession) -> None:
         with pytest.raises(ValueError):
@@ -1143,8 +1182,11 @@ class TestGetProposalForBot:
 
 class TestWithdrawProposal:
     """Service-layer coverage for ``withdraw_proposal`` (TECH-6018):
-    sender-only retraction of a still-pending proposal, and the dedup
-    unlock it produces for a same-key resubmission."""
+    sender-only retraction of a proposal the submitting bot has since
+    determined is stale or wrong, before a human can decide it -- NOT for
+    unlocking a same-key resubmission, which the create-time dedup already
+    handles by updating the existing pending row in place (see
+    ``withdraw_proposal``'s own docstring)."""
 
     async def test_unknown_hold_raises_access_denied(self, session: AsyncSession) -> None:
         with pytest.raises(AccessDeniedError):
