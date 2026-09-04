@@ -52,6 +52,12 @@ service/tools boundary:
 - ``RateLimitExceededError``: a sender exceeded a per-hour cap. Specific by
   design — DESIGN.md does not treat rate limiting as an enumeration risk.
 
+- ``DocsVerificationFailedError`` (TECH-5998): a ``docs``-type message
+  failed ``plugins.DocsVerifier`` grounding/cleanliness verification.
+  Specific by design, same reasoning as ``RateLimitExceededError`` —
+  a content-correctness problem the sender can act on, not a secret to
+  guard against enumeration.
+
 - ``UnknownConversationTypeError``: ``accepted_types`` (at ``comms_register``)
   or ``conversation_type`` (at ``comms_start_conversation``) named a value
   outside ``schemas.CONVERSATION_TYPES``. Specific and lists the valid set
@@ -150,6 +156,28 @@ class ConversationArchivedError(Exception):
 
 class RateLimitExceededError(Exception):
     """A sender exceeded a rolling-window rate limit. Message is specific by design."""
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+class DocsVerificationFailedError(Exception):
+    """A ``docs``-type message (``schemas.DocsV1``) failed
+    ``plugins.DocsVerifier`` verification -- TECH-5998.
+
+    Message is specific by design, same reasoning as
+    ``RateLimitExceededError``: this is a content-correctness problem the
+    sender can act on (re-summarize, cite the right document), not an
+    access-control decision this board deliberately keeps opaque via
+    ``AccessDeniedError``. The caller has already passed authorization
+    checks (``_require_active_agent`` + ``_authorize_conversation_open`` on
+    the ``start_conversation`` path, or the equivalent active-participant
+    check on ``post_message``) by the time this can fire -- not
+    necessarily an existing conversation *participant*, since
+    ``start_conversation``'s opener has no participant row yet -- so there
+    is nothing to enumerate by naming the real cause here.
+    """
 
     def __init__(self, message: str, *, reason: str) -> None:
         super().__init__(message)
@@ -372,6 +400,7 @@ __all__ = [
     "AgentSuspendedError",
     "ConversationArchivedError",
     "DisplayNameCollisionError",
+    "DocsVerificationFailedError",
     "HoldAlreadyDecidedError",
     "HoldAwaitingAutoReviewError",
     "HoldExpiredError",

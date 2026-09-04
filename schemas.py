@@ -2,21 +2,26 @@
 
 Every message posted to the board must validate against the schema
 registered for ``(message_type, schema_version)`` — free text is limited to
-two explicitly-marked, individually-controlled types: ``note`` and
-``instruction_share`` (doc-backed kinds only; TECH-5822) (DESIGN.md §6, §9).
+three explicitly-marked, individually-controlled types: ``note``,
+``instruction_share`` (doc-backed kinds only; TECH-5822), and ``docs``
+(sender-authored summaries only, never raw document content; TECH-5998)
+(DESIGN.md §6, §9).
 Validation rules:
 
 - ``extra="forbid"`` on every model (strict — unknown fields rejected).
 - All datetimes are timezone-aware ISO 8601 (``AwareDatetime``); naive
   datetimes are rejected.
-- Enumerated string fields are closed ``Literal`` sets. Outside ``note``
-  and ``instruction_share``, no free-text fields anywhere — every other
-  field is a bounded numeric/datetime/enum value or a bounded list of them.
-  ``instruction_share``'s ``kind`` (not ``text`` itself) is drawn from a
-  closed ``InstructionKind`` enum; ``text`` is bounded by ``max_length`` and
-  verified downstream against a canonical per-``kind`` hash (see that
+- Enumerated string fields are closed ``Literal`` sets. Outside ``note``,
+  ``instruction_share``, and ``docs``, no free-text fields anywhere — every
+  other field is a bounded numeric/datetime/enum value or a bounded list of
+  them. ``instruction_share``'s ``kind`` (not ``text`` itself) is drawn from
+  a closed ``InstructionKind`` enum; ``text`` is bounded by ``max_length``
+  and verified downstream against a canonical per-``kind`` hash (see that
   model's docstring) — bounded, pre-approved free text, not an open
-  channel.
+  channel. ``docs``'s ``summary`` is genuinely sender-authored (not
+  pre-approved), so its containment is a dedicated downstream verification
+  stage instead (``plugins.DocsVerifier`` — see ``DocsV1``'s docstring),
+  not a canonical-text hash match.
 
 Discriminator field: every top-level message model also carries a
 ``type: Literal[...]`` field matching the DB ``messages.type`` column
@@ -118,6 +123,7 @@ MessageType = Literal[
     "counter_proposal",
     "confirm",
     "decline",
+    "docs",
     "instruction_request",
     "instruction_share",
     "needs_clarification",
@@ -455,6 +461,64 @@ class NoteV1(_StrictModel):
     text: str = Field(min_length=1, max_length=50000)
 
 
+class DocCitation(_StrictModel):
+    """One cited source document backing a ``docs`` message's summary --
+    TECH-5998. Identifies WHERE to look up the source for downstream
+    grounding verification (``account_id``, matching Arcana's own
+    tenant-id vocabulary -- ``str(Site.mdm_org_id)``, per redesign-ai's
+    ``services/arcana_client.py``) and WHICH document within that account
+    (``document_id``) -- never the document's own content, which is
+    exactly what ``DocsV1`` exists to keep out of the message payload
+    entirely (see that model's docstring).
+    """
+
+    # A real DocsVerifier holds cross-account access and builds API calls
+    # (e.g. ``GET /accounts/{account_id}/documents/{document_id}``) from
+    # these values -- unconstrained strings would let a `/`, `..`, or other
+    # separator-shaped value smuggle path/URL injection into that lookup.
+    # `\w` (word chars) plus `-` covers every id shape this repo has seen
+    # from Arcana (module docstring) without permitting separators.
+    account_id: str = Field(min_length=1, max_length=100, pattern=r"^[\w-]+$")
+    document_id: str = Field(min_length=1, max_length=200, pattern=r"^[\w-]+$")
+    # filename is display-only (never used to build a lookup path), so this
+    # excludes path separators and control/NUL bytes rather than
+    # restricting to a word-character allowlist -- same rationale as
+    # InstructionShareV1.link's pattern above: block the concretely
+    # exploitable class, not every non-alphanumeric character.
+    filename: str = Field(min_length=1, max_length=255, pattern=r'^[^/\\<>:"|?*\x00-\x1f]+$')
+
+
+class DocsV1(_StrictModel):
+    """docs / v1 -- TECH-5998, cited-summary sharing, barrier-sensitive
+    (``plugins.BARRIER_SENSITIVE_TYPES``).
+
+    A second, narrower exception to "no free text" alongside ``note``
+    (module docstring) -- ``summary`` is sender-authored free text, unlike
+    ``instruction_share``'s enum-selected canonical text. The containment
+    model is different from ``note``'s, though: ``note`` is an injection
+    control problem solved by human review at send time (this schema's
+    module docstring, ``NoteV1``'s own docstring); ``docs`` additionally
+    carries a factual-grounding problem a human reviewer has no way to
+    check without independently re-reading the cited source document
+    themselves -- an LLM-authored summary can misstate or fabricate a
+    claim, or smuggle content from the source document well beyond what
+    the summary purports to cite. This schema only bounds shape (a summary
+    length far below ``NoteV1``'s 50000 -- a summary that needs to be that
+    long is not meaningfully different from raw content, and a generous
+    bound here would blur that line; at least one citation, capped at 5).
+    The actual grounding/cleanliness judgment happens downstream, in a
+    dedicated ``plugins.DocsVerifier`` stage that runs BEFORE the ordinary
+    structural approval pipeline (``plugins.RiskScorer``/``AutoApprover``)
+    -- see that Protocol's docstring for the full contract. Raw document
+    content is never a field on this schema at all: there is no way for a
+    sender to attach it even if a downstream check were skipped.
+    """
+
+    type: Literal["docs"] = "docs"
+    summary: str = Field(min_length=1, max_length=5000)
+    citations: list[DocCitation] = Field(min_length=1, max_length=5)
+
+
 class ConversationOpenedV1(_StrictModel):
     """conversation_opened / v1 — minimal system-synthesized marker
     (TECH-5389 PR2).
@@ -589,6 +653,7 @@ MESSAGE_SCHEMAS: dict[tuple[str, int], type[BaseModel]] = {
     ("counter_proposal", 1): CounterProposalV1,
     ("confirm", 1): ConfirmV1,
     ("decline", 1): DeclineV1,
+    ("docs", 1): DocsV1,
     ("instruction_request", 1): InstructionRequestV1,
     ("instruction_share", 1): InstructionShareV1,
     ("needs_clarification", 1): NeedsClarificationV1,

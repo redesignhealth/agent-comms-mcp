@@ -406,3 +406,26 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
         < drop_decision_source_pos
         < add_decision_source_pos
     )
+    # f3a1b9c7d2e4 (TECH-5998): broadens idx_messages_conversation_id_free_text
+    # from ('note', 'instruction_share') to also cover 'docs', backing
+    # service._conversation_has_note_history's query now that `docs` has
+    # joined plugins.BARRIER_SENSITIVE_TYPES. Explicit assertions here, same
+    # rationale as c1a2b3d4e5f6's above: a typo in this migration's index
+    # name, column, or WHERE predicate would otherwise be invisible to CI.
+    two_type_predicate_pos = result.stdout.index(
+        "CREATE INDEX IF NOT EXISTS idx_messages_conversation_id_free_text "
+        "ON messages (conversation_id) WHERE type IN ('note', 'instruction_share')"
+    )
+    assert (
+        result.stdout.count("DROP INDEX IF EXISTS public.idx_messages_conversation_id_free_text")
+        == 1
+    )
+    three_type_predicate_pos = result.stdout.index(
+        "CREATE INDEX IF NOT EXISTS idx_messages_conversation_id_free_text "
+        "ON messages (conversation_id) WHERE type IN ('note', 'instruction_share', 'docs')"
+    )
+    # Anchor on the OLD two-type predicate text (not the bare index name --
+    # see round-6's reasoning above for why that would be vacuous), so a
+    # hypothetically reordered migration would make this comparison itself
+    # fail rather than merely raising a different exception.
+    assert two_type_predicate_pos < three_type_predicate_pos

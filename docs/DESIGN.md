@@ -644,11 +644,15 @@ Design notes:
 ## 6. Message schemas (two-axis model)
 
 Strict Pydantic (`extra='forbid'`), timezone-aware datetimes only, enum-coded reasons,
-**no free-text fields anywhere except `note` and `instruction_share`'s doc-backed kinds**
-(TECH-5822 — the latter's `kind`, not `text` itself, is drawn from a closed
+**no free-text fields anywhere except `note`, `instruction_share`'s doc-backed kinds,
+and `docs`'s summary**
+(TECH-5822 — the `instruction_share` `kind`, not `text` itself, is drawn from a closed
 `InstructionKind` enum; `text` is bounded by `max_length` and verified downstream
 against a canonical per-kind hash, so it is bounded, pre-approved free text, not an
-open channel). All types legal only in `state=active`.
+open channel. TECH-5998 — `docs`'s `summary` is sender-authored free text gated by
+the pluggable `plugins.DocsVerifier` seam instead, which must confirm it is
+grounded in the cited document(s) and clean of site data before the message can
+even reach the ordinary approval pipeline). All types legal only in `state=active`.
 
 The `boundary_safe` column (below) no longer exists as a schema field (TECH-5389):
 which types can cross an ownership boundary is now scorer-private policy
@@ -673,6 +677,7 @@ crossing a boundary no longer denies the send — it diverts to a human-approval
 | `note` | **yes** | text (string) | free-text note; posts immediately unless it would cross a boundary, in which case it is held for human approval (never denied for that reason alone — see §9) |
 | `instruction_request` | no | kind (closed `InstructionKind` enum) | a newly-onboarding/handed-off agent's request for one of a fixed set of startup/handoff instructions; no content, so not boundary-sensitive |
 | `instruction_share` | **yes** | kind (`InstructionKind`) + exactly one of text (doc-backed kinds, 1-20000 chars) or link (link-backed kinds, `https://` URL, 1-2048 chars), per `kind`'s group | pre-defined instruction content, never arbitrary text; same posts-immediately-unless-crossing-a-boundary behavior as `note`. Content verified downstream (agent-comms-approvals' `RHAutoApprover`): doc-backed `text` against a canonical per-kind hash, link-backed `link` against a deployment-side allowlist — a mismatch always escalates to a human, never auto-clears |
+| `docs` | **yes** | summary (1-5000 chars, free text) + citations (1-5 `{account_id, document_id, filename}`) | cited-summary sharing (TECH-5998); never the raw document. Gated by the pluggable `plugins.DocsVerifier` seam BEFORE the ordinary approval pipeline even sees it: the verifier must open every cited document, confirm the summary is actually grounded in it, and confirm it's clean of site-identifying data — only then does it proceed to `_check_boundary_crossing` like any other barrier-sensitive type. The default `RejectAllDocsVerifier` fails closed; a real verifier is a deploy-side concern, same split as `instruction_share`'s canonical-hash/allowlist checks |
 | `conversation_opened` | no (exempt) | reason (enum, fixed `"pending_approval"`) | service-synthesized-only marker; never legal as a caller-supplied `message_type` (`denied.system_message_type`); the seq-1 message of a conversation whose real opener was diverted to a hold (§9) |
 
 ## 7. MCP tool surface
@@ -701,7 +706,7 @@ scroll-to-load-more use case.
 | `comms_list_conversations` | comms:read | paginated conversation list, filterable by `role`, `type`, and `state`; both `invited` and `active` participant statuses included |
 | `comms_accept` | comms:write | flips caller's participant status `invited → active`. Grants history read and posting rights from this point. Rejects with the specific `conversation_archived` error (TECH-5887, see `comms_archive_conversation`'s own row) if the conversation has been archived, even for an invite sent before archiving -- accepting admits a brand-new active participant with full retroactive history read, the same outcome archiving is meant to close off; `comms_decline_invite` is unaffected |
 | `comms_decline_invite` | comms:write | declines a pending invite: terminal, no access is ever granted. Requires caller to currently be `invited`. Distinct from `comms_leave` (which covers already-`active` members), keeping the audit trail clean |
-| `comms_invite` | comms:write | adds a target as `invited` (not `active`); a registry-retired target (TECH-5703) raises the same specific "agent retired" error `comms_start_conversation` does. `internal` additionally never admits an `is_shared` target (TECH-5735, §9 Axis 1). **Two response shapes**, same convention as `comms_post_message`: the normal invited-participant shape (`conversation_id`, `target_agent_id`, `status`, `invited_by`, plus `auto_approved: true` + `hold_id` when an `AutoApprover` cleared an invite hold inline rather than this being the ordinary no-hold path), or — if the conversation already has any `note` or `instruction_share` history (`plugins.BARRIER_SENSITIVE_TYPES`, TECH-5735/TECH-5822) — `{"held_for_approval": true, "hold_id", "conversation_id", "status", "risk_reason", "expires_at", "created_at"}` (plus `decision_url` when `DECISION_PAGE_BASE_URL` is configured) (§9 Axis 1's free-text invite-approval rule) — admitting a new participant grants it full retroactive history read the moment it accepts, so that requires human approval first, same as a high-risk message does. Rejects with the specific `conversation_archived` error (TECH-5887, see `comms_archive_conversation`'s own row) if the conversation has been archived |
+| `comms_invite` | comms:write | adds a target as `invited` (not `active`); a registry-retired target (TECH-5703) raises the same specific "agent retired" error `comms_start_conversation` does. `internal` additionally never admits an `is_shared` target (TECH-5735, §9 Axis 1). **Two response shapes**, same convention as `comms_post_message`: the normal invited-participant shape (`conversation_id`, `target_agent_id`, `status`, `invited_by`, plus `auto_approved: true` + `hold_id` when an `AutoApprover` cleared an invite hold inline rather than this being the ordinary no-hold path), or — if the conversation already has any `note`, `instruction_share`, or `docs` history (`plugins.BARRIER_SENSITIVE_TYPES`, TECH-5735/TECH-5822/TECH-5998) — `{"held_for_approval": true, "hold_id", "conversation_id", "status", "risk_reason", "expires_at", "created_at"}` (plus `decision_url` when `DECISION_PAGE_BASE_URL` is configured) (§9 Axis 1's free-text invite-approval rule) — admitting a new participant grants it full retroactive history read the moment it accepts, so that requires human approval first, same as a high-risk message does. Rejects with the specific `conversation_archived` error (TECH-5887, see `comms_archive_conversation`'s own row) if the conversation has been archived |
 | `comms_leave` | comms:write | leave: covers already-active members |
 | `comms_archive_conversation` | comms:write | archive a conversation (TECH-5887): sets `archived_at`, permanently. Any CURRENT `active` participant may trigger it (symmetric across the whole conversation, not gated to owner/creator) -- distinct from `comms_leave`, which only ever changes the CALLER's own participant row. Once archived: `comms_invite`/`comms_post_message`/`comms_accept` all reject with the specific `conversation_archived` error (not the uniform denial); also blocks approving a pending hold via the HTTP approval endpoint's `decide_hold` (the hold stays `pending_human`, a human can still reject it) -- the only one of the four blocked surfaces that isn't an MCP tool. Every read path (`comms_get_conversation`/`comms_inbox`/`comms_list_conversations`, and `comms_get_hold_status`) is completely unaffected -- archiving is not a delete or a redaction, every past message stays fully readable. Idempotent (re-archiving is a silent no-op, `archived_at` unchanged); one-directional -- no unarchive tool |
 
@@ -856,15 +861,17 @@ notify) even though the caller's actual opening content is held — only
  never posts), or `pending_human` (awaiting a decision). The same
  pipeline gates a second kind of hold, `kind=invite` (TECH-5735): a new
  participant is never admitted into a conversation with existing free-text
- (`note` or `instruction_share`, TECH-5822; jointly,
+ (`note`, `instruction_share` (TECH-5822), or `docs` (TECH-5998); jointly,
  `plugins.BARRIER_SENSITIVE_TYPES`) history without the identical explicit
  approval — never silently invited, never silently dropped, and approval
  creates the `participants` row (not a `messages` row) under the same
  three-outcome contract.
-3. Typed, schema-validated payloads only. No free text except `note` and
+3. Typed, schema-validated payloads only. No free text except `note`,
  `instruction_share`'s doc-backed kinds (TECH-5822 — bounded by
  `max_length` and verified downstream against a canonical per-kind hash,
- not an open channel), which now post immediately when they don't cross a
+ not an open channel), and `docs`'s summary (TECH-5998 — verified by the
+ pluggable `plugins.DocsVerifier` seam before it can even reach the
+ boundary-crossing check), which now post immediately when they don't cross a
  boundary and are held for human approval (never silently dropped, never
  denied for that reason alone) when they would (§9). Scorer INFRASTRUCTURE
  failure (an unscorable message) still hard-denies via `denied.risk_unscored`
@@ -975,12 +982,13 @@ invite that fails its predicate is denied, preventing unilateral de-isolation
 of an `internal` conversation or a boundary-violating expansion of an
 `asymmetric` one.
 
-**Any invite into a conversation with existing free-text history — `note` or
-`instruction_share` (TECH-5822; jointly, `plugins.BARRIER_SENSITIVE_TYPES`) —
+**Any invite into a conversation with existing free-text history — `note`,
+`instruction_share` (TECH-5822), or `docs` (TECH-5998; jointly,
+`plugins.BARRIER_SENSITIVE_TYPES`) —
 requires human approval (TECH-5735), regardless of conversation type.**
 `comms_accept` grants a new participant full retroactive read access to every
-existing message the moment it accepts — including any `note` or
-`instruction_share`, whose content is unstructured (or, for `instruction_share`,
+existing message the moment it accepts — including any `note`,
+`instruction_share`, or `docs`, whose content is unstructured (or, for `instruction_share`,
 verified only at send time against a specific canonical value, not re-verified
 retroactively for a new reader) and can't be risk-scored the way ownership sets
 can. A per-message check can never catch this, because the exposure isn't "a
@@ -1006,20 +1014,21 @@ hold pipeline this reuses.
 
 Axis 1 (admission — the whole participant set at conversation-open time,
 above) is untouched by this section. Axis 2 used to be a single hard
-`boundary_safe` schema flag; it is now three pluggable seams evaluated on
+`boundary_safe` schema flag; it is now five pluggable seams evaluated on
 every send, sharing one resolution mechanism (env-var-configured, fail-fast
 at startup — see the Configuration subsection below): a **risk scorer**, an
-**auto-approver**, and an **approval notifier**. `plugins.py` holds all
-three `Protocol` interfaces, their registries, and the shared resolver
-(`resolve_plugin`), mirroring this codebase's existing `OwnershipClient` seam
-convention: injected by the caller, never looked up ad hoc inside
-`service.py`.
+**auto-approver**, an **approval notifier**, an **active checker**, and (TECH-5998)
+a **docs verifier**. `plugins.py` holds all five `Protocol` interfaces, their
+registries, and the shared resolver (`resolve_plugin`), mirroring this
+codebase's existing `OwnershipClient` seam convention: injected by the caller,
+never looked up ad hoc inside `service.py`.
 
 **Seam 1 — the risk scorer** decides, per send, whether the message is
 high-risk (`RiskVerdict(high_risk, reason, detail)`). The v1 implementation,
 `boundary_v1` (`BoundaryCrossingScorer`), is the relocated former
 `boundary_safe` rule, now scorer-private policy data
-(`BARRIER_SENSITIVE_TYPES = {"note"}`) rather than a schema field:
+(`BARRIER_SENSITIVE_TYPES = {"note", "instruction_share", "docs"}`) rather
+than a schema field:
 
 - A non-sensitive type is never high risk on its own. For `open`/`internal`
  this skips the ownership lookup entirely (the cheap common path). For
@@ -1472,11 +1481,12 @@ the exact digest this scheme produces for a fixed input.
 
 `RISK_SCORER` (default `boundary_v1`), `AUTO_APPROVER` (default
 `escalate_all`), `APPROVAL_NOTIFIER` (default `log_only`), `ACTIVE_CHECKER`
-(default `always_active`, TECH-5703 — see "A fifth seam" below) each
-resolve a registry name or, if the value contains a `:`, an import path
+(default `always_active`, TECH-5703 — see "A fifth seam" below), and
+`DOCS_VERIFIER` (default `reject_all`, TECH-5998 — see "A sixth seam" below)
+each resolve a registry name or, if the value contains a `:`, an import path
 (`"pkg.module:factory"`) via `importlib` — letting a deployment plug in a
 private implementation from its own package on `PYTHONPATH` without forking
-this repo. All four are validated at process start
+this repo. All five are validated at process start
 (`plugins.validate_configuration()`, called from `main._cli()` beside the
 existing `DATABASE_URL` fail-fast check): an unknown name, a bad import path,
 or (for `APPROVAL_NOTIFIER=webhook`) a missing `APPROVAL_WEBHOOK_URL`/
@@ -1544,7 +1554,7 @@ board's behavior before this seam existed — no filtering, no invite refusal �
 deployment configures a real, registry-backed implementation via `ACTIVE_CHECKER`.
 This board has no registry of its own; a real implementation is expected to be supplied
 by whichever consumer deploys this board alongside an actual agent-ownership registry,
-via the same `pkg.module:factory` mechanism the other four seams use. Design note: such
+via the same `pkg.module:factory` mechanism the other seams use. Design note: such
 an implementation should reuse whatever cache its `OWNERSHIP_CLIENT`/
 `AGENT_TOKEN_VERIFIERS` registry lookup already needs (TTL + negative-cache +
 stale-serve-on-registry-unavailability), not stand up a second, differently-tuned cache
@@ -1563,6 +1573,34 @@ also fans its per-row `is_active()` calls out concurrently via `asyncio.gather`
 (up to `limit`, capped at 200, concurrent calls per page) rather than
 sequentially — a real implementation must be safe under that burst width
 (e.g. connection-pool-bounded), not built assuming one call at a time.
+
+**A sixth seam, `DOCS_VERIFIER`** (default `reject_all`) [TECH-5998], resolves the
+same way as the other stateless, process-wide-singleton seams (`plugins.resolve_plugin`/
+`plugins.validate_configuration`). Answers one question per `docs` message,
+`verify(DocsVerificationContext) -> DocsVerificationResult`: is this summary actually
+grounded in the cited document(s), and clean of site-identifying data? Called from
+both `start_conversation` and `post_message`, after schema validation but before the
+ordinary risk-scoring pipeline (`_check_boundary_crossing`/`_score_message_risk`) ever
+sees the message — a `docs` message that fails verification is denied outright
+(`DocsVerificationFailedError`, caller-visible, same reasoning as
+`RateLimitExceededError`), it never reaches the boundary-crossing check at all. This is
+a distinct stage from that pipeline, not folded into it: boundary-crossing decides
+whether a message that is already known-safe-to-send may cross an ownership boundary
+without human review; the docs verifier decides whether the message is safe to send in
+the first place. The default `RejectAllDocsVerifier` fails closed (every `docs` message
+is denied) since this repo has no client for cross-account document fetching — same
+"code owns vocabulary, deploy-side owns judgment" split as `instruction_share`'s
+canonical-hash/link-allowlist checks. A real implementation needs privileged,
+cross-account read access this board's own callers do NOT have (that is the entire
+point: a sender can request a summary be shared without itself being trusted to read
+every cited document), and is expected to be supplied by whichever consumer deploys
+this board, via the same `pkg.module:factory` mechanism the other seams use. An
+infrastructure failure inside a real verifier (the cited document store is
+unreachable, say) must raise `DocsVerificationInfraError` rather than returning
+`verified=False` — that distinction routes to the uniform `AccessDeniedError` denial
+(`denied.docs_verification_unscored`) instead of the caller-visible
+`DocsVerificationFailedError`, so a transient infra outage is never misreported to the
+sender as "your summary failed grounding review."
 
 **`owner_sub` provenance — accepted risk, partially resolved by the
 snapshot design.** Every high-risk post now depends on the decide

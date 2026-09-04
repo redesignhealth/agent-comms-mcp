@@ -19,6 +19,8 @@ from schemas import (
     ConfirmV1,
     CounterProposalV1,
     DeclineV1,
+    DocCitation,
+    DocsV1,
     InstructionRequestV1,
     InstructionShareV1,
     NeedsClarificationV1,
@@ -375,6 +377,134 @@ class TestNoteV1:
     def test_rejects_extra_field(self) -> None:
         with pytest.raises(ValidationError):
             NoteV1.model_validate({"text": "hi", "other": 1})
+
+
+class TestDocCitation:
+    def _valid(self, **overrides: object) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "account_id": "acct-123",
+            "document_id": "doc-456",
+            "filename": "board-deck.pdf",
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_accepts_valid_citation(self) -> None:
+        model = DocCitation.model_validate(self._valid())
+        assert model.account_id == "acct-123"
+        assert model.document_id == "doc-456"
+        assert model.filename == "board-deck.pdf"
+
+    @pytest.mark.parametrize("field", ["account_id", "document_id", "filename"])
+    def test_rejects_empty_field(self, field: str) -> None:
+        with pytest.raises(ValidationError):
+            DocCitation.model_validate(self._valid(**{field: ""}))
+
+    def test_rejects_missing_field(self) -> None:
+        payload = self._valid()
+        del payload["document_id"]
+        with pytest.raises(ValidationError):
+            DocCitation.model_validate(payload)
+
+    def test_rejects_extra_field(self) -> None:
+        with pytest.raises(ValidationError):
+            DocCitation.model_validate(self._valid(other=1))
+
+    def test_rejects_overlong_account_id(self) -> None:
+        with pytest.raises(ValidationError):
+            DocCitation.model_validate(self._valid(account_id="x" * 101))
+
+    def test_rejects_overlong_document_id(self) -> None:
+        with pytest.raises(ValidationError):
+            DocCitation.model_validate(self._valid(document_id="x" * 201))
+
+    def test_rejects_overlong_filename(self) -> None:
+        with pytest.raises(ValidationError):
+            DocCitation.model_validate(self._valid(filename="x" * 256))
+
+    def test_accepts_account_id_at_max_length(self) -> None:
+        model = DocCitation.model_validate(self._valid(account_id="x" * 100))
+        assert model.account_id == "x" * 100
+
+    def test_accepts_document_id_at_max_length(self) -> None:
+        model = DocCitation.model_validate(self._valid(document_id="x" * 200))
+        assert model.document_id == "x" * 200
+
+    def test_accepts_filename_at_max_length(self) -> None:
+        model = DocCitation.model_validate(self._valid(filename="x" * 255))
+        assert model.filename == "x" * 255
+
+    @pytest.mark.parametrize("value", ["../admin", "id/evil", "id?x=y", "id with spaces"])
+    def test_rejects_account_id_injection_shapes(self, value: str) -> None:
+        with pytest.raises(ValidationError):
+            DocCitation.model_validate(self._valid(account_id=value))
+
+    @pytest.mark.parametrize("value", ["doc/path", "../secret", "doc?x=y"])
+    def test_rejects_document_id_injection_shapes(self, value: str) -> None:
+        with pytest.raises(ValidationError):
+            DocCitation.model_validate(self._valid(document_id=value))
+
+    @pytest.mark.parametrize("value", ["a/b.pdf", "a\\b.pdf", "a\x00b.pdf", "a\x1fb.pdf"])
+    def test_rejects_filename_control_and_path_chars(self, value: str) -> None:
+        with pytest.raises(ValidationError):
+            DocCitation.model_validate(self._valid(filename=value))
+
+
+class TestDocsV1:
+    def _valid(self, **overrides: object) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "summary": "The board deck shows Q3 revenue grew 12% YoY.",
+            "citations": [
+                {
+                    "account_id": "acct-123",
+                    "document_id": "doc-456",
+                    "filename": "board-deck.pdf",
+                }
+            ],
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_accepts_valid_summary_and_citation(self) -> None:
+        model = DocsV1.model_validate(self._valid())
+        assert model.type == "docs"
+        assert len(model.citations) == 1
+
+    def test_accepts_up_to_five_citations(self) -> None:
+        citation = self._valid()["citations"][0]  # type: ignore[index]
+        model = DocsV1.model_validate(self._valid(citations=[citation] * 5))
+        assert len(model.citations) == 5
+
+    def test_rejects_more_than_five_citations(self) -> None:
+        citation = self._valid()["citations"][0]  # type: ignore[index]
+        with pytest.raises(ValidationError):
+            DocsV1.model_validate(self._valid(citations=[citation] * 6))
+
+    def test_rejects_empty_citations(self) -> None:
+        with pytest.raises(ValidationError):
+            DocsV1.model_validate(self._valid(citations=[]))
+
+    def test_rejects_empty_summary(self) -> None:
+        with pytest.raises(ValidationError):
+            DocsV1.model_validate(self._valid(summary=""))
+
+    def test_accepts_summary_at_max_length(self) -> None:
+        model = DocsV1.model_validate(self._valid(summary="x" * 5000))
+        assert len(model.summary) == 5000
+
+    def test_rejects_overlong_summary(self) -> None:
+        with pytest.raises(ValidationError):
+            DocsV1.model_validate(self._valid(summary="x" * 5001))
+
+    def test_rejects_extra_field(self) -> None:
+        with pytest.raises(ValidationError):
+            DocsV1.model_validate(self._valid(other=1))
+
+    def test_rejects_missing_citations(self) -> None:
+        payload = self._valid()
+        del payload["citations"]
+        with pytest.raises(ValidationError):
+            DocsV1.model_validate(payload)
 
 
 class TestTaskAssignV1:
