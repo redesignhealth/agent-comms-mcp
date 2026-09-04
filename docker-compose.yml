@@ -20,7 +20,7 @@ services:
       OKTA_CLIENT_SECRET: ${OKTA_CLIENT_SECRET}
       MCP_JWT_SECRET: ${MCP_JWT_SECRET}
       AGENT_JWT_SECRET: ${AGENT_JWT_SECRET}
-      LINEAR_API_TOKEN: ${LINEAR_API_TOKEN:-}
+      LINEAR_API_TOKEN: ${LINEAR_API_TOKEN}
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/agent_comms
     volumes:
       - token-storage:/data

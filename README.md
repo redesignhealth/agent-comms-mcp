@@ -305,7 +305,22 @@ docker compose up --build
 | `DECISION_PAGE_BASE_URL` | Base URL of the separate `agent-comms-approvals-decision-page` service. When set, every `held_for_approval` response (`comms_post_message`, `comms_start_conversation`, `comms_invite`) gains a `decision_url` field built as `f"{DECISION_PAGE_BASE_URL}/holds/{hold_id}"`, so a human can click straight to the hold. Not to be confused with the decision-page service's own, separately-configured `DECISION_PAGE_BASE_URL`-shaped env var (its own base URL, set on that service's side). Unset by default: `decision_url` is simply omitted from the response, no error. |
 | `LINEAR_API_TOKEN` | A Linear **personal API token** (not an OAuth workspace token -- see `.env.example`; the client sends it unprefixed, without a `Bearer` prefix) for `linear_client.py`'s direct Linear API calls, used when a `POST /proposals/{id}/decide` approval or an auto-approved submission applies a `linear_progress_update` proposal. The server runs without it, but any such apply resolves to `apply_failed` if it's unset. |
 
-**Deployment prerequisite for the approve/apply path (TECH-5874, Argus review round-4 suggestion):** in ECS environments, `LINEAR_API_TOKEN` is provisioned via SSM (`/reclaw-comms/{env}/linear-api-token`) by `rh-data-platform`'s Terraform, a SEPARATE repo/deploy from this one -- landing this repo's TECH-5873 code does not itself provision the credential. Until that Terraform lands and applies, every approve/auto-apply of a `linear_progress_update` proposal resolves to `"apply_failed"` with a normal HTTP 200 (not an error response -- see the decide/apply section above), which is easy to misread as "it worked" during a deploy verification pass that only checks the status code. Confirm `apply_error` is absent (or check the `LINEAR_API_TOKEN` env var is actually set in the running container), not just that the response is 200.
+> [!WARNING]
+> **Deployment prerequisite for the approve/apply path (TECH-5874).** In ECS
+> environments, `LINEAR_API_TOKEN` is provisioned via SSM
+> (`/reclaw-comms/{env}/linear-api-token`) by `rh-data-platform`'s Terraform
+> -- a SEPARATE repo/deploy from this one. **Landing this repo's TECH-5873
+> code does not itself provision the credential.** Until that Terraform
+> lands and applies, every approve/auto-apply of a `linear_progress_update`
+> proposal resolves to `"apply_failed"` with a normal HTTP 200 (not an
+> error response -- see the decide/apply section above), which is easy to
+> misread as "it worked" during a deploy verification pass that only
+> checks the status code.
+>
+> **Pre-deploy checklist:** confirm `apply_error` is absent on a real
+> approve/auto-apply, or check that `LINEAR_API_TOKEN` is actually set in
+> the running container's environment -- not just that the response is
+> 200 (Argus review round-4 suggestion, round-5 S7).
 
 `entrypoint.sh` runs `alembic upgrade head` automatically on every container
 start, so migrations apply before the server accepts traffic.

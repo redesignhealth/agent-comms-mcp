@@ -6069,26 +6069,39 @@ async def _claim_proposal_hold_for_applying(
     return True
 
 
-_MAX_APPLY_ERROR_LENGTH = 500
+# Argus review round-5 S4: `apply_error` was previously returned to any
+# authenticated caller of `POST /proposals/{id}/decide`
+# via `_proposal_dict` -- any authenticated actor, not just an operator with
+# Linear/infra access. A raw `httpx` transport exception's `str()` can
+# contain request internals (a full URL including query params, redirect
+# targets, TLS/connection details) that are meant for an operator reading
+# logs, not for every caller of this endpoint. Rather than pass through an
+# unbounded set of possible messages (merely truncated), classify into a
+# small allowlisted set of caller-safe messages and log the real `str(exc)`
+# server-side at WARNING for whoever's debugging `apply_failed` -- the exact
+# same disposition `_apply_or_finalize_proposal_hold`'s `elif apply_error is
+# not None:` branch already logs, so nothing observable to an operator is
+# lost, only what's returned over the API is narrowed.
+_APPLY_ERROR_TOKEN_MESSAGE = "Linear API token not configured"
+_APPLY_ERROR_UNAVAILABLE_MESSAGE = "Linear API unavailable"
+_APPLY_ERROR_GENERIC_MESSAGE = "Linear API returned an error"
 
 
 def _sanitize_apply_error(exc: Exception) -> str:
-    """Bound the length of a ``LinearAPIError`` message before it's
-    persisted to ``hold.apply_error`` and returned to API callers via
-    ``_proposal_dict`` (Argus review round-4 suggestion). The messages
-    this module and ``linear_client.py`` construct themselves are already
-    curated -- ``linear_client._post_graphql`` extracts only the
-    ``message`` field from Linear's own GraphQL error objects (Argus
-    review round-2 S4), never the raw error payload -- so this is
-    defense-in-depth against an unexpectedly verbose ``httpx`` transport
-    exception (a stack-trace-shaped ``str()``, or a very long redirect
-    chain description) rather than a response to any KNOWN leak; truncate
-    rather than replace, so a human debugging ``apply_failed`` still sees
-    the actual error, just capped."""
+    """Map a ``LinearAPIError`` to one of a small allowlisted, caller-safe
+    message set before it's persisted to ``hold.apply_error`` and returned
+    to API callers via ``_proposal_dict`` (Argus review round-4 suggestion,
+    round-5 S4 hardening). The full, unredacted ``str(exc)`` is always
+    logged server-side by the caller (see
+    ``_apply_or_finalize_proposal_hold``'s ``logger.warning`` on the
+    ``apply_failed`` path) -- this function only bounds what leaves the
+    process via the API response."""
     text = str(exc)
-    if len(text) <= _MAX_APPLY_ERROR_LENGTH:
-        return text
-    return text[:_MAX_APPLY_ERROR_LENGTH] + "... (truncated)"
+    if "is not configured" in text:
+        return _APPLY_ERROR_TOKEN_MESSAGE
+    if "Linear API request failed" in text:
+        return _APPLY_ERROR_UNAVAILABLE_MESSAGE
+    return _APPLY_ERROR_GENERIC_MESSAGE
 
 
 async def _apply_or_finalize_proposal_hold(
@@ -6172,30 +6185,63 @@ async def _apply_or_finalize_proposal_hold(
     target_id, _action_type = _extract_proposal_target(hold.action)
     kind = hold.kind
     action = hold.action
+    rationale = hold.rationale
     stored_fingerprint = hold.target_fingerprint
     await session.commit()
 
     is_stale = False
     apply_error: str | None = None
+    # Argus review round-5 B1: `asyncio.CancelledError` (a `BaseException`,
+    # not caught by the `except linear_client.LinearAPIError` clauses
+    # below) previously propagated straight out of this function on
+    # cancellation -- an ASGI client disconnect mid-apply, or any other
+    # task cancellation during the fingerprinter/applier await -- leaving
+    # the hold permanently stuck at `"applying"` with no automated
+    # recovery (see the "Stuck applying rows" note in docs/DESIGN.md).
+    # Catch it, record a distinguishable apply_error, fall through to the
+    # SAME terminal write every other path below takes (so the hold still
+    # resolves to a real terminal status), and re-raise at the very end --
+    # this cooperative-cancellation shape (catch, clean up, re-raise) is
+    # the same one this module already uses at `_fire_approval_notifier`
+    # (see its own `except asyncio.CancelledError: raise` comment); the
+    # caller still observes its task as cancelled, this function just
+    # doesn't leave a stranded row behind while it happens.
+    cancelled_exc: asyncio.CancelledError | None = None
     try:
         fingerprinter = getattr(linear_client, _PROPOSAL_FINGERPRINTER_NAMES[kind])
         current_fingerprint = await fingerprinter(target_id)
         is_stale = current_fingerprint != stored_fingerprint
     except linear_client.LinearAPIError as exc:
         apply_error = _sanitize_apply_error(exc)
+    except asyncio.CancelledError as exc:
+        apply_error = "apply cancelled before completion (request disconnected or task cancelled)"
+        cancelled_exc = exc
     else:
         if not is_stale:
             applier = getattr(linear_client, _PROPOSAL_APPLIER_NAMES[kind])
             try:
-                await applier(action)
+                await applier(action, rationale)
             except linear_client.LinearAPIError as exc:
                 apply_error = _sanitize_apply_error(exc)
+            except asyncio.CancelledError as exc:
+                apply_error = (
+                    "apply cancelled before completion (request disconnected or task cancelled)"
+                )
+                cancelled_exc = exc
 
     hold = await _find_proposal_hold(session, hold_id, for_update=True)
     if hold is None:
         raise AssertionError("invariant violation: hold vanished between commit and re-read")
     if hold.status != expected_status:
         await session.commit()
+        # Argus review round-5 B1: re-raise a cancellation even on this
+        # early-return path -- a caller cancelled mid-apply is owed a
+        # cancelled task regardless of which return this function takes;
+        # swallowing it here just because a race also resolved the hold
+        # would be an accidental side-effect of return-path ordering, not
+        # a deliberate choice.
+        if cancelled_exc is not None:
+            raise cancelled_exc
         return None
 
     hold.decision_source = decision_source
@@ -6214,6 +6260,12 @@ async def _apply_or_finalize_proposal_hold(
     elif apply_error is not None:
         hold.status = "apply_failed"
         hold.apply_error = apply_error
+        logger.warning(
+            "proposal apply_failed for hold_id=%s target_id=%s: %s",
+            hold_id,
+            target_id,
+            apply_error,
+        )
         _audit(
             session,
             actor_sub=decided_by_actor_id,
@@ -6237,7 +6289,15 @@ async def _apply_or_finalize_proposal_hold(
     # this helper, rather than duplicated at each call site) is required,
     # unlike `decide_hold`'s `_hold_dict`, which never touches it.
     await session.refresh(hold)
-    return _proposal_dict(hold)
+    result = _proposal_dict(hold)
+    if cancelled_exc is not None:
+        # The terminal write above completed successfully despite the
+        # cancellation -- the hold is NOT stranded -- but the caller's
+        # task was still asked to cancel, and cooperative cancellation
+        # means honoring that after cleanup, not silently returning a
+        # normal result as if nothing happened.
+        raise cancelled_exc
+    return result
 
 
 async def decide_proposal(

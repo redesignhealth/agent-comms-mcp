@@ -60,12 +60,14 @@ mutation CreateComment($issueId: String!, $body: String!) {
 # actual Linear "write" for kind="linear_progress_update" is a comment
 # posted to the target issue, not an issue-state mutation -- this is a
 # progress-reporting bot (the name says so), and the two action_types the
-# judge understands (open_ticket/close_ticket, service._LINEAR_OPEN_TICKET_
-# ACTION_TYPES/_LINEAR_CLOSE_TICKET_ACTION_TYPES) read as "report that a
-# ticket was opened/closed", not "mutate this issue's workflow state" --
-# mutating state would additionally require resolving a team-specific
-# workflow state id, which the action payload doesn't carry. A future kind
-# that genuinely needs a state transition gets its own applier function.
+# judge understands (open_ticket/close_ticket -- see
+# citation_urls.CLOSE_TICKET_ACTION_TYPES for the close-ticket set, shared
+# with service.py to avoid semantic drift since Argus review round-4 S1)
+# read as "report that a ticket was opened/closed", not "mutate this
+# issue's workflow state" -- mutating state would additionally require
+# resolving a team-specific workflow state id, which the action payload
+# doesn't carry. A future kind that genuinely needs a state transition
+# gets its own applier function.
 
 
 class LinearAPIError(Exception):
@@ -119,6 +121,21 @@ def compute_target_fingerprint(issue: dict[str, Any]) -> str:
     ``stale``. This function is the single source of truth for that scheme
     on the agent-comms-mcp side; see ``docs/DESIGN.md``'s proposal
     decide/apply section for the contract note.
+
+    Exact serialization pinned here (Argus review round-5 S6 -- a
+    same-inputs-different-bytes bug in either implementation would be
+    silent and only surface as spurious ``stale`` results, so this is
+    intentionally explicit rather than "whatever ``json.dumps`` happens to
+    do"): ``json.dumps(..., sort_keys=True)`` with the library DEFAULT
+    ``separators`` (``", "``/``": "``, i.e. a space after both `,` and `:`)
+    and DEFAULT ``ensure_ascii=True``; ``updated_at`` is the raw
+    ``updatedAt`` string as Linear's GraphQL API returns it (an ISO-8601
+    timestamp), not re-parsed or re-formatted. A cross-repo implementation
+    must match all of the above, not just the field set -- see
+    ``test_pinned_digest_for_fixed_input`` in ``tests/test_linear_client.py``
+    for the exact digest this scheme produces for a fixed input, which
+    would need updating (with the other side of the contract) if any of
+    these serialization choices ever changed.
     """
     state = issue.get("state") or {}
     assignee = issue.get("assignee") or {}
@@ -147,41 +164,61 @@ async def fetch_current_fingerprint(target_id: str) -> str:
     return compute_target_fingerprint(issue)
 
 
-def _progress_comment_body(action: dict[str, Any]) -> str:
+def _omit_invalid_url_instead_of_raising(action_type: str, key: str) -> bool:
+    """Whether an invalid ``key`` URL field should be silently OMITTED
+    from the Linear comment rather than raising -- per FIELD, not
+    (only) per ``action_type`` (Argus review round-5 B3 -- an earlier
+    version of this decision was made per-``action_type`` alone, which
+    desynced from the judge for exactly one combination it didn't
+    consider: ``open_ticket`` + a present-but-invalid ``resolving_pr_url``).
+
+    The judge (``service.evaluate_linear_progress_update_judge``) never
+    inspects ``resolving_pr_url`` for ``open_ticket`` at all -- it is not
+    part of that action_type's approval criteria one way or the other, so
+    its validity is irrelevant to why this proposal got approved. Raising
+    on it anyway (the old per-``action_type`` logic did, since
+    ``open_ticket`` isn't a close-ticket action type) meant a proposal
+    the judge legitimately auto-approved on a valid ``source_message_url``
+    alone could still deterministically hit ``apply_failed`` if it also
+    happened to carry an unrelated, invalid ``resolving_pr_url`` -- with
+    no retry path, since the terminal row blocks a dedup'd resubmission
+    (see ``docs/DESIGN.md``'s stuck-``applying``/dedup section).
+    ``resolving_pr_url`` is therefore ALWAYS omit-on-invalid, for every
+    action_type: for close-ticket it already has an OR-partner (see
+    below), and for every other action_type the judge doesn't gate on it
+    at all -- there is no action_type today where an invalid
+    ``resolving_pr_url`` should block the apply.
+
+    ``source_message_url`` is different: for ``open_ticket`` it is the
+    SOLE required field with no OR-partner, so an invalid one there means
+    a human manually approved a proposal the judge itself never would
+    have -- that must still raise. For close-ticket action types, it has
+    an OR-partner (``resolving_pr_url``) per the judge's rule, so the
+    same reasoning as always applies: omit rather than raise."""
+    if key == "resolving_pr_url":
+        return True
+    return action_type in citation_urls.CLOSE_TICKET_ACTION_TYPES
+
+
+def _progress_comment_body(action: dict[str, Any], rationale: str) -> str:
     # Argus review S3: re-validate URL fields with the same allowlist
     # `citation_urls.is_valid_citation_url` uses at judging time (extracted
     # to a neutral shared module in Argus review round-2 S2, so this no
     # longer needs a lazy `import service` to reach it). A proposal can
     # reach here via manual human approval (not just the auto-approve
     # judge path), so a non-allowlisted URL must not silently reach Linear.
-    #
-    # Argus review round-2 B3 + round-3 S4: for close-ticket actions ONLY,
-    # SKIP a non-allowlisted URL rather than raising. The judge's
-    # close-ticket rule auto-approves when EITHER `source_message_url` OR
-    # `resolving_pr_url` is valid (OR semantics -- the other field can be
-    # present-but-invalid, or simply absent, and the judge doesn't care).
-    # Raising here on ANY present-but-invalid field enforced AND
-    # semantics instead, so a judge-approved close-ticket proposal with
-    # exactly one valid + one invalid URL would deterministically fail
-    # apply with no retry path through decide. Omitting the invalid field
-    # (rather than writing it verbatim, which the pre-round-2 S3 fix
-    # already ruled out) keeps the security property -- no
-    # non-allowlisted URL ever reaches the Linear comment -- while
-    # matching what actually got THIS action_type's proposal approved.
-    # Every OTHER action_type (open_ticket, or anything unrecognized) has
-    # no such OR-partner, so a present-but-invalid field there still
-    # raises (see the module-level comment above this function).
+    # See `_omit_invalid_url_instead_of_raising`'s own docstring for the
+    # per-field/per-action_type omit-vs-raise reasoning (Argus review
+    # round-2 B3, round-3 S4, round-5 B3).
     action_type = action.get("action_type", "update")
-    omit_instead_of_raise = action_type in citation_urls.CLOSE_TICKET_ACTION_TYPES
     lines = [f"Progress update: {action_type}"]
-    rationale = action.get("rationale")
-    if isinstance(rationale, str) and rationale:
+    if rationale:
         lines.append(rationale)
     for label, key in (("Source", "source_message_url"), ("Resolved by", "resolving_pr_url")):
         value = action.get(key)
         if isinstance(value, str) and value:
             if not citation_urls.is_valid_citation_url(value):
-                if omit_instead_of_raise:
+                if _omit_invalid_url_instead_of_raising(action_type, key):
                     logger.warning(
                         "Omitting %s from Linear comment for target_id=%r: "
                         "failed citation-URL validation",
@@ -194,15 +231,26 @@ def _progress_comment_body(action: dict[str, Any]) -> str:
     return "\n\n".join(lines)
 
 
-async def apply_progress_update(action: dict[str, Any]) -> None:
+async def apply_progress_update(action: dict[str, Any], rationale: str) -> None:
     """Execute the real Linear write for a decided ``linear_progress_update``
     proposal -- posts a comment on ``action["target_id"]`` summarizing the
     action (see ``_progress_comment_body``). Called ONLY after staleness
     has already been checked by the caller. Raises ``LinearAPIError`` on
     any failure; the caller maps that to ``status="apply_failed"``.
+
+    ``rationale`` is a top-level ``ProposalHold`` column, NOT part of
+    ``action`` (Argus review round-5 B2): a proposal's human-authored
+    justification for the write is threaded through as its own
+    parameter, not read off ``action`` -- ``action`` is exactly the
+    caller-submitted JSONB blob (``ProposalHold.action``), which never
+    contains it. An earlier version of this function read
+    ``action.get("rationale")``, which was always ``None`` in production
+    (the field simply isn't there) and only appeared to work in tests
+    because the test fixtures incorrectly baked ``rationale`` into the
+    action dict they constructed.
     """
     target_id = action["target_id"]
-    body = _progress_comment_body(action)
+    body = _progress_comment_body(action, rationale)
     result = await _post_graphql(_COMMENT_MUTATION, {"issueId": target_id, "body": body})
     if not result.get("commentCreate", {}).get("success"):
         raise LinearAPIError("commentCreate returned success=false")

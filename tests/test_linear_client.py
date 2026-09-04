@@ -215,10 +215,10 @@ class TestProgressCommentBody:
         body = _progress_comment_body(
             {
                 "action_type": "close_ticket",
-                "rationale": "Shipped in the linked PR.",
                 "source_message_url": _VALID_SOURCE_URL,
                 "resolving_pr_url": _VALID_PR_URL,
-            }
+            },
+            "Shipped in the linked PR.",
         )
         assert "Progress update: close_ticket" in body
         assert "Shipped in the linked PR." in body
@@ -226,26 +226,30 @@ class TestProgressCommentBody:
         assert f"Resolved by: {_VALID_PR_URL}" in body
 
     def test_all_optional_fields_absent(self) -> None:
-        body = _progress_comment_body({"action_type": "open_ticket"})
+        body = _progress_comment_body({"action_type": "open_ticket"}, "")
         assert body == "Progress update: open_ticket"
 
     def test_default_action_type_when_missing(self) -> None:
-        body = _progress_comment_body({})
+        body = _progress_comment_body({}, "")
         assert body == "Progress update: update"
 
     def test_only_rationale_present(self) -> None:
-        body = _progress_comment_body({"action_type": "open_ticket", "rationale": "Because."})
+        """Argus review round-5 B2: `rationale` is a top-level
+        `ProposalHold` column threaded through as its own parameter, NOT
+        read off the `action` dict -- a prior version of this test (and
+        of the production code) incorrectly baked it into `action`."""
+        body = _progress_comment_body({"action_type": "open_ticket"}, "Because.")
         assert body == "Progress update: open_ticket\n\nBecause."
 
     def test_only_source_message_url_present(self) -> None:
         body = _progress_comment_body(
-            {"action_type": "open_ticket", "source_message_url": _VALID_SOURCE_URL}
+            {"action_type": "open_ticket", "source_message_url": _VALID_SOURCE_URL}, ""
         )
         assert body == f"Progress update: open_ticket\n\nSource: {_VALID_SOURCE_URL}"
 
     def test_only_resolving_pr_url_present(self) -> None:
         body = _progress_comment_body(
-            {"action_type": "close_ticket", "resolving_pr_url": _VALID_PR_URL}
+            {"action_type": "close_ticket", "resolving_pr_url": _VALID_PR_URL}, ""
         )
         assert body == f"Progress update: close_ticket\n\nResolved by: {_VALID_PR_URL}"
 
@@ -263,7 +267,8 @@ class TestProgressCommentBody:
                 {
                     "action_type": "open_ticket",
                     "source_message_url": "https://not-allowlisted.example/p123",
-                }
+                },
+                "",
             )
 
     def test_non_allowlisted_source_url_on_close_ticket_is_omitted_not_raised(self) -> None:
@@ -275,7 +280,8 @@ class TestProgressCommentBody:
             {
                 "action_type": "close_ticket",
                 "source_message_url": "https://not-allowlisted.example/p123",
-            }
+            },
+            "",
         )
         assert "not-allowlisted.example" not in body
         assert body == "Progress update: close_ticket"
@@ -285,7 +291,8 @@ class TestProgressCommentBody:
             {
                 "action_type": "close_ticket",
                 "resolving_pr_url": "https://not-allowlisted.example/pull/1",
-            }
+            },
+            "",
         )
         assert "not-allowlisted.example" not in body
         assert body == "Progress update: close_ticket"
@@ -300,7 +307,27 @@ class TestProgressCommentBody:
                 "action_type": "close_ticket",
                 "source_message_url": _VALID_SOURCE_URL,
                 "resolving_pr_url": "https://not-allowlisted.example/pull/1",
-            }
+            },
+            "",
+        )
+        assert f"Source: {_VALID_SOURCE_URL}" in body
+        assert "not-allowlisted.example" not in body
+
+    def test_open_ticket_with_invalid_resolving_pr_url_is_omitted_not_raised(self) -> None:
+        """Argus review round-5 B3: an earlier version of this omit-vs-raise
+        decision was scoped per `action_type` alone (only close_ticket
+        omitted; open_ticket always raised). That desynced from the judge
+        for exactly this combination: open_ticket's judge rule never
+        inspects `resolving_pr_url` at all, so an invalid one here must
+        not block an otherwise judge-approved apply that only needed a
+        valid `source_message_url`."""
+        body = _progress_comment_body(
+            {
+                "action_type": "open_ticket",
+                "source_message_url": _VALID_SOURCE_URL,
+                "resolving_pr_url": "https://not-allowlisted.example/pull/1",
+            },
+            "",
         )
         assert f"Source: {_VALID_SOURCE_URL}" in body
         assert "not-allowlisted.example" not in body
@@ -314,7 +341,8 @@ class TestProgressCommentBody:
                 "action_type": "close_ticket",
                 "source_message_url": "https://not-allowlisted.example/p123",
                 "resolving_pr_url": "https://also-not-allowlisted.example/pull/1",
-            }
+            },
+            "",
         )
         assert "Source:" not in body
         assert "Resolved by:" not in body
@@ -335,7 +363,8 @@ class TestApplyProgressUpdate:
                 "target_id": "TECH-1234",
                 "action_type": "open_ticket",
                 "source_message_url": _VALID_SOURCE_URL,
-            }
+            },
+            "Because.",
         )
 
     async def test_success_false_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -354,7 +383,8 @@ class TestApplyProgressUpdate:
                     "target_id": "TECH-1234",
                     "action_type": "open_ticket",
                     "source_message_url": _VALID_SOURCE_URL,
-                }
+                },
+                "Because.",
             )
 
     async def test_invalid_url_on_close_ticket_is_omitted_write_still_proceeds(
@@ -385,6 +415,32 @@ class TestApplyProgressUpdate:
                 "target_id": "TECH-1234",
                 "action_type": "close_ticket",
                 "source_message_url": "https://not-allowlisted.example/p123",
-            }
+            },
+            "",
         )
         assert "not-allowlisted.example" not in captured["json"]["variables"]["body"]
+
+    async def test_rationale_reaches_the_comment_body(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Argus review round-5 B2 regression coverage: `rationale` (a
+        top-level `ProposalHold` column) must actually reach the posted
+        Linear comment when threaded through as its own parameter, not
+        silently dropped the way it was when the old code looked for it
+        inside `action` (where it never lived in production)."""
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        captured: dict[str, Any] = {}
+        success_body = b'{"data": {"commentCreate": {"success": true}}}'
+
+        async def _capture(
+            self: httpx.AsyncClient, url: str, *, json: dict[str, object], headers: dict[str, str]
+        ) -> httpx.Response:
+            captured["json"] = json
+            return httpx.Response(200, content=success_body, request=httpx.Request("POST", url))
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", _capture)
+        await apply_progress_update(
+            {"target_id": "TECH-1234", "action_type": "open_ticket"},
+            "This is the human-authored rationale.",
+        )
+        assert "This is the human-authored rationale." in captured["json"]["variables"]["body"]

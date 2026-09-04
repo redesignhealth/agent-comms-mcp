@@ -945,7 +945,10 @@ class TestDecideProposalEndpoint:
         assert resp.status_code == 200
         body = resp.json()
         assert body["status"] == "apply_failed"
-        assert body["apply_error"] == "linear unavailable"
+        # Argus review round-5 S4: the raw LinearAPIError message is no
+        # longer returned verbatim to API callers -- unrecognized messages
+        # map to the generic allowlisted message (see `_sanitize_apply_error`).
+        assert body["apply_error"] == "Linear API returned an error"
 
     async def test_retrying_applied_hold_does_not_double_call_linear(
         self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
@@ -998,3 +1001,38 @@ class TestDecideProposalEndpoint:
         )
         assert resp.status_code == 409
         assert resp.json()["status"] == "rejected"
+
+    async def test_deciding_already_applying_hold_returns_409(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        """Argus review round-5 S3: only ``test_proposal_service.py`` had
+        coverage for the ``"applying"``-observed-mid-decide 409 path
+        (``test_hold_resolved_during_apply_window_raises_already_decided``,
+        ``test_decide_on_already_applying_hold_raises_already_decided``) --
+        nothing exercised it through the actual HTTP route, which is what
+        callers other than this module's own test suite actually hit."""
+        from models import ProposalHold
+
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider, owner_sub="owner-a@example.com")
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+
+        hold = await session.get(ProposalHold, uuid.UUID(proposal_id))
+        assert hold is not None
+        hold.status = "applying"
+        # `ck_proposal_holds_decision_consistency` requires all three
+        # decision fields set together whenever status != "pending".
+        hold.decided_at = hold.created_at
+        hold.decided_by_actor_id = "owner-a@example.com"
+        hold.decision_source = "human"
+        await session.commit()
+
+        resp = await http_client.post(
+            f"/proposals/{proposal_id}/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={"decision": "approve"},
+        )
+        assert resp.status_code == 409
+        assert resp.json() == {"error": "already_decided", "status": "applying"}

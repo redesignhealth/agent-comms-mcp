@@ -319,8 +319,21 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
         "ON proposal_holds (kind, proposed_by_bot_id, (action ->> 'target_id'), "
         "(action ->> 'action_type')) WHERE status IN ('pending', 'applying')" in result.stdout
     )
-    # The widened index must appear strictly after the original 'pending'-only
-    # one emitted by 9a1c2d3e4f5b -- confirms this is a rebuild via a real
-    # migration step, not an accidental duplicate/edit of the earlier one.
-    widened_index_pos = result.stdout.index("WHERE status IN ('pending', 'applying')", dedup_pos)
-    assert dedup_pos < widened_index_pos
+    # The widened index must appear strictly after the ORIGINAL 'pending'-only
+    # predicate emitted by 9a1c2d3e4f5b -- confirms this is a rebuild via a
+    # real migration step (DROP the old predicate, CREATE the new one), not
+    # an accidental duplicate/edit of the earlier CREATE INDEX statement.
+    # Argus review round-5 S8: a prior version of this assertion compared
+    # against `dedup_pos` (the position of the bare index NAME, which only
+    # ever appears once in the whole output since every CREATE/DROP for this
+    # index references the same name) -- that made
+    # `widened_index_pos > dedup_pos` true by construction regardless of
+    # ordering, since `.index(..., dedup_pos)` can only ever find a position
+    # >= dedup_pos in the first place. Anchor on the OLD predicate text
+    # instead, which -- unlike the index name -- genuinely only appears in
+    # 9a1c2d3e4f5b's original CREATE, not in this migration's rebuild.
+    original_predicate_pos = result.stdout.index("WHERE status = 'pending'", dedup_pos)
+    widened_index_pos = result.stdout.index(
+        "WHERE status IN ('pending', 'applying')", original_predicate_pos
+    )
+    assert original_predicate_pos < widened_index_pos

@@ -424,7 +424,10 @@ class TestJudgeIntegration:
                 ),
             )
         assert result["status"] == "apply_failed"
-        assert result["apply_error"] == "LINEAR_API_TOKEN is not configured"
+        # Argus review round-5 S4: the raw LinearAPIError message is no
+        # longer returned verbatim to API callers -- it's mapped to one of
+        # a small allowlisted set (see `_sanitize_apply_error`).
+        assert result["apply_error"] == "Linear API token not configured"
         mock_apply.assert_not_awaited()
 
 
@@ -562,7 +565,9 @@ class TestDecideProposal:
             )
         assert decided["status"] == "applied"
         assert "applied_at" in decided
-        mock_apply.assert_awaited_once_with(submitted["action"])
+        # rationale is threaded as an explicit second argument, not part of
+        # the action dict (Argus review round-5 B2).
+        mock_apply.assert_awaited_once_with(submitted["action"], "because reasons")
 
     async def test_approve_stale_fingerprint_skips_apply(self, session: AsyncSession) -> None:
         submitted = await _submit(session, target_fingerprint="fp-original")
@@ -603,7 +608,9 @@ class TestDecideProposal:
                 decision_note=None,
             )
         assert decided["status"] == "apply_failed"
-        assert decided["apply_error"] == "linear is down"
+        # Argus review round-5 S4: unrecognized LinearAPIError messages map
+        # to the generic allowlisted message, not the raw exception text.
+        assert decided["apply_error"] == "Linear API returned an error"
         assert "applied_at" not in decided
 
     async def test_retrying_applied_hold_is_idempotent_no_op(self, session: AsyncSession) -> None:
@@ -678,7 +685,9 @@ class TestDecideProposal:
                 decision_note=None,
             )
         assert decided["status"] == "apply_failed"
-        assert decided["apply_error"] == "linear is down"
+        # Argus review round-5 S4: unrecognized LinearAPIError messages map
+        # to the generic allowlisted message, not the raw exception text.
+        assert decided["apply_error"] == "Linear API returned an error"
         mock_apply.assert_not_awaited()
 
     async def test_hold_resolved_during_apply_window_raises_already_decided(

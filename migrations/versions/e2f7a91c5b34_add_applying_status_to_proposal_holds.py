@@ -48,7 +48,16 @@ only be changed via DROP + CREATE.
 
 DEPLOYMENT: purely additive (widening a CHECK constraint's allowed value
 set, not narrowing it; widening a partial index's predicate to cover MORE
-rows, not fewer) -- safe for a normal rolling deploy. An old container's
+rows, not fewer) -- safe for a normal rolling deploy TODAY, while
+``proposal_holds`` has zero production write traffic (see the index-rebuild
+locking note below). This claim is time-bound, not permanent (Argus review
+round-5 S5): once TECH-5884 ships and the table takes live writes, the
+plain (non-``CONCURRENTLY``) index rebuild's ACCESS EXCLUSIVE lock would
+block concurrent writers for the rebuild's duration, and an old container
+mid-rollout still needs the "treats unknown status as opaque" reasoning
+below to hold -- re-verify both before applying this migration against a
+deployment with real traffic; don't assume "safe for rolling deploy" still
+applies unmodified. An old container's
 code never writes ``'applying'`` (it doesn't know the value exists) and
 reads any row's ``status`` as an opaque string it doesn't branch on
 except via equality checks against the OLD 6-value vocabulary, so it
