@@ -50,7 +50,7 @@ from collections.abc import Sequence
 from alembic import op
 
 revision: str = "f3a1b9c7d2e4"
-down_revision: str | None = "e2f7a91c5b34"
+down_revision: str | None = "f3c9a7e2b1d4"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
