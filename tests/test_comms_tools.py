@@ -715,10 +715,14 @@ class TestRegister:
         """Tool-layer counterpart to
         ``test_service.test_is_shared_frozen_on_reregister``: the freeze on
         ``is_shared`` is a design invariant independent of any scope gate --
-        re-registering through the MCP tool with a request to flip the value
-        neither gets denied nor changes the already-frozen stored value,
-        regardless of what scope either registration call carries. Freeze
-        semantics hold at this boundary too."""
+        re-registering through the MCP tool with a request to flip the
+        already-frozen ``True`` back to ``False`` neither gets denied nor
+        changes the stored value, regardless of what scope either
+        registration call carries. Freeze semantics hold at this boundary
+        too. (The reverse direction, ``False`` frozen against an upgrade to
+        ``True``, is covered by
+        ``test_register_is_shared_false_to_true_upgrade_attempt_stays_false``
+        below.)"""
         first_token = _token("agent-is-shared-freeze-mcp", scopes=["comms:read", "comms:write"])
         first = await _call(
             main,
@@ -742,7 +746,7 @@ class TestRegister:
             {
                 "display_name": "Freeze v2",
                 "accepted_types": ["availability_request"],
-                "is_shared": True,
+                "is_shared": False,
             },
         )
         assert second["is_shared"] is True
