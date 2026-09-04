@@ -233,6 +233,68 @@ class TestRegistryPerAgentCap:
         assert "comms://x1" in subscriptions._registry
         assert "comms://x2" in subscriptions._registry
 
+    async def test_eviction_uses_seq_not_dict_order_when_they_diverge(
+        self, monkeypatch: Any
+    ) -> None:
+        """Discriminates true seq-based eviction from a regression back to
+        dict/URI-iteration-order eviction (Argus round-3 SUGGESTION): a
+        naive test that only ever inserts URIs in seq order can't tell the
+        two algorithms apart, since they'd agree on every case where an
+        agent's own dict-position order happens to match its own seq order.
+
+        Divergence requires a URI another agent already subscribed to
+        BEFORE this agent ever touched it: that URI's dict position reflects
+        when it first entered `_registry` (via the OTHER agent), not when
+        THIS agent subscribed to it -- so this agent's chronologically NEWER
+        record can sit at an EARLIER dict position than its chronologically
+        OLDER record in a URI unique to it.
+        """
+        monkeypatch.setattr(subscriptions, "MAX_SUBSCRIPTIONS_PER_AGENT", 2)
+        agent_id = _new_agent_id()
+        other_agent_id = _new_agent_id()
+
+        # "shared" enters `_registry` via `other_agent_id` first, so it sits
+        # at dict position 0 well before `agent_id` ever subscribes to it.
+        await subscriptions.subscribe(
+            "comms://shared",
+            _FakeSession(),
+            agent_id=other_agent_id,
+            sub="other",  # type: ignore[arg-type]
+        )
+        # `agent_id`'s chronologically OLDEST record: a URI unique to it,
+        # inserted into the dict only now (dict position 1).
+        await subscriptions.subscribe(
+            "comms://own",
+            _FakeSession(),
+            agent_id=agent_id,
+            sub="a",  # type: ignore[arg-type]
+        )
+        # `agent_id`'s chronologically NEWEST record: "shared" already
+        # exists in the dict (from `other_agent_id`) at position 0 -- lower
+        # dict position than "own" despite a higher seq.
+        await subscriptions.subscribe(
+            "comms://shared",
+            _FakeSession(),
+            agent_id=agent_id,
+            sub="a",  # type: ignore[arg-type]
+        )
+        assert subscriptions._agent_subscription_counts[agent_id] == 2
+
+        # Push `agent_id` over the cap. Dict-order eviction (the regression
+        # this test guards against) would scan "shared" first and evict
+        # `agent_id`'s record there -- the wrong choice, since "own" is
+        # `agent_id`'s actual oldest record by seq.
+        await subscriptions.subscribe(
+            "comms://third",
+            _FakeSession(),
+            agent_id=agent_id,
+            sub="a",  # type: ignore[arg-type]
+        )
+
+        assert "comms://own" not in subscriptions._registry
+        assert any(r.agent_id == agent_id for r in subscriptions._registry["comms://shared"])
+        assert "comms://third" in subscriptions._registry
+
 
 class TestNotifyConversationEvent:
     async def test_fires_conversation_and_inbox_uris(self) -> None:
@@ -517,6 +579,94 @@ class TestSubscribeAuthorization:
             async with Client(main.mcp) as client:
                 with pytest.raises(McpError, match=re.escape("access_denied")):
                     await client.session.subscribe_resource(AnyUrl(uri))
+
+    async def test_left_participant_subscribe_is_denied(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Direct coverage for `allow_terminal_status`'s default-False path
+        (Argus round-3 SUGGESTION): a participant who left must still be
+        denied SUBSCRIBE (only unsubscribe tolerates a terminal status --
+        see `test_left_participant_can_unsubscribe` below)."""
+        conversation_id, _ids = await _start_open_conversation(
+            main, test_session_factory, "left-sub-owner", "left-sub-member"
+        )
+        member_token = _token("left-sub-member")
+        await _call(
+            main,
+            test_session_factory,
+            member_token,
+            "comms_accept",
+            {"conversation_id": conversation_id},
+        )
+        await _call(
+            main,
+            test_session_factory,
+            member_token,
+            "comms_leave",
+            {"conversation_id": conversation_id},
+        )
+        uri = f"comms://comms/conversations/{conversation_id}"
+
+        with (
+            _OIDC_PATCH,
+            _ENV_PATCH,
+            patch("providers.comms.get_access_token", return_value=member_token),
+            patch("providers.comms.get_session_factory", return_value=test_session_factory),
+            patch("main.get_session_factory", return_value=test_session_factory),
+        ):
+            async with Client(main.mcp) as client:
+                with pytest.raises(McpError, match=re.escape("access_denied")):
+                    await client.session.subscribe_resource(AnyUrl(uri))
+
+    async def test_left_participant_can_unsubscribe(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Direct coverage for `allow_terminal_status`'s True path (Argus
+        round-3 SUGGESTION): a participant who subscribed while active, then
+        left, must still be able to remove their own stale subscription --
+        the whole point of the round-1/round-2 unsubscribe-after-leave fix."""
+        conversation_id, _ids = await _start_open_conversation(
+            main, test_session_factory, "left-unsub-owner", "left-unsub-member"
+        )
+        member_token = _token("left-unsub-member")
+        await _call(
+            main,
+            test_session_factory,
+            member_token,
+            "comms_accept",
+            {"conversation_id": conversation_id},
+        )
+        uri = f"comms://comms/conversations/{conversation_id}"
+
+        with (
+            _OIDC_PATCH,
+            _ENV_PATCH,
+            patch("providers.comms.get_access_token", return_value=member_token),
+            patch("providers.comms.get_session_factory", return_value=test_session_factory),
+            patch("main.get_session_factory", return_value=test_session_factory),
+        ):
+            async with Client(main.mcp) as client:
+                await client.session.subscribe_resource(AnyUrl(uri))
+
+        await _call(
+            main,
+            test_session_factory,
+            member_token,
+            "comms_leave",
+            {"conversation_id": conversation_id},
+        )
+
+        with (
+            _OIDC_PATCH,
+            _ENV_PATCH,
+            patch("providers.comms.get_access_token", return_value=member_token),
+            patch("providers.comms.get_session_factory", return_value=test_session_factory),
+            patch("main.get_session_factory", return_value=test_session_factory),
+        ):
+            async with Client(main.mcp) as client:
+                # Must not raise -- this is exactly the case `require_active=False`
+                # plus `allow_terminal_status=True` exists to permit.
+                await client.session.unsubscribe_resource(AnyUrl(uri))
 
     async def test_non_member_subscribe_is_uniformly_denied(
         self,

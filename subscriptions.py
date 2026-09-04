@@ -147,6 +147,18 @@ def _evict_oldest_for_agent_locked(agent_id: uuid.UUID) -> None:
                 oldest_index = index
                 oldest_seq = record.seq
     if oldest_uri is None or oldest_index is None:
+        # Argus round-3 SUGGESTION: this is only ever called when the count
+        # already says `agent_id` is at cap, so finding zero of its records
+        # here means `_registry`/`_agent_subscription_counts` have diverged
+        # -- silently returning would let `subscribe()`'s caller append a
+        # new record right past the cap with no signal that the invariant
+        # broke.
+        logger.error(
+            "cap eviction found no records for agent %s despite being at "
+            "the %d-subscription cap -- registry/count state has diverged",
+            agent_id,
+            MAX_SUBSCRIPTIONS_PER_AGENT,
+        )
         return
     records = _registry[oldest_uri]
     del records[oldest_index]

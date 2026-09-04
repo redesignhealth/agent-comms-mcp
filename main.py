@@ -156,9 +156,14 @@ class ScopeEnforcementMiddleware(Middleware):
 
         # `check_resource_scope` only answers the yes/no authorization
         # question (it deliberately collapses "not enrolled" and "scope
-        # missing" into a single False, per its own docstring) -- the
-        # denial-reason breakdown below is purely for `_deny_resource`'s
-        # structured logging and is otherwise dead code by this point.
+        # missing" into a single False, per its own docstring); authorization
+        # itself is already decided by this point (denied, since the early
+        # return above didn't fire) -- everything below is reachable and
+        # runs real side effects (structured denial logging, raising
+        # `ResourceError`), it just re-derives WHICH denial reason to log,
+        # since that breakdown isn't part of `check_resource_scope`'s
+        # boolean return (Argus round-3 SUGGESTION: the prior wording of
+        # this comment misleadingly called the block itself "dead code").
         if token is None:
             self._deny_resource(uri, reason="missing_token", client_id=None)
 
@@ -528,17 +533,29 @@ async def _handle_unsubscribe_resource(uri: AnyUrl) -> None:
         )
         _deny_resource_subscribe()
     session = _low_level_server.request_context.session
-    # Argus round-3 BLOCKING catch: the previous two-lock-acquisition
-    # sequence (a non-mutating `is_subscribed` check, an awaited audit
-    # write, THEN `unsubscribe`) left a TOCTOU window across the audit
-    # write's DB await -- a concurrent unsubscribe/prune could remove the
-    # record in that gap, producing a spurious `resource.unsubscribe` audit
-    # row for what was actually a no-op by the time `unsubscribe` itself
-    # ran. Calling `unsubscribe` first and branching on its own `bool`
-    # return collapses this to one lock acquisition: the audit row is only
-    # written when a record was genuinely removed.
-    removed = await subscriptions.unsubscribe(auth.canonical_uri, session)
-    if not removed:
+    # Argus round-4: restores audit-before-mutation (round-2's "unsubscribe
+    # first, branch on its bool return" fix traded this away and reintroduced
+    # exactly the divergence-on-audit-failure bug round-1's BLOCKING finding
+    # #8 fixed -- a transient audit-write failure would leave the
+    # subscription permanently removed with zero audit record, and a client
+    # retry would see `removed=False` and return early, making the gap
+    # unrecoverable; this also violated DESIGN.md §8's "every mutation is
+    # audited" invariant, per Argus round-3's BLOCKING catch).
+    #
+    # `is_subscribed` (non-mutating) decides whether to audit+mutate at all;
+    # the audit write happens BEFORE `unsubscribe()` runs, so a failed audit
+    # write leaves the registry untouched -- no divergence. This reopens a
+    # narrower race than round-2 worried about: between this peek and the
+    # `unsubscribe()` call below, a concurrent prune/unsubscribe of the exact
+    # same (uri, session) pair could make `unsubscribe()` a no-op despite the
+    # peek seeing it as subscribed, producing one spurious audit row. That
+    # window requires two operations racing on the SAME session's SAME
+    # subscription -- session-scoped state only the owning connection would
+    # normally touch -- and its cost (one extra audit row) is far smaller
+    # than the bug it replaces (a real mutation with permanently zero audit
+    # trail). Accepted tradeoff, not revisited without a concrete report of
+    # the race actually occurring.
+    if not await subscriptions.is_subscribed(auth.canonical_uri, session):
         return
     async with get_session_factory()() as db_session:
         await service.audit_resource_subscription(
@@ -549,6 +566,7 @@ async def _handle_unsubscribe_resource(uri: AnyUrl) -> None:
             uri=auth.canonical_uri,
             conversation_id=auth.conversation_id,
         )
+    await subscriptions.unsubscribe(auth.canonical_uri, session)
 
 
 # The SDK hardcodes `resources.subscribe=False` in `get_capabilities` even

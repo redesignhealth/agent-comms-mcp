@@ -2320,7 +2320,16 @@ async def authorize_resource_subscribe(
             try:
                 await _resolve_caller_agent(session, target.sub, token)
             except ToolError as exc:
-                raise ResourceSubscribeDeniedError(str(exc)) from exc
+                # Argus round-3 SUGGESTION: `main.py`'s denial handler logs
+                # this exception's message server-side (`reason=%s`) --
+                # forwarding the raw `ToolError` text here (as the first
+                # `_resolve_caller_agent` call above still does, since that
+                # one resolves the REQUESTER's own identity, not someone
+                # else's) would leak the TARGET/inbox-owner's suspension or
+                # registration state to anyone with log access, even though
+                # the client-facing denial stays uniform either way. Use a
+                # fixed category string instead of `str(exc)`.
+                raise ResourceSubscribeDeniedError("inbox_target_unavailable") from exc
             return ResourceSubscribeAuthorization(
                 caller=requester,
                 base_sub=base_sub,
