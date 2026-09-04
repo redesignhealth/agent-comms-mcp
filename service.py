@@ -885,7 +885,19 @@ async def _deny_docs_unverified(
     """Mirrors ``_deny_bad_schema``'s shape exactly: audit, commit, then
     raise a specific, caller-visible error rather than the uniform
     ``AccessDeniedError`` -- see ``DocsVerificationFailedError``'s
-    docstring for why."""
+    docstring for why.
+
+    ``result.reason`` comes from the pluggable, deploy-side ``DocsVerifier``
+    and is the one part of this denial that reaches the MCP caller verbatim
+    (TECH-5998 Argus round-2 SUGGESTION / round-3 BLOCKING): a privileged
+    cross-account verifier that accidentally embeds document content in
+    ``reason`` would otherwise turn this into a cross-tenant read oracle
+    over the MCP channel. Truncated and defaulted once, here, at the single
+    choke point both the audit detail and the caller-visible exception
+    message read from -- not enforced at the ``DocsVerificationResult``
+    schema level, since a well-behaved verifier's own vocabulary is
+    documented, not type-checked."""
+    safe_reason = (result.reason or "unspecified")[:200]
     _audit(
         session,
         actor_sub=actor_sub,
@@ -901,14 +913,14 @@ async def _deny_docs_unverified(
             # overwrite this audit row's authoritative reason/verifier
             # name, forging its own denial record.
             **(result.detail or {}),
-            "reason": result.reason,
+            "reason": safe_reason,
             "docs_verifier": _docs_verifier_name(docs_verifier),
         },
     )
     await session.commit()
     raise DocsVerificationFailedError(
-        f"docs message failed verification: {result.reason}",
-        reason=result.reason or "unspecified",
+        f"docs message failed verification: {safe_reason}",
+        reason=safe_reason,
     )
 
 
@@ -4333,6 +4345,74 @@ async def _enforce_message_type_accepted(
             return
 
 
+async def _fetch_boundary_participants(
+    session: AsyncSession,
+    *,
+    sender_agent_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+) -> tuple[
+    list[uuid.UUID],
+    list[tuple[uuid.UUID, list[str]]],
+    list[ParticipantInfo],
+]:
+    """Single participants+agents join, shared by ``_check_boundary_crossing``
+    and ``post_message``'s early docs-specific capability-gate check (TECH-5998
+    Argus round-3 BLOCKING fix) -- extracted so both call sites see the exact
+    same rows/ordering instead of two independently-written queries drifting
+    apart.
+
+    Returns ``(other_ids, capability_others, participants)`` -- see
+    ``_check_boundary_crossing``'s docstring for what each represents.
+    """
+    rows = (
+        await session.execute(
+            select(
+                Participant.agent_id,
+                Participant.status,
+                Participant.role,
+                Agent.accepted_types,
+                Agent.display_name,
+                Agent.sub,
+            )
+            .join(Agent, Agent.id == Participant.agent_id)
+            .where(
+                Participant.conversation_id == conversation_id,
+                Participant.agent_id != sender_agent_id,
+                Participant.status.in_(("active", "invited")),
+            )
+            # Deterministic HoldContext.participants ordering (TECH-5754
+            # Argus round-1 catch) -- without this, identical holds could
+            # see different participant orderings across requests, causing
+            # prompt-cache misses (and potentially unstable judgments) for
+            # a downstream LLM-judge AutoApprover consuming this field.
+            # collate("C") (Argus round-3 catch): plain .order_by(Agent.sub)
+            # sorts under Postgres's configured locale, which can order
+            # mixed-case subs differently than start_conversation's Python
+            # `sorted(targets, key=lambda t: t.sub)` (always codepoint
+            # order) -- pinning the SQL side to byte/codepoint order keeps
+            # every HoldContext.participants producer path on the exact
+            # same comparator. NOTE (Argus round-4 catch): this does NOT
+            # match get_hold_conversation_participants/get_conversation
+            # below, which query without a COLLATE pin -- see
+            # TECH-5389-APPROVAL-PIPELINE.md's participants section.
+            .order_by(Agent.sub.collate("C"))
+        )
+    ).all()
+    other_ids = [agent_id for agent_id, _status, _role, _accepted, _display_name, _sub in rows]
+    capability_others = [
+        (agent_id, accepted)
+        for agent_id, status, _role, accepted, _display_name, _sub in rows
+        if status == "active"
+    ]
+    participants = [
+        ParticipantInfo(
+            agent_id=agent_id, display_name=display_name, role=role, status=status, sub=sub
+        )
+        for agent_id, status, role, _accepted, display_name, sub in rows
+    ]
+    return other_ids, capability_others, participants
+
+
 async def _check_boundary_crossing(
     session: AsyncSession,
     *,
@@ -4382,52 +4462,9 @@ async def _check_boundary_crossing(
     anyway -- so it isn't actually a savings; the query is the cheapest
     correct way to answer "does anyone here need checking."
     """
-    rows = (
-        await session.execute(
-            select(
-                Participant.agent_id,
-                Participant.status,
-                Participant.role,
-                Agent.accepted_types,
-                Agent.display_name,
-                Agent.sub,
-            )
-            .join(Agent, Agent.id == Participant.agent_id)
-            .where(
-                Participant.conversation_id == conversation.id,
-                Participant.agent_id != sender_agent_id,
-                Participant.status.in_(("active", "invited")),
-            )
-            # Deterministic HoldContext.participants ordering (TECH-5754
-            # Argus round-1 catch) -- without this, identical holds could
-            # see different participant orderings across requests, causing
-            # prompt-cache misses (and potentially unstable judgments) for
-            # a downstream LLM-judge AutoApprover consuming this field.
-            # collate("C") (Argus round-3 catch): plain .order_by(Agent.sub)
-            # sorts under Postgres's configured locale, which can order
-            # mixed-case subs differently than start_conversation's Python
-            # `sorted(targets, key=lambda t: t.sub)` (always codepoint
-            # order) -- pinning the SQL side to byte/codepoint order keeps
-            # every HoldContext.participants producer path on the exact
-            # same comparator. NOTE (Argus round-4 catch): this does NOT
-            # match get_hold_conversation_participants/get_conversation
-            # below, which query without a COLLATE pin -- see
-            # TECH-5389-APPROVAL-PIPELINE.md's participants section.
-            .order_by(Agent.sub.collate("C"))
-        )
-    ).all()
-    other_ids = [agent_id for agent_id, _status, _role, _accepted, _display_name, _sub in rows]
-    capability_others = [
-        (agent_id, accepted)
-        for agent_id, status, _role, accepted, _display_name, _sub in rows
-        if status == "active"
-    ]
-    participants = [
-        ParticipantInfo(
-            agent_id=agent_id, display_name=display_name, role=role, status=status, sub=sub
-        )
-        for agent_id, status, role, _accepted, display_name, sub in rows
-    ]
+    other_ids, capability_others, participants = await _fetch_boundary_participants(
+        session, sender_agent_id=sender_agent_id, conversation_id=conversation.id
+    )
     await _enforce_message_type_accepted(
         session,
         actor_sub=actor_sub,
@@ -7098,6 +7135,33 @@ async def post_message(
             conversation_id=conversation.id,
             message_type=message_type,
             exc=exc,
+        )
+
+    # TECH-5998 (Argus round-3 BLOCKING fix): a "docs" message must clear
+    # the same cheap, universal accepted_types capability gate
+    # _check_boundary_crossing runs below *before* it's allowed to reach
+    # _verify_docs_message -- otherwise a sender could repeatedly trigger
+    # the (potentially expensive, cross-account) verifier against a target
+    # that never declared "docs" support, getting DocsVerificationFailedError
+    # instead of the cheaper denied.message_type_not_accepted, and paying
+    # verifier cost for a request that was always going to be rejected.
+    # Mirrors start_conversation's identical ordering (Argus round-1
+    # SUGGESTION, already applied there). _fetch_boundary_participants is
+    # the same query _check_boundary_crossing runs below -- called again
+    # there is an accepted, docs-only extra round-trip, not a correctness
+    # issue: _enforce_message_type_accepted's own denial path returns
+    # NoReturn, so a rejection here never reaches that second call.
+    if message_type == "docs":
+        _other_ids, capability_others, _participants = await _fetch_boundary_participants(
+            session, sender_agent_id=sender_agent_id, conversation_id=conversation.id
+        )
+        await _enforce_message_type_accepted(
+            session,
+            actor_sub=actor_sub,
+            sender_agent_id=sender_agent_id,
+            conversation_id=conversation.id,
+            other_agents=capability_others,
+            message_type=message_type,
         )
 
     # TECH-5998: a docs message's own grounding/cleanliness verification

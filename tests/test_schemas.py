@@ -434,6 +434,21 @@ class TestDocCitation:
         model = DocCitation.model_validate(self._valid(filename="x" * 255))
         assert model.filename == "x" * 255
 
+    @pytest.mark.parametrize("value", ["../admin", "id/evil", "id?x=y", "id with spaces"])
+    def test_rejects_account_id_injection_shapes(self, value: str) -> None:
+        with pytest.raises(ValidationError):
+            DocCitation.model_validate(self._valid(account_id=value))
+
+    @pytest.mark.parametrize("value", ["doc/path", "../secret", "doc?x=y"])
+    def test_rejects_document_id_injection_shapes(self, value: str) -> None:
+        with pytest.raises(ValidationError):
+            DocCitation.model_validate(self._valid(document_id=value))
+
+    @pytest.mark.parametrize("value", ["a/b.pdf", "a\\b.pdf", "a\x00b.pdf", "a\x1fb.pdf"])
+    def test_rejects_filename_control_and_path_chars(self, value: str) -> None:
+        with pytest.raises(ValidationError):
+            DocCitation.model_validate(self._valid(filename=value))
+
 
 class TestDocsV1:
     def _valid(self, **overrides: object) -> dict[str, object]:

@@ -1,7 +1,7 @@
 """broaden messages conversation_id free-text index to docs
 
 Revision ID: f3a1b9c7d2e4
-Revises: e2f7a91c5b34
+Revises: f3c9a7e2b1d4
 Create Date: 2026-09-04 00:00:00.000000
 
 TECH-5998: ``docs`` (a summary + citation-list message type, verified by

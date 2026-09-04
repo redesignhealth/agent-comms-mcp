@@ -359,6 +359,28 @@ class _FailDocsVerifier:
         )
 
 
+class _FailWithNoneReasonDocsVerifier:
+    """TECH-5998 Argus round-3 BLOCKING-fix test double: fails verification
+    with ``reason=None`` -- exercises ``_deny_docs_unverified``'s
+    ``"unspecified"`` fallback, distinct from ``_FailDocsVerifier``'s
+    always-populated reason."""
+
+    async def verify(self, ctx: plugins.DocsVerificationContext) -> plugins.DocsVerificationResult:
+        return plugins.DocsVerificationResult(verified=False, reason=None, detail=None)
+
+
+class _FailWithOverlongReasonDocsVerifier:
+    """TECH-5998 Argus round-3 BLOCKING-fix test double: a misbehaving
+    verifier whose ``reason`` exceeds the ≤200-char caller-visible bound
+    documented on ``DocsVerificationResult.reason`` -- exercises
+    ``_deny_docs_unverified``'s truncation, the enforcement point for a
+    contract this plugin seam cannot enforce at the schema level since
+    ``reason`` is deploy-side-verifier-supplied, not validated input."""
+
+    async def verify(self, ctx: plugins.DocsVerificationContext) -> plugins.DocsVerificationResult:
+        return plugins.DocsVerificationResult(verified=False, reason="x" * 500, detail=None)
+
+
 class _RaisingDocsVerifier:
     """TECH-5998 test double: simulates a real verifier's own
     infrastructure failure (source system unreachable) -- exercises
@@ -377,8 +399,10 @@ class _RecordingDocsVerifier:
 
     def __init__(self) -> None:
         self.captured_ctx: plugins.DocsVerificationContext | None = None
+        self.call_count = 0
 
     async def verify(self, ctx: plugins.DocsVerificationContext) -> plugins.DocsVerificationResult:
+        self.call_count += 1
         self.captured_ctx = ctx
         return plugins.DocsVerificationResult(verified=True, reason=None, detail=None)
 
@@ -5144,6 +5168,91 @@ class TestPostMessageDocsVerification:
         assert verifier.captured_ctx.conversation_id == conversation.id
         assert verifier.captured_ctx.payload["summary"].startswith("The Q3 board deck")
 
+    async def test_none_reason_denies_with_unspecified_not_the_string_none(
+        self, session: AsyncSession
+    ) -> None:
+        owner, _target, conversation = await self._active_pair(
+            session, "docs-owner-7", "docs-target-7"
+        )
+        with pytest.raises(DocsVerificationFailedError) as exc_info:
+            await post_message(
+                session,
+                actor_sub=owner.sub,
+                sender_agent_id=owner.id,
+                conversation_id=conversation.id,
+                message_type="docs",
+                payload=_docs_payload(),
+                docs_verifier=_FailWithNoneReasonDocsVerifier(),
+            )
+        assert exc_info.value.reason == "unspecified"
+        assert "None" not in str(exc_info.value)
+
+    async def test_overlong_reason_is_truncated_before_reaching_the_caller(
+        self, session: AsyncSession
+    ) -> None:
+        owner, _target, conversation = await self._active_pair(
+            session, "docs-owner-8", "docs-target-8"
+        )
+        with pytest.raises(DocsVerificationFailedError) as exc_info:
+            await post_message(
+                session,
+                actor_sub=owner.sub,
+                sender_agent_id=owner.id,
+                conversation_id=conversation.id,
+                message_type="docs",
+                payload=_docs_payload(),
+                docs_verifier=_FailWithOverlongReasonDocsVerifier(),
+            )
+        assert len(exc_info.value.reason) == 200
+        actions = (
+            await session.execute(
+                select(AuditLog.detail).where(
+                    AuditLog.conversation_id == conversation.id,
+                    AuditLog.action == "denied.docs_unverified",
+                )
+            )
+        ).scalar_one()
+        assert len(actions["reason"]) == 200
+
+    async def test_verifier_never_invoked_when_target_has_not_declared_docs(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-5998 Argus round-3 BLOCKING fix: the cheap accepted_types
+        capability gate must reject a ``docs`` message to a target that
+        hasn't declared ``docs`` support BEFORE the (potentially expensive,
+        cross-account) DocsVerifier is ever invoked -- otherwise a sender
+        could repeatedly trigger verifier cost against a request that was
+        always going to be denied on type-acceptance grounds alone."""
+        owner = await _register(session, "docs-owner-caps")
+        target = await _register(
+            session, "docs-target-caps", accepted_types=["availability_request"]
+        )
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        verifier = _RecordingDocsVerifier()
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await post_message(
+                session,
+                actor_sub=owner.sub,
+                sender_agent_id=owner.id,
+                conversation_id=conversation.id,
+                message_type="docs",
+                payload=_docs_payload(),
+                docs_verifier=verifier,
+            )
+        assert exc_info.value.reason == "denied.message_type_not_accepted"
+        assert verifier.call_count == 0
+        assert verifier.captured_ctx is None
+
 
 class TestStartConversationDocsVerification:
     """TECH-5998: a seq-1 ``docs`` message goes through the identical
@@ -5250,6 +5359,31 @@ class TestStartConversationDocsVerification:
             initial_message=_request_payload(),
             docs_verifier=verifier,
         )
+        assert verifier.captured_ctx is None
+
+    async def test_verifier_never_invoked_when_target_has_not_declared_docs(
+        self, session: AsyncSession
+    ) -> None:
+        """Mirrors TestPostMessageDocsVerification's same-named test: the
+        Argus round-1 ordering fix (accepted_types gate before the
+        verifier) applies just as much to the seq-1 opener as it does to
+        every later post_message call."""
+        owner = await _register(session, "docs-start-owner-caps")
+        target = await _register(session, "docs-start-target-caps", accepted_types=["confirm"])
+        verifier = _RecordingDocsVerifier()
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await start_conversation(
+                session,
+                actor_sub=owner.sub,
+                initiator_agent_id=owner.id,
+                conversation_type="open",
+                target_agent_ids=[target.id],
+                initial_message=_docs_payload(),
+                message_type="docs",
+                docs_verifier=verifier,
+            )
+        assert exc_info.value.reason == "denied.message_type_not_accepted"
+        assert verifier.call_count == 0
         assert verifier.captured_ctx is None
 
 
