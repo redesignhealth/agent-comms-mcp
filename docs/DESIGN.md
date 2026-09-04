@@ -317,24 +317,43 @@ proposal_holds id, kind (at the DB level an open TEXT column -- NOT
  detected at apply/decide time, by which point decision fields are already
  stamped at the `applying` claim (see models.ProposalHold's class
  docstring and the `ck_proposal_holds_decision_consistency` CHECK).
- **Stuck `applying` rows** (the process dies between the claim commit and
- the terminal write -- rare, but not impossible) have no background
- reaper today AND no in-app recovery path (corrected, Argus review
- round-4 suggestion -- an earlier version of this note claimed a fresh
- `POST /proposals` resubmission could recover one; it cannot, precisely
- BECAUSE the round-3 B1 dedup fix now also matches `applying` rows: a
- resubmission for the same target finds the stuck row via dedup and is
- folded into it as a no-op, per `_dedup_or_insert_proposal`'s "don't
- mutate an in-flight applying row" guard -- it can never re-arm it). The
- row is also invisible to `list_pending_proposal_holds` (`status='pending'`
- only) and a decide call on it raises `HoldAlreadyDecidedError`. The ONLY
- real recovery today is manual DB intervention: an operator running
- `UPDATE proposal_holds SET status = 'apply_failed', apply_error = '<note>'
- WHERE id = '<hold_id>'` (the same terminal status a genuine Linear
- failure would have produced), after which a fresh `POST /proposals`
- resubmission for the same target works normally again. Automating this
- (a background reaper that transitions `applying` rows older than some
- threshold to `apply_failed`) is a reasonable follow-up, not yet built.
+ **Stuck `applying` rows** (the process dies, OR the request is cancelled,
+ between the claim commit and the terminal write) have two distinct
+ recovery stories depending on the cause (updated, Argus review round-6
+ suggestion -- a prior version of this note said the ONLY recovery was
+ manual DB intervention, which stopped being true once round-5 B1 added
+ cooperative cancellation handling):
+ - **Cancellation (client disconnect, task cancelled) IS auto-recovered**:
+   `service._apply_or_finalize_proposal_hold` catches
+   `asyncio.CancelledError` around both the fingerprinter and applier
+   awaits, still performs the SAME terminal write every other path takes
+   (setting `"apply_failed"` with a distinguishable `apply_error`), and
+   only re-raises the cancellation afterward -- the row reaches a real
+   terminal status, it is not left stuck. This does NOT cover a second
+   cancellation landing during the terminal write itself (re-fetch through
+   commit/refresh) -- that narrower window is still a residual gap,
+   documented at that code's own comment rather than closed via
+   `asyncio.shield` (sharing a single `AsyncSession` across a shielded
+   Task is its own hazard -- see that comment for why the trade-off wasn't
+   taken).
+ - **A hard process death** (the container itself dies mid-apply, not a
+   cooperative cancellation) still has no background reaper AND no in-app
+   recovery path -- an earlier version of this note claimed a fresh
+   `POST /proposals` resubmission could recover one; it cannot, precisely
+   BECAUSE the round-3 B1 dedup fix now also matches `applying` rows: a
+   resubmission for the same target finds the stuck row via dedup and is
+   folded into it as a no-op, per `_dedup_or_insert_proposal`'s "don't
+   mutate an in-flight applying row" guard -- it can never re-arm it). The
+   row is also invisible to `list_pending_proposal_holds`
+   (`status='pending'` only) and a decide call on it raises
+   `HoldAlreadyDecidedError`. The only recovery for THIS case is manual DB
+   intervention: an operator running `UPDATE proposal_holds SET status =
+   'apply_failed', apply_error = '<note>' WHERE id = '<hold_id>'` (the
+   same terminal status a genuine Linear failure would have produced),
+   after which a fresh `POST /proposals` resubmission for the same target
+   works normally again. Automating this (a background reaper that
+   transitions `applying` rows older than some threshold to
+   `apply_failed`) is a reasonable follow-up, not yet built.
  Migration
  only in TECH-5871 (+ e2f7a91c5b34 for `applying`); `POST /proposals`
  (submission), `GET /proposals/pending` (listing), per-bot rate limiting,
@@ -1202,10 +1221,18 @@ system), or on `"approve"`:
    `linear_client.apply_progress_update` for
    `kind="linear_progress_update"`) executes the real write. Success ->
    `"applied"` (+ `applied_at`). A raised `linear_client.LinearAPIError` ->
-   `"apply_failed"` (+ `apply_error` populated with the failure detail) --
-   this is a normal 200 response, not a raised exception, since the DECIDE
-   itself succeeded even though the apply did not; the hold stays
-   queryable for a human to retry via a fresh proposal resubmission.
+   `"apply_failed"` (+ `apply_error` set to one of THREE fixed, allowlisted
+   strings -- `"Linear API token not configured"` / `"Linear API
+   unavailable"` / `"Linear API returned an error"` -- via
+   `service._sanitize_apply_error`, Argus review round-5 S4: the raw
+   exception text is never returned over the API, since any authenticated
+   caller of this endpoint can reach it, not just an operator with
+   Linear/infra access; the full unredacted text is instead captured into
+   a `raw_apply_error` local and logged server-side at WARNING, Argus
+   review round-6 B1) -- this is a normal 200 response, not a raised
+   exception, since the DECIDE itself succeeded even though the apply did
+   not; the hold stays queryable for a human to retry via a fresh proposal
+   resubmission.
 
 Idempotent on an already-`"applied"` hold: a retried decide call (timeout +
 client retry, double-click) returns the existing applied state verbatim,
@@ -1242,6 +1269,19 @@ id, `updatedAt`). Whatever submits the original proposal (the Prefect flow)
 MUST compute `target_fingerprint` the same way over the same fields, or
 every decide will spuriously come back `"stale"` -- this function is the
 single source of truth for that scheme on the agent-comms-mcp side.
+
+The field set alone is NOT the whole contract (Argus review round-6
+suggestion -- these serialization details previously lived only in
+`compute_target_fingerprint`'s own docstring, not here, where a cross-repo
+implementer is more likely to look): the fields are serialized via
+`json.dumps(..., sort_keys=True)` with the library's DEFAULT `separators`
+(`", "` / `": "`, i.e. a space after both `,` and `:`) and DEFAULT
+`ensure_ascii=True`; `updated_at` is Linear's raw `updatedAt` string
+exactly as the GraphQL API returns it (an ISO-8601 timestamp), never
+re-parsed or re-formatted. A same-inputs-different-bytes mismatch in any
+of these choices produces the same spurious `"stale"` symptom as a
+field-set mismatch, just harder to spot -- match all of it, not only the
+field names.
 
 ### Configuration: pluggable seams
 

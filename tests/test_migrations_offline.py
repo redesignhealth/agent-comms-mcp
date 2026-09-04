@@ -332,8 +332,20 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
     # >= dedup_pos in the first place. Anchor on the OLD predicate text
     # instead, which -- unlike the index name -- genuinely only appears in
     # 9a1c2d3e4f5b's original CREATE, not in this migration's rebuild.
-    original_predicate_pos = result.stdout.index("WHERE status = 'pending'", dedup_pos)
-    widened_index_pos = result.stdout.index(
-        "WHERE status IN ('pending', 'applying')", original_predicate_pos
-    )
+    #
+    # Argus review round-6 suggestion: the round-5 fix above was STILL
+    # vacuous -- `str.index(sub, start)` always returns a position >=
+    # `start` (or raises `ValueError` if `sub` doesn't appear at or after
+    # `start`), so passing `original_predicate_pos` as the search floor for
+    # `widened_index_pos` made `original_predicate_pos < widened_index_pos`
+    # true by construction whenever the widened text exists anywhere at or
+    # after that floor -- the `assert` could never actually fail; only a
+    # missing widened predicate would fail, via `ValueError`, not this
+    # `assert`. Search from the START of the output (no `start` argument)
+    # so a hypothetically reordered migration -- one that emitted the
+    # widened predicate BEFORE the original -- would make this comparison
+    # itself fail, not merely raise a different exception for an unrelated
+    # reason.
+    original_predicate_pos = result.stdout.index("WHERE status = 'pending'")
+    widened_index_pos = result.stdout.index("WHERE status IN ('pending', 'applying')")
     assert original_predicate_pos < widened_index_pos

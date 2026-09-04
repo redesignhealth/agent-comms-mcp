@@ -77,10 +77,27 @@ class LinearAPIError(Exception):
     ``apply_error=str(exc)`` -- never propagated as an unhandled 500."""
 
 
+class LinearTokenMissingError(LinearAPIError):
+    """``LINEAR_API_TOKEN`` is unset. A typed subclass (Argus review
+    round-6 suggestion), not string-matched by
+    ``service._sanitize_apply_error``: a bare substring check
+    (``"is not configured" in str(exc)``) would also match this text if it
+    ever appeared verbatim inside a message Linear's own GraphQL API
+    returned, misclassifying a real Linear-side error as a local
+    configuration problem."""
+
+
+class LinearTransportError(LinearAPIError):
+    """The HTTP request to Linear itself failed (connection error, timeout,
+    non-JSON body) -- as opposed to a well-formed response Linear returned
+    with an error payload. A typed subclass (Argus review round-6
+    suggestion) for the same reason as ``LinearTokenMissingError``."""
+
+
 def _require_api_token() -> str:
     token = os.environ.get(_LINEAR_API_TOKEN_ENV_VAR)
     if not token:
-        raise LinearAPIError(f"{_LINEAR_API_TOKEN_ENV_VAR} is not configured")
+        raise LinearTokenMissingError(f"{_LINEAR_API_TOKEN_ENV_VAR} is not configured")
     return token
 
 
@@ -98,7 +115,7 @@ async def _post_graphql(query: str, variables: dict[str, Any]) -> dict[str, Any]
             response.raise_for_status()
             payload = response.json()
     except (httpx.HTTPError, ValueError) as exc:
-        raise LinearAPIError(f"Linear API request failed: {exc}") from exc
+        raise LinearTransportError(f"Linear API request failed: {exc}") from exc
     if payload.get("errors"):
         messages = "; ".join(
             error.get("message", str(error)) if isinstance(error, dict) else str(error)
@@ -219,10 +236,18 @@ def _progress_comment_body(action: dict[str, Any], rationale: str) -> str:
         if isinstance(value, str) and value:
             if not citation_urls.is_valid_citation_url(value):
                 if _omit_invalid_url_instead_of_raising(action_type, key):
+                    # Argus review round-6 suggestion: include the rejected
+                    # URL value itself, not just the field name -- the
+                    # raise path a few lines below already includes it
+                    # (`value!r`), and with multiple proposals in flight
+                    # against the same target_id, the value is what lets an
+                    # operator actually identify which proposal's omission
+                    # this log line is about.
                     logger.warning(
-                        "Omitting %s from Linear comment for target_id=%r: "
+                        "Omitting %s=%r from Linear comment for target_id=%r: "
                         "failed citation-URL validation",
                         key,
+                        value,
                         action.get("target_id"),
                     )
                     continue
@@ -258,6 +283,8 @@ async def apply_progress_update(action: dict[str, Any], rationale: str) -> None:
 
 __all__ = [
     "LinearAPIError",
+    "LinearTokenMissingError",
+    "LinearTransportError",
     "apply_progress_update",
     "compute_target_fingerprint",
     "fetch_current_fingerprint",

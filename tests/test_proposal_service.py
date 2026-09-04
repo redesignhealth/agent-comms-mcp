@@ -13,6 +13,7 @@ judge's verdict end-to-end.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
@@ -25,10 +26,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from exceptions import AccessDeniedError, HoldAlreadyDecidedError, RateLimitExceededError
-from linear_client import LinearAPIError
+from linear_client import LinearAPIError, LinearTokenMissingError, LinearTransportError
 from models import ProposalHold
 from service import (
     MAX_PROPOSALS_PER_BOT_PER_WINDOW,
+    _sanitize_apply_error,
     create_proposal,
     decide_proposal,
     list_pending_proposal_holds,
@@ -412,7 +414,9 @@ class TestJudgeIntegration:
         with (
             patch(
                 "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(side_effect=LinearAPIError("LINEAR_API_TOKEN is not configured")),
+                AsyncMock(
+                    side_effect=LinearTokenMissingError("LINEAR_API_TOKEN is not configured")
+                ),
             ),
             patch("service.linear_client.apply_progress_update", AsyncMock()) as mock_apply,
         ):
@@ -690,6 +694,124 @@ class TestDecideProposal:
         assert decided["apply_error"] == "Linear API returned an error"
         mock_apply.assert_not_awaited()
 
+    async def test_cancellation_during_fingerprinting_resolves_to_apply_failed(
+        self, session: AsyncSession
+    ) -> None:
+        """Argus review round-6 suggestion: the round-5 B1 cooperative-
+        cancellation machinery (catch ``asyncio.CancelledError``, still
+        write a terminal status, re-raise) had zero test coverage. This
+        covers the fingerprinter-cancelled branch: the hold must reach
+        ``apply_failed`` (NOT be left stranded at ``applying``), and the
+        cancellation must still propagate out of ``decide_proposal``."""
+        submitted = await _submit(session, target_fingerprint="fp-match")
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(side_effect=asyncio.CancelledError()),
+            ),
+            patch("service.linear_client.apply_progress_update", AsyncMock()) as mock_apply,
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await decide_proposal(
+                    session,
+                    approver_sub="owner-a@example.com",
+                    hold_id=hold_id,
+                    decision="approve",
+                    decision_note=None,
+                )
+        mock_apply.assert_not_awaited()
+        row = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        assert row.status == "apply_failed"
+        assert row.apply_error is not None
+
+    async def test_cancellation_during_apply_resolves_to_apply_failed(
+        self, session: AsyncSession
+    ) -> None:
+        """Same as above, for the applier-cancelled branch specifically --
+        cancellation during the fingerprinter vs. during the applier are
+        two distinct ``except asyncio.CancelledError`` sites in
+        ``_apply_or_finalize_proposal_hold``."""
+        submitted = await _submit(session, target_fingerprint="fp-match")
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(return_value="fp-match"),
+            ),
+            patch(
+                "service.linear_client.apply_progress_update",
+                AsyncMock(side_effect=asyncio.CancelledError()),
+            ),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await decide_proposal(
+                    session,
+                    approver_sub="owner-a@example.com",
+                    hold_id=hold_id,
+                    decision="approve",
+                    decision_note=None,
+                )
+        row = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        assert row.status == "apply_failed"
+        assert row.apply_error is not None
+
+    async def test_cancellation_racing_concurrent_resolution_reraises_without_terminal_write(
+        self, session: AsyncSession
+    ) -> None:
+        """Argus review round-6 suggestion: the early-return path (hold
+        resolved by something else during the external round-trip, see
+        ``test_hold_resolved_during_apply_window_raises_already_decided``
+        directly below) must ALSO re-raise a cancellation when one landed,
+        rather than only in the normal terminal-write path -- a caller
+        cancelled mid-apply is owed a cancelled task regardless of which
+        return this function takes. No terminal write happens on this
+        path: the row keeps whatever status the concurrent mutation left
+        it at."""
+        submitted = await _submit(session, target_fingerprint="fp-match")
+        hold_id = uuid.UUID(submitted["proposal_id"])
+
+        async def _mutate_then_cancel(_target_id: str) -> str:
+            await session.execute(
+                update(ProposalHold)
+                .where(ProposalHold.id == hold_id)
+                .values(
+                    status="rejected",
+                    decision_source="human",
+                    decided_by_actor_id="someone-else@example.com",
+                    decided_at=text("now()"),
+                )
+            )
+            await session.commit()
+            raise asyncio.CancelledError()
+
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(side_effect=_mutate_then_cancel),
+            ),
+            patch("service.linear_client.apply_progress_update", AsyncMock()) as mock_apply,
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await decide_proposal(
+                    session,
+                    approver_sub="owner-a@example.com",
+                    hold_id=hold_id,
+                    decision="approve",
+                    decision_note=None,
+                )
+        mock_apply.assert_not_awaited()
+        row = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        # Unchanged by this call's own (nonexistent) terminal write --
+        # still whatever the concurrent mutation left it at.
+        assert row.status == "rejected"
+
     async def test_hold_resolved_during_apply_window_raises_already_decided(
         self, session: AsyncSession
     ) -> None:
@@ -772,3 +894,33 @@ class TestDecideProposal:
                 )
         assert exc_info.value.status == "applying"
         mock_apply.assert_not_awaited()
+
+
+class TestSanitizeApplyError:
+    """Pure-function tests for ``_sanitize_apply_error`` -- no DB needed,
+    but this module is the only place that imports ``service``'s proposal
+    internals, so it lives here rather than a new file for three cases."""
+
+    def test_token_missing_maps_to_token_message(self) -> None:
+        exc = LinearTokenMissingError("LINEAR_API_TOKEN is not configured")
+        assert _sanitize_apply_error(exc) == "Linear API token not configured"
+
+    def test_transport_error_maps_to_unavailable_message(self) -> None:
+        """Argus review round-6 suggestion: this branch (triggered by
+        ``LinearTransportError``, raised by ``linear_client._post_graphql``
+        on an ``httpx``/JSON-decode failure) previously had no test --
+        both existing apply-failure tests used a plain ``LinearAPIError``,
+        which never exercises this case."""
+        exc = LinearTransportError("Linear API request failed: connection refused")
+        assert _sanitize_apply_error(exc) == "Linear API unavailable"
+
+    def test_generic_linear_api_error_maps_to_generic_message(self) -> None:
+        """A message that merely happens to contain "is not configured" --
+        e.g. echoed back from Linear's own GraphQL error payload -- must
+        NOT be misclassified as a local token-configuration problem now
+        that dispatch is by exception TYPE, not substring match (Argus
+        review round-6 suggestion, the whole point of
+        ``LinearTokenMissingError``/``LinearTransportError`` as distinct
+        types)."""
+        exc = LinearAPIError("Linear API returned errors: field X is not configured on this team")
+        assert _sanitize_apply_error(exc) == "Linear API returned an error"

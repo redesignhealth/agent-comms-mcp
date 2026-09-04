@@ -6091,15 +6091,27 @@ def _sanitize_apply_error(exc: Exception) -> str:
     """Map a ``LinearAPIError`` to one of a small allowlisted, caller-safe
     message set before it's persisted to ``hold.apply_error`` and returned
     to API callers via ``_proposal_dict`` (Argus review round-4 suggestion,
-    round-5 S4 hardening). The full, unredacted ``str(exc)`` is always
-    logged server-side by the caller (see
-    ``_apply_or_finalize_proposal_hold``'s ``logger.warning`` on the
-    ``apply_failed`` path) -- this function only bounds what leaves the
-    process via the API response."""
-    text = str(exc)
-    if "is not configured" in text:
+    round-5 S4 hardening). The full, unredacted ``str(exc)`` is NOT logged
+    by this function -- the caller (``_apply_or_finalize_proposal_hold``)
+    captures it into its own ``raw_apply_error`` local BEFORE calling this
+    function, and logs that at WARNING on the ``apply_failed`` path
+    (Argus review round-6 B1 -- an earlier version of this docstring
+    claimed the caller logged it, without that call site actually doing
+    so). This function only bounds what leaves the process via the API
+    response.
+
+    Dispatches on the exception's TYPE, not a substring match against its
+    message text (Argus review round-6 suggestion): a earlier version
+    checked ``"is not configured" in str(exc)``, which would also match a
+    ``LinearAPIError`` whose message happened to contain that phrase for
+    an unrelated reason (e.g. echoed back verbatim from Linear's own
+    GraphQL error payload), misclassifying a real Linear-side error as a
+    local configuration problem. ``linear_client.LinearTokenMissingError``/
+    ``LinearTransportError`` are typed subclasses of ``LinearAPIError``
+    that exist specifically so this dispatch is exact."""
+    if isinstance(exc, linear_client.LinearTokenMissingError):
         return _APPLY_ERROR_TOKEN_MESSAGE
-    if "Linear API request failed" in text:
+    if isinstance(exc, linear_client.LinearTransportError):
         return _APPLY_ERROR_UNAVAILABLE_MESSAGE
     return _APPLY_ERROR_GENERIC_MESSAGE
 
@@ -6191,6 +6203,7 @@ async def _apply_or_finalize_proposal_hold(
 
     is_stale = False
     apply_error: str | None = None
+    raw_apply_error: str | None = None
     # Argus review round-5 B1: `asyncio.CancelledError` (a `BaseException`,
     # not caught by the `except linear_client.LinearAPIError` clauses
     # below) previously propagated straight out of this function on
@@ -6212,9 +6225,19 @@ async def _apply_or_finalize_proposal_hold(
         current_fingerprint = await fingerprinter(target_id)
         is_stale = current_fingerprint != stored_fingerprint
     except linear_client.LinearAPIError as exc:
+        # Argus review round-6 B1: `_sanitize_apply_error`'s own docstring
+        # promises the caller always logs the full, unredacted `str(exc)`
+        # server-side -- that promise is only true if this call site
+        # actually does it. Capture the raw text into a local BEFORE
+        # sanitizing, and log it (not the sanitized constant, which is
+        # exactly what the "sanitized" value already is) below.
+        raw_apply_error = str(exc)
         apply_error = _sanitize_apply_error(exc)
     except asyncio.CancelledError as exc:
-        apply_error = "apply cancelled before completion (request disconnected or task cancelled)"
+        raw_apply_error = (
+            "apply cancelled before completion (request disconnected or task cancelled)"
+        )
+        apply_error = raw_apply_error
         cancelled_exc = exc
     else:
         if not is_stale:
@@ -6222,11 +6245,13 @@ async def _apply_or_finalize_proposal_hold(
             try:
                 await applier(action, rationale)
             except linear_client.LinearAPIError as exc:
+                raw_apply_error = str(exc)
                 apply_error = _sanitize_apply_error(exc)
             except asyncio.CancelledError as exc:
-                apply_error = (
+                raw_apply_error = (
                     "apply cancelled before completion (request disconnected or task cancelled)"
                 )
+                apply_error = raw_apply_error
                 cancelled_exc = exc
 
     hold = await _find_proposal_hold(session, hold_id, for_update=True)
@@ -6260,11 +6285,17 @@ async def _apply_or_finalize_proposal_hold(
     elif apply_error is not None:
         hold.status = "apply_failed"
         hold.apply_error = apply_error
+        # Argus review round-6 B1: log the RAW (unsanitized) exception text
+        # here, not `apply_error` -- `apply_error` is already the sanitized
+        # allowlisted constant (`_sanitize_apply_error`), so logging it
+        # would collapse every distinct Linear failure to the same three
+        # strings, defeating the whole point of keeping full detail
+        # server-side while narrowing what the API returns.
         logger.warning(
             "proposal apply_failed for hold_id=%s target_id=%s: %s",
             hold_id,
             target_id,
-            apply_error,
+            raw_apply_error,
         )
         _audit(
             session,
@@ -6282,6 +6313,24 @@ async def _apply_or_finalize_proposal_hold(
             action="proposal.applied",
             detail={"hold_id": str(hold_id), "target_id": target_id},
         )
+    # Argus review round-6 suggestion: a SECOND cancellation delivered while
+    # this terminal write (re-fetch through commit/refresh above and below)
+    # is in flight could still strand the row at `expected_status`, the
+    # same shape B1 fixed for the first one. Deliberately NOT wrapped in
+    # `asyncio.shield` -- shielding would run this write in a separate Task
+    # while still sharing `session` (a single `AsyncSession` is not safe to
+    # use concurrently from two Tasks: SQLAlchemy's asyncio session has no
+    # internal locking, so if this awaiting coroutine's OWN cancellation
+    # propagates past the shield -- which `asyncio.shield` does NOT
+    # prevent, only the inner task's cancellation is prevented -- while the
+    # caller's `async with get_session_factory()()` context manager then
+    # closes `session` on its way out, the still-running shielded write
+    # would race a closing connection. A double-cancellation landing in
+    # this exact multi-await window is rare enough (requires two
+    # `task.cancel()` calls in quick succession, or a watchdog racing a
+    # client disconnect) that this documents the residual gap rather than
+    # trading it for a session-safety hazard that would apply on every
+    # single decide.
     await session.commit()
     # `updated_at`'s onupdate=text("now()") (models.py) leaves the ORM
     # attribute expired after this UPDATE's commit -- `_proposal_dict`
