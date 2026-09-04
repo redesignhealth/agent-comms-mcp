@@ -472,9 +472,20 @@ class DocCitation(_StrictModel):
     entirely (see that model's docstring).
     """
 
-    account_id: str = Field(min_length=1, max_length=100)
-    document_id: str = Field(min_length=1, max_length=200)
-    filename: str = Field(min_length=1, max_length=255)
+    # A real DocsVerifier holds cross-account access and builds API calls
+    # (e.g. ``GET /accounts/{account_id}/documents/{document_id}``) from
+    # these values -- unconstrained strings would let a `/`, `..`, or other
+    # separator-shaped value smuggle path/URL injection into that lookup.
+    # `\w` (word chars) plus `-` covers every id shape this repo has seen
+    # from Arcana (module docstring) without permitting separators.
+    account_id: str = Field(min_length=1, max_length=100, pattern=r"^[\w-]+$")
+    document_id: str = Field(min_length=1, max_length=200, pattern=r"^[\w-]+$")
+    # filename is display-only (never used to build a lookup path), so this
+    # excludes path separators and control/NUL bytes rather than
+    # restricting to a word-character allowlist -- same rationale as
+    # InstructionShareV1.link's pattern above: block the concretely
+    # exploitable class, not every non-alphanumeric character.
+    filename: str = Field(min_length=1, max_length=255, pattern=r'^[^/\\<>:"|?*\x00-\x1f]+$')
 
 
 class DocsV1(_StrictModel):

@@ -5164,6 +5164,15 @@ class TestStartConversationDocsVerification:
                 message_type="docs",
                 docs_verifier=plugins.RejectAllDocsVerifier(),
             )
+        # No conversation row exists on this denial path (checked before
+        # session.add(conversation)) -- query by agent_id, same convention
+        # as test_start_conversation_denied_when_target_has_not_declared_type.
+        actions = (
+            (await session.execute(select(AuditLog.action).where(AuditLog.agent_id == owner.id)))
+            .scalars()
+            .all()
+        )
+        assert "denied.docs_unverified" in actions
 
     async def test_verified_docs_opener_creates_the_conversation(
         self, session: AsyncSession
@@ -5180,7 +5189,18 @@ class TestStartConversationDocsVerification:
             message_type="docs",
             docs_verifier=_RecordingDocsVerifier(),
         )
+        # docs joined BARRIER_SENSITIVE_TYPES, so a verified docs opener
+        # still diverts to a human-approval hold exactly like
+        # TestPostMessageDocsVerification's verified case -- passing docs
+        # verification is "safe to score," not "safe to deliver
+        # unconditionally," even for the seq-1 message.
         assert conversation.state == "active"
+        hold = (
+            await session.execute(
+                select(ApprovalHold).where(ApprovalHold.conversation_id == conversation.id)
+            )
+        ).scalar_one()
+        assert hold.risk_reason == "boundary_crossing"
 
     async def test_infra_failure_denies_before_any_row_is_persisted(
         self, session: AsyncSession
@@ -5198,6 +5218,24 @@ class TestStartConversationDocsVerification:
                 message_type="docs",
                 docs_verifier=_RaisingDocsVerifier(),
             )
+        actions = (
+            (await session.execute(select(AuditLog.action).where(AuditLog.agent_id == owner.id)))
+            .scalars()
+            .all()
+        )
+        assert "denied.docs_verification_unscored" in actions
+        conversations = (
+            (await session.execute(select(Conversation).where(Conversation.created_by == owner.id)))
+            .scalars()
+            .all()
+        )
+        assert conversations == []
+        participants = (
+            (await session.execute(select(Participant).where(Participant.agent_id == owner.id)))
+            .scalars()
+            .all()
+        )
+        assert participants == []
 
     async def test_verifier_never_invoked_for_non_docs_opener(self, session: AsyncSession) -> None:
         owner = await _register(session, "docs-start-owner-4")

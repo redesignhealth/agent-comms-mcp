@@ -893,9 +893,16 @@ async def _deny_docs_unverified(
         agent_id=agent_id,
         conversation_id=conversation_id,
         detail={
+            # Spread FIRST, fixed keys last (Argus round 1, BLOCKING): a
+            # pluggable, deploy-side DocsVerifier's own `detail` dict is
+            # less trusted than this function's own audit fields -- if the
+            # spread came last, a verifier returning
+            # detail={"reason": ..., "docs_verifier": ...} could silently
+            # overwrite this audit row's authoritative reason/verifier
+            # name, forging its own denial record.
+            **(result.detail or {}),
             "reason": result.reason,
             "docs_verifier": _docs_verifier_name(docs_verifier),
-            **(result.detail or {}),
         },
     )
     await session.commit()
@@ -3186,22 +3193,6 @@ async def start_conversation(
             exc=exc,
         )
 
-    # TECH-5998: same grounding/cleanliness gate as post_message's -- a
-    # seq-1 "docs" message is just as capable of leaking site data as any
-    # later one, so it goes through the identical verifier before this
-    # conversation (and its first message) are ever persisted. No-ops for
-    # every message_type other than "docs".
-    await _verify_docs_message(
-        session,
-        actor_sub=actor_sub,
-        sender_agent_id=initiator.id,
-        sender_sub=actor_sub,
-        conversation_id=None,
-        message_type=message_type,
-        payload=payload,
-        docs_verifier=docs_verifier,
-    )
-
     # DESIGN.md §9 Axis 2 and the sender-role restriction apply to the
     # seq-1 message exactly like every later one. Checked here, before any
     # row is created: ``_deny`` commits whatever is already staged on the
@@ -3226,6 +3217,27 @@ async def start_conversation(
         conversation_id=None,
         other_agents=[(t.id, t.accepted_types) for t in targets],
         message_type=message_type,
+    )
+
+    # TECH-5998: same grounding/cleanliness gate as post_message's -- a
+    # seq-1 "docs" message is just as capable of leaking site data as any
+    # later one, so it goes through the identical verifier before this
+    # conversation (and its first message) are ever persisted. No-ops for
+    # every message_type other than "docs". Deliberately run after
+    # ``_enforce_message_type_accepted`` (Argus round 1 SUGGESTION): a
+    # caller whose target doesn't even accept "docs" should be rejected by
+    # the cheap capability check first, not allowed to probe the
+    # (potentially expensive, cross-account) verifier for a message that
+    # was always going to be refused on type-acceptance grounds alone.
+    await _verify_docs_message(
+        session,
+        actor_sub=actor_sub,
+        sender_agent_id=initiator.id,
+        sender_sub=actor_sub,
+        conversation_id=None,
+        message_type=message_type,
+        payload=payload,
+        docs_verifier=docs_verifier,
     )
     risk_reason = await _score_message_risk(
         session,
@@ -3686,8 +3698,9 @@ async def _authorize_invite_owner_freeze(
 
 async def _conversation_has_note_history(session: AsyncSession, conversation_id: uuid.UUID) -> bool:
     """Has any free-text message (``plugins.BARRIER_SENSITIVE_TYPES`` --
-    ``note``, or ``instruction_share``'s doc-backed ``text``, TECH-5822)
-    ever been posted to this conversation? Used by ``invite`` (TECH-5735)
+    ``note``, ``instruction_share``'s doc-backed ``text`` (TECH-5822), or
+    ``docs``'s verifier-gated ``summary`` (TECH-5998)) ever been posted to
+    this conversation? Used by ``invite`` (TECH-5735)
     to decide whether admitting a new participant requires human approval
     first -- ``comms_accept`` grants full retroactive history read the
     moment a participant is admitted, and free text can't be structurally

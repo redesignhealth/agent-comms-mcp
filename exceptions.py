@@ -170,9 +170,13 @@ class DocsVerificationFailedError(Exception):
     ``RateLimitExceededError``: this is a content-correctness problem the
     sender can act on (re-summarize, cite the right document), not an
     access-control decision this board deliberately keeps opaque via
-    ``AccessDeniedError``. The caller is already an authorized, active
-    conversation participant by the time this can fire, so there is
-    nothing to enumerate by naming the real cause here.
+    ``AccessDeniedError``. The caller has already passed authorization
+    checks (``_require_active_agent`` + ``_authorize_conversation_open`` on
+    the ``start_conversation`` path, or the equivalent active-participant
+    check on ``post_message``) by the time this can fire -- not
+    necessarily an existing conversation *participant*, since
+    ``start_conversation``'s opener has no participant row yet -- so there
+    is nothing to enumerate by naming the real cause here.
     """
 
     def __init__(self, message: str, *, reason: str) -> None:

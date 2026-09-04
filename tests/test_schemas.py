@@ -422,6 +422,18 @@ class TestDocCitation:
         with pytest.raises(ValidationError):
             DocCitation.model_validate(self._valid(filename="x" * 256))
 
+    def test_accepts_account_id_at_max_length(self) -> None:
+        model = DocCitation.model_validate(self._valid(account_id="x" * 100))
+        assert model.account_id == "x" * 100
+
+    def test_accepts_document_id_at_max_length(self) -> None:
+        model = DocCitation.model_validate(self._valid(document_id="x" * 200))
+        assert model.document_id == "x" * 200
+
+    def test_accepts_filename_at_max_length(self) -> None:
+        model = DocCitation.model_validate(self._valid(filename="x" * 255))
+        assert model.filename == "x" * 255
+
 
 class TestDocsV1:
     def _valid(self, **overrides: object) -> dict[str, object]:

@@ -62,6 +62,7 @@ from exceptions import (
     AgentSuspendedError,
     ConversationArchivedError,
     DisplayNameCollisionError,
+    DocsVerificationFailedError,
     InvalidConversationStateError,
     RateLimitExceededError,
     SchemaVersionMismatchError,
@@ -375,6 +376,7 @@ async def _map_service_errors(error_cls: type[Exception] = ToolError) -> AsyncIt
         AgentSuspendedError,
         AgentAlreadyRegisteredError,
         ConversationArchivedError,
+        DocsVerificationFailedError,
     ) as exc:
         raise error_cls(str(exc)) from None
     except (ValueError, RuntimeError):
@@ -532,10 +534,10 @@ async def register(
           ``schemas.MessageType``): ``availability_request``,
           ``availability_response``, ``counter_proposal``, ``confirm``,
           ``decline``, ``needs_clarification``, ``note``,
-          ``instruction_request``, ``instruction_share``, ``task_assign``,
-          ``task_report``, ``task_complete``, ``task_decline``,
-          ``task_cancel``. Each entry capped at 100 chars; list capped at
-          20 entries.
+          ``instruction_request``, ``instruction_share``, ``docs``,
+          ``task_assign``, ``task_report``, ``task_complete``,
+          ``task_decline``, ``task_cancel``. Each entry capped at 100
+          chars; list capped at 20 entries.
     - ``min_schema_version``/``max_schema_version``: the range
       of wire-schema versions this agent's own code can correctly
       interpret. Both default to ``1`` — the only version that exists
@@ -1086,7 +1088,7 @@ async def start_conversation(
       ``availability_request``. All valid types: ``availability_request``,
       ``availability_response``, ``counter_proposal``, ``confirm``,
       ``decline``, ``needs_clarification``, ``note``, ``instruction_request``,
-      ``instruction_share``, ``task_assign``, ``task_report``,
+      ``instruction_share``, ``docs``, ``task_assign``, ``task_report``,
       ``task_complete``, ``task_decline``, ``task_cancel``.
       See ``comms_post_message`` for payload shapes per type.
     - ``initial_message``: payload dict for the opening message. Must match
@@ -1329,6 +1331,16 @@ async def post_message(
       downstream against a deployment-side allowlist). Boundary-sensitive
       like ``note`` — same held-for-approval behavior across a crossing
       boundary.
+    - ``docs``: ``summary`` (str 1-5000 chars, sender-authored free text) plus
+      ``citations`` (1-5 objects, each ``{account_id, document_id, filename}``)
+      identifying the source document(s) the summary is drawn from — never the
+      document content itself. Verified BEFORE the ordinary approval pipeline
+      even sees it: the configured ``DocsVerifier`` must open every cited
+      document, confirm the summary is actually grounded in it, and confirm
+      it's clean of site-identifying data. A message that fails this check is
+      denied outright (caller-visible, not a uniform denial) and never reaches
+      the held-for-approval path below. Boundary-sensitive like ``note`` once
+      verified — same held-for-approval behavior across a crossing boundary.
     - ``task_assign``: ``action`` enum:
       gather_availability/schedule_meeting/reschedule_meeting/cancel_meeting/
       confirm_slot/report_status. ``gather_availability``,
@@ -1354,8 +1366,8 @@ async def post_message(
       ``payload``, ``created_at``. If a (test-injected or future)
       auto-approver cleared a high-risk post inline, this same shape gains
       ``auto_approved: true`` and ``hold_id``.
-    - High-risk, escalated (v1's default outcome for a crossing ``note`` or
-      ``instruction_share``):
+    - High-risk, escalated (v1's default outcome for a crossing ``note``,
+      ``instruction_share``, or verified ``docs``):
       ``{"held_for_approval": true, "hold_id", "conversation_id",
       "status", "risk_reason", "expires_at", "created_at"}``, plus
       ``decision_url`` when ``DECISION_PAGE_BASE_URL`` is configured — no
@@ -1767,8 +1779,8 @@ async def invite(
       invite hold inline rather than this being the ordinary no-hold path)
       ``auto_approved: true`` and ``hold_id``, mirroring
       ``comms_post_message``'s equivalent fields.
-    - The conversation already has ``note`` or ``instruction_share`` history
-      (``BARRIER_SENSITIVE_TYPES``, TECH-5735/TECH-5822): admitting
+    - The conversation already has ``note``, ``instruction_share``, or ``docs``
+      history (``BARRIER_SENSITIVE_TYPES``, TECH-5735/TECH-5822/TECH-5998): admitting
       a new participant would grant it full retroactive read access to
       that history the moment it accepts, so the invite is held for human
       approval instead -- ``{"held_for_approval": true, "hold_id",

@@ -418,7 +418,12 @@ class TestDocsVerifierRegistry:
             sender_agent_id=uuid.uuid4(),
             sender_sub="agent:sender",
             conversation_id=uuid.uuid4(),
-            payload={"summary": "x", "citations": []},
+            payload={
+                "summary": "x",
+                "citations": [
+                    {"account_id": "acct-123", "document_id": "doc-456", "filename": "f.pdf"}
+                ],
+            },
         )
         result = await verifier.verify(ctx)
         assert result.verified is False

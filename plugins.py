@@ -79,6 +79,13 @@ DEFAULT_RISK_SCORER = "boundary_v1"
 # scorer-private policy data instead of a schema field. Any message type
 # NOT in this set is exempt from ownership-boundary scoring entirely (no
 # lookup, always low risk) -- the cheap common path.
+#
+# SYNC HAZARD: if this frozenset gains (or loses) a member, `models.py`'s
+# ``idx_messages_conversation_id_free_text`` partial index WHERE clause
+# and a new Alembic migration must be updated to match -- there is no way
+# to derive a partial index predicate from a Python frozenset at
+# migration-authoring time, so this is a manual sync point (see
+# ``models.py``'s own mirrored comment on that index).
 BARRIER_SENSITIVE_TYPES: frozenset[str] = frozenset({"note", "instruction_share", "docs"})
 # ``instruction_request`` is deliberately NOT included here (TECH-5822) --
 # it carries no content (schemas.InstructionRequestV1 has only a ``kind``
@@ -961,6 +968,18 @@ class DocsVerificationResult(NamedTuple):
     to the sender (unlike ``RiskVerdict.reason``) -- this is a
     correctness problem the sender can act on, not an access decision this
     board deliberately keeps opaque.
+
+    ``reason`` MUST be a short, generic code or phrase (roughly 200
+    characters or fewer) drawn from a small, implementation-defined
+    vocabulary -- NEVER a substring, paraphrase, or excerpt of the cited
+    source document's own content. A real verifier holds a privileged
+    credential to read documents the sender itself cannot see (documents
+    on a DIFFERENT account than the one the sender is scoped to, per
+    TECH-5979's `arcana_query` contrast); a ``reason`` like ``"summary
+    says X but source actually says Y"`` would leak that other account's
+    confidential content straight back to the sender through the one
+    channel this stage deliberately keeps sender-visible. Prefer a fixed
+    enum-like value over any dynamically-constructed string.
     """
 
     verified: bool
@@ -996,9 +1015,17 @@ class DocsVerificationContext(NamedTuple):
     is no correctness judgment to make here without the summary text and
     its citation. ``payload`` is the already schema-validated, normalized
     ``DocsV1`` dump (``schemas.validate_payload``'s return value) -- a
-    real implementation can trust its shape (bounded ``summary``, 1-5
+    real implementation can trust its SHAPE (bounded ``summary``, 1-5
     ``citations`` each with ``account_id``/``document_id``/``filename``)
     without re-validating it.
+
+    Trusting the shape is not the same as trusting the CONTENT:
+    ``payload["summary"]`` is sender-authored free text (schema-bounded to
+    5000 characters, nothing more) that any real verifier will almost
+    certainly embed in an LLM grounding-check prompt. Treat it as
+    untrusted, potentially adversarial input in that prompt -- use role
+    delimiters or an equivalent boundary marker, the same discipline
+    already required of any user-supplied text reaching a model.
 
     Runs BEFORE a conversation row is necessarily loaded in the
     ``start_conversation`` path, so ``conversation_id`` is ``None`` there

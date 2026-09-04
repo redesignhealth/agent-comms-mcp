@@ -28,6 +28,19 @@ DEPLOYMENT: safe for a normal rolling deploy -- an old container still
 running ``WHERE type IN ('note', 'instruction_share')``-only queries
 continues to work fine against the broadened index (a query's own WHERE
 clause doesn't have to name every value the index's WHERE clause covers).
+
+DOWNGRADE HAZARD (Argus round 1): ``downgrade()`` narrows the index back to
+``WHERE type IN ('note', 'instruction_share')``, which no longer covers
+``docs`` rows. If code and migrations ever roll back independently -- an
+old migration state applied against code that still posts/queries ``docs``
+messages (e.g. a partial rollback, or this migration reverted ahead of
+``plugins.BARRIER_SENSITIVE_TYPES`` itself being reverted) --
+``_conversation_has_note_history``'s query against ``docs`` history would
+fall back to a full table scan instead of an index scan. That's a silent
+performance regression, not a correctness one: the query still returns the
+right answer, just slower as ``messages`` grows. Re-apply this migration
+(or avoid downgrading past it while ``docs`` is still a live message type)
+rather than accepting the scan.
 """
 
 from __future__ import annotations
