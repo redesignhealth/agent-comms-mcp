@@ -105,7 +105,12 @@ Axis 2's per-message sender-role check), ``denied.message_type_not_accepted``
 universally, even to ``internal`` traffic that Axis 2 itself always
 allows), ``denied.is_shared_requires_elevated_scope`` (a caller without
 ``comms:admin`` tried to self-declare ``is_shared=True`` at first
-registration), and ``denied.set_shared_requires_elevated_scope`` (a caller
+registration -- as of TECH-6002, 2026-09-03, the only production caller of
+``register_agent``, ``providers/comms.py``'s ``register`` tool, always
+passes ``is_shared_authorized=True``, so this denial is currently
+unreachable from the API; it remains a defense-in-depth fail-closed check
+for any future caller of ``register_agent`` that doesn't go through that
+tool), and ``denied.set_shared_requires_elevated_scope`` (a caller
 without ``comms:admin`` tried to use the ``set_agent_shared`` admin
 override).
 
@@ -138,10 +143,12 @@ mutation nor a denial: they record that a privileged or fire-and-forget
 code path was taken, not that anything was created or refused.
 ``risk.shared_sender_bypass`` (renamed from PR1's still-unrenamed
 ``agent.boundary_check_bypassed_shared`` — no backwards compatibility,
-ratified)/``agent.conversation_open_bypassed_shared`` (a
-``comms:admin``-authorized shared sender/initiator skipped the
-ownership-boundary check for a message/conversation-open respectively --
-DESIGN.md §9), ``agent.reregister_is_shared_ignored`` (a re-registration's
+ratified)/``agent.conversation_open_bypassed_shared`` (a shared
+sender/initiator skipped the ownership-boundary check for a
+message/conversation-open respectively -- as of TECH-6002, 2026-09-03, a
+plain ``comms:write``-scoped caller can self-declare ``is_shared`` and
+trigger this too, not only a ``comms:admin``-authorized one -- DESIGN.md
+§9), ``agent.reregister_is_shared_ignored`` (a re-registration's
 requested ``is_shared`` value diverged from the already-frozen row value
 and was silently ignored, per ``is_shared``'s freeze-at-first-registration
 rule), and ``approval.notify_failed`` (the post-commit approval notifier
@@ -1484,7 +1491,13 @@ async def admin_register_agent(
     ``is_shared_authorized`` (a NARROWER gate on one parameter of an
     otherwise-reachable self-service tool), ``admin_authorized`` gates the
     entire call -- there is no unprivileged use of this function, so
-    ``is_shared`` itself needs no separate authorization check here.
+    ``is_shared`` itself needs no separate authorization check here. Note
+    that as of TECH-6002 the tool-layer caller of ``register_agent`` (the
+    ``register``/``comms_register`` tool) always passes
+    ``is_shared_authorized=True`` unconditionally, so the contrast above is
+    historical context on the two functions' respective designs, not a
+    description of a live conditional check at the ``register`` tool layer
+    today.
 
     **``owner_sub``/``owner_email`` are explicit, caller-supplied
     parameters here** -- the one deliberate exception to DESIGN.md §4's
@@ -1838,22 +1851,27 @@ async def register_agent(
     verification of its own; it persists exactly what it is given. Never
     call it with owner_sub/owner_email taken from untrusted tool arguments.
 
-    SECURITY: ``is_shared_authorized`` gates ``is_shared=True`` on FIRST
+    ``is_shared_authorized`` gates ``is_shared=True`` on FIRST
     registration only (a re-registration can never change the already-frozen
     ``is_shared`` value, so the gate is a no-op there). ``is_shared`` is an
     admission-decision input — it lets its holder skip the pairwise
     ownership-boundary check in ``_authorize_conversation_open`` and the
-    risk scorer's ownership lookups (``_score_message_risk``) — so
-    self-declaring it at registration
-    with only the baseline write scope would be a privilege escalation.
-    Callers MUST compute this from the caller's own verified token (e.g. an
-    elevated ``comms:admin`` scope or platform-provisioning identity) and
-    pass ``True`` only when that check passes. Defaults to ``False``
-    (fail-closed): an admission-decision-input gate must never silently
-    grant its privilege to a caller that forgets the kwarg. Direct
-    service-layer callers that need the convenience of a permissive
-    default (e.g. tests) should set it in their own helper, not rely on
-    this signature's default.
+    risk scorer's ownership lookups (``_score_message_risk``). As of
+    2026-09-03 (TECH-6002, confirmed with Dan), self-registration
+    deliberately no longer requires elevated scope for this --
+    the ``register`` tool (``comms_register`` MCP tool) in
+    ``providers/comms.py`` (this function's only
+    tool-layer caller -- ``tests/test_approval_endpoint.py`` and
+    ``tests/test_service.py`` also call this function directly) now always
+    passes ``True`` here, since an agent declaring ITS OWN ``is_shared``
+    is a self-service product decision, not a privilege escalation. The
+    parameter and its fail-closed ``False`` default are kept rather than
+    removed: it's still the mechanism that would gate this for any FUTURE
+    caller of this function that isn't plain self-registration, and
+    removing it would silently make this function's own default trust
+    everyone. Direct service-layer callers that need the convenience of a
+    permissive default (e.g. tests) should set it in their own helper, not
+    rely on this signature's default.
 
     Idempotent: calling again with the same ``sub`` updates
     ``display_name``/``accepted_types``/``owner_email`` in place (unique on
@@ -7519,10 +7537,11 @@ class AgentTableOwnershipClient:
     ``is_shared`` IS still frozen
     against an agent's own re-registration, but -- unlike ``owner_sub`` --
     mutable via the separate ``comms:admin``-gated ``set_agent_shared``
-    admin override (see that function's docstring); its only mutation path
-    is itself gated on the same elevated scope required to escalate it at
-    first registration, so there is no path by which an unprivileged
-    caller can move it.
+    admin override (see that function's docstring). As of TECH-6002, setting
+    ``is_shared=True`` at FIRST registration only requires ``comms:write``
+    (a plain, unprivileged caller can self-declare it on their own first
+    registration); it is post-registration mutation via ``set_agent_shared``
+    that still requires the elevated ``comms:admin`` scope.
     """
 
     def __init__(self, session: AsyncSession) -> None:

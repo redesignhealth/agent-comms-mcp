@@ -598,14 +598,17 @@ async def register(
       the usual pairwise ownership-overlap check, and its senders may post
       non-``boundary_safe`` messages there without an ownership-boundary
       check; neither bypass applies to ``internal`` conversations. Setting
-      ``is_shared=True`` on FIRST registration requires the caller's token
-      to carry the ``comms:admin`` scope (or be an interactive/Okta caller)
-      — it is an admission-decision input, so self-declaring it with only
-      the baseline ``comms:write`` scope would be a privilege escalation;
-      a caller without that scope gets the standard anti-enumeration
-      ``access_denied`` error (the specific reason,
-      ``denied.is_shared_requires_elevated_scope``, is recorded only in the
-      audit log — never returned to the caller).
+      ``is_shared=True`` on FIRST registration requires only the baseline
+      ``comms:write`` scope -- self-declaring it here is a deliberate
+      product decision (confirmed with Dan, 2026-09-03), not gated by
+      ``comms:admin``/interactive auth the way it used to be. The two
+      adjacent operations that touch ``is_shared`` for a sub OTHER than
+      the caller's own -- ``comms_set_agent_shared`` (correcting an
+      EXISTING agent's value after the fact) and ``comms_admin_register``
+      (registering a different sub on that sub's behalf) -- still require
+      the elevated ``comms:admin``-or-interactive authorization; only
+      an agent's OWN self-registration of its OWN ``is_shared`` was
+      relaxed.
     - ``confirm_new_identity``: acknowledges "yes, I intend to register a
       GENUINELY SEPARATE identity for this base_sub" (TECH-5736). Only
       relevant when this call would otherwise create a new row for a
@@ -616,8 +619,8 @@ async def register(
       use of ``agent_key``; almost always a mistake (an omitted/typoed
       ``agent_key``) otherwise -- pass it deliberately, per new identity,
       never as a blanket default. Requires only the baseline
-      ``comms:write`` scope, unlike ``is_shared=True`` above -- deliberately
-      not ``comms:admin``-gated: unlike ``is_shared``, this flag is not an
+      ``comms:write`` scope, same as ``is_shared=True`` above -- not
+      ``comms:admin``-gated: unlike ``is_shared``, this flag is not an
       admission-decision input (it affects no authorization path), and any
       caller with ``comms:write`` legitimately needs to be able to
       register a genuinely new sibling identity under their own
@@ -691,12 +694,29 @@ async def register(
 
     # `is_shared=True` is an admission-decision input (DESIGN.md §9): it
     # lets its holder bypass the pairwise ownership check for `asymmetric`
-    # conversations. Interactive (Okta) callers already bypass scope checks
-    # entirely elsewhere in this module, so they're trusted here too;
-    # non-interactive callers need the elevated `comms:admin` scope.
+    # conversations. Self-registration no longer requires elevated scope to
+    # set this on first registration -- TECH-6002, confirmed with Dan,
+    # 2026-09-03: an agent may now declare itself `is_shared=True` with only
+    # the baseline `comms:write` scope, no `comms:admin`/interactive
+    # requirement. This is a deliberate product decision (self-service, not
+    # a bug fix) -- the
+    # `comms:admin`-or-interactive gate this replaced is UNCHANGED for the
+    # two adjacent tools that still need it: `comms_set_agent_shared`
+    # (correcting an EXISTING agent's `is_shared` after the fact) and the
+    # admin-authorization on `comms_admin_register` itself (registering a
+    # DIFFERENT sub on that sub's behalf) -- neither of those is "the agent
+    # speaking for itself," which is the only case this change relaxes.
     # `register_agent` enforces this only on first registration (a no-op
     # for the frozen re-registration path either way).
-    is_shared_authorized = is_interactive_token(token) or "comms:admin" in scopes_for_token(token)
+    #
+    # Note the bypass this grants is not confined to actions the declaring
+    # agent itself takes: when agent X declares `is_shared=True` as the
+    # TARGET of an `asymmetric` conversation, a separate, unprivileged
+    # initiator Y also gains the pairwise ownership-boundary bypass for that
+    # (Y, X) pair. The declaring agent must be a party to the bypassed pair,
+    # but the OTHER party in that pair may be a completely different,
+    # unprivileged agent -- this is intended (see DESIGN.md §9), not a gap.
+    is_shared_authorized = True
 
     async with get_session_factory()() as session, _map_service_errors():
         agent = await service.register_agent(
@@ -740,11 +760,14 @@ async def set_agent_shared(agent_id: str, is_shared: bool) -> dict[str, Any]:
     bot spanning multiple owners, or the reverse.
 
     Requires the caller's token to carry the ``comms:admin`` scope (or be
-    an interactive/Okta caller) — same gate as first-registration
-    ``is_shared=True``. A caller without it gets the standard
-    anti-enumeration ``access_denied`` error (the specific reason,
-    ``denied.set_shared_requires_elevated_scope``, is recorded only in the
-    audit log).
+    an interactive/Okta caller) -- because this tool corrects a ``sub``
+    OTHER than (in general) the caller's own, unlike ``comms_register``'s
+    ``is_shared=True`` on first registration, which is self-service (see
+    DESIGN.md §5; that gate was intentionally removed for self-registration
+    only, as of 2026-09-03 -- this tool's own gate is unaffected). A caller
+    without it gets the standard anti-enumeration ``access_denied`` error
+    (the specific reason, ``denied.set_shared_requires_elevated_scope``, is
+    recorded only in the audit log).
 
     - ``agent_id``: UUID string from ``comms_list_agents``.
     - ``is_shared``: the corrected value.
@@ -897,10 +920,14 @@ async def admin_register(
       message type" opt-out sentinel when omitted/``None``/``[]``.
     - ``is_shared``: set ``True`` if this agent spans ownership boundaries.
       No separate authorization check on this parameter (unlike
-      ``comms_register``'s ``is_shared=True`` gate) — the entire
+      ``comms_set_agent_shared``'s own gate) -- the entire
       ``comms_admin_register`` call already requires the same elevated
       authorization, so there is no less-privileged path through this tool
-      for ``is_shared`` to escalate past.
+      for ``is_shared`` to escalate past. (``comms_register``'s
+      self-registration path has no ``is_shared=True`` gate of its own
+      either, as of 2026-09-03 -- but for the opposite reason: there, the
+      caller and the ``sub`` being registered are the same identity, so
+      there's nothing to escalate past in the first place.)
     - ``confirm_new_identity``: same acknowledgement semantics as
       ``comms_register``'s parameter of the same name (TECH-5736) -- this
       tool deliberately does NOT skip that guard just because it's an

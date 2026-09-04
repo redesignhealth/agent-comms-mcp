@@ -40,9 +40,10 @@ _DEFAULT_EXPIRES_SECONDS = 90 * 24 * 60 * 60
 # case for a token that outlives this service's own longest-lived state.
 _MAX_EXPIRES_SECONDS = 90 * 24 * 60 * 60
 
-# comms:admin gates providers.comms.register/set_agent_shared directly (see
-# scopes.py) but never appears as a TOOL_SCOPES value since it isn't itself
-# a per-tool requirement — union it in explicitly so it remains mintable.
+# comms:admin gates providers.comms.set_agent_shared/deregister_agent/
+# admin_register directly (see scopes.py) but never appears as a
+# TOOL_SCOPES value since it isn't itself a per-tool requirement — union it
+# in explicitly so it remains mintable.
 # PROPOSAL_SUBMIT_SCOPE (comms:proposals:write) is the same story for the
 # non-MCP `POST /proposals` route (TECH-5872): it self-checks this scope
 # directly rather than going through TOOL_SCOPES/ScopeEnforcementMiddleware
