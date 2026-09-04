@@ -33,6 +33,7 @@ from service import (
     _APPLY_ERROR_CANCELLED_MESSAGE,
     MAX_PROPOSALS_PER_BOT_PER_WINDOW,
     PROPOSAL_SUBMITTER_SURFACES,
+    _redact_bot_facing_dict,
     _sanitize_apply_error,
     audit_denied_proposal_submission,
     create_proposal,
@@ -93,6 +94,30 @@ async def _submit(
         impact=impact,
         target_fingerprint=target_fingerprint,
     )
+
+
+class TestRedactBotFacingDict:
+    """Direct, DB-free coverage of ``_redact_bot_facing_dict`` (Argus
+    review round-5 suggestion) -- the shared rule ``_bot_facing_proposal_dict``
+    and ``create_proposal``'s auto-judge happy path both delegate to. Pins
+    the extracted contract independently of any integration path, so the
+    refactor's stated goal (a call site can't silently regress by
+    hardcoding the wrong ``decision_source`` or dropping the call
+    entirely) is actually enforced by a test, not just exercised
+    incidentally by unrelated ones."""
+
+    def test_pops_decided_by_actor_id_when_human(self) -> None:
+        result = _redact_bot_facing_dict(
+            {"decided_by_actor_id": "owner-a@example.com"}, decision_source="human"
+        )
+        assert "decided_by_actor_id" not in result
+
+    def test_preserves_decided_by_actor_id_when_not_human(self) -> None:
+        for decision_source in ("auto", "bot", None):
+            result = _redact_bot_facing_dict(
+                {"decided_by_actor_id": "bot-1"}, decision_source=decision_source
+            )
+            assert result["decided_by_actor_id"] == "bot-1"
 
 
 class TestDedup:
@@ -236,15 +261,17 @@ class TestDedup:
         partial index covers ``'applying'`` too, per
         ``service._proposal_dedup_where``'s own docstring), resubmit
         against the SAME dedup key, and confirm the submitting bot's
-        response never discloses that human's identity. Covers the
-        dedup-into-``applying`` return path specifically (service.py:5986)
-        -- without the round-2 fix, that path returned a bare
+        response never discloses that human's identity. Covers
+        ``create_proposal``'s ``if not auto_approved:`` return path
+        specifically -- without the round-2 fix, that path returned a bare
         ``_proposal_dict`` and this test would still pass green if it only
         checked ``status`` -- it must assert the REDACTION itself. The lost-
         claim-race and auto-judge return paths are separately reachable
         only via a hand-authored race (see
         ``test_integrity_error_race_falls_back_to_select_and_update`` for
-        that pattern) and are not exercised by this test."""
+        that pattern) and are not exercised by this test -- see
+        ``TestRedactBotFacingDict`` for direct coverage of the shared
+        ``_redact_bot_facing_dict`` rule those paths delegate to."""
         action = _action(target_id="TECH-77")
         applying_hold = ProposalHold(
             kind="linear_progress_update",
@@ -1247,10 +1274,14 @@ class TestWithdrawProposal:
     async def test_withdraw_then_resubmit_same_key_creates_fresh_row(
         self, session: AsyncSession
     ) -> None:
-        """The whole point of withdraw over just leaving a stale pending
-        row sitting: once withdrawn, the SAME (kind, bot, target_id,
-        action_type) key is free for a fresh submission instead of being
-        blocked by/silently updating the withdrawn row."""
+        """A withdrawn row does not block or get silently updated by a
+        later same-key submission -- verifies the create-time dedup
+        partial index excludes ``'withdrawn'`` rows, so a fresh submission
+        for the same ``(kind, bot, target_id, action_type)`` key becomes a
+        genuinely new pending row rather than colliding with the retired
+        one. (NOT withdraw's purpose, which is retracting a proposal the
+        bot now considers stale/wrong before a human decides it -- see
+        ``TestWithdrawProposal``'s own class docstring.)"""
         submitted = await _submit(session, proposed_by_bot_id="bot-1")
         await withdraw_proposal(
             session,
