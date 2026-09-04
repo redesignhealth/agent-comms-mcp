@@ -6091,6 +6091,18 @@ _APPLY_ERROR_GENERIC_MESSAGE = "Linear API returned an error"
 # discoverable as "one of four fixed public values"), and given
 # human-readable prose matching the sibling constants' style instead of a
 # `status:reason` machine-token shape.
+#
+# Backward compatibility (Argus review round-10 suggestion): this value
+# changed from the machine-token `"apply_failed:cancelled"` (introduced
+# round-9, same PR/deploy cycle) to this human-readable string. No
+# production traffic exists yet for TECH-5873's decide/apply endpoint --
+# `proposal_holds` has zero live write traffic pre-TECH-5884/5884 (see
+# migration `e2f7a91c5b34`'s own DEPLOYMENT note) -- so there is no
+# persisted row anywhere carrying the old value and no migration is
+# needed. This string is NOT meant to be machine-matched by any consumer
+# going forward either -- like its three `LinearAPIError` siblings, it is
+# prose for a human reading the API response, not a stable enum value;
+# don't build string-equality logic against it in a future caller.
 _APPLY_ERROR_CANCELLED_MESSAGE = "Apply cancelled before completion"
 
 
@@ -6316,10 +6328,13 @@ async def _apply_or_finalize_proposal_hold(
         hold.status = "apply_failed"
         hold.apply_error = apply_error
         # Argus review round-6 B1: log the RAW (unsanitized) exception text
-        # here, not `apply_error` -- `apply_error` is already the sanitized
-        # allowlisted constant (`_sanitize_apply_error`), so logging it
-        # would collapse every distinct Linear failure to the same three
-        # strings, defeating the whole point of keeping full detail
+        # here, not `apply_error` -- `apply_error` is already one of the
+        # four fixed allowlisted strings (Argus review round-9 fix to this
+        # comment: three `LinearAPIError` messages via `_sanitize_apply_error`,
+        # plus `_APPLY_ERROR_CANCELLED_MESSAGE` assigned directly at the
+        # `CancelledError` call sites, not through that function), so
+        # logging it would collapse every distinct failure to one of only
+        # four strings, defeating the whole point of keeping full detail
         # server-side while narrowing what the API returns.
         logger.warning(
             "proposal apply_failed for hold_id=%s target_id=%s: %s",

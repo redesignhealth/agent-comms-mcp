@@ -94,6 +94,17 @@ class TestIsValidCitationUrl:
     def test_missing_hostname_rejected(self) -> None:
         assert is_valid_citation_url("https:///path-with-no-host") is False
 
+    def test_malformed_ipv6_url_rejected_not_raises(self) -> None:
+        """Argus review round-10 BLOCKING: `urlsplit()` itself (not just a
+        later `.hostname`/`.port` access) raises `ValueError` for a
+        malformed IPv6 literal -- an unclosed bracket or invalid group
+        count. This is the FIRST call site a proposal action's URL field
+        reaches (before `redact_url_for_logging`, which only runs on a
+        value already found invalid here), so a crash here is the one
+        that actually stranded holds in production terms."""
+        assert is_valid_citation_url("https://[::1/x") is False
+        assert is_valid_citation_url("https://[::1::2]/path") is False
+
 
 class TestRedactUrlForLogging:
     """Argus review round-7/round-8: `redact_url_for_logging` is the
@@ -149,3 +160,10 @@ class TestRedactUrlForLogging:
     def test_ipv6_host_keeps_brackets(self) -> None:
         assert redact_url_for_logging("https://[::1]:8443/path") == "https://[::1]:8443/path"
         assert redact_url_for_logging("https://[::1]/path") == "https://[::1]/path"
+
+    def test_malformed_ipv6_url_returns_placeholder_not_raises(self) -> None:
+        """Argus review round-10 BLOCKING: mirrors
+        ``TestIsValidCitationUrl.test_malformed_ipv6_url_rejected_not_raises``
+        for this function's own (separate) unguarded ``urlsplit()`` call."""
+        assert redact_url_for_logging("https://[::1/x") == "<unparseable-url>"
+        assert redact_url_for_logging("https://[::1::2]/path") == "<unparseable-url>"

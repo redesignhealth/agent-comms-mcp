@@ -24,7 +24,30 @@ B3/round-3 S4).
 from __future__ import annotations
 
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, urlsplit
+
+
+# Argus review round-10 BLOCKING fix: `urlsplit()` ITSELF can raise
+# `ValueError` for a malformed IPv6 literal (e.g. an unclosed bracket
+# `https://[::1/x`, or extra `::` groups `https://[::1::2]/path`) --
+# eagerly, at parse time, not lazily on a later `.port`/`.hostname`
+# access. Both call sites in this module (`is_valid_citation_url`,
+# `redact_url_for_logging`) run on arbitrary caller-supplied strings that
+# have not yet been validated as well-formed URLs, so BOTH need this same
+# guard -- round-9's fix only wrapped `.port` in `redact_url_for_logging`,
+# which is a strict subset of the actual failure surface: a bare
+# `urlsplit()` call in `is_valid_citation_url` (which runs FIRST, before a
+# rejected value ever reaches `redact_url_for_logging`) could already
+# raise, propagating straight out of `_apply_or_finalize_proposal_hold`'s
+# exception handling (neither `LinearAPIError` nor `CancelledError`
+# matches a bare `ValueError`) and permanently stranding the hold at
+# `"applying"`.
+def _safe_urlsplit(value: str) -> SplitResult | None:
+    try:
+        return urlsplit(value)
+    except ValueError:
+        return None
+
 
 # A citation URL (``source_message_url``/``resolving_pr_url`` on a
 # ``linear_progress_update`` proposal action) must now be an http(s) URL
@@ -62,7 +85,9 @@ def is_valid_citation_url(value: Any) -> bool:
     """
     if not isinstance(value, str) or not value.strip():
         return False
-    parsed = urlsplit(value)
+    parsed = _safe_urlsplit(value)
+    if parsed is None:
+        return False
     if parsed.scheme not in ("http", "https"):
         return False
     if "@" in parsed.netloc:
@@ -110,9 +135,14 @@ def redact_url_for_logging(value: str) -> str:
     (Argus review round-9 suggestion): ``parsed.hostname`` strips them
     (``"::1"``, not ``"[::1]"``), so a bare f-string join would produce an
     address that no longer parses as a URL at all -- misleading in a log
-    line about what the actual offending value looked like."""
-    parsed = urlsplit(value)
-    if not parsed.scheme or not parsed.hostname:
+    line about what the actual offending value looked like.
+
+    Uses ``_safe_urlsplit`` (Argus review round-10 BLOCKING fix): the bare
+    ``urlsplit()`` call itself, not just the later ``.port`` access, can
+    raise ``ValueError`` for a malformed URL (see the module-level
+    comment on ``_safe_urlsplit``)."""
+    parsed = _safe_urlsplit(value)
+    if parsed is None or not parsed.scheme or not parsed.hostname:
         return "<unparseable-url>"
     try:
         port = parsed.port

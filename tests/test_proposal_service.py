@@ -735,12 +735,19 @@ class TestDecideProposal:
         # text (the other branch of `_cancellation_apply_error`, exercised
         # by `test_cancellation_with_message_uses_message_in_raw_error_only`
         # for the WITH-message case) should also land in the audit log.
+        # Argus review round-10 suggestion: filter by `hold_id` (a JSONB
+        # field on `detail`), not `order_by(at.desc()).first()` -- the
+        # timestamp-ordering approach only happened to work because this
+        # test's own hold is the only row this action type could produce
+        # in an otherwise-truncated table; filtering directly is correct
+        # regardless of ordering or what else might run in this table.
         audit_row = (
             (
                 await session.execute(
-                    select(AuditLog)
-                    .where(AuditLog.action == "proposal.apply_failed")
-                    .order_by(AuditLog.at.desc())
+                    select(AuditLog).where(
+                        AuditLog.action == "proposal.apply_failed",
+                        AuditLog.detail["hold_id"].astext == str(hold_id),
+                    )
                 )
             )
             .scalars()
@@ -787,6 +794,26 @@ class TestDecideProposal:
         ).scalar_one()
         assert row.status == "apply_failed"
         assert row.apply_error == _APPLY_ERROR_CANCELLED_MESSAGE
+        # Argus review round-10 suggestion: mirror the fingerprinter-
+        # cancelled test's audit-log assertion here, for the applier-
+        # cancelled branch specifically -- these are two distinct
+        # `except asyncio.CancelledError` call sites in
+        # `_apply_or_finalize_proposal_hold`, both of which write to the
+        # audit log independently.
+        audit_row = (
+            (
+                await session.execute(
+                    select(AuditLog).where(
+                        AuditLog.action == "proposal.apply_failed",
+                        AuditLog.detail["hold_id"].astext == str(hold_id),
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        assert audit_row is not None
+        assert "apply cancelled before completion" in audit_row.detail["error"]
 
     async def test_cancellation_with_message_uses_message_in_raw_error_only(
         self, session: AsyncSession
@@ -824,9 +851,10 @@ class TestDecideProposal:
         audit_row = (
             (
                 await session.execute(
-                    select(AuditLog)
-                    .where(AuditLog.action == "proposal.apply_failed")
-                    .order_by(AuditLog.at.desc())
+                    select(AuditLog).where(
+                        AuditLog.action == "proposal.apply_failed",
+                        AuditLog.detail["hold_id"].astext == str(hold_id),
+                    )
                 )
             )
             .scalars()
