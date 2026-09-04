@@ -66,6 +66,11 @@ logger = logging.getLogger(__name__)
 _DENIAL_MESSAGE = "insufficient_scope: tool '{tool_name}' requires elevated permissions"
 _RESOURCE_DENIAL_MESSAGE = "insufficient_scope: resource '{uri}' requires elevated permissions"
 
+# Flat scope requirement for resources/list and resources/templates/list
+# (see ScopeEnforcementMiddleware._gate_resource_listing) — every resource
+# this service registers today requires comms:read (TECH-5903).
+_LIST_RESOURCES_REQUIRED_SCOPE = "comms:read"
+
 
 class ScopeEnforcementMiddleware(Middleware):
     """Enforce agent-jwt scopes on every tool dispatch.
@@ -133,8 +138,10 @@ class ScopeEnforcementMiddleware(Middleware):
     ) -> Any:
         """Enforce agent-jwt scopes on resource reads (mirrors the tool path).
 
-        This service registers no resources today; the hook exists so any
-        future resource is fail-closed for agent-jwt callers by default.
+        Every resource ``providers.comms`` registers is enrolled in
+        ``scopes.RESOURCE_SCOPES``/``RESOURCE_TEMPLATE_SCOPES`` (TECH-5903);
+        an unenrolled resource URI is fail-closed for agent-jwt callers by
+        default, same contract as an unenrolled tool.
         """
         uri = str(context.message.uri)
         token = get_access_token()
@@ -157,6 +164,76 @@ class ScopeEnforcementMiddleware(Middleware):
                 reason="missing_scope",
                 client_id=safe_client_id(token),
                 required_scope=required,
+            )
+
+        return await call_next(context)
+
+    async def on_list_resources(
+        self,
+        context: MiddlewareContext[mt.ListResourcesRequest],
+        call_next: CallNext[mt.ListResourcesRequest, Any],
+    ) -> Any:
+        """Gate ``resources/list`` on ``comms:read`` for agent-jwt callers.
+
+        The listed metadata (URI/name/description) is static and
+        non-sensitive, but this keeps "an agent-jwt token with zero scopes
+        learns nothing" true even for listing, same interactive bypass as
+        every other hook. Flat scope requirement (not per-resource) because
+        every resource this service registers today requires the same
+        ``comms:read`` scope (TECH-5903) — if a resource requiring a
+        different scope is ever added, listing would need to become
+        per-item filtering instead of an all-or-nothing gate.
+        """
+        return await self._gate_resource_listing("resources/list", call_next, context)
+
+    async def on_list_resource_templates(
+        self,
+        context: MiddlewareContext[mt.ListResourceTemplatesRequest],
+        call_next: CallNext[mt.ListResourceTemplatesRequest, Any],
+    ) -> Any:
+        """Gate ``resources/templates/list`` on ``comms:read`` — see ``on_list_resources``."""
+        return await self._gate_resource_listing("resources/templates/list", call_next, context)
+
+    @staticmethod
+    async def _gate_resource_listing(
+        pseudo_uri: str,
+        call_next: CallNext[Any, Any],
+        context: MiddlewareContext[Any],
+    ) -> Any:
+        """Shared body for ``on_list_resources``/``on_list_resource_templates``.
+
+        ``pseudo_uri`` is a fixed, non-URI label (not a real resource URI —
+        there is no single URI to attribute a *listing* denial to) fed to
+        ``_deny_resource`` purely so its existing ``scope_denial`` logging
+        and ``ResourceError`` shape are reused unchanged rather than
+        duplicated for this call site.
+        """
+        token = get_access_token()
+
+        if is_interactive_token(token):
+            return await call_next(context)
+
+        if token is None:
+            ScopeEnforcementMiddleware._deny_resource(
+                pseudo_uri, reason="missing_token", client_id=None
+            )
+        if token is None:
+            # Not an `assert` (Argus round-2 BLOCKING catch, same reasoning
+            # as the `_okta_server is None` check above): assertions are
+            # stripped under `python -O`/`-OO`, which would silently let
+            # `None` flow into `scopes_for_token` below instead of failing
+            # loudly here. `_deny_resource` is `NoReturn` so this branch is
+            # unreachable in practice — but that guarantee lives entirely
+            # in a separate function's annotation, not in this branch's own
+            # control flow.
+            raise RuntimeError("_deny_resource must have raised: token should be non-None here")
+
+        if _LIST_RESOURCES_REQUIRED_SCOPE not in scopes_for_token(token):
+            ScopeEnforcementMiddleware._deny_resource(
+                pseudo_uri,
+                reason="missing_scope",
+                client_id=safe_client_id(token),
+                required_scope=_LIST_RESOURCES_REQUIRED_SCOPE,
             )
 
         return await call_next(context)
@@ -205,6 +282,16 @@ class ObservabilityMiddleware(Middleware):
     forged email claims cannot poison ``log_user_active``; Okta tokens
     prefer the canonical ``upstream_claims.email`` threaded through the
     OIDCProxy, falling back to the shared resolver.
+
+    Known gap (TECH-5965, filed from a TECH-5903 Argus round-1 SUGGESTION):
+    this only hooks ``on_call_tool``. Resource
+    *denials* are observable via ``ScopeEnforcementMiddleware``'s own
+    ``scope_denial`` event (``_deny_resource``), but a successful resource
+    read or list emits no equivalent of this class's ``tool_call`` event --
+    that surface is invisible in metrics today. Not addressed in this PR;
+    add ``on_read_resource``/``on_list_resources``/``on_list_resource_templates``
+    hooks here before Phase B's subscription notifications make resource
+    traffic volume-relevant.
     """
 
     async def on_call_tool(

@@ -17,6 +17,8 @@ the required scope in the token's ``scopes`` claim.
 
 from __future__ import annotations
 
+import re
+
 # FastMCP's AccessToken (adds the `claims` field) rather than the base SDK
 # AccessToken from `mcp.server.auth.provider`, which has no claims attribute.
 from fastmcp.exceptions import ToolError
@@ -109,10 +111,54 @@ TOOL_SCOPES: dict[str, str] = {
 
 
 # Resources gated for agent-jwt callers (interactive Okta users bypass, like
-# tools). Maps resource URI to required scope. Fail-closed: an agent-jwt
-# caller reading an unmapped resource is denied, mirroring the unmapped-tool
-# behavior. Empty today — this service registers no resources yet.
-RESOURCE_SCOPES: dict[str, str] = {}
+# tools). Maps a resource's exact, post-mount URI to its required scope.
+# Fail-closed: an agent-jwt caller reading an unmapped resource is denied,
+# mirroring the unmapped-tool behavior. Templated URIs (containing a
+# `{param}` segment) do NOT belong here — see RESOURCE_TEMPLATE_SCOPES below.
+RESOURCE_SCOPES: dict[str, str] = {
+    "comms://comms/agents": "comms:read",
+}
+
+# Templated resource URIs (one entry per `@comms_server.resource(...)`
+# registered with a `{param}` segment), mapped to their required scope.
+# Matched via the compiled regexes in _COMPILED_RESOURCE_TEMPLATES below —
+# `RESOURCE_SCOPES.get(uri)` can never exact-match a concrete URI like
+# `comms://comms/conversations/<uuid>` against a template key.
+RESOURCE_TEMPLATE_SCOPES: dict[str, str] = {
+    "comms://comms/conversations/{conversation_id}": "comms:read",
+    "comms://comms/agents/{agent_id}/inbox": "comms:read",
+}
+
+# Matches one `{param}` placeholder segment in a template string, e.g.
+# `{conversation_id}` — deliberately excludes `/` inside the braces so a
+# malformed template can't accidentally span a path separator.
+_TEMPLATE_PARAM_RE = re.compile(r"\{[^/{}]+\}")
+
+
+def _compile_resource_template(template: str) -> re.Pattern[str]:
+    """Compile a resource template string into a matching regex.
+
+    One wildcard segment (``[^/]+``) per ``{param}`` placeholder — e.g.
+    ``comms://comms/conversations/{conversation_id}`` matches any concrete
+    ``comms://comms/conversations/<value>`` URI. Every other character is
+    escaped literally. No dependency on FastMCP internals — this is a
+    from-scratch regex built once at import time (RESOURCE_TEMPLATE_SCOPES
+    is static), not per lookup.
+    """
+    pattern_parts: list[str] = []
+    last_end = 0
+    for match in _TEMPLATE_PARAM_RE.finditer(template):
+        pattern_parts.append(re.escape(template[last_end : match.start()]))
+        pattern_parts.append("[^/]+")
+        last_end = match.end()
+    pattern_parts.append(re.escape(template[last_end:]))
+    return re.compile("^" + "".join(pattern_parts) + "$")
+
+
+_COMPILED_RESOURCE_TEMPLATES: list[tuple[re.Pattern[str], str]] = [
+    (_compile_resource_template(template), scope)
+    for template, scope in RESOURCE_TEMPLATE_SCOPES.items()
+]
 
 
 # Not in TOOL_SCOPES: ``POST /proposals`` (TECH-5872) is a non-MCP
@@ -199,8 +245,21 @@ def required_scope_for(tool_name: str) -> str | None:
 
 
 def required_scope_for_resource(uri: str) -> str | None:
-    """Return the scope required to read resource ``uri``, or None if unmapped."""
-    return RESOURCE_SCOPES.get(uri)
+    """Return the scope required to read resource ``uri``, or None if unmapped.
+
+    Exact match against ``RESOURCE_SCOPES`` first (static resources), then a
+    pattern match against the compiled ``RESOURCE_TEMPLATE_SCOPES`` regexes
+    (templated resources) — see ``_compile_resource_template``. Unmatched
+    (either table) returns ``None``, same fail-closed contract as
+    ``required_scope_for``.
+    """
+    exact = RESOURCE_SCOPES.get(uri)
+    if exact is not None:
+        return exact
+    for pattern, scope in _COMPILED_RESOURCE_TEMPLATES:
+        if pattern.match(uri):
+            return scope
+    return None
 
 
 _REDACTED_CLIENT_ID = "invalid_sub"
@@ -267,6 +326,7 @@ def scopes_for_token(token: AccessToken) -> list[str]:
 __all__ = [
     "PROPOSAL_SUBMIT_SCOPE",
     "RESOURCE_SCOPES",
+    "RESOURCE_TEMPLATE_SCOPES",
     "TOOL_SCOPES",
     "is_interactive_token",
     "is_registry_backed_agent_token",
