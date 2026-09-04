@@ -3245,7 +3245,14 @@ async def start_conversation(
         session,
         actor_sub=actor_sub,
         sender_agent_id=initiator.id,
-        sender_sub=actor_sub,
+        # initiator.sub, not actor_sub (Argus round-4 SUGGESTION): matches
+        # post_message's sender_sub=sender.sub -- the resolved agent row's
+        # own sub, not the bare token-derived identity. _require_active_agent
+        # doesn't assert agent.sub == actor_sub, so these aren't guaranteed
+        # equal, and DocsVerificationContext.sender_sub is the deploy-side
+        # verifier's primary identity input for cross-account privilege
+        # decisions -- the two entry points must agree on which one it is.
+        sender_sub=initiator.sub,
         conversation_id=None,
         message_type=message_type,
         payload=payload,
