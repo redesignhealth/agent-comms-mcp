@@ -349,3 +349,60 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
     original_predicate_pos = result.stdout.index("WHERE status = 'pending'")
     widened_index_pos = result.stdout.index("WHERE status IN ('pending', 'applying')")
     assert original_predicate_pos < widened_index_pos
+    # f3c9a7e2b1d4 (TECH-6018, Argus review S9): widen ck_proposal_holds_status
+    # to accept 'withdrawn' and ck_proposal_holds_decision_source to accept
+    # 'bot' -- pins the exact DDL so a typo in either widened value set (wrong
+    # order, a value accidentally dropped, wrong constraint name) fails this
+    # test instead of only surfacing later against a real database.
+    assert (
+        "ALTER TABLE proposal_holds ADD CONSTRAINT ck_proposal_holds_status "
+        "CHECK (status IN ('pending', 'approved', 'applying', 'rejected', "
+        "'applied', 'apply_failed', 'stale', 'withdrawn'))" in result.stdout
+    )
+    assert (
+        "ALTER TABLE proposal_holds ADD CONSTRAINT ck_proposal_holds_decision_source "
+        "CHECK (decision_source IS NULL OR decision_source IN "
+        "('human', 'auto', 'bot'))" in result.stdout
+    )
+    # Argus review round-2 suggestion: the two ADD-CONSTRAINT assertions
+    # above pin the WIDENED text but not that each is preceded by its own
+    # DROP -- a migration that forgot the drop and only added would fail at
+    # a live database (Postgres rejects two same-named CHECK constraints),
+    # but this offline test wouldn't catch it, since "ADD ... IN (...,
+    # 'withdrawn')" would still appear in the output either way. Anchor the
+    # floor on e2f7a91c5b34's own ADD-CONSTRAINT text (round-6's established
+    # anti-vacuous pattern above) -- NOT on the bare "DROP CONSTRAINT
+    # ck_proposal_holds_status;" string, which is not unique in this output
+    # (e2f7a91c5b34 emits the identical line for its own drop-and-widen).
+    e2f7a91c5b34_add_status_pos = result.stdout.index(
+        "ALTER TABLE proposal_holds ADD CONSTRAINT ck_proposal_holds_status "
+        "CHECK (status IN ('pending', 'approved', 'applying', 'rejected', "
+        "'applied', 'apply_failed', 'stale'));"
+    )
+    drop_status_pos = result.stdout.index(
+        "ALTER TABLE proposal_holds DROP CONSTRAINT ck_proposal_holds_status;",
+        e2f7a91c5b34_add_status_pos,
+    )
+    add_status_pos = result.stdout.index(
+        "ALTER TABLE proposal_holds ADD CONSTRAINT ck_proposal_holds_status "
+        "CHECK (status IN ('pending', 'approved', 'applying', 'rejected', "
+        "'applied', 'apply_failed', 'stale', 'withdrawn'));",
+        drop_status_pos,
+    )
+    drop_decision_source_pos = result.stdout.index(
+        "ALTER TABLE proposal_holds DROP CONSTRAINT ck_proposal_holds_decision_source;",
+        add_status_pos,
+    )
+    add_decision_source_pos = result.stdout.index(
+        "ALTER TABLE proposal_holds ADD CONSTRAINT ck_proposal_holds_decision_source "
+        "CHECK (decision_source IS NULL OR decision_source IN "
+        "('human', 'auto', 'bot'));",
+        drop_decision_source_pos,
+    )
+    assert (
+        e2f7a91c5b34_add_status_pos
+        < drop_status_pos
+        < add_status_pos
+        < drop_decision_source_pos
+        < add_decision_source_pos
+    )

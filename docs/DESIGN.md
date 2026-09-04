@@ -296,7 +296,10 @@ proposal_holds id, kind (at the DB level an open TEXT column -- NOT
  self-reported, advisory only), priority(low|medium|high, server-derived
  from kind+action -- never caller-supplied, despite sharing a vocabulary
  with the three self-reported columns), status(pending|approved|applying|
- rejected|applied|apply_failed|stale), decision_source(human|auto),
+ rejected|applied|apply_failed|stale|withdrawn), decision_source(human|
+ auto|bot -- `bot` added TECH-6018, marking a decision made by the
+ SUBMITTING bot itself; reachable only via withdraw, since a bot can
+ never reach `decide_proposal` at all),
  decided_by_actor_id, decided_at, decision_note, target_fingerprint
  (sha256 hex digest of the target's state at proposal time, for detecting
  staleness at apply time), applied_at, apply_error, timestamps
@@ -310,7 +313,15 @@ proposal_holds id, kind (at the DB level an open TEXT column -- NOT
  written by whichever caller, human decide or the TECH-5877 auto-judge,
  first claims the row for apply), then applying -> applied|apply_failed|
  stale, or pending -> rejected (human decide only, never touches
- `applying`). `approved` is a value the CHECK constraint still accepts
+ `applying`), or pending -> withdrawn (TECH-6018, the SUBMITTING bot's own
+ `POST /proposals/{id}/withdraw` -- a caller-initiated retraction, not a
+ TTL-based expiry; `proposal_holds` has no `expires_at`/sweep mechanism.
+ Lets a bot retract a proposal it has since determined is stale or wrong
+ before a human decides it -- NOT for freeing up its dedup key: a
+ resubmission for the SAME `(kind, proposed_by_bot_id, target_id,
+ action_type)` key already updates the existing pending row in place at
+ create time, and a DIFFERENT key was never blocked to begin with).
+ `approved` is a value the CHECK constraint still accepts
  (migration d23b37d4e187, widened by e2f7a91c5b34) but is NEVER actually
  persisted -- it is the auto-judge's in-memory verdict, converted
  immediately to a claiming `applying` write before any commit a
@@ -374,11 +385,14 @@ proposal_holds id, kind (at the DB level an open TEXT column -- NOT
    transitions `applying` rows older than some threshold to
    `apply_failed`) is a reasonable follow-up, not yet built.
  Migration
- only in TECH-5871 (+ e2f7a91c5b34 for `applying`); `POST /proposals`
+ only in TECH-5871 (+ e2f7a91c5b34 for `applying`; + f3c9a7e2b1d4 for
+ `withdrawn`/`bot`, TECH-6018); `POST /proposals`
  (submission), `GET /proposals/pending` (listing), per-bot rate limiting,
  and the deterministic auto-approval judge shipped as the follow-on
- TECH-5872/TECH-5875/TECH-5877 (see "The proposal submission pipeline"
- below)
+ TECH-5872/TECH-5875/TECH-5877; `GET /proposals/{id}` (sender-only status
+ lookup) and `POST /proposals/{id}/withdraw` (sender-only retraction of a
+ still-pending proposal) shipped as TECH-6018 (see "The proposal
+ submission pipeline" below)
 ```
 
 Design notes:
@@ -1206,23 +1220,52 @@ conversation creation outright, same as before this PR.
 member-only (non-owner). These map directly to `participants.role` and are checked
 before the state-machine transition.
 
-### The proposal submission pipeline (`POST /proposals`, `GET /proposals/pending`, `POST /proposals/{id}/decide`) [TECH-5872/TECH-5875/TECH-5877/TECH-5873]
+### The proposal submission pipeline (`POST /proposals`, `GET /proposals/pending`, `GET /proposals/{id}`, `POST /proposals/{id}/withdraw`, `POST /proposals/{id}/decide`) [TECH-5872/TECH-5875/TECH-5877/TECH-5873/TECH-6018]
 
 A sibling pipeline to the approval-holds one above, generalized to
 `proposal_holds` (§5) for autonomous bots' arbitrary actions rather than
-this board's own comms traffic. Two non-MCP `mcp.custom_route`s, opposite
-auth postures:
+this board's own comms traffic. Four non-MCP `mcp.custom_route`s split
+across two opposite auth postures:
 
-- **`POST /proposals`** is submitted BY BOTS, not humans -- the reverse of
-  the decide endpoint's gate. The bearer token must verify structurally
-  against the agent-token verifier chain ONLY (never Okta -- `main.
-  _verify_agent_token`, mirroring `_okta_provider`'s structural isolation
-  for the opposite gate) and carry `comms:proposals:write`
-  (`scopes.PROPOSAL_SUBMIT_SCOPE`) in its `scopes` claim. This scope is
-  self-checked by the route directly, like `/approvals/*` self-checks
-  interactivity -- it is deliberately NOT in `TOOL_SCOPES` (never
-  dispatched through `ScopeEnforcementMiddleware`), but IS unioned into
-  `mint_token.py`'s `_VALID_SCOPES` so it remains mintable.
+- **`POST /proposals`**, **`GET /proposals/{id}`** (TECH-6018), and
+  **`POST /proposals/{id}/withdraw`** (TECH-6018) are all submitted BY
+  BOTS, not humans -- the reverse of the decide endpoint's gate, and all
+  three share one auth helper, `main._authenticate_proposal_submitter`.
+  The bearer token must verify structurally against the agent-token
+  verifier chain ONLY (never Okta -- `main._verify_agent_token`,
+  mirroring `_okta_provider`'s structural isolation for the opposite
+  gate) and carry `comms:proposals:write` (`scopes.PROPOSAL_SUBMIT_SCOPE`)
+  in its `scopes` claim. This scope is self-checked by the route directly,
+  like `/approvals/*` self-checks interactivity -- it is deliberately NOT
+  in `TOOL_SCOPES` (never dispatched through `ScopeEnforcementMiddleware`),
+  but IS unioned into `mint_token.py`'s `_VALID_SCOPES` so it remains
+  mintable. `_authenticate_proposal_submitter` threads its own
+  `surface="submit"|"get"|"withdraw"` parameter through to
+  `service.audit_denied_proposal_submission` (`service.
+  PROPOSAL_SUBMITTER_SURFACES` enumerates the three), so a rejected GET or
+  withdraw is never misrecorded as a fabricated submission denial --
+  same reasoning as `ALLOWED_SURFACES` on the interactive side below.
+  `GET /proposals/{id}` (`service.get_proposal_for_bot`) is the only place
+  a bot can learn a proposal's outcome after the fact if it wasn't decided
+  synchronously in its own submission response (i.e., a human decided it
+  later). Every bot-facing return path -- this one, `withdraw_proposal`'s
+  own, and `create_proposal`'s (a submission response can itself observe a
+  hold a CONCURRENT human decide already claimed, on its lost-claim-race
+  fallback branches) -- goes through the shared
+  `service._bot_facing_proposal_dict` formatter (or, where only a plain
+  dict is available rather than the `ProposalHold` object, its dict-
+  accepting sibling `service._redact_bot_facing_dict`), which omits
+  `decided_by_actor_id` whenever `decision_source == "human"`, so a human
+  reviewer's own identity is never disclosed to the bot that merely
+  proposed something. `decide_proposal` and
+  `list_pending_proposal_holds` are human-facing and call the unredacted
+  `service._proposal_dict` directly -- never route those through the
+  bot-facing formatter.
+  `POST /proposals/{id}/withdraw` (`service.withdraw_proposal`) lets the
+  submitting bot retire its own still-`pending` proposal (see §5's
+  `withdrawn` status note) -- sender-only, `FOR UPDATE`-locked against a
+  concurrent decide/auto-judge claim the same way `decide_proposal` locks
+  its own read.
 - **`GET /proposals/pending`** reuses `_authenticate_approval_caller`'s
   same hard interactive-only gate the decide endpoint uses, threading a
   `surface="proposals"` parameter through so its denial audit action

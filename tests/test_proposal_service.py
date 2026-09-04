@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -31,10 +32,15 @@ from models import AuditLog, ProposalHold
 from service import (
     _APPLY_ERROR_CANCELLED_MESSAGE,
     MAX_PROPOSALS_PER_BOT_PER_WINDOW,
+    PROPOSAL_SUBMITTER_SURFACES,
+    _redact_bot_facing_dict,
     _sanitize_apply_error,
+    audit_denied_proposal_submission,
     create_proposal,
     decide_proposal,
+    get_proposal_for_bot,
     list_pending_proposal_holds,
+    withdraw_proposal,
 )
 
 # Real-Postgres fixtures (database_url, _migrated_schema, engine) are shared
@@ -88,6 +94,30 @@ async def _submit(
         impact=impact,
         target_fingerprint=target_fingerprint,
     )
+
+
+class TestRedactBotFacingDict:
+    """Direct, DB-free coverage of ``_redact_bot_facing_dict`` (Argus
+    review round-5 suggestion) -- the shared rule ``_bot_facing_proposal_dict``
+    and ``create_proposal``'s auto-judge happy path both delegate to. Pins
+    the extracted contract independently of any integration path, so the
+    refactor's stated goal (a call site can't silently regress by
+    hardcoding the wrong ``decision_source`` or dropping the call
+    entirely) is actually enforced by a test, not just exercised
+    incidentally by unrelated ones."""
+
+    def test_pops_decided_by_actor_id_when_human(self) -> None:
+        result = _redact_bot_facing_dict(
+            {"decided_by_actor_id": "owner-a@example.com"}, decision_source="human"
+        )
+        assert "decided_by_actor_id" not in result
+
+    def test_preserves_decided_by_actor_id_when_not_human(self) -> None:
+        for decision_source in ("auto", "bot", None):
+            result = _redact_bot_facing_dict(
+                {"decided_by_actor_id": "bot-1"}, decision_source=decision_source
+            )
+            assert result["decided_by_actor_id"] == "bot-1"
 
 
 class TestDedup:
@@ -221,6 +251,52 @@ class TestDedup:
         rows = (await session.execute(select(ProposalHold))).scalars().all()
         assert len(rows) == 2
         assert second["proposal_id"] != first["proposal_id"]
+
+    async def test_resubmission_against_applying_row_redacts_human_decider(
+        self, session: AsyncSession
+    ) -> None:
+        """Argus review round-3 suggestion: the exact scenario the round-2
+        BLOCKING fix (``_bot_facing_proposal_dict``) was written for --
+        seed an ``'applying'`` row a HUMAN concurrently claimed (dedup's
+        partial index covers ``'applying'`` too, per
+        ``service._proposal_dedup_where``'s own docstring), resubmit
+        against the SAME dedup key, and confirm the submitting bot's
+        response never discloses that human's identity. Covers
+        ``create_proposal``'s ``if not auto_approved:`` return path
+        specifically -- without the round-2 fix, that path returned a bare
+        ``_proposal_dict`` and this test would still pass green if it only
+        checked ``status`` -- it must assert the REDACTION itself. The lost-
+        claim-race and auto-judge return paths are separately reachable
+        only via a hand-authored race (see
+        ``test_integrity_error_race_falls_back_to_select_and_update`` for
+        that pattern) and are not exercised by this test -- see
+        ``TestRedactBotFacingDict`` for direct coverage of the shared
+        ``_redact_bot_facing_dict`` rule those paths delegate to."""
+        action = _action(target_id="TECH-77")
+        applying_hold = ProposalHold(
+            kind="linear_progress_update",
+            proposed_by_bot_id="bot-1",
+            owner_sub="owner-a@example.com",
+            action=action,
+            rationale="because reasons",
+            confidence="medium",
+            importance="medium",
+            impact="medium",
+            priority="medium",
+            target_fingerprint="deadbeef",
+            status="applying",
+            decision_source="human",
+            decided_by_actor_id="owner-a@example.com",
+            decided_at=datetime.now(UTC),
+        )
+        session.add(applying_hold)
+        await session.commit()
+
+        result = await _submit(session, action=action, target_fingerprint="fp-new")
+
+        assert result["status"] == "applying"
+        assert result["proposal_id"] == str(applying_hold.id)
+        assert "decided_by_actor_id" not in result
 
     async def test_missing_target_id_raises_value_error(self, session: AsyncSession) -> None:
         with pytest.raises(ValueError):
@@ -1024,3 +1100,291 @@ class TestSanitizeApplyError:
         types)."""
         exc = LinearAPIError("Linear API returned errors: field X is not configured on this team")
         assert _sanitize_apply_error(exc) == "Linear API returned an error"
+
+
+class TestGetProposalForBot:
+    """Service-layer coverage for ``get_proposal_for_bot`` (TECH-6018):
+    sender-only visibility and uniform anti-enumeration posture."""
+
+    async def test_unknown_hold_raises_access_denied(self, session: AsyncSession) -> None:
+        with pytest.raises(AccessDeniedError):
+            await get_proposal_for_bot(session, hold_id=uuid.uuid4(), requesting_bot_sub="bot-1")
+
+    async def test_different_bot_raises_access_denied(self, session: AsyncSession) -> None:
+        submitted = await _submit(session, proposed_by_bot_id="bot-1")
+        with pytest.raises(AccessDeniedError):
+            await get_proposal_for_bot(
+                session,
+                hold_id=uuid.UUID(submitted["proposal_id"]),
+                requesting_bot_sub="bot-2",
+            )
+
+    async def test_submitting_bot_can_read_own_pending_proposal(
+        self, session: AsyncSession
+    ) -> None:
+        submitted = await _submit(session, proposed_by_bot_id="bot-1")
+        result = await get_proposal_for_bot(
+            session,
+            hold_id=uuid.UUID(submitted["proposal_id"]),
+            requesting_bot_sub="bot-1",
+        )
+        assert result["status"] == "pending"
+        assert result["proposal_id"] == submitted["proposal_id"]
+
+    async def test_submitting_bot_can_read_own_decided_proposal(
+        self, session: AsyncSession
+    ) -> None:
+        """Confirms the whole point of this endpoint: a decided outcome
+        stays readable by the submitting bot after the fact, not just in
+        the synchronous response to whatever call decided it."""
+        submitted = await _submit(session, proposed_by_bot_id="bot-1")
+        await decide_proposal(
+            session,
+            approver_sub="owner-a@example.com",
+            hold_id=uuid.UUID(submitted["proposal_id"]),
+            decision="reject",
+            decision_note="not needed",
+        )
+        result = await get_proposal_for_bot(
+            session,
+            hold_id=uuid.UUID(submitted["proposal_id"]),
+            requesting_bot_sub="bot-1",
+        )
+        assert result["status"] == "rejected"
+        assert result["decision_note"] == "not needed"
+        # Argus review suggestion: the human reviewer's own identity must
+        # not be disclosed to the submitting bot.
+        assert "decided_by_actor_id" not in result
+
+    async def test_submitting_bot_can_read_own_bot_withdrawn_proposal(
+        self, session: AsyncSession
+    ) -> None:
+        """Redaction is conditioned on ``decision_source == "human"``, not
+        blanket -- a proposal the SUBMITTING BOT itself withdrew has
+        ``decided_by_actor_id`` set to that same bot's own sub, which is
+        not a privacy leak (it's just telling the bot its own action was
+        recorded), so it must stay present (Argus review round-2)."""
+        submitted = await _submit(session, proposed_by_bot_id="bot-1")
+        await withdraw_proposal(
+            session,
+            hold_id=uuid.UUID(submitted["proposal_id"]),
+            requesting_bot_sub="bot-1",
+            reason=None,
+        )
+        result = await get_proposal_for_bot(
+            session,
+            hold_id=uuid.UUID(submitted["proposal_id"]),
+            requesting_bot_sub="bot-1",
+        )
+        assert result["status"] == "withdrawn"
+        assert result["decided_by_actor_id"] == "bot-1"
+
+    async def test_unknown_hold_denial_is_audited(self, session: AsyncSession) -> None:
+        with pytest.raises(AccessDeniedError):
+            await get_proposal_for_bot(session, hold_id=uuid.uuid4(), requesting_bot_sub="bot-1")
+        rows = (
+            (
+                await session.execute(
+                    select(AuditLog).where(AuditLog.action == "denied.unknown_proposal_hold")
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert rows
+
+    async def test_different_bot_denial_is_audited(self, session: AsyncSession) -> None:
+        submitted = await _submit(session, proposed_by_bot_id="bot-1")
+        with pytest.raises(AccessDeniedError):
+            await get_proposal_for_bot(
+                session,
+                hold_id=uuid.UUID(submitted["proposal_id"]),
+                requesting_bot_sub="bot-2",
+            )
+        rows = (
+            (
+                await session.execute(
+                    select(AuditLog).where(AuditLog.action == "denied.proposal_hold_not_submitter")
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert rows
+
+
+class TestWithdrawProposal:
+    """Service-layer coverage for ``withdraw_proposal`` (TECH-6018):
+    sender-only retraction of a proposal the submitting bot has since
+    determined is stale or wrong, before a human can decide it -- NOT for
+    unlocking a same-key resubmission, which the create-time dedup already
+    handles by updating the existing pending row in place (see
+    ``withdraw_proposal``'s own docstring)."""
+
+    async def test_unknown_hold_raises_access_denied(self, session: AsyncSession) -> None:
+        with pytest.raises(AccessDeniedError):
+            await withdraw_proposal(
+                session, hold_id=uuid.uuid4(), requesting_bot_sub="bot-1", reason=None
+            )
+
+    async def test_different_bot_raises_access_denied(self, session: AsyncSession) -> None:
+        submitted = await _submit(session, proposed_by_bot_id="bot-1")
+        with pytest.raises(AccessDeniedError):
+            await withdraw_proposal(
+                session,
+                hold_id=uuid.UUID(submitted["proposal_id"]),
+                requesting_bot_sub="bot-2",
+                reason=None,
+            )
+
+    async def test_withdraw_pending_sets_withdrawn_with_bot_decision_source(
+        self, session: AsyncSession
+    ) -> None:
+        submitted = await _submit(session, proposed_by_bot_id="bot-1")
+        result = await withdraw_proposal(
+            session,
+            hold_id=uuid.UUID(submitted["proposal_id"]),
+            requesting_bot_sub="bot-1",
+            reason="superseded by a newer proposal",
+        )
+        assert result["status"] == "withdrawn"
+        assert result["decision_source"] == "bot"
+        assert result["decided_by_actor_id"] == "bot-1"
+        assert result["decision_note"] == "superseded by a newer proposal"
+
+    async def test_withdraw_already_decided_raises_already_decided(
+        self, session: AsyncSession
+    ) -> None:
+        submitted = await _submit(session, proposed_by_bot_id="bot-1")
+        await decide_proposal(
+            session,
+            approver_sub="owner-a@example.com",
+            hold_id=uuid.UUID(submitted["proposal_id"]),
+            decision="reject",
+            decision_note="not needed",
+        )
+        with pytest.raises(HoldAlreadyDecidedError):
+            await withdraw_proposal(
+                session,
+                hold_id=uuid.UUID(submitted["proposal_id"]),
+                requesting_bot_sub="bot-1",
+                reason=None,
+            )
+
+    async def test_withdraw_then_resubmit_same_key_creates_fresh_row(
+        self, session: AsyncSession
+    ) -> None:
+        """A withdrawn row does not block or get silently updated by a
+        later same-key submission -- verifies the create-time dedup
+        partial index excludes ``'withdrawn'`` rows, so a fresh submission
+        for the same ``(kind, bot, target_id, action_type)`` key becomes a
+        genuinely new pending row rather than colliding with the retired
+        one. (NOT withdraw's purpose, which is retracting a proposal the
+        bot now considers stale/wrong before a human decides it -- see
+        ``TestWithdrawProposal``'s own class docstring.)"""
+        submitted = await _submit(session, proposed_by_bot_id="bot-1")
+        await withdraw_proposal(
+            session,
+            hold_id=uuid.UUID(submitted["proposal_id"]),
+            requesting_bot_sub="bot-1",
+            reason="stale",
+        )
+        resubmitted = await _submit(session, proposed_by_bot_id="bot-1")
+        assert resubmitted["proposal_id"] != submitted["proposal_id"]
+        assert resubmitted["status"] == "pending"
+
+    async def test_withdraw_applying_hold_raises_already_decided(
+        self, session: AsyncSession
+    ) -> None:
+        """The highest-risk case the FOR UPDATE lock exists to protect:
+        a hold already CLAIMED (mid-flight on the auto-judge's or a
+        concurrent decide's own external Linear round-trip) must not be
+        withdrawn out from under it."""
+        submitted = await _submit(session, proposed_by_bot_id="bot-1")
+        hold = await session.get(ProposalHold, uuid.UUID(submitted["proposal_id"]))
+        assert hold is not None
+        hold.status = "applying"
+        hold.decided_at = hold.created_at
+        hold.decided_by_actor_id = "owner-a@example.com"
+        hold.decision_source = "human"
+        await session.commit()
+
+        with pytest.raises(HoldAlreadyDecidedError):
+            await withdraw_proposal(
+                session,
+                hold_id=uuid.UUID(submitted["proposal_id"]),
+                requesting_bot_sub="bot-1",
+                reason=None,
+            )
+
+    async def test_withdraw_is_audited(self, session: AsyncSession) -> None:
+        submitted = await _submit(session, proposed_by_bot_id="bot-1")
+        await withdraw_proposal(
+            session,
+            hold_id=uuid.UUID(submitted["proposal_id"]),
+            requesting_bot_sub="bot-1",
+            reason="stale",
+        )
+        rows = (
+            (await session.execute(select(AuditLog).where(AuditLog.action == "proposal.withdraw")))
+            .scalars()
+            .all()
+        )
+        assert rows
+
+
+class TestAuditDeniedProposalSubmission:
+    """Direct, service-level coverage of ``audit_denied_proposal_submission``'s
+    ``surface`` parameter (Argus review round-2 suggestion) -- the HTTP-level
+    tests in ``test_proposal_endpoint.py`` cover this indirectly through
+    ``main._authenticate_proposal_submitter``, but a typo in the ``surface``
+    literal at either of THOSE call sites could still slip past a test that
+    only checks "some denial row exists" rather than pinning the exact
+    formatted action string this function produces for each surface."""
+
+    @pytest.mark.parametrize("surface", sorted(PROPOSAL_SUBMITTER_SURFACES))
+    async def test_missing_scope_action_string(self, session: AsyncSession, surface: str) -> None:
+        await audit_denied_proposal_submission(
+            session, actor_sub="bot-1", reason="missing_scope", surface=surface
+        )
+        rows = (
+            (
+                await session.execute(
+                    select(AuditLog.action).where(
+                        AuditLog.action == f"denied.proposal_{surface}_missing_scope"
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert rows
+
+    @pytest.mark.parametrize("surface", sorted(PROPOSAL_SUBMITTER_SURFACES))
+    async def test_not_agent_token_action_string(self, session: AsyncSession, surface: str) -> None:
+        await audit_denied_proposal_submission(
+            session, actor_sub="bot-1", reason="not_agent_token", surface=surface
+        )
+        rows = (
+            (
+                await session.execute(
+                    select(AuditLog.action).where(
+                        AuditLog.action == f"denied.proposal_{surface}_not_agent_token"
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert rows
+
+    def test_default_surface_is_submit(self) -> None:
+        """Backward-compatibility guarantee: pre-existing callers that
+        don't pass ``surface`` at all must still produce
+        ``denied.proposal_submit_*``, unchanged."""
+        import inspect
+
+        assert (
+            inspect.signature(audit_denied_proposal_submission).parameters["surface"].default
+            == "submit"
+        )

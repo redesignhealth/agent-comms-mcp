@@ -124,8 +124,26 @@ PROPOSAL_HOLD_STATUSES = (
     "applied",
     "apply_failed",
     "stale",
+    "withdrawn",
 )
-PROPOSAL_HOLD_DECISION_SOURCES = ("human", "auto")
+# `withdrawn` (TECH-6018) is reachable only from `pending`, via the
+# SUBMITTING bot's own `POST /proposals/{id}/withdraw` -- a caller-
+# initiated retraction, not the TTL-based lazy expiry `approval_holds`
+# uses for its own (differently-named) `expired` status: `ProposalHold`
+# has no `expires_at` column and no sweep/lazy-touch mechanism at all.
+# Its purpose is letting a bot retire a proposal it has since determined
+# is stale or simply wrong, before a human can decide it -- NOT for
+# freeing up the create-time dedup key: a resubmission for the SAME
+# `(kind, proposed_by_bot_id, target_id, action_type)` key already
+# updates the existing pending row in place at create time, and a
+# DIFFERENT key was never blocked to begin with.
+PROPOSAL_HOLD_DECISION_SOURCES = ("human", "auto", "bot")
+# `"bot"` (TECH-6018) marks a decision made by the SUBMITTING bot itself
+# (currently only via withdraw) -- distinct from `"auto"` (the TECH-5877
+# judge, evaluated on the board's own behalf) and `"human"` (a reviewer
+# deciding through decide_proposal). A bot can never reach decide_proposal
+# at all (interactive-only gate), so `"bot"` can only ever appear on a
+# `"withdrawn"` row today.
 # Shared closed vocabulary for the three self-reported, advisory-only axes
 # (confidence/importance/impact) AND the server-derived `priority` -- same
 # three levels, different provenance (see ProposalHold.priority).

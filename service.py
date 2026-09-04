@@ -4821,22 +4821,37 @@ async def audit_denied_approval_requires_interactive(
 # calls this function, so ``"rate_limited"`` is deliberately NOT listed.
 ALLOWED_DENIAL_REASONS = frozenset({"not_agent_token", "missing_scope"})
 
+# TECH-6018: `_authenticate_proposal_submitter` (main.py) now gates THREE
+# bot-side HTTP surfaces -- `POST /proposals` (submit), `GET
+# /proposals/{id}` (get), `POST /proposals/{id}/withdraw` (withdraw) -- not
+# just submission. Without a surface, a rejected GET or withdraw attempt
+# was recorded as a fabricated `denied.proposal_submit_*` row, exactly the
+# audit-misattribution `audit_denied_approval_requires_interactive`'s own
+# `surface` parameter already exists to prevent on the interactive side.
+# "submit" is the default so every pre-existing call site/test (which never
+# passed a surface) keeps writing the exact same action string as before.
+PROPOSAL_SUBMITTER_SURFACES = frozenset({"submit", "get", "withdraw"})
+
 
 async def audit_denied_proposal_submission(
-    session: AsyncSession, *, actor_sub: str, reason: str
+    session: AsyncSession, *, actor_sub: str, reason: str, surface: str = "submit"
 ) -> None:
-    """Audit + commit a ``POST /proposals`` submission denial (TECH-5872,
+    """Audit + commit a bot-side proposal-route denial (TECH-5872/6018,
     Argus review S5) -- the two 403 causes in ``main._authenticate_
     proposal_submitter`` (``reason="not_agent_token"`` for an
     interactive/unverifiable-as-agent caller, ``reason="missing_scope"`` for
-    a verified agent-jwt token lacking ``PROPOSAL_SUBMIT_SCOPE``). Same "no
-    board Agent/conversation context" shape as
+    a verified agent-jwt token lacking ``PROPOSAL_SUBMIT_SCOPE``), across
+    whichever of the three bot-side surfaces (``surface``, see
+    ``PROPOSAL_SUBMITTER_SURFACES``) rejected the caller. Same "no board
+    Agent/conversation context" shape as
     ``audit_denied_approval_requires_interactive`` above -- there is nothing
     to raise, only an audit row to persist.
     """
     if reason not in ALLOWED_DENIAL_REASONS:
         raise ValueError(f"unexpected denial reason: {reason!r}")
-    _audit(session, actor_sub=actor_sub, action=f"denied.proposal_submit_{reason}")
+    if surface not in PROPOSAL_SUBMITTER_SURFACES:
+        raise ValueError(f"unexpected surface: {surface!r}")
+    _audit(session, actor_sub=actor_sub, action=f"denied.proposal_{surface}_{reason}")
     await session.commit()
 
 
@@ -5670,6 +5685,46 @@ def _proposal_dict(hold: ProposalHold) -> dict[str, Any]:
     return result
 
 
+def _bot_facing_proposal_dict(hold: ProposalHold) -> dict[str, Any]:
+    """``_proposal_dict(hold)``, redacted for a response going back to the
+    SUBMITTING bot (TECH-6018, Argus review round-2 BLOCKING) -- omits
+    ``decided_by_actor_id`` when ``decision_source == "human"``, so a
+    human reviewer's own identity (an email-shaped Okta sub) is never
+    disclosed to a bot merely for having proposed something.
+
+    Every ``create_proposal`` return path is bot-facing (it's the direct
+    response to that bot's own ``POST /proposals`` call) and can observe a
+    hold a CONCURRENT human decide already claimed/decided out from under
+    it (the dedup-into-``applying``-row and lost-claim-race branches) --
+    those paths returned a bare ``_proposal_dict(hold)`` before this fix,
+    which leaked exactly the identity ``get_proposal_for_bot`` was already
+    redacting. Use this here AND there; never call ``_proposal_dict``
+    directly from a bot-facing return path again.
+
+    ``create_proposal``'s auto-judge happy path already has a
+    ``dict[str, Any]`` from ``_apply_or_finalize_proposal_hold`` (a
+    ``ProposalHold`` was re-fetched and discarded internally, so there's
+    no hold object left to pass here) -- use ``_redact_bot_facing_dict``
+    directly for that call site instead of duplicating the redaction rule
+    inline (Argus review round-4 suggestion).
+    """
+    return _redact_bot_facing_dict(_proposal_dict(hold), decision_source=hold.decision_source)
+
+
+def _redact_bot_facing_dict(
+    result: dict[str, Any], *, decision_source: str | None
+) -> dict[str, Any]:
+    """Shared redaction rule ``_bot_facing_proposal_dict`` applies to a
+    ``ProposalHold`` -- factored out so a caller holding only the already-
+    built dict (not the ORM object) can apply the SAME rule without a
+    second, driftable copy of the ``if decision_source == "human": pop(...)``
+    logic (Argus review round-4 suggestion, closing the dead-code inline
+    guard this replaced at ``create_proposal``'s auto-judge happy path)."""
+    if decision_source == "human":
+        result.pop("decided_by_actor_id", None)
+    return result
+
+
 def validate_hold_level(value: str, name: str) -> str:
     """Shared ``confidence``/``importance``/``impact`` membership check
     (Argus review S14) -- ``PROPOSAL_HOLD_LEVELS`` is the single source of
@@ -5946,7 +6001,7 @@ async def create_proposal(
     await session.refresh(hold)
 
     if not auto_approved:
-        return _proposal_dict(hold)
+        return _bot_facing_proposal_dict(hold)
 
     # Argus review B1: resolve the auto-judge's "approved" verdict to a
     # terminal status synchronously, right here, instead of persisting a
@@ -5974,7 +6029,11 @@ async def create_proposal(
         if resolved is None:
             raise AssertionError("invariant violation: hold vanished after its own commit")
         await session.commit()
-        return _proposal_dict(resolved)
+        # This hold may have been claimed by a CONCURRENT human decide
+        # call (not just another auto-judge run) -- redact, same as every
+        # other bot-facing return path in this function (Argus review
+        # round-2 B1).
+        return _bot_facing_proposal_dict(resolved)
 
     result = await _apply_or_finalize_proposal_hold(
         session,
@@ -5985,7 +6044,18 @@ async def create_proposal(
         decision_note=decision_note,
     )
     if result is not None:
-        return result
+        # `_apply_or_finalize_proposal_hold` returns a dict, not a
+        # `ProposalHold` (it re-fetches and discards the ORM object
+        # internally), so `_bot_facing_proposal_dict` -- which takes a
+        # `ProposalHold` -- doesn't apply directly here. Its
+        # `decision_source` is always ``"auto"`` on THIS call (the only
+        # other caller, `decide_proposal`, passes `"human"`), so this is a
+        # no-op today, not an actual leak -- but redact anyway, through the
+        # SAME shared rule `_bot_facing_proposal_dict` itself uses (Argus
+        # review round-4 suggestion: a separate inline copy of the rule was
+        # dead code with no way to regress-test it), so no bot-facing
+        # return path in this function ever relies on convention alone.
+        return _redact_bot_facing_dict(result, decision_source=result.get("decision_source"))
     # Vanishingly unlikely given the claim above already serializes
     # access to this hold_id, but the helper's own re-check is the
     # authoritative guard, not this comment -- reload and return current
@@ -5994,7 +6064,10 @@ async def create_proposal(
     if resolved is None:
         raise AssertionError("invariant violation: hold vanished after its own commit")
     await session.commit()
-    return _proposal_dict(resolved)
+    # Same rationale as the other race-fallback return above: whatever
+    # resolved this hold out from under the claim could have been a
+    # concurrent human decide.
+    return _bot_facing_proposal_dict(resolved)
 
 
 async def list_pending_proposal_holds(
@@ -6016,6 +6089,133 @@ async def list_pending_proposal_holds(
     rows = rows[:limit]
     proposals = [_proposal_dict(hold) for hold in rows]
     return {"proposals": proposals, "has_more": has_more}
+
+
+async def get_proposal_for_bot(
+    session: AsyncSession, *, hold_id: uuid.UUID, requesting_bot_sub: str
+) -> dict[str, Any]:
+    """``GET /proposals/{hold_id}`` (main.py, non-MCP, bot-gated -- TECH-6018).
+
+    Lets the SUBMITTING bot poll a proposal's current status/decision
+    outcome after the fact -- the synchronous ``POST /proposals`` response
+    is otherwise the only place a bot ever learns what happened to its own
+    proposal (see this route's own module-level context in ``main.py``).
+
+    Sender-only, same anti-enumeration posture as ``decide_proposal``: an
+    unknown ``hold_id`` and a hold that exists but belongs to a DIFFERENT
+    ``proposed_by_bot_id`` both raise the uniform ``AccessDeniedError`` (->
+    404 at the HTTP layer) -- never a distinct error for one vs. the
+    other, so a bot probing IDs it doesn't own can't distinguish
+    "doesn't exist" from "exists, not yours."
+
+    Read-only: no ``for_update`` lock, since this never mutates the row --
+    unlike ``decide_proposal``, there is no write here to protect against
+    a concurrent decide.
+
+    ``decided_by_actor_id`` is OMITTED from the response when
+    ``decision_source == "human"`` (Argus review suggestion): every other
+    caller of ``_proposal_dict`` returns it to the party who WAS that
+    actor (the human reviewer's own ``decide_proposal`` response) or to
+    whom it's never a person (the auto-judge's ``"system:judge"``) -- this
+    is the one case where it would hand the submitting BOT a human
+    reviewer's own identity (an email-shaped Okta sub) merely for having
+    proposed something. Omitted, not nulled: a bot-facing consumer should
+    not be able to tell "no actor recorded" apart from "actor withheld"
+    either way, and an absent key reads more clearly as "not disclosed
+    here" than an explicit ``null`` would.
+    """
+    hold = await _find_proposal_hold(session, hold_id)
+    if hold is None:
+        await _deny(
+            session,
+            actor_sub=requesting_bot_sub,
+            action="denied.unknown_proposal_hold",
+            detail={"attempted_hold_id": str(hold_id)},
+        )
+    if hold.proposed_by_bot_id != requesting_bot_sub:
+        await _deny(
+            session,
+            actor_sub=requesting_bot_sub,
+            action="denied.proposal_hold_not_submitter",
+            detail={"attempted_hold_id": str(hold_id)},
+        )
+    return _bot_facing_proposal_dict(hold)
+
+
+async def withdraw_proposal(
+    session: AsyncSession,
+    *,
+    hold_id: uuid.UUID,
+    requesting_bot_sub: str,
+    reason: str | None,
+) -> dict[str, Any]:
+    """``POST /proposals/{hold_id}/withdraw`` (main.py, non-MCP, bot-gated
+    -- TECH-6018). Lets the SUBMITTING bot retire its own still-``pending``
+    proposal -- most useful when the bot has since determined the proposal
+    is stale or simply wrong (e.g. the situation it was reacting to changed)
+    and wants it retracted before a human can decide it, rather than a
+    resubmission for the SAME ``target_id``/``action_type``, which the
+    create-time dedup already handles by updating the existing PENDING row
+    in place -- no withdraw needed for THAT case. An ``'applying'`` match
+    (claimed by a concurrent decide/auto-judge) is NOT mutated in place by
+    that same dedup, though (see ``_dedup_or_insert_proposal``'s own
+    docstring) -- it's returned as-is -- and this function's own 409 below
+    means neither resubmit nor withdraw is an escape hatch during that
+    window; a fresh submission after the claim resolves is the retry path.
+
+    Sender-only, same uniform-404 anti-enumeration posture as
+    ``get_proposal_for_bot``/``decide_proposal``: unknown hold and
+    not-your-hold are indistinguishable. Only a ``'pending'`` hold can be
+    withdrawn -- ``FOR UPDATE`` locked for the same reason
+    ``decide_proposal`` locks its own read, to close the same race against
+    a concurrent decide/auto-judge claim. Any other status (including the
+    transient ``'applying'``) raises ``HoldAlreadyDecidedError`` (409):
+    once a decide or the auto-judge has claimed the row, it is no longer
+    this bot's to retract -- a fresh proposal resubmission is the retry
+    path, same as every other already-decided outcome in this module.
+    """
+    hold = await _find_proposal_hold(session, hold_id, for_update=True)
+    if hold is None:
+        await _deny(
+            session,
+            actor_sub=requesting_bot_sub,
+            action="denied.unknown_proposal_hold",
+            detail={"attempted_hold_id": str(hold_id)},
+        )
+    if hold.proposed_by_bot_id != requesting_bot_sub:
+        await _deny(
+            session,
+            actor_sub=requesting_bot_sub,
+            action="denied.proposal_hold_not_submitter",
+            detail={"attempted_hold_id": str(hold_id)},
+        )
+    if hold.status != "pending":
+        # Release the FOR UPDATE lock before raising (Argus review S1) --
+        # mirroring decide_proposal's identical commit-before-raise here:
+        # otherwise the lock stays held through exception propagation and
+        # response construction until the session's own rollback on
+        # __aexit__, needlessly blocking a concurrent decide/auto-judge
+        # claim on the same row for that whole window.
+        await session.commit()
+        raise HoldAlreadyDecidedError(status=hold.status)
+
+    hold.status = "withdrawn"
+    hold.decision_source = "bot"
+    hold.decided_by_actor_id = requesting_bot_sub
+    hold.decided_at = _now()
+    hold.decision_note = reason
+    _audit(
+        session,
+        actor_sub=requesting_bot_sub,
+        action="proposal.withdraw",
+        detail={"hold_id": str(hold_id)},
+    )
+    await session.commit()
+    # `updated_at`'s onupdate=text("now()") (models.py) means the ORM can't
+    # know the server-computed value without a refresh -- see
+    # `decide_proposal`'s reject branch for the same pattern/reasoning.
+    await session.refresh(hold)
+    return _bot_facing_proposal_dict(hold)
 
 
 async def _find_proposal_hold(
@@ -7834,6 +8034,7 @@ __all__ = [
     "OWNERSHIP_CLIENT_ENV_VAR",
     "PROPOSAL_HOLD_LEVELS",
     "PROPOSAL_RATE_LIMIT_WINDOW",
+    "PROPOSAL_SUBMITTER_SURFACES",
     "AgentTableOwnershipClient",
     "OwnershipClient",
     "OwnershipClientFactory",
@@ -7854,6 +8055,7 @@ __all__ = [
     "get_conversation",
     "get_hold_status",
     "get_ownership_client_factory",
+    "get_proposal_for_bot",
     "inbox",
     "invite",
     "leave",
@@ -7872,5 +8074,6 @@ __all__ = [
     "start_conversation",
     "validate_hold_level",
     "validate_ownership_client_configuration",
+    "withdraw_proposal",
     "write_through_ownership",
 ]

@@ -153,6 +153,12 @@ async def client(
         routes=[
             Route("/proposals", main.submit_proposal, methods=["POST"]),
             Route("/proposals/pending", main.list_pending_proposals, methods=["GET"]),
+            Route("/proposals/{proposal_id}", main.get_proposal, methods=["GET"]),
+            Route(
+                "/proposals/{proposal_id}/withdraw",
+                main.withdraw_proposal_route,
+                methods=["POST"],
+            ),
             Route("/proposals/{hold_id}/decide", main.decide_proposal_route, methods=["POST"]),
         ]
     )
@@ -1036,3 +1042,446 @@ class TestDecideProposalEndpoint:
         )
         assert resp.status_code == 409
         assert resp.json() == {"error": "already_decided", "status": "applying"}
+
+
+class TestGetProposalEndpoint:
+    """``GET /proposals/{proposal_id}`` (TECH-6018): bot-only, sender-only
+    polling of a proposal's own status after the fact."""
+
+    async def test_interactive_token_returns_403(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        """Opposite gate from ``/proposals/{id}/decide``: this route is for
+        the bot side, not a human reviewer."""
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider)
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+        resp = await http_client.get(
+            f"/proposals/{proposal_id}", headers={"Authorization": "Bearer human-token"}
+        )
+        assert resp.status_code == 403
+
+    async def test_interactive_token_rejection_is_audited(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        """Guards the ``surface="get"`` literal threaded through
+        ``_authenticate_proposal_submitter`` -> ``audit_denied_proposal_submission``
+        (Argus review round-2 suggestion): a typo in that literal would
+        raise a ``ValueError`` (unioned into ``PROPOSAL_SUBMITTER_SURFACES``)
+        rather than silently misrecording as a ``submit`` denial, so this
+        must assert the EXACT action string, not just "some row exists"."""
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider)
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+        resp = await http_client.get(
+            f"/proposals/{proposal_id}", headers={"Authorization": "Bearer human-token"}
+        )
+        assert resp.status_code == 403
+
+        rows = (
+            (
+                await session.execute(
+                    select(AuditLog.action).where(
+                        AuditLog.action == "denied.proposal_get_not_agent_token"
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert rows
+
+    async def test_agent_jwt_missing_scope_is_audited(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        """Same guard as ``test_interactive_token_rejection_is_audited``,
+        for the other ``ALLOWED_DENIAL_REASONS`` branch."""
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider)
+        provider.tokens["under-scoped-bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:write"], owner_sub="owner-a@example.com"
+        )
+        resp = await http_client.get(
+            f"/proposals/{proposal_id}",
+            headers={"Authorization": "Bearer under-scoped-bot-token"},
+        )
+        assert resp.status_code == 403
+
+        rows = (
+            (
+                await session.execute(
+                    select(AuditLog.action).where(
+                        AuditLog.action == "denied.proposal_get_missing_scope"
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert rows
+
+    async def test_uniform_404_for_unknown_hold(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        resp = await http_client.get(
+            f"/proposals/{uuid.uuid4()}", headers={"Authorization": "Bearer bot-token"}
+        )
+        assert resp.status_code == 404
+        assert resp.json() == {"error": "not_found"}
+
+    async def test_uniform_404_for_malformed_proposal_id(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        resp = await http_client.get(
+            "/proposals/not-a-uuid", headers={"Authorization": "Bearer bot-token"}
+        )
+        assert resp.status_code == 404
+        assert resp.json() == {"error": "not_found"}
+
+    async def test_uniform_404_for_a_different_bots_proposal(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider)
+        provider.tokens["other-bot-token"] = _agent_jwt_token(
+            "bot-2", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        resp = await http_client.get(
+            f"/proposals/{proposal_id}", headers={"Authorization": "Bearer other-bot-token"}
+        )
+        assert resp.status_code == 404
+        assert resp.json() == {"error": "not_found"}
+
+    async def test_submitting_bot_can_read_its_own_pending_proposal(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider)
+        resp = await http_client.get(
+            f"/proposals/{proposal_id}", headers={"Authorization": "Bearer bot-token"}
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "pending"
+
+    async def test_submitting_bot_can_read_its_own_decided_proposal(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        """The whole point of this route: the outcome of a human decide
+        call is readable by the submitting bot later, not just in that
+        decide call's own response."""
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider, owner_sub="owner-a@example.com")
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+        decide_resp = await http_client.post(
+            f"/proposals/{proposal_id}/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={"decision": "reject", "decision_note": "no thanks"},
+        )
+        assert decide_resp.status_code == 200
+
+        resp = await http_client.get(
+            f"/proposals/{proposal_id}", headers={"Authorization": "Bearer bot-token"}
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "rejected"
+        assert resp.json()["decision_note"] == "no thanks"
+        # Privacy redaction (Argus review round-2 BLOCKING): the human
+        # reviewer's own identity must never reach the submitting bot.
+        assert "decided_by_actor_id" not in resp.json()
+
+
+class TestWithdrawProposalEndpoint:
+    """``POST /proposals/{proposal_id}/withdraw`` (TECH-6018): bot-only,
+    sender-only retraction of a still-pending proposal."""
+
+    async def test_interactive_token_returns_403(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider)
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+        resp = await http_client.post(
+            f"/proposals/{proposal_id}/withdraw",
+            headers={"Authorization": "Bearer human-token"},
+            json={},
+        )
+        assert resp.status_code == 403
+
+    async def test_interactive_token_rejection_is_audited(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        """Guards the ``surface="withdraw"`` literal (Argus review round-2
+        suggestion) -- see the twin test on ``TestGetProposalEndpoint`` for
+        why the exact action string matters here, not just row existence."""
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider)
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+        resp = await http_client.post(
+            f"/proposals/{proposal_id}/withdraw",
+            headers={"Authorization": "Bearer human-token"},
+            json={},
+        )
+        assert resp.status_code == 403
+
+        rows = (
+            (
+                await session.execute(
+                    select(AuditLog.action).where(
+                        AuditLog.action == "denied.proposal_withdraw_not_agent_token"
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert rows
+
+    async def test_agent_jwt_missing_scope_is_audited(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider)
+        provider.tokens["under-scoped-bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:write"], owner_sub="owner-a@example.com"
+        )
+        resp = await http_client.post(
+            f"/proposals/{proposal_id}/withdraw",
+            headers={"Authorization": "Bearer under-scoped-bot-token"},
+            json={},
+        )
+        assert resp.status_code == 403
+
+        rows = (
+            (
+                await session.execute(
+                    select(AuditLog.action).where(
+                        AuditLog.action == "denied.proposal_withdraw_missing_scope"
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert rows
+
+    async def test_uniform_404_for_unknown_hold(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        resp = await http_client.post(
+            f"/proposals/{uuid.uuid4()}/withdraw",
+            headers={"Authorization": "Bearer bot-token"},
+            json={},
+        )
+        assert resp.status_code == 404
+        assert resp.json() == {"error": "not_found"}
+
+    async def test_uniform_404_for_a_different_bots_proposal(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider)
+        provider.tokens["other-bot-token"] = _agent_jwt_token(
+            "bot-2", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        resp = await http_client.post(
+            f"/proposals/{proposal_id}/withdraw",
+            headers={"Authorization": "Bearer other-bot-token"},
+            json={},
+        )
+        assert resp.status_code == 404
+        assert resp.json() == {"error": "not_found"}
+
+    async def test_submitting_bot_can_withdraw_its_own_pending_proposal(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider)
+        resp = await http_client.post(
+            f"/proposals/{proposal_id}/withdraw",
+            headers={"Authorization": "Bearer bot-token"},
+            json={"reason": "superseded"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "withdrawn"
+        assert body["decision_source"] == "bot"
+        assert body["decision_note"] == "superseded"
+
+    async def test_withdraw_without_body_succeeds_with_no_reason(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        """``reason`` is optional -- an empty/absent body must not 422."""
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider)
+        resp = await http_client.post(
+            f"/proposals/{proposal_id}/withdraw",
+            headers={"Authorization": "Bearer bot-token"},
+            content=b"",
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "withdrawn"
+
+    async def test_withdraw_already_decided_returns_409(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider, owner_sub="owner-a@example.com")
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+        decide_resp = await http_client.post(
+            f"/proposals/{proposal_id}/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={"decision": "reject", "decision_note": "no thanks"},
+        )
+        assert decide_resp.status_code == 200
+
+        resp = await http_client.post(
+            f"/proposals/{proposal_id}/withdraw",
+            headers={"Authorization": "Bearer bot-token"},
+            json={},
+        )
+        assert resp.status_code == 409
+        assert resp.json() == {"error": "already_decided", "status": "rejected"}
+
+    async def test_withdraw_then_resubmit_same_target_creates_fresh_pending_proposal(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider, target_id="TECH-99")
+        withdraw_resp = await http_client.post(
+            f"/proposals/{proposal_id}/withdraw",
+            headers={"Authorization": "Bearer bot-token"},
+            json={"reason": "stale"},
+        )
+        assert withdraw_resp.status_code == 200
+
+        resubmit_resp = await http_client.post(
+            "/proposals",
+            json={**_PROPOSAL_BODY, "action": {**_PROPOSAL_BODY["action"], "target_id": "TECH-99"}},
+            headers={"Authorization": "Bearer bot-token"},
+        )
+        assert resubmit_resp.status_code == 200
+        resubmitted = resubmit_resp.json()
+        assert resubmitted["proposal_id"] != proposal_id
+        assert resubmitted["status"] == "pending"
+
+    async def test_uniform_404_for_malformed_proposal_id(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        resp = await http_client.post(
+            "/proposals/not-a-uuid/withdraw",
+            headers={"Authorization": "Bearer bot-token"},
+            json={},
+        )
+        assert resp.status_code == 404
+        assert resp.json() == {"error": "not_found"}
+
+    async def test_non_dict_body_returns_invalid_body_422(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider)
+        resp = await http_client.post(
+            f"/proposals/{proposal_id}/withdraw",
+            headers={"Authorization": "Bearer bot-token"},
+            json=[],
+        )
+        assert resp.status_code == 422
+        assert resp.json()["error"] == "invalid_body"
+
+    async def test_non_empty_malformed_json_body_returns_invalid_json_422(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        """A truly empty body is a lenient no-reason withdraw (see
+        ``test_withdraw_without_body_succeeds_with_no_reason``), but a
+        NON-empty body that fails to parse as JSON is malformed input, not
+        an absent one -- Argus review round-2 suggestion."""
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider)
+        resp = await http_client.post(
+            f"/proposals/{proposal_id}/withdraw",
+            headers={"Authorization": "Bearer bot-token"},
+            content=b"not json",
+        )
+        assert resp.status_code == 422
+        assert resp.json()["error"] == "invalid_json"
+
+    async def test_non_string_reason_returns_invalid_reason_422(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider)
+        resp = await http_client.post(
+            f"/proposals/{proposal_id}/withdraw",
+            headers={"Authorization": "Bearer bot-token"},
+            json={"reason": 123},
+        )
+        assert resp.status_code == 422
+        assert resp.json()["error"] == "invalid_reason"
+
+    async def test_reason_exceeding_max_length_returns_invalid_reason_422(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider)
+        resp = await http_client.post(
+            f"/proposals/{proposal_id}/withdraw",
+            headers={"Authorization": "Bearer bot-token"},
+            json={"reason": "x" * 2001},
+        )
+        assert resp.status_code == 422
+        assert resp.json()["error"] == "invalid_reason"
+
+
+class TestProposalRouteRegistrationOrder:
+    """Guards the route-ordering invariant ``get_proposal``'s own docstring
+    depends on (Argus review suggestion): Starlette matches routes in
+    registration order, so ``/proposals/pending`` (static) MUST be
+    registered before ``/proposals/{proposal_id}`` (wildcard), or a GET to
+    ``/proposals/pending`` would resolve to ``get_proposal`` with
+    ``proposal_id="pending"`` instead of ``list_pending_proposals`` --
+    silently returning a uniform 404 for every caller instead of the
+    pending list. This module's own test fixture hand-builds an
+    independently-ordered ``Route`` list (see the ``client`` fixture
+    above), so it can't catch a production ordering regression -- this
+    test inspects ``main.mcp``'s ACTUAL registered routes instead."""
+
+    def test_pending_registered_before_wildcard_proposal_id(self) -> None:
+        main = _import_main()
+        # `_additional_http_routes` is a private FastMCP attribute (Argus
+        # review round-2 suggestion) -- a future FastMCP upgrade could
+        # rename or drop it. Skip rather than fail so an unrelated
+        # dependency bump doesn't block CI on a test whose only job is
+        # guarding an internal-to-this-repo invariant, not FastMCP's API.
+        if not hasattr(main.mcp, "_additional_http_routes"):
+            pytest.skip(
+                "main.mcp._additional_http_routes no longer exists on this FastMCP "
+                "version -- this test needs a new way to inspect registered routes"
+            )
+        paths = [getattr(route, "path", None) for route in main.mcp._additional_http_routes]
+        assert "/proposals/pending" in paths
+        assert "/proposals/{proposal_id}" in paths
+        assert paths.index("/proposals/pending") < paths.index("/proposals/{proposal_id}")

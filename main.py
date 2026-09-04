@@ -794,9 +794,16 @@ async def _verify_agent_token(token_str: str) -> Any | None:
 
 
 async def _authenticate_proposal_submitter(
-    request: Request,
+    request: Request, *, surface: str = "submit"
 ) -> tuple[str | None, Any | None, int]:
-    """Self-verify the bearer token for ``POST /proposals`` (TECH-5872).
+    """Self-verify the bearer token for the bot-side proposal routes:
+    ``POST /proposals`` (``surface="submit"``, the default), ``GET
+    /proposals/{id}`` (``surface="get"``, TECH-6018), and ``POST
+    /proposals/{id}/withdraw`` (``surface="withdraw"``, TECH-6018) -- same
+    ``comms:proposals:write`` gate on all three, just distinguished in the
+    audit trail (``service.audit_denied_proposal_submission``'s own
+    ``surface`` param) so a rejected GET/withdraw doesn't get recorded as a
+    fabricated submission denial.
 
     Structural mirror of ``_authenticate_approval_caller``, but the OPPOSITE
     gate: proposals are submitted BY BOTS, not humans. Argus review S4: this
@@ -842,7 +849,7 @@ async def _authenticate_proposal_submitter(
             audit_sub = try_resolve_email(token) or "unknown"
             async with get_session_factory()() as session:
                 await service.audit_denied_proposal_submission(
-                    session, actor_sub=audit_sub, reason="missing_scope"
+                    session, actor_sub=audit_sub, reason="missing_scope", surface=surface
                 )
             return None, None, 403
         bot_sub = try_resolve_email(token)
@@ -860,7 +867,7 @@ async def _authenticate_proposal_submitter(
     rejected_sub = try_resolve_email(full_chain_token) or "unknown"
     async with get_session_factory()() as session:
         await service.audit_denied_proposal_submission(
-            session, actor_sub=rejected_sub, reason="not_agent_token"
+            session, actor_sub=rejected_sub, reason="not_agent_token", surface=surface
         )
     return None, None, 403
 
@@ -1047,6 +1054,129 @@ async def list_pending_proposals(request: Request) -> Response:
         result = await service.list_pending_proposal_holds(
             session, owner_sub=owner_sub, limit=limit
         )
+    return JSONResponse(result, status_code=200)
+
+
+@mcp.custom_route("/proposals/{proposal_id}", methods=["GET"])
+async def get_proposal(request: Request) -> Response:
+    """Let the SUBMITTING bot poll a proposal's current status/decision
+    outcome after the fact (TECH-6018) -- the synchronous ``POST
+    /proposals`` response is otherwise the only place a bot ever learns
+    what happened to its own proposal (see ``service.get_proposal_for_bot``).
+
+    Auth: same bot-only ``comms:proposals:write`` gate as submission
+    (``_authenticate_proposal_submitter``), NOT the interactive-only gate
+    ``GET /proposals/pending`` uses -- this route exists specifically for
+    the bot side, not a human reviewer. Sender-only, uniform 404 for both
+    an unknown ``proposal_id`` and one that exists but belongs to a
+    different bot (anti-enumeration, same posture as
+    ``/proposals/{hold_id}/decide``).
+
+    Registered AFTER ``GET /proposals/pending`` deliberately -- Starlette
+    matches routes in registration order, and ``/proposals/pending`` is a
+    static path that would otherwise be swallowed by this route's
+    ``{proposal_id}`` wildcard if this one came first (a GET to
+    ``/proposals/pending`` would resolve here with ``proposal_id="pending"``
+    instead).
+    """
+    bot_sub, bot_token, status = await _authenticate_proposal_submitter(request, surface="get")
+    if bot_sub is None or bot_token is None:
+        return JSONResponse({"error": "unauthorized"}, status_code=status)
+
+    proposal_id_str = request.path_params["proposal_id"]
+    try:
+        proposal_id = uuid.UUID(proposal_id_str)
+    except ValueError:
+        return JSONResponse(_UNIFORM_HOLD_NOT_FOUND, status_code=404)
+
+    async with get_session_factory()() as session:
+        try:
+            result = await service.get_proposal_for_bot(
+                session, hold_id=proposal_id, requesting_bot_sub=bot_sub
+            )
+        except AccessDeniedError:
+            return JSONResponse(_UNIFORM_HOLD_NOT_FOUND, status_code=404)
+        except Exception:
+            logger.exception("get_proposal_for_bot invariant violation for hold_id=%s", proposal_id)
+            return JSONResponse({"error": "internal_error"}, status_code=500)
+
+    return JSONResponse(result, status_code=200)
+
+
+@mcp.custom_route("/proposals/{proposal_id}/withdraw", methods=["POST"])
+async def withdraw_proposal_route(request: Request) -> Response:
+    """Let the SUBMITTING bot retire its own still-``pending`` proposal
+    (TECH-6018) -- most useful when the bot has since determined the
+    proposal is stale or simply wrong and wants it retracted before a
+    human can decide it. A resubmission for the SAME ``target_id``/
+    ``action_type`` doesn't need this at all -- dedup already updates a
+    matching PENDING row in place. An ``'applying'`` match is not mutated
+    that way, though (see ``service.withdraw_proposal``'s docstring) -- a
+    fresh submission after that claim resolves is the retry path.
+
+    Body: ``{"reason": "<optional string, max 2000 chars>"}``. Auth: same
+    bot-only gate as submission/``GET /proposals/{id}`` -- a human can
+    never withdraw a bot's proposal through this route (that's what
+    ``POST /proposals/{id}/decide``'s ``reject`` is for). Sender-only,
+    uniform 404 for unknown/not-yours. Only a ``pending`` proposal can be
+    withdrawn; anything already claimed or decided (including the
+    transient ``applying``) returns 409.
+    """
+    bot_sub, bot_token, status = await _authenticate_proposal_submitter(request, surface="withdraw")
+    if bot_sub is None or bot_token is None:
+        return JSONResponse({"error": "unauthorized"}, status_code=status)
+
+    proposal_id_str = request.path_params["proposal_id"]
+    try:
+        proposal_id = uuid.UUID(proposal_id_str)
+    except ValueError:
+        return JSONResponse(_UNIFORM_HOLD_NOT_FOUND, status_code=404)
+
+    raw_body = await request.body()
+    if not raw_body:
+        # The entire body is optional -- `reason` is the only field, and
+        # it's fine with no value at all. A truly empty body (a bot's
+        # simple fire-and-forget withdraw call with no JSON at all) is NOT
+        # malformed JSON, so treat it as an absent object rather than
+        # 422ing.
+        body: Any = {}
+    else:
+        # A NON-empty body that fails to parse (Argus review round-2
+        # suggestion) IS malformed and gets the same `invalid_json` 422 as
+        # decide_proposal_route -- only a genuinely empty body gets the
+        # lenient fallback above.
+        try:
+            body = json.loads(raw_body)
+        except json.JSONDecodeError:
+            return JSONResponse({"error": "invalid_json"}, status_code=422)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "invalid_body"}, status_code=422)
+    reason = body.get("reason")
+    if reason is not None:
+        if not isinstance(reason, str):
+            return JSONResponse({"error": "invalid_reason"}, status_code=422)
+        if len(reason) > _MAX_DECISION_REASON_LENGTH:
+            return JSONResponse(
+                {
+                    "error": "invalid_reason",
+                    "detail": f"reason exceeds {_MAX_DECISION_REASON_LENGTH} characters",
+                },
+                status_code=422,
+            )
+
+    async with get_session_factory()() as session:
+        try:
+            result = await service.withdraw_proposal(
+                session, hold_id=proposal_id, requesting_bot_sub=bot_sub, reason=reason
+            )
+        except AccessDeniedError:
+            return JSONResponse(_UNIFORM_HOLD_NOT_FOUND, status_code=404)
+        except HoldAlreadyDecidedError as exc:
+            return JSONResponse({"error": "already_decided", "status": exc.status}, status_code=409)
+        except Exception:
+            logger.exception("withdraw_proposal invariant violation for hold_id=%s", proposal_id)
+            return JSONResponse({"error": "internal_error"}, status_code=500)
+
     return JSONResponse(result, status_code=200)
 
 
