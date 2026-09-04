@@ -4821,22 +4821,37 @@ async def audit_denied_approval_requires_interactive(
 # calls this function, so ``"rate_limited"`` is deliberately NOT listed.
 ALLOWED_DENIAL_REASONS = frozenset({"not_agent_token", "missing_scope"})
 
+# TECH-6018: `_authenticate_proposal_submitter` (main.py) now gates THREE
+# bot-side HTTP surfaces -- `POST /proposals` (submit), `GET
+# /proposals/{id}` (get), `POST /proposals/{id}/withdraw` (withdraw) -- not
+# just submission. Without a surface, a rejected GET or withdraw attempt
+# was recorded as a fabricated `denied.proposal_submit_*` row, exactly the
+# audit-misattribution `audit_denied_approval_requires_interactive`'s own
+# `surface` parameter already exists to prevent on the interactive side.
+# "submit" is the default so every pre-existing call site/test (which never
+# passed a surface) keeps writing the exact same action string as before.
+PROPOSAL_SUBMITTER_SURFACES = frozenset({"submit", "get", "withdraw"})
+
 
 async def audit_denied_proposal_submission(
-    session: AsyncSession, *, actor_sub: str, reason: str
+    session: AsyncSession, *, actor_sub: str, reason: str, surface: str = "submit"
 ) -> None:
-    """Audit + commit a ``POST /proposals`` submission denial (TECH-5872,
+    """Audit + commit a bot-side proposal-route denial (TECH-5872/6018,
     Argus review S5) -- the two 403 causes in ``main._authenticate_
     proposal_submitter`` (``reason="not_agent_token"`` for an
     interactive/unverifiable-as-agent caller, ``reason="missing_scope"`` for
-    a verified agent-jwt token lacking ``PROPOSAL_SUBMIT_SCOPE``). Same "no
-    board Agent/conversation context" shape as
+    a verified agent-jwt token lacking ``PROPOSAL_SUBMIT_SCOPE``), across
+    whichever of the three bot-side surfaces (``surface``, see
+    ``PROPOSAL_SUBMITTER_SURFACES``) rejected the caller. Same "no board
+    Agent/conversation context" shape as
     ``audit_denied_approval_requires_interactive`` above -- there is nothing
     to raise, only an audit row to persist.
     """
     if reason not in ALLOWED_DENIAL_REASONS:
         raise ValueError(f"unexpected denial reason: {reason!r}")
-    _audit(session, actor_sub=actor_sub, action=f"denied.proposal_submit_{reason}")
+    if surface not in PROPOSAL_SUBMITTER_SURFACES:
+        raise ValueError(f"unexpected surface: {surface!r}")
+    _audit(session, actor_sub=actor_sub, action=f"denied.proposal_{surface}_{reason}")
     await session.commit()
 
 
@@ -6038,6 +6053,18 @@ async def get_proposal_for_bot(
     Read-only: no ``for_update`` lock, since this never mutates the row --
     unlike ``decide_proposal``, there is no write here to protect against
     a concurrent decide.
+
+    ``decided_by_actor_id`` is OMITTED from the response when
+    ``decision_source == "human"`` (Argus review suggestion): every other
+    caller of ``_proposal_dict`` returns it to the party who WAS that
+    actor (the human reviewer's own ``decide_proposal`` response) or to
+    whom it's never a person (the auto-judge's ``"system:judge"``) -- this
+    is the one case where it would hand the submitting BOT a human
+    reviewer's own identity (an email-shaped Okta sub) merely for having
+    proposed something. Omitted, not nulled: a bot-facing consumer should
+    not be able to tell "no actor recorded" apart from "actor withheld"
+    either way, and an absent key reads more clearly as "not disclosed
+    here" than an explicit ``null`` would.
     """
     hold = await _find_proposal_hold(session, hold_id)
     if hold is None:
@@ -6054,7 +6081,10 @@ async def get_proposal_for_bot(
             action="denied.proposal_hold_not_submitter",
             detail={"attempted_hold_id": str(hold_id)},
         )
-    return _proposal_dict(hold)
+    result = _proposal_dict(hold)
+    if hold.decision_source == "human":
+        result.pop("decided_by_actor_id", None)
+    return result
 
 
 async def withdraw_proposal(
@@ -6098,6 +6128,13 @@ async def withdraw_proposal(
             detail={"attempted_hold_id": str(hold_id)},
         )
     if hold.status != "pending":
+        # Release the FOR UPDATE lock before raising (Argus review S1) --
+        # mirroring decide_proposal's identical commit-before-raise here:
+        # otherwise the lock stays held through exception propagation and
+        # response construction until the session's own rollback on
+        # __aexit__, needlessly blocking a concurrent decide/auto-judge
+        # claim on the same row for that whole window.
+        await session.commit()
         raise HoldAlreadyDecidedError(status=hold.status)
 
     hold.status = "withdrawn"
@@ -7935,6 +7972,7 @@ __all__ = [
     "OWNERSHIP_CLIENT_ENV_VAR",
     "PROPOSAL_HOLD_LEVELS",
     "PROPOSAL_RATE_LIMIT_WINDOW",
+    "PROPOSAL_SUBMITTER_SURFACES",
     "AgentTableOwnershipClient",
     "OwnershipClient",
     "OwnershipClientFactory",
@@ -7955,6 +7993,7 @@ __all__ = [
     "get_conversation",
     "get_hold_status",
     "get_ownership_client_factory",
+    "get_proposal_for_bot",
     "inbox",
     "invite",
     "leave",
@@ -7973,5 +8012,6 @@ __all__ = [
     "start_conversation",
     "validate_hold_level",
     "validate_ownership_client_configuration",
+    "withdraw_proposal",
     "write_through_ownership",
 ]

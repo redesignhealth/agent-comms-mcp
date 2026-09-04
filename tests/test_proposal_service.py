@@ -1078,6 +1078,42 @@ class TestGetProposalForBot:
         )
         assert result["status"] == "rejected"
         assert result["decision_note"] == "not needed"
+        # Argus review suggestion: the human reviewer's own identity must
+        # not be disclosed to the submitting bot.
+        assert "decided_by_actor_id" not in result
+
+    async def test_unknown_hold_denial_is_audited(self, session: AsyncSession) -> None:
+        with pytest.raises(AccessDeniedError):
+            await get_proposal_for_bot(session, hold_id=uuid.uuid4(), requesting_bot_sub="bot-1")
+        rows = (
+            (
+                await session.execute(
+                    select(AuditLog).where(AuditLog.action == "denied.unknown_proposal_hold")
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert rows
+
+    async def test_different_bot_denial_is_audited(self, session: AsyncSession) -> None:
+        submitted = await _submit(session, proposed_by_bot_id="bot-1")
+        with pytest.raises(AccessDeniedError):
+            await get_proposal_for_bot(
+                session,
+                hold_id=uuid.UUID(submitted["proposal_id"]),
+                requesting_bot_sub="bot-2",
+            )
+        rows = (
+            (
+                await session.execute(
+                    select(AuditLog).where(AuditLog.action == "denied.proposal_hold_not_submitter")
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert rows
 
 
 class TestWithdrawProposal:
@@ -1152,3 +1188,42 @@ class TestWithdrawProposal:
         resubmitted = await _submit(session, proposed_by_bot_id="bot-1")
         assert resubmitted["proposal_id"] != submitted["proposal_id"]
         assert resubmitted["status"] == "pending"
+
+    async def test_withdraw_applying_hold_raises_already_decided(
+        self, session: AsyncSession
+    ) -> None:
+        """The highest-risk case the FOR UPDATE lock exists to protect:
+        a hold already CLAIMED (mid-flight on the auto-judge's or a
+        concurrent decide's own external Linear round-trip) must not be
+        withdrawn out from under it."""
+        submitted = await _submit(session, proposed_by_bot_id="bot-1")
+        hold = await session.get(ProposalHold, uuid.UUID(submitted["proposal_id"]))
+        assert hold is not None
+        hold.status = "applying"
+        hold.decided_at = hold.created_at
+        hold.decided_by_actor_id = "owner-a@example.com"
+        hold.decision_source = "human"
+        await session.commit()
+
+        with pytest.raises(HoldAlreadyDecidedError):
+            await withdraw_proposal(
+                session,
+                hold_id=uuid.UUID(submitted["proposal_id"]),
+                requesting_bot_sub="bot-1",
+                reason=None,
+            )
+
+    async def test_withdraw_is_audited(self, session: AsyncSession) -> None:
+        submitted = await _submit(session, proposed_by_bot_id="bot-1")
+        await withdraw_proposal(
+            session,
+            hold_id=uuid.UUID(submitted["proposal_id"]),
+            requesting_bot_sub="bot-1",
+            reason="stale",
+        )
+        rows = (
+            (await session.execute(select(AuditLog).where(AuditLog.action == "proposal.withdraw")))
+            .scalars()
+            .all()
+        )
+        assert rows

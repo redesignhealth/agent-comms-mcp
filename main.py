@@ -794,9 +794,16 @@ async def _verify_agent_token(token_str: str) -> Any | None:
 
 
 async def _authenticate_proposal_submitter(
-    request: Request,
+    request: Request, *, surface: str = "submit"
 ) -> tuple[str | None, Any | None, int]:
-    """Self-verify the bearer token for ``POST /proposals`` (TECH-5872).
+    """Self-verify the bearer token for the bot-side proposal routes:
+    ``POST /proposals`` (``surface="submit"``, the default), ``GET
+    /proposals/{id}`` (``surface="get"``, TECH-6018), and ``POST
+    /proposals/{id}/withdraw`` (``surface="withdraw"``, TECH-6018) -- same
+    ``comms:proposals:write`` gate on all three, just distinguished in the
+    audit trail (``service.audit_denied_proposal_submission``'s own
+    ``surface`` param) so a rejected GET/withdraw doesn't get recorded as a
+    fabricated submission denial.
 
     Structural mirror of ``_authenticate_approval_caller``, but the OPPOSITE
     gate: proposals are submitted BY BOTS, not humans. Argus review S4: this
@@ -842,7 +849,7 @@ async def _authenticate_proposal_submitter(
             audit_sub = try_resolve_email(token) or "unknown"
             async with get_session_factory()() as session:
                 await service.audit_denied_proposal_submission(
-                    session, actor_sub=audit_sub, reason="missing_scope"
+                    session, actor_sub=audit_sub, reason="missing_scope", surface=surface
                 )
             return None, None, 403
         bot_sub = try_resolve_email(token)
@@ -860,7 +867,7 @@ async def _authenticate_proposal_submitter(
     rejected_sub = try_resolve_email(full_chain_token) or "unknown"
     async with get_session_factory()() as session:
         await service.audit_denied_proposal_submission(
-            session, actor_sub=rejected_sub, reason="not_agent_token"
+            session, actor_sub=rejected_sub, reason="not_agent_token", surface=surface
         )
     return None, None, 403
 
@@ -1072,7 +1079,7 @@ async def get_proposal(request: Request) -> Response:
     ``/proposals/pending`` would resolve here with ``proposal_id="pending"``
     instead).
     """
-    bot_sub, bot_token, status = await _authenticate_proposal_submitter(request)
+    bot_sub, bot_token, status = await _authenticate_proposal_submitter(request, surface="get")
     if bot_sub is None or bot_token is None:
         return JSONResponse({"error": "unauthorized"}, status_code=status)
 
@@ -1089,6 +1096,9 @@ async def get_proposal(request: Request) -> Response:
             )
         except AccessDeniedError:
             return JSONResponse(_UNIFORM_HOLD_NOT_FOUND, status_code=404)
+        except Exception:
+            logger.exception("get_proposal_for_bot invariant violation for hold_id=%s", proposal_id)
+            return JSONResponse({"error": "internal_error"}, status_code=500)
 
     return JSONResponse(result, status_code=200)
 
@@ -1111,7 +1121,7 @@ async def withdraw_proposal_route(request: Request) -> Response:
     withdrawn; anything already claimed or decided (including the
     transient ``applying``) returns 409.
     """
-    bot_sub, bot_token, status = await _authenticate_proposal_submitter(request)
+    bot_sub, bot_token, status = await _authenticate_proposal_submitter(request, surface="withdraw")
     if bot_sub is None or bot_token is None:
         return JSONResponse({"error": "unauthorized"}, status_code=status)
 
@@ -1124,6 +1134,13 @@ async def withdraw_proposal_route(request: Request) -> Response:
     try:
         body = await request.json()
     except json.JSONDecodeError:
+        # Unlike decide_proposal_route (which 422s on malformed JSON), the
+        # entire body here is optional -- `reason` is the only field, and
+        # it's fine with no value at all. Treating a garbled body the same
+        # as an absent one keeps a bot's simple fire-and-forget withdraw
+        # call working even if it sent junk, rather than forcing it to
+        # retry with a fixed-up body for a field it may not have wanted to
+        # set anyway.
         body = {}
     if not isinstance(body, dict):
         return JSONResponse({"error": "invalid_body"}, status_code=422)
@@ -1149,6 +1166,9 @@ async def withdraw_proposal_route(request: Request) -> Response:
             return JSONResponse(_UNIFORM_HOLD_NOT_FOUND, status_code=404)
         except HoldAlreadyDecidedError as exc:
             return JSONResponse({"error": "already_decided", "status": exc.status}, status_code=409)
+        except Exception:
+            logger.exception("withdraw_proposal invariant violation for hold_id=%s", proposal_id)
+            return JSONResponse({"error": "internal_error"}, status_code=500)
 
     return JSONResponse(result, status_code=200)
 

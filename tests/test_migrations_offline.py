@@ -349,3 +349,18 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
     original_predicate_pos = result.stdout.index("WHERE status = 'pending'")
     widened_index_pos = result.stdout.index("WHERE status IN ('pending', 'applying')")
     assert original_predicate_pos < widened_index_pos
+    # f3c9a7e2b1d4 (TECH-6018, Argus review S9): widen ck_proposal_holds_status
+    # to accept 'withdrawn' and ck_proposal_holds_decision_source to accept
+    # 'bot' -- pins the exact DDL so a typo in either widened value set (wrong
+    # order, a value accidentally dropped, wrong constraint name) fails this
+    # test instead of only surfacing later against a real database.
+    assert (
+        "ALTER TABLE proposal_holds ADD CONSTRAINT ck_proposal_holds_status "
+        "CHECK (status IN ('pending', 'approved', 'applying', 'rejected', "
+        "'applied', 'apply_failed', 'stale', 'withdrawn'))" in result.stdout
+    )
+    assert (
+        "ALTER TABLE proposal_holds ADD CONSTRAINT ck_proposal_holds_decision_source "
+        "CHECK (decision_source IS NULL OR decision_source IN "
+        "('human', 'auto', 'bot'))" in result.stdout
+    )

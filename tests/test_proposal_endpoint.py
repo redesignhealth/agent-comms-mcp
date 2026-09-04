@@ -1256,3 +1256,78 @@ class TestWithdrawProposalEndpoint:
         resubmitted = resubmit_resp.json()
         assert resubmitted["proposal_id"] != proposal_id
         assert resubmitted["status"] == "pending"
+
+    async def test_uniform_404_for_malformed_proposal_id(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        resp = await http_client.post(
+            "/proposals/not-a-uuid/withdraw",
+            headers={"Authorization": "Bearer bot-token"},
+            json={},
+        )
+        assert resp.status_code == 404
+        assert resp.json() == {"error": "not_found"}
+
+    async def test_non_dict_body_returns_invalid_body_422(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider)
+        resp = await http_client.post(
+            f"/proposals/{proposal_id}/withdraw",
+            headers={"Authorization": "Bearer bot-token"},
+            json=[],
+        )
+        assert resp.status_code == 422
+        assert resp.json()["error"] == "invalid_body"
+
+    async def test_non_string_reason_returns_invalid_reason_422(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider)
+        resp = await http_client.post(
+            f"/proposals/{proposal_id}/withdraw",
+            headers={"Authorization": "Bearer bot-token"},
+            json={"reason": 123},
+        )
+        assert resp.status_code == 422
+        assert resp.json()["error"] == "invalid_reason"
+
+    async def test_reason_exceeding_max_length_returns_invalid_reason_422(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider)
+        resp = await http_client.post(
+            f"/proposals/{proposal_id}/withdraw",
+            headers={"Authorization": "Bearer bot-token"},
+            json={"reason": "x" * 2001},
+        )
+        assert resp.status_code == 422
+        assert resp.json()["error"] == "invalid_reason"
+
+
+class TestProposalRouteRegistrationOrder:
+    """Guards the route-ordering invariant ``get_proposal``'s own docstring
+    depends on (Argus review suggestion): Starlette matches routes in
+    registration order, so ``/proposals/pending`` (static) MUST be
+    registered before ``/proposals/{proposal_id}`` (wildcard), or a GET to
+    ``/proposals/pending`` would resolve to ``get_proposal`` with
+    ``proposal_id="pending"`` instead of ``list_pending_proposals`` --
+    silently returning a uniform 404 for every caller instead of the
+    pending list. This module's own test fixture hand-builds an
+    independently-ordered ``Route`` list (see the ``client`` fixture
+    above), so it can't catch a production ordering regression -- this
+    test inspects ``main.mcp``'s ACTUAL registered routes instead."""
+
+    def test_pending_registered_before_wildcard_proposal_id(self) -> None:
+        main = _import_main()
+        paths = [getattr(route, "path", None) for route in main.mcp._additional_http_routes]
+        assert "/proposals/pending" in paths
+        assert "/proposals/{proposal_id}" in paths
+        assert paths.index("/proposals/pending") < paths.index("/proposals/{proposal_id}")
