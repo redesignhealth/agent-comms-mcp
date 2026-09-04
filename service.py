@@ -5301,6 +5301,15 @@ async def decide_hold(
         await session.commit()
         result = _hold_dict(hold)
         result["participant_status"] = participant.status
+        # TECH-5903 Phase B: private, provider-layer-only keys -- popped and
+        # consumed by main.decide_approval AFTER this session closes, never
+        # sent to the HTTP caller. Invite-hold approve: the new invited
+        # target isn't active yet, so it's pinged via its inbox URI directly
+        # rather than folded into the active-participant recheck set.
+        active_ids = await get_active_participant_agent_ids(session, conversation.id)
+        result["_notify_conversation_id"] = str(conversation.id)
+        result["_notify_active_agent_ids"] = [str(a) for a in active_ids]
+        result["_notify_inbox_agent_ids"] = [str(hold.target_agent_id)]
         return result
 
     rows = (
@@ -5360,7 +5369,14 @@ async def decide_hold(
             detail={"new_state": new_state, "via": hold.message_type},
         )
     await session.commit()
-    return _hold_dict(hold)
+    result = _hold_dict(hold)
+    # TECH-5903 Phase B: see the invite-hold branch above for why these
+    # private keys exist and who consumes them.
+    active_ids = await get_active_participant_agent_ids(session, conversation.id)
+    result["_notify_conversation_id"] = str(conversation.id)
+    result["_notify_active_agent_ids"] = [str(a) for a in active_ids]
+    result["_notify_inbox_agent_ids"] = [str(a) for a in active_ids]
+    return result
 
 
 # --- Proposal holds (TECH-5871/5872/5875/5877) --------------------------------
@@ -7079,6 +7095,96 @@ async def resolve_inbox_target(
         # state, not standing in for a security check that must always run.
         raise AssertionError("unreachable: _deny must have raised")
     return target
+
+
+async def resolve_conversation_participant(
+    session: AsyncSession,
+    *,
+    actor_sub: str,
+    agent_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+) -> tuple[Conversation, Participant]:
+    """Public entry point over ``_load_participant_for_read`` (TECH-5903 Phase B).
+
+    Exists so ``providers.comms.authorize_resource_subscribe`` can reuse the
+    EXACT SAME membership check ``get_conversation``/``conversation_resource``
+    use ("is this caller an admitted participant", ``invited`` included) —
+    the plan doc's resolved decision that subscribe authz must not be a
+    separately-maintained rule — without either reaching into this module's
+    private helper directly or duplicating its logic. Callers that need the
+    stricter subscribe-only ``active`` gate on top check ``participant.status``
+    themselves and deny via ``deny_resource_subscribe`` below.
+    """
+    return await _load_participant_for_read(
+        session, actor_sub=actor_sub, agent_id=agent_id, conversation_id=conversation_id
+    )
+
+
+async def deny_resource_subscribe(
+    session: AsyncSession,
+    *,
+    actor_sub: str,
+    action: str,
+    agent_id: uuid.UUID | None = None,
+    conversation_id: uuid.UUID | None = None,
+    detail: dict[str, Any] | None = None,
+) -> NoReturn:
+    """Audited, uniform denial for a resource subscribe/unsubscribe attempt
+    (TECH-5903 Phase B) — thin public wrapper over ``_deny`` so every
+    subscribe/unsubscribe failure category writes the same kind of
+    ``audit_log`` row every other denial in this module does, before
+    ``providers.comms.authorize_resource_subscribe`` folds all of them into
+    one uniform, anti-enumeration ``McpError`` at the transport boundary.
+    """
+    await _deny(
+        session,
+        actor_sub=actor_sub,
+        action=action,
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+        detail=detail,
+    )
+
+
+async def audit_resource_subscription(
+    session: AsyncSession,
+    *,
+    actor_sub: str,
+    agent_id: uuid.UUID,
+    action: str,
+    uri: str,
+) -> None:
+    """Audit + commit a successful ``resource.subscribe``/``resource.unsubscribe``
+    (TECH-5903 Phase B). Unlike every other tool/resource call, the low-level
+    subscribe/unsubscribe handlers (``main.py``) open a session solely for
+    this audit write — there is no other mutation to share a transaction
+    with — so this commits immediately rather than deferring to a caller.
+    """
+    _audit(session, actor_sub=actor_sub, action=action, agent_id=agent_id, detail={"uri": uri})
+    await session.commit()
+
+
+async def get_active_participant_agent_ids(
+    session: AsyncSession, conversation_id: uuid.UUID
+) -> set[uuid.UUID]:
+    """Every currently-``active`` participant's ``agent_id`` for
+    ``conversation_id`` (TECH-5903 Phase B) — used post-commit by the
+    provider layer to compute ``subscriptions.notify_conversation_event``'s
+    ``active_agent_ids`` re-check set. Deliberately its own plain read
+    rather than reused from an existing private helper: every other
+    participant query in this module is shaped around a specific write
+    path's own side effects (row locking, role checks, ...), not a bare
+    read of the current active set.
+    """
+    rows = (
+        await session.execute(
+            select(Participant.agent_id).where(
+                Participant.conversation_id == conversation_id,
+                Participant.status == "active",
+            )
+        )
+    ).scalars()
+    return set(rows)
 
 
 async def inbox(

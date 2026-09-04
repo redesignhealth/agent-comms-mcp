@@ -66,6 +66,20 @@ class TestServerComposition:
             with pytest.raises(RuntimeError, match="MCP_JWT_SECRET"):
                 require_env("MCP_JWT_SECRET")
 
+    def test_initialize_advertises_resource_subscribe(self) -> None:
+        """TECH-5903 Phase B: the SDK hardcodes ``resources.subscribe=False``
+        in ``get_capabilities`` even with subscribe/unsubscribe handlers
+        registered (plan doc §3.4) -- ``main.py`` patches the bound method
+        on ``_low_level_server`` to advertise ``subscribe=True`` instead.
+        Pinned here so an SDK upgrade that changes the hardcoded default
+        (or a refactor that drops the patch) is caught."""
+        from mcp.server.lowlevel.server import NotificationOptions
+
+        main = _import_main()
+        capabilities = main._low_level_server.get_capabilities(NotificationOptions(), {})
+        assert capabilities.resources is not None
+        assert capabilities.resources.subscribe is True
+
 
 class TestScopeRegistryParity:
     """The actual mounted tool names must resolve against the scope registry.

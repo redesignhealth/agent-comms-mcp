@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import uuid
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
@@ -51,6 +52,7 @@ from sqlalchemy.exc import InterfaceError, OperationalError
 
 import plugins
 import service
+import subscriptions
 from db import get_session_factory
 from exceptions import (
     AccessDeniedError,
@@ -73,7 +75,12 @@ from schemas import (
     MAX_PARTICIPANTS_PER_CONVERSATION,
     PayloadValidationError,
 )
-from scopes import is_interactive_token, is_registry_backed_agent_token, scopes_for_token
+from scopes import (
+    is_interactive_token,
+    is_registry_backed_agent_token,
+    required_scope_for_resource,
+    scopes_for_token,
+)
 
 comms_server: FastMCP[Any] = FastMCP("comms")
 
@@ -175,8 +182,6 @@ def _validate_agent_key(agent_key: str | None) -> str | None:
             )
 
     # Strict allowlist: alphanumeric, dot, underscore, hyphen
-    import re
-
     if not re.match(r"^[A-Za-z0-9._-]+$", agent_key):
         raise ToolError(
             "invalid_request: agent_key must contain only alphanumeric"
@@ -1180,6 +1185,14 @@ async def start_conversation(
         decision_url = _decision_url(str(pending_hold.id))
         if decision_url is not None:
             result["decision_url"] = decision_url
+    # TECH-5903 Phase B: post-commit, best-effort -- see subscriptions.py's
+    # module docstring. No conversation-URI ping: this conversation didn't
+    # exist before this call, so nothing could have subscribed to it yet.
+    # Every invitee starts `invited`, not `active` -- their inbox is pinged
+    # unconditionally regardless (plan doc §4).
+    await subscriptions.notify_conversation_event(
+        conversation.id, active_agent_ids=set(), inbox_agent_ids=target_uuids
+    )
     return result
 
 
@@ -1316,6 +1329,14 @@ async def post_message(
                 owner_sub_claim=owner_sub_claim,
                 review_reason=review_reason,
             )
+        # TECH-5903 Phase B: queried inside the still-open session so this
+        # is one round trip, not a second connection post-close -- a
+        # held-for-approval outcome fires no notification (plan doc §4:
+        # "nothing visible changed"), so this is skipped entirely for that
+        # branch.
+        active_ids: set[uuid.UUID] = set()
+        if not isinstance(result, ApprovalHold):
+            active_ids = await service.get_active_participant_agent_ids(session, conv_id)
 
     if isinstance(result, ApprovalHold):
         held_response: dict[str, Any] = {
@@ -1332,6 +1353,11 @@ async def post_message(
             held_response["decision_url"] = decision_url
         return held_response
     message = result
+    await subscriptions.notify_conversation_event(
+        conv_id,
+        active_agent_ids=active_ids,
+        inbox_agent_ids=active_ids - {caller.id},
+    )
     response: dict[str, Any] = {
         "conversation_id": conversation_id,
         "seq": message.seq,
@@ -1598,7 +1624,13 @@ async def accept(conversation_id: str, agent_key: str | None = None) -> dict[str
                 agent_id=caller.id,
                 conversation_id=conv_id,
             )
+        # TECH-5903 Phase B: active_ids already includes the caller, since
+        # accept_invite committed the invited->active transition above.
+        active_ids = await service.get_active_participant_agent_ids(session, conv_id)
 
+    await subscriptions.notify_conversation_event(
+        conv_id, active_agent_ids=active_ids, inbox_agent_ids=[caller.id]
+    )
     return {
         "conversation_id": conversation_id,
         "agent_id": str(participant.agent_id),
@@ -1632,7 +1664,13 @@ async def decline_invite(conversation_id: str, agent_key: str | None = None) -> 
                 agent_id=caller.id,
                 conversation_id=conv_id,
             )
+        # TECH-5903 Phase B: the decliner was never `active`, so it's not in
+        # this set -- pinged via inbox_agent_ids directly below instead.
+        active_ids = await service.get_active_participant_agent_ids(session, conv_id)
 
+    await subscriptions.notify_conversation_event(
+        conv_id, active_agent_ids=active_ids, inbox_agent_ids=[caller.id]
+    )
     return {"conversation_id": conversation_id, "agent_id": str(caller.id), "status": "declined"}
 
 
@@ -1701,6 +1739,11 @@ async def invite(
                 notifier=plugins.get_approval_notifier(),
                 owner_sub_claim=owner_sub_claim,
             )
+        # TECH-5903 Phase B: see comms_post_message's identical comment --
+        # skipped for the held branch (nothing visible changed yet).
+        active_ids: set[uuid.UUID] = set()
+        if not isinstance(result, ApprovalHold):
+            active_ids = await service.get_active_participant_agent_ids(session, conv_id)
 
     if isinstance(result, ApprovalHold):
         held_response: dict[str, Any] = {
@@ -1717,6 +1760,12 @@ async def invite(
             held_response["decision_url"] = decision_url
         return held_response
     participant = result
+    # Target isn't active yet (still `invited`) -- pinged directly rather
+    # than folded into the active-participant recheck set (plan doc §4:
+    # "target's inbox URI; conversation URI (participant set changed)").
+    await subscriptions.notify_conversation_event(
+        conv_id, active_agent_ids=active_ids, inbox_agent_ids=[target_id]
+    )
     response: dict[str, Any] = {
         "conversation_id": conversation_id,
         "target_agent_id": str(participant.agent_id),
@@ -1753,7 +1802,14 @@ async def leave(conversation_id: str, agent_key: str | None = None) -> dict[str,
                 agent_id=caller.id,
                 conversation_id=conv_id,
             )
+        # TECH-5903 Phase B: queried after leave's commit, so the caller
+        # itself is already excluded here -- it's pinged via
+        # inbox_agent_ids directly below instead.
+        active_ids = await service.get_active_participant_agent_ids(session, conv_id)
 
+    await subscriptions.notify_conversation_event(
+        conv_id, active_agent_ids=active_ids, inbox_agent_ids=[caller.id]
+    )
     return {"conversation_id": conversation_id, "agent_id": str(caller.id), "status": "left"}
 
 
@@ -2002,3 +2058,130 @@ async def agents_directory_resource() -> dict[str, Any]:
                 cursor=None,
                 active_checker=plugins.get_active_checker(),
             )
+
+
+# --- Subscribe / unsubscribe authorization (TECH-5903 Phase B) --------------------
+#
+# The low-level ``subscribe_resource``/``unsubscribe_resource`` handlers
+# (registered in ``main.py`` directly on ``mcp._mcp_server``, since FastMCP's
+# own ``@comms_server.resource`` decorator has no subscribe counterpart)
+# bypass every FastMCP middleware, including `ScopeEnforcementMiddleware` —
+# so scope enforcement AND the resource-specific membership check both have
+# to be re-implemented here, in one place, rather than left to middleware
+# that will never see these requests. `authorize_resource_subscribe` is that
+# one place; `main.py`'s handlers do nothing but call it, register/deregister
+# with `subscriptions.py`, and audit the outcome.
+
+_CONVERSATION_SUBSCRIBE_URI_RE = re.compile(r"^comms://comms/conversations/([^/]+)$")
+_INBOX_SUBSCRIBE_URI_RE = re.compile(r"^comms://comms/agents/([^/]+)/inbox$")
+
+
+class ResourceSubscribeDeniedError(Exception):
+    """Uniform denial for a subscribe/unsubscribe attempt (TECH-5903 Phase B).
+
+    Raised for EVERY failure category — missing/invalid token, missing or
+    unenrolled scope, unknown URI, malformed UUID, non-member, invited-but-
+    not-active, agent-suspended, and not-yet-registered — so
+    ``main.py``'s low-level handlers can map every one of them to the
+    identical ``McpError`` string. Anti-enumeration, the same posture
+    ``exceptions.AccessDeniedError`` establishes for the tool/read-resource
+    paths — deliberately a distinct type from that one, though, since this
+    denial additionally folds in categories (missing token, missing scope)
+    that never reach the service layer at all for the read/tool paths
+    (those are caught by ``ScopeEnforcementMiddleware`` instead, which never
+    runs for subscribe/unsubscribe).
+    """
+
+
+async def authorize_resource_subscribe(uri: str) -> tuple[Agent, str]:
+    """Authorize a subscribe OR unsubscribe request for ``uri``.
+
+    Returns ``(caller_agent, base_sub)`` on success; raises
+    ``ResourceSubscribeDeniedError`` uniformly on every failure. Called from both
+    of ``main.py``'s low-level handlers — same authorization for both
+    directions, since either one acting on a URI the caller can't read
+    would leak the same information a read denial guards against.
+
+    Conversation URIs require the caller to be an ``active`` participant —
+    stricter than a plain read, which allows ``invited`` for metadata-only
+    access (plan doc §6 point 6): an ``invited`` participant that hasn't
+    accepted yet must not learn message cadence via a content-free ping.
+    The membership check itself is ``service.resolve_conversation_participant``
+    — the exact same helper ``conversation_resource``'s read path resolves
+    through (via ``service.get_conversation``) — with one additional gate
+    (``status == "active"``) layered on top here, not a separately
+    maintained rule.
+
+    Inbox URIs reuse ``service.resolve_inbox_target`` unchanged — the same
+    self-or-sibling check ``agent_inbox_resource`` uses; there is no
+    ``invited``/``active`` distinction for a self-scoped inbox to require.
+
+    Every other URI (including the static ``comms://comms/agents``
+    directory, which this ticket does not wire any subscribe behavior for)
+    is uniformly denied as unknown.
+    """
+    token = get_access_token()
+    if token is None:
+        raise ResourceSubscribeDeniedError("missing_token")
+
+    if not is_interactive_token(token):
+        required = required_scope_for_resource(uri)
+        if required is None or required not in scopes_for_token(token):
+            raise ResourceSubscribeDeniedError("missing_scope")
+
+    base_sub = try_resolve_email(token)
+    if base_sub is None:
+        raise ResourceSubscribeDeniedError("unresolvable_identity")
+
+    conversation_match = _CONVERSATION_SUBSCRIBE_URI_RE.match(uri)
+    inbox_match = _INBOX_SUBSCRIBE_URI_RE.match(uri)
+
+    conversation_id: uuid.UUID | None = None
+    target_agent_id: uuid.UUID | None = None
+    if conversation_match is not None:
+        try:
+            conversation_id = uuid.UUID(conversation_match.group(1))
+        except ValueError as exc:
+            raise ResourceSubscribeDeniedError("malformed_uuid") from exc
+    elif inbox_match is not None:
+        try:
+            target_agent_id = uuid.UUID(inbox_match.group(1))
+        except ValueError as exc:
+            raise ResourceSubscribeDeniedError("malformed_uuid") from exc
+    else:
+        raise ResourceSubscribeDeniedError("unknown_uri")
+
+    async with get_session_factory()() as session:
+        try:
+            caller = await _resolve_caller_agent(session, base_sub, token)
+        except ToolError as exc:
+            raise ResourceSubscribeDeniedError(str(exc)) from exc
+
+        async with _map_service_errors(ResourceSubscribeDeniedError):
+            if conversation_id is not None:
+                _, participant = await service.resolve_conversation_participant(
+                    session,
+                    actor_sub=base_sub,
+                    agent_id=caller.id,
+                    conversation_id=conversation_id,
+                )
+                if participant.status != "active":
+                    await service.deny_resource_subscribe(
+                        session,
+                        actor_sub=base_sub,
+                        action=f"denied.subscribe_requires_active.{participant.status}",
+                        agent_id=caller.id,
+                        conversation_id=conversation_id,
+                        detail={"current_status": participant.status},
+                    )
+                return caller, base_sub
+
+            if target_agent_id is None:
+                raise RuntimeError(
+                    "unreachable: exactly one of conversation_id/target_agent_id is always set"
+                )
+            target = await service.resolve_inbox_target(
+                session, sub=base_sub, target_agent_id=target_agent_id
+            )
+            caller = await _resolve_caller_agent(session, target.sub, token)
+            return caller, base_sub

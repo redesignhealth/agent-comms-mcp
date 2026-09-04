@@ -20,11 +20,15 @@ from fastmcp.exceptions import ResourceError, ToolError
 from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.tools import ToolResult
+from mcp.server.lowlevel.server import NotificationOptions
+from mcp.shared.exceptions import McpError
+from pydantic import AnyUrl
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 
 import plugins
 import service
+import subscriptions
 from auth import build_auth_provider
 from db import database_url, get_session_factory
 from exceptions import (
@@ -45,7 +49,7 @@ from observability import (
     log_user_active,
 )
 from plugins import validate_configuration as validate_plugin_configuration
-from providers.comms import comms_server
+from providers.comms import ResourceSubscribeDeniedError, authorize_resource_subscribe, comms_server
 from scopes import (
     PROPOSAL_SUBMIT_SCOPE,
     is_interactive_token,
@@ -408,6 +412,96 @@ mcp.add_middleware(ObservabilityMiddleware())
 mcp.add_middleware(ScopeEnforcementMiddleware())
 
 mcp.mount(comms_server, namespace="comms")
+
+_RESOURCE_SUBSCRIBE_DENIAL_MESSAGE = "access_denied: not authorized for this resource"
+
+
+def _deny_resource_subscribe() -> NoReturn:
+    """Uniform denial for the low-level subscribe/unsubscribe handlers below.
+
+    Mirrors ``_deny_resource``'s client-facing string, but raises the raw
+    SDK ``McpError`` type rather than ``fastmcp.exceptions.ResourceError``:
+    these handlers are registered directly on the low-level server (see
+    below), which never passes through FastMCP's own exception-translation
+    layer the way ``@comms_server.resource``-decorated reads do.
+    """
+    raise McpError(mt.ErrorData(code=mt.INVALID_PARAMS, message=_RESOURCE_SUBSCRIBE_DENIAL_MESSAGE))
+
+
+# Low-level subscribe/unsubscribe handlers (TECH-5903 Phase B). FastMCP's
+# own `@comms_server.resource` decorator has no subscribe counterpart, so
+# these are registered directly on `mcp._mcp_server` (the underlying
+# low-level `mcp.server.lowlevel.Server`) via its own
+# `subscribe_resource()`/`unsubscribe_resource()` decorators -- which means
+# they bypass `ScopeEnforcementMiddleware`/`ObservabilityMiddleware`
+# entirely (those only ever see `on_call_tool`/`on_read_resource`/
+# `on_list_resources`-shaped dispatch). All authz is therefore
+# reimplemented in `providers.comms.authorize_resource_subscribe`, which
+# both handlers below call and nothing else.
+_low_level_server = mcp._mcp_server
+
+
+@_low_level_server.subscribe_resource()  # type: ignore[no-untyped-call, untyped-decorator]
+async def _handle_subscribe_resource(uri: AnyUrl) -> None:
+    uri_str = str(uri)
+    try:
+        caller, base_sub = await authorize_resource_subscribe(uri_str)
+    except ResourceSubscribeDeniedError:
+        _deny_resource_subscribe()
+    session = _low_level_server.request_context.session
+    await subscriptions.subscribe(uri_str, session, agent_id=caller.id, sub=base_sub)
+    async with get_session_factory()() as db_session:
+        await service.audit_resource_subscription(
+            db_session,
+            actor_sub=base_sub,
+            agent_id=caller.id,
+            action="resource.subscribe",
+            uri=uri_str,
+        )
+
+
+@_low_level_server.unsubscribe_resource()  # type: ignore[no-untyped-call, untyped-decorator]
+async def _handle_unsubscribe_resource(uri: AnyUrl) -> None:
+    uri_str = str(uri)
+    try:
+        caller, base_sub = await authorize_resource_subscribe(uri_str)
+    except ResourceSubscribeDeniedError:
+        _deny_resource_subscribe()
+    session = _low_level_server.request_context.session
+    await subscriptions.unsubscribe(uri_str, session)
+    async with get_session_factory()() as db_session:
+        await service.audit_resource_subscription(
+            db_session,
+            actor_sub=base_sub,
+            agent_id=caller.id,
+            action="resource.unsubscribe",
+            uri=uri_str,
+        )
+
+
+# The SDK hardcodes `resources.subscribe=False` in `get_capabilities` even
+# with subscribe/unsubscribe handlers registered (plan doc §3.4 --
+# `mcp/server/lowlevel/server.py::get_capabilities`, verified against
+# fastmcp 3.4.2). Patch the bound method on THIS server instance, after
+# registration above, to advertise `subscribe=True` instead -- otherwise a
+# spec-compliant client never even attempts `resources/subscribe`. See
+# `tests/test_main.py`'s capability test, which pins this so an SDK
+# upgrade that changes the hardcoded default is caught rather than
+# silently regressing.
+_original_get_capabilities = _low_level_server.get_capabilities
+
+
+def _get_capabilities_with_subscribe(
+    notification_options: NotificationOptions,
+    experimental_capabilities: dict[str, dict[str, Any]],
+) -> mt.ServerCapabilities:
+    capabilities = _original_get_capabilities(notification_options, experimental_capabilities)
+    if capabilities.resources is not None:
+        capabilities.resources = capabilities.resources.model_copy(update={"subscribe": True})
+    return capabilities
+
+
+_low_level_server.get_capabilities = _get_capabilities_with_subscribe  # type: ignore[method-assign]
 
 
 @mcp.custom_route("/health", methods=["GET"])
@@ -957,6 +1051,20 @@ async def decide_approval(request: Request) -> Response:
         except RuntimeError:
             logger.exception("decide_hold invariant violation for hold_id=%s", hold_id)
             return JSONResponse({"error": "internal_error"}, status_code=500)
+
+    # TECH-5903 Phase B: private keys service.decide_hold's approve path
+    # attaches for this handler only -- popped and consumed here, AFTER the
+    # session above closed (post-commit, matching
+    # service._fire_approval_notifier's posture), never sent to the caller.
+    notify_conversation_id = result.pop("_notify_conversation_id", None)
+    notify_active_agent_ids = result.pop("_notify_active_agent_ids", None)
+    notify_inbox_agent_ids = result.pop("_notify_inbox_agent_ids", None)
+    if notify_conversation_id is not None:
+        await subscriptions.notify_conversation_event(
+            uuid.UUID(notify_conversation_id),
+            active_agent_ids={uuid.UUID(a) for a in notify_active_agent_ids or []},
+            inbox_agent_ids=[uuid.UUID(a) for a in notify_inbox_agent_ids or []],
+        )
 
     return JSONResponse(result, status_code=200)
 
