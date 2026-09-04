@@ -74,9 +74,11 @@ class _FakeSession:
 async def _clear_registry() -> AsyncIterator[None]:
     subscriptions._registry.clear()
     subscriptions._agent_subscription_counts.clear()
+    subscriptions._seq_counter = 0
     yield
     subscriptions._registry.clear()
     subscriptions._agent_subscription_counts.clear()
+    subscriptions._seq_counter = 0
 
 
 class TestRegistrySubscribeUnsubscribe:
@@ -418,7 +420,7 @@ def database_url() -> str:
     return url
 
 
-@pytest.fixture(scope="module", autouse=True)
+@pytest.fixture(scope="module")
 def _migrated_schema(database_url: str) -> None:
     import subprocess
 
@@ -441,7 +443,7 @@ async def engine(database_url: str) -> AsyncIterator[AsyncEngine]:
     await eng.dispose()
 
 
-@pytest_asyncio.fixture(autouse=True)
+@pytest_asyncio.fixture
 async def _clean_tables(engine: AsyncEngine) -> AsyncIterator[None]:
     async with engine.begin() as conn:
         await conn.execute(
@@ -573,6 +575,17 @@ async def _wait_until(predicate: Any, *, timeout: float = 2.0) -> None:
 
 
 class TestSubscribeAuthorization:
+    # Real-Postgres e2e layer (see module docstring's §5 two-layer split) --
+    # `_migrated_schema`/`_clean_tables` are scoped to this class (and the
+    # other real-Postgres classes below), not file-wide autouse, so the
+    # DB-less `TestRegistry*`/`TestIsSubscribed`/`TestNotifyConversationEvent`/
+    # `TestCapDivergenceRecovery` classes above genuinely run without
+    # Postgres (Argus round-5 BLOCKING catch: a file-wide autouse fixture
+    # depending on `database_url` -- which calls `pytest.skip()` when
+    # Postgres is unreachable -- would cascade that skip to every test in
+    # this file, defeating the whole point of having a DB-less layer).
+    pytestmark = pytest.mark.usefixtures("_migrated_schema", "_clean_tables")
+
     async def test_subscribe_requires_active_participant(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
@@ -949,6 +962,10 @@ class TestSubscribeAuthorization:
 
 
 class TestNotificationFiring:
+    # See TestSubscribeAuthorization's comment on why this is scoped here
+    # rather than file-wide autouse.
+    pytestmark = pytest.mark.usefixtures("_migrated_schema", "_clean_tables")
+
     async def test_subscriber_receives_notification_on_post_message(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
@@ -1282,6 +1299,10 @@ class _FakeApprovalAuthProvider:
 
 
 class TestApprovalHttpNotification:
+    # See TestSubscribeAuthorization's comment on why this is scoped here
+    # rather than file-wide autouse.
+    pytestmark = pytest.mark.usefixtures("_migrated_schema", "_clean_tables")
+
     async def test_approve_notifies_conversation_and_participant_inboxes(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
@@ -1367,6 +1388,10 @@ class TestApprovalHttpNotification:
 
 
 class TestRollbackSafety:
+    # See TestSubscribeAuthorization's comment on why this is scoped here
+    # rather than file-wide autouse.
+    pytestmark = pytest.mark.usefixtures("_migrated_schema", "_clean_tables")
+
     async def test_failed_write_triggers_zero_notifications(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
@@ -1423,6 +1448,10 @@ class TestAuditBeforeMutationOrdering:
     inject a failure into ``service.audit_resource_subscription`` itself
     and assert the registry was never mutated when that happens.
     """
+
+    # See TestSubscribeAuthorization's comment on why this is scoped here
+    # rather than file-wide autouse.
+    pytestmark = pytest.mark.usefixtures("_migrated_schema", "_clean_tables")
 
     async def test_failed_audit_leaves_subscribe_registry_unmutated(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]

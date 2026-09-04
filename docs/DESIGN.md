@@ -776,6 +776,7 @@ the request, mirroring `service._fire_approval_notifier`'s posture):
 | `comms_leave` | Yes (active participants, now excluding the caller) | the caller |
 | `main.decide_approval` (approve, message hold) | Yes (active participants) | every active participant |
 | `main.decide_approval` (approve, invite hold) | Yes (active participants, pre-existing — the newly-admitted target isn't active yet) | only the newly-invited target |
+| `comms_archive_conversation` | Yes (active participants) | none |
 
 A held-for-approval outcome (post_message/invite) fires no notification —
 nothing visible changed yet. `comms_start_conversation`'s held branch is
@@ -783,6 +784,26 @@ different: it always still notifies every invited target's inbox (the
 conversation itself is genuinely new, so there is no conversation URI to
 notify) even though the caller's actual opening content is held — only
 `post_message`/`invite` skip notification entirely when held.
+
+**Known gaps (Phase B)**, accepted for this PR, not addressed here:
+
+- No rate limiting on the subscribe/unsubscribe handlers (unlike
+  `comms_post_message`/`comms_start_conversation`/`comms_invite`, which all
+  have one) — this repo's existing rate-limiting infra is scoped to those
+  tool-dispatch paths, and building new infra for a two-handler surface
+  isn't justified for v1.
+- No `ObservabilityMiddleware` instrumentation on subscribe/unsubscribe or
+  on resource reads/lists generally (TECH-5965) — these handlers sit
+  outside every FastMCP middleware (see "Low-level handler registration"
+  above), so a successful subscribe/unsubscribe/read/list emits no
+  equivalent of `ObservabilityMiddleware`'s `tool_call` event; only
+  denials are observable today, via `ScopeEnforcementMiddleware`'s
+  `scope_denial` event or the pre-DB `logger.warning` calls in `main.py`.
+- Per-agent cap eviction and prune-on-dead-weakref/prune-on-send-failure
+  (`subscriptions.py`) write no audit row — both are system-driven
+  registry cleanup, not a caller-initiated action, so there's no actor to
+  attribute a row to; cap eviction is at least visible via a
+  `logger.warning` naming the evicted URI.
 
 ## 8. Security invariants
 

@@ -1215,6 +1215,13 @@ async def _get_active_participant_agent_ids_or_empty(
     try:
         return await service.get_active_participant_agent_ids(session, conversation_id)
     except Exception:
+        # Intentionally broad (matches `service._fire_approval_notifier`'s and
+        # `subscriptions.notify()`'s own broad-catch-with-warning-log
+        # posture elsewhere in this codebase): a programming bug in this
+        # specific helper is exactly the case where the already-durable
+        # write must still appear to succeed to the caller -- only the
+        # best-effort notification fan-out is allowed to be lossy here, not
+        # the write itself. Do not narrow this to fewer exception types.
         logger.exception(
             "failed to resolve active participants for conversation %s; "
             "notification recipients default to empty (write already committed)",
@@ -1897,7 +1904,12 @@ async def archive_conversation(
                 agent_id=caller.id,
                 conversation_id=conv_id,
             )
+        # TECH-5903 Phase B: archiving is a conversation-state change, same
+        # as every other write path in this module -- ping current active
+        # participants (queried fresh, post-commit) via the conversation URI.
+        active_ids = await _get_active_participant_agent_ids_or_empty(session, conv_id)
 
+    await subscriptions.notify_conversation_event(conv_id, active_agent_ids=active_ids)
     return {
         "conversation_id": conversation_id,
         "agent_id": str(caller.id),
@@ -2115,14 +2127,29 @@ def _find_template(needle: str) -> str:
     ``StopIteration`` at import time if ``RESOURCE_TEMPLATE_SCOPES``'s shape
     ever changes (Argus round-2 SUGGESTION) -- this raises a
     ``RuntimeError`` naming exactly which lookup failed instead.
+
+    Also verifies uniqueness (Argus round-5 SUGGESTION): a bare
+    first-match-wins scan would silently pick the wrong template if
+    ``RESOURCE_TEMPLATE_SCOPES`` ever grew a second entry containing the
+    same ``needle`` substring -- scan the whole collection and raise loudly
+    on a second match instead of returning early on the first.
     """
+    match: str | None = None
     for template in RESOURCE_TEMPLATE_SCOPES:
         if needle in template:
-            return template
-    raise RuntimeError(
-        f"no RESOURCE_TEMPLATE_SCOPES entry contains {needle!r} -- "
-        "subscribe/unsubscribe authorization cannot resolve its URI templates"
-    )
+            if match is not None:
+                raise RuntimeError(
+                    f"ambiguous RESOURCE_TEMPLATE_SCOPES lookup for {needle!r} -- "
+                    f"both {match!r} and {template!r} match; subscribe/unsubscribe "
+                    "authorization cannot resolve which URI template this needle refers to"
+                )
+            match = template
+    if match is None:
+        raise RuntimeError(
+            f"no RESOURCE_TEMPLATE_SCOPES entry contains {needle!r} -- "
+            "subscribe/unsubscribe authorization cannot resolve its URI templates"
+        )
+    return match
 
 
 _CONVERSATION_SUBSCRIBE_TEMPLATE = _find_template("/conversations/")
@@ -2317,6 +2344,18 @@ async def authorize_resource_subscribe(
             # write-through side effects apply to the TARGET), but its
             # return value is discarded -- `requester` (the caller's own
             # agent, resolved above) is what gets charged/audited.
+            #
+            # Argus round-5 SUGGESTION: this call still passes the
+            # REQUESTER's own `token`, so its ownership-metadata write-through
+            # side effect (see `_resolve_caller_agent`'s own docstring) is
+            # applied to the TARGET using the requester's token/claims, not
+            # the target's own. This is inherited, accepted behavior, not a
+            # new decision made here -- `agent_inbox_resource` (the read
+            # path) already does the identical thing when resolving an
+            # inbox's owner. Documented explicitly rather than changed:
+            # changing it would be a design decision affecting the read path
+            # too, out of scope for this subscribe/unsubscribe authorization
+            # change.
             try:
                 await _resolve_caller_agent(session, target.sub, token)
             except ToolError:

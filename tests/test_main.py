@@ -346,13 +346,24 @@ class TestReadResourceMiddleware:
         call_next = AsyncMock()
         bot_token = self._make_token(iss="agent-jwt", scopes=["comms:write"])
 
-        # Patched at `scopes.required_scope_for_resource` (not
-        # `main.required_scope_for_resource`): `on_read_resource` now goes
-        # through `scopes.check_resource_scope`, which resolves its own
-        # module-level `required_scope_for_resource` internally -- a patch
-        # on `main`'s imported name would no longer be consulted by that
-        # internal lookup.
-        with patch("scopes.required_scope_for_resource", return_value="comms:read"):
+        # `on_read_resource` calls `scopes.check_resource_scope` first
+        # (which resolves its own module-level `required_scope_for_resource`
+        # internally), then, on denial, ALSO calls `required_scope_for_resource`
+        # directly via `main`'s own imported name (bound at import time via
+        # `from scopes import (..., required_scope_for_resource, ...)`) to
+        # decide which denial-reason branch to log. Patching only
+        # `scopes.required_scope_for_resource` leaves `main`'s separate name
+        # binding pointing at the real, unpatched function -- for this test's
+        # synthetic, never-registered URI that returns `None`, silently
+        # steering the denial-reason breakdown into the `resource_not_enrolled`
+        # branch instead of the `missing_scope` branch this test claims to
+        # exercise (both raise the identical generic `ResourceError` text, so
+        # the test still passes either way). Patch both names so the
+        # breakdown actually resolves consistently with what's being tested.
+        with (
+            patch("scopes.required_scope_for_resource", return_value="comms:read"),
+            patch("main.required_scope_for_resource", return_value="comms:read"),
+        ):
             with patch("main.get_access_token", return_value=bot_token):
                 with pytest.raises(ResourceError, match="requires elevated permissions"):
                     asyncio.run(middleware.on_read_resource(context, call_next))
@@ -366,8 +377,12 @@ class TestReadResourceMiddleware:
         bot_token = self._make_token(iss="agent-jwt", scopes=["comms:read"])
 
         # See test_missing_scope_is_rejected's comment on why this patches
-        # `scopes.required_scope_for_resource`, not `main`'s imported name.
-        with patch("scopes.required_scope_for_resource", return_value="comms:read"):
+        # both `scopes.required_scope_for_resource` and
+        # `main.required_scope_for_resource`.
+        with (
+            patch("scopes.required_scope_for_resource", return_value="comms:read"),
+            patch("main.required_scope_for_resource", return_value="comms:read"),
+        ):
             with patch("main.get_access_token", return_value=bot_token):
                 asyncio.run(middleware.on_read_resource(context, call_next))
 

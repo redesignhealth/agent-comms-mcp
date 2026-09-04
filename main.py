@@ -438,8 +438,21 @@ def _deny_resource_subscribe() -> NoReturn:
     these handlers are registered directly on the low-level server (see
     below), which never passes through FastMCP's own exception-translation
     layer the way ``@comms_server.resource``-decorated reads do.
+
+    ``code=mt.INVALID_PARAMS`` is a deliberate reuse, not an oversight
+    (Argus round-5 SUGGESTION): this is an authorization denial, not
+    literally an invalid parameter, but the MCP/JSON-RPC error code set
+    (``mcp.types``) has no dedicated "forbidden"/permission-denied code --
+    only the generic JSON-RPC codes plus a handful of MCP-specific,
+    unrelated ones (task/elicitation codes). ``INVALID_PARAMS`` is the
+    closest fit, and reusing one uniform code across every denial category
+    here matches this function's anti-enumeration posture (the message text
+    is already uniform; the code doesn't leak anything the message
+    doesn't).
     """
-    raise McpError(mt.ErrorData(code=mt.INVALID_PARAMS, message=_RESOURCE_SUBSCRIBE_DENIAL_MESSAGE))
+    raise McpError(
+        mt.ErrorData(code=mt.INVALID_PARAMS, message=_RESOURCE_SUBSCRIBE_DENIAL_MESSAGE)
+    ) from None
 
 
 # Low-level subscribe/unsubscribe handlers (TECH-5903 Phase B). FastMCP's
@@ -491,21 +504,38 @@ async def _handle_subscribe_resource(uri: AnyUrl) -> None:
             safe_client_id(_token_for_log) if _token_for_log is not None else "unknown",
         )
         _deny_resource_subscribe()
-    # Argus round-2 BLOCKING catch: audit BEFORE mutating the in-memory
-    # registry (was previously the other way around) -- if
-    # `audit_resource_subscription` fails, the exception now propagates
-    # before `subscriptions.subscribe` ever ran, so state and the audit
-    # trail can't diverge (a subscribe with no audit row).
-    async with get_session_factory()() as db_session:
-        await service.audit_resource_subscription(
-            db_session,
-            actor_sub=auth.base_sub,
-            agent_id=auth.caller.id,
-            action="resource.subscribe",
-            uri=auth.canonical_uri,
-            conversation_id=auth.conversation_id,
-        )
     session = _low_level_server.request_context.session
+    # Argus round-5 SUGGESTION: peek (non-mutating) BEFORE the audit write,
+    # mirroring the unsubscribe handler's own no-op gate below -- without
+    # this, an idempotent re-subscribe (same session re-subscribing to a URI
+    # it's already subscribed to -- a legitimate no-op per
+    # `subscriptions.subscribe`'s own idempotency handling) would still write
+    # a fresh `resource.subscribe` audit row every time, unlike the
+    # symmetric no-op case on the unsubscribe side. `subscriptions.subscribe`
+    # is itself idempotent (safe to call again even without this gate) --
+    # the only thing this gate actually changes is whether a spurious audit
+    # row gets written for a call that mutates nothing. Same CancelledError-
+    # interleaving analysis as the unsubscribe handler's TOCTOU comment below
+    # applies symmetrically here: a race between this peek and the
+    # `subscribe()` call could, in the narrow window, produce one extra/
+    # missing audit row relative to registry state, which is the same
+    # accepted tradeoff made there.
+    already_subscribed = await subscriptions.is_subscribed(auth.canonical_uri, session)
+    if not already_subscribed:
+        # Argus round-2 BLOCKING catch: audit BEFORE mutating the in-memory
+        # registry (was previously the other way around) -- if
+        # `audit_resource_subscription` fails, the exception now propagates
+        # before `subscriptions.subscribe` ever ran, so state and the audit
+        # trail can't diverge (a subscribe with no audit row).
+        async with get_session_factory()() as db_session:
+            await service.audit_resource_subscription(
+                db_session,
+                actor_sub=auth.base_sub,
+                agent_id=auth.caller.id,
+                action="resource.subscribe",
+                uri=auth.canonical_uri,
+                conversation_id=auth.conversation_id,
+            )
     await subscriptions.subscribe(
         auth.canonical_uri, session, agent_id=auth.caller.id, sub=auth.base_sub
     )

@@ -15,6 +15,14 @@ Deployment fit (plan doc §6): this repo runs one ECS Fargate task
 correct-by-deployment for v1. Sessions and subscriptions are ephemeral: any
 deploy/restart drops the registry and every client must re-subscribe after
 re-initializing.
+
+Known gap: per-agent cap eviction (``_evict_oldest_for_agent_locked``) and
+prune-on-dead-weakref/prune-on-send-failure (``notify``) are silent by
+design — no audit row is written for either. Both are system-driven
+cleanup of stale bookkeeping, not a caller-initiated action, so there is no
+actor to attribute an audit row to; giving this module a DB dependency to
+write one would also cut against its deliberate DB-less design (see above).
+Eviction is at least visible via a ``logger.warning`` naming the evicted URI.
 """
 
 from __future__ import annotations
@@ -114,12 +122,14 @@ async def subscribe(uri: str, session: ServerSession, *, agent_id: uuid.UUID, su
             # tells this caller whether the count was actually backed by a
             # real record; the log line only fires on that success path, so
             # it no longer contradicts the divergence error logged below.
-            evicted = _evict_oldest_for_agent_locked(agent_id)
-            if evicted:
+            evicted_uri = _evict_oldest_for_agent_locked(agent_id)
+            if evicted_uri is not None:
                 logger.warning(
-                    "agent %s hit the %d-subscription cap; evicted its oldest subscription",
+                    "agent %s hit the %d-subscription cap; evicted its oldest "
+                    "subscription (uri=%r)",
                     agent_id,
                     MAX_SUBSCRIPTIONS_PER_AGENT,
+                    evicted_uri,
                 )
             else:
                 # Self-heal: the count claimed `agent_id` was at cap, but no
@@ -145,7 +155,7 @@ async def subscribe(uri: str, session: ServerSession, *, agent_id: uuid.UUID, su
         _agent_subscription_counts[agent_id] = _agent_subscription_counts.get(agent_id, 0) + 1
 
 
-def _evict_oldest_for_agent_locked(agent_id: uuid.UUID) -> bool:
+def _evict_oldest_for_agent_locked(agent_id: uuid.UUID) -> str | None:
     """Drop the single TRULY oldest record belonging to ``agent_id``, across
     every URI, by creation order (``_Record.seq``) -- not by ``_registry``'s
     own dict/URI iteration order, which reflects URI registration order, not
@@ -155,14 +165,15 @@ def _evict_oldest_for_agent_locked(agent_id: uuid.UUID) -> bool:
     one for the same agent survived, whenever the older one happened to live
     under a later-inserted URI key). Caller must hold ``_lock``.
 
-    Returns ``True`` if a record was actually evicted, ``False`` if
-    ``agent_id`` has no records anywhere in ``_registry`` despite being
-    called only when ``_agent_subscription_counts`` says it's at cap --
-    the caller (``subscribe()``) uses this to distinguish a genuine
-    eviction from a registry/count divergence (Argus round-4 BLOCKING
-    catch: an earlier revision only logged this divergence here and let
-    the caller append+increment unconditionally regardless, growing the
-    count unboundedly past the cap on every subsequent subscribe).
+    Returns the evicted record's URI if a record was actually evicted,
+    ``None`` if ``agent_id`` has no records anywhere in ``_registry`` despite
+    being called only when ``_agent_subscription_counts`` says it's at cap --
+    the caller (``subscribe()``) uses this (via truthiness -- a non-``None``
+    string is truthy, ``None`` is falsy) to distinguish a genuine eviction
+    from a registry/count divergence (Argus round-4 BLOCKING catch: an
+    earlier revision only logged this divergence here and let the caller
+    append+increment unconditionally regardless, growing the count
+    unboundedly past the cap on every subsequent subscribe).
     """
     oldest_uri: str | None = None
     oldest_index: int | None = None
@@ -183,13 +194,13 @@ def _evict_oldest_for_agent_locked(agent_id: uuid.UUID) -> bool:
             agent_id,
             MAX_SUBSCRIPTIONS_PER_AGENT,
         )
-        return False
+        return None
     records = _registry[oldest_uri]
     del records[oldest_index]
     _dec_count(agent_id)
     if not records:
         del _registry[oldest_uri]
-    return True
+    return oldest_uri
 
 
 async def is_subscribed(uri: str, session: ServerSession) -> bool:
@@ -256,7 +267,6 @@ async def notify(uri: str, *, recipient_filter: Collection[uuid.UUID] | None = N
     async with _lock:
         records = list(_registry.get(uri, ()))
 
-    live: list[_Record] = []
     dead_or_failed: list[_Record] = []
     for record in records:
         if recipient_filter is not None and record.agent_id not in recipient_filter:
@@ -269,8 +279,6 @@ async def notify(uri: str, *, recipient_filter: Collection[uuid.UUID] | None = N
             # path never attempts.
             if record.session_ref() is None:
                 dead_or_failed.append(record)
-            else:
-                live.append(record)
             continue
         session = record.session_ref()
         if session is None:
@@ -295,12 +303,16 @@ async def notify(uri: str, *, recipient_filter: Collection[uuid.UUID] | None = N
                 exc_info=True,
             )
             dead_or_failed.append(record)
-        else:
-            live.append(record)
 
     if dead_or_failed:
         async with _lock:
             current = _registry.get(uri)
+            # `current` can be `None` here: a concurrent operation (e.g.
+            # another `unsubscribe()` racing this same re-lock) may have
+            # already removed `_registry[uri]`'s entire entry between the
+            # unlocked send loop above and this re-lock -- there is nothing
+            # left to prune or decrement against in that case, so skip the
+            # block entirely rather than resurrecting a deleted `uri` key.
             if current is not None:
                 # Argus round-2 BLOCKING catch: decrement only for records
                 # still actually present in this freshly re-locked snapshot,
