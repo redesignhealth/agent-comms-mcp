@@ -92,9 +92,32 @@ def redact_url_for_logging(value: str) -> str:
     this "redaction" path, and using `netloc` would have logged the
     credential verbatim instead of stripping it. `hostname` is userinfo-
     free by contract (``urllib.parse`` strips it before exposing that
-    property)."""
+    property).
+
+    Every value read off ``parsed`` here is called on a URL that is, BY
+    DEFINITION, one that already failed validation -- ``.port`` is a
+    property that PARSES the authority on access and raises ``ValueError``
+    for a malformed one (Argus review round-9 BLOCKING fix: a bare
+    ``.port`` access previously let that propagate straight out of this
+    function, uncaught anywhere in `_apply_or_finalize_proposal_hold`'s
+    exception handling since neither `LinearAPIError` nor
+    `CancelledError` matches a bare `ValueError`, permanently stranding
+    the hold at `"applying"` -- exactly the failure mode this whole
+    cooperative-cancellation/sanitization effort exists to prevent).
+    Falls back to the same placeholder as an unparseable scheme/host.
+
+    IPv6 literal hosts need their brackets restored on reconstruction
+    (Argus review round-9 suggestion): ``parsed.hostname`` strips them
+    (``"::1"``, not ``"[::1]"``), so a bare f-string join would produce an
+    address that no longer parses as a URL at all -- misleading in a log
+    line about what the actual offending value looked like."""
     parsed = urlsplit(value)
     if not parsed.scheme or not parsed.hostname:
         return "<unparseable-url>"
-    authority = f"{parsed.hostname}:{parsed.port}" if parsed.port else parsed.hostname
+    try:
+        port = parsed.port
+    except ValueError:
+        return "<unparseable-url>"
+    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+    authority = f"{host}:{port}" if port else host
     return f"{parsed.scheme}://{authority}{parsed.path}"

@@ -282,6 +282,26 @@ class TestProgressCommentBody:
                 "",
             )
 
+    def test_raise_path_does_not_leak_credentials_in_exception_text(self) -> None:
+        """Argus review round-9 suggestion: the raise path (unlike the
+        omit-and-continue path, covered by
+        ``test_omit_path_warning_does_not_leak_query_string`` above) had
+        no regression test proving it also redacts -- both paths call
+        ``citation_urls.redact_url_for_logging`` on the SAME rejected
+        value, so a future edit that redacted one path but not the other
+        would only be caught here."""
+        with pytest.raises(LinearAPIError) as exc_info:
+            _progress_comment_body(
+                {
+                    "action_type": "open_ticket",
+                    "source_message_url": "https://token:secret123@evil.example/p?x=y",
+                },
+                "",
+            )
+        text = str(exc_info.value)
+        assert "token" not in text
+        assert "secret123" not in text
+
     def test_non_allowlisted_source_url_on_close_ticket_is_omitted_not_raised(self) -> None:
         """Argus review round-2 B3 (skip, don't raise) for close_ticket
         specifically: a present-but-invalid field must not block the

@@ -29,6 +29,7 @@ from exceptions import AccessDeniedError, HoldAlreadyDecidedError, RateLimitExce
 from linear_client import LinearAPIError, LinearTokenMissingError, LinearTransportError
 from models import AuditLog, ProposalHold
 from service import (
+    _APPLY_ERROR_CANCELLED_MESSAGE,
     MAX_PROPOSALS_PER_BOT_PER_WINDOW,
     _sanitize_apply_error,
     create_proposal,
@@ -729,7 +730,24 @@ class TestDecideProposal:
         # and specifically the FIXED public constant (Argus review round-8
         # BLOCKING fix: `apply_error` must never carry cancellation detail
         # that could leak internal information via the API response).
-        assert row.apply_error == "apply_failed:cancelled"
+        assert row.apply_error == _APPLY_ERROR_CANCELLED_MESSAGE
+        # Argus review round-9 suggestion: the bare-CancelledError fallback
+        # text (the other branch of `_cancellation_apply_error`, exercised
+        # by `test_cancellation_with_message_uses_message_in_raw_error_only`
+        # for the WITH-message case) should also land in the audit log.
+        audit_row = (
+            (
+                await session.execute(
+                    select(AuditLog)
+                    .where(AuditLog.action == "proposal.apply_failed")
+                    .order_by(AuditLog.at.desc())
+                )
+            )
+            .scalars()
+            .first()
+        )
+        assert audit_row is not None
+        assert "apply cancelled before completion" in audit_row.detail["error"]
 
     async def test_cancellation_during_apply_resolves_to_apply_failed(
         self, session: AsyncSession
@@ -768,7 +786,7 @@ class TestDecideProposal:
             await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
         ).scalar_one()
         assert row.status == "apply_failed"
-        assert row.apply_error == "apply_failed:cancelled"
+        assert row.apply_error == _APPLY_ERROR_CANCELLED_MESSAGE
 
     async def test_cancellation_with_message_uses_message_in_raw_error_only(
         self, session: AsyncSession
@@ -802,7 +820,7 @@ class TestDecideProposal:
             await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
         ).scalar_one()
         assert row.status == "apply_failed"
-        assert row.apply_error == "apply_failed:cancelled"
+        assert row.apply_error == _APPLY_ERROR_CANCELLED_MESSAGE
         audit_row = (
             (
                 await session.execute(

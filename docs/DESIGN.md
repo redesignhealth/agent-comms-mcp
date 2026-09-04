@@ -1237,16 +1237,25 @@ system), or on `"approve"`:
 2. Match -> the kind-scoped applier (`_PROPOSAL_APPLIER_NAMES`,
    `linear_client.apply_progress_update` for
    `kind="linear_progress_update"`) executes the real write. Success ->
-   `"applied"` (+ `applied_at`). A raised `linear_client.LinearAPIError` ->
-   `"apply_failed"` (+ `apply_error` set to one of THREE fixed, allowlisted
-   strings -- `"Linear API token not configured"` / `"Linear API
-   unavailable"` / `"Linear API returned an error"` -- via
-   `service._sanitize_apply_error`, Argus review round-5 S4: the raw
-   exception text is never returned over the API, since any authenticated
-   caller of this endpoint can reach it, not just an operator with
-   Linear/infra access; the full unredacted text is instead captured into
-   a `raw_apply_error` local and logged server-side at WARNING, Argus
-   review round-6 B1) -- this is a normal 200 response, not a raised
+   `"applied"` (+ `applied_at`). A raised `linear_client.LinearAPIError` OR
+   a caught `asyncio.CancelledError` -> `"apply_failed"` (+ `apply_error`
+   set to one of FOUR fixed, allowlisted strings, Argus review round-9
+   suggestion -- corrected from an earlier "THREE" count that missed the
+   cancellation case added in round-7/8: `"Linear API token not
+   configured"` / `"Linear API unavailable"` / `"Linear API returned an
+   error"` (via `service._sanitize_apply_error` for a `LinearAPIError`) /
+   `"Apply cancelled before completion"` (the fixed
+   `service._APPLY_ERROR_CANCELLED_MESSAGE` constant for a
+   `CancelledError` -- Argus review round-8 BLOCKING fix: an enriched,
+   caller-supplied `task.cancel(msg=...)` message must NEVER reach
+   `apply_error` itself, only the internal `raw_apply_error`/audit-log
+   path below) -- Argus review round-5 S4: the raw exception text is
+   never returned over the API, since any authenticated caller of this
+   endpoint can reach it, not just an operator with Linear/infra access;
+   the full unredacted text is instead captured into a `raw_apply_error`
+   local and logged server-side at WARNING (and persisted to the
+   `proposal.apply_failed` audit-log row's `detail.error` field), Argus
+   review round-6 B1 -- this is a normal 200 response, not a raised
    exception, since the DECIDE itself succeeded even though the apply did
    not; the hold stays queryable for a human to retry via a fresh proposal
    resubmission.

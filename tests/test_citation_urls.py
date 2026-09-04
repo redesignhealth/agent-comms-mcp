@@ -135,3 +135,17 @@ class TestRedactUrlForLogging:
     def test_unparseable_url_returns_placeholder(self) -> None:
         assert redact_url_for_logging("not-a-url-at-all") == "<unparseable-url>"
         assert redact_url_for_logging("https:///no-host") == "<unparseable-url>"
+
+    def test_invalid_port_returns_placeholder_not_raises(self) -> None:
+        """Argus review round-9 BLOCKING: `parsed.port` raises `ValueError`
+        for a malformed port, and an uncaught exception here previously
+        propagated straight out of `_apply_or_finalize_proposal_hold`'s
+        exception handling (neither `LinearAPIError` nor `CancelledError`
+        matches a bare `ValueError`), permanently stranding the hold at
+        `"applying"`."""
+        assert redact_url_for_logging("https://evil.example:notaport/x") == "<unparseable-url>"
+        assert redact_url_for_logging("https://evil.example:99999999/x") == "<unparseable-url>"
+
+    def test_ipv6_host_keeps_brackets(self) -> None:
+        assert redact_url_for_logging("https://[::1]:8443/path") == "https://[::1]:8443/path"
+        assert redact_url_for_logging("https://[::1]/path") == "https://[::1]/path"
