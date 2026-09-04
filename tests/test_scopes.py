@@ -54,9 +54,11 @@ class TestToolScopesRegistry:
         assert not bare, f"unprefixed tool names in registry: {bare}"
 
     def test_comms_admin_not_a_tool_scope(self) -> None:
-        """``comms:admin`` gates a parameter (``is_shared=True`` on
-        registration), not tool reachability -- it must never appear in
-        TOOL_SCOPES, or it would invert the intended gate semantics."""
+        """``comms:admin`` gates parameters on ``comms_set_agent_shared``,
+        ``comms_deregister_agent``, and ``comms_admin_register`` (as of
+        TECH-6002, 2026-09-03, no longer on ``comms_register``'s
+        ``is_shared=True``), not tool reachability -- it must never appear
+        in TOOL_SCOPES, or it would invert the intended gate semantics."""
         assert "comms:admin" not in TOOL_SCOPES.values()
 
     def test_whoami_uses_comms_read(self) -> None:

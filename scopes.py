@@ -41,10 +41,7 @@ from observability import log_auth_rejected
 #             below (that table gates whether a tool is reachable at all;
 #             an in-handler check like this gates one input to a reachable
 #             tool). Currently: ``comms:admin``, required by
-#             ``providers.comms.register`` to accept ``is_shared=True`` on
-#             first registration (see that tool's docstring and
-#             ``service.register_agent``'s ``is_shared_authorized`` param),
-#             and by ``providers.comms.set_agent_shared`` to correct an
+#             ``providers.comms.set_agent_shared`` to correct an
 #             existing agent's ``is_shared`` value after the fact (see
 #             ``service.set_agent_shared``'s ``is_shared_authorized`` param),
 #             and by ``providers.comms.deregister_agent`` (TECH-5736) to
@@ -53,7 +50,14 @@ from observability import log_auth_rejected
 #             and by ``providers.comms.admin_register`` to perform an
 #             on-behalf-of FIRST registration for a ``sub`` other than the
 #             caller's own (see ``service.admin_register_agent``'s
-#             ``admin_authorized`` param).
+#             ``admin_authorized`` param). As of TECH-6002 (2026-09-03),
+#             ``comms:admin`` is no longer required by
+#             ``providers.comms.register``'s ``is_shared=True``
+#             self-registration path -- an agent may now self-declare its
+#             OWN ``is_shared`` with only the baseline ``comms:write``
+#             scope. The remaining ``comms:admin`` consumers are exactly
+#             the three listed above: ``comms_set_agent_shared``,
+#             ``comms_deregister_agent``, and ``comms_admin_register``.
 TOOL_SCOPES: dict[str, str] = {
     # --- comms (provider: providers/comms.py, namespace="comms") ---
     "comms_whoami": "comms:read",

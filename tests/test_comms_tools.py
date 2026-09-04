@@ -696,8 +696,9 @@ class TestRegister:
     async def test_register_is_shared_default_false_no_admin_scope_needed(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
-        """The default (``is_shared`` omitted, i.e. ``False``) never needs
-        the elevated scope -- only requesting ``True`` does."""
+        """The default (``is_shared`` omitted, i.e. ``False``) never needed
+        the elevated scope -- and as of TECH-6002 (2026-09-03), requesting
+        ``True`` on self-registration doesn't need it either."""
         token = _token("agent-is-shared-default", scopes=["comms:read", "comms:write"])
         result = await _call(
             main,
@@ -782,13 +783,14 @@ class TestRegister:
         assert second["is_shared"] is False
         assert second["display_name"] == "Upgrade v2"
 
-    async def test_register_is_shared_true_interactive_caller_no_admin_scope_needed(
+    async def test_register_is_shared_true_interactive_caller_succeeds(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
-        """Interactive (Okta) callers bypass scope checks entirely elsewhere
-        in this module (``is_interactive_token``); the same bypass applies
-        to the ``comms:admin`` gate on ``is_shared=True`` -- an interactive
-        caller needs no scopes claim at all to set it on first registration."""
+        """As of TECH-6002 (2026-09-03), ALL callers can self-declare
+        ``is_shared=True`` on first registration -- there's no ``comms:admin``
+        gate left for any caller type to bypass. This exercises an interactive
+        (Okta) caller specifically: one with no ``scopes`` claim at all still
+        succeeds, same as a plain ``comms:write`` agent-jwt caller would."""
         interactive_token = MagicMock()
         interactive_token.claims = {
             "iss": "https://agent-comms.example/mcp",

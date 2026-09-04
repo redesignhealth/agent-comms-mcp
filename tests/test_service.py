@@ -9291,10 +9291,11 @@ class TestAdminRegisterAgent:
         )
         assert admin_created.is_shared is True
 
-        # The bot's own later self-registration call: unprivileged
-        # (is_shared_authorized=False, matching a plain comms:write-scoped
-        # agent-jwt token), attempting to self-report is_shared=False and a
-        # different owner_sub -- neither should take effect.
+        # The bot's own later self-registration call, attempting to
+        # self-report is_shared=False and a different owner_sub -- neither
+        # should take effect. is_shared_authorized=False here is testing the
+        # service layer in isolation; the provider always passes True for a
+        # comms:write-scoped agent-jwt token as of TECH-6002 (2026-09-03).
         self_registered = await register_agent(
             session,
             sub="arc-bot-later-self-register",

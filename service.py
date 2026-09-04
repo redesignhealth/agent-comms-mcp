@@ -105,7 +105,12 @@ Axis 2's per-message sender-role check), ``denied.message_type_not_accepted``
 universally, even to ``internal`` traffic that Axis 2 itself always
 allows), ``denied.is_shared_requires_elevated_scope`` (a caller without
 ``comms:admin`` tried to self-declare ``is_shared=True`` at first
-registration), and ``denied.set_shared_requires_elevated_scope`` (a caller
+registration -- as of TECH-6002, 2026-09-03, the only production caller of
+``register_agent``, ``providers/comms.py``'s ``register`` tool, always
+passes ``is_shared_authorized=True``, so this denial is currently
+unreachable from the API; it remains a defense-in-depth fail-closed check
+for any future caller of ``register_agent`` that doesn't go through that
+tool), and ``denied.set_shared_requires_elevated_scope`` (a caller
 without ``comms:admin`` tried to use the ``set_agent_shared`` admin
 override).
 
@@ -138,10 +143,12 @@ mutation nor a denial: they record that a privileged or fire-and-forget
 code path was taken, not that anything was created or refused.
 ``risk.shared_sender_bypass`` (renamed from PR1's still-unrenamed
 ``agent.boundary_check_bypassed_shared`` — no backwards compatibility,
-ratified)/``agent.conversation_open_bypassed_shared`` (a
-``comms:admin``-authorized shared sender/initiator skipped the
-ownership-boundary check for a message/conversation-open respectively --
-DESIGN.md §9), ``agent.reregister_is_shared_ignored`` (a re-registration's
+ratified)/``agent.conversation_open_bypassed_shared`` (a shared
+sender/initiator skipped the ownership-boundary check for a
+message/conversation-open respectively -- as of TECH-6002, 2026-09-03, a
+plain ``comms:write``-scoped caller can self-declare ``is_shared`` and
+trigger this too, not only a ``comms:admin``-authorized one -- DESIGN.md
+§9), ``agent.reregister_is_shared_ignored`` (a re-registration's
 requested ``is_shared`` value diverged from the already-frozen row value
 and was silently ignored, per ``is_shared``'s freeze-at-first-registration
 rule), and ``approval.notify_failed`` (the post-commit approval notifier
@@ -1844,9 +1851,11 @@ async def register_agent(
     admission-decision input — it lets its holder skip the pairwise
     ownership-boundary check in ``_authorize_conversation_open`` and the
     risk scorer's ownership lookups (``_score_message_risk``). As of
-    2026-09-03 (confirmed with Dan), self-registration deliberately no
-    longer requires elevated scope for this — ``providers/comms.py``'s
-    ``register_agent`` tool (this function's only caller) now always
+    2026-09-03 (TECH-6002, confirmed with Dan), self-registration
+    deliberately no longer requires elevated scope for this --
+    ``providers/comms.py``'s ``register_agent`` tool (this function's only
+    tool-layer caller -- ``tests/test_approval_endpoint.py`` and
+    ``tests/test_service.py`` also call this function directly) now always
     passes ``True`` here, since an agent declaring ITS OWN ``is_shared``
     is a self-service product decision, not a privilege escalation. The
     parameter and its fail-closed ``False`` default are kept rather than

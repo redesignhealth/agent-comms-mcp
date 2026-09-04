@@ -316,9 +316,10 @@ class Agent(Base):
     )
     # Frozen at first registration (service.register_agent) - an
     # admission-decision input (DESIGN.md §9), so a later re-registration
-    # must never be able to change it. Self-declaring True on first
-    # registration requires the caller's token to carry `comms:admin`
-    # (scopes.py); see providers.comms.register.
+    # must never be able to change it. As of TECH-6002 (2026-09-03),
+    # self-declaring True on first registration requires only the baseline
+    # `comms:write` scope; `comms:admin` still gates `comms_set_agent_shared`
+    # and `comms_admin_register` (scopes.py); see providers.comms.register.
     is_shared: Mapped[bool] = mapped_column(
         nullable=False, default=False, server_default=text("false")
     )

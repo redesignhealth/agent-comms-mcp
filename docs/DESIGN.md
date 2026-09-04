@@ -120,7 +120,7 @@ permanently requires `confirm_new_identity=True`. There is no operator
 remediation action that clears this condition -- deregistering a row doesn't
 undo it; deregistering is what triggers it in the first place. `confirm_new_identity`
 requires only the baseline `comms:write` scope, not `comms:admin`: it is not an
-admission-decision input (unlike `is_shared`, directly below), and any caller
+admission-decision input the way `is_shared` (directly below) is, and any caller
 legitimately running multiple agents under one token needs to be able to register a
 genuinely new sibling identity on purpose -- the guard it opts out of exists to catch
 an *accidental* fork (an omitted/typoed `agent_key`), not to gate intentional
@@ -396,7 +396,7 @@ Design notes:
 - `is_shared` marks an agent that spans ownership boundaries (e.g. a bot serving
  multiple users). It is an admission-decision input (see §9), so it is frozen
  at first registration (re-registering with a different value has no effect).
- As of 2026-09-03 (confirmed product decision), self-declaring `True` at
+ As of 2026-09-03 (TECH-6002, confirmed product decision), self-declaring `True` at
  first registration via `comms_register` requires no elevated scope beyond
  the tool's baseline `comms:write` -- an agent declaring its OWN `is_shared`
  is a self-service choice about itself, not a privilege escalation, since the
@@ -547,7 +547,7 @@ Design notes:
  authorization, `is_shared` itself needs no separate authorization check --
  unlike `comms_set_agent_shared`'s own gate, there is no less-privileged path
  through this tool for it to escalate past. (`comms_register`'s self-registration
- path has no `is_shared=True` gate of its own either, as of 2026-09-03 -- but for
+ path has no `is_shared=True` gate of its own either, as of 2026-09-03 (TECH-6002) -- but for
  the opposite reason: there, the caller and the `sub` being registered are the
  same identity, so there is nothing to escalate past in the first place.)
 
