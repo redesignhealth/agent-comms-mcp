@@ -828,6 +828,55 @@ class TestSubscribeAuthorization:
         ).scalar_one()
         assert row_count == 1
 
+    async def test_noop_resubscribe_writes_no_second_audit_row(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        session: AsyncSession,
+    ) -> None:
+        """Argus round-6 SUGGESTION: the idempotent-resubscribe no-op gate
+        (main.py's `is_subscribed()` peek before the subscribe handler's
+        audit write) had no dedicated test -- every existing single-subscribe
+        test still passes even if that gate were deleted entirely, since
+        none of them re-subscribe the same session to the same URI twice."""
+        conversation_id, _ids = await _start_open_conversation(
+            main, test_session_factory, "resub-audit-owner", "resub-audit-member"
+        )
+        member_token = _token("resub-audit-member")
+        await _call(
+            main,
+            test_session_factory,
+            member_token,
+            "comms_accept",
+            {"conversation_id": conversation_id},
+        )
+        uri = f"comms://comms/conversations/{conversation_id}"
+
+        with (
+            _OIDC_PATCH,
+            _ENV_PATCH,
+            patch("providers.comms.get_access_token", return_value=member_token),
+            patch("providers.comms.get_session_factory", return_value=test_session_factory),
+            patch("main.get_session_factory", return_value=test_session_factory),
+        ):
+            async with Client(main.mcp) as client:
+                await client.session.subscribe_resource(AnyUrl(uri))
+                # Same session, same URI, again -- idempotent per
+                # `subscriptions.subscribe()`'s own handling; must not write
+                # a second audit row.
+                await client.session.subscribe_resource(AnyUrl(uri))
+
+        row_count = (
+            await session.execute(
+                text(
+                    "SELECT COUNT(*) FROM audit_log WHERE action = 'resource.subscribe' "
+                    "AND actor_sub = :actor_sub"
+                ),
+                {"actor_sub": "resub-audit-member"},
+            )
+        ).scalar_one()
+        assert row_count == 1
+
     async def test_successful_unsubscribe_writes_audit_row(
         self,
         main: Any,
@@ -1278,6 +1327,49 @@ class TestNotificationFiring:
             )
 
             await _wait_until(lambda: conv_uri in collector.uris and inbox_uri in collector.uris)
+
+    async def test_archive_conversation_notifies_conversation_uri(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Argus round-6 SUGGESTION: `comms_archive_conversation` (wired
+        into notify_conversation_event as a round-5 BLOCKING fix) was the
+        only write path in the DESIGN.md §7 notification table with zero
+        test coverage -- a regression silently dropping its
+        `notify_conversation_event` call would not have been caught."""
+        conversation_id, _ids = await _start_open_conversation(
+            main, test_session_factory, "archive-notify-owner", "archive-notify-member"
+        )
+        owner_token = _token("archive-notify-owner")
+        member_token = _token("archive-notify-member")
+        conv_uri = f"comms://comms/conversations/{conversation_id}"
+        collector = _NotificationCollector()
+
+        async with Client(main.mcp, message_handler=collector) as client:
+            with (
+                _OIDC_PATCH,
+                _ENV_PATCH,
+                patch("providers.comms.get_access_token", return_value=owner_token),
+                patch("providers.comms.get_session_factory", return_value=test_session_factory),
+                patch("main.get_session_factory", return_value=test_session_factory),
+            ):
+                await client.session.subscribe_resource(AnyUrl(conv_uri))
+
+            await _call(
+                main,
+                test_session_factory,
+                member_token,
+                "comms_accept",
+                {"conversation_id": conversation_id},
+            )
+            await _call(
+                main,
+                test_session_factory,
+                member_token,
+                "comms_archive_conversation",
+                {"conversation_id": conversation_id},
+            )
+
+            await _wait_until(lambda: conv_uri in collector.uris)
 
 
 class _FakeApprovalAccessToken:

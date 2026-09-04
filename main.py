@@ -511,15 +511,29 @@ async def _handle_subscribe_resource(uri: AnyUrl) -> None:
     # it's already subscribed to -- a legitimate no-op per
     # `subscriptions.subscribe`'s own idempotency handling) would still write
     # a fresh `resource.subscribe` audit row every time, unlike the
-    # symmetric no-op case on the unsubscribe side. `subscriptions.subscribe`
-    # is itself idempotent (safe to call again even without this gate) --
-    # the only thing this gate actually changes is whether a spurious audit
-    # row gets written for a call that mutates nothing. Same CancelledError-
-    # interleaving analysis as the unsubscribe handler's TOCTOU comment below
-    # applies symmetrically here: a race between this peek and the
-    # `subscribe()` call could, in the narrow window, produce one extra/
-    # missing audit row relative to registry state, which is the same
-    # accepted tradeoff made there.
+    # symmetric no-op case on the unsubscribe side.
+    #
+    # Argus round-6 SUGGESTION: `subscriptions.subscribe()` is still called
+    # UNCONDITIONALLY below, even when `already_subscribed` is True -- it
+    # drops and re-appends the `_Record` with a freshly incremented `seq`,
+    # which shifts this subscription to the newest position in the agent's
+    # cap-eviction queue. That IS a real state mutation (not "nothing"), and
+    # it now happens with no audit row when idempotent. Accepted: the only
+    # externally-observable fact this changes is eviction ORDERING under a
+    # future cap-eviction, not the set of active subscriptions itself, and
+    # auditing every idempotent re-subscribe (MCP clients commonly
+    # re-subscribe after reconnect) would produce far more audit-log noise
+    # than the ordering effect is worth tracking.
+    #
+    # Round-6 also flagged that this race is directionally WORSE than the
+    # unsubscribe TOCTOU below: unsubscribe's race can produce a SURPLUS
+    # audit row for a no-op (tolerable -- every real mutation still has
+    # >=1 row); this race, if a concurrent `notify()` prune removes the
+    # record between this peek and `subscribe()`'s re-add, could produce a
+    # real mutation with ZERO audit rows. Still accepted: it requires a
+    # concurrent prune-on-failed-send racing this exact (uri, session) in
+    # the same narrow window, and the worst case is one missing audit row
+    # for an idempotent-looking call, not a security/access-control gap.
     already_subscribed = await subscriptions.is_subscribed(auth.canonical_uri, session)
     if not already_subscribed:
         # Argus round-2 BLOCKING catch: audit BEFORE mutating the in-memory
