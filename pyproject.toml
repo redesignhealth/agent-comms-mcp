@@ -73,9 +73,9 @@ testpaths = ["tests"]
 
 [tool.setuptools]
 py-modules = [
-    "auth", "db", "exceptions", "identity", "main", "migrate", "mint_token",
-    "models", "observability", "plugins", "scopes", "schemas",
-    "service", "state_machine",
+    "auth", "citation_urls", "db", "exceptions", "identity", "linear_client",
+    "main", "migrate", "mint_token", "models", "observability", "plugins",
+    "scopes", "schemas", "service", "state_machine",
 ]
 packages = ["providers", "migrations", "migrations.versions"]
 

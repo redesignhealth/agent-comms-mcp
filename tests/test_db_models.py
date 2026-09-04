@@ -685,8 +685,55 @@ class TestProposalHoldsSchema:
                 )
             ).scalar_one_or_none()
         assert constraint_def is not None
-        for status in ("pending", "approved", "rejected", "applied", "apply_failed", "stale"):
+        for status in (
+            "pending",
+            "approved",
+            "applying",
+            "rejected",
+            "applied",
+            "apply_failed",
+            "stale",
+        ):
             assert status in constraint_def
+
+    async def test_applying_status_accepted_at_db_level(self, engine: AsyncEngine) -> None:
+        """Argus review round-3 S7: an ORM-level roundtrip against the
+        REAL migrated schema (unlike a truncated fixture, which can't
+        confirm the actual migration's CHECK constraint), confirming
+        migration e2f7a91c5b34's widened
+        ``ck_proposal_holds_status`` genuinely accepts ``'applying'`` at
+        the database, not just in Python's ``PROPOSAL_HOLD_STATUSES``
+        tuple."""
+        async with engine.connect() as conn:
+            async with conn.begin():
+                row_id = (
+                    await conn.execute(
+                        text(
+                            "INSERT INTO proposal_holds "
+                            "(kind, proposed_by_bot_id, owner_sub, action, rationale, "
+                            "confidence, importance, impact, priority, status, "
+                            "decision_source, decided_by_actor_id, decided_at, "
+                            "target_fingerprint) "
+                            "VALUES ('linear_progress_update', 'test-bot', 'test-owner', "
+                            "'{}'::jsonb, 'rationale', 'low', 'low', 'low', 'low', 'applying', "
+                            "'human', 'test-actor', now(), 'deadbeef') "
+                            "RETURNING id"
+                        )
+                    )
+                ).scalar_one()
+                read_back = (
+                    await conn.execute(
+                        text("SELECT status FROM proposal_holds WHERE id = :id"),
+                        {"id": row_id},
+                    )
+                ).scalar_one()
+                assert read_back == "applying"
+                # Clean up within the same transaction -- this test's own
+                # insert must not leak a row into any other test in this
+                # module-scoped-engine class.
+                await conn.execute(
+                    text("DELETE FROM proposal_holds WHERE id = :id"), {"id": row_id}
+                )
 
     async def test_status_check_constraint_rejects_invalid_value(self, engine: AsyncEngine) -> None:
         async with engine.connect() as conn:

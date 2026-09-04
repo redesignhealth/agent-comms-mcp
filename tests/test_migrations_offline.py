@@ -304,3 +304,48 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
     )
     begin_pos = result.stdout.index("BEGIN;", concurrently_pos)
     assert dedup_pos < commit_pos < concurrently_pos < begin_pos
+    # e2f7a91c5b34 (Argus review round-2 B1, round-3 B1): widen
+    # ck_proposal_holds_status to accept 'applying', and rebuild
+    # idx_proposal_holds_pending_dedup's partial predicate to also cover
+    # it -- the CHECK-widen alone (round-2) left the dedup index blind to
+    # 'applying' rows for the round-3 fix to close.
+    assert (
+        "ALTER TABLE proposal_holds ADD CONSTRAINT ck_proposal_holds_status "
+        "CHECK (status IN ('pending', 'approved', 'applying', 'rejected', "
+        "'applied', 'apply_failed', 'stale'))" in result.stdout
+    )
+    assert (
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_proposal_holds_pending_dedup "
+        "ON proposal_holds (kind, proposed_by_bot_id, (action ->> 'target_id'), "
+        "(action ->> 'action_type')) WHERE status IN ('pending', 'applying')" in result.stdout
+    )
+    # The widened index must appear strictly after the ORIGINAL 'pending'-only
+    # predicate emitted by 9a1c2d3e4f5b -- confirms this is a rebuild via a
+    # real migration step (DROP the old predicate, CREATE the new one), not
+    # an accidental duplicate/edit of the earlier CREATE INDEX statement.
+    # Argus review round-5 S8: a prior version of this assertion compared
+    # against `dedup_pos` (the position of the bare index NAME, which only
+    # ever appears once in the whole output since every CREATE/DROP for this
+    # index references the same name) -- that made
+    # `widened_index_pos > dedup_pos` true by construction regardless of
+    # ordering, since `.index(..., dedup_pos)` can only ever find a position
+    # >= dedup_pos in the first place. Anchor on the OLD predicate text
+    # instead, which -- unlike the index name -- genuinely only appears in
+    # 9a1c2d3e4f5b's original CREATE, not in this migration's rebuild.
+    #
+    # Argus review round-6 suggestion: the round-5 fix above was STILL
+    # vacuous -- `str.index(sub, start)` always returns a position >=
+    # `start` (or raises `ValueError` if `sub` doesn't appear at or after
+    # `start`), so passing `original_predicate_pos` as the search floor for
+    # `widened_index_pos` made `original_predicate_pos < widened_index_pos`
+    # true by construction whenever the widened text exists anywhere at or
+    # after that floor -- the `assert` could never actually fail; only a
+    # missing widened predicate would fail, via `ValueError`, not this
+    # `assert`. Search from the START of the output (no `start` argument)
+    # so a hypothetically reordered migration -- one that emitted the
+    # widened predicate BEFORE the original -- would make this comparison
+    # itself fail, not merely raise a different exception for an unrelated
+    # reason.
+    original_predicate_pos = result.stdout.index("WHERE status = 'pending'")
+    widened_index_pos = result.stdout.index("WHERE status IN ('pending', 'applying')")
+    assert original_predicate_pos < widened_index_pos

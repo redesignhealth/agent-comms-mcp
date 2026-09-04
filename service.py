@@ -158,12 +158,13 @@ from collections.abc import Callable, Sequence
 from collections.abc import Set as AbstractSet
 from datetime import UTC, datetime, timedelta
 from typing import Any, NoReturn, Protocol
-from urllib.parse import urlsplit
 
 from sqlalchemy import and_, func, literal, or_, select, text, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import citation_urls
+import linear_client
 from exceptions import (
     AccessDeniedError,
     AgentAlreadyRegisteredError,
@@ -4752,23 +4753,31 @@ async def _fire_approval_notifier(
         await session.commit()
 
 
+ALLOWED_SURFACES = frozenset({"approval", "proposals", "proposals_decide"})
+
+
 async def audit_denied_approval_requires_interactive(
     session: AsyncSession, *, actor_sub: str, surface: str = "approval"
 ) -> None:
     """Audit + commit ``denied.<surface>_requires_interactive`` -- the hard
-    interactive-token-only gate ``main.py`` reuses across two distinct HTTP
-    surfaces: ``/approvals/*`` (``surface="approval"``, the default) and
-    ``GET /proposals/pending`` (``surface="proposals"``). Argus review S6:
-    both surfaces used to write the SAME action name
+    interactive-token-only gate ``main.py`` reuses across three distinct HTTP
+    surfaces: ``/approvals/*`` (``surface="approval"``, the default),
+    ``GET /proposals/pending`` (``surface="proposals"``), and ``POST
+    /proposals/{hold_id}/decide`` (``surface="proposals_decide"``). Argus
+    review S6: these surfaces used to write the SAME action name
     (``denied.approval_requires_interactive``), making them indistinguishable
     in the audit trail even though they gate different resources -- the
-    caller now threads its own surface through. Unlike every other denial
-    in this module, the caller here (``main.py``, a non-MCP
-    ``mcp.custom_route`` handler) has no board ``Agent``/conversation
-    context at all -- there is nothing to raise (the HTTP handler decides
-    its own 403 response), only an audit row to persist so the denial is
-    still recorded per this module's "every denial is audited" invariant.
+    caller now threads its own surface through. ``surface`` is checked
+    against ``ALLOWED_SURFACES`` so an arbitrary caller-supplied string can
+    never become an audit action name. Unlike every other denial in this
+    module, the caller here (``main.py``, a non-MCP ``mcp.custom_route``
+    handler) has no board ``Agent``/conversation context at all -- there is
+    nothing to raise (the HTTP handler decides its own 403 response), only
+    an audit row to persist so the denial is still recorded per this
+    module's "every denial is audited" invariant.
     """
+    if surface not in ALLOWED_SURFACES:
+        raise ValueError(f"unexpected surface: {surface!r}")
     _audit(session, actor_sub=actor_sub, action=f"denied.{surface}_requires_interactive")
     await session.commit()
 
@@ -5514,37 +5523,23 @@ def _derive_proposal_priority(kind: str, action: dict[str, Any]) -> str:
 # needs its OWN judge function registered in ``_PROPOSAL_JUDGES`` below --
 # deliberately not a shared/generic judge across kinds.
 _LINEAR_OPEN_TICKET_ACTION_TYPES = frozenset({"open_ticket"})
-_LINEAR_CLOSE_TICKET_ACTION_TYPES = frozenset({"close_ticket"})
+# Shared with linear_client.py (Argus review round-4 suggestion): the
+# applier mirrors this judge's OR-of-two-fields auto-approval rule by
+# omitting rather than raising on an invalid citation field, but ONLY for
+# these same action types -- a locally-duplicated literal here risked the
+# two silently desyncing.
+_LINEAR_CLOSE_TICKET_ACTION_TYPES = citation_urls.CLOSE_TICKET_ACTION_TYPES
 
 # Argus review B4: presence of a non-empty string was NOT sufficient to
 # treat a citation as real -- a bot could self-approve by writing ANY
 # string (including whitespace-shaped junk, or a URL to a host it fully
 # controls) into ``source_message_url``/``resolving_pr_url``. A citation
-# must now be an http(s) URL whose host is one of these two families:
-# Slack message permalinks (``*.slack.com``) and GitHub PR/commit links
-# (``github.com``) -- the two citation shapes this judge is documented to
-# accept.
-_ALLOWED_CITATION_HOST_EXACT = frozenset({"github.com"})
-_ALLOWED_CITATION_HOST_SUFFIXES = (".slack.com",)
-
-
-def _is_allowed_citation_host(host: str) -> bool:
-    host = host.lower()
-    if host in _ALLOWED_CITATION_HOST_EXACT:
-        return True
-    return any(host.endswith(suffix) for suffix in _ALLOWED_CITATION_HOST_SUFFIXES)
-
-
-def _is_valid_citation_url(value: Any) -> bool:
-    """Argus review B4: a citation must be an http(s) URL on an allowlisted
-    host (see ``_ALLOWED_CITATION_HOST_EXACT``/``_ALLOWED_CITATION_HOST_SUFFIXES``
-    above), not merely a non-empty string."""
-    if not isinstance(value, str) or not value.strip():
-        return False
-    parsed = urlsplit(value)
-    if parsed.scheme not in ("http", "https"):
-        return False
-    return parsed.hostname is not None and _is_allowed_citation_host(parsed.hostname)
+# must now be an http(s) URL whose host is one of two allowlisted families
+# (Slack message permalinks, GitHub PR/commit links) -- see
+# ``citation_urls`` (extracted there in Argus review round-2 S2 so
+# ``linear_client.py`` can re-validate at apply time without a circular
+# import back into this module).
+_is_valid_citation_url = citation_urls.is_valid_citation_url
 
 
 def evaluate_linear_progress_update_judge(action: dict[str, Any]) -> tuple[str, str | None]:
@@ -5626,6 +5621,10 @@ def _proposal_dict(hold: ProposalHold) -> dict[str, Any]:
         result["decided_at"] = _iso(hold.decided_at)
     if hold.decision_note is not None:
         result["decision_note"] = hold.decision_note
+    if hold.applied_at is not None:
+        result["applied_at"] = _iso(hold.applied_at)
+    if hold.apply_error is not None:
+        result["apply_error"] = hold.apply_error
     return result
 
 
@@ -5646,20 +5645,35 @@ def _proposal_dedup_where(
 ) -> tuple[Any, ...]:
     """Shared create-time dedup predicate (TECH-5872, Argus review B1 fix):
     ``(kind, proposed_by_bot_id, target_id, action_type)`` against any
-    currently ``status='pending'`` row. Scoped to the SAME submitting bot
-    deliberately -- a different bot targeting the same ``(kind, target_id,
-    action_type)`` must get its own fresh row, never silently overwrite (and
-    get auto-approved under) another bot's pending proposal. This predicate
-    is shared between ``_dedup_or_insert_proposal``'s app-level SELECT
-    (used both for the common case and to re-query after losing the B2
-    race below) and must use the SAME key as the DB-level partial unique
-    index backing it, ``idx_proposal_holds_pending_dedup`` (migration
-    9a1c2d3e4f5b) -- the two must never drift onto different keys, or they
-    will fight each other."""
+    currently ``status IN ('pending', 'applying')`` row. Scoped to the
+    SAME submitting bot deliberately -- a different bot targeting the
+    same ``(kind, target_id, action_type)`` must get its own fresh row,
+    never silently overwrite (and get auto-approved under) another bot's
+    pending proposal. This predicate is shared between
+    ``_dedup_or_insert_proposal``'s app-level SELECT (used both for the
+    common case and to re-query after losing the B2 race below) and must
+    use the SAME key/status set as the DB-level partial unique index
+    backing it, ``idx_proposal_holds_pending_dedup`` (migration
+    9a1c2d3e4f5b, predicate widened in e2f7a91c5b34) -- the two must
+    never drift onto different keys/predicates, or they will fight each
+    other.
+
+    ``'applying'`` is included (Argus review round-3 B1) so a
+    resubmission during the brief claimed-but-not-yet-terminal window
+    (see ``_claim_proposal_hold_for_applying``) still finds the
+    in-flight row instead of inserting a fresh duplicate -- a
+    ``'pending'``-only predicate went blind for exactly that window.
+    ``_dedup_or_insert_proposal`` does NOT mutate an ``'applying'`` match
+    in place the way it does a ``'pending'`` one, though (see its own
+    docstring): the row is actively being read/written by a concurrent
+    apply-or-finalize in flight, and rewriting its ``action``/
+    ``target_fingerprint`` out from under that would desync what
+    actually got applied to Linear from what the row claims was
+    submitted."""
     return (
         ProposalHold.kind == kind,
         ProposalHold.proposed_by_bot_id == proposed_by_bot_id,
-        ProposalHold.status == "pending",
+        ProposalHold.status.in_(("pending", "applying")),
         ProposalHold.action["target_id"].astext == target_id,
         ProposalHold.action["action_type"].astext == action_type,
     )
@@ -5726,16 +5740,25 @@ async def _dedup_or_insert_proposal(
     )
     existing = (await session.execute(select(ProposalHold).where(*where))).scalar_one_or_none()
     if existing is not None:
-        _apply_proposal_resubmission(
-            existing,
-            action=action,
-            rationale=rationale,
-            confidence=confidence,
-            importance=importance,
-            impact=impact,
-            priority=priority,
-            target_fingerprint=target_fingerprint,
-        )
+        # Argus review round-3 B1: an 'applying' match is mid-flight under
+        # a concurrent _apply_or_finalize_proposal_hold -- mutating its
+        # action/target_fingerprint here would desync what actually gets
+        # (or already got) applied to Linear from what the row claims was
+        # submitted. Return it AS-IS (still dedup-blocked from a fresh
+        # INSERT, which is the property this predicate exists to
+        # guarantee); the caller can resubmit again once it resolves to a
+        # terminal status.
+        if existing.status == "pending":
+            _apply_proposal_resubmission(
+                existing,
+                action=action,
+                rationale=rationale,
+                confidence=confidence,
+                importance=importance,
+                impact=impact,
+                priority=priority,
+                target_fingerprint=target_fingerprint,
+            )
         return existing
 
     hold = ProposalHold(
@@ -5766,16 +5789,19 @@ async def _dedup_or_insert_proposal(
             # before this re-read) -- nothing sane to update; surface the
             # original DB error rather than silently proceeding.
             raise
-        _apply_proposal_resubmission(
-            existing_after_race,
-            action=action,
-            rationale=rationale,
-            confidence=confidence,
-            importance=importance,
-            impact=impact,
-            priority=priority,
-            target_fingerprint=target_fingerprint,
-        )
+        # Argus review round-3 B1: same "don't mutate an in-flight
+        # 'applying' row" guard as the common-case SELECT above.
+        if existing_after_race.status == "pending":
+            _apply_proposal_resubmission(
+                existing_after_race,
+                action=action,
+                rationale=rationale,
+                confidence=confidence,
+                importance=importance,
+                impact=impact,
+                priority=priority,
+                target_fingerprint=target_fingerprint,
+            )
         return existing_after_race
     return hold
 
@@ -5813,16 +5839,23 @@ async def create_proposal(
     that reaches this point is guaranteed to be ``"linear_progress_update"``
     -- ``_derive_proposal_priority`` above already raised (422) for any
     other kind, so the judge lookup here can never miss; there is no live
-    "kind with no registered judge stays pending" path today. The judge
-    only ever sets
-    ``status``/``decision_source``/``decided_by_actor_id``/``decided_at``/
-    ``decision_note`` -- it never executes the underlying write (that is
-    TECH-5873's concern, not yet built). Note: once B1 lands, a SAME-bot
-    resubmission that adds a valid citation to an already-pending row is
-    expected to auto-approve on this pass -- a bot progressively refining
-    its own proposal, not a new escalation path (see
-    ``tests/test_proposal_service.py::TestJudgeIntegration::
-    test_resubmit_with_citation_auto_approves_pending_row``).
+    "kind with no registered judge stays pending" path today.
+
+    A judge verdict of ``"approved"`` is never itself persisted (Argus
+    review B1): a hold left sitting at rest with ``status="approved"``
+    would be invisible to ``list_pending_proposal_holds`` (``status=
+    'pending'`` only) AND unreachable via ``decide_proposal`` (which
+    treats any non-``"pending"`` status as already-decided) -- permanently
+    stranded, never applied. Instead, the row is committed as ``pending``
+    first, then ``_apply_or_finalize_proposal_hold`` -- the same helper
+    ``decide_proposal``'s human-approve path uses -- resolves it
+    synchronously to ``"applied"``/``"apply_failed"``/``"stale"`` before
+    this function returns. Note: a SAME-bot resubmission that adds a
+    valid citation to an already-pending row is expected to auto-apply on
+    this pass -- a bot progressively refining its own proposal, not a new
+    escalation path (see ``tests/test_proposal_service.py::
+    TestJudgeIntegration::test_resubmit_with_citation_auto_approves_
+    pending_row``).
     """
     validate_hold_level(confidence, "confidence")
     validate_hold_level(importance, "importance")
@@ -5859,12 +5892,7 @@ async def create_proposal(
     # so the lookup below is guaranteed to hit (no "kind with no registered
     # judge" path is actually reachable -- see this function's docstring).
     judged_status, decision_note = _PROPOSAL_JUDGES[kind](hold.action)
-    if judged_status == "approved" and hold.status == "pending":
-        hold.status = "approved"
-        hold.decision_source = "auto"
-        hold.decided_by_actor_id = _PROPOSAL_JUDGE_DECIDED_BY
-        hold.decided_at = _now()
-        hold.decision_note = decision_note
+    auto_approved = judged_status == "approved" and hold.status == "pending"
 
     await session.commit()
     # Refresh so server-defaulted columns (created_at/updated_at on a fresh
@@ -5874,7 +5902,57 @@ async def create_proposal(
     # would try to lazy-load them post-commit, which asyncpg's AsyncSession
     # cannot do outside an explicit await.
     await session.refresh(hold)
-    return _proposal_dict(hold)
+
+    if not auto_approved:
+        return _proposal_dict(hold)
+
+    # Argus review B1: resolve the auto-judge's "approved" verdict to a
+    # terminal status synchronously, right here, instead of persisting a
+    # hold at rest in a status nothing else can ever reach (see this
+    # function's docstring). First CLAIM the row (Argus review round-2
+    # B1) by writing status="applying" under a fresh FOR UPDATE and
+    # committing -- this is what stops a concurrent human decide call
+    # (racing the auto-judge for this SAME still-pending hold) from also
+    # reaching the applier. Only then call the shared apply-or-finalize
+    # helper ``decide_proposal``'s human-approve path also uses.
+    claimed = await _claim_proposal_hold_for_applying(
+        session,
+        hold_id=hold.id,
+        decided_by_actor_id=_PROPOSAL_JUDGE_DECIDED_BY,
+        decision_source="auto",
+        decision_note=decision_note,
+    )
+    if not claimed:
+        # Something else (e.g. a human decide call) claimed this SAME
+        # hold between the commit above and this claim attempt, in the
+        # brief window before any caller could plausibly have learned
+        # this hold's id. Reload and return its current state rather
+        # than raising on a race this function did not cause.
+        resolved = await _find_proposal_hold(session, hold.id)
+        if resolved is None:
+            raise AssertionError("invariant violation: hold vanished after its own commit")
+        await session.commit()
+        return _proposal_dict(resolved)
+
+    result = await _apply_or_finalize_proposal_hold(
+        session,
+        hold_id=hold.id,
+        expected_status="applying",
+        decided_by_actor_id=_PROPOSAL_JUDGE_DECIDED_BY,
+        decision_source="auto",
+        decision_note=decision_note,
+    )
+    if result is not None:
+        return result
+    # Vanishingly unlikely given the claim above already serializes
+    # access to this hold_id, but the helper's own re-check is the
+    # authoritative guard, not this comment -- reload and return current
+    # state rather than raising on a race this function did not cause.
+    resolved = await _find_proposal_hold(session, hold.id)
+    if resolved is None:
+        raise AssertionError("invariant violation: hold vanished after its own commit")
+    await session.commit()
+    return _proposal_dict(resolved)
 
 
 async def list_pending_proposal_holds(
@@ -5896,6 +5974,598 @@ async def list_pending_proposal_holds(
     rows = rows[:limit]
     proposals = [_proposal_dict(hold) for hold in rows]
     return {"proposals": proposals, "has_more": has_more}
+
+
+async def _find_proposal_hold(
+    session: AsyncSession, hold_id: uuid.UUID, *, for_update: bool = False
+) -> ProposalHold | None:
+    """Mirror of ``_find_hold`` (approval_holds) for ``proposal_holds`` --
+    same ``FOR UPDATE`` + ``populate_existing`` rationale (TOCTOU on
+    concurrent decides of the SAME hold; stale in-identity-map object on a
+    re-fetch within the same session -- see ``_find_hold``'s docstring).
+
+    ``populate_existing=True`` always, not just under ``for_update``
+    (Argus review round-2 S6): ``_apply_or_finalize_proposal_hold`` does a
+    non-locking read of this SAME hold_id first (to drive the ~10s
+    external fingerprinter/applier calls), then a locking re-read to
+    write the terminal status -- without this, the non-locking read could
+    return a stale identity-mapped object if anything else in the same
+    session touched this row first."""
+    stmt = (
+        select(ProposalHold)
+        .where(ProposalHold.id == hold_id)
+        .execution_options(populate_existing=True)
+    )
+    if for_update:
+        stmt = stmt.with_for_update()
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
+# Kind-scoped appliers for a decided ``linear_progress_update`` proposal
+# (TECH-5873) -- same registry shape as ``_PROPOSAL_JUDGES``, and for the
+# same reason: a kind reaching ``decide_proposal``'s approve path is
+# guaranteed (by ``_derive_proposal_priority`` at submission time) to be
+# ``"linear_progress_update"`` today, but a future kind adds its own entry
+# here rather than a generic dispatcher silently no-op'ing on it.
+#
+# Stores attribute NAMES on the ``linear_client`` module, not the function
+# objects themselves -- tests patch ``service.linear_client.<name>``
+# (``service.linear_client`` IS the ``linear_client`` module, so this is
+# the same object `main.py` would import), and binding the function object
+# into this dict at module-import time would freeze the ORIGINAL,
+# unpatched function in here forever.
+_PROPOSAL_APPLIER_NAMES: dict[str, str] = {
+    "linear_progress_update": "apply_progress_update",
+}
+_PROPOSAL_FINGERPRINTER_NAMES: dict[str, str] = {
+    "linear_progress_update": "fetch_current_fingerprint",
+}
+
+
+async def _claim_proposal_hold_for_applying(
+    session: AsyncSession,
+    *,
+    hold_id: uuid.UUID,
+    decided_by_actor_id: str,
+    decision_source: str,
+    decision_note: str | None,
+) -> bool:
+    """Claims a still-``"pending"`` hold for synchronous apply by writing
+    ``status="applying"`` under a fresh ``FOR UPDATE`` and committing
+    (Argus review round-2 B1) -- this is the write that closes the
+    double-Linear-write race: it happens BEFORE any external I/O, so a
+    second concurrent caller (a human decide racing the auto-judge, or
+    two decide calls racing each other) that acquires the lock after this
+    commits sees ``"applying"``, not ``"pending"``, and takes the
+    already-decided branch instead of ever reaching the fingerprinter/
+    applier for this SAME hold.
+
+    Sets ``decided_at``/``decided_by_actor_id``/``decision_source`` here
+    too (not just at the eventual terminal write in
+    ``_apply_or_finalize_proposal_hold``) because
+    ``ck_proposal_holds_decision_consistency`` requires all three
+    whenever ``status != 'pending'`` -- ``"applying"`` is such a status.
+    ``_apply_or_finalize_proposal_hold`` re-stamps ``decided_at`` at the
+    terminal write; that's a monotonic no-op overwrite, not a
+    correctness issue.
+
+    Returns ``True`` if this call claimed the row (caller should proceed
+    to ``_apply_or_finalize_proposal_hold`` with
+    ``expected_status="applying"``), ``False`` if the row was no longer
+    ``"pending"`` when re-checked under the lock (caller should reload
+    and return the hold's current state instead)."""
+    hold = await _find_proposal_hold(session, hold_id, for_update=True)
+    if hold is None:
+        raise AssertionError("invariant violation: hold vanished before it could be claimed")
+    if hold.status != "pending":
+        await session.commit()
+        return False
+    hold.status = "applying"
+    hold.decision_source = decision_source
+    hold.decided_by_actor_id = decided_by_actor_id
+    hold.decided_at = _now()
+    hold.decision_note = decision_note
+    await session.commit()
+    return True
+
+
+# Argus review round-5 S4: `apply_error` was previously returned to any
+# authenticated caller of `POST /proposals/{id}/decide`
+# via `_proposal_dict` -- any authenticated actor, not just an operator with
+# Linear/infra access. A raw `httpx` transport exception's `str()` can
+# contain request internals (a full URL including query params, redirect
+# targets, TLS/connection details) that are meant for an operator reading
+# logs, not for every caller of this endpoint. Rather than pass through an
+# unbounded set of possible messages (merely truncated), classify into a
+# small allowlisted set of caller-safe messages and log the real `str(exc)`
+# server-side at WARNING for whoever's debugging `apply_failed` -- the exact
+# same disposition `_apply_or_finalize_proposal_hold`'s `elif apply_error is
+# not None:` branch already logs, so nothing observable to an operator is
+# lost, only what's returned over the API is narrowed.
+_APPLY_ERROR_TOKEN_MESSAGE = "Linear API token not configured"
+_APPLY_ERROR_UNAVAILABLE_MESSAGE = "Linear API unavailable"
+_APPLY_ERROR_GENERIC_MESSAGE = "Linear API returned an error"
+# Argus review round-9 suggestions: grouped alongside its LinearAPIError
+# siblings (was previously declared next to `_cancellation_apply_error`,
+# separately from the rest of the allowlisted `apply_error` set -- less
+# discoverable as "one of four fixed public values"), and given
+# human-readable prose matching the sibling constants' style instead of a
+# `status:reason` machine-token shape.
+#
+# Backward compatibility (Argus review round-10 suggestion): this value
+# changed from the machine-token `"apply_failed:cancelled"` (introduced
+# round-9, same PR/deploy cycle) to this human-readable string. No
+# production traffic exists yet for TECH-5873's decide/apply endpoint --
+# `proposal_holds` has zero live write traffic pre-TECH-5884 (see
+# migration `e2f7a91c5b34`'s own DEPLOYMENT note) -- so there is no
+# persisted row anywhere carrying the old value and no migration is
+# needed. This string is NOT meant to be machine-matched by any consumer
+# going forward either -- like its three `LinearAPIError` siblings, it is
+# prose for a human reading the API response, not a stable enum value;
+# don't build string-equality logic against it in a future caller.
+_APPLY_ERROR_CANCELLED_MESSAGE = "Apply cancelled before completion"
+
+
+def _sanitize_apply_error(exc: Exception) -> str:
+    """Map a ``LinearAPIError`` to one of a small allowlisted, caller-safe
+    message set before it's persisted to ``hold.apply_error`` and returned
+    to API callers via ``_proposal_dict`` (Argus review round-4 suggestion,
+    round-5 S4 hardening). The full, unredacted ``str(exc)`` is NOT logged
+    by this function -- the caller (``_apply_or_finalize_proposal_hold``)
+    captures it into its own ``raw_apply_error`` local BEFORE calling this
+    function, and logs that at WARNING on the ``apply_failed`` path
+    (Argus review round-6 B1 -- an earlier version of this docstring
+    claimed the caller logged it, without that call site actually doing
+    so). This function only bounds what leaves the process via the API
+    response.
+
+    Dispatches on the exception's TYPE, not a substring match against its
+    message text (Argus review round-6 suggestion): a earlier version
+    checked ``"is not configured" in str(exc)``, which would also match a
+    ``LinearAPIError`` whose message happened to contain that phrase for
+    an unrelated reason (e.g. echoed back verbatim from Linear's own
+    GraphQL error payload), misclassifying a real Linear-side error as a
+    local configuration problem. ``linear_client.LinearTokenMissingError``/
+    ``LinearTransportError`` are typed subclasses of ``LinearAPIError``
+    that exist specifically so this dispatch is exact."""
+    if isinstance(exc, linear_client.LinearTokenMissingError):
+        return _APPLY_ERROR_TOKEN_MESSAGE
+    if isinstance(exc, linear_client.LinearTransportError):
+        return _APPLY_ERROR_UNAVAILABLE_MESSAGE
+    return _APPLY_ERROR_GENERIC_MESSAGE
+
+
+def _cancellation_apply_error(exc: asyncio.CancelledError) -> str:
+    """Build the RAW (log/audit-only) message for a cancellation caught
+    mid-apply (Argus review round-7 suggestion): a bare
+    ``asyncio.CancelledError()`` usually carries no message, but
+    ``task.cancel(msg=...)`` (Python 3.9+) can attach one, and discarding
+    it in favor of a hardcoded literal throws away debugging context a
+    caller may have deliberately provided (e.g. a watchdog's own timeout
+    reason). Falls back to the fixed literal when ``str(exc)`` is empty.
+
+    Returns a value for ``raw_apply_error`` ONLY -- NEVER assign this
+    function's return value to ``apply_error`` (Argus review round-8
+    BLOCKING fix, clarified round-9 suggestion: an earlier version
+    assigned this same enriched string to both, so an arbitrary
+    ``task.cancel(msg=...)`` message -- potentially containing internal
+    hostnames, trace IDs, or other request internals a watchdog embedded
+    for its own purposes -- would flow straight into the HTTP response
+    body via ``hold.apply_error`` -> ``_proposal_dict``, visible to any
+    authenticated caller of this endpoint). ``apply_error`` on a
+    cancellation is always the fixed ``_APPLY_ERROR_CANCELLED_MESSAGE``
+    constant, set directly at each call site -- never derived from this
+    function -- the same "small allowlisted set" treatment
+    ``_sanitize_apply_error`` gives a ``LinearAPIError``."""
+    detail = str(exc)
+    base = "apply cancelled before completion (request disconnected or task cancelled)"
+    return f"{base}: {detail}" if detail else base
+
+
+async def _apply_or_finalize_proposal_hold(
+    session: AsyncSession,
+    *,
+    hold_id: uuid.UUID,
+    expected_status: str,
+    decided_by_actor_id: str,
+    decision_source: str,
+    decision_note: str | None,
+) -> dict[str, Any] | None:
+    """Shared fingerprint-check-then-apply-or-stale logic for a hold
+    leaving ``pending`` via approval -- reused by both ``decide_proposal``
+    (human decision) and ``create_proposal`` (TECH-5877 auto-judge), so an
+    auto-approved hold resolves to a terminal status synchronously instead
+    of being left sitting at rest in a persisted ``"approved"`` state that
+    nothing ever revisits (Argus review B1).
+
+    Re-fetches the target's current fingerprint via the kind-scoped
+    fingerprinter and compares it against ``hold.target_fingerprint`` (the
+    fingerprint the proposing bot computed at submission time) BEFORE
+    writing anything. A mismatch means the target drifted since
+    submission -- sets ``status="stale"`` and never calls the kind-scoped
+    applier. A match proceeds to the actual write; success sets
+    ``status="applied"`` (and ``applied_at``); a raised
+    ``linear_client.LinearAPIError`` sets ``status="apply_failed"`` with
+    ``apply_error`` populated instead of propagating -- both are normal,
+    queryable outcomes of this function, not exceptions raised to the
+    caller.
+
+    Deliberately re-fetches ``hold_id`` from scratch rather than taking a
+    caller-held ORM object: the fingerprinter/applier calls above are
+    ~10s external HTTP round-trips, and the row lock this function itself
+    takes is scoped ONLY to the final write below, not held across those
+    calls (Argus review S1). ``expected_status`` is ``"applying"`` from
+    both call sites (Argus review round-2 B1): the caller must have
+    already claimed the row by writing ``status="applying"`` under its
+    OWN initial ``FOR UPDATE`` and committed BEFORE calling this function
+    -- that claiming write is what makes a second concurrent caller
+    observe a non-``"pending"`` status and bail out via
+    ``HoldAlreadyDecidedError`` instead of ever reaching the fingerprinter/
+    applier a second time for the same hold. Returns ``None`` if the row
+    is no longer ``expected_status`` by the time this re-acquires it with
+    ``FOR UPDATE`` -- something else (in practice, only a hand-authored
+    test faking a race, since the claiming write above should make this
+    unreachable in production) resolved it while the HTTP round-trip
+    above was in flight -- and the caller is responsible for reloading
+    and returning the now-current state instead of this function
+    double-writing over it.
+
+    The fingerprinter call is wrapped in the SAME ``LinearAPIError``
+    handling as the applier call (Argus review round-2 B2): a transport
+    failure, missing ``LINEAR_API_TOKEN``, or Linear-side error while
+    fetching the current fingerprint must resolve the hold to
+    ``"apply_failed"`` like any other Linear failure, not propagate past
+    this function to main.py's generic 500 handler.
+
+    Releases the DB connection this function's own initial read checks
+    out, via a bare ``session.commit()``, BEFORE the fingerprinter/applier
+    calls (Argus review round-4 B2): committing (even with no pending
+    changes) ends the implicit read transaction that read opened and
+    returns the connection to the pool -- ``db.py``'s pool is capped at
+    10 connections (``pool_size=5, max_overflow=5``), and both call sites
+    (``main.decide_proposal_route``, ``main.submit_proposal``) wrap this
+    entire function in an outer ``async with get_session_factory()()``
+    block, so without this the connection stays checked out for the FULL
+    ~10-20s external round-trip, not just the final write -- ten
+    concurrent approvals/auto-applies would exhaust the pool and stall
+    every other DB operation in the service. ``expire_on_commit=False``
+    (``db.py``) means ``hold`` would stay readable post-commit anyway, but
+    the fields needed across the I/O gap are captured into local
+    variables regardless, for clarity independent of that setting. The
+    session object itself remains fully usable afterward -- SQLAlchemy
+    transparently checks out a fresh connection from the pool on the next
+    query (the ``FOR UPDATE`` re-fetch below), it does not need to be
+    replaced with a new session.
+    """
+    hold = await _find_proposal_hold(session, hold_id)
+    if hold is None:
+        raise AssertionError("invariant violation: hold vanished between commit and re-read")
+    target_id, _action_type = _extract_proposal_target(hold.action)
+    kind = hold.kind
+    action = hold.action
+    rationale = hold.rationale
+    stored_fingerprint = hold.target_fingerprint
+    await session.commit()
+
+    is_stale = False
+    apply_error: str | None = None
+    raw_apply_error: str | None = None
+    # Argus review round-5 B1: `asyncio.CancelledError` (a `BaseException`,
+    # not caught by the `except linear_client.LinearAPIError` clauses
+    # below) previously propagated straight out of this function on
+    # cancellation -- an ASGI client disconnect mid-apply, or any other
+    # task cancellation during the fingerprinter/applier await -- leaving
+    # the hold permanently stuck at `"applying"` with no automated
+    # recovery (see the "Stuck applying rows" note in docs/DESIGN.md).
+    # Catch it, record a distinguishable apply_error, fall through to the
+    # SAME terminal write every other path below takes (so the hold still
+    # resolves to a real terminal status), and re-raise at the very end --
+    # this cooperative-cancellation shape (catch, clean up, re-raise) is
+    # the same one this module already uses at `_fire_approval_notifier`
+    # (see its own `except asyncio.CancelledError: raise` comment); the
+    # caller still observes its task as cancelled, this function just
+    # doesn't leave a stranded row behind while it happens.
+    cancelled_exc: asyncio.CancelledError | None = None
+    try:
+        fingerprinter = getattr(linear_client, _PROPOSAL_FINGERPRINTER_NAMES[kind])
+        current_fingerprint = await fingerprinter(target_id)
+        is_stale = current_fingerprint != stored_fingerprint
+    except linear_client.LinearAPIError as exc:
+        # Argus review round-6 B1: `_sanitize_apply_error`'s own docstring
+        # promises the caller always logs the full, unredacted `str(exc)`
+        # server-side -- that promise is only true if this call site
+        # actually does it. Capture the raw text into a local BEFORE
+        # sanitizing, and log it (not the sanitized constant, which is
+        # exactly what the "sanitized" value already is) below.
+        raw_apply_error = str(exc)
+        apply_error = _sanitize_apply_error(exc)
+    except asyncio.CancelledError as exc:
+        raw_apply_error = _cancellation_apply_error(exc)
+        apply_error = _APPLY_ERROR_CANCELLED_MESSAGE
+        cancelled_exc = exc
+    else:
+        if not is_stale:
+            applier = getattr(linear_client, _PROPOSAL_APPLIER_NAMES[kind])
+            try:
+                await applier(action, rationale)
+            except linear_client.LinearAPIError as exc:
+                raw_apply_error = str(exc)
+                apply_error = _sanitize_apply_error(exc)
+            except asyncio.CancelledError as exc:
+                raw_apply_error = _cancellation_apply_error(exc)
+                apply_error = _APPLY_ERROR_CANCELLED_MESSAGE
+                cancelled_exc = exc
+
+    hold = await _find_proposal_hold(session, hold_id, for_update=True)
+    if hold is None:
+        raise AssertionError("invariant violation: hold vanished between commit and re-read")
+    if hold.status != expected_status:
+        await session.commit()
+        # Argus review round-5 B1: re-raise a cancellation even on this
+        # early-return path -- a caller cancelled mid-apply is owed a
+        # cancelled task regardless of which return this function takes;
+        # swallowing it here just because a race also resolved the hold
+        # would be an accidental side-effect of return-path ordering, not
+        # a deliberate choice.
+        if cancelled_exc is not None:
+            raise cancelled_exc
+        return None
+
+    hold.decision_source = decision_source
+    hold.decided_by_actor_id = decided_by_actor_id
+    hold.decided_at = _now()
+    hold.decision_note = decision_note
+
+    if is_stale:
+        hold.status = "stale"
+        _audit(
+            session,
+            actor_sub=decided_by_actor_id,
+            action="proposal.stale",
+            detail={"hold_id": str(hold_id), "target_id": target_id},
+        )
+    elif apply_error is not None:
+        hold.status = "apply_failed"
+        hold.apply_error = apply_error
+        # Argus review round-6 B1: log the RAW (unsanitized) exception text
+        # here, not `apply_error` -- `apply_error` is already one of the
+        # four fixed allowlisted strings (Argus review round-9 fix to this
+        # comment: three `LinearAPIError` messages via `_sanitize_apply_error`,
+        # plus `_APPLY_ERROR_CANCELLED_MESSAGE` assigned directly at the
+        # `CancelledError` call sites, not through that function), so
+        # logging it would collapse every distinct failure to one of only
+        # four strings, defeating the whole point of keeping full detail
+        # server-side while narrowing what the API returns.
+        logger.warning(
+            "proposal apply_failed for hold_id=%s target_id=%s: %s",
+            hold_id,
+            target_id,
+            raw_apply_error,
+        )
+        _audit(
+            session,
+            actor_sub=decided_by_actor_id,
+            action="proposal.apply_failed",
+            # Argus review round-7 suggestion: the audit log is internal-
+            # only, with none of the caller-safety argument that justifies
+            # narrowing the API response -- record raw_apply_error here,
+            # not the sanitized constant, or this internal record loses
+            # the same debugging detail the round-6 B1 fix was about.
+            detail={"hold_id": str(hold_id), "target_id": target_id, "error": raw_apply_error},
+        )
+    else:
+        hold.status = "applied"
+        hold.applied_at = _now()
+        hold.apply_error = None
+        _audit(
+            session,
+            actor_sub=decided_by_actor_id,
+            action="proposal.applied",
+            detail={"hold_id": str(hold_id), "target_id": target_id},
+        )
+    # Argus review round-6 suggestion: a SECOND cancellation delivered while
+    # this terminal write (re-fetch through commit/refresh above and below)
+    # is in flight could still strand the row at `expected_status`, the
+    # same shape B1 fixed for the first one. Deliberately NOT wrapped in
+    # `asyncio.shield` -- shielding would run this write in a separate Task
+    # while still sharing `session` (a single `AsyncSession` is not safe to
+    # use concurrently from two Tasks: SQLAlchemy's asyncio session has no
+    # internal locking, so if this awaiting coroutine's OWN cancellation
+    # propagates past the shield -- which `asyncio.shield` does NOT
+    # prevent, only the inner task's cancellation is prevented -- while the
+    # caller's `async with get_session_factory()()` context manager then
+    # closes `session` on its way out, the still-running shielded write
+    # would race a closing connection. A double-cancellation landing in
+    # this exact multi-await window is rare enough (requires two
+    # `task.cancel()` calls in quick succession, or a watchdog racing a
+    # client disconnect) that this documents the residual gap rather than
+    # trading it for a session-safety hazard that would apply on every
+    # single decide.
+    await session.commit()
+    # `updated_at`'s onupdate=text("now()") (models.py) leaves the ORM
+    # attribute expired after this UPDATE's commit -- `_proposal_dict`
+    # reads it, so this refresh (consolidated here for every caller of
+    # this helper, rather than duplicated at each call site) is required,
+    # unlike `decide_hold`'s `_hold_dict`, which never touches it.
+    await session.refresh(hold)
+    result = _proposal_dict(hold)
+    if cancelled_exc is not None:
+        # The terminal write above completed successfully despite the
+        # cancellation -- the hold is NOT stranded -- but the caller's
+        # task was still asked to cancel, and cooperative cancellation
+        # means honoring that after cleanup, not silently returning a
+        # normal result as if nothing happened.
+        raise cancelled_exc
+    return result
+
+
+async def decide_proposal(
+    session: AsyncSession,
+    *,
+    approver_sub: str,
+    hold_id: uuid.UUID,
+    decision: str,
+    decision_note: str | None,
+) -> dict[str, Any]:
+    """``POST /proposals/{hold_id}/decide`` (main.py, non-MCP,
+    interactive+owner-gated -- TECH-5873). ``decision`` is ``"approve"`` or
+    ``"reject"``.
+
+    Auth/ownership/anti-enumeration posture is a direct mirror of
+    ``decide_hold``: unknown hold or a caller whose verified sub doesn't
+    match the hold's own ``owner_sub`` snapshot both raise the uniform
+    ``AccessDeniedError`` (-> 404 at the HTTP layer) -- never a distinct
+    error for one vs. the other. Bots can never reach this at all: the
+    HTTP layer gates this route on the same interactive-only token check
+    ``decide_hold`` uses (``main._authenticate_approval_caller``), which
+    structurally rejects every agent-jwt token regardless of scope -- this
+    is what makes a bot self-approving its own proposal impossible, not a
+    same-sub comparison here (a bot has no interactive identity to match
+    ``owner_sub`` with in the first place).
+
+    Idempotent on an already-``"applied"`` hold: returns the existing
+    applied state as-is, without re-running the judge/apply/decision
+    logic, and without a second Linear write -- a retried decide call
+    (client timeout + retry, double-click, etc.) must never double-apply.
+    Any OTHER non-``"pending"`` status (``"applying"``/``"rejected"``/
+    ``"applied"`` already handled above/``"apply_failed"``/``"stale"``)
+    raises ``HoldAlreadyDecidedError`` -- ``"applying"`` specifically means
+    a concurrent decide call (or the auto-judge) has already CLAIMED this
+    hold and is mid-flight on its own external Linear round-trip (Argus
+    review round-2 B1) -- unlike the other statuses in this list, it is
+    not a genuinely terminal outcome, but it is equally non-retryable
+    THROUGH THIS CALL: this caller must not wait on or retry against the
+    other in-flight decide, it simply never got to decide anything (Argus
+    review round-3 S9 -- an earlier version of this docstring claimed
+    ``"pending"`` was the only status reachable here, which stopped being
+    true the moment `"applying"` became a real, persisted, observable
+    status a second caller's own ``FOR UPDATE`` can land on). Every OTHER
+    non-``"pending"`` status IS a terminal-but-not-safely-retryable
+    outcome; a fresh proposal resubmission is required to retry them, not
+    a second decide call on the same hold (out of scope for this ticket).
+    ``"approved"`` is never one of the statuses a decide call can observe
+    here at all -- it is a transient in-memory verdict that resolves
+    synchronously (to ``"applying"`` and then a terminal status) wherever
+    it's produced (here, or in ``create_proposal``'s auto-judge path) and
+    is never itself persisted (see ``PROPOSAL_HOLD_STATUSES``'s
+    state-machine comment in ``models.py``, Argus review B1/B6).
+
+    ``reject`` requires a non-empty ``decision_note`` (enforced here too,
+    defense-in-depth against the HTTP-layer check in
+    ``main.decide_proposal_route``) and never touches the target system.
+
+    ``approve`` first CLAIMS the row by writing ``status="applying"``
+    (plus decision fields) and committing -- releasing the `FOR UPDATE`
+    lock acquired above BEFORE the ~10s external Linear calls (Argus
+    review S1), while also closing a double-Linear-write race a second
+    concurrent decide call could otherwise hit (Argus review round-2 B1):
+    once claimed, a second caller sees ``"applying"``, not ``"pending"``,
+    and raises ``HoldAlreadyDecidedError`` itself without ever reaching
+    the applier. It then delegates to ``_apply_or_finalize_proposal_hold``,
+    which re-fetches the target's current state via the kind-scoped
+    fingerprinter (``_PROPOSAL_FINGERPRINTER_NAMES``) and compares it against
+    ``hold.target_fingerprint`` (the fingerprint the proposing bot computed
+    at submission time) BEFORE writing anything. A mismatch means the
+    target drifted since submission -- sets ``status="stale"`` and returns
+    without ever calling the kind-scoped applier (``_PROPOSAL_APPLIER_NAMES``).
+    A match proceeds to the actual write; success sets ``status="applied"``
+    (and ``applied_at``), a raised ``linear_client.LinearAPIError`` from
+    EITHER the fingerprinter or the applier (Argus review round-2 B2) sets
+    ``status="apply_failed"`` with ``apply_error`` populated instead of
+    propagating -- both are normal, queryable outcomes of this endpoint,
+    not exceptions raised to the caller. In the vanishingly unlikely event
+    something else resolves the hold between this call's claim and the
+    helper's own re-check, this raises ``HoldAlreadyDecidedError`` (409)
+    rather than returning the concurrent winner's result as a 200 (Argus
+    review round-2 S4) -- this call never got to decide anything.
+    """
+    hold = await _find_proposal_hold(session, hold_id, for_update=True)
+    if hold is None:
+        await _deny(
+            session,
+            actor_sub=approver_sub,
+            action="denied.unknown_proposal_hold",
+            detail={"attempted_hold_id": str(hold_id)},
+        )
+    if hold.owner_sub != approver_sub:
+        await _deny(
+            session,
+            actor_sub=approver_sub,
+            action="denied.proposal_hold_not_owner",
+            detail={"attempted_hold_id": str(hold_id)},
+        )
+
+    if hold.status == "applied":
+        # Idempotent no-op: a retry of an already-successful apply must
+        # never re-run the write, let alone double-write.
+        await session.commit()
+        return _proposal_dict(hold)
+    if hold.status != "pending":
+        await session.commit()
+        raise HoldAlreadyDecidedError(hold.status)
+
+    if decision == "reject":
+        if not isinstance(decision_note, str) or not decision_note.strip():
+            raise ValueError("decision_note is required and must be non-empty to reject")
+        hold.status = "rejected"
+        hold.decision_source = "human"
+        hold.decided_by_actor_id = approver_sub
+        hold.decided_at = _now()
+        hold.decision_note = decision_note
+        _audit(
+            session,
+            actor_sub=approver_sub,
+            action="proposal.reject",
+            detail={"hold_id": str(hold_id)},
+        )
+        await session.commit()
+        # `updated_at`'s onupdate=text("now()") (models.py) means the ORM
+        # can't know the server-computed value without a refresh -- the
+        # attribute is left expired after this UPDATE's commit, and
+        # `_proposal_dict` reads it, so (unlike `decide_hold`'s `_hold_dict`,
+        # which never touches `updated_at`) this refresh is NOT redundant.
+        await session.refresh(hold)
+        return _proposal_dict(hold)
+
+    # decision == "approve" (main.py's route already restricts `decision`
+    # to these two values before calling in). Argus review S1: commit now
+    # to release the `FOR UPDATE` lock acquired above BEFORE
+    # ``_apply_or_finalize_proposal_hold``'s ~10s external HTTP calls --
+    # holding a row lock across those would let a handful of concurrent
+    # slow approves saturate the whole connection pool. Argus review
+    # round-2 B1: rather than just committing the read-only ``"pending"``
+    # state, CLAIM the row (write ``status="applying"``) before
+    # releasing the lock -- this is what stops a second concurrent
+    # decide call (or the auto-judge, in principle) for this SAME hold
+    # from also reaching the applier before either call's terminal write.
+    hold.status = "applying"
+    hold.decision_source = "human"
+    hold.decided_by_actor_id = approver_sub
+    hold.decided_at = _now()
+    hold.decision_note = decision_note
+    await session.commit()
+    result = await _apply_or_finalize_proposal_hold(
+        session,
+        hold_id=hold_id,
+        expected_status="applying",
+        decided_by_actor_id=approver_sub,
+        decision_source="human",
+        decision_note=decision_note,
+    )
+    if result is not None:
+        return result
+    # Another decide call (or, in principle, an auto-judge re-approval)
+    # already resolved this hold while the Linear round-trip above was in
+    # flight. Argus review round-2 S4: the design/docstring above say a
+    # non-"pending" terminal status raises 409, so route this the same
+    # way rather than silently returning 200 with the concurrent winner's
+    # result -- the CALLER (this decide call) never got to decide
+    # anything; someone else already did.
+    resolved = await _find_proposal_hold(session, hold_id)
+    if resolved is None:
+        raise AssertionError("invariant violation: hold vanished between decide calls")
+    await session.commit()
+    raise HoldAlreadyDecidedError(resolved.status)
 
 
 async def post_message(
@@ -6984,6 +7654,7 @@ async def reconcile_agent_ownership(
 
 __all__ = [
     "ALLOWED_DENIAL_REASONS",
+    "ALLOWED_SURFACES",
     "APPROVAL_HOLD_TTL",
     "CONVERSATION_TTL",
     "DEFAULT_OWNERSHIP_CLIENT",
@@ -7007,6 +7678,7 @@ __all__ = [
     "audit_denied_proposal_submission",
     "create_proposal",
     "decide_hold",
+    "decide_proposal",
     "decline_invite",
     "deregister_agent",
     "evaluate_linear_progress_update_judge",

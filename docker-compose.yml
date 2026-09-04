@@ -20,6 +20,16 @@ services:
       OKTA_CLIENT_SECRET: ${OKTA_CLIENT_SECRET}
       MCP_JWT_SECRET: ${MCP_JWT_SECRET}
       AGENT_JWT_SECRET: ${AGENT_JWT_SECRET}
+      # Argus review round-5 S10 suggested dropping this `:-` default for
+      # consistency with the other vars in this block; round-6 flagged that
+      # doing so makes Docker Compose v2 print a "variable is not set"
+      # warning on every `docker compose up` for anyone following
+      # .env.example (where this is commented out under "Optional"),
+      # contradicting README's documented "server runs without it".
+      # Restored: LINEAR_API_TOKEN is genuinely optional, unlike every
+      # other var in this block, so it's the one that should keep the
+      # explicit empty-string default.
+      LINEAR_API_TOKEN: ${LINEAR_API_TOKEN:-}
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/agent_comms
     volumes:
       - token-storage:/data

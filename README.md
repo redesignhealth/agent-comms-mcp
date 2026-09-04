@@ -108,9 +108,22 @@ approval flow for this board's own comms traffic. It requires an agent-jwt
 token carrying `comms:proposals:write`, which -- like `comms:admin` --
 gates a non-MCP route directly rather than appearing in the `TOOL_SCOPES`
 table above; `GET /proposals/pending` reuses `/approvals/pending`'s
-hard interactive-only gate. See docs/DESIGN.md's "The proposal submission
-pipeline" section for the create-time dedup key, per-bot rate limit, and
-the deterministic auto-approval judge.
+hard interactive-only gate. `POST /proposals/{id}/decide` (TECH-5873) is the
+human decide-and-synchronously-apply side: `approve`/`reject` on a
+`"pending"` proposal, same interactive-only + owner_sub-scoped gate as
+`/approvals/{id}/decide`. Approving re-checks the target hasn't drifted
+since submission (`"stale"` if it has) before calling out to Linear
+directly (`linear_client.py`, credential via `LINEAR_API_TOKEN`); a Linear
+failure resolves to `"apply_failed"` rather than an error response.
+Retrying an already-`"applied"` hold is a no-op (returns the existing
+applied state, no second Linear write) -- but retrying while the hold is
+still `"applying"` (another decide call, or the auto-judge, currently has
+it claimed and is mid-flight on its own Linear round-trip) returns 409,
+not a no-op: this call never got a chance to decide anything. See
+docs/DESIGN.md's "The proposal submission pipeline" section for the
+create-time dedup key, per-bot rate limit, deterministic auto-approval
+judge, and the full decide/apply status-transition and
+fingerprint-contract details.
 
 ## Auth model
 
@@ -290,6 +303,24 @@ docker compose up --build
 | Variable | Purpose |
 |---|---|
 | `DECISION_PAGE_BASE_URL` | Base URL of the separate `agent-comms-approvals-decision-page` service. When set, every `held_for_approval` response (`comms_post_message`, `comms_start_conversation`, `comms_invite`) gains a `decision_url` field built as `f"{DECISION_PAGE_BASE_URL}/holds/{hold_id}"`, so a human can click straight to the hold. Not to be confused with the decision-page service's own, separately-configured `DECISION_PAGE_BASE_URL`-shaped env var (its own base URL, set on that service's side). Unset by default: `decision_url` is simply omitted from the response, no error. |
+| `LINEAR_API_TOKEN` | A Linear **personal API token** (not an OAuth workspace token -- see `.env.example`; the client sends it unprefixed, without a `Bearer` prefix) for `linear_client.py`'s direct Linear API calls, used when a `POST /proposals/{id}/decide` approval or an auto-approved submission applies a `linear_progress_update` proposal. The server runs without it, but any such apply resolves to `apply_failed` if it's unset. |
+
+> [!WARNING]
+> **Deployment prerequisite for the approve/apply path (TECH-5874).** In ECS
+> environments, `LINEAR_API_TOKEN` is provisioned via SSM
+> (`/reclaw-comms/{env}/linear-api-token`) by `rh-data-platform`'s Terraform
+> -- a SEPARATE repo/deploy from this one. **Landing this repo's TECH-5873
+> code does not itself provision the credential.** Until that Terraform
+> lands and applies, every approve/auto-apply of a `linear_progress_update`
+> proposal resolves to `"apply_failed"` with a normal HTTP 200 (not an
+> error response -- see the decide/apply section above), which is easy to
+> misread as "it worked" during a deploy verification pass that only
+> checks the status code.
+>
+> **Pre-deploy checklist:** confirm `apply_error` is absent on a real
+> approve/auto-apply, or check that `LINEAR_API_TOKEN` is actually set in
+> the running container's environment -- not just that the response is
+> 200 (Argus review round-4 suggestion, round-5 S7).
 
 `entrypoint.sh` runs `alembic upgrade head` automatically on every container
 start, so migrations apply before the server accepts traffic.
