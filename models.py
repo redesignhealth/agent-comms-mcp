@@ -494,19 +494,20 @@ class Message(Base):
         # this file.
         Index("idx_messages_sender_id_created_at", "sender_id", "created_at"),
         # Backs service._conversation_has_note_history's
-        # WHERE conversation_id = ... AND type IN ('note', 'instruction_share')
-        # LIMIT 1 query (TECH-5735, broadened for TECH-5822) -- without this,
-        # Postgres uses the composite index above (conversation_id-leading)
-        # and scans every message in the conversation until it finds a match
-        # or exhausts the set. Partial on plugins.BARRIER_SENSITIVE_TYPES's
-        # current members since no other message type participates in this
-        # lookup -- if that frozenset gains a member, this WHERE clause (and
-        # migration c1a2b3d4e5f6) must be updated to match; there's no way to
-        # derive a partial index predicate from a Python frozenset here.
+        # WHERE conversation_id = ... AND type IN ('note', 'instruction_share', 'docs')
+        # LIMIT 1 query (TECH-5735, broadened for TECH-5822, broadened again
+        # for TECH-5998) -- without this, Postgres uses the composite index
+        # above (conversation_id-leading) and scans every message in the
+        # conversation until it finds a match or exhausts the set. Partial on
+        # plugins.BARRIER_SENSITIVE_TYPES's current members since no other
+        # message type participates in this lookup -- if that frozenset
+        # gains a member, this WHERE clause (and migration f3a1b9c7d2e4)
+        # must be updated to match; there's no way to derive a partial index
+        # predicate from a Python frozenset here.
         Index(
             "idx_messages_conversation_id_free_text",
             "conversation_id",
-            postgresql_where=text("type IN ('note', 'instruction_share')"),
+            postgresql_where=text("type IN ('note', 'instruction_share', 'docs')"),
         ),
     )
 

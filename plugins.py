@@ -19,7 +19,11 @@ PR2 (TECH-5389) adds two more seams, same mechanism: the auto-approver
 (``AutoApprover``/``AUTO_APPROVERS``/``AUTO_APPROVER_ENV_VAR``) and the
 approval-request notifier (``ApprovalNotifier``/``APPROVAL_NOTIFIERS``/
 ``APPROVAL_NOTIFIER_ENV_VAR``), both resolved via the same
-``resolve_plugin`` helper the risk scorer already uses.
+``resolve_plugin`` helper the risk scorer already uses. TECH-5998 adds a
+fourth: the docs verifier (``DocsVerifier``/``DOCS_VERIFIERS``/
+``DOCS_VERIFIER_ENV_VAR``), same mechanism again -- see that seam's own
+section below for why it is a distinct stage from ``RiskScorer`` rather
+than an extension of it.
 
 ``resolve_plugin``'s single-name resolution rule (registry lookup or
 ``pkg.module:factory`` import path) is factored out into
@@ -75,13 +79,22 @@ DEFAULT_RISK_SCORER = "boundary_v1"
 # scorer-private policy data instead of a schema field. Any message type
 # NOT in this set is exempt from ownership-boundary scoring entirely (no
 # lookup, always low risk) -- the cheap common path.
-BARRIER_SENSITIVE_TYPES: frozenset[str] = frozenset({"note", "instruction_share"})
+BARRIER_SENSITIVE_TYPES: frozenset[str] = frozenset({"note", "instruction_share", "docs"})
 # ``instruction_request`` is deliberately NOT included here (TECH-5822) --
 # it carries no content (schemas.InstructionRequestV1 has only a ``kind``
 # enum field, nothing free-text or link-shaped to inspect), so it gets the
 # same treatment as any other non-sensitive type: the universal
 # shared-recipient check still applies, but there is no boundary-crossing
 # CONTENT risk to score.
+# ``docs`` (TECH-5998) IS included, despite already passing through its own
+# dedicated ``DocsVerifier`` stage before reaching this scorer at all (see
+# that Protocol's docstring, and service._verify_docs_message) -- grounding/
+# cleanliness verification answers "is this summary true and free of
+# unintended content," not "is the RECEIVING party allowed to have it,"
+# which is exactly the question this scorer (and, on a crossing, the
+# ordinary human-approval-hold path) still needs to answer. A message
+# passing the docs verifier is not thereby exempt from the same ownership-
+# boundary treatment ``note``/``instruction_share`` already get.
 
 # Canonical instruction-text registry (TECH-5822): the codebase's source of
 # truth for what each doc-backed ``InstructionKind`` is ALLOWED to say.
@@ -518,8 +531,8 @@ def notifier_name(notifier: ApprovalNotifier) -> str:
 
 
 def validate_configuration() -> None:
-    """Fail fast at process start if any of the four seams in THIS MODULE
-    don't resolve. ``OWNERSHIP_CLIENT`` is a fifth, board-wide seam that
+    """Fail fast at process start if any of the five seams in THIS MODULE
+    don't resolve. ``OWNERSHIP_CLIENT`` is a sixth, board-wide seam that
     lives in ``service.py`` and is validated separately, by
     ``service.validate_ownership_client_configuration()``.
 
@@ -532,6 +545,7 @@ def validate_configuration() -> None:
     get_auto_approver()
     get_approval_notifier()
     get_active_checker()
+    get_docs_verifier()
 
 
 # --- Seam 2: the auto-approver (TECH-5389 PR2) -------------------------------
@@ -877,6 +891,182 @@ def get_active_checker() -> ActiveChecker:
     return _active_checker
 
 
+# --- Seam 5 of this module (sixth board-wide seam) -- the docs verifier
+# (TECH-5998) ------------------------------------------------------------
+#
+# ``docs`` messages (schemas.DocsV1) carry a sender-authored summary plus a
+# citation of the source document it was drawn from -- never the source
+# document's own content. Two questions have to be answered before such a
+# message is safe to treat like any other message type:
+#
+#   1. Is the summary actually grounded in the cited document (not
+#      fabricated/hallucinated), and free of anything beyond what the
+#      citation supports (no leaked, uncited content riding along)?
+#   2. Is the RECEIVING party even allowed to have this information at
+#      all (an ownership-boundary question, unrelated to whether the
+#      summary is true)?
+#
+# This seam answers ONLY (1), and runs BEFORE (2) -- ``service.post_message``
+# calls ``get_docs_verifier()`` immediately after payload validation, ahead
+# of ``RiskScorer``/``_check_boundary_crossing`` entirely (see
+# ``service._verify_docs_message``). A ``docs`` message that fails
+# verification is rejected outright with a caller-visible reason (mirrors
+# ``_deny_bad_schema``'s posture: this is a content-correctness problem the
+# sender can fix by re-summarizing, not an access-control decision needing
+# this board's uniform, deliberately-vague ``AccessDeniedError``). Only a
+# message that PASSES this stage proceeds to the ordinary structural
+# pipeline, where ``docs``'s ``BARRIER_SENSITIVE_TYPES`` membership (above)
+# still applies -- passing verification here says nothing about whether a
+# given recipient is allowed to receive it.
+#
+# This could not be folded into the existing ``RiskScorer`` seam:
+# ``MessageRiskContext`` deliberately carries no payload ("the v1 rule is
+# type/topology-based, not content-based" -- see that NamedTuple's
+# docstring), and a real implementation of this judgment needs it (the
+# summary text and its citation) plus the ability to fetch the cited
+# source document, which this repo has no client for at all -- the same
+# "code owns the vocabulary, deploy-side owns the judgment" split already
+# used for ``instruction_share``'s canonical-hash/link-allowlist checks
+# (see ``INSTRUCTION_REGISTRY_PATH``'s comment above and
+# ``InstructionShareV1``'s docstring): a real ``DocsVerifier`` -- with
+# whatever credential lets it read a document from ANY account, not just
+# one bot's own site (unlike TECH-5979's per-bot-scoped ``arcana_query``
+# tool) -- is expected to be supplied by whichever consumer deploys this
+# board, via the same ``pkg.module:factory`` import-path mechanism
+# ``AutoApprover``/``ActiveChecker`` already use, most likely alongside
+# ``agent-comms-approvals``'s existing ``rh_comms_plugins`` package (where
+# the instruction-share checks and the boundary-crossing scorer's own real
+# deployment-side judgment already live). This repo does not attempt that
+# implementation, and its own default fails CLOSED (below) rather than
+# silently permitting every ``docs`` message once nothing is configured --
+# unlike ``ActiveChecker``'s fail-open default (which preserves this
+# board's PRE-EXISTING behavior from before that seam existed), there is
+# no prior "docs messages just worked" behavior for this seam's default to
+# preserve; the safe default is refusing all of them until a real verifier
+# is wired up.
+
+DOCS_VERIFIER_ENV_VAR = "DOCS_VERIFIER"
+DEFAULT_DOCS_VERIFIER = "reject_all"
+
+
+class DocsVerificationResult(NamedTuple):
+    """A docs verifier's decision for one ``docs`` message.
+
+    ``verified=True`` means the summary is grounded in its cited
+    document(s) and clean of unintended content -- safe to proceed to the
+    ordinary structural approval pipeline. ``detail`` carries audit-only
+    extras (mirrors ``RiskVerdict.detail``/``AutoDecision.detail``) and is
+    never shown to the sender; ``reason`` (e.g. ``"not_grounded"``,
+    ``"contains_uncited_content"``, ``"no_verifier_configured"``) IS shown
+    to the sender (unlike ``RiskVerdict.reason``) -- this is a
+    correctness problem the sender can act on, not an access decision this
+    board deliberately keeps opaque.
+    """
+
+    verified: bool
+    reason: str | None
+    detail: dict[str, Any] | None
+
+
+class DocsVerificationInfraError(Exception):
+    """Raised by a ``DocsVerifier.verify()`` on any infrastructure failure
+    -- e.g. the cited document's source system is unreachable, or the
+    citation references an account/document that genuinely cannot be
+    resolved. Mirrors ``RiskScoringInfraError``'s contract exactly: the
+    caller (``service._verify_docs_message``) must map every instance to a
+    hard, fail-closed denial, never a silent post -- an implementation
+    returns a ``DocsVerificationResult`` only when verification itself
+    (successfully) ran to completion, whether or not it passed.
+
+    ``cause`` is an enum-coded string for the caller's audit detail, same
+    convention as ``RiskScoringInfraError.cause``.
+    """
+
+    def __init__(self, cause: str) -> None:
+        self.cause = cause
+        super().__init__(cause)
+
+
+class DocsVerificationContext(NamedTuple):
+    """Everything a ``DocsVerifier`` needs to verify one ``docs`` message.
+
+    Unlike ``MessageRiskContext`` (no payload in v1), this DOES carry the
+    payload -- same rationale as ``HoldContext``'s own "unlike
+    MessageRiskContext, this DOES carry the payload" docstring note: there
+    is no correctness judgment to make here without the summary text and
+    its citation. ``payload`` is the already schema-validated, normalized
+    ``DocsV1`` dump (``schemas.validate_payload``'s return value) -- a
+    real implementation can trust its shape (bounded ``summary``, 1-5
+    ``citations`` each with ``account_id``/``document_id``/``filename``)
+    without re-validating it.
+
+    Runs BEFORE a conversation row is necessarily loaded in the
+    ``start_conversation`` path, so ``conversation_id`` is ``None`` there
+    (mirrors ``MessageRiskContext.conversation_id``'s identical
+    nullability and identical reason).
+    """
+
+    sender_agent_id: uuid.UUID
+    sender_sub: str
+    conversation_id: uuid.UUID | None
+    payload: dict[str, Any]
+
+
+class DocsVerifier(Protocol):
+    async def verify(self, ctx: DocsVerificationContext) -> DocsVerificationResult:
+        """Return a verdict, or raise ``DocsVerificationInfraError`` on any
+        infrastructure failure. Never raise for a genuine failed-
+        verification finding -- that is a normal
+        ``DocsVerificationResult(verified=False, ...)``."""
+        ...
+
+
+class RejectAllDocsVerifier:
+    """``reject_all`` -- the default. Every ``docs`` message fails
+    verification, unconditionally.
+
+    Deliberately NOT an ``EscalateAllAutoApprover``-style "hold for a
+    human" default: there is no existing human-review UI in this repo (or
+    known to it) that could show a reviewer the cited source document
+    side-by-side with the summary to make this specific judgment, the way
+    the existing high-risk-hold flow lets a human eyeball a plain ``note``.
+    Refusing outright, with a clear ``reason``, is more honest than
+    accepting a message into a queue no human-facing tool can actually
+    adjudicate.
+    """
+
+    async def verify(self, ctx: DocsVerificationContext) -> DocsVerificationResult:
+        return DocsVerificationResult(
+            verified=False,
+            reason="no_verifier_configured",
+            detail=None,
+        )
+
+
+DOCS_VERIFIERS: dict[str, Callable[[], DocsVerifier]] = {
+    DEFAULT_DOCS_VERIFIER: RejectAllDocsVerifier,
+}
+
+_docs_verifier: DocsVerifier | None = None
+
+
+def get_docs_verifier() -> DocsVerifier:
+    """Return the process-wide configured ``DocsVerifier`` (lazy
+    singleton, mirrors ``get_risk_scorer``)."""
+    global _docs_verifier
+    if _docs_verifier is None:
+        _docs_verifier = resolve_plugin(
+            DOCS_VERIFIER_ENV_VAR, DOCS_VERIFIERS, DEFAULT_DOCS_VERIFIER
+        )
+    return _docs_verifier
+
+
+def docs_verifier_name(verifier: DocsVerifier) -> str:
+    """Audit-readable name for a resolved ``DocsVerifier`` instance --
+    mirrors ``risk_scorer_name``/``auto_approver_name``/``notifier_name``."""
+    return _plugin_display_name(verifier, DOCS_VERIFIERS)
+
+
 __all__ = [
     "ACTIVE_CHECKERS",
     "ACTIVE_CHECKER_ENV_VAR",
@@ -890,7 +1080,10 @@ __all__ = [
     "DEFAULT_ACTIVE_CHECKER",
     "DEFAULT_APPROVAL_NOTIFIER",
     "DEFAULT_AUTO_APPROVER",
+    "DEFAULT_DOCS_VERIFIER",
     "DEFAULT_RISK_SCORER",
+    "DOCS_VERIFIERS",
+    "DOCS_VERIFIER_ENV_VAR",
     "INSTRUCTION_REGISTRY_PATH",
     "INSTRUCTION_TEXT_HASHES",
     "RISK_SCORERS",
@@ -902,19 +1095,26 @@ __all__ = [
     "AutoApprover",
     "AutoDecision",
     "BoundaryCrossingScorer",
+    "DocsVerificationContext",
+    "DocsVerificationInfraError",
+    "DocsVerificationResult",
+    "DocsVerifier",
     "EscalateAllAutoApprover",
     "HoldContext",
     "LogOnlyNotifier",
     "MessageRiskContext",
     "ParticipantInfo",
+    "RejectAllDocsVerifier",
     "RiskScorer",
     "RiskScoringInfraError",
     "RiskVerdict",
     "WebhookNotifier",
     "auto_approver_name",
+    "docs_verifier_name",
     "get_active_checker",
     "get_approval_notifier",
     "get_auto_approver",
+    "get_docs_verifier",
     "get_risk_scorer",
     "normalize_instruction_text",
     "notifier_name",

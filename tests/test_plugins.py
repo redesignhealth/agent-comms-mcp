@@ -18,9 +18,13 @@ import service
 from plugins import (
     ApprovalNotification,
     BoundaryCrossingScorer,
+    DocsVerificationContext,
+    DocsVerificationInfraError,
+    DocsVerificationResult,
     EscalateAllAutoApprover,
     HoldContext,
     LogOnlyNotifier,
+    RejectAllDocsVerifier,
     RiskScorer,
     WebhookNotifier,
     resolve_plugin,
@@ -100,12 +104,14 @@ class TestGetRiskScorerAndValidateConfiguration:
         plugins._auto_approver = None
         plugins._approval_notifier = None
         plugins._active_checker = None
+        plugins._docs_verifier = None
 
     def teardown_method(self) -> None:
         plugins._risk_scorer = None
         plugins._auto_approver = None
         plugins._approval_notifier = None
         plugins._active_checker = None
+        plugins._docs_verifier = None
 
     def test_get_risk_scorer_defaults_to_boundary_v1(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(plugins.RISK_SCORER_ENV_VAR, raising=False)
@@ -333,12 +339,14 @@ class TestGetActiveCheckerAndValidateConfiguration:
         plugins._auto_approver = None
         plugins._approval_notifier = None
         plugins._active_checker = None
+        plugins._docs_verifier = None
 
     def teardown_method(self) -> None:
         plugins._risk_scorer = None
         plugins._auto_approver = None
         plugins._approval_notifier = None
         plugins._active_checker = None
+        plugins._docs_verifier = None
 
     def test_get_active_checker_defaults_to_always_active(
         self, monkeypatch: pytest.MonkeyPatch
@@ -390,6 +398,106 @@ class TestGetActiveCheckerAndValidateConfiguration:
             plugins.validate_configuration()
 
 
+# --- DocsVerifier pluggable seam (TECH-5998) ---------------------------------
+
+
+class TestDocsVerifierRegistry:
+    def test_default_registry_contains_reject_all(self) -> None:
+        assert (
+            plugins.DOCS_VERIFIERS[plugins.DEFAULT_DOCS_VERIFIER] is plugins.RejectAllDocsVerifier
+        )
+
+    def test_reject_all_docs_verifier_satisfies_protocol(self) -> None:
+        verifier: plugins.DocsVerifier = plugins.RejectAllDocsVerifier()
+        assert hasattr(verifier, "verify")
+
+    @pytest.mark.asyncio
+    async def test_reject_all_docs_verifier_always_fails_closed(self) -> None:
+        verifier = RejectAllDocsVerifier()
+        ctx = DocsVerificationContext(
+            sender_agent_id=uuid.uuid4(),
+            sender_sub="agent:sender",
+            conversation_id=uuid.uuid4(),
+            payload={"summary": "x", "citations": []},
+        )
+        result = await verifier.verify(ctx)
+        assert result.verified is False
+        assert result.reason == "no_verifier_configured"
+
+    def test_docs_verification_infra_error_carries_cause(self) -> None:
+        exc = DocsVerificationInfraError("source_unreachable")
+        assert exc.cause == "source_unreachable"
+
+    def test_docs_verification_result_defaults(self) -> None:
+        result = DocsVerificationResult(verified=True, reason=None, detail=None)
+        assert result.verified is True
+        assert result.reason is None
+        assert result.detail is None
+
+
+class TestGetDocsVerifierAndValidateConfiguration:
+    def setup_method(self) -> None:
+        plugins._risk_scorer = None
+        plugins._auto_approver = None
+        plugins._approval_notifier = None
+        plugins._active_checker = None
+        plugins._docs_verifier = None
+
+    def teardown_method(self) -> None:
+        plugins._risk_scorer = None
+        plugins._auto_approver = None
+        plugins._approval_notifier = None
+        plugins._active_checker = None
+        plugins._docs_verifier = None
+
+    def test_get_docs_verifier_defaults_to_reject_all(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(plugins.DOCS_VERIFIER_ENV_VAR, raising=False)
+        assert isinstance(plugins.get_docs_verifier(), plugins.RejectAllDocsVerifier)
+
+    def test_get_docs_verifier_caches_the_instance(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv(plugins.DOCS_VERIFIER_ENV_VAR, raising=False)
+        first = plugins.get_docs_verifier()
+        second = plugins.get_docs_verifier()
+        assert first is second
+
+    def test_validate_configuration_passes_for_the_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(plugins.DOCS_VERIFIER_ENV_VAR, raising=False)
+        plugins.validate_configuration()  # must not raise
+
+    def test_validate_configuration_fails_fast_on_unknown_verifier(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(plugins.DOCS_VERIFIER_ENV_VAR, "not_a_real_verifier")
+        with pytest.raises(RuntimeError, match="unknown plugin"):
+            plugins.validate_configuration()
+
+    def test_non_default_registry_name_resolves(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class _AllowAllVerifier:
+            async def verify(self, ctx: DocsVerificationContext) -> DocsVerificationResult:
+                return DocsVerificationResult(verified=True, reason=None, detail=None)
+
+        monkeypatch.setitem(plugins.DOCS_VERIFIERS, "sentinel", _AllowAllVerifier)
+        monkeypatch.setenv(plugins.DOCS_VERIFIER_ENV_VAR, "sentinel")
+        assert isinstance(plugins.get_docs_verifier(), _AllowAllVerifier)
+
+    def test_validate_configuration_fails_fast_on_bad_import_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Isolate the earlier seams, same rationale as
+        # TestGetActiveCheckerAndValidateConfiguration's identical guard.
+        monkeypatch.delenv(plugins.RISK_SCORER_ENV_VAR, raising=False)
+        monkeypatch.delenv(plugins.AUTO_APPROVER_ENV_VAR, raising=False)
+        monkeypatch.delenv(plugins.APPROVAL_NOTIFIER_ENV_VAR, raising=False)
+        monkeypatch.delenv(plugins.ACTIVE_CHECKER_ENV_VAR, raising=False)
+        monkeypatch.setenv(plugins.DOCS_VERIFIER_ENV_VAR, "not_a_real_module:Whatever")
+        with pytest.raises(RuntimeError, match="failed to import plugin"):
+            plugins.validate_configuration()
+
+
 # --- Plugin name resolution (audit-readable names) ---------------------------
 
 
@@ -402,6 +510,9 @@ class TestPluginDisplayNames:
 
     def test_notifier_name_for_registry_instance(self) -> None:
         assert plugins.notifier_name(LogOnlyNotifier()) == "log_only"
+
+    def test_docs_verifier_name_for_registry_instance(self) -> None:
+        assert plugins.docs_verifier_name(RejectAllDocsVerifier()) == "reject_all"
 
     def test_falls_back_to_module_qualname_for_unregistered_instance(self) -> None:
         class _AdHocScorer:
@@ -520,6 +631,11 @@ class TestInstructionShareBarrierSensitivity:
         # Regression: adding instruction_share must not have replaced the
         # set instead of extending it.
         assert "note" in plugins.BARRIER_SENSITIVE_TYPES
+
+    def test_docs_is_barrier_sensitive(self) -> None:
+        # TECH-5998: docs joins note/instruction_share as a third
+        # free-text, barrier-sensitive type.
+        assert "docs" in plugins.BARRIER_SENSITIVE_TYPES
 
 
 class TestInstructionRegistryDriftGuard:

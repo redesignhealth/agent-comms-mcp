@@ -43,6 +43,7 @@ from exceptions import (
     AgentSuspendedError,
     ConversationArchivedError,
     DisplayNameCollisionError,
+    DocsVerificationFailedError,
     HoldAlreadyDecidedError,
     HoldAwaitingAutoReviewError,
     HoldExpiredError,
@@ -103,13 +104,14 @@ async def start_conversation(
     auto_approver: plugins.AutoApprover | None = None,
     notifier: plugins.ApprovalNotifier | None = None,
     active_checker: plugins.ActiveChecker | None = None,
+    docs_verifier: plugins.DocsVerifier | None = None,
     **kwargs: Any,
 ) -> Any:
     """Thin wrapper defaulting ``ownership_client``/``risk_scorer``/
-    ``auto_approver``/``notifier``/``active_checker`` so every pre-existing
-    call site in this file keeps working unchanged — tests that care about
-    ownership/risk/approval/retirement behavior pass their own fake
-    explicitly."""
+    ``auto_approver``/``notifier``/``active_checker``/``docs_verifier`` so
+    every pre-existing call site in this file keeps working unchanged —
+    tests that care about ownership/risk/approval/retirement/docs-
+    verification behavior pass their own fake explicitly."""
     return await _service.start_conversation(
         session,
         ownership_client=ownership_client or AgentTableOwnershipClient(session),
@@ -117,6 +119,7 @@ async def start_conversation(
         auto_approver=auto_approver or plugins.EscalateAllAutoApprover(),
         notifier=notifier or plugins.LogOnlyNotifier(),
         active_checker=active_checker or plugins.AlwaysActiveChecker(),
+        docs_verifier=docs_verifier or _AllowAllDocsVerifier(),
         **kwargs,
     )
 
@@ -178,6 +181,7 @@ async def post_message(
     risk_scorer: plugins.RiskScorer | None = None,
     auto_approver: plugins.AutoApprover | None = None,
     notifier: plugins.ApprovalNotifier | None = None,
+    docs_verifier: plugins.DocsVerifier | None = None,
     **kwargs: Any,
 ) -> Any:
     return await _service.post_message(
@@ -186,6 +190,7 @@ async def post_message(
         risk_scorer=risk_scorer or plugins.BoundaryCrossingScorer(),
         auto_approver=auto_approver or plugins.EscalateAllAutoApprover(),
         notifier=notifier or plugins.LogOnlyNotifier(),
+        docs_verifier=docs_verifier or _AllowAllDocsVerifier(),
         **kwargs,
     )
 
@@ -326,6 +331,58 @@ class _RaisingActiveChecker:
         raise RuntimeError("simulated registry failure")
 
 
+class _AllowAllDocsVerifier:
+    """TECH-5998 test double: every ``docs`` message passes verification
+    unconditionally. Deliberately NOT added to ``plugins.DOCS_VERIFIERS`` --
+    unlike ``ActiveChecker``/``AutoApprover``, there is no real permissive
+    implementation of this seam anywhere (the shipped default,
+    ``RejectAllDocsVerifier``, fails closed on purpose), so a wide-open fake
+    belongs only here, as the wrapper's default so existing non-``docs``
+    call sites in this file are unaffected (``_verify_docs_message`` never
+    even calls this for other message types) and new ``docs``-specific
+    tests can still exercise the structural-approval pipeline without also
+    standing up a real grounding check."""
+
+    async def verify(self, ctx: plugins.DocsVerificationContext) -> plugins.DocsVerificationResult:
+        return plugins.DocsVerificationResult(verified=True, reason=None, detail=None)
+
+
+class _FailDocsVerifier:
+    """TECH-5998 test double: every ``docs`` message fails verification
+    with a fixed, distinguishable reason -- exercises
+    ``service._deny_docs_unverified``'s caller-visible-error path without
+    depending on ``RejectAllDocsVerifier``'s own specific reason string."""
+
+    async def verify(self, ctx: plugins.DocsVerificationContext) -> plugins.DocsVerificationResult:
+        return plugins.DocsVerificationResult(
+            verified=False, reason="fabricated_claim", detail={"claim": "revenue grew 12%"}
+        )
+
+
+class _RaisingDocsVerifier:
+    """TECH-5998 test double: simulates a real verifier's own
+    infrastructure failure (source system unreachable) -- exercises
+    ``service._verify_docs_message``'s fail-closed ``_deny`` path, distinct
+    from a computed ``verified=False`` finding."""
+
+    async def verify(self, ctx: plugins.DocsVerificationContext) -> plugins.DocsVerificationResult:
+        raise plugins.DocsVerificationInfraError("source_unreachable")
+
+
+class _RecordingDocsVerifier:
+    """TECH-5998 test double: captures the ``DocsVerificationContext`` it
+    was called with (so a test can assert on ``.payload``/``.sender_sub``)
+    and always passes -- lets a regression test prove the verifier is
+    invoked for ``docs`` and never for any other message type."""
+
+    def __init__(self) -> None:
+        self.captured_ctx: plugins.DocsVerificationContext | None = None
+
+    async def verify(self, ctx: plugins.DocsVerificationContext) -> plugins.DocsVerificationResult:
+        self.captured_ctx = ctx
+        return plugins.DocsVerificationResult(verified=True, reason=None, detail=None)
+
+
 class _RecordingAutoApprover:
     """TECH-5754 test double: captures the ``HoldContext`` it was called
     with (so a test can assert on ``.participants``) and always escalates
@@ -360,6 +417,17 @@ def _task_assign_payload(**overrides: Any) -> dict[str, Any]:
 
 def _decline_payload(reason: str = "owner_declined") -> dict[str, Any]:
     return {"reason": reason}
+
+
+def _docs_payload(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "summary": "The Q3 board deck shows revenue grew 12% YoY.",
+        "citations": [
+            {"account_id": "acct-123", "document_id": "doc-456", "filename": "board-deck.pdf"}
+        ],
+    }
+    payload.update(overrides)
+    return payload
 
 
 def _confirm_payload() -> dict[str, Any]:
@@ -4929,6 +4997,222 @@ class TestPostMessage:
             payload=_decline_payload(),
         )
         assert message.type == "decline"
+
+
+class TestPostMessageDocsVerification:
+    """TECH-5998: ``docs`` messages run through the configured
+    ``DocsVerifier`` before the ordinary structural approval pipeline even
+    sees them. Uses ``conversation_type="open"`` (like ``TestPostMessage``)
+    so a verified ``docs`` message's downstream fate (an ``ApprovalHold``,
+    since ``docs`` joined ``BARRIER_SENSITIVE_TYPES``) is exercised too,
+    not just the verification stage in isolation."""
+
+    async def _active_pair(self, session: AsyncSession, owner_sub: str, target_sub: str) -> Any:
+        owner = await _register(session, owner_sub)
+        target = await _register(session, target_sub)
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        return owner, target, conversation
+
+    async def test_default_verifier_rejects_every_docs_message(self, session: AsyncSession) -> None:
+        owner, _target, conversation = await self._active_pair(
+            session, "docs-owner-1", "docs-target-1"
+        )
+        with pytest.raises(DocsVerificationFailedError) as exc_info:
+            await post_message(
+                session,
+                actor_sub=owner.sub,
+                sender_agent_id=owner.id,
+                conversation_id=conversation.id,
+                message_type="docs",
+                payload=_docs_payload(),
+                docs_verifier=plugins.RejectAllDocsVerifier(),
+            )
+        assert exc_info.value.reason == "no_verifier_configured"
+
+        actions = await _audit_actions(session, conversation.id)
+        assert "denied.docs_unverified" in actions
+
+    async def test_failed_verification_is_caller_visible_not_uniform_denial(
+        self, session: AsyncSession
+    ) -> None:
+        owner, _target, conversation = await self._active_pair(
+            session, "docs-owner-2", "docs-target-2"
+        )
+        with pytest.raises(DocsVerificationFailedError) as exc_info:
+            await post_message(
+                session,
+                actor_sub=owner.sub,
+                sender_agent_id=owner.id,
+                conversation_id=conversation.id,
+                message_type="docs",
+                payload=_docs_payload(),
+                docs_verifier=_FailDocsVerifier(),
+            )
+        assert exc_info.value.reason == "fabricated_claim"
+
+    async def test_verified_docs_message_proceeds_to_structural_pipeline(
+        self, session: AsyncSession
+    ) -> None:
+        owner, _target, conversation = await self._active_pair(
+            session, "docs-owner-3", "docs-target-3"
+        )
+        result = await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="docs",
+            payload=_docs_payload(),
+            docs_verifier=_RecordingDocsVerifier(),
+        )
+        # docs joined BARRIER_SENSITIVE_TYPES, so a verified docs message
+        # crossing an ownership boundary under "open" still diverts to a
+        # human-approval hold exactly like a verified/pre-existing "note"
+        # would -- passing docs verification is "safe to score," not "safe
+        # to deliver unconditionally."
+        assert isinstance(result, ApprovalHold)
+        assert result.status == "pending_human"
+        assert result.risk_reason == "boundary_crossing"
+
+    async def test_infra_failure_denies_via_uniform_access_denied(
+        self, session: AsyncSession
+    ) -> None:
+        owner, _target, conversation = await self._active_pair(
+            session, "docs-owner-4", "docs-target-4"
+        )
+        with pytest.raises(AccessDeniedError):
+            await post_message(
+                session,
+                actor_sub=owner.sub,
+                sender_agent_id=owner.id,
+                conversation_id=conversation.id,
+                message_type="docs",
+                payload=_docs_payload(),
+                docs_verifier=_RaisingDocsVerifier(),
+            )
+        actions = await _audit_actions(session, conversation.id)
+        assert "denied.docs_verification_unscored" in actions
+
+    async def test_verifier_never_invoked_for_other_message_types(
+        self, session: AsyncSession
+    ) -> None:
+        owner, _target, conversation = await self._active_pair(
+            session, "docs-owner-5", "docs-target-5"
+        )
+        verifier = _RecordingDocsVerifier()
+        message = await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="confirm",
+            payload=_confirm_payload(),
+            docs_verifier=verifier,
+        )
+        assert message.type == "confirm"
+        assert verifier.captured_ctx is None
+
+    async def test_verifier_receives_the_validated_payload_and_sender(
+        self, session: AsyncSession
+    ) -> None:
+        owner, _target, conversation = await self._active_pair(
+            session, "docs-owner-6", "docs-target-6"
+        )
+        verifier = _RecordingDocsVerifier()
+        await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="docs",
+            payload=_docs_payload(),
+            docs_verifier=verifier,
+        )
+        assert verifier.captured_ctx is not None
+        assert verifier.captured_ctx.sender_sub == owner.sub
+        assert verifier.captured_ctx.sender_agent_id == owner.id
+        assert verifier.captured_ctx.conversation_id == conversation.id
+        assert verifier.captured_ctx.payload["summary"].startswith("The Q3 board deck")
+
+
+class TestStartConversationDocsVerification:
+    """TECH-5998: a seq-1 ``docs`` message goes through the identical
+    verification gate ``post_message`` uses, before the conversation (or
+    its first message) is ever persisted."""
+
+    async def test_default_verifier_rejects_a_docs_opener(self, session: AsyncSession) -> None:
+        owner = await _register(session, "docs-start-owner-1")
+        target = await _register(session, "docs-start-target-1")
+        with pytest.raises(DocsVerificationFailedError):
+            await start_conversation(
+                session,
+                actor_sub=owner.sub,
+                initiator_agent_id=owner.id,
+                conversation_type="open",
+                target_agent_ids=[target.id],
+                initial_message=_docs_payload(),
+                message_type="docs",
+                docs_verifier=plugins.RejectAllDocsVerifier(),
+            )
+
+    async def test_verified_docs_opener_creates_the_conversation(
+        self, session: AsyncSession
+    ) -> None:
+        owner = await _register(session, "docs-start-owner-2")
+        target = await _register(session, "docs-start-target-2")
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_docs_payload(),
+            message_type="docs",
+            docs_verifier=_RecordingDocsVerifier(),
+        )
+        assert conversation.state == "active"
+
+    async def test_infra_failure_denies_before_any_row_is_persisted(
+        self, session: AsyncSession
+    ) -> None:
+        owner = await _register(session, "docs-start-owner-3")
+        target = await _register(session, "docs-start-target-3")
+        with pytest.raises(AccessDeniedError):
+            await start_conversation(
+                session,
+                actor_sub=owner.sub,
+                initiator_agent_id=owner.id,
+                conversation_type="open",
+                target_agent_ids=[target.id],
+                initial_message=_docs_payload(),
+                message_type="docs",
+                docs_verifier=_RaisingDocsVerifier(),
+            )
+
+    async def test_verifier_never_invoked_for_non_docs_opener(self, session: AsyncSession) -> None:
+        owner = await _register(session, "docs-start-owner-4")
+        target = await _register(session, "docs-start-target-4")
+        verifier = _RecordingDocsVerifier()
+        await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            docs_verifier=verifier,
+        )
+        assert verifier.captured_ctx is None
 
 
 class TestPostMessageBoundaryCrossing:

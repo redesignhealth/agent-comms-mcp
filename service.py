@@ -179,6 +179,7 @@ from exceptions import (
     AgentSuspendedError,
     ConversationArchivedError,
     DisplayNameCollisionError,
+    DocsVerificationFailedError,
     HoldAlreadyDecidedError,
     HoldAwaitingAutoReviewError,
     HoldExpiredError,
@@ -204,6 +205,10 @@ from plugins import (
     ApprovalNotification,
     ApprovalNotifier,
     AutoApprover,
+    DocsVerificationContext,
+    DocsVerificationInfraError,
+    DocsVerificationResult,
+    DocsVerifier,
     HoldContext,
     MessageRiskContext,
     ParticipantInfo,
@@ -213,6 +218,9 @@ from plugins import (
 )
 from plugins import (
     auto_approver_name as _auto_approver_name,
+)
+from plugins import (
+    docs_verifier_name as _docs_verifier_name,
 )
 from plugins import (
     notifier_name as _notifier_name,
@@ -795,6 +803,106 @@ async def _deny_bad_schema(
     )
     await session.commit()
     raise exc
+
+
+async def _verify_docs_message(
+    session: AsyncSession,
+    *,
+    actor_sub: str,
+    sender_agent_id: uuid.UUID,
+    sender_sub: str,
+    conversation_id: uuid.UUID | None,
+    message_type: str,
+    payload: dict[str, Any],
+    docs_verifier: DocsVerifier,
+) -> None:
+    """TECH-5998: for a ``docs``-type message ONLY, run the configured
+    ``plugins.DocsVerifier`` before the ordinary structural approval
+    pipeline (``_check_boundary_crossing``/``_score_message_risk``) even
+    sees it — see ``plugins.DocsVerifier``'s own docstring for why this is
+    a distinct stage rather than folded into ``RiskScorer``, and why a
+    verified message still goes on to that pipeline afterward (this
+    function answers "is the summary true and clean," never "is the
+    recipient allowed to have it").
+
+    A no-op for every other ``message_type`` — this stage exists
+    exclusively for ``docs``, unlike ``_score_message_risk``, which runs
+    for every message type and privately no-ops for non-sensitive ones.
+
+    Mirrors ``_score_message_risk``'s fail-closed contract for
+    infrastructure failures: a raised ``DocsVerificationInfraError`` denies
+    via the uniform ``_deny`` path (this is an availability problem, not
+    something the sender can fix by rewording), while a computed
+    ``verified=False`` verdict denies via ``_deny_docs_unverified``
+    instead, raising the specific, caller-visible
+    ``DocsVerificationFailedError`` — a content-correctness problem the
+    sender CAN fix (mirrors ``_deny_bad_schema``'s posture toward a
+    caller-visible ``PayloadValidationError``, not ``_deny``'s uniform,
+    deliberately-vague ``AccessDeniedError``).
+    """
+    if message_type != "docs":
+        return
+
+    ctx = DocsVerificationContext(
+        sender_agent_id=sender_agent_id,
+        sender_sub=sender_sub,
+        conversation_id=conversation_id,
+        payload=payload,
+    )
+    try:
+        result = await docs_verifier.verify(ctx)
+    except DocsVerificationInfraError as exc:
+        logger.warning("docs verifier infrastructure failure: %s", exc.cause, exc_info=True)
+        await _deny(
+            session,
+            actor_sub=actor_sub,
+            action="denied.docs_verification_unscored",
+            agent_id=sender_agent_id,
+            conversation_id=conversation_id,
+            detail={"cause": exc.cause, "docs_verifier": _docs_verifier_name(docs_verifier)},
+        )
+
+    if not result.verified:
+        await _deny_docs_unverified(
+            session,
+            actor_sub=actor_sub,
+            agent_id=sender_agent_id,
+            conversation_id=conversation_id,
+            result=result,
+            docs_verifier=docs_verifier,
+        )
+
+
+async def _deny_docs_unverified(
+    session: AsyncSession,
+    *,
+    actor_sub: str,
+    agent_id: uuid.UUID,
+    conversation_id: uuid.UUID | None,
+    result: DocsVerificationResult,
+    docs_verifier: DocsVerifier,
+) -> NoReturn:
+    """Mirrors ``_deny_bad_schema``'s shape exactly: audit, commit, then
+    raise a specific, caller-visible error rather than the uniform
+    ``AccessDeniedError`` -- see ``DocsVerificationFailedError``'s
+    docstring for why."""
+    _audit(
+        session,
+        actor_sub=actor_sub,
+        action="denied.docs_unverified",
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+        detail={
+            "reason": result.reason,
+            "docs_verifier": _docs_verifier_name(docs_verifier),
+            **(result.detail or {}),
+        },
+    )
+    await session.commit()
+    raise DocsVerificationFailedError(
+        f"docs message failed verification: {result.reason}",
+        reason=result.reason or "unspecified",
+    )
 
 
 async def _deny_if_system_message_type(
@@ -2945,6 +3053,7 @@ async def start_conversation(
     auto_approver: AutoApprover,
     notifier: ApprovalNotifier,
     active_checker: ActiveChecker,
+    docs_verifier: DocsVerifier,
     message_type: str = "availability_request",
     schema_version: int = 1,
     expires_at: datetime | None = None,
@@ -3076,6 +3185,22 @@ async def start_conversation(
             message_type=message_type,
             exc=exc,
         )
+
+    # TECH-5998: same grounding/cleanliness gate as post_message's -- a
+    # seq-1 "docs" message is just as capable of leaking site data as any
+    # later one, so it goes through the identical verifier before this
+    # conversation (and its first message) are ever persisted. No-ops for
+    # every message_type other than "docs".
+    await _verify_docs_message(
+        session,
+        actor_sub=actor_sub,
+        sender_agent_id=initiator.id,
+        sender_sub=actor_sub,
+        conversation_id=None,
+        message_type=message_type,
+        payload=payload,
+        docs_verifier=docs_verifier,
+    )
 
     # DESIGN.md §9 Axis 2 and the sender-role restriction apply to the
     # seq-1 message exactly like every later one. Checked here, before any
@@ -6822,6 +6947,7 @@ async def post_message(
     risk_scorer: RiskScorer,
     auto_approver: AutoApprover,
     notifier: ApprovalNotifier,
+    docs_verifier: DocsVerifier,
     schema_version: int = 1,
     owner_sub_claim: str | None = None,
     review_reason: str | None = None,
@@ -6960,6 +7086,25 @@ async def post_message(
             message_type=message_type,
             exc=exc,
         )
+
+    # TECH-5998: a docs message's own grounding/cleanliness verification
+    # runs here -- after schema validation (so it always sees a
+    # well-formed payload), but still before the risk scorer, matching
+    # _deny_bad_schema's precedent of gating the scorer on an earlier,
+    # more fundamental check first. No-ops for every message_type other
+    # than "docs". See _verify_docs_message's own docstring for why this
+    # is a distinct stage from _check_boundary_crossing below, not folded
+    # into it.
+    await _verify_docs_message(
+        session,
+        actor_sub=actor_sub,
+        sender_agent_id=sender_agent_id,
+        sender_sub=sender.sub,
+        conversation_id=conversation.id,
+        message_type=message_type,
+        payload=validated,
+        docs_verifier=docs_verifier,
+    )
 
     # Validated above, not after: an unregistered (message_type,
     # schema_version) pair must go through _deny_bad_schema's audit trail
