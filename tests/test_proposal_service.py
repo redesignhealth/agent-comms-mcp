@@ -34,7 +34,9 @@ from service import (
     _sanitize_apply_error,
     create_proposal,
     decide_proposal,
+    get_proposal_for_bot,
     list_pending_proposal_holds,
+    withdraw_proposal,
 )
 
 # Real-Postgres fixtures (database_url, _migrated_schema, engine) are shared
@@ -1024,3 +1026,129 @@ class TestSanitizeApplyError:
         types)."""
         exc = LinearAPIError("Linear API returned errors: field X is not configured on this team")
         assert _sanitize_apply_error(exc) == "Linear API returned an error"
+
+
+class TestGetProposalForBot:
+    """Service-layer coverage for ``get_proposal_for_bot`` (TECH-6018):
+    sender-only visibility and uniform anti-enumeration posture."""
+
+    async def test_unknown_hold_raises_access_denied(self, session: AsyncSession) -> None:
+        with pytest.raises(AccessDeniedError):
+            await get_proposal_for_bot(session, hold_id=uuid.uuid4(), requesting_bot_sub="bot-1")
+
+    async def test_different_bot_raises_access_denied(self, session: AsyncSession) -> None:
+        submitted = await _submit(session, proposed_by_bot_id="bot-1")
+        with pytest.raises(AccessDeniedError):
+            await get_proposal_for_bot(
+                session,
+                hold_id=uuid.UUID(submitted["proposal_id"]),
+                requesting_bot_sub="bot-2",
+            )
+
+    async def test_submitting_bot_can_read_own_pending_proposal(
+        self, session: AsyncSession
+    ) -> None:
+        submitted = await _submit(session, proposed_by_bot_id="bot-1")
+        result = await get_proposal_for_bot(
+            session,
+            hold_id=uuid.UUID(submitted["proposal_id"]),
+            requesting_bot_sub="bot-1",
+        )
+        assert result["status"] == "pending"
+        assert result["proposal_id"] == submitted["proposal_id"]
+
+    async def test_submitting_bot_can_read_own_decided_proposal(
+        self, session: AsyncSession
+    ) -> None:
+        """Confirms the whole point of this endpoint: a decided outcome
+        stays readable by the submitting bot after the fact, not just in
+        the synchronous response to whatever call decided it."""
+        submitted = await _submit(session, proposed_by_bot_id="bot-1")
+        await decide_proposal(
+            session,
+            approver_sub="owner-a@example.com",
+            hold_id=uuid.UUID(submitted["proposal_id"]),
+            decision="reject",
+            decision_note="not needed",
+        )
+        result = await get_proposal_for_bot(
+            session,
+            hold_id=uuid.UUID(submitted["proposal_id"]),
+            requesting_bot_sub="bot-1",
+        )
+        assert result["status"] == "rejected"
+        assert result["decision_note"] == "not needed"
+
+
+class TestWithdrawProposal:
+    """Service-layer coverage for ``withdraw_proposal`` (TECH-6018):
+    sender-only retraction of a still-pending proposal, and the dedup
+    unlock it produces for a same-key resubmission."""
+
+    async def test_unknown_hold_raises_access_denied(self, session: AsyncSession) -> None:
+        with pytest.raises(AccessDeniedError):
+            await withdraw_proposal(
+                session, hold_id=uuid.uuid4(), requesting_bot_sub="bot-1", reason=None
+            )
+
+    async def test_different_bot_raises_access_denied(self, session: AsyncSession) -> None:
+        submitted = await _submit(session, proposed_by_bot_id="bot-1")
+        with pytest.raises(AccessDeniedError):
+            await withdraw_proposal(
+                session,
+                hold_id=uuid.UUID(submitted["proposal_id"]),
+                requesting_bot_sub="bot-2",
+                reason=None,
+            )
+
+    async def test_withdraw_pending_sets_withdrawn_with_bot_decision_source(
+        self, session: AsyncSession
+    ) -> None:
+        submitted = await _submit(session, proposed_by_bot_id="bot-1")
+        result = await withdraw_proposal(
+            session,
+            hold_id=uuid.UUID(submitted["proposal_id"]),
+            requesting_bot_sub="bot-1",
+            reason="superseded by a newer proposal",
+        )
+        assert result["status"] == "withdrawn"
+        assert result["decision_source"] == "bot"
+        assert result["decided_by_actor_id"] == "bot-1"
+        assert result["decision_note"] == "superseded by a newer proposal"
+
+    async def test_withdraw_already_decided_raises_already_decided(
+        self, session: AsyncSession
+    ) -> None:
+        submitted = await _submit(session, proposed_by_bot_id="bot-1")
+        await decide_proposal(
+            session,
+            approver_sub="owner-a@example.com",
+            hold_id=uuid.UUID(submitted["proposal_id"]),
+            decision="reject",
+            decision_note="not needed",
+        )
+        with pytest.raises(HoldAlreadyDecidedError):
+            await withdraw_proposal(
+                session,
+                hold_id=uuid.UUID(submitted["proposal_id"]),
+                requesting_bot_sub="bot-1",
+                reason=None,
+            )
+
+    async def test_withdraw_then_resubmit_same_key_creates_fresh_row(
+        self, session: AsyncSession
+    ) -> None:
+        """The whole point of withdraw over just leaving a stale pending
+        row sitting: once withdrawn, the SAME (kind, bot, target_id,
+        action_type) key is free for a fresh submission instead of being
+        blocked by/silently updating the withdrawn row."""
+        submitted = await _submit(session, proposed_by_bot_id="bot-1")
+        await withdraw_proposal(
+            session,
+            hold_id=uuid.UUID(submitted["proposal_id"]),
+            requesting_bot_sub="bot-1",
+            reason="stale",
+        )
+        resubmitted = await _submit(session, proposed_by_bot_id="bot-1")
+        assert resubmitted["proposal_id"] != submitted["proposal_id"]
+        assert resubmitted["status"] == "pending"

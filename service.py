@@ -6018,6 +6018,107 @@ async def list_pending_proposal_holds(
     return {"proposals": proposals, "has_more": has_more}
 
 
+async def get_proposal_for_bot(
+    session: AsyncSession, *, hold_id: uuid.UUID, requesting_bot_sub: str
+) -> dict[str, Any]:
+    """``GET /proposals/{hold_id}`` (main.py, non-MCP, bot-gated -- TECH-6018).
+
+    Lets the SUBMITTING bot poll a proposal's current status/decision
+    outcome after the fact -- the synchronous ``POST /proposals`` response
+    is otherwise the only place a bot ever learns what happened to its own
+    proposal (see this route's own module-level context in ``main.py``).
+
+    Sender-only, same anti-enumeration posture as ``decide_proposal``: an
+    unknown ``hold_id`` and a hold that exists but belongs to a DIFFERENT
+    ``proposed_by_bot_id`` both raise the uniform ``AccessDeniedError`` (->
+    404 at the HTTP layer) -- never a distinct error for one vs. the
+    other, so a bot probing IDs it doesn't own can't distinguish
+    "doesn't exist" from "exists, not yours."
+
+    Read-only: no ``for_update`` lock, since this never mutates the row --
+    unlike ``decide_proposal``, there is no write here to protect against
+    a concurrent decide.
+    """
+    hold = await _find_proposal_hold(session, hold_id)
+    if hold is None:
+        await _deny(
+            session,
+            actor_sub=requesting_bot_sub,
+            action="denied.unknown_proposal_hold",
+            detail={"attempted_hold_id": str(hold_id)},
+        )
+    if hold.proposed_by_bot_id != requesting_bot_sub:
+        await _deny(
+            session,
+            actor_sub=requesting_bot_sub,
+            action="denied.proposal_hold_not_submitter",
+            detail={"attempted_hold_id": str(hold_id)},
+        )
+    return _proposal_dict(hold)
+
+
+async def withdraw_proposal(
+    session: AsyncSession,
+    *,
+    hold_id: uuid.UUID,
+    requesting_bot_sub: str,
+    reason: str | None,
+) -> dict[str, Any]:
+    """``POST /proposals/{hold_id}/withdraw`` (main.py, non-MCP, bot-gated
+    -- TECH-6018). Lets the SUBMITTING bot retire its own still-``pending``
+    proposal -- most useful right before resubmitting a replacement with a
+    DIFFERENT ``target_id``/``action_type`` that the create-time dedup (keyed
+    on the OLD target/action_type) would never match and would otherwise
+    leave stranded alongside the new one.
+
+    Sender-only, same uniform-404 anti-enumeration posture as
+    ``get_proposal_for_bot``/``decide_proposal``: unknown hold and
+    not-your-hold are indistinguishable. Only a ``'pending'`` hold can be
+    withdrawn -- ``FOR UPDATE`` locked for the same reason
+    ``decide_proposal`` locks its own read, to close the same race against
+    a concurrent decide/auto-judge claim. Any other status (including the
+    transient ``'applying'``) raises ``HoldAlreadyDecidedError`` (409):
+    once a decide or the auto-judge has claimed the row, it is no longer
+    this bot's to retract -- a fresh proposal resubmission is the retry
+    path, same as every other already-decided outcome in this module.
+    """
+    hold = await _find_proposal_hold(session, hold_id, for_update=True)
+    if hold is None:
+        await _deny(
+            session,
+            actor_sub=requesting_bot_sub,
+            action="denied.unknown_proposal_hold",
+            detail={"attempted_hold_id": str(hold_id)},
+        )
+    if hold.proposed_by_bot_id != requesting_bot_sub:
+        await _deny(
+            session,
+            actor_sub=requesting_bot_sub,
+            action="denied.proposal_hold_not_submitter",
+            detail={"attempted_hold_id": str(hold_id)},
+        )
+    if hold.status != "pending":
+        raise HoldAlreadyDecidedError(status=hold.status)
+
+    hold.status = "withdrawn"
+    hold.decision_source = "bot"
+    hold.decided_by_actor_id = requesting_bot_sub
+    hold.decided_at = _now()
+    hold.decision_note = reason
+    _audit(
+        session,
+        actor_sub=requesting_bot_sub,
+        action="proposal.withdraw",
+        detail={"hold_id": str(hold_id)},
+    )
+    await session.commit()
+    # `updated_at`'s onupdate=text("now()") (models.py) means the ORM can't
+    # know the server-computed value without a refresh -- see
+    # `decide_proposal`'s reject branch for the same pattern/reasoning.
+    await session.refresh(hold)
+    return _proposal_dict(hold)
+
+
 async def _find_proposal_hold(
     session: AsyncSession, hold_id: uuid.UUID, *, for_update: bool = False
 ) -> ProposalHold | None:

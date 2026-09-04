@@ -1050,6 +1050,109 @@ async def list_pending_proposals(request: Request) -> Response:
     return JSONResponse(result, status_code=200)
 
 
+@mcp.custom_route("/proposals/{proposal_id}", methods=["GET"])
+async def get_proposal(request: Request) -> Response:
+    """Let the SUBMITTING bot poll a proposal's current status/decision
+    outcome after the fact (TECH-6018) -- the synchronous ``POST
+    /proposals`` response is otherwise the only place a bot ever learns
+    what happened to its own proposal (see ``service.get_proposal_for_bot``).
+
+    Auth: same bot-only ``comms:proposals:write`` gate as submission
+    (``_authenticate_proposal_submitter``), NOT the interactive-only gate
+    ``GET /proposals/pending`` uses -- this route exists specifically for
+    the bot side, not a human reviewer. Sender-only, uniform 404 for both
+    an unknown ``proposal_id`` and one that exists but belongs to a
+    different bot (anti-enumeration, same posture as
+    ``/proposals/{hold_id}/decide``).
+
+    Registered AFTER ``GET /proposals/pending`` deliberately -- Starlette
+    matches routes in registration order, and ``/proposals/pending`` is a
+    static path that would otherwise be swallowed by this route's
+    ``{proposal_id}`` wildcard if this one came first (a GET to
+    ``/proposals/pending`` would resolve here with ``proposal_id="pending"``
+    instead).
+    """
+    bot_sub, bot_token, status = await _authenticate_proposal_submitter(request)
+    if bot_sub is None or bot_token is None:
+        return JSONResponse({"error": "unauthorized"}, status_code=status)
+
+    proposal_id_str = request.path_params["proposal_id"]
+    try:
+        proposal_id = uuid.UUID(proposal_id_str)
+    except ValueError:
+        return JSONResponse(_UNIFORM_HOLD_NOT_FOUND, status_code=404)
+
+    async with get_session_factory()() as session:
+        try:
+            result = await service.get_proposal_for_bot(
+                session, hold_id=proposal_id, requesting_bot_sub=bot_sub
+            )
+        except AccessDeniedError:
+            return JSONResponse(_UNIFORM_HOLD_NOT_FOUND, status_code=404)
+
+    return JSONResponse(result, status_code=200)
+
+
+@mcp.custom_route("/proposals/{proposal_id}/withdraw", methods=["POST"])
+async def withdraw_proposal_route(request: Request) -> Response:
+    """Let the SUBMITTING bot retire its own still-``pending`` proposal
+    (TECH-6018) -- most useful right before resubmitting a replacement
+    with a DIFFERENT ``target_id``/``action_type`` that the existing
+    create-time dedup (keyed on the OLD target/action_type) would never
+    match and would otherwise leave stranded alongside the new one. A
+    same-key resubmission doesn't need this at all -- dedup already
+    updates a matching pending row in place.
+
+    Body: ``{"reason": "<optional string, max 2000 chars>"}``. Auth: same
+    bot-only gate as submission/``GET /proposals/{id}`` -- a human can
+    never withdraw a bot's proposal through this route (that's what
+    ``POST /proposals/{id}/decide``'s ``reject`` is for). Sender-only,
+    uniform 404 for unknown/not-yours. Only a ``pending`` proposal can be
+    withdrawn; anything already claimed or decided (including the
+    transient ``applying``) returns 409.
+    """
+    bot_sub, bot_token, status = await _authenticate_proposal_submitter(request)
+    if bot_sub is None or bot_token is None:
+        return JSONResponse({"error": "unauthorized"}, status_code=status)
+
+    proposal_id_str = request.path_params["proposal_id"]
+    try:
+        proposal_id = uuid.UUID(proposal_id_str)
+    except ValueError:
+        return JSONResponse(_UNIFORM_HOLD_NOT_FOUND, status_code=404)
+
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        body = {}
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "invalid_body"}, status_code=422)
+    reason = body.get("reason")
+    if reason is not None:
+        if not isinstance(reason, str):
+            return JSONResponse({"error": "invalid_reason"}, status_code=422)
+        if len(reason) > _MAX_DECISION_REASON_LENGTH:
+            return JSONResponse(
+                {
+                    "error": "invalid_reason",
+                    "detail": f"reason exceeds {_MAX_DECISION_REASON_LENGTH} characters",
+                },
+                status_code=422,
+            )
+
+    async with get_session_factory()() as session:
+        try:
+            result = await service.withdraw_proposal(
+                session, hold_id=proposal_id, requesting_bot_sub=bot_sub, reason=reason
+            )
+        except AccessDeniedError:
+            return JSONResponse(_UNIFORM_HOLD_NOT_FOUND, status_code=404)
+        except HoldAlreadyDecidedError as exc:
+            return JSONResponse({"error": "already_decided", "status": exc.status}, status_code=409)
+
+    return JSONResponse(result, status_code=200)
+
+
 @mcp.custom_route("/proposals/{hold_id}/decide", methods=["POST"])
 async def decide_proposal_route(request: Request) -> Response:
     """Human decide endpoint for a pending proposal hold (TECH-5873).
