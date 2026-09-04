@@ -10,6 +10,7 @@ explicit ``pytest.mark.asyncio`` decorator.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 import httpx
@@ -295,6 +296,30 @@ class TestProgressCommentBody:
         )
         assert "not-allowlisted.example" not in body
         assert body == "Progress update: close_ticket"
+
+    def test_omit_path_warning_does_not_leak_query_string(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Argus review round-7/round-8: the omit-path warning must log a
+        REDACTED form of the rejected URL (see
+        `citation_urls.redact_url_for_logging`), not the raw value -- a
+        query string on a URL that already failed the citation allowlist
+        may carry a secret. `caplog` closes the gap Argus flagged: no
+        prior test asserted anything about the log line's CONTENT, only
+        about the comment body."""
+        with caplog.at_level(logging.WARNING):
+            body = _progress_comment_body(
+                {
+                    "action_type": "close_ticket",
+                    "source_message_url": "https://not-allowlisted.example/p?token=secret123",
+                },
+                "",
+            )
+        assert body == "Progress update: close_ticket"
+        assert any("Omitting" in r.message for r in caplog.records)
+        for record in caplog.records:
+            assert "token" not in record.message
+            assert "secret123" not in record.message
 
     def test_non_allowlisted_resolving_pr_url_is_omitted_not_raised(self) -> None:
         body = _progress_comment_body(

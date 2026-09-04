@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import pytest
 
-from citation_urls import is_allowed_citation_host, is_valid_citation_url
+from citation_urls import is_allowed_citation_host, is_valid_citation_url, redact_url_for_logging
 
 
 class TestIsAllowedCitationHost:
@@ -93,3 +93,45 @@ class TestIsValidCitationUrl:
 
     def test_missing_hostname_rejected(self) -> None:
         assert is_valid_citation_url("https:///path-with-no-host") is False
+
+
+class TestRedactUrlForLogging:
+    """Argus review round-7/round-8: `redact_url_for_logging` is the
+    barrier between a REJECTED citation URL (untrusted by definition) and
+    every downstream log/exception/audit sink -- these tests are the
+    regression net for that security property, not just a coverage
+    checkbox (round-8 caught a real bug here: an earlier version used
+    ``parsed.netloc``, which does NOT strip userinfo)."""
+
+    def test_normal_url_keeps_scheme_host_path(self) -> None:
+        assert (
+            redact_url_for_logging("https://not-allowlisted.example/some/path")
+            == "https://not-allowlisted.example/some/path"
+        )
+
+    def test_query_and_fragment_are_stripped(self) -> None:
+        redacted = redact_url_for_logging(
+            "https://not-allowlisted.example/path?token=secret123#frag"
+        )
+        assert redacted == "https://not-allowlisted.example/path"
+        assert "token" not in redacted
+        assert "secret123" not in redacted
+
+    def test_userinfo_credentials_are_stripped(self) -> None:
+        """Argus review round-8 BLOCKING: the exact bug this test guards
+        against -- a prior version used `parsed.netloc`, which includes
+        userinfo verbatim, so this would have logged the credential."""
+        redacted = redact_url_for_logging("https://token:secret@evil.example/path")
+        assert redacted == "https://evil.example/path"
+        assert "token" not in redacted
+        assert "secret" not in redacted
+
+    def test_port_is_preserved_without_userinfo(self) -> None:
+        redacted = redact_url_for_logging("https://user:pw@evil.example:8443/path")
+        assert redacted == "https://evil.example:8443/path"
+        assert "user" not in redacted
+        assert "pw" not in redacted
+
+    def test_unparseable_url_returns_placeholder(self) -> None:
+        assert redact_url_for_logging("not-a-url-at-all") == "<unparseable-url>"
+        assert redact_url_for_logging("https:///no-host") == "<unparseable-url>"

@@ -135,9 +135,13 @@ def compute_target_fingerprint(issue: dict[str, Any]) -> str:
     CROSS-REPO CONTRACT: whatever submits the original proposal (a Prefect
     flow, per the ticket) must compute ``target_fingerprint`` the SAME way,
     over the SAME field set, or every decide will spuriously come back
-    ``stale``. This function is the single source of truth for that scheme
-    on the agent-comms-mcp side; see ``docs/DESIGN.md``'s proposal
-    decide/apply section for the contract note.
+    ``stale``. THIS DOCSTRING is the single source of truth for that
+    scheme on the agent-comms-mcp side (Argus review round-8 suggestion:
+    ``docs/DESIGN.md``'s proposal decide/apply section intentionally
+    defers back to this docstring rather than duplicating it -- don't
+    re-point that cross-reference back here, or a cross-repo implementer
+    following it lands on a paragraph that only says "see the
+    docstring").
 
     Exact serialization pinned here (Argus review round-5 S6 -- a
     same-inputs-different-bytes bug in either implementation would be

@@ -80,8 +80,21 @@ def redact_url_for_logging(value: str) -> str:
     less-trusted sinks (log aggregators, error-tracking services) than the
     Linear comment this validation exists to protect in the first place.
     Falls back to a fixed placeholder if the value doesn't even parse as a
-    URL with a netloc, rather than logging the raw string in that case."""
+    URL with a netloc, rather than logging the raw string in that case.
+
+    Reconstructs the authority from ``parsed.hostname``/``parsed.port``,
+    NOT ``parsed.netloc`` (Argus review round-8 BLOCKING fix): `netloc`
+    includes embedded userinfo verbatim
+    (``urlsplit("https://token:secret@evil.example/x").netloc ==
+    "token:secret@evil.example"``) -- exactly the shape
+    ``is_valid_citation_url`` rejects a URL FOR (round-4's userinfo
+    check), which means every userinfo-bearing URL is guaranteed to reach
+    this "redaction" path, and using `netloc` would have logged the
+    credential verbatim instead of stripping it. `hostname` is userinfo-
+    free by contract (``urllib.parse`` strips it before exposing that
+    property)."""
     parsed = urlsplit(value)
-    if not parsed.scheme or not parsed.netloc:
+    if not parsed.scheme or not parsed.hostname:
         return "<unparseable-url>"
-    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    authority = f"{parsed.hostname}:{parsed.port}" if parsed.port else parsed.hostname
+    return f"{parsed.scheme}://{authority}{parsed.path}"

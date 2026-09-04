@@ -27,7 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from exceptions import AccessDeniedError, HoldAlreadyDecidedError, RateLimitExceededError
 from linear_client import LinearAPIError, LinearTokenMissingError, LinearTransportError
-from models import ProposalHold
+from models import AuditLog, ProposalHold
 from service import (
     MAX_PROPOSALS_PER_BOT_PER_WINDOW,
     _sanitize_apply_error,
@@ -725,7 +725,11 @@ class TestDecideProposal:
             await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
         ).scalar_one()
         assert row.status == "apply_failed"
-        assert row.apply_error is not None
+        # Argus review round-8 suggestion: content, not just non-None --
+        # and specifically the FIXED public constant (Argus review round-8
+        # BLOCKING fix: `apply_error` must never carry cancellation detail
+        # that could leak internal information via the API response).
+        assert row.apply_error == "apply_failed:cancelled"
 
     async def test_cancellation_during_apply_resolves_to_apply_failed(
         self, session: AsyncSession
@@ -764,7 +768,54 @@ class TestDecideProposal:
             await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
         ).scalar_one()
         assert row.status == "apply_failed"
-        assert row.apply_error is not None
+        assert row.apply_error == "apply_failed:cancelled"
+
+    async def test_cancellation_with_message_uses_message_in_raw_error_only(
+        self, session: AsyncSession
+    ) -> None:
+        """Argus review round-8 suggestion: `_cancellation_apply_error`'s
+        non-empty-``str(exc)`` branch (``task.cancel(msg=...)``) was never
+        exercised -- both cancellation tests above inject a bare
+        ``CancelledError()``. This also verifies the round-8 BLOCKING
+        fix's split: the enriched message reaches the AUDIT log
+        (internal-only), but `apply_error` (the API-response field) stays
+        the fixed constant regardless of what the cancellation message
+        says."""
+        submitted = await _submit(session, target_fingerprint="fp-match")
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(side_effect=asyncio.CancelledError("watchdog: 30s timeout")),
+            ),
+            patch("service.linear_client.apply_progress_update", AsyncMock()),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await decide_proposal(
+                    session,
+                    approver_sub="owner-a@example.com",
+                    hold_id=hold_id,
+                    decision="approve",
+                    decision_note=None,
+                )
+        row = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        assert row.status == "apply_failed"
+        assert row.apply_error == "apply_failed:cancelled"
+        audit_row = (
+            (
+                await session.execute(
+                    select(AuditLog)
+                    .where(AuditLog.action == "proposal.apply_failed")
+                    .order_by(AuditLog.at.desc())
+                )
+            )
+            .scalars()
+            .first()
+        )
+        assert audit_row is not None
+        assert "watchdog: 30s timeout" in audit_row.detail["error"]
 
     async def test_cancellation_racing_concurrent_resolution_reraises_without_terminal_write(
         self, session: AsyncSession

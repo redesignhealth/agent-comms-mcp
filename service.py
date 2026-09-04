@@ -6116,14 +6116,29 @@ def _sanitize_apply_error(exc: Exception) -> str:
     return _APPLY_ERROR_GENERIC_MESSAGE
 
 
+_APPLY_ERROR_CANCELLED_MESSAGE = "apply_failed:cancelled"
+
+
 def _cancellation_apply_error(exc: asyncio.CancelledError) -> str:
-    """Build the ``apply_error``/log message for a cancellation caught
+    """Build the RAW (log/audit-only) message for a cancellation caught
     mid-apply (Argus review round-7 suggestion): a bare
     ``asyncio.CancelledError()`` usually carries no message, but
     ``task.cancel(msg=...)`` (Python 3.9+) can attach one, and discarding
     it in favor of a hardcoded literal throws away debugging context a
     caller may have deliberately provided (e.g. a watchdog's own timeout
-    reason). Falls back to the fixed literal when ``str(exc)`` is empty."""
+    reason). Falls back to the fixed literal when ``str(exc)`` is empty.
+
+    This function's return value is for ``raw_apply_error`` ONLY -- never
+    ``apply_error`` (Argus review round-8 BLOCKING fix: an earlier version
+    assigned this same enriched string to both, so an arbitrary
+    ``task.cancel(msg=...)`` message -- potentially containing internal
+    hostnames, trace IDs, or other request internals a watchdog embedded
+    for its own purposes -- would flow straight into the HTTP response
+    body via ``hold.apply_error`` -> ``_proposal_dict``, visible to any
+    authenticated caller of this endpoint. `apply_error` for a
+    cancellation is always the fixed `_APPLY_ERROR_CANCELLED_MESSAGE`
+    constant instead, the same "small allowlisted set" treatment
+    `_sanitize_apply_error` gives a `LinearAPIError`."""
     detail = str(exc)
     base = "apply cancelled before completion (request disconnected or task cancelled)"
     return f"{base}: {detail}" if detail else base
@@ -6248,7 +6263,7 @@ async def _apply_or_finalize_proposal_hold(
         apply_error = _sanitize_apply_error(exc)
     except asyncio.CancelledError as exc:
         raw_apply_error = _cancellation_apply_error(exc)
-        apply_error = raw_apply_error
+        apply_error = _APPLY_ERROR_CANCELLED_MESSAGE
         cancelled_exc = exc
     else:
         if not is_stale:
@@ -6260,7 +6275,7 @@ async def _apply_or_finalize_proposal_hold(
                 apply_error = _sanitize_apply_error(exc)
             except asyncio.CancelledError as exc:
                 raw_apply_error = _cancellation_apply_error(exc)
-                apply_error = raw_apply_error
+                apply_error = _APPLY_ERROR_CANCELLED_MESSAGE
                 cancelled_exc = exc
 
     hold = await _find_proposal_hold(session, hold_id, for_update=True)
