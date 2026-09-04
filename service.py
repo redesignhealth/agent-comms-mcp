@@ -1491,7 +1491,13 @@ async def admin_register_agent(
     ``is_shared_authorized`` (a NARROWER gate on one parameter of an
     otherwise-reachable self-service tool), ``admin_authorized`` gates the
     entire call -- there is no unprivileged use of this function, so
-    ``is_shared`` itself needs no separate authorization check here.
+    ``is_shared`` itself needs no separate authorization check here. Note
+    that as of TECH-6002 the tool-layer caller of ``register_agent`` (the
+    ``register``/``comms_register`` tool) always passes
+    ``is_shared_authorized=True`` unconditionally, so the contrast above is
+    historical context on the two functions' respective designs, not a
+    description of a live conditional check at the ``register`` tool layer
+    today.
 
     **``owner_sub``/``owner_email`` are explicit, caller-supplied
     parameters here** -- the one deliberate exception to DESIGN.md §4's
@@ -1853,7 +1859,8 @@ async def register_agent(
     risk scorer's ownership lookups (``_score_message_risk``). As of
     2026-09-03 (TECH-6002, confirmed with Dan), self-registration
     deliberately no longer requires elevated scope for this --
-    ``providers/comms.py``'s ``register_agent`` tool (this function's only
+    the ``register`` tool (``comms_register`` MCP tool) in
+    ``providers/comms.py`` (this function's only
     tool-layer caller -- ``tests/test_approval_endpoint.py`` and
     ``tests/test_service.py`` also call this function directly) now always
     passes ``True`` here, since an agent declaring ITS OWN ``is_shared``
@@ -7530,10 +7537,11 @@ class AgentTableOwnershipClient:
     ``is_shared`` IS still frozen
     against an agent's own re-registration, but -- unlike ``owner_sub`` --
     mutable via the separate ``comms:admin``-gated ``set_agent_shared``
-    admin override (see that function's docstring); its only mutation path
-    is itself gated on the same elevated scope required to escalate it at
-    first registration, so there is no path by which an unprivileged
-    caller can move it.
+    admin override (see that function's docstring). As of TECH-6002, setting
+    ``is_shared=True`` at FIRST registration only requires ``comms:write``
+    (a plain, unprivileged caller can self-declare it on their own first
+    registration); it is post-registration mutation via ``set_agent_shared``
+    that still requires the elevated ``comms:admin`` scope.
     """
 
     def __init__(self, session: AsyncSession) -> None:

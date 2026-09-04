@@ -713,18 +713,17 @@ class TestRegister:
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
         """Tool-layer counterpart to
-        ``test_service.test_is_shared_frozen_on_reregister``: re-registering
-        through the MCP tool without the admin scope the second time neither
-        gets denied (the gate only fires on FIRST registration) nor changes
-        the already-frozen stored value -- freeze semantics hold at this
-        boundary too."""
-        admin_token = _token(
-            "agent-is-shared-freeze-mcp", scopes=["comms:read", "comms:write", "comms:admin"]
-        )
+        ``test_service.test_is_shared_frozen_on_reregister``: the freeze on
+        ``is_shared`` is a design invariant independent of any scope gate --
+        re-registering through the MCP tool with a request to flip the value
+        neither gets denied nor changes the already-frozen stored value,
+        regardless of what scope either registration call carries. Freeze
+        semantics hold at this boundary too."""
+        first_token = _token("agent-is-shared-freeze-mcp", scopes=["comms:read", "comms:write"])
         first = await _call(
             main,
             test_session_factory,
-            admin_token,
+            first_token,
             "comms_register",
             {
                 "display_name": "Freeze v1",
@@ -734,13 +733,11 @@ class TestRegister:
         )
         assert first["is_shared"] is True
 
-        unauthorized_token = _token(
-            "agent-is-shared-freeze-mcp", scopes=["comms:read", "comms:write"]
-        )
+        second_token = _token("agent-is-shared-freeze-mcp", scopes=["comms:read", "comms:write"])
         second = await _call(
             main,
             test_session_factory,
-            unauthorized_token,
+            second_token,
             "comms_register",
             {
                 "display_name": "Freeze v2",
@@ -756,9 +753,9 @@ class TestRegister:
     ) -> None:
         """The freeze boundary in the OTHER direction: an agent first
         registered with ``is_shared=False`` cannot be upgraded to ``True``
-        on re-registration, even without attempting the admin-scope gate
-        (freeze is checked before authorization would even matter, since
-        ``is_shared_authorized`` only gates FIRST registration)."""
+        on re-registration -- a separate mechanism from scope, since the
+        freeze invariant applies regardless of what scope the re-registration
+        call carries."""
         token = _token("agent-is-shared-upgrade-attempt", scopes=["comms:read", "comms:write"])
         first = await _call(
             main,

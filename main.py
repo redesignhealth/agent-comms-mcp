@@ -1323,9 +1323,11 @@ async def reconcile_ownership(request: Request) -> Response:
     adds -- is an operational decision, not something this route decides.
 
     Auth: interactive (Okta) caller OR an agent-jwt token carrying
-    ``comms:admin`` -- same elevated-scope convention
-    ``providers.comms.register``/``set_agent_shared`` already use for
-    ``is_shared=True``, verified against the FULL ``_auth_provider`` chain
+    ``comms:admin`` -- same elevated-scope convention the remaining
+    ``comms:admin`` tools (``set_agent_shared``, ``deregister_agent``,
+    ``admin_register``) use; ``providers.comms.register`` no longer
+    requires this scope for ``is_shared=True`` at first registration
+    (TECH-6002), verified against the FULL ``_auth_provider`` chain
     (unlike ``_authenticate_approval_caller``'s Okta-only verification for
     hold decisions). That stricter, no-escape-hatch gate exists specifically
     to make an agent's self-approval of its OWN high-risk content

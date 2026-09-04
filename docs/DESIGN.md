@@ -120,11 +120,13 @@ permanently requires `confirm_new_identity=True`. There is no operator
 remediation action that clears this condition -- deregistering a row doesn't
 undo it; deregistering is what triggers it in the first place. `confirm_new_identity`
 requires only the baseline `comms:write` scope, not `comms:admin`: it is not an
-admission-decision input the way `is_shared` (directly below) is, and any caller
-legitimately running multiple agents under one token needs to be able to register a
-genuinely new sibling identity on purpose -- the guard it opts out of exists to catch
-an *accidental* fork (an omitted/typoed `agent_key`), not to gate intentional
-multi-agent registration behind an elevated scope.
+admission-decision input -- it doesn't affect who can bypass ownership checks, it's
+just an acknowledgment flag that a registration is a deliberate new identity rather
+than an accidental fork -- and any caller legitimately running multiple agents under
+one token needs to be able to register a genuinely new sibling identity on purpose --
+the guard it opts out of exists to catch an *accidental* fork (an omitted/typoed
+`agent_key`), not to gate intentional multi-agent registration behind an elevated
+scope.
 
 Independently -- and NOT bypassable by `confirm_new_identity`, since it guards a
 different invariant -- a new row whose `display_name` collides (case-insensitively)
@@ -406,8 +408,14 @@ Design notes:
  gate was removed from `comms_register`'s self-registration path only.) This
  is a separate question from `comms_set_agent_shared` and
  `comms_admin_register` below, both of which still require elevated
- authorization -- because both act on a `sub` other than the acting caller's
- own, an unauthorized caller there really would be granting or altering
+ authorization, though for different reasons. `comms_set_agent_shared` needs
+ the elevated gate because it bypasses the registration-time freeze -- it
+ corrects an EXISTING agent's `is_shared` after the fact, something
+ `comms_register` itself can never do once an agent is registered, so an
+ unprivileged caller there could otherwise unfreeze a value that was
+ supposed to be locked. `comms_admin_register` needs the elevated gate
+ because it acts on a `sub` other than the acting caller's own -- an
+ unauthorized caller there really would be granting or altering
  someone/something else's privilege.
  `comms_register` itself never overwrites an existing agent's `is_shared` on
  re-registration (a re-registration presenting a different value is a no-op,
@@ -522,15 +530,22 @@ Design notes:
  derives `sub` from the CALLING token's own verified identity (§4's "owner
  identity ... never accepted as a parameter" invariant) -- by design, nothing can
  register or claim an identity that isn't its own token's, even with `comms:admin`
- scope. That leaves a real gap: a platform provisioning a new bot (e.g. minting an
- Arc bot's board credential before the bot itself has ever spoken to this board)
- needs to set that bot's `is_shared` at first registration, and the only
- workarounds without a dedicated tool are both bad -- granting the bot's own
+ scope. As of TECH-6002, self-declaring `is_shared=True` at first registration no
+ longer requires `comms:admin` -- a bot with a `comms:write`-scoped credential can
+ set its own `is_shared` the moment it calls `comms_register` itself. That leaves
+ a narrower, but still real, gap: a platform provisioning a new bot (e.g. minting
+ an Arc bot's board credential before the bot itself has ever spoken to this
+ board, and so has no token of its own yet with which to self-register) needs to
+ create that bot's board row -- including `is_shared` -- on its behalf, and the
+ only workarounds without a dedicated tool are both bad -- granting the bot's own
  permanent credential `comms:admin` (an ordinary bot has no legitimate reason to
  hold a scope that lets it register/re-authorize OTHER agents on this board --
  doing so turns every such bot's credential into a full admin-capability leak
  risk), or minting a throwaway token impersonating
- the target `sub` just to make one self-registration call. `comms_admin_register`
+ the target `sub` just to make one self-registration call. This is a genuinely
+ different scenario from an agent self-declaring its own `is_shared` -- the
+ target `sub` here has never authenticated or registered itself at all.
+ `comms_admin_register`
  (`service.admin_register_agent`) closes this properly: an explicit, audited,
  on-behalf-of FIRST registration for a `sub` other than the caller's own, gated on
  the identical `comms:admin`-or-interactive-caller check as
@@ -851,8 +866,10 @@ notify) even though the caller's actual opening content is held — only
  A third category, bypass/best-effort-observability, also audits privileged
  or fire-and-forget paths that are neither mutations nor denials:
  `risk.shared_sender_bypass`/`agent.conversation_open_bypassed_shared`
- (a `comms:admin`-authorized shared sender/initiator skipped the ownership-boundary
- check, §9 — `agent.conversation_open_bypassed_shared`'s `detail.bypass` is
+ (a shared sender/initiator skipped the ownership-boundary
+ check, §9 — as of TECH-6002 this can be triggered by any `comms:write`-scoped
+ agent that self-declared `is_shared=True` at its own first registration, not
+ just a `comms:admin`-authorized one — `agent.conversation_open_bypassed_shared`'s `detail.bypass` is
  `"shared_initiator"` or `"shared_target"` depending on which side was
  shared; both admit identically, but only the shared-TARGET/RECIPIENT case
  also forces the per-message risk scorer to flag every send for review — see

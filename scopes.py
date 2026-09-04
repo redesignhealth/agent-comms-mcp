@@ -55,9 +55,16 @@ from observability import log_auth_rejected
 #             ``providers.comms.register``'s ``is_shared=True``
 #             self-registration path -- an agent may now self-declare its
 #             OWN ``is_shared`` with only the baseline ``comms:write``
-#             scope. The remaining ``comms:admin`` consumers are exactly
-#             the three listed above: ``comms_set_agent_shared``,
-#             ``comms_deregister_agent``, and ``comms_admin_register``.
+#             scope. The remaining in-handler ``comms:admin`` checks
+#             (gating a privileged PARAMETER within an already-scoped
+#             tool, as opposed to a route-level auth gate like
+#             ``main.py``'s ``/admin/agents/reconcile-ownership``) are
+#             exactly the three listed above: ``comms_set_agent_shared``,
+#             ``comms_deregister_agent``, and ``comms_admin_register`` --
+#             enforced by
+#             ``tests/test_scopes.py::TestCommsAdminConsumers``, which
+#             will fail if a future PR adds a fourth without updating
+#             this comment.
 TOOL_SCOPES: dict[str, str] = {
     # --- comms (provider: providers/comms.py, namespace="comms") ---
     "comms_whoami": "comms:read",

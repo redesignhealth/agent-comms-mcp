@@ -708,6 +708,14 @@ async def register(
     # speaking for itself," which is the only case this change relaxes.
     # `register_agent` enforces this only on first registration (a no-op
     # for the frozen re-registration path either way).
+    #
+    # Note the bypass this grants is not confined to actions the declaring
+    # agent itself takes: when agent X declares `is_shared=True` as the
+    # TARGET of an `asymmetric` conversation, a separate, unprivileged
+    # initiator Y also gains the pairwise ownership-boundary bypass for that
+    # (Y, X) pair. The declaring agent must be a party to the bypassed pair,
+    # but the OTHER party in that pair may be a completely different,
+    # unprivileged agent -- this is intended (see DESIGN.md §9), not a gap.
     is_shared_authorized = True
 
     async with get_session_factory()() as session, _map_service_errors():

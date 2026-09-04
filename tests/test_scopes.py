@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import inspect
 import re
 from unittest.mock import MagicMock, patch
 
 import mint_token
+import providers.comms as comms_provider
 from auth import AGENT_TOKEN_VERIFIER_CLAIM, DEFAULT_AGENT_TOKEN_VERIFIER
 from scopes import (
     PROPOSAL_SUBMIT_SCOPE,
@@ -347,3 +349,27 @@ class TestCheckResourceScope:
         token = _fake_access_token({"iss": "https://agent-comms.example/mcp"})
         assert check_resource_scope(token, "schema://anything") is True
         assert check_resource_scope(token, "comms://comms/agents") is True
+
+
+class TestCommsAdminConsumers:
+    """Guards scopes.py's ``:admin`` verb comment claim that the remaining
+    in-handler ``comms:admin`` checks (gating a privileged PARAMETER within
+    an already-``comms:write``-scoped tool, distinct from a route-level
+    auth gate) are exactly ``set_agent_shared``, ``deregister_agent``, and
+    ``admin_register`` in ``providers/comms.py``. Enumerates every function
+    in that module whose source contains the ``comms:admin`` scope check --
+    if a future PR adds a fourth, this test fails and forces an intentional
+    update rather than letting the comment quietly go stale."""
+
+    def test_exactly_three_functions_gate_on_comms_admin(self) -> None:
+        admin_gated = []
+        for name, func in inspect.getmembers(comms_provider, inspect.iscoroutinefunction):
+            source = inspect.getsource(func)
+            if '"comms:admin" in scopes_for_token' in source:
+                admin_gated.append(name)
+
+        assert sorted(admin_gated) == [
+            "admin_register",
+            "deregister_agent",
+            "set_agent_shared",
+        ]
