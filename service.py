@@ -1111,13 +1111,21 @@ async def _load_participant_for_read(
     actor_sub: str,
     agent_id: uuid.UUID,
     conversation_id: uuid.UUID,
+    allow_terminal_status: bool = False,
 ) -> tuple[Conversation, Participant]:
     """Load a conversation + participant for ``get_conversation``.
 
     Unlike ``_load_participant_for_transition``, an ``invited`` participant
     is NOT denied here — ``get_conversation`` itself decides what an
     ``invited`` caller may see (metadata only). Only "no participant row"
-    and "left"/"declined" are denied, identically to non-membership.
+    and "left"/"declined" are denied, identically to non-membership --
+    unless ``allow_terminal_status`` is set, in which case a "left"/
+    "declined" participant is treated the same as any other member instead
+    of being denied (TECH-5903 Phase B, Argus round-2 BLOCKING catch: the
+    subscribe-authorization unsubscribe path needs to tolerate a departed
+    participant cleaning up its own stale subscription, which this
+    function's default terminal-status denial otherwise makes impossible —
+    see ``resolve_conversation_participant``).
     """
     conversation = await _find_conversation(session, conversation_id)
     participant = (
@@ -1132,7 +1140,7 @@ async def _load_participant_for_read(
             conversation_id=conversation.id if conversation else None,
             detail={"attempted_agent_id": str(agent_id)},
         )
-    if participant.status in ("left", "declined"):
+    if participant.status in ("left", "declined") and not allow_terminal_status:
         await _deny(
             session,
             actor_sub=actor_sub,
@@ -5301,6 +5309,15 @@ async def decide_hold(
         await session.commit()
         result = _hold_dict(hold)
         result["participant_status"] = participant.status
+        # TECH-5903 Phase B: private, provider-layer-only keys -- popped and
+        # consumed by main.decide_approval AFTER this session closes, never
+        # sent to the HTTP caller. Invite-hold approve: the new invited
+        # target isn't active yet, so it's pinged via its inbox URI directly
+        # rather than folded into the active-participant recheck set.
+        active_ids = await get_active_participant_agent_ids(session, conversation.id)
+        result["_notify_conversation_id"] = str(conversation.id)
+        result["_notify_active_agent_ids"] = [str(a) for a in active_ids]
+        result["_notify_inbox_agent_ids"] = [str(hold.target_agent_id)]
         return result
 
     rows = (
@@ -5360,7 +5377,14 @@ async def decide_hold(
             detail={"new_state": new_state, "via": hold.message_type},
         )
     await session.commit()
-    return _hold_dict(hold)
+    result = _hold_dict(hold)
+    # TECH-5903 Phase B: see the invite-hold branch above for why these
+    # private keys exist and who consumes them.
+    active_ids = await get_active_participant_agent_ids(session, conversation.id)
+    result["_notify_conversation_id"] = str(conversation.id)
+    result["_notify_active_agent_ids"] = [str(a) for a in active_ids]
+    result["_notify_inbox_agent_ids"] = [str(a) for a in active_ids]
+    return result
 
 
 # --- Proposal holds (TECH-5871/5872/5875/5877) --------------------------------
@@ -7081,6 +7105,128 @@ async def resolve_inbox_target(
     return target
 
 
+async def resolve_conversation_participant(
+    session: AsyncSession,
+    *,
+    actor_sub: str,
+    agent_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    allow_terminal_status: bool = False,
+) -> tuple[Conversation, Participant]:
+    """Public entry point over ``_load_participant_for_read`` (TECH-5903 Phase B).
+
+    Exists so ``providers.comms.authorize_resource_subscribe`` can reuse the
+    EXACT SAME membership check ``get_conversation``/``conversation_resource``
+    use ("is this caller an admitted participant", ``invited`` included) —
+    the plan doc's resolved decision that subscribe authz must not be a
+    separately-maintained rule — without either reaching into this module's
+    private helper directly or duplicating its logic. Callers that need the
+    stricter subscribe-only ``active`` gate on top check ``participant.status``
+    themselves and deny via ``deny_resource_subscribe`` below.
+
+    ``allow_terminal_status``, when set, tolerates a ``left``/``declined``
+    participant instead of denying (Argus round-2 BLOCKING catch): the
+    unsubscribe path (``authorize_resource_subscribe`` with
+    ``require_active=False``) must let a departed participant clean up its
+    own stale subscription, which the default terminal-status denial
+    otherwise blocks just as hard as a genuine non-member. Only the
+    unsubscribe call site passes ``True`` — the subscribe path keeps the
+    default ``False`` so a departed participant still cannot re-subscribe.
+    """
+    return await _load_participant_for_read(
+        session,
+        actor_sub=actor_sub,
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+        allow_terminal_status=allow_terminal_status,
+    )
+
+
+async def deny_resource_subscribe(
+    session: AsyncSession,
+    *,
+    actor_sub: str,
+    action: str,
+    agent_id: uuid.UUID | None = None,
+    conversation_id: uuid.UUID | None = None,
+    detail: dict[str, Any] | None = None,
+) -> NoReturn:
+    """Audited, uniform denial for a resource subscribe/unsubscribe attempt
+    (TECH-5903 Phase B) — thin public wrapper over ``_deny`` so every
+    subscribe/unsubscribe failure category writes the same kind of
+    ``audit_log`` row every other denial in this module does, before
+    ``providers.comms.authorize_resource_subscribe`` folds all of them into
+    one uniform, anti-enumeration ``McpError`` at the transport boundary.
+    """
+    await _deny(
+        session,
+        actor_sub=actor_sub,
+        action=action,
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+        detail=detail,
+    )
+    # Argus round-2 SUGGESTION: `_deny` is `NoReturn`, so this is genuinely
+    # unreachable -- matching `resolve_inbox_target`'s existing pattern
+    # (a plain `raise`, never optimized away under `python -O`, unlike a
+    # bare `assert`).
+    raise AssertionError("unreachable: _deny must have raised")
+
+
+async def audit_resource_subscription(
+    session: AsyncSession,
+    *,
+    actor_sub: str,
+    agent_id: uuid.UUID,
+    action: str,
+    uri: str,
+    conversation_id: uuid.UUID | None = None,
+) -> None:
+    """Audit + commit a successful ``resource.subscribe``/``resource.unsubscribe``
+    (TECH-5903 Phase B). Unlike every other tool/resource call, the low-level
+    subscribe/unsubscribe handlers (``main.py``) open a session solely for
+    this audit write — there is no other mutation to share a transaction
+    with — so this commits immediately rather than deferring to a caller.
+
+    ``conversation_id``, when the subscribed/unsubscribed URI encodes one,
+    threads through onto the audit row for parity with ``deny_resource_subscribe``
+    (Argus round-2 SUGGESTION) -- omitted (``None``) for inbox URIs, which
+    have no conversation to attribute.
+    """
+    _audit(
+        session,
+        actor_sub=actor_sub,
+        action=action,
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+        detail={"uri": uri},
+    )
+    await session.commit()
+
+
+async def get_active_participant_agent_ids(
+    session: AsyncSession, conversation_id: uuid.UUID
+) -> set[uuid.UUID]:
+    """Every currently-``active`` participant's ``agent_id`` for
+    ``conversation_id`` (TECH-5903 Phase B) — used post-commit by the
+    provider layer to compute ``subscriptions.notify_conversation_event``'s
+    ``active_agent_ids`` re-check set. Deliberately its own plain read
+    rather than reused from an existing private helper: every other
+    participant query in this module is shaped around a specific write
+    path's own side effects (row locking, role checks, ...), not a bare
+    read of the current active set.
+    """
+    rows = (
+        await session.execute(
+            select(Participant.agent_id).where(
+                Participant.conversation_id == conversation_id,
+                Participant.status == "active",
+            )
+        )
+    ).scalars()
+    return set(rows)
+
+
 async def inbox(
     session: AsyncSession,
     *,
@@ -7676,12 +7822,15 @@ __all__ = [
     "archive_conversation",
     "audit_denied_approval_requires_interactive",
     "audit_denied_proposal_submission",
+    "audit_resource_subscription",
     "create_proposal",
     "decide_hold",
     "decide_proposal",
     "decline_invite",
+    "deny_resource_subscribe",
     "deregister_agent",
     "evaluate_linear_progress_update_judge",
+    "get_active_participant_agent_ids",
     "get_agent_by_sub",
     "get_conversation",
     "get_hold_status",
@@ -7699,6 +7848,8 @@ __all__ = [
     "post_message",
     "reconcile_agent_ownership",
     "register_agent",
+    "resolve_conversation_participant",
+    "resolve_inbox_target",
     "start_conversation",
     "validate_hold_level",
     "validate_ownership_client_configuration",

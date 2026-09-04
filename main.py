@@ -20,11 +20,15 @@ from fastmcp.exceptions import ResourceError, ToolError
 from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.tools import ToolResult
+from mcp.server.lowlevel.server import NotificationOptions
+from mcp.shared.exceptions import McpError
+from pydantic import AnyUrl
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 
 import plugins
 import service
+import subscriptions
 from auth import build_auth_provider
 from db import database_url, get_session_factory
 from exceptions import (
@@ -45,9 +49,10 @@ from observability import (
     log_user_active,
 )
 from plugins import validate_configuration as validate_plugin_configuration
-from providers.comms import comms_server
+from providers.comms import ResourceSubscribeDeniedError, authorize_resource_subscribe, comms_server
 from scopes import (
     PROPOSAL_SUBMIT_SCOPE,
+    check_resource_scope,
     is_interactive_token,
     required_scope_for,
     required_scope_for_resource,
@@ -146,9 +151,19 @@ class ScopeEnforcementMiddleware(Middleware):
         uri = str(context.message.uri)
         token = get_access_token()
 
-        if is_interactive_token(token):
+        if check_resource_scope(token, uri):
             return await call_next(context)
 
+        # `check_resource_scope` only answers the yes/no authorization
+        # question (it deliberately collapses "not enrolled" and "scope
+        # missing" into a single False, per its own docstring); authorization
+        # itself is already decided by this point (denied, since the early
+        # return above didn't fire) -- everything below is reachable and
+        # runs real side effects (structured denial logging, raising
+        # `ResourceError`), it just re-derives WHICH denial reason to log,
+        # since that breakdown isn't part of `check_resource_scope`'s
+        # boolean return (Argus round-3 SUGGESTION: the prior wording of
+        # this comment misleadingly called the block itself "dead code").
         if token is None:
             self._deny_resource(uri, reason="missing_token", client_id=None)
 
@@ -158,15 +173,12 @@ class ScopeEnforcementMiddleware(Middleware):
                 uri, reason="resource_not_enrolled", client_id=safe_client_id(token)
             )
 
-        if required not in scopes_for_token(token):
-            self._deny_resource(
-                uri,
-                reason="missing_scope",
-                client_id=safe_client_id(token),
-                required_scope=required,
-            )
-
-        return await call_next(context)
+        self._deny_resource(
+            uri,
+            reason="missing_scope",
+            client_id=safe_client_id(token),
+            required_scope=required,
+        )
 
     async def on_list_resources(
         self,
@@ -395,7 +407,13 @@ mcp: FastMCP[Any] = FastMCP(
         "yourself to that narrower set (e.g. ['task_assign', "
         "'availability_request']). A restricted agent's declared list is "
         "enforced: a message of a type it hasn't declared is denied on the "
-        "sender's call, with no direct feedback to the recipient."
+        "sender's call, with no direct feedback to the recipient. "
+        "Resource subscriptions (resources/subscribe on conversation and "
+        "inbox URIs) are backed by a process-local, in-memory registry: "
+        "this deployment runs a single task (desired_count=1), and the "
+        "registry does not survive a restart or re-initialize -- clients "
+        "must re-subscribe every time they re-initialize the MCP session, "
+        "not just once at first connect."
     ),
     auth=_auth_provider,
 )
@@ -408,6 +426,239 @@ mcp.add_middleware(ObservabilityMiddleware())
 mcp.add_middleware(ScopeEnforcementMiddleware())
 
 mcp.mount(comms_server, namespace="comms")
+
+_RESOURCE_SUBSCRIBE_DENIAL_MESSAGE = "access_denied: not authorized for this resource"
+
+
+def _deny_resource_subscribe() -> NoReturn:
+    """Uniform denial for the low-level subscribe/unsubscribe handlers below.
+
+    Mirrors ``_deny_resource``'s client-facing string, but raises the raw
+    SDK ``McpError`` type rather than ``fastmcp.exceptions.ResourceError``:
+    these handlers are registered directly on the low-level server (see
+    below), which never passes through FastMCP's own exception-translation
+    layer the way ``@comms_server.resource``-decorated reads do.
+
+    ``code=mt.INVALID_PARAMS`` is a deliberate reuse, not an oversight
+    (Argus round-5 SUGGESTION): this is an authorization denial, not
+    literally an invalid parameter, but the MCP/JSON-RPC error code set
+    (``mcp.types``) has no dedicated "forbidden"/permission-denied code --
+    only the generic JSON-RPC codes plus a handful of MCP-specific,
+    unrelated ones (task/elicitation codes). ``INVALID_PARAMS`` is the
+    closest fit, and reusing one uniform code across every denial category
+    here matches this function's anti-enumeration posture (the message text
+    is already uniform; the code doesn't leak anything the message
+    doesn't).
+    """
+    raise McpError(
+        mt.ErrorData(code=mt.INVALID_PARAMS, message=_RESOURCE_SUBSCRIBE_DENIAL_MESSAGE)
+    ) from None
+
+
+# Low-level subscribe/unsubscribe handlers (TECH-5903 Phase B). FastMCP's
+# own `@comms_server.resource` decorator has no subscribe counterpart, so
+# these are registered directly on `mcp._mcp_server` (the underlying
+# low-level `mcp.server.lowlevel.Server`) via its own
+# `subscribe_resource()`/`unsubscribe_resource()` decorators -- which means
+# they bypass `ScopeEnforcementMiddleware`/`ObservabilityMiddleware`
+# entirely (those only ever see `on_call_tool`/`on_read_resource`/
+# `on_list_resources`-shaped dispatch). All authz is therefore
+# reimplemented in `providers.comms.authorize_resource_subscribe`, which
+# both handlers below call and nothing else.
+#
+# Known gaps, accepted for this PR, not addressed here:
+#   - No rate limiting on either handler (unlike comms_post_message/
+#     comms_start_conversation/comms_invite, which all have one) -- this
+#     repo's existing rate-limiting infra is scoped to those tool-dispatch
+#     paths, and building new infra for a two-handler surface isn't
+#     justified for v1. Accepted tradeoff; revisit if this becomes a real
+#     abuse vector.
+#   - No ObservabilityMiddleware instrumentation (TECH-5965, filed from a
+#     TECH-5903 Phase A Argus round-1 SUGGESTION for resource reads/lists --
+#     that gap also covers subscribe/unsubscribe, since these handlers sit
+#     outside all middleware the same way resource reads do).
+_low_level_server = mcp._mcp_server
+
+
+@_low_level_server.subscribe_resource()  # type: ignore[no-untyped-call, untyped-decorator]
+async def _handle_subscribe_resource(uri: AnyUrl) -> None:
+    uri_str = str(uri)
+    try:
+        auth = await authorize_resource_subscribe(uri_str, require_active=True)
+    except ResourceSubscribeDeniedError as exc:
+        # Argus round-2 BLOCKING catch: pre-DB denials (missing token,
+        # missing scope, unknown URI, malformed UUID) bypass
+        # ScopeEnforcementMiddleware entirely (this handler is registered
+        # directly on the low-level server -- see module comment above), so
+        # there is no `log_scope_denial` call and no audit row for these
+        # categories otherwise -- a probing attacker would generate zero
+        # server-side signal. DB-layer denials (non-member, invited-not-
+        # active, ...) already get an audited row via
+        # `service.deny_resource_subscribe`; this is specifically for the
+        # pre-DB categories that never reach that function.
+        _token_for_log = get_access_token()
+        logger.warning(
+            "resource subscribe denied: reason=%s uri=%r client_id=%s",
+            exc,
+            uri_str,
+            safe_client_id(_token_for_log) if _token_for_log is not None else "unknown",
+        )
+        _deny_resource_subscribe()
+    session = _low_level_server.request_context.session
+    # Argus round-5 SUGGESTION: peek (non-mutating) BEFORE the audit write,
+    # mirroring the unsubscribe handler's own no-op gate below -- without
+    # this, an idempotent re-subscribe (same session re-subscribing to a URI
+    # it's already subscribed to -- a legitimate no-op per
+    # `subscriptions.subscribe`'s own idempotency handling) would still write
+    # a fresh `resource.subscribe` audit row every time, unlike the
+    # symmetric no-op case on the unsubscribe side.
+    #
+    # Argus round-6 SUGGESTION: `subscriptions.subscribe()` is still called
+    # UNCONDITIONALLY below, even when `already_subscribed` is True -- it
+    # drops and re-appends the `_Record` with a freshly incremented `seq`,
+    # which shifts this subscription to the newest position in the agent's
+    # cap-eviction queue. That IS a real state mutation (not "nothing"), and
+    # it now happens with no audit row when idempotent. Accepted: the only
+    # externally-observable fact this changes is eviction ORDERING under a
+    # future cap-eviction, not the set of active subscriptions itself, and
+    # auditing every idempotent re-subscribe (MCP clients commonly
+    # re-subscribe after reconnect) would produce far more audit-log noise
+    # than the ordering effect is worth tracking.
+    #
+    # Round-6 also flagged that this race is directionally WORSE than the
+    # unsubscribe TOCTOU below: unsubscribe's race can produce a SURPLUS
+    # audit row for a no-op (tolerable -- every real mutation still has
+    # >=1 row); this race, if a concurrent `notify()` prune removes the
+    # record between this peek and `subscribe()`'s re-add, could produce a
+    # real mutation with ZERO audit rows. Still accepted: it requires a
+    # concurrent prune-on-failed-send racing this exact (uri, session) in
+    # the same narrow window, and the worst case is one missing audit row
+    # for an idempotent-looking call, not a security/access-control gap.
+    already_subscribed = await subscriptions.is_subscribed(auth.canonical_uri, session)
+    if not already_subscribed:
+        # Argus round-2 BLOCKING catch: audit BEFORE mutating the in-memory
+        # registry (was previously the other way around) -- if
+        # `audit_resource_subscription` fails, the exception now propagates
+        # before `subscriptions.subscribe` ever ran, so state and the audit
+        # trail can't diverge (a subscribe with no audit row).
+        async with get_session_factory()() as db_session:
+            await service.audit_resource_subscription(
+                db_session,
+                actor_sub=auth.base_sub,
+                agent_id=auth.caller.id,
+                action="resource.subscribe",
+                uri=auth.canonical_uri,
+                conversation_id=auth.conversation_id,
+            )
+    await subscriptions.subscribe(
+        auth.canonical_uri, session, agent_id=auth.caller.id, sub=auth.base_sub
+    )
+
+
+@_low_level_server.unsubscribe_resource()  # type: ignore[no-untyped-call, untyped-decorator]
+async def _handle_unsubscribe_resource(uri: AnyUrl) -> None:
+    uri_str = str(uri)
+    try:
+        # `require_active=False` (Argus round-2 BLOCKING catch): a
+        # participant who already left/declined must still be able to
+        # remove their own stale subscription record -- gating unsubscribe
+        # on `active` the same as subscribe would make that permanently
+        # impossible except via cap-eviction or a failed-send prune. The
+        # underlying membership/self-or-sibling check still applies
+        # unconditionally; see `authorize_resource_subscribe`'s docstring.
+        auth = await authorize_resource_subscribe(uri_str, require_active=False)
+    except ResourceSubscribeDeniedError as exc:
+        _token_for_log = get_access_token()
+        logger.warning(
+            "resource unsubscribe denied: reason=%s uri=%r client_id=%s",
+            exc,
+            uri_str,
+            safe_client_id(_token_for_log) if _token_for_log is not None else "unknown",
+        )
+        _deny_resource_subscribe()
+    session = _low_level_server.request_context.session
+    # Argus round-4: restores audit-before-mutation (round-2's "unsubscribe
+    # first, branch on its bool return" fix traded this away and reintroduced
+    # exactly the divergence-on-audit-failure bug round-1's BLOCKING finding
+    # #8 fixed -- a transient audit-write failure would leave the
+    # subscription permanently removed with zero audit record, and a client
+    # retry would see `removed=False` and return early, making the gap
+    # unrecoverable; this also violated DESIGN.md §8's "every mutation is
+    # audited" invariant, per Argus round-3's BLOCKING catch).
+    #
+    # `is_subscribed` (non-mutating) decides whether to audit+mutate at all;
+    # the audit write happens BEFORE `unsubscribe()` runs, so a failed audit
+    # write leaves the registry untouched -- no divergence. This reopens a
+    # narrower race than round-2 worried about: between this peek and the
+    # `unsubscribe()` call below, a concurrent removal of this exact record
+    # could make `unsubscribe()` a no-op despite the peek seeing it as
+    # subscribed, producing one spurious audit row. The realistic racer here
+    # (Argus round-4 SUGGESTION -- an earlier version of this comment
+    # incorrectly claimed this needs two operations on the SAME session,
+    # which isn't true) is `notify()`'s own prune-on-send-failure path:
+    # `notify()` releases `subscriptions.py`'s lock across each
+    # `await session.send_resource_updated(...)` call and only re-acquires
+    # it afterward to prune dead/failed records, so a DIFFERENT agent's
+    # concurrent write (which triggers a `notify()` call against this same
+    # subscription) can remove this record in that gap. A `CancelledError`
+    # injected at the `unsubscribe()` await below, after the audit row has
+    # already committed, produces the identical bounded outcome (a stale
+    # audit row for a subscription that's actually still live). Either way
+    # the cost is one extra/stale audit row, far smaller than the bug this
+    # ordering replaces (a real mutation with permanently zero audit trail).
+    # Accepted tradeoff, not revisited without a concrete report of the race
+    # actually occurring.
+    if not await subscriptions.is_subscribed(auth.canonical_uri, session):
+        return
+    async with get_session_factory()() as db_session:
+        await service.audit_resource_subscription(
+            db_session,
+            actor_sub=auth.base_sub,
+            agent_id=auth.caller.id,
+            action="resource.unsubscribe",
+            uri=auth.canonical_uri,
+            conversation_id=auth.conversation_id,
+        )
+    await subscriptions.unsubscribe(auth.canonical_uri, session)
+
+
+# The SDK hardcodes `resources.subscribe=False` in `get_capabilities` even
+# with subscribe/unsubscribe handlers registered (plan doc §3.4 --
+# `mcp/server/lowlevel/server.py::get_capabilities`, verified against
+# fastmcp 3.4.2). Patch the bound method on THIS server instance, after
+# registration above, to advertise `subscribe=True` instead -- otherwise a
+# spec-compliant client never even attempts `resources/subscribe`. See
+# `tests/test_main.py`'s capability test, which pins this so an SDK
+# upgrade that changes the hardcoded default is caught rather than
+# silently regressing.
+_original_get_capabilities = _low_level_server.get_capabilities
+
+
+def _get_capabilities_with_subscribe(
+    notification_options: NotificationOptions,
+    experimental_capabilities: dict[str, dict[str, Any]],
+) -> mt.ServerCapabilities:
+    capabilities = _original_get_capabilities(notification_options, experimental_capabilities)
+    if capabilities.resources is not None:
+        capabilities.resources = capabilities.resources.model_copy(update={"subscribe": True})
+    else:
+        # Argus round-2 SUGGESTION: silently no-op-ing here (as an earlier
+        # revision did) means an SDK upgrade that changes
+        # `get_capabilities` to omit `resources` entirely would quietly
+        # stop advertising subscribe support -- a client would still be
+        # able to call `resources/subscribe` (the handlers are registered
+        # either way) but would never know to try, since capability
+        # negotiation says it can't. Loud, not silent.
+        logger.error(
+            "capabilities.resources is None after calling the original "
+            "get_capabilities() -- the subscribe=True patch below could not "
+            "be applied; clients will not be told this server supports "
+            "resources/subscribe"
+        )
+    return capabilities
+
+
+_low_level_server.get_capabilities = _get_capabilities_with_subscribe  # type: ignore[method-assign]
 
 
 @mcp.custom_route("/health", methods=["GET"])
@@ -957,6 +1208,39 @@ async def decide_approval(request: Request) -> Response:
         except RuntimeError:
             logger.exception("decide_hold invariant violation for hold_id=%s", hold_id)
             return JSONResponse({"error": "internal_error"}, status_code=500)
+
+    # TECH-5903 Phase B: private keys service.decide_hold's approve path
+    # attaches for this handler only -- popped and consumed here, AFTER the
+    # session above closed (post-commit, matching
+    # service._fire_approval_notifier's posture), never sent to the caller.
+    notify_conversation_id = result.pop("_notify_conversation_id", None)
+    notify_active_agent_ids = result.pop("_notify_active_agent_ids", None)
+    notify_inbox_agent_ids = result.pop("_notify_inbox_agent_ids", None)
+    if notify_conversation_id is not None:
+        # Argus round-2 BLOCKING catch: the approval already committed
+        # successfully above -- a ValueError converting one of these
+        # caller-controlled-shape strings back to a UUID must not turn a
+        # genuinely successful decision into an uncaught 500. (A caller that
+        # retries after a 500 would hit HoldAlreadyDecidedError's 409
+        # instead and never see the success it already achieved.)
+        # Notification delivery is best-effort here, same posture as
+        # `_fire_approval_notifier` -- log and move on, still return 200.
+        try:
+            conversation_uuid = uuid.UUID(notify_conversation_id)
+            active_agent_uuids = {uuid.UUID(a) for a in notify_active_agent_ids or []}
+            inbox_agent_uuids = [uuid.UUID(a) for a in notify_inbox_agent_ids or []]
+        except (ValueError, TypeError):
+            logger.exception(
+                "decide_approval: failed to parse notification UUIDs for hold_id=%s; "
+                "decision already committed, skipping notification",
+                hold_id,
+            )
+        else:
+            await subscriptions.notify_conversation_event(
+                conversation_uuid,
+                active_agent_ids=active_agent_uuids,
+                inbox_agent_ids=inbox_agent_uuids,
+            )
 
     return JSONResponse(result, status_code=200)
 
