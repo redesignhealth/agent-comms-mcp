@@ -126,9 +126,9 @@ class TestIsSubscribed:
         subscribed_session, other_session = _FakeSession(), _FakeSession()
         await subscriptions.subscribe(
             "comms://x",
-            subscribed_session,
+            subscribed_session,  # type: ignore[arg-type]
             agent_id=agent_id,
-            sub="a",  # type: ignore[arg-type]
+            sub="a",
         )
         assert await subscriptions.is_subscribed("comms://x", other_session) is False  # type: ignore[arg-type]
 
@@ -252,31 +252,44 @@ class TestRegistryPerAgentCap:
         monkeypatch.setattr(subscriptions, "MAX_SUBSCRIPTIONS_PER_AGENT", 2)
         agent_id = _new_agent_id()
         other_agent_id = _new_agent_id()
+        # Argus round-4 SUGGESTION: bound to locals so these sessions stay
+        # alive (and their weakrefs live) through the assertions below --
+        # an earlier revision constructed these inline as call arguments,
+        # letting each one get garbage-collected immediately after its own
+        # `subscribe()` call returned, so this test was actually exercising
+        # dead-weakref cleanup rather than live-subscription eviction
+        # ordering.
+        other_session, own_session, shared_session, third_session = (
+            _FakeSession(),
+            _FakeSession(),
+            _FakeSession(),
+            _FakeSession(),
+        )
 
         # "shared" enters `_registry` via `other_agent_id` first, so it sits
         # at dict position 0 well before `agent_id` ever subscribes to it.
         await subscriptions.subscribe(
             "comms://shared",
-            _FakeSession(),
+            other_session,  # type: ignore[arg-type]
             agent_id=other_agent_id,
-            sub="other",  # type: ignore[arg-type]
+            sub="other",
         )
         # `agent_id`'s chronologically OLDEST record: a URI unique to it,
         # inserted into the dict only now (dict position 1).
         await subscriptions.subscribe(
             "comms://own",
-            _FakeSession(),
+            own_session,  # type: ignore[arg-type]
             agent_id=agent_id,
-            sub="a",  # type: ignore[arg-type]
+            sub="a",
         )
         # `agent_id`'s chronologically NEWEST record: "shared" already
         # exists in the dict (from `other_agent_id`) at position 0 -- lower
         # dict position than "own" despite a higher seq.
         await subscriptions.subscribe(
             "comms://shared",
-            _FakeSession(),
+            shared_session,  # type: ignore[arg-type]
             agent_id=agent_id,
-            sub="a",  # type: ignore[arg-type]
+            sub="a",
         )
         assert subscriptions._agent_subscription_counts[agent_id] == 2
 
@@ -286,9 +299,9 @@ class TestRegistryPerAgentCap:
         # `agent_id`'s actual oldest record by seq.
         await subscriptions.subscribe(
             "comms://third",
-            _FakeSession(),
+            third_session,  # type: ignore[arg-type]
             agent_id=agent_id,
-            sub="a",  # type: ignore[arg-type]
+            sub="a",
         )
 
         assert "comms://own" not in subscriptions._registry
@@ -638,34 +651,49 @@ class TestSubscribeAuthorization:
         )
         uri = f"comms://comms/conversations/{conversation_id}"
 
-        with (
-            _OIDC_PATCH,
-            _ENV_PATCH,
-            patch("providers.comms.get_access_token", return_value=member_token),
-            patch("providers.comms.get_session_factory", return_value=test_session_factory),
-            patch("main.get_session_factory", return_value=test_session_factory),
-        ):
-            async with Client(main.mcp) as client:
+        # Argus round-4 SUGGESTION: subscribe and unsubscribe now share ONE
+        # `Client` session (an earlier revision used two separate `Client`
+        # blocks -- since `subscriptions.is_subscribed`/registry lookups are
+        # keyed by `ServerSession` weakref IDENTITY, the unsubscribe call
+        # would silently no-op against a different session's record,
+        # leaving the actual stale-subscription-removal path this test
+        # claims to cover completely untested). `_call`'s own OIDC/ENV/token
+        # patches (used for the `comms_leave` tool call in between) can't be
+        # entered while this test's own copies of the SAME patch objects
+        # (`_OIDC_PATCH`/`_ENV_PATCH` are shared, reused objects, not
+        # per-call factories) are already active -- `unittest.mock` raises
+        # "Patch is already started" on a double-enter -- so those patches
+        # are scoped narrowly around just the two low-level calls, with
+        # `_call` running (and entering its own copies) in between while
+        # only the outer `Client` connection itself stays open throughout.
+        async with Client(main.mcp) as client:
+            with (
+                _OIDC_PATCH,
+                _ENV_PATCH,
+                patch("providers.comms.get_access_token", return_value=member_token),
+                patch("providers.comms.get_session_factory", return_value=test_session_factory),
+                patch("main.get_session_factory", return_value=test_session_factory),
+            ):
                 await client.session.subscribe_resource(AnyUrl(uri))
 
-        await _call(
-            main,
-            test_session_factory,
-            member_token,
-            "comms_leave",
-            {"conversation_id": conversation_id},
-        )
+            await _call(
+                main,
+                test_session_factory,
+                member_token,
+                "comms_leave",
+                {"conversation_id": conversation_id},
+            )
 
-        with (
-            _OIDC_PATCH,
-            _ENV_PATCH,
-            patch("providers.comms.get_access_token", return_value=member_token),
-            patch("providers.comms.get_session_factory", return_value=test_session_factory),
-            patch("main.get_session_factory", return_value=test_session_factory),
-        ):
-            async with Client(main.mcp) as client:
-                # Must not raise -- this is exactly the case `require_active=False`
-                # plus `allow_terminal_status=True` exists to permit.
+            with (
+                _OIDC_PATCH,
+                _ENV_PATCH,
+                patch("providers.comms.get_access_token", return_value=member_token),
+                patch("providers.comms.get_session_factory", return_value=test_session_factory),
+                patch("main.get_session_factory", return_value=test_session_factory),
+            ):
+                # Must not raise -- this is exactly the case
+                # `require_active=False` plus `allow_terminal_status=True`
+                # exists to permit.
                 await client.session.unsubscribe_resource(AnyUrl(uri))
 
     async def test_non_member_subscribe_is_uniformly_denied(
@@ -1385,3 +1413,124 @@ class TestRollbackSafety:
             )
 
         notify_mock.assert_not_called()
+
+
+class TestAuditBeforeMutationOrdering:
+    """Argus round-4 SUGGESTION: the happy-path and no-op tests elsewhere in
+    this file pass identically whether the audit write happens before or
+    after the registry mutation -- neither pins the actual ordering
+    guarantee the round-3/round-4 fixes exist to enforce. These tests
+    inject a failure into ``service.audit_resource_subscription`` itself
+    and assert the registry was never mutated when that happens.
+    """
+
+    async def test_failed_audit_leaves_subscribe_registry_unmutated(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        conversation_id, _ids = await _start_open_conversation(
+            main, test_session_factory, "audit-fail-sub-owner", "audit-fail-sub-member"
+        )
+        member_token = _token("audit-fail-sub-member")
+        await _call(
+            main,
+            test_session_factory,
+            member_token,
+            "comms_accept",
+            {"conversation_id": conversation_id},
+        )
+        uri = f"comms://comms/conversations/{conversation_id}"
+
+        with (
+            _OIDC_PATCH,
+            _ENV_PATCH,
+            patch("providers.comms.get_access_token", return_value=member_token),
+            patch("providers.comms.get_session_factory", return_value=test_session_factory),
+            patch("main.get_session_factory", return_value=test_session_factory),
+            patch(
+                "service.audit_resource_subscription",
+                AsyncMock(side_effect=RuntimeError("simulated audit-write failure")),
+            ),
+        ):
+            async with Client(main.mcp) as client:
+                with pytest.raises(Exception):  # noqa: B017 -- any client-side surfacing is fine
+                    await client.session.subscribe_resource(AnyUrl(uri))
+                # The failed audit write must have happened BEFORE any
+                # registry mutation -- so the registry must be untouched.
+                # `client.session` is the CLIENT-side `mcp.ClientSession`,
+                # not the server-side `ServerSession` object the registry
+                # stores weakrefs to (those two are distinct objects
+                # connected over the in-memory transport, and the
+                # server-side one isn't directly reachable from test code)
+                # -- verify via the registry's own shape instead of a
+                # session-identity check.
+                assert uri not in subscriptions._registry
+
+    async def test_failed_audit_leaves_unsubscribe_registry_unmutated(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        conversation_id, _ids = await _start_open_conversation(
+            main, test_session_factory, "audit-fail-unsub-owner", "audit-fail-unsub-member"
+        )
+        member_token = _token("audit-fail-unsub-member")
+        await _call(
+            main,
+            test_session_factory,
+            member_token,
+            "comms_accept",
+            {"conversation_id": conversation_id},
+        )
+        uri = f"comms://comms/conversations/{conversation_id}"
+
+        with (
+            _OIDC_PATCH,
+            _ENV_PATCH,
+            patch("providers.comms.get_access_token", return_value=member_token),
+            patch("providers.comms.get_session_factory", return_value=test_session_factory),
+            patch("main.get_session_factory", return_value=test_session_factory),
+        ):
+            async with Client(main.mcp) as client:
+                await client.session.subscribe_resource(AnyUrl(uri))
+                # See test_failed_audit_leaves_subscribe_registry_unmutated's
+                # comment on why this checks the registry's own shape rather
+                # than `is_subscribed(uri, client.session)`.
+                assert len(subscriptions._registry.get(uri, [])) == 1
+
+                with patch(
+                    "service.audit_resource_subscription",
+                    AsyncMock(side_effect=RuntimeError("simulated audit-write failure")),
+                ):
+                    with pytest.raises(Exception):  # noqa: B017
+                        await client.session.unsubscribe_resource(AnyUrl(uri))
+
+                # The failed audit write must have happened BEFORE
+                # `subscriptions.unsubscribe()` ran -- so the subscription
+                # must still be live.
+                assert len(subscriptions._registry.get(uri, [])) == 1
+
+
+class TestCapDivergenceRecovery:
+    """Argus round-4 BLOCKING catch: `_evict_oldest_for_agent_locked`'s
+    divergence branch (no records found for an agent despite the count
+    saying it's at cap) had no test -- neither existing eviction test
+    reaches it, since both exercise the normal "a record IS found" path.
+    """
+
+    async def test_subscribe_self_heals_a_diverged_count(
+        self, monkeypatch: Any, caplog: Any
+    ) -> None:
+        monkeypatch.setattr(subscriptions, "MAX_SUBSCRIPTIONS_PER_AGENT", 2)
+        agent_id = _new_agent_id()
+        # Force divergence directly: the count claims `agent_id` is at cap,
+        # but `_registry` has no records for it at all.
+        subscriptions._agent_subscription_counts[agent_id] = 2
+
+        session = _FakeSession()
+        with caplog.at_level("ERROR"):
+            await subscriptions.subscribe("comms://x", session, agent_id=agent_id, sub="a")  # type: ignore[arg-type]
+
+        assert "registry/count state has diverged" in caplog.text
+        # Self-healed, not left at 2+1=3 (or worse, growing unboundedly on
+        # every subsequent subscribe) -- exactly one real record now exists,
+        # so the count must read exactly 1.
+        assert subscriptions._agent_subscription_counts[agent_id] == 1
+        assert len(subscriptions._registry["comms://x"]) == 1

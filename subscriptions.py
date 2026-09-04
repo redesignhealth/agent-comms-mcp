@@ -106,12 +106,30 @@ async def subscribe(uri: str, session: ServerSession, *, agent_id: uuid.UUID, su
 
         total_for_agent = _agent_subscription_counts.get(agent_id, 0)
         if total_for_agent >= MAX_SUBSCRIPTIONS_PER_AGENT:
-            _evict_oldest_for_agent_locked(agent_id)
-            logger.warning(
-                "agent %s hit the %d-subscription cap; evicted its oldest subscription",
-                agent_id,
-                MAX_SUBSCRIPTIONS_PER_AGENT,
-            )
+            # Argus round-4 BLOCKING catch: a prior revision logged the
+            # divergence below but still let `subscribe()` fall through to
+            # the unconditional append+increment afterward, so a diverged
+            # agent's count grew to MAX+1, MAX+2, ... on every subsequent
+            # subscribe -- unbounded, with no recovery path. `evicted` now
+            # tells this caller whether the count was actually backed by a
+            # real record; the log line only fires on that success path, so
+            # it no longer contradicts the divergence error logged below.
+            evicted = _evict_oldest_for_agent_locked(agent_id)
+            if evicted:
+                logger.warning(
+                    "agent %s hit the %d-subscription cap; evicted its oldest subscription",
+                    agent_id,
+                    MAX_SUBSCRIPTIONS_PER_AGENT,
+                )
+            else:
+                # Self-heal: the count claimed `agent_id` was at cap, but no
+                # record backs that claim anywhere in `_registry` -- the
+                # count itself is the stale half of the divergence. Reset it
+                # to 0 (about to become 1 via this subscribe's own append)
+                # rather than leaving it at `MAX_SUBSCRIPTIONS_PER_AGENT` and
+                # letting every future subscribe repeat this same detection
+                # forever without ever correcting the underlying number.
+                _agent_subscription_counts.pop(agent_id, None)
 
         # Re-fetched AFTER eviction, not reused from above (Argus round-2
         # BLOCKING catch): eviction can delete `_registry[uri]`'s own list
@@ -127,7 +145,7 @@ async def subscribe(uri: str, session: ServerSession, *, agent_id: uuid.UUID, su
         _agent_subscription_counts[agent_id] = _agent_subscription_counts.get(agent_id, 0) + 1
 
 
-def _evict_oldest_for_agent_locked(agent_id: uuid.UUID) -> None:
+def _evict_oldest_for_agent_locked(agent_id: uuid.UUID) -> bool:
     """Drop the single TRULY oldest record belonging to ``agent_id``, across
     every URI, by creation order (``_Record.seq``) -- not by ``_registry``'s
     own dict/URI iteration order, which reflects URI registration order, not
@@ -136,6 +154,15 @@ def _evict_oldest_for_agent_locked(agent_id: uuid.UUID) -> None:
     subscription this agent registered moments ago while an actually older
     one for the same agent survived, whenever the older one happened to live
     under a later-inserted URI key). Caller must hold ``_lock``.
+
+    Returns ``True`` if a record was actually evicted, ``False`` if
+    ``agent_id`` has no records anywhere in ``_registry`` despite being
+    called only when ``_agent_subscription_counts`` says it's at cap --
+    the caller (``subscribe()``) uses this to distinguish a genuine
+    eviction from a registry/count divergence (Argus round-4 BLOCKING
+    catch: an earlier revision only logged this divergence here and let
+    the caller append+increment unconditionally regardless, growing the
+    count unboundedly past the cap on every subsequent subscribe).
     """
     oldest_uri: str | None = None
     oldest_index: int | None = None
@@ -147,24 +174,22 @@ def _evict_oldest_for_agent_locked(agent_id: uuid.UUID) -> None:
                 oldest_index = index
                 oldest_seq = record.seq
     if oldest_uri is None or oldest_index is None:
-        # Argus round-3 SUGGESTION: this is only ever called when the count
-        # already says `agent_id` is at cap, so finding zero of its records
-        # here means `_registry`/`_agent_subscription_counts` have diverged
-        # -- silently returning would let `subscribe()`'s caller append a
-        # new record right past the cap with no signal that the invariant
-        # broke.
+        # This is only ever called when the count already says `agent_id`
+        # is at cap, so finding zero of its records here means
+        # `_registry`/`_agent_subscription_counts` have diverged.
         logger.error(
             "cap eviction found no records for agent %s despite being at "
             "the %d-subscription cap -- registry/count state has diverged",
             agent_id,
             MAX_SUBSCRIPTIONS_PER_AGENT,
         )
-        return
+        return False
     records = _registry[oldest_uri]
     del records[oldest_index]
     _dec_count(agent_id)
     if not records:
         del _registry[oldest_uri]
+    return True
 
 
 async def is_subscribed(uri: str, session: ServerSession) -> bool:
@@ -187,9 +212,16 @@ async def unsubscribe(uri: str, session: ServerSession) -> bool:
     """Remove ``session``'s subscription to ``uri``, if any. Idempotent.
 
     Returns ``True`` if a record was actually removed, ``False`` if this was
-    a no-op (nothing was registered for this ``(uri, session)`` pair) --
-    callers (``main.py``'s low-level handler) use this to skip writing an
-    audit row for a no-op unsubscribe (Argus round-2 SUGGESTION).
+    a no-op (nothing was registered for this ``(uri, session)`` pair).
+
+    This return value is informational/currently unused by ``main.py``
+    (Argus round-4 SUGGESTION: an earlier revision had the caller branch on
+    it to decide whether to write an audit row, but that ordering had to be
+    reverted -- see ``main.py``'s unsubscribe handler for why -- back to a
+    non-mutating ``is_subscribed()`` peek as the no-op gate, called BEFORE
+    the audit write, with this function's own mutation happening only
+    after). Kept (rather than reverted to returning ``None``) since it's
+    cheap to compute and may be useful to a future caller.
     """
     async with _lock:
         records = _registry.get(uri)

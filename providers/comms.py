@@ -2319,7 +2319,7 @@ async def authorize_resource_subscribe(
             # agent, resolved above) is what gets charged/audited.
             try:
                 await _resolve_caller_agent(session, target.sub, token)
-            except ToolError as exc:
+            except ToolError:
                 # Argus round-3 SUGGESTION: `main.py`'s denial handler logs
                 # this exception's message server-side (`reason=%s`) --
                 # forwarding the raw `ToolError` text here (as the first
@@ -2328,8 +2328,14 @@ async def authorize_resource_subscribe(
                 # else's) would leak the TARGET/inbox-owner's suspension or
                 # registration state to anyone with log access, even though
                 # the client-facing denial stays uniform either way. Use a
-                # fixed category string instead of `str(exc)`.
-                raise ResourceSubscribeDeniedError("inbox_target_unavailable") from exc
+                # fixed category string instead of `str(exc)`. `from None`
+                # (Argus round-4 SUGGESTION), not `from exc`: the latter
+                # still attaches the original `ToolError` as `__cause__`, so
+                # any error-monitoring sink capturing the full exception
+                # chain (Sentry, `logging.exception`, ...) would still see
+                # the target's suspension/registration text even though the
+                # message on this exception itself is scrubbed.
+                raise ResourceSubscribeDeniedError("inbox_target_unavailable") from None
             return ResourceSubscribeAuthorization(
                 caller=requester,
                 base_sub=base_sub,

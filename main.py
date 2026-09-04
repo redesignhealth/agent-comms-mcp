@@ -546,15 +546,24 @@ async def _handle_unsubscribe_resource(uri: AnyUrl) -> None:
     # the audit write happens BEFORE `unsubscribe()` runs, so a failed audit
     # write leaves the registry untouched -- no divergence. This reopens a
     # narrower race than round-2 worried about: between this peek and the
-    # `unsubscribe()` call below, a concurrent prune/unsubscribe of the exact
-    # same (uri, session) pair could make `unsubscribe()` a no-op despite the
-    # peek seeing it as subscribed, producing one spurious audit row. That
-    # window requires two operations racing on the SAME session's SAME
-    # subscription -- session-scoped state only the owning connection would
-    # normally touch -- and its cost (one extra audit row) is far smaller
-    # than the bug it replaces (a real mutation with permanently zero audit
-    # trail). Accepted tradeoff, not revisited without a concrete report of
-    # the race actually occurring.
+    # `unsubscribe()` call below, a concurrent removal of this exact record
+    # could make `unsubscribe()` a no-op despite the peek seeing it as
+    # subscribed, producing one spurious audit row. The realistic racer here
+    # (Argus round-4 SUGGESTION -- an earlier version of this comment
+    # incorrectly claimed this needs two operations on the SAME session,
+    # which isn't true) is `notify()`'s own prune-on-send-failure path:
+    # `notify()` releases `subscriptions.py`'s lock across each
+    # `await session.send_resource_updated(...)` call and only re-acquires
+    # it afterward to prune dead/failed records, so a DIFFERENT agent's
+    # concurrent write (which triggers a `notify()` call against this same
+    # subscription) can remove this record in that gap. A `CancelledError`
+    # injected at the `unsubscribe()` await below, after the audit row has
+    # already committed, produces the identical bounded outcome (a stale
+    # audit row for a subscription that's actually still live). Either way
+    # the cost is one extra/stale audit row, far smaller than the bug this
+    # ordering replaces (a real mutation with permanently zero audit trail).
+    # Accepted tradeoff, not revisited without a concrete report of the race
+    # actually occurring.
     if not await subscriptions.is_subscribed(auth.canonical_uri, session):
         return
     async with get_session_factory()() as db_session:
