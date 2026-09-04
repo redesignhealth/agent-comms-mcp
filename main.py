@@ -52,6 +52,7 @@ from plugins import validate_configuration as validate_plugin_configuration
 from providers.comms import ResourceSubscribeDeniedError, authorize_resource_subscribe, comms_server
 from scopes import (
     PROPOSAL_SUBMIT_SCOPE,
+    check_resource_scope,
     is_interactive_token,
     required_scope_for,
     required_scope_for_resource,
@@ -150,9 +151,14 @@ class ScopeEnforcementMiddleware(Middleware):
         uri = str(context.message.uri)
         token = get_access_token()
 
-        if is_interactive_token(token):
+        if check_resource_scope(token, uri):
             return await call_next(context)
 
+        # `check_resource_scope` only answers the yes/no authorization
+        # question (it deliberately collapses "not enrolled" and "scope
+        # missing" into a single False, per its own docstring) -- the
+        # denial-reason breakdown below is purely for `_deny_resource`'s
+        # structured logging and is otherwise dead code by this point.
         if token is None:
             self._deny_resource(uri, reason="missing_token", client_id=None)
 
@@ -162,15 +168,12 @@ class ScopeEnforcementMiddleware(Middleware):
                 uri, reason="resource_not_enrolled", client_id=safe_client_id(token)
             )
 
-        if required not in scopes_for_token(token):
-            self._deny_resource(
-                uri,
-                reason="missing_scope",
-                client_id=safe_client_id(token),
-                required_scope=required,
-            )
-
-        return await call_next(context)
+        self._deny_resource(
+            uri,
+            reason="missing_scope",
+            client_id=safe_client_id(token),
+            required_scope=required,
+        )
 
     async def on_list_resources(
         self,
@@ -525,14 +528,17 @@ async def _handle_unsubscribe_resource(uri: AnyUrl) -> None:
         )
         _deny_resource_subscribe()
     session = _low_level_server.request_context.session
-    # Argus round-2: reconciles two fixes that would otherwise conflict --
-    # "audit before mutation" (so a failed audit write never leaves the
-    # registry mutated with no audit row) and "skip the audit row for a
-    # no-op unsubscribe" (so a retry after nothing changed doesn't write a
-    # spurious row). Checking non-mutating `is_subscribed` first lets both
-    # hold: a genuine no-op skips both the audit write and the registry
-    # mutation entirely; a real unsubscribe still audits before mutating.
-    if not await subscriptions.is_subscribed(auth.canonical_uri, session):
+    # Argus round-3 BLOCKING catch: the previous two-lock-acquisition
+    # sequence (a non-mutating `is_subscribed` check, an awaited audit
+    # write, THEN `unsubscribe`) left a TOCTOU window across the audit
+    # write's DB await -- a concurrent unsubscribe/prune could remove the
+    # record in that gap, producing a spurious `resource.unsubscribe` audit
+    # row for what was actually a no-op by the time `unsubscribe` itself
+    # ran. Calling `unsubscribe` first and branching on its own `bool`
+    # return collapses this to one lock acquisition: the audit row is only
+    # written when a record was genuinely removed.
+    removed = await subscriptions.unsubscribe(auth.canonical_uri, session)
+    if not removed:
         return
     async with get_session_factory()() as db_session:
         await service.audit_resource_subscription(
@@ -543,7 +549,6 @@ async def _handle_unsubscribe_resource(uri: AnyUrl) -> None:
             uri=auth.canonical_uri,
             conversation_id=auth.conversation_id,
         )
-    await subscriptions.unsubscribe(auth.canonical_uri, session)
 
 
 # The SDK hardcodes `resources.subscribe=False` in `get_capabilities` even
@@ -1153,7 +1158,7 @@ async def decide_approval(request: Request) -> Response:
             conversation_uuid = uuid.UUID(notify_conversation_id)
             active_agent_uuids = {uuid.UUID(a) for a in notify_active_agent_ids or []}
             inbox_agent_uuids = [uuid.UUID(a) for a in notify_inbox_agent_ids or []]
-        except ValueError:
+        except (ValueError, TypeError):
             logger.exception(
                 "decide_approval: failed to parse notification UUIDs for hold_id=%s; "
                 "decision already committed, skipping notification",

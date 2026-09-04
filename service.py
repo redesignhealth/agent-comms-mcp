@@ -1111,13 +1111,21 @@ async def _load_participant_for_read(
     actor_sub: str,
     agent_id: uuid.UUID,
     conversation_id: uuid.UUID,
+    allow_terminal_status: bool = False,
 ) -> tuple[Conversation, Participant]:
     """Load a conversation + participant for ``get_conversation``.
 
     Unlike ``_load_participant_for_transition``, an ``invited`` participant
     is NOT denied here — ``get_conversation`` itself decides what an
     ``invited`` caller may see (metadata only). Only "no participant row"
-    and "left"/"declined" are denied, identically to non-membership.
+    and "left"/"declined" are denied, identically to non-membership --
+    unless ``allow_terminal_status`` is set, in which case a "left"/
+    "declined" participant is treated the same as any other member instead
+    of being denied (TECH-5903 Phase B, Argus round-2 BLOCKING catch: the
+    subscribe-authorization unsubscribe path needs to tolerate a departed
+    participant cleaning up its own stale subscription, which this
+    function's default terminal-status denial otherwise makes impossible —
+    see ``resolve_conversation_participant``).
     """
     conversation = await _find_conversation(session, conversation_id)
     participant = (
@@ -1132,7 +1140,7 @@ async def _load_participant_for_read(
             conversation_id=conversation.id if conversation else None,
             detail={"attempted_agent_id": str(agent_id)},
         )
-    if participant.status in ("left", "declined"):
+    if participant.status in ("left", "declined") and not allow_terminal_status:
         await _deny(
             session,
             actor_sub=actor_sub,
@@ -7103,6 +7111,7 @@ async def resolve_conversation_participant(
     actor_sub: str,
     agent_id: uuid.UUID,
     conversation_id: uuid.UUID,
+    allow_terminal_status: bool = False,
 ) -> tuple[Conversation, Participant]:
     """Public entry point over ``_load_participant_for_read`` (TECH-5903 Phase B).
 
@@ -7114,9 +7123,22 @@ async def resolve_conversation_participant(
     private helper directly or duplicating its logic. Callers that need the
     stricter subscribe-only ``active`` gate on top check ``participant.status``
     themselves and deny via ``deny_resource_subscribe`` below.
+
+    ``allow_terminal_status``, when set, tolerates a ``left``/``declined``
+    participant instead of denying (Argus round-2 BLOCKING catch): the
+    unsubscribe path (``authorize_resource_subscribe`` with
+    ``require_active=False``) must let a departed participant clean up its
+    own stale subscription, which the default terminal-status denial
+    otherwise blocks just as hard as a genuine non-member. Only the
+    unsubscribe call site passes ``True`` — the subscribe path keeps the
+    default ``False`` so a departed participant still cannot re-subscribe.
     """
     return await _load_participant_for_read(
-        session, actor_sub=actor_sub, agent_id=agent_id, conversation_id=conversation_id
+        session,
+        actor_sub=actor_sub,
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+        allow_terminal_status=allow_terminal_status,
     )
 
 

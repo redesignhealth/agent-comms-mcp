@@ -346,7 +346,13 @@ class TestReadResourceMiddleware:
         call_next = AsyncMock()
         bot_token = self._make_token(iss="agent-jwt", scopes=["comms:write"])
 
-        with patch("main.required_scope_for_resource", return_value="comms:read"):
+        # Patched at `scopes.required_scope_for_resource` (not
+        # `main.required_scope_for_resource`): `on_read_resource` now goes
+        # through `scopes.check_resource_scope`, which resolves its own
+        # module-level `required_scope_for_resource` internally -- a patch
+        # on `main`'s imported name would no longer be consulted by that
+        # internal lookup.
+        with patch("scopes.required_scope_for_resource", return_value="comms:read"):
             with patch("main.get_access_token", return_value=bot_token):
                 with pytest.raises(ResourceError, match="requires elevated permissions"):
                     asyncio.run(middleware.on_read_resource(context, call_next))
@@ -359,7 +365,9 @@ class TestReadResourceMiddleware:
         call_next = AsyncMock(return_value=MagicMock())
         bot_token = self._make_token(iss="agent-jwt", scopes=["comms:read"])
 
-        with patch("main.required_scope_for_resource", return_value="comms:read"):
+        # See test_missing_scope_is_rejected's comment on why this patches
+        # `scopes.required_scope_for_resource`, not `main`'s imported name.
+        with patch("scopes.required_scope_for_resource", return_value="comms:read"):
             with patch("main.get_access_token", return_value=bot_token):
                 asyncio.run(middleware.on_read_resource(context, call_next))
 

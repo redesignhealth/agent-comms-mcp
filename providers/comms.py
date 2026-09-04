@@ -2099,6 +2099,7 @@ async def agents_directory_resource() -> dict[str, Any]:
 # one place; `main.py`'s handlers do nothing but call it, register/deregister
 # with `subscriptions.py`, and audit the outcome.
 
+
 # Derived from RESOURCE_TEMPLATE_SCOPES's own template strings (Argus
 # round-2 SUGGESTION) rather than hand-rolled separately -- these two regexes
 # used to duplicate the same URI shapes `scopes.RESOURCE_TEMPLATE_SCOPES`
@@ -2107,10 +2108,25 @@ async def agents_directory_resource() -> dict[str, Any]:
 # placeholder-escaping logic `required_scope_for_resource`'s own matching
 # already relies on, just with named capture groups instead of a bare
 # yes/no match.
-_CONVERSATION_SUBSCRIBE_TEMPLATE = next(
-    t for t in RESOURCE_TEMPLATE_SCOPES if "/conversations/" in t
-)
-_INBOX_SUBSCRIBE_TEMPLATE = next(t for t in RESOURCE_TEMPLATE_SCOPES if "/inbox" in t)
+def _find_template(needle: str) -> str:
+    """Return the sole ``RESOURCE_TEMPLATE_SCOPES`` key containing ``needle``.
+
+    A bare ``next(...)`` with no default raises an undiagnostic
+    ``StopIteration`` at import time if ``RESOURCE_TEMPLATE_SCOPES``'s shape
+    ever changes (Argus round-2 SUGGESTION) -- this raises a
+    ``RuntimeError`` naming exactly which lookup failed instead.
+    """
+    for template in RESOURCE_TEMPLATE_SCOPES:
+        if needle in template:
+            return template
+    raise RuntimeError(
+        f"no RESOURCE_TEMPLATE_SCOPES entry contains {needle!r} -- "
+        "subscribe/unsubscribe authorization cannot resolve its URI templates"
+    )
+
+
+_CONVERSATION_SUBSCRIBE_TEMPLATE = _find_template("/conversations/")
+_INBOX_SUBSCRIBE_TEMPLATE = _find_template("/inbox")
 _CONVERSATION_SUBSCRIBE_URI_RE = compile_uri_template(_CONVERSATION_SUBSCRIBE_TEMPLATE)
 _INBOX_SUBSCRIBE_URI_RE = compile_uri_template(_INBOX_SUBSCRIBE_TEMPLATE)
 
@@ -2242,11 +2258,21 @@ async def authorize_resource_subscribe(
 
         async with _map_service_errors(ResourceSubscribeDeniedError):
             if conversation_id is not None:
+                # `allow_terminal_status=not require_active`: the unsubscribe
+                # call site (`require_active=False`) must tolerate a
+                # `left`/`declined` participant cleaning up its own stale
+                # subscription -- without this, `resolve_conversation_participant`
+                # (via `_load_participant_for_read`) denies a terminal-status
+                # participant BEFORE control ever reaches the
+                # `require_active` check below, making `require_active=False`
+                # a no-op for exactly the departed-participant case it exists
+                # to support (Argus round-2 BLOCKING catch).
                 _, participant = await service.resolve_conversation_participant(
                     session,
                     actor_sub=base_sub,
                     agent_id=requester.id,
                     conversation_id=conversation_id,
+                    allow_terminal_status=not require_active,
                 )
                 if require_active and participant.status != "active":
                     await service.deny_resource_subscribe(
@@ -2291,7 +2317,10 @@ async def authorize_resource_subscribe(
             # write-through side effects apply to the TARGET), but its
             # return value is discarded -- `requester` (the caller's own
             # agent, resolved above) is what gets charged/audited.
-            await _resolve_caller_agent(session, target.sub, token)
+            try:
+                await _resolve_caller_agent(session, target.sub, token)
+            except ToolError as exc:
+                raise ResourceSubscribeDeniedError(str(exc)) from exc
             return ResourceSubscribeAuthorization(
                 caller=requester,
                 base_sub=base_sub,

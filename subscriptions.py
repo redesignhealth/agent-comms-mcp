@@ -53,11 +53,20 @@ class _Record:
     session_ref: weakref.ReferenceType[ServerSession]
     agent_id: uuid.UUID
     sub: str
+    # Monotonically increasing creation order (Argus round-2 BLOCKING catch):
+    # `_evict_oldest_for_agent_locked` must evict the record an agent
+    # actually registered longest ago, not merely the first one encountered
+    # via `_registry`'s dict/URI iteration order (which reflects URI
+    # registration order, not per-agent subscription recency) -- without
+    # this field, eviction could drop a subscription registered moments ago
+    # while an actually-older one for the same agent survives.
+    seq: int
 
 
 _registry: dict[str, list[_Record]] = {}
 _agent_subscription_counts: dict[uuid.UUID, int] = {}
 _lock = asyncio.Lock()
+_seq_counter = 0
 
 
 def _dec_count(agent_id: uuid.UUID) -> None:
@@ -80,6 +89,7 @@ async def subscribe(uri: str, session: ServerSession, *, agent_id: uuid.UUID, su
     stopped being useful — e.g. its owning agent went idle — leaks nothing
     until its next failed send).
     """
+    global _seq_counter
     async with _lock:
         records = _registry.setdefault(uri, [])
         before = len(records)
@@ -103,26 +113,46 @@ async def subscribe(uri: str, session: ServerSession, *, agent_id: uuid.UUID, su
                 MAX_SUBSCRIPTIONS_PER_AGENT,
             )
 
-        records.append(_Record(weakref.ref(session), agent_id, sub))
+        # Re-fetched AFTER eviction, not reused from above (Argus round-2
+        # BLOCKING catch): eviction can delete `_registry[uri]`'s own list
+        # entry entirely (e.g. this agent's oldest subscription happens to
+        # be to this very `uri`) -- appending to the pre-eviction `records`
+        # object in that case would append to a list no longer reachable
+        # from `_registry`, silently dropping this subscription from the
+        # live registry while `_agent_subscription_counts` still counts it
+        # as registered.
+        records = _registry.setdefault(uri, [])
+        _seq_counter += 1
+        records.append(_Record(weakref.ref(session), agent_id, sub, _seq_counter))
         _agent_subscription_counts[agent_id] = _agent_subscription_counts.get(agent_id, 0) + 1
 
 
 def _evict_oldest_for_agent_locked(agent_id: uuid.UUID) -> None:
-    """Drop the single oldest record belonging to ``agent_id``, across every
-    URI. Caller must hold ``_lock``."""
-    # Snapshot via `list(...)` (Argus round-2 SUGGESTION): this loop deletes
-    # from `_registry` mid-iteration. That's only safe today because the
-    # first match always `return`s immediately -- iterating the live dict
-    # directly would raise `RuntimeError: dictionary changed size during
-    # iteration` the moment a match isn't found on the very first URI.
-    for uri, records in list(_registry.items()):
+    """Drop the single TRULY oldest record belonging to ``agent_id``, across
+    every URI, by creation order (``_Record.seq``) -- not by ``_registry``'s
+    own dict/URI iteration order, which reflects URI registration order, not
+    this agent's own subscription recency (Argus round-2 BLOCKING catch: the
+    prior first-match-wins scan over `_registry.items()` could evict a
+    subscription this agent registered moments ago while an actually older
+    one for the same agent survived, whenever the older one happened to live
+    under a later-inserted URI key). Caller must hold ``_lock``.
+    """
+    oldest_uri: str | None = None
+    oldest_index: int | None = None
+    oldest_seq: int | None = None
+    for uri, records in _registry.items():
         for index, record in enumerate(records):
-            if record.agent_id == agent_id:
-                del records[index]
-                _dec_count(agent_id)
-                if not records:
-                    del _registry[uri]
-                return
+            if record.agent_id == agent_id and (oldest_seq is None or record.seq < oldest_seq):
+                oldest_uri = uri
+                oldest_index = index
+                oldest_seq = record.seq
+    if oldest_uri is None or oldest_index is None:
+        return
+    records = _registry[oldest_uri]
+    del records[oldest_index]
+    _dec_count(agent_id)
+    if not records:
+        del _registry[oldest_uri]
 
 
 async def is_subscribed(uri: str, session: ServerSession) -> bool:

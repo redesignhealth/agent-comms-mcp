@@ -10,6 +10,8 @@ from auth import AGENT_TOKEN_VERIFIER_CLAIM, DEFAULT_AGENT_TOKEN_VERIFIER
 from scopes import (
     PROPOSAL_SUBMIT_SCOPE,
     TOOL_SCOPES,
+    check_resource_scope,
+    compile_uri_template,
     is_interactive_token,
     is_registry_backed_agent_token,
     required_scope_for,
@@ -303,3 +305,43 @@ class TestIsRegistryBackedAgentToken:
             }
         )
         assert is_registry_backed_agent_token(token) is False
+
+
+class TestCompileUriTemplate:
+    def test_single_placeholder_extracts_named_group(self) -> None:
+        pattern = compile_uri_template("comms://comms/conversations/{conversation_id}")
+        match = pattern.match("comms://comms/conversations/abc-123")
+        assert match is not None
+        assert match.group("conversation_id") == "abc-123"
+
+    def test_multiple_placeholders_extract_all_groups(self) -> None:
+        pattern = compile_uri_template("comms://comms/agents/{agent_id}/things/{thing_id}")
+        match = pattern.match("comms://comms/agents/agent-1/things/thing-2")
+        assert match is not None
+        assert match.group("agent_id") == "agent-1"
+        assert match.group("thing_id") == "thing-2"
+
+    def test_malformed_unclosed_placeholder_is_treated_as_literal(self) -> None:
+        # `_TEMPLATE_PARAM_RE` only matches a well-formed `{name}` span --
+        # an unclosed brace never matches at all, so it's escaped and
+        # matched as literal text rather than raising or silently
+        # swallowing the rest of the template.
+        pattern = compile_uri_template("comms://comms/conversations/{oops")
+        assert pattern.match("comms://comms/conversations/{oops") is not None
+        assert pattern.match("comms://comms/conversations/anything") is None
+
+
+class TestCheckResourceScope:
+    def test_none_token_returns_false(self) -> None:
+        assert check_resource_scope(None, "comms://comms/agents") is False
+
+    def test_unenrolled_uri_returns_false(self) -> None:
+        token = _fake_access_token(
+            {"iss": "agent-jwt", "sub": "test-svc", "scopes": ["comms:read"]}
+        )
+        assert check_resource_scope(token, "schema://anything") is False
+
+    def test_interactive_token_bypasses_check_regardless_of_uri(self) -> None:
+        token = _fake_access_token({"iss": "https://agent-comms.example/mcp"})
+        assert check_resource_scope(token, "schema://anything") is True
+        assert check_resource_scope(token, "comms://comms/agents") is True

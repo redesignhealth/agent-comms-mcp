@@ -109,6 +109,36 @@ def _new_agent_id() -> uuid.UUID:
     return uuid.uuid4()
 
 
+class TestIsSubscribed:
+    """Argus round-2 SUGGESTION: no direct unit tests existed for the
+    public ``is_subscribed`` function itself, only indirect coverage via
+    ``main.py``'s unsubscribe handler."""
+
+    async def test_unknown_uri_returns_false(self) -> None:
+        result = await subscriptions.is_subscribed(
+            "comms://never-subscribed",
+            _FakeSession(),  # type: ignore[arg-type]
+        )
+        assert result is False
+
+    async def test_different_session_returns_false(self) -> None:
+        agent_id = _new_agent_id()
+        subscribed_session, other_session = _FakeSession(), _FakeSession()
+        await subscriptions.subscribe(
+            "comms://x",
+            subscribed_session,
+            agent_id=agent_id,
+            sub="a",  # type: ignore[arg-type]
+        )
+        assert await subscriptions.is_subscribed("comms://x", other_session) is False  # type: ignore[arg-type]
+
+    async def test_subscribed_session_returns_true(self) -> None:
+        agent_id = _new_agent_id()
+        session = _FakeSession()
+        await subscriptions.subscribe("comms://x", session, agent_id=agent_id, sub="a")  # type: ignore[arg-type]
+        assert await subscriptions.is_subscribed("comms://x", session) is True  # type: ignore[arg-type]
+
+
 class TestRegistryNotify:
     async def test_recipient_filter_narrows_delivery(self) -> None:
         agent_a, agent_b = _new_agent_id(), _new_agent_id()
@@ -160,6 +190,34 @@ class TestRegistryNotify:
         # A second notify must not attempt to call the (now-removed) session
         # again -- nothing left to prune, and no exception either way.
         await subscriptions.notify("comms://x")
+
+    async def test_dead_weakref_excluded_by_recipient_filter_is_still_pruned_and_decremented(
+        self,
+    ) -> None:
+        """Argus round-2 SUGGESTION: a record whose session is already dead
+        AND whose agent is excluded by ``recipient_filter`` (so no send is
+        ever attempted for it) must still be pruned from the registry with
+        its count decremented -- otherwise it would never be pruned, since
+        the only other prune trigger is a failed *send*, which this path
+        never attempts."""
+        agent_id = _new_agent_id()
+        other_agent_id = _new_agent_id()
+
+        async def _subscribe_a_doomed_session() -> None:
+            session = _FakeSession()
+            await subscriptions.subscribe("comms://x", session, agent_id=agent_id, sub="a")  # type: ignore[arg-type]
+
+        await _subscribe_a_doomed_session()
+        gc.collect()
+
+        assert subscriptions._agent_subscription_counts[agent_id] == 1
+
+        # recipient_filter excludes `agent_id` entirely -- no send is ever
+        # attempted for its (already-dead) record.
+        await subscriptions.notify("comms://x", recipient_filter={other_agent_id})
+
+        assert "comms://x" not in subscriptions._registry
+        assert agent_id not in subscriptions._agent_subscription_counts
 
 
 class TestRegistryPerAgentCap:
@@ -620,6 +678,52 @@ class TestSubscribeAuthorization:
         ).scalar_one()
         assert row_count == 1
 
+    async def test_noop_unsubscribe_writes_no_audit_row(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        session: AsyncSession,
+    ) -> None:
+        """Argus round-2 SUGGESTION: calling unsubscribe without ever having
+        subscribed first is a no-op (``subscriptions.unsubscribe`` returns
+        ``False``) -- ``main._handle_unsubscribe_resource`` must skip the
+        audit write entirely in that case, not just skip the registry
+        mutation."""
+        conversation_id, _ids = await _start_open_conversation(
+            main, test_session_factory, "noop-unsub-owner", "noop-unsub-member"
+        )
+        member_token = _token("noop-unsub-member")
+        await _call(
+            main,
+            test_session_factory,
+            member_token,
+            "comms_accept",
+            {"conversation_id": conversation_id},
+        )
+        uri = f"comms://comms/conversations/{conversation_id}"
+
+        with (
+            _OIDC_PATCH,
+            _ENV_PATCH,
+            patch("providers.comms.get_access_token", return_value=member_token),
+            patch("providers.comms.get_session_factory", return_value=test_session_factory),
+            patch("main.get_session_factory", return_value=test_session_factory),
+        ):
+            async with Client(main.mcp) as client:
+                # Never subscribed -- this unsubscribe call is a genuine no-op.
+                await client.session.unsubscribe_resource(AnyUrl(uri))
+
+        row_count = (
+            await session.execute(
+                text(
+                    "SELECT COUNT(*) FROM audit_log WHERE action = 'resource.unsubscribe' "
+                    "AND actor_sub = :actor_sub"
+                ),
+                {"actor_sub": "noop-unsub-member"},
+            )
+        ).scalar_one()
+        assert row_count == 0
+
     async def test_own_inbox_subscribe_succeeds(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
@@ -1003,7 +1107,7 @@ class TestApprovalHttpNotification:
     async def test_approve_notifies_conversation_and_participant_inboxes(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
-        conversation_id, _ids = await _start_open_conversation(
+        conversation_id, ids = await _start_open_conversation(
             main, test_session_factory, "approve-notify-owner", "approve-notify-member"
         )
         member_token = _token("approve-notify-member")
@@ -1034,6 +1138,7 @@ class TestApprovalHttpNotification:
         hold_id = held["hold_id"]
 
         conv_uri = f"comms://comms/conversations/{conversation_id}"
+        inbox_uri = f"comms://comms/agents/{ids['approve-notify-member']}/inbox"
         collector = _NotificationCollector()
 
         fake_provider = _FakeApprovalAuthProvider()
@@ -1053,6 +1158,14 @@ class TestApprovalHttpNotification:
                 patch("main.get_session_factory", return_value=test_session_factory),
             ):
                 await client.session.subscribe_resource(AnyUrl(conv_uri))
+                # Argus round-2 SUGGESTION: this test's name promises
+                # coverage of the inbox-notification behavior too, but a
+                # prior revision never subscribed to any inbox URI, so it
+                # never actually observed it -- the message-hold approve
+                # branch pings every active participant's inbox (see
+                # `service.decide_hold`'s `_notify_inbox_agent_ids`), so
+                # subscribe here and assert delivery below.
+                await client.session.subscribe_resource(AnyUrl(inbox_uri))
 
             with (
                 _OIDC_PATCH,
@@ -1072,17 +1185,22 @@ class TestApprovalHttpNotification:
                     )
             assert resp.status_code == 200
 
-            await _wait_until(lambda: conv_uri in collector.uris)
+            await _wait_until(lambda: conv_uri in collector.uris and inbox_uri in collector.uris)
 
 
 class TestRollbackSafety:
     async def test_failed_write_triggers_zero_notifications(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
-        """Plan doc §5: a write path that fails BEFORE commit must fire no
-        notification at all -- simulated here by forcing
-        ``service.post_message`` to raise mid-call, standing in for a
-        genuine partial-DB-operation-then-rollback failure."""
+        """Call-ordering test, not a true rollback-after-partial-write test
+        (Argus round-2 SUGGESTION): this forces ``service.post_message`` to
+        raise BEFORE any DB work runs, and verifies
+        ``subscriptions.notify_conversation_event`` is never invoked when
+        the service call fails that way. It does NOT exercise a genuine
+        mid-transaction failure after some DB writes but before commit --
+        constructing that correctly would need to force a failure partway
+        through a transaction without corrupting the test DB session for
+        other tests, which is out of scope here."""
         conversation_id, _ids = await _start_open_conversation(
             main, test_session_factory, "rollback-owner", "rollback-member"
         )

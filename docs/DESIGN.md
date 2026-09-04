@@ -774,12 +774,17 @@ the request, mirroring `service._fire_approval_notifier`'s posture):
 | `comms_decline_invite` | Yes (active participants) | the caller |
 | `comms_invite` | Yes (active participants) | the newly-invited target |
 | `comms_leave` | Yes (active participants, now excluding the caller) | the caller |
-| `main.decide_approval` (approve) | Yes (active participants) | active participants, per `service.decide_hold`'s `_notify_*` payload |
+| `main.decide_approval` (approve, message hold) | Yes (active participants) | every active participant |
+| `main.decide_approval` (approve, invite hold) | Yes (active participants, pre-existing — the newly-admitted target isn't active yet) | only the newly-invited target |
 
-A held-for-approval outcome (post_message/invite/start_conversation) fires no
-notification — nothing visible changed yet.
+A held-for-approval outcome (post_message/invite) fires no notification —
+nothing visible changed yet. `comms_start_conversation`'s held branch is
+different: it always still notifies every invited target's inbox (the
+conversation itself is genuinely new, so there is no conversation URI to
+notify) even though the caller's actual opening content is held — only
+`post_message`/`invite` skip notification entirely when held.
 
-
+## 8. Security invariants
 
 1. Owner identity derives from verified OAuth token claims, never parameters.
 2. High-risk content crosses an ownership boundary only via an explicitly-approved
