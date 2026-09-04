@@ -1248,13 +1248,16 @@ across two opposite auth postures:
   `GET /proposals/{id}` (`service.get_proposal_for_bot`) is the only place
   a bot can learn a proposal's outcome after the fact if it wasn't decided
   synchronously in its own submission response (i.e., a human decided it
-  later). Every bot-facing return path -- this one, and `create_proposal`'s
-  own (a submission response can itself observe a hold a CONCURRENT human
-  decide already claimed, on its lost-claim-race fallback branches) --
-  goes through the shared `service._bot_facing_proposal_dict` formatter,
-  which omits `decided_by_actor_id` whenever `decision_source == "human"`,
-  so a human reviewer's own identity is never disclosed to the bot that
-  merely proposed something. `decide_proposal` and
+  later). Every bot-facing return path -- this one, `withdraw_proposal`'s
+  own, and `create_proposal`'s (a submission response can itself observe a
+  hold a CONCURRENT human decide already claimed, on its lost-claim-race
+  fallback branches) -- goes through the shared
+  `service._bot_facing_proposal_dict` formatter (or, where only a plain
+  dict is available rather than the `ProposalHold` object, its dict-
+  accepting sibling `service._redact_bot_facing_dict`), which omits
+  `decided_by_actor_id` whenever `decision_source == "human"`, so a human
+  reviewer's own identity is never disclosed to the bot that merely
+  proposed something. `decide_proposal` and
   `list_pending_proposal_holds` are human-facing and call the unredacted
   `service._proposal_dict` directly -- never route those through the
   bot-facing formatter.

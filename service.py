@@ -5700,9 +5700,27 @@ def _bot_facing_proposal_dict(hold: ProposalHold) -> dict[str, Any]:
     which leaked exactly the identity ``get_proposal_for_bot`` was already
     redacting. Use this here AND there; never call ``_proposal_dict``
     directly from a bot-facing return path again.
+
+    ``create_proposal``'s auto-judge happy path already has a
+    ``dict[str, Any]`` from ``_apply_or_finalize_proposal_hold`` (a
+    ``ProposalHold`` was re-fetched and discarded internally, so there's
+    no hold object left to pass here) -- use ``_redact_bot_facing_dict``
+    directly for that call site instead of duplicating the redaction rule
+    inline (Argus review round-4 suggestion).
     """
-    result = _proposal_dict(hold)
-    if hold.decision_source == "human":
+    return _redact_bot_facing_dict(_proposal_dict(hold), decision_source=hold.decision_source)
+
+
+def _redact_bot_facing_dict(
+    result: dict[str, Any], *, decision_source: str | None
+) -> dict[str, Any]:
+    """Shared redaction rule ``_bot_facing_proposal_dict`` applies to a
+    ``ProposalHold`` -- factored out so a caller holding only the already-
+    built dict (not the ORM object) can apply the SAME rule without a
+    second, driftable copy of the ``if decision_source == "human": pop(...)``
+    logic (Argus review round-4 suggestion, closing the dead-code inline
+    guard this replaced at ``create_proposal``'s auto-judge happy path)."""
+    if decision_source == "human":
         result.pop("decided_by_actor_id", None)
     return result
 
@@ -6032,13 +6050,12 @@ async def create_proposal(
         # `ProposalHold` -- doesn't apply directly here. Its
         # `decision_source` is always ``"auto"`` on THIS call (the only
         # other caller, `decide_proposal`, passes `"human"`), so this is a
-        # no-op today, not an actual leak -- but redact anyway (Argus
-        # review round-3 suggestion) so every bot-facing return path in
-        # this function uses the SAME redaction rule, not one relying on
-        # this call site's argument happening to be `"auto"`.
-        if result.get("decision_source") == "human":
-            result.pop("decided_by_actor_id", None)
-        return result
+        # no-op today, not an actual leak -- but redact anyway, through the
+        # SAME shared rule `_bot_facing_proposal_dict` itself uses (Argus
+        # review round-4 suggestion: a separate inline copy of the rule was
+        # dead code with no way to regress-test it), so no bot-facing
+        # return path in this function ever relies on convention alone.
+        return _redact_bot_facing_dict(result, decision_source=result.get("decision_source"))
     # Vanishingly unlikely given the claim above already serializes
     # access to this hold_id, but the helper's own re-check is the
     # authoritative guard, not this comment -- reload and return current

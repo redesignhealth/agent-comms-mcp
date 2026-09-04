@@ -131,14 +131,12 @@ PROPOSAL_HOLD_STATUSES = (
 # initiated retraction, not the TTL-based lazy expiry `approval_holds`
 # uses for its own (differently-named) `expired` status: `ProposalHold`
 # has no `expires_at` column and no sweep/lazy-touch mechanism at all.
-# Its purpose is letting a bot retire a stale pending proposal it no
-# longer wants decided -- most commonly right before resubmitting a
-# replacement with a DIFFERENT `target_id`/`action_type` (a same-key
-# resubmission is already handled for free by the existing create-time
-# dedup, which updates a matching pending row in place instead of
-# leaving it stranded -- withdraw exists for the cases dedup can't
-# reach: retiring a proposal outright with no replacement, or replacing
-# it with a different target/action_type that dedup would never match).
+# Its purpose is letting a bot retire a proposal it has since determined
+# is stale or simply wrong, before a human can decide it -- NOT for
+# freeing up the create-time dedup key: a resubmission for the SAME
+# `(kind, proposed_by_bot_id, target_id, action_type)` key already
+# updates the existing pending row in place at create time, and a
+# DIFFERENT key was never blocked to begin with.
 PROPOSAL_HOLD_DECISION_SOURCES = ("human", "auto", "bot")
 # `"bot"` (TECH-6018) marks a decision made by the SUBMITTING bot itself
 # (currently only via withdraw) -- distinct from `"auto"` (the TECH-5877

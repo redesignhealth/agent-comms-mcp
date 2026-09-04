@@ -16,12 +16,13 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import func, select, text, update
+from sqlalchemy import select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -232,13 +233,18 @@ class TestDedup:
         """Argus review round-3 suggestion: the exact scenario the round-2
         BLOCKING fix (``_bot_facing_proposal_dict``) was written for --
         seed an ``'applying'`` row a HUMAN concurrently claimed (dedup's
-        partial index covers ``'applying'`` too, per this module's own
-        docstring), resubmit against the SAME dedup key, and confirm the
-        submitting bot's response never discloses that human's identity.
-        Without the round-2 fix, every one of the three converted
-        ``create_proposal`` return sites could regress to a bare
-        ``_proposal_dict`` call and this test would still pass green if it
-        only checked ``status`` -- it must assert the REDACTION itself."""
+        partial index covers ``'applying'`` too, per
+        ``service._proposal_dedup_where``'s own docstring), resubmit
+        against the SAME dedup key, and confirm the submitting bot's
+        response never discloses that human's identity. Covers the
+        dedup-into-``applying`` return path specifically (service.py:5986)
+        -- without the round-2 fix, that path returned a bare
+        ``_proposal_dict`` and this test would still pass green if it only
+        checked ``status`` -- it must assert the REDACTION itself. The lost-
+        claim-race and auto-judge return paths are separately reachable
+        only via a hand-authored race (see
+        ``test_integrity_error_race_falls_back_to_select_and_update`` for
+        that pattern) and are not exercised by this test."""
         action = _action(target_id="TECH-77")
         applying_hold = ProposalHold(
             kind="linear_progress_update",
@@ -254,7 +260,7 @@ class TestDedup:
             status="applying",
             decision_source="human",
             decided_by_actor_id="owner-a@example.com",
-            decided_at=func.now(),
+            decided_at=datetime.now(UTC),
         )
         session.add(applying_hold)
         await session.commit()
