@@ -319,14 +319,23 @@ proposal_holds id, kind (at the DB level an open TEXT column -- NOT
  docstring and the `ck_proposal_holds_decision_consistency` CHECK).
  **Stuck `applying` rows** (the process dies between the claim commit and
  the terminal write -- rare, but not impossible) have no background
- reaper today: the row is invisible to `list_pending_proposal_holds`
- (`status='pending'` only) and a decide call on it raises
- `HoldAlreadyDecidedError`, so the only recovery path is a fresh
- `POST /proposals` resubmission for the same target (dedup is scoped to
- `pending`+`applying`, so a resubmission while the ORIGINAL is still
- legitimately in-flight is correctly blocked too -- see "The proposal
- submission pipeline" below; this only matters once the stuck row is
- truly abandoned, which nothing currently detects automatically). Migration
+ reaper today AND no in-app recovery path (corrected, Argus review
+ round-4 suggestion -- an earlier version of this note claimed a fresh
+ `POST /proposals` resubmission could recover one; it cannot, precisely
+ BECAUSE the round-3 B1 dedup fix now also matches `applying` rows: a
+ resubmission for the same target finds the stuck row via dedup and is
+ folded into it as a no-op, per `_dedup_or_insert_proposal`'s "don't
+ mutate an in-flight applying row" guard -- it can never re-arm it). The
+ row is also invisible to `list_pending_proposal_holds` (`status='pending'`
+ only) and a decide call on it raises `HoldAlreadyDecidedError`. The ONLY
+ real recovery today is manual DB intervention: an operator running
+ `UPDATE proposal_holds SET status = 'apply_failed', apply_error = '<note>'
+ WHERE id = '<hold_id>'` (the same terminal status a genuine Linear
+ failure would have produced), after which a fresh `POST /proposals`
+ resubmission for the same target works normally again. Automating this
+ (a background reaper that transitions `applying` rows older than some
+ threshold to `apply_failed`) is a reasonable follow-up, not yet built.
+ Migration
  only in TECH-5871 (+ e2f7a91c5b34 for `applying`); `POST /proposals`
  (submission), `GET /proposals/pending` (listing), per-bot rate limiting,
  and the deterministic auto-approval judge shipped as the follow-on
@@ -1145,6 +1154,19 @@ claim observes `"applying"`, not `"pending"`, and raises
 now-current state (`create_proposal`, which never "decides" anything --
 it just reports the hold's already-resolved status) instead of ever
 reaching the fingerprinter/applier itself.
+
+**Latency (Argus review round-4 suggestion):** `POST /proposals` was
+DB-only latency before TECH-5873 landed the auto-apply behavior above.
+On the auto-approved path it can now make up to two sequential Linear
+HTTP calls (fingerprint fetch, then the write) inline before responding,
+each bounded by `linear_client._LINEAR_REQUEST_TIMEOUT_SECONDS` -- worst
+case, tens of seconds, not the sub-second DB-only latency this endpoint
+had before. A client or load balancer with a short timeout tuned to the
+old behavior can time out mid-apply; the apply itself still completes
+server-side and the hold still resolves to a terminal status, but the
+caller's HTTP request may not see the response. Any client integrating
+against this endpoint should set a timeout comfortably longer than
+`linear_client._LINEAR_REQUEST_TIMEOUT_SECONDS * 2`.
 
 **`POST /proposals/{id}/decide`** (TECH-5873, `service.decide_proposal`) is
 the human decide-and-synchronously-apply endpoint for a still-`"pending"`

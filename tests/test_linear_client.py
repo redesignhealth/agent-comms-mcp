@@ -38,12 +38,6 @@ def _set_fake_post(monkeypatch: pytest.MonkeyPatch, response: httpx.Response) ->
     monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
 
 
-def _run(coro: object) -> object:
-    import asyncio
-
-    return asyncio.run(coro)  # type: ignore[arg-type]
-
-
 class TestRequireApiToken:
     def test_missing_token_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(_TOKEN_ENV_VAR, raising=False)
@@ -56,7 +50,7 @@ class TestRequireApiToken:
 
 
 class TestPostGraphql:
-    def test_transport_error_wrapped_as_linear_api_error(
+    async def test_transport_error_wrapped_as_linear_api_error(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
@@ -68,18 +62,18 @@ class TestPostGraphql:
 
         monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
         with pytest.raises(LinearAPIError):
-            _run(_post_graphql("query {}", {}))
+            await _post_graphql("query {}", {})
 
-    def test_non_2xx_status_wrapped_as_linear_api_error(
+    async def test_non_2xx_status_wrapped_as_linear_api_error(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
         response = httpx.Response(500, request=httpx.Request("POST", linear_client._LINEAR_API_URL))
         _set_fake_post(monkeypatch, response)
         with pytest.raises(LinearAPIError):
-            _run(_post_graphql("query {}", {}))
+            await _post_graphql("query {}", {})
 
-    def test_json_decode_error_wrapped_as_linear_api_error(
+    async def test_json_decode_error_wrapped_as_linear_api_error(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Argus review B2: a 2xx response with a non-JSON body raises
@@ -94,9 +88,9 @@ class TestPostGraphql:
         )
         _set_fake_post(monkeypatch, response)
         with pytest.raises(LinearAPIError):
-            _run(_post_graphql("query {}", {}))
+            await _post_graphql("query {}", {})
 
-    def test_graphql_errors_payload_extracts_message_only(
+    async def test_graphql_errors_payload_extracts_message_only(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Argus review S4: only the ``message`` field of each GraphQL
@@ -118,13 +112,13 @@ class TestPostGraphql:
         )
         _set_fake_post(monkeypatch, response)
         with pytest.raises(LinearAPIError) as exc_info:
-            _run(_post_graphql("query {}", {}))
+            await _post_graphql("query {}", {})
         message = str(exc_info.value)
         assert "Issue not found" in message
         assert "secret-detail" not in message
         assert "extensions" not in message
 
-    def test_missing_data_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_missing_data_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
         response = httpx.Response(
             200,
@@ -133,9 +127,9 @@ class TestPostGraphql:
         )
         _set_fake_post(monkeypatch, response)
         with pytest.raises(LinearAPIError, match="missing 'data'"):
-            _run(_post_graphql("query {}", {}))
+            await _post_graphql("query {}", {})
 
-    def test_follow_redirects_disabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_follow_redirects_disabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Argus review S10: SSRF-avoidance convention shared with
         ``plugins.py``'s webhook client -- ``follow_redirects=False``."""
         monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
@@ -153,7 +147,7 @@ class TestPostGraphql:
             request=httpx.Request("POST", linear_client._LINEAR_API_URL),
         )
         _set_fake_post(monkeypatch, response)
-        _run(_post_graphql("query {}", {}))
+        await _post_graphql("query {}", {})
         assert captured["follow_redirects"] is False
 
 

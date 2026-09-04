@@ -146,21 +146,6 @@ async def fetch_current_fingerprint(target_id: str) -> str:
         raise LinearAPIError(f"Linear API returned no issue for id={target_id!r}")
     return compute_target_fingerprint(issue)
 
-    # Argus review round-3 S4: the OR-vs-AND semantics only exist for the
-    # close-ticket action types (the judge's rule that EITHER field being
-    # valid is sufficient). Scoping the omit-and-continue behavior to
-    # THOSE action types specifically, rather than every action type,
-    # matters because open_ticket's judge rule requires exactly ONE field
-    # (`source_message_url`) to be valid with no OR-partner -- there is
-    # no "the other field covered for it" story there, so a
-    # present-but-invalid field on an open_ticket apply (necessarily
-    # reached via manual human approval, since the judge itself would
-    # never have auto-approved it) must still raise, not silently post a
-    # citation-free comment.
-
-
-_CLOSE_TICKET_ACTION_TYPES = frozenset({"close_ticket"})
-
 
 def _progress_comment_body(action: dict[str, Any]) -> str:
     # Argus review S3: re-validate URL fields with the same allowlist
@@ -187,7 +172,7 @@ def _progress_comment_body(action: dict[str, Any]) -> str:
     # no such OR-partner, so a present-but-invalid field there still
     # raises (see the module-level comment above this function).
     action_type = action.get("action_type", "update")
-    omit_instead_of_raise = action_type in _CLOSE_TICKET_ACTION_TYPES
+    omit_instead_of_raise = action_type in citation_urls.CLOSE_TICKET_ACTION_TYPES
     lines = [f"Progress update: {action_type}"]
     rationale = action.get("rationale")
     if isinstance(rationale, str) and rationale:

@@ -5523,7 +5523,12 @@ def _derive_proposal_priority(kind: str, action: dict[str, Any]) -> str:
 # needs its OWN judge function registered in ``_PROPOSAL_JUDGES`` below --
 # deliberately not a shared/generic judge across kinds.
 _LINEAR_OPEN_TICKET_ACTION_TYPES = frozenset({"open_ticket"})
-_LINEAR_CLOSE_TICKET_ACTION_TYPES = frozenset({"close_ticket"})
+# Shared with linear_client.py (Argus review round-4 suggestion): the
+# applier mirrors this judge's OR-of-two-fields auto-approval rule by
+# omitting rather than raising on an invalid citation field, but ONLY for
+# these same action types -- a locally-duplicated literal here risked the
+# two silently desyncing.
+_LINEAR_CLOSE_TICKET_ACTION_TYPES = citation_urls.CLOSE_TICKET_ACTION_TYPES
 
 # Argus review B4: presence of a non-empty string was NOT sufficient to
 # treat a citation as real -- a bot could self-approve by writing ANY
@@ -6064,6 +6069,28 @@ async def _claim_proposal_hold_for_applying(
     return True
 
 
+_MAX_APPLY_ERROR_LENGTH = 500
+
+
+def _sanitize_apply_error(exc: Exception) -> str:
+    """Bound the length of a ``LinearAPIError`` message before it's
+    persisted to ``hold.apply_error`` and returned to API callers via
+    ``_proposal_dict`` (Argus review round-4 suggestion). The messages
+    this module and ``linear_client.py`` construct themselves are already
+    curated -- ``linear_client._post_graphql`` extracts only the
+    ``message`` field from Linear's own GraphQL error objects (Argus
+    review round-2 S4), never the raw error payload -- so this is
+    defense-in-depth against an unexpectedly verbose ``httpx`` transport
+    exception (a stack-trace-shaped ``str()``, or a very long redirect
+    chain description) rather than a response to any KNOWN leak; truncate
+    rather than replace, so a human debugging ``apply_failed`` still sees
+    the actual error, just capped."""
+    text = str(exc)
+    if len(text) <= _MAX_APPLY_ERROR_LENGTH:
+        return text
+    return text[:_MAX_APPLY_ERROR_LENGTH] + "... (truncated)"
+
+
 async def _apply_or_finalize_proposal_hold(
     session: AsyncSession,
     *,
@@ -6118,27 +6145,51 @@ async def _apply_or_finalize_proposal_hold(
     fetching the current fingerprint must resolve the hold to
     ``"apply_failed"`` like any other Linear failure, not propagate past
     this function to main.py's generic 500 handler.
+
+    Releases the DB connection this function's own initial read checks
+    out, via a bare ``session.commit()``, BEFORE the fingerprinter/applier
+    calls (Argus review round-4 B2): committing (even with no pending
+    changes) ends the implicit read transaction that read opened and
+    returns the connection to the pool -- ``db.py``'s pool is capped at
+    10 connections (``pool_size=5, max_overflow=5``), and both call sites
+    (``main.decide_proposal_route``, ``main.submit_proposal``) wrap this
+    entire function in an outer ``async with get_session_factory()()``
+    block, so without this the connection stays checked out for the FULL
+    ~10-20s external round-trip, not just the final write -- ten
+    concurrent approvals/auto-applies would exhaust the pool and stall
+    every other DB operation in the service. ``expire_on_commit=False``
+    (``db.py``) means ``hold`` would stay readable post-commit anyway, but
+    the fields needed across the I/O gap are captured into local
+    variables regardless, for clarity independent of that setting. The
+    session object itself remains fully usable afterward -- SQLAlchemy
+    transparently checks out a fresh connection from the pool on the next
+    query (the ``FOR UPDATE`` re-fetch below), it does not need to be
+    replaced with a new session.
     """
     hold = await _find_proposal_hold(session, hold_id)
     if hold is None:
         raise AssertionError("invariant violation: hold vanished between commit and re-read")
     target_id, _action_type = _extract_proposal_target(hold.action)
+    kind = hold.kind
+    action = hold.action
+    stored_fingerprint = hold.target_fingerprint
+    await session.commit()
 
     is_stale = False
     apply_error: str | None = None
     try:
-        fingerprinter = getattr(linear_client, _PROPOSAL_FINGERPRINTER_NAMES[hold.kind])
+        fingerprinter = getattr(linear_client, _PROPOSAL_FINGERPRINTER_NAMES[kind])
         current_fingerprint = await fingerprinter(target_id)
-        is_stale = current_fingerprint != hold.target_fingerprint
+        is_stale = current_fingerprint != stored_fingerprint
     except linear_client.LinearAPIError as exc:
-        apply_error = str(exc)
+        apply_error = _sanitize_apply_error(exc)
     else:
         if not is_stale:
-            applier = getattr(linear_client, _PROPOSAL_APPLIER_NAMES[hold.kind])
+            applier = getattr(linear_client, _PROPOSAL_APPLIER_NAMES[kind])
             try:
-                await applier(hold.action)
+                await applier(action)
             except linear_client.LinearAPIError as exc:
-                apply_error = str(exc)
+                apply_error = _sanitize_apply_error(exc)
 
     hold = await _find_proposal_hold(session, hold_id, for_update=True)
     if hold is None:
@@ -6253,11 +6304,11 @@ async def decide_proposal(
     and raises ``HoldAlreadyDecidedError`` itself without ever reaching
     the applier. It then delegates to ``_apply_or_finalize_proposal_hold``,
     which re-fetches the target's current state via the kind-scoped
-    fingerprinter (``_PROPOSAL_FINGERPRINTERS``) and compares it against
+    fingerprinter (``_PROPOSAL_FINGERPRINTER_NAMES``) and compares it against
     ``hold.target_fingerprint`` (the fingerprint the proposing bot computed
     at submission time) BEFORE writing anything. A mismatch means the
     target drifted since submission -- sets ``status="stale"`` and returns
-    without ever calling the kind-scoped applier (``_PROPOSAL_APPLIERS``).
+    without ever calling the kind-scoped applier (``_PROPOSAL_APPLIER_NAMES``).
     A match proceeds to the actual write; success sets ``status="applied"``
     (and ``applied_at``), a raised ``linear_client.LinearAPIError`` from
     EITHER the fingerprinter or the applier (Argus review round-2 B2) sets

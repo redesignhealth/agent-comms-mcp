@@ -76,14 +76,20 @@ class TestIsValidCitationUrl:
     def test_non_allowlisted_host_rejected(self) -> None:
         assert is_valid_citation_url("https://not-allowlisted.example/p123") is False
 
-    def test_userinfo_embedded_host_still_validated_by_hostname_not_userinfo(self) -> None:
-        """`urlsplit` parses the userinfo separately from the hostname --
-        confirm a malicious userinfo component (a common URL-parsing
-        confusion vector: `https://github.com@evil.example/`) is judged by
-        the actual host (`evil.example`), not by whatever precedes the
-        `@`."""
+    def test_userinfo_embedded_url_rejected_even_with_allowlisted_host(self) -> None:
+        """Argus review round-4 suggestion: userinfo is rejected outright,
+        regardless of which host follows the `@` -- the full URL
+        (userinfo included) is posted verbatim into the Linear comment,
+        so an allowlisted host after the `@` doesn't make the userinfo
+        component itself safe to display (a social-engineering vector:
+        `https://click-here-for-a-refund@redesignhealth.slack.com/...`).
+        This also covers the classic confusion vector where a malicious
+        host masquerades as userinfo ahead of a real one
+        (`https://github.com@evil.example/`) -- both shapes are rejected
+        by the same blanket rule, not by hostname-parsing correctness
+        alone."""
         assert is_valid_citation_url("https://github.com@evil.example/") is False
-        assert is_valid_citation_url("https://evil.example@github.com/") is True
+        assert is_valid_citation_url("https://evil.example@github.com/") is False
 
     def test_missing_hostname_rejected(self) -> None:
         assert is_valid_citation_url("https:///path-with-no-host") is False
