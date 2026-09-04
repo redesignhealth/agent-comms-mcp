@@ -1061,6 +1061,69 @@ class TestGetProposalEndpoint:
         )
         assert resp.status_code == 403
 
+    async def test_interactive_token_rejection_is_audited(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        """Guards the ``surface="get"`` literal threaded through
+        ``_authenticate_proposal_submitter`` -> ``audit_denied_proposal_submission``
+        (Argus review round-2 suggestion): a typo in that literal would
+        raise a ``ValueError`` (unioned into ``PROPOSAL_SUBMITTER_SURFACES``)
+        rather than silently misrecording as a ``submit`` denial, so this
+        must assert the EXACT action string, not just "some row exists"."""
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider)
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+        resp = await http_client.get(
+            f"/proposals/{proposal_id}", headers={"Authorization": "Bearer human-token"}
+        )
+        assert resp.status_code == 403
+
+        rows = (
+            (
+                await session.execute(
+                    select(AuditLog.action).where(
+                        AuditLog.action == "denied.proposal_get_not_agent_token"
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert rows
+
+    async def test_agent_jwt_missing_scope_is_audited(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        """Same guard as ``test_interactive_token_rejection_is_audited``,
+        for the other ``ALLOWED_DENIAL_REASONS`` branch."""
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider)
+        provider.tokens["under-scoped-bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:write"], owner_sub="owner-a@example.com"
+        )
+        resp = await http_client.get(
+            f"/proposals/{proposal_id}",
+            headers={"Authorization": "Bearer under-scoped-bot-token"},
+        )
+        assert resp.status_code == 403
+
+        rows = (
+            (
+                await session.execute(
+                    select(AuditLog.action).where(
+                        AuditLog.action == "denied.proposal_get_missing_scope"
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert rows
+
     async def test_uniform_404_for_unknown_hold(
         self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
     ) -> None:
@@ -1134,6 +1197,9 @@ class TestGetProposalEndpoint:
         assert resp.status_code == 200
         assert resp.json()["status"] == "rejected"
         assert resp.json()["decision_note"] == "no thanks"
+        # Privacy redaction (Argus review round-2 BLOCKING): the human
+        # reviewer's own identity must never reach the submitting bot.
+        assert "decided_by_actor_id" not in resp.json()
 
 
 class TestWithdrawProposalEndpoint:
@@ -1152,6 +1218,67 @@ class TestWithdrawProposalEndpoint:
             json={},
         )
         assert resp.status_code == 403
+
+    async def test_interactive_token_rejection_is_audited(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        """Guards the ``surface="withdraw"`` literal (Argus review round-2
+        suggestion) -- see the twin test on ``TestGetProposalEndpoint`` for
+        why the exact action string matters here, not just row existence."""
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider)
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+        resp = await http_client.post(
+            f"/proposals/{proposal_id}/withdraw",
+            headers={"Authorization": "Bearer human-token"},
+            json={},
+        )
+        assert resp.status_code == 403
+
+        rows = (
+            (
+                await session.execute(
+                    select(AuditLog.action).where(
+                        AuditLog.action == "denied.proposal_withdraw_not_agent_token"
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert rows
+
+    async def test_agent_jwt_missing_scope_is_audited(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider)
+        provider.tokens["under-scoped-bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:write"], owner_sub="owner-a@example.com"
+        )
+        resp = await http_client.post(
+            f"/proposals/{proposal_id}/withdraw",
+            headers={"Authorization": "Bearer under-scoped-bot-token"},
+            json={},
+        )
+        assert resp.status_code == 403
+
+        rows = (
+            (
+                await session.execute(
+                    select(AuditLog.action).where(
+                        AuditLog.action == "denied.proposal_withdraw_missing_scope"
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert rows
 
     async def test_uniform_404_for_unknown_hold(
         self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
@@ -1285,6 +1412,23 @@ class TestWithdrawProposalEndpoint:
         assert resp.status_code == 422
         assert resp.json()["error"] == "invalid_body"
 
+    async def test_non_empty_malformed_json_body_returns_invalid_json_422(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        """A truly empty body is a lenient no-reason withdraw (see
+        ``test_withdraw_without_body_succeeds_with_no_reason``), but a
+        NON-empty body that fails to parse as JSON is malformed input, not
+        an absent one -- Argus review round-2 suggestion."""
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider)
+        resp = await http_client.post(
+            f"/proposals/{proposal_id}/withdraw",
+            headers={"Authorization": "Bearer bot-token"},
+            content=b"not json",
+        )
+        assert resp.status_code == 422
+        assert resp.json()["error"] == "invalid_json"
+
     async def test_non_string_reason_returns_invalid_reason_422(
         self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
     ) -> None:
@@ -1327,6 +1471,16 @@ class TestProposalRouteRegistrationOrder:
 
     def test_pending_registered_before_wildcard_proposal_id(self) -> None:
         main = _import_main()
+        # `_additional_http_routes` is a private FastMCP attribute (Argus
+        # review round-2 suggestion) -- a future FastMCP upgrade could
+        # rename or drop it. Skip rather than fail so an unrelated
+        # dependency bump doesn't block CI on a test whose only job is
+        # guarding an internal-to-this-repo invariant, not FastMCP's API.
+        if not hasattr(main.mcp, "_additional_http_routes"):
+            pytest.skip(
+                "main.mcp._additional_http_routes no longer exists on this FastMCP "
+                "version -- this test needs a new way to inspect registered routes"
+            )
         paths = [getattr(route, "path", None) for route in main.mcp._additional_http_routes]
         assert "/proposals/pending" in paths
         assert "/proposals/{proposal_id}" in paths

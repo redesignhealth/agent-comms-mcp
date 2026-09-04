@@ -1106,12 +1106,11 @@ async def get_proposal(request: Request) -> Response:
 @mcp.custom_route("/proposals/{proposal_id}/withdraw", methods=["POST"])
 async def withdraw_proposal_route(request: Request) -> Response:
     """Let the SUBMITTING bot retire its own still-``pending`` proposal
-    (TECH-6018) -- most useful right before resubmitting a replacement
-    with a DIFFERENT ``target_id``/``action_type`` that the existing
-    create-time dedup (keyed on the OLD target/action_type) would never
-    match and would otherwise leave stranded alongside the new one. A
-    same-key resubmission doesn't need this at all -- dedup already
-    updates a matching pending row in place.
+    (TECH-6018) -- most useful when the bot has since determined the
+    proposal is stale or simply wrong and wants it retracted before a
+    human can decide it. A resubmission for the SAME ``target_id``/
+    ``action_type`` doesn't need this at all -- dedup already updates a
+    matching pending row in place.
 
     Body: ``{"reason": "<optional string, max 2000 chars>"}``. Auth: same
     bot-only gate as submission/``GET /proposals/{id}`` -- a human can
@@ -1131,17 +1130,23 @@ async def withdraw_proposal_route(request: Request) -> Response:
     except ValueError:
         return JSONResponse(_UNIFORM_HOLD_NOT_FOUND, status_code=404)
 
-    try:
-        body = await request.json()
-    except json.JSONDecodeError:
-        # Unlike decide_proposal_route (which 422s on malformed JSON), the
-        # entire body here is optional -- `reason` is the only field, and
-        # it's fine with no value at all. Treating a garbled body the same
-        # as an absent one keeps a bot's simple fire-and-forget withdraw
-        # call working even if it sent junk, rather than forcing it to
-        # retry with a fixed-up body for a field it may not have wanted to
-        # set anyway.
-        body = {}
+    raw_body = await request.body()
+    if not raw_body:
+        # The entire body is optional -- `reason` is the only field, and
+        # it's fine with no value at all. A truly empty body (a bot's
+        # simple fire-and-forget withdraw call with no JSON at all) is NOT
+        # malformed JSON, so treat it as an absent object rather than
+        # 422ing.
+        body: Any = {}
+    else:
+        # A NON-empty body that fails to parse (Argus review round-2
+        # suggestion) IS malformed and gets the same `invalid_json` 422 as
+        # decide_proposal_route -- only a genuinely empty body gets the
+        # lenient fallback above.
+        try:
+            body = json.loads(raw_body)
+        except json.JSONDecodeError:
+            return JSONResponse({"error": "invalid_json"}, status_code=422)
     if not isinstance(body, dict):
         return JSONResponse({"error": "invalid_body"}, status_code=422)
     reason = body.get("reason")

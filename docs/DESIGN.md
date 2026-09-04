@@ -316,10 +316,12 @@ proposal_holds id, kind (at the DB level an open TEXT column -- NOT
  `applying`), or pending -> withdrawn (TECH-6018, the SUBMITTING bot's own
  `POST /proposals/{id}/withdraw` -- a caller-initiated retraction, not a
  TTL-based expiry; `proposal_holds` has no `expires_at`/sweep mechanism.
- Lets a bot retire a stale pending proposal outright, or free its
- `(kind, proposed_by_bot_id, target_id, action_type)` dedup key for a
- resubmission targeting a DIFFERENT target/action_type that the existing
- create-time dedup would never match). `approved` is a value the CHECK constraint still accepts
+ Lets a bot retract a proposal it has since determined is stale or wrong
+ before a human decides it -- NOT for freeing up its dedup key: a
+ resubmission for the SAME `(kind, proposed_by_bot_id, target_id,
+ action_type)` key already updates the existing pending row in place at
+ create time, and a DIFFERENT key was never blocked to begin with).
+ `approved` is a value the CHECK constraint still accepts
  (migration d23b37d4e187, widened by e2f7a91c5b34) but is NEVER actually
  persisted -- it is the auto-judge's in-memory verdict, converted
  immediately to a claiming `applying` write before any commit a
@@ -1246,9 +1248,16 @@ across two opposite auth postures:
   `GET /proposals/{id}` (`service.get_proposal_for_bot`) is the only place
   a bot can learn a proposal's outcome after the fact if it wasn't decided
   synchronously in its own submission response (i.e., a human decided it
-  later) -- omits `decided_by_actor_id` from the response when
-  `decision_source == "human"`, so a human reviewer's own identity is
-  never disclosed to the bot that merely proposed something.
+  later). Every bot-facing return path -- this one, and `create_proposal`'s
+  own (a submission response can itself observe a hold a CONCURRENT human
+  decide already claimed, on its lost-claim-race fallback branches) --
+  goes through the shared `service._bot_facing_proposal_dict` formatter,
+  which omits `decided_by_actor_id` whenever `decision_source == "human"`,
+  so a human reviewer's own identity is never disclosed to the bot that
+  merely proposed something. `decide_proposal` and
+  `list_pending_proposal_holds` are human-facing and call the unredacted
+  `service._proposal_dict` directly -- never route those through the
+  bot-facing formatter.
   `POST /proposals/{id}/withdraw` (`service.withdraw_proposal`) lets the
   submitting bot retire its own still-`pending` proposal (see §5's
   `withdrawn` status note) -- sender-only, `FOR UPDATE`-locked against a

@@ -31,7 +31,9 @@ from models import AuditLog, ProposalHold
 from service import (
     _APPLY_ERROR_CANCELLED_MESSAGE,
     MAX_PROPOSALS_PER_BOT_PER_WINDOW,
+    PROPOSAL_SUBMITTER_SURFACES,
     _sanitize_apply_error,
+    audit_denied_proposal_submission,
     create_proposal,
     decide_proposal,
     get_proposal_for_bot,
@@ -1082,6 +1084,29 @@ class TestGetProposalForBot:
         # not be disclosed to the submitting bot.
         assert "decided_by_actor_id" not in result
 
+    async def test_submitting_bot_can_read_own_bot_withdrawn_proposal(
+        self, session: AsyncSession
+    ) -> None:
+        """Redaction is conditioned on ``decision_source == "human"``, not
+        blanket -- a proposal the SUBMITTING BOT itself withdrew has
+        ``decided_by_actor_id`` set to that same bot's own sub, which is
+        not a privacy leak (it's just telling the bot its own action was
+        recorded), so it must stay present (Argus review round-2)."""
+        submitted = await _submit(session, proposed_by_bot_id="bot-1")
+        await withdraw_proposal(
+            session,
+            hold_id=uuid.UUID(submitted["proposal_id"]),
+            requesting_bot_sub="bot-1",
+            reason=None,
+        )
+        result = await get_proposal_for_bot(
+            session,
+            hold_id=uuid.UUID(submitted["proposal_id"]),
+            requesting_bot_sub="bot-1",
+        )
+        assert result["status"] == "withdrawn"
+        assert result["decided_by_actor_id"] == "bot-1"
+
     async def test_unknown_hold_denial_is_audited(self, session: AsyncSession) -> None:
         with pytest.raises(AccessDeniedError):
             await get_proposal_for_bot(session, hold_id=uuid.uuid4(), requesting_bot_sub="bot-1")
@@ -1227,3 +1252,60 @@ class TestWithdrawProposal:
             .all()
         )
         assert rows
+
+
+class TestAuditDeniedProposalSubmission:
+    """Direct, service-level coverage of ``audit_denied_proposal_submission``'s
+    ``surface`` parameter (Argus review round-2 suggestion) -- the HTTP-level
+    tests in ``test_proposal_endpoint.py`` cover this indirectly through
+    ``main._authenticate_proposal_submitter``, but a typo in the ``surface``
+    literal at either of THOSE call sites could still slip past a test that
+    only checks "some denial row exists" rather than pinning the exact
+    formatted action string this function produces for each surface."""
+
+    @pytest.mark.parametrize("surface", sorted(PROPOSAL_SUBMITTER_SURFACES))
+    async def test_missing_scope_action_string(self, session: AsyncSession, surface: str) -> None:
+        await audit_denied_proposal_submission(
+            session, actor_sub="bot-1", reason="missing_scope", surface=surface
+        )
+        rows = (
+            (
+                await session.execute(
+                    select(AuditLog.action).where(
+                        AuditLog.action == f"denied.proposal_{surface}_missing_scope"
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert rows
+
+    @pytest.mark.parametrize("surface", sorted(PROPOSAL_SUBMITTER_SURFACES))
+    async def test_not_agent_token_action_string(self, session: AsyncSession, surface: str) -> None:
+        await audit_denied_proposal_submission(
+            session, actor_sub="bot-1", reason="not_agent_token", surface=surface
+        )
+        rows = (
+            (
+                await session.execute(
+                    select(AuditLog.action).where(
+                        AuditLog.action == f"denied.proposal_{surface}_not_agent_token"
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert rows
+
+    def test_default_surface_is_submit(self) -> None:
+        """Backward-compatibility guarantee: pre-existing callers that
+        don't pass ``surface`` at all must still produce
+        ``denied.proposal_submit_*``, unchanged."""
+        import inspect
+
+        assert (
+            inspect.signature(audit_denied_proposal_submission).parameters["surface"].default
+            == "submit"
+        )

@@ -5685,6 +5685,28 @@ def _proposal_dict(hold: ProposalHold) -> dict[str, Any]:
     return result
 
 
+def _bot_facing_proposal_dict(hold: ProposalHold) -> dict[str, Any]:
+    """``_proposal_dict(hold)``, redacted for a response going back to the
+    SUBMITTING bot (TECH-6018, Argus review round-2 BLOCKING) -- omits
+    ``decided_by_actor_id`` when ``decision_source == "human"``, so a
+    human reviewer's own identity (an email-shaped Okta sub) is never
+    disclosed to a bot merely for having proposed something.
+
+    Every ``create_proposal`` return path is bot-facing (it's the direct
+    response to that bot's own ``POST /proposals`` call) and can observe a
+    hold a CONCURRENT human decide already claimed/decided out from under
+    it (the dedup-into-``applying``-row and lost-claim-race branches) --
+    those paths returned a bare ``_proposal_dict(hold)`` before this fix,
+    which leaked exactly the identity ``get_proposal_for_bot`` was already
+    redacting. Use this here AND there; never call ``_proposal_dict``
+    directly from a bot-facing return path again.
+    """
+    result = _proposal_dict(hold)
+    if hold.decision_source == "human":
+        result.pop("decided_by_actor_id", None)
+    return result
+
+
 def validate_hold_level(value: str, name: str) -> str:
     """Shared ``confidence``/``importance``/``impact`` membership check
     (Argus review S14) -- ``PROPOSAL_HOLD_LEVELS`` is the single source of
@@ -5961,7 +5983,7 @@ async def create_proposal(
     await session.refresh(hold)
 
     if not auto_approved:
-        return _proposal_dict(hold)
+        return _bot_facing_proposal_dict(hold)
 
     # Argus review B1: resolve the auto-judge's "approved" verdict to a
     # terminal status synchronously, right here, instead of persisting a
@@ -5989,7 +6011,11 @@ async def create_proposal(
         if resolved is None:
             raise AssertionError("invariant violation: hold vanished after its own commit")
         await session.commit()
-        return _proposal_dict(resolved)
+        # This hold may have been claimed by a CONCURRENT human decide
+        # call (not just another auto-judge run) -- redact, same as every
+        # other bot-facing return path in this function (Argus review
+        # round-2 B1).
+        return _bot_facing_proposal_dict(resolved)
 
     result = await _apply_or_finalize_proposal_hold(
         session,
@@ -6009,7 +6035,10 @@ async def create_proposal(
     if resolved is None:
         raise AssertionError("invariant violation: hold vanished after its own commit")
     await session.commit()
-    return _proposal_dict(resolved)
+    # Same rationale as the other race-fallback return above: whatever
+    # resolved this hold out from under the claim could have been a
+    # concurrent human decide.
+    return _bot_facing_proposal_dict(resolved)
 
 
 async def list_pending_proposal_holds(
@@ -6096,10 +6125,12 @@ async def withdraw_proposal(
 ) -> dict[str, Any]:
     """``POST /proposals/{hold_id}/withdraw`` (main.py, non-MCP, bot-gated
     -- TECH-6018). Lets the SUBMITTING bot retire its own still-``pending``
-    proposal -- most useful right before resubmitting a replacement with a
-    DIFFERENT ``target_id``/``action_type`` that the create-time dedup (keyed
-    on the OLD target/action_type) would never match and would otherwise
-    leave stranded alongside the new one.
+    proposal -- most useful when the bot has since determined the proposal
+    is stale or simply wrong (e.g. the situation it was reacting to changed)
+    and wants it retracted before a human can decide it, rather than a
+    resubmission for the SAME ``target_id``/``action_type``, which the
+    create-time dedup already handles by updating the existing pending row
+    in place -- no withdraw needed for that case.
 
     Sender-only, same uniform-404 anti-enumeration posture as
     ``get_proposal_for_bot``/``decide_proposal``: unknown hold and
