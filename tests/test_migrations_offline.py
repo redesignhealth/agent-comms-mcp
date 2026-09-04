@@ -304,3 +304,23 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
     )
     begin_pos = result.stdout.index("BEGIN;", concurrently_pos)
     assert dedup_pos < commit_pos < concurrently_pos < begin_pos
+    # e2f7a91c5b34 (Argus review round-2 B1, round-3 B1): widen
+    # ck_proposal_holds_status to accept 'applying', and rebuild
+    # idx_proposal_holds_pending_dedup's partial predicate to also cover
+    # it -- the CHECK-widen alone (round-2) left the dedup index blind to
+    # 'applying' rows for the round-3 fix to close.
+    assert (
+        "ALTER TABLE proposal_holds ADD CONSTRAINT ck_proposal_holds_status "
+        "CHECK (status IN ('pending', 'approved', 'applying', 'rejected', "
+        "'applied', 'apply_failed', 'stale'))" in result.stdout
+    )
+    assert (
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_proposal_holds_pending_dedup "
+        "ON proposal_holds (kind, proposed_by_bot_id, (action ->> 'target_id'), "
+        "(action ->> 'action_type')) WHERE status IN ('pending', 'applying')" in result.stdout
+    )
+    # The widened index must appear strictly after the original 'pending'-only
+    # one emitted by 9a1c2d3e4f5b -- confirms this is a rebuild via a real
+    # migration step, not an accidental duplicate/edit of the earlier one.
+    widened_index_pos = result.stdout.index("WHERE status IN ('pending', 'applying')", dedup_pos)
+    assert dedup_pos < widened_index_pos

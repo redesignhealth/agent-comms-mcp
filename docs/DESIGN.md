@@ -293,8 +293,8 @@ proposal_holds id, kind (at the DB level an open TEXT column -- NOT
  action jsonb, rationale, confidence/importance/impact(low|medium|high,
  self-reported, advisory only), priority(low|medium|high, server-derived
  from kind+action -- never caller-supplied, despite sharing a vocabulary
- with the three self-reported columns), status(pending|approved|rejected|
- applied|apply_failed|stale), decision_source(human|auto),
+ with the three self-reported columns), status(pending|approved|applying|
+ rejected|applied|apply_failed|stale), decision_source(human|auto),
  decided_by_actor_id, decided_at, decision_note, target_fingerprint
  (sha256 hex digest of the target's state at proposal time, for detecting
  staleness at apply time), applied_at, apply_error, timestamps
@@ -303,16 +303,35 @@ proposal_holds id, kind (at the DB level an open TEXT column -- NOT
  for this board's own comms traffic (TECH-5389/TECH-5735); proposal_holds
  generalizes the same "propose, hold for a human, decide, apply" shape to
  any autonomous bot's arbitrary action, keyed by an open `kind`
- discriminator. Lifecycle: pending -> approved|rejected, then (approved
- only) -> applied|apply_failed|stale -- `stale` is reachable only from
- `approved` (never directly from `pending`), since staleness is only ever
+ discriminator. Lifecycle (updated TECH-5873 Argus review round-2/3 B1):
+ pending -> applying (a transient but PERSISTED claim -- see below --
+ written by whichever caller, human decide or the TECH-5877 auto-judge,
+ first claims the row for apply), then applying -> applied|apply_failed|
+ stale, or pending -> rejected (human decide only, never touches
+ `applying`). `approved` is a value the CHECK constraint still accepts
+ (migration d23b37d4e187, widened by e2f7a91c5b34) but is NEVER actually
+ persisted -- it is the auto-judge's in-memory verdict, converted
+ immediately to a claiming `applying` write before any commit a
+ concurrent reader could observe. `stale` is reachable only from
+ `applying` (never directly from `pending`), since staleness is only ever
  detected at apply/decide time, by which point decision fields are already
- stamped (see models.ProposalHold's class docstring and the
- `ck_proposal_holds_decision_consistency` CHECK). Migration only in
- TECH-5871; `POST /proposals` (submission), `GET /proposals/pending`
- (listing), per-bot rate limiting, and the deterministic auto-approval
- judge shipped as the follow-on TECH-5872/TECH-5875/TECH-5877 (see "The
- proposal submission pipeline" below)
+ stamped at the `applying` claim (see models.ProposalHold's class
+ docstring and the `ck_proposal_holds_decision_consistency` CHECK).
+ **Stuck `applying` rows** (the process dies between the claim commit and
+ the terminal write -- rare, but not impossible) have no background
+ reaper today: the row is invisible to `list_pending_proposal_holds`
+ (`status='pending'` only) and a decide call on it raises
+ `HoldAlreadyDecidedError`, so the only recovery path is a fresh
+ `POST /proposals` resubmission for the same target (dedup is scoped to
+ `pending`+`applying`, so a resubmission while the ORIGINAL is still
+ legitimately in-flight is correctly blocked too -- see "The proposal
+ submission pipeline" below; this only matters once the stuck row is
+ truly abandoned, which nothing currently detects automatically). Migration
+ only in TECH-5871 (+ e2f7a91c5b34 for `applying`); `POST /proposals`
+ (submission), `GET /proposals/pending` (listing), per-bot rate limiting,
+ and the deterministic auto-approval judge shipped as the follow-on
+ TECH-5872/TECH-5875/TECH-5877 (see "The proposal submission pipeline"
+ below)
 ```
 
 Design notes:

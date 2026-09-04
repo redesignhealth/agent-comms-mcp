@@ -726,3 +726,40 @@ class TestDecideProposal:
                 )
         assert exc_info.value.status == "rejected"
         mock_apply.assert_awaited_once()
+
+    async def test_decide_on_already_applying_hold_raises_already_decided(
+        self, session: AsyncSession
+    ) -> None:
+        """Argus review round-3 S8: the initial status check in
+        ``decide_proposal`` (before this call's own claim attempt) must
+        already reject a hold some OTHER caller has claimed --
+        ``test_hold_resolved_during_apply_window_raises_already_decided``
+        above covers the helper's own re-check after a race started
+        mid-flight; this covers the simpler, more common case of a
+        decide call landing on a hold that was ALREADY ``"applying"``
+        before this call ever acquired its lock."""
+        submitted = await _submit(session, target_fingerprint="fp-match")
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        await session.execute(
+            update(ProposalHold)
+            .where(ProposalHold.id == hold_id)
+            .values(
+                status="applying",
+                decision_source="auto",
+                decided_by_actor_id="system:judge",
+                decided_at=text("now()"),
+            )
+        )
+        await session.commit()
+
+        with patch("service.linear_client.apply_progress_update", AsyncMock()) as mock_apply:
+            with pytest.raises(HoldAlreadyDecidedError) as exc_info:
+                await decide_proposal(
+                    session,
+                    approver_sub="owner-a@example.com",
+                    hold_id=hold_id,
+                    decision="approve",
+                    decision_note=None,
+                )
+        assert exc_info.value.status == "applying"
+        mock_apply.assert_not_awaited()

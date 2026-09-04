@@ -255,22 +255,36 @@ class TestProgressCommentBody:
         )
         assert body == f"Progress update: close_ticket\n\nResolved by: {_VALID_PR_URL}"
 
-    def test_non_allowlisted_source_url_is_omitted_not_raised(self) -> None:
-        """Argus review S3 (re-validate) + round-2 B3 (skip, don't raise):
-        a proposal that skipped auto-approval (judge left it 'pending')
-        can still reach ``apply_progress_update`` via manual human
-        approval, and an arbitrary URL must not silently land in a Linear
-        comment -- but a present-but-invalid field must not block the
-        whole apply either, since the judge's close-ticket rule only
-        requires ONE of the two URL fields to be valid (OR), not both."""
+    def test_non_allowlisted_source_url_on_open_ticket_raises(self) -> None:
+        """Argus review S3 (re-validate) + round-3 S4 (scope the omit
+        behavior to close_ticket only): open_ticket's judge rule requires
+        exactly ONE field (`source_message_url`) to be valid with no
+        OR-partner, so a proposal reaching here with an invalid one
+        (necessarily via manual human approval, since the judge itself
+        would never auto-approve this) must still raise -- there is no
+        "the other field covered for it" story the way there is for
+        close_ticket."""
+        with pytest.raises(LinearAPIError):
+            _progress_comment_body(
+                {
+                    "action_type": "open_ticket",
+                    "source_message_url": "https://not-allowlisted.example/p123",
+                }
+            )
+
+    def test_non_allowlisted_source_url_on_close_ticket_is_omitted_not_raised(self) -> None:
+        """Argus review round-2 B3 (skip, don't raise) for close_ticket
+        specifically: a present-but-invalid field must not block the
+        whole apply, since the judge's close-ticket rule only requires
+        ONE of the two URL fields to be valid (OR), not both."""
         body = _progress_comment_body(
             {
-                "action_type": "open_ticket",
+                "action_type": "close_ticket",
                 "source_message_url": "https://not-allowlisted.example/p123",
             }
         )
         assert "not-allowlisted.example" not in body
-        assert body == "Progress update: open_ticket"
+        assert body == "Progress update: close_ticket"
 
     def test_non_allowlisted_resolving_pr_url_is_omitted_not_raised(self) -> None:
         body = _progress_comment_body(
@@ -296,6 +310,21 @@ class TestProgressCommentBody:
         )
         assert f"Source: {_VALID_SOURCE_URL}" in body
         assert "not-allowlisted.example" not in body
+
+    def test_both_citation_urls_invalid_on_close_ticket_omits_both(self) -> None:
+        """Argus review round-3 S10: neither valid -- the resulting
+        comment must carry zero citation fields, not silently keep one
+        with an invalid value."""
+        body = _progress_comment_body(
+            {
+                "action_type": "close_ticket",
+                "source_message_url": "https://not-allowlisted.example/p123",
+                "resolving_pr_url": "https://also-not-allowlisted.example/pull/1",
+            }
+        )
+        assert "Source:" not in body
+        assert "Resolved by:" not in body
+        assert body == "Progress update: close_ticket"
 
 
 class TestApplyProgressUpdate:
@@ -334,15 +363,17 @@ class TestApplyProgressUpdate:
                 }
             )
 
-    async def test_invalid_url_is_omitted_write_still_proceeds(
+    async def test_invalid_url_on_close_ticket_is_omitted_write_still_proceeds(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Argus review round-2 B3: the URL re-validation in
-        ``_progress_comment_body`` OMITS a non-allowlisted URL, it does not
-        block the write -- the judge's OR semantics mean the OTHER
-        citation field (or, as here, no citation field at all if this is
-        the only one and it's invalid) is what got this proposal approved,
-        not this specific field."""
+        """Argus review round-2 B3 + round-3 S4: the URL re-validation in
+        ``_progress_comment_body`` OMITS a non-allowlisted URL for
+        close_ticket, it does not block the write -- the judge's OR
+        semantics mean the OTHER citation field (or, as here, no citation
+        field at all if this is the only one and it's invalid) is what
+        got this proposal approved, not this specific field. (open_ticket
+        has no such OR-partner and raises instead -- see
+        ``TestProgressCommentBody.test_non_allowlisted_source_url_on_open_ticket_raises``.)"""
         monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
         captured: dict[str, Any] = {}
 
@@ -358,7 +389,7 @@ class TestApplyProgressUpdate:
         await apply_progress_update(
             {
                 "target_id": "TECH-1234",
-                "action_type": "open_ticket",
+                "action_type": "close_ticket",
                 "source_message_url": "https://not-allowlisted.example/p123",
             }
         )

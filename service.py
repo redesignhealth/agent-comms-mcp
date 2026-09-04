@@ -5640,20 +5640,35 @@ def _proposal_dedup_where(
 ) -> tuple[Any, ...]:
     """Shared create-time dedup predicate (TECH-5872, Argus review B1 fix):
     ``(kind, proposed_by_bot_id, target_id, action_type)`` against any
-    currently ``status='pending'`` row. Scoped to the SAME submitting bot
-    deliberately -- a different bot targeting the same ``(kind, target_id,
-    action_type)`` must get its own fresh row, never silently overwrite (and
-    get auto-approved under) another bot's pending proposal. This predicate
-    is shared between ``_dedup_or_insert_proposal``'s app-level SELECT
-    (used both for the common case and to re-query after losing the B2
-    race below) and must use the SAME key as the DB-level partial unique
-    index backing it, ``idx_proposal_holds_pending_dedup`` (migration
-    9a1c2d3e4f5b) -- the two must never drift onto different keys, or they
-    will fight each other."""
+    currently ``status IN ('pending', 'applying')`` row. Scoped to the
+    SAME submitting bot deliberately -- a different bot targeting the
+    same ``(kind, target_id, action_type)`` must get its own fresh row,
+    never silently overwrite (and get auto-approved under) another bot's
+    pending proposal. This predicate is shared between
+    ``_dedup_or_insert_proposal``'s app-level SELECT (used both for the
+    common case and to re-query after losing the B2 race below) and must
+    use the SAME key/status set as the DB-level partial unique index
+    backing it, ``idx_proposal_holds_pending_dedup`` (migration
+    9a1c2d3e4f5b, predicate widened in e2f7a91c5b34) -- the two must
+    never drift onto different keys/predicates, or they will fight each
+    other.
+
+    ``'applying'`` is included (Argus review round-3 B1) so a
+    resubmission during the brief claimed-but-not-yet-terminal window
+    (see ``_claim_proposal_hold_for_applying``) still finds the
+    in-flight row instead of inserting a fresh duplicate -- a
+    ``'pending'``-only predicate went blind for exactly that window.
+    ``_dedup_or_insert_proposal`` does NOT mutate an ``'applying'`` match
+    in place the way it does a ``'pending'`` one, though (see its own
+    docstring): the row is actively being read/written by a concurrent
+    apply-or-finalize in flight, and rewriting its ``action``/
+    ``target_fingerprint`` out from under that would desync what
+    actually got applied to Linear from what the row claims was
+    submitted."""
     return (
         ProposalHold.kind == kind,
         ProposalHold.proposed_by_bot_id == proposed_by_bot_id,
-        ProposalHold.status == "pending",
+        ProposalHold.status.in_(("pending", "applying")),
         ProposalHold.action["target_id"].astext == target_id,
         ProposalHold.action["action_type"].astext == action_type,
     )
@@ -5720,16 +5735,25 @@ async def _dedup_or_insert_proposal(
     )
     existing = (await session.execute(select(ProposalHold).where(*where))).scalar_one_or_none()
     if existing is not None:
-        _apply_proposal_resubmission(
-            existing,
-            action=action,
-            rationale=rationale,
-            confidence=confidence,
-            importance=importance,
-            impact=impact,
-            priority=priority,
-            target_fingerprint=target_fingerprint,
-        )
+        # Argus review round-3 B1: an 'applying' match is mid-flight under
+        # a concurrent _apply_or_finalize_proposal_hold -- mutating its
+        # action/target_fingerprint here would desync what actually gets
+        # (or already got) applied to Linear from what the row claims was
+        # submitted. Return it AS-IS (still dedup-blocked from a fresh
+        # INSERT, which is the property this predicate exists to
+        # guarantee); the caller can resubmit again once it resolves to a
+        # terminal status.
+        if existing.status == "pending":
+            _apply_proposal_resubmission(
+                existing,
+                action=action,
+                rationale=rationale,
+                confidence=confidence,
+                importance=importance,
+                impact=impact,
+                priority=priority,
+                target_fingerprint=target_fingerprint,
+            )
         return existing
 
     hold = ProposalHold(
@@ -5760,16 +5784,19 @@ async def _dedup_or_insert_proposal(
             # before this re-read) -- nothing sane to update; surface the
             # original DB error rather than silently proceeding.
             raise
-        _apply_proposal_resubmission(
-            existing_after_race,
-            action=action,
-            rationale=rationale,
-            confidence=confidence,
-            importance=importance,
-            impact=impact,
-            priority=priority,
-            target_fingerprint=target_fingerprint,
-        )
+        # Argus review round-3 B1: same "don't mutate an in-flight
+        # 'applying' row" guard as the common-case SELECT above.
+        if existing_after_race.status == "pending":
+            _apply_proposal_resubmission(
+                existing_after_race,
+                action=action,
+                rationale=rationale,
+                confidence=confidence,
+                importance=importance,
+                impact=impact,
+                priority=priority,
+                target_fingerprint=target_fingerprint,
+            )
         return existing_after_race
     return hold
 
@@ -6190,17 +6217,28 @@ async def decide_proposal(
     applied state as-is, without re-running the judge/apply/decision
     logic, and without a second Linear write -- a retried decide call
     (client timeout + retry, double-click, etc.) must never double-apply.
-    Any OTHER non-``"pending"`` status (``"rejected"``/``"applied"``
-    already handled above/``"apply_failed"``/``"stale"``) raises
-    ``HoldAlreadyDecidedError`` -- those are terminal-but-not-safely-
-    retryable outcomes; a fresh proposal resubmission is required to
-    retry them, not a second decide call on the same hold (out of scope
-    for this ticket). ``"pending"`` is the only status a hold can ever be
-    sitting in when a decide call reaches this point -- see
-    ``PROPOSAL_HOLD_STATUSES``'s state-machine comment in ``models.py``
-    (Argus review B1/B6): ``"approved"`` is a transient in-memory verdict
-    that resolves synchronously wherever it's produced (here, or in
-    ``create_proposal``'s auto-judge path) and is never itself persisted.
+    Any OTHER non-``"pending"`` status (``"applying"``/``"rejected"``/
+    ``"applied"`` already handled above/``"apply_failed"``/``"stale"``)
+    raises ``HoldAlreadyDecidedError`` -- ``"applying"`` specifically means
+    a concurrent decide call (or the auto-judge) has already CLAIMED this
+    hold and is mid-flight on its own external Linear round-trip (Argus
+    review round-2 B1) -- unlike the other statuses in this list, it is
+    not a genuinely terminal outcome, but it is equally non-retryable
+    THROUGH THIS CALL: this caller must not wait on or retry against the
+    other in-flight decide, it simply never got to decide anything (Argus
+    review round-3 S9 -- an earlier version of this docstring claimed
+    ``"pending"`` was the only status reachable here, which stopped being
+    true the moment `"applying"` became a real, persisted, observable
+    status a second caller's own ``FOR UPDATE`` can land on). Every OTHER
+    non-``"pending"`` status IS a terminal-but-not-safely-retryable
+    outcome; a fresh proposal resubmission is required to retry them, not
+    a second decide call on the same hold (out of scope for this ticket).
+    ``"approved"`` is never one of the statuses a decide call can observe
+    here at all -- it is a transient in-memory verdict that resolves
+    synchronously (to ``"applying"`` and then a terminal status) wherever
+    it's produced (here, or in ``create_proposal``'s auto-judge path) and
+    is never itself persisted (see ``PROPOSAL_HOLD_STATUSES``'s
+    state-machine comment in ``models.py``, Argus review B1/B6).
 
     ``reject`` requires a non-empty ``decision_note`` (enforced here too,
     defense-in-depth against the HTTP-layer check in

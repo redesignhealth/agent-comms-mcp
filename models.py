@@ -769,13 +769,21 @@ class ProposalHold(Base):
         # see migration 9a1c2d3e4f5b's own docstring for the full B1/B2
         # rationale. Declared here too so a future
         # `alembic revision --autogenerate` doesn't propose dropping it.
+        # Predicate widened to also cover `applying` (migration
+        # e2f7a91c5b34, Argus review round-3 B1): a claimed-but-not-yet-
+        # terminal hold is not "pending" anymore, but it is very much
+        # still a live in-flight duplicate a resubmission must be blocked
+        # against -- `pending`-only left a ~10s window, for the duration
+        # of the external Linear round-trip, where a resubmission with the
+        # same dedup key found no `pending` row and inserted a fresh one,
+        # silently bypassing dedup.
         Index(
             "idx_proposal_holds_pending_dedup",
             "kind",
             "proposed_by_bot_id",
             text("(action ->> 'target_id')"),
             text("(action ->> 'action_type')"),
-            postgresql_where=text("status = 'pending'"),
+            postgresql_where=text("status IN ('pending', 'applying')"),
             unique=True,
         ),
         # Backs proposed_by_bot_id-scoped lookups (an ops/observability
