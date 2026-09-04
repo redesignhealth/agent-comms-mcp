@@ -28,8 +28,9 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import mcp.types as mt
 import pytest
 import pytest_asyncio
@@ -43,6 +44,8 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from starlette.applications import Starlette
+from starlette.routing import Route
 
 import subscriptions
 from schemas import MESSAGE_TYPES
@@ -83,6 +86,12 @@ class TestRegistrySubscribeUnsubscribe:
         await subscriptions.subscribe("comms://x", session, agent_id=agent_id, sub="a")  # type: ignore[arg-type]
         await subscriptions.subscribe("comms://x", session, agent_id=agent_id, sub="a")  # type: ignore[arg-type]
         assert len(subscriptions._registry["comms://x"]) == 1
+        # Argus round-2 BLOCKING catch: a prior revision incremented
+        # `_agent_subscription_counts` unconditionally on every subscribe
+        # call, including this idempotent re-subscribe, inflating the
+        # agent's count even though the registry itself stayed at one
+        # record.
+        assert subscriptions._agent_subscription_counts[agent_id] == 1
 
     async def test_unsubscribe_is_idempotent(self) -> None:
         session = _FakeSession()
@@ -421,8 +430,9 @@ class _NotificationCollector:
 
 
 async def _wait_until(predicate: Any, *, timeout: float = 2.0) -> None:
-    deadline = asyncio.get_event_loop().time() + timeout
-    while asyncio.get_event_loop().time() < deadline:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
         if predicate():
             return
         await asyncio.sleep(0.02)
@@ -451,7 +461,10 @@ class TestSubscribeAuthorization:
                     await client.session.subscribe_resource(AnyUrl(uri))
 
     async def test_non_member_subscribe_is_uniformly_denied(
-        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        session: AsyncSession,
     ) -> None:
         conversation_id, _ids = await _start_open_conversation(
             main, test_session_factory, "sub-nm-owner", "sub-nm-member"
@@ -471,6 +484,20 @@ class TestSubscribeAuthorization:
                 with pytest.raises(McpError, match=re.escape("access_denied")):
                     await client.session.subscribe_resource(AnyUrl(uri))
 
+        # Argus round-2 SUGGESTION: a non-member denial is a DB-layer denial
+        # (reaches `service.deny_resource_subscribe`), so it must write an
+        # audited row same as every other denial category in this module.
+        row_count = (
+            await session.execute(
+                text(
+                    "SELECT COUNT(*) FROM audit_log WHERE actor_sub = :actor_sub "
+                    "AND action LIKE 'denied.%'"
+                ),
+                {"actor_sub": "sub-nm-stranger"},
+            )
+        ).scalar_one()
+        assert row_count >= 1
+
     async def test_unknown_uri_is_uniformly_denied(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
@@ -487,6 +514,30 @@ class TestSubscribeAuthorization:
             async with Client(main.mcp) as client:
                 with pytest.raises(McpError, match=re.escape("access_denied")):
                     await client.session.subscribe_resource(AnyUrl("comms://comms/nonsense"))
+
+    async def test_malformed_uuid_subscribe_is_uniformly_denied(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Distinct from ``test_unknown_uri_is_uniformly_denied``: this URI
+        matches the conversation TEMPLATE shape, but the UUID segment itself
+        doesn't parse -- a different denial branch (``malformed_uuid``) than
+        an unrecognized URI shape (``unknown_uri``), both folded into the
+        same uniform, anti-enumeration ``access_denied`` message."""
+        await _register(main, test_session_factory, "sub-malformed-uuid")
+        token = _token("sub-malformed-uuid")
+
+        with (
+            _OIDC_PATCH,
+            _ENV_PATCH,
+            patch("providers.comms.get_access_token", return_value=token),
+            patch("providers.comms.get_session_factory", return_value=test_session_factory),
+            patch("main.get_session_factory", return_value=test_session_factory),
+        ):
+            async with Client(main.mcp) as client:
+                with pytest.raises(McpError, match=re.escape("access_denied")):
+                    await client.session.subscribe_resource(
+                        AnyUrl("comms://comms/conversations/not-a-uuid-at-all")
+                    )
 
     async def test_successful_subscribe_writes_audit_row(
         self,
@@ -527,6 +578,92 @@ class TestSubscribeAuthorization:
             )
         ).scalar_one()
         assert row_count == 1
+
+    async def test_successful_unsubscribe_writes_audit_row(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        session: AsyncSession,
+    ) -> None:
+        conversation_id, _ids = await _start_open_conversation(
+            main, test_session_factory, "unsub-audit-owner", "unsub-audit-member"
+        )
+        member_token = _token("unsub-audit-member")
+        await _call(
+            main,
+            test_session_factory,
+            member_token,
+            "comms_accept",
+            {"conversation_id": conversation_id},
+        )
+        uri = f"comms://comms/conversations/{conversation_id}"
+
+        with (
+            _OIDC_PATCH,
+            _ENV_PATCH,
+            patch("providers.comms.get_access_token", return_value=member_token),
+            patch("providers.comms.get_session_factory", return_value=test_session_factory),
+            patch("main.get_session_factory", return_value=test_session_factory),
+        ):
+            async with Client(main.mcp) as client:
+                await client.session.subscribe_resource(AnyUrl(uri))
+                await client.session.unsubscribe_resource(AnyUrl(uri))
+
+        row_count = (
+            await session.execute(
+                text(
+                    "SELECT COUNT(*) FROM audit_log WHERE action = 'resource.unsubscribe' "
+                    "AND actor_sub = :actor_sub"
+                ),
+                {"actor_sub": "unsub-audit-member"},
+            )
+        ).scalar_one()
+        assert row_count == 1
+
+    async def test_own_inbox_subscribe_succeeds(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        await _register(main, test_session_factory, "inbox-self-sub")
+        token = _token("inbox-self-sub")
+        list_result = await _call(main, test_session_factory, token, "comms_list_agents")
+        agent_id = next(
+            a["agent_id"] for a in list_result["agents"] if a["sub"] == "inbox-self-sub"
+        )
+        uri = f"comms://comms/agents/{agent_id}/inbox"
+
+        with (
+            _OIDC_PATCH,
+            _ENV_PATCH,
+            patch("providers.comms.get_access_token", return_value=token),
+            patch("providers.comms.get_session_factory", return_value=test_session_factory),
+            patch("main.get_session_factory", return_value=test_session_factory),
+        ):
+            async with Client(main.mcp) as client:
+                await client.session.subscribe_resource(AnyUrl(uri))
+
+    async def test_other_agent_inbox_subscribe_is_uniformly_denied(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        await _register(main, test_session_factory, "inbox-owner")
+        await _register(main, test_session_factory, "inbox-stranger")
+        owner_token = _token("inbox-owner")
+        list_result = await _call(main, test_session_factory, owner_token, "comms_list_agents")
+        owner_agent_id = next(
+            a["agent_id"] for a in list_result["agents"] if a["sub"] == "inbox-owner"
+        )
+        stranger_token = _token("inbox-stranger")
+        uri = f"comms://comms/agents/{owner_agent_id}/inbox"
+
+        with (
+            _OIDC_PATCH,
+            _ENV_PATCH,
+            patch("providers.comms.get_access_token", return_value=stranger_token),
+            patch("providers.comms.get_session_factory", return_value=test_session_factory),
+            patch("main.get_session_factory", return_value=test_session_factory),
+        ):
+            async with Client(main.mcp) as client:
+                with pytest.raises(McpError, match=re.escape("access_denied")):
+                    await client.session.subscribe_resource(AnyUrl(uri))
 
 
 class TestNotificationFiring:
@@ -669,3 +806,314 @@ class TestNotificationFiring:
             )
             await asyncio.sleep(0.2)
             assert uri not in collector.uris
+
+    async def test_start_conversation_notifies_invitee_inbox(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        await _register(main, test_session_factory, "sc-notify-owner")
+        await _register(main, test_session_factory, "sc-notify-target")
+        owner_token = _token("sc-notify-owner")
+        list_result = await _call(main, test_session_factory, owner_token, "comms_list_agents")
+        target_id = next(
+            a["agent_id"] for a in list_result["agents"] if a["sub"] == "sc-notify-target"
+        )
+        inbox_uri = f"comms://comms/agents/{target_id}/inbox"
+        target_token = _token("sc-notify-target")
+        collector = _NotificationCollector()
+
+        async with Client(main.mcp, message_handler=collector) as client:
+            with (
+                _OIDC_PATCH,
+                _ENV_PATCH,
+                patch("providers.comms.get_access_token", return_value=target_token),
+                patch("providers.comms.get_session_factory", return_value=test_session_factory),
+                patch("main.get_session_factory", return_value=test_session_factory),
+            ):
+                await client.session.subscribe_resource(AnyUrl(inbox_uri))
+
+            await _call(
+                main,
+                test_session_factory,
+                owner_token,
+                "comms_start_conversation",
+                {
+                    "conversation_type": "open",
+                    "target_agent_ids": [target_id],
+                    "initial_message": _availability_request(),
+                },
+            )
+
+            await _wait_until(lambda: inbox_uri in collector.uris)
+
+    async def test_invite_notifies_target_inbox_and_conversation(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        conversation_id, _ids = await _start_open_conversation(
+            main, test_session_factory, "inv-notify-owner", "inv-notify-member"
+        )
+        member_token = _token("inv-notify-member")
+        await _call(
+            main,
+            test_session_factory,
+            member_token,
+            "comms_accept",
+            {"conversation_id": conversation_id},
+        )
+        await _register(main, test_session_factory, "inv-notify-target")
+        owner_token = _token("inv-notify-owner")
+        list_result = await _call(main, test_session_factory, owner_token, "comms_list_agents")
+        target_id = next(
+            a["agent_id"] for a in list_result["agents"] if a["sub"] == "inv-notify-target"
+        )
+        conv_uri = f"comms://comms/conversations/{conversation_id}"
+        inbox_uri = f"comms://comms/agents/{target_id}/inbox"
+        target_token = _token("inv-notify-target")
+        collector = _NotificationCollector()
+
+        async with Client(main.mcp, message_handler=collector) as client:
+            with (
+                _OIDC_PATCH,
+                _ENV_PATCH,
+                patch("providers.comms.get_access_token", return_value=member_token),
+                patch("providers.comms.get_session_factory", return_value=test_session_factory),
+                patch("main.get_session_factory", return_value=test_session_factory),
+            ):
+                await client.session.subscribe_resource(AnyUrl(conv_uri))
+            with (
+                _OIDC_PATCH,
+                _ENV_PATCH,
+                patch("providers.comms.get_access_token", return_value=target_token),
+                patch("providers.comms.get_session_factory", return_value=test_session_factory),
+                patch("main.get_session_factory", return_value=test_session_factory),
+            ):
+                await client.session.subscribe_resource(AnyUrl(inbox_uri))
+
+            await _call(
+                main,
+                test_session_factory,
+                owner_token,
+                "comms_invite",
+                {"conversation_id": conversation_id, "target_agent_id": target_id},
+            )
+
+            await _wait_until(lambda: conv_uri in collector.uris and inbox_uri in collector.uris)
+
+    async def test_accept_notifies_conversation_and_actor_inbox(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        conversation_id, ids = await _start_open_conversation(
+            main, test_session_factory, "acc-notify-owner", "acc-notify-target"
+        )
+        owner_token = _token("acc-notify-owner")
+        target_token = _token("acc-notify-target")
+        conv_uri = f"comms://comms/conversations/{conversation_id}"
+        inbox_uri = f"comms://comms/agents/{ids['acc-notify-target']}/inbox"
+        collector = _NotificationCollector()
+
+        async with Client(main.mcp, message_handler=collector) as client:
+            with (
+                _OIDC_PATCH,
+                _ENV_PATCH,
+                patch("providers.comms.get_access_token", return_value=owner_token),
+                patch("providers.comms.get_session_factory", return_value=test_session_factory),
+                patch("main.get_session_factory", return_value=test_session_factory),
+            ):
+                await client.session.subscribe_resource(AnyUrl(conv_uri))
+            with (
+                _OIDC_PATCH,
+                _ENV_PATCH,
+                patch("providers.comms.get_access_token", return_value=target_token),
+                patch("providers.comms.get_session_factory", return_value=test_session_factory),
+                patch("main.get_session_factory", return_value=test_session_factory),
+            ):
+                # Inbox subscribe is self-scoped, no active-participant gate
+                # -- allowed even while the target is still `invited`.
+                await client.session.subscribe_resource(AnyUrl(inbox_uri))
+
+            await _call(
+                main,
+                test_session_factory,
+                target_token,
+                "comms_accept",
+                {"conversation_id": conversation_id},
+            )
+
+            await _wait_until(lambda: conv_uri in collector.uris and inbox_uri in collector.uris)
+
+    async def test_decline_invite_notifies_conversation_and_actor_inbox(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        conversation_id, ids = await _start_open_conversation(
+            main, test_session_factory, "dec-notify-owner", "dec-notify-target"
+        )
+        owner_token = _token("dec-notify-owner")
+        target_token = _token("dec-notify-target")
+        conv_uri = f"comms://comms/conversations/{conversation_id}"
+        inbox_uri = f"comms://comms/agents/{ids['dec-notify-target']}/inbox"
+        collector = _NotificationCollector()
+
+        async with Client(main.mcp, message_handler=collector) as client:
+            with (
+                _OIDC_PATCH,
+                _ENV_PATCH,
+                patch("providers.comms.get_access_token", return_value=owner_token),
+                patch("providers.comms.get_session_factory", return_value=test_session_factory),
+                patch("main.get_session_factory", return_value=test_session_factory),
+            ):
+                await client.session.subscribe_resource(AnyUrl(conv_uri))
+            with (
+                _OIDC_PATCH,
+                _ENV_PATCH,
+                patch("providers.comms.get_access_token", return_value=target_token),
+                patch("providers.comms.get_session_factory", return_value=test_session_factory),
+                patch("main.get_session_factory", return_value=test_session_factory),
+            ):
+                await client.session.subscribe_resource(AnyUrl(inbox_uri))
+
+            await _call(
+                main,
+                test_session_factory,
+                target_token,
+                "comms_decline_invite",
+                {"conversation_id": conversation_id},
+            )
+
+            await _wait_until(lambda: conv_uri in collector.uris and inbox_uri in collector.uris)
+
+
+class _FakeApprovalAccessToken:
+    def __init__(self, claims: dict[str, Any]) -> None:
+        self.claims = claims
+
+
+class _FakeApprovalAuthProvider:
+    """Minimal stand-in for ``main._auth_provider``/``main._okta_provider``,
+    mirroring ``tests/test_approval_endpoint.py``'s own fake -- only the
+    interactive-token verification path is exercised here."""
+
+    def __init__(self) -> None:
+        self.tokens: dict[str, _FakeApprovalAccessToken] = {}
+        self.server = self
+
+    async def verify_token(self, token: str) -> _FakeApprovalAccessToken | None:
+        return self.tokens.get(token)
+
+
+class TestApprovalHttpNotification:
+    async def test_approve_notifies_conversation_and_participant_inboxes(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        conversation_id, _ids = await _start_open_conversation(
+            main, test_session_factory, "approve-notify-owner", "approve-notify-member"
+        )
+        member_token = _token("approve-notify-member")
+        await _call(
+            main,
+            test_session_factory,
+            member_token,
+            "comms_accept",
+            {"conversation_id": conversation_id},
+        )
+
+        owner_token = _token("approve-notify-owner")
+        # A `note` under an `open` conversation always crosses the
+        # ownership boundary -> held for human approval (see
+        # comms_post_message's docstring).
+        held = await _call(
+            main,
+            test_session_factory,
+            owner_token,
+            "comms_post_message",
+            {
+                "conversation_id": conversation_id,
+                "message_type": "note",
+                "payload": {"text": "hello"},
+            },
+        )
+        assert held["held_for_approval"] is True
+        hold_id = held["hold_id"]
+
+        conv_uri = f"comms://comms/conversations/{conversation_id}"
+        collector = _NotificationCollector()
+
+        fake_provider = _FakeApprovalAuthProvider()
+        fake_provider.tokens["human-token"] = _FakeApprovalAccessToken(
+            {"iss": "https://agent-comms.example/mcp", "email": "approve-notify-owner"}
+        )
+        app = Starlette(
+            routes=[Route("/approvals/{hold_id}/decide", main.decide_approval, methods=["POST"])]
+        )
+
+        async with Client(main.mcp, message_handler=collector) as client:
+            with (
+                _OIDC_PATCH,
+                _ENV_PATCH,
+                patch("providers.comms.get_access_token", return_value=member_token),
+                patch("providers.comms.get_session_factory", return_value=test_session_factory),
+                patch("main.get_session_factory", return_value=test_session_factory),
+            ):
+                await client.session.subscribe_resource(AnyUrl(conv_uri))
+
+            with (
+                _OIDC_PATCH,
+                _ENV_PATCH,
+                patch.object(main, "_auth_provider", fake_provider),
+                patch.object(main, "_okta_provider", fake_provider.server),
+                patch("main.get_session_factory", return_value=test_session_factory),
+            ):
+                transport = httpx.ASGITransport(app=app)
+                async with httpx.AsyncClient(
+                    transport=transport, base_url="http://test"
+                ) as http_client:
+                    resp = await http_client.post(
+                        f"/approvals/{hold_id}/decide",
+                        headers={"Authorization": "Bearer human-token"},
+                        json={"decision": "approve"},
+                    )
+            assert resp.status_code == 200
+
+            await _wait_until(lambda: conv_uri in collector.uris)
+
+
+class TestRollbackSafety:
+    async def test_failed_write_triggers_zero_notifications(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Plan doc §5: a write path that fails BEFORE commit must fire no
+        notification at all -- simulated here by forcing
+        ``service.post_message`` to raise mid-call, standing in for a
+        genuine partial-DB-operation-then-rollback failure."""
+        conversation_id, _ids = await _start_open_conversation(
+            main, test_session_factory, "rollback-owner", "rollback-member"
+        )
+        member_token = _token("rollback-member")
+        await _call(
+            main,
+            test_session_factory,
+            member_token,
+            "comms_accept",
+            {"conversation_id": conversation_id},
+        )
+
+        owner_token = _token("rollback-owner")
+        with (
+            patch(
+                "service.post_message",
+                AsyncMock(side_effect=RuntimeError("simulated mid-service failure")),
+            ),
+            patch("subscriptions.notify_conversation_event", AsyncMock()) as notify_mock,
+            pytest.raises(Exception),  # noqa: B017 -- any client-side surfacing is fine
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                owner_token,
+                "comms_post_message",
+                {
+                    "conversation_id": conversation_id,
+                    "message_type": "needs_clarification",
+                    "payload": {"about_seq": 1},
+                },
+            )
+
+        notify_mock.assert_not_called()

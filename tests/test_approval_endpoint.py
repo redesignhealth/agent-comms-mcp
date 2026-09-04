@@ -400,6 +400,13 @@ class TestDecideEndpoint:
         assert message.type == "note"
         assert message.payload == hold.payload
         assert message.sender_id == sender.id
+        # TECH-5903 Phase B, Argus round-2 SUGGESTION: `service.decide_hold`
+        # attaches these private `_notify_*` keys to its result dict purely
+        # so `main.decide_approval` can fire the post-commit subscription
+        # notification -- they must never reach the HTTP caller.
+        assert "_notify_conversation_id" not in body
+        assert "_notify_active_agent_ids" not in body
+        assert "_notify_inbox_agent_ids" not in body
 
     async def test_decide_uses_hold_snapshot_not_live_agents_row(
         self,

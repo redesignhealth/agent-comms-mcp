@@ -7144,6 +7144,11 @@ async def deny_resource_subscribe(
         conversation_id=conversation_id,
         detail=detail,
     )
+    # Argus round-2 SUGGESTION: `_deny` is `NoReturn`, so this is genuinely
+    # unreachable -- matching `resolve_inbox_target`'s existing pattern
+    # (a plain `raise`, never optimized away under `python -O`, unlike a
+    # bare `assert`).
+    raise AssertionError("unreachable: _deny must have raised")
 
 
 async def audit_resource_subscription(
@@ -7153,14 +7158,27 @@ async def audit_resource_subscription(
     agent_id: uuid.UUID,
     action: str,
     uri: str,
+    conversation_id: uuid.UUID | None = None,
 ) -> None:
     """Audit + commit a successful ``resource.subscribe``/``resource.unsubscribe``
     (TECH-5903 Phase B). Unlike every other tool/resource call, the low-level
     subscribe/unsubscribe handlers (``main.py``) open a session solely for
     this audit write — there is no other mutation to share a transaction
     with — so this commits immediately rather than deferring to a caller.
+
+    ``conversation_id``, when the subscribed/unsubscribed URI encodes one,
+    threads through onto the audit row for parity with ``deny_resource_subscribe``
+    (Argus round-2 SUGGESTION) -- omitted (``None``) for inbox URIs, which
+    have no conversation to attribute.
     """
-    _audit(session, actor_sub=actor_sub, action=action, agent_id=agent_id, detail={"uri": uri})
+    _audit(
+        session,
+        actor_sub=actor_sub,
+        action=action,
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+        detail={"uri": uri},
+    )
     await session.commit()
 
 
@@ -7782,12 +7800,15 @@ __all__ = [
     "archive_conversation",
     "audit_denied_approval_requires_interactive",
     "audit_denied_proposal_submission",
+    "audit_resource_subscription",
     "create_proposal",
     "decide_hold",
     "decide_proposal",
     "decline_invite",
+    "deny_resource_subscribe",
     "deregister_agent",
     "evaluate_linear_progress_update_judge",
+    "get_active_participant_agent_ids",
     "get_agent_by_sub",
     "get_conversation",
     "get_hold_status",
@@ -7805,6 +7826,8 @@ __all__ = [
     "post_message",
     "reconcile_agent_ownership",
     "register_agent",
+    "resolve_conversation_participant",
+    "resolve_inbox_target",
     "start_conversation",
     "validate_hold_level",
     "validate_ownership_client_configuration",

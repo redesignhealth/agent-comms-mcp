@@ -161,6 +161,58 @@ _COMPILED_RESOURCE_TEMPLATES: list[tuple[re.Pattern[str], str]] = [
 ]
 
 
+def compile_uri_template(template: str) -> re.Pattern[str]:
+    """Compile a resource template into a regex with one NAMED capture group
+    per ``{param}`` placeholder (named after the placeholder itself).
+
+    Sibling of ``_compile_resource_template`` above, which is deliberately
+    non-capturing (it only needs a yes/no match for scope lookup). This
+    variant is for callers that need the matched value(s) back out --
+    e.g. ``providers.comms.authorize_resource_subscribe``, which used to
+    hand-roll its own ``_CONVERSATION_SUBSCRIBE_URI_RE``/
+    ``_INBOX_SUBSCRIBE_URI_RE`` regexes duplicating these same URI shapes
+    (Argus round-2 SUGGESTION) -- deriving them from
+    ``RESOURCE_TEMPLATE_SCOPES``'s own template strings via this function
+    keeps the URI shape defined in exactly one place.
+    """
+    pattern_parts: list[str] = []
+    last_end = 0
+    for match in _TEMPLATE_PARAM_RE.finditer(template):
+        name = template[match.start() + 1 : match.end() - 1]
+        pattern_parts.append(re.escape(template[last_end : match.start()]))
+        pattern_parts.append(f"(?P<{name}>[^/]+)")
+        last_end = match.end()
+    pattern_parts.append(re.escape(template[last_end:]))
+    return re.compile("^" + "".join(pattern_parts) + "$")
+
+
+def check_resource_scope(token: AccessToken | None, uri: str) -> bool:
+    """Return True if ``token`` is authorized to read/subscribe to ``uri``.
+
+    Shared by ``main.ScopeEnforcementMiddleware.on_read_resource`` and
+    ``providers.comms.authorize_resource_subscribe`` (Argus round-2 BLOCKING
+    catch: both independently re-implemented the identical interactive-
+    bypass + ``required_scope_for_resource`` + ``scopes_for_token`` sequence
+    before this was extracted).
+
+    Returns ``False`` (never raises) for both "resource not enrolled"
+    (``required_scope_for_resource`` returns ``None``) and "scope missing"
+    -- callers that need to distinguish those two cases for logging/denial-
+    reason purposes should call ``required_scope_for_resource`` themselves
+    in addition to this; this function only answers the yes/no authorization
+    question. A ``None`` token is treated as unauthorized (fail closed),
+    matching ``is_interactive_token``'s own ``None`` handling.
+    """
+    if is_interactive_token(token):
+        return True
+    if token is None:
+        return False
+    required = required_scope_for_resource(uri)
+    if required is None:
+        return False
+    return required in scopes_for_token(token)
+
+
 # Not in TOOL_SCOPES: ``POST /proposals`` (TECH-5872) is a non-MCP
 # ``mcp.custom_route`` in main.py, not a tool dispatched through
 # ``ScopeEnforcementMiddleware`` -- that route self-checks this scope
@@ -328,6 +380,8 @@ __all__ = [
     "RESOURCE_SCOPES",
     "RESOURCE_TEMPLATE_SCOPES",
     "TOOL_SCOPES",
+    "check_resource_scope",
+    "compile_uri_template",
     "is_interactive_token",
     "is_registry_backed_agent_token",
     "required_scope_for",

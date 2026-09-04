@@ -82,7 +82,17 @@ async def subscribe(uri: str, session: ServerSession, *, agent_id: uuid.UUID, su
     """
     async with _lock:
         records = _registry.setdefault(uri, [])
+        before = len(records)
         records[:] = [r for r in records if r.session_ref() is not session]
+        # Idempotent re-subscribe (same uri, same session): the filter above
+        # just dropped this session's existing record. Without decrementing
+        # here, the unconditional increment below double-counts it against
+        # `agent_id` -- Argus round-2 BLOCKING catch (a caller re-subscribing
+        # to the same URI N times would inflate its count by N, eventually
+        # tripping the cap on a genuinely idempotent no-op).
+        removed_existing = len(records) < before
+        if removed_existing:
+            _dec_count(agent_id)
 
         total_for_agent = _agent_subscription_counts.get(agent_id, 0)
         if total_for_agent >= MAX_SUBSCRIPTIONS_PER_AGENT:
@@ -100,7 +110,12 @@ async def subscribe(uri: str, session: ServerSession, *, agent_id: uuid.UUID, su
 def _evict_oldest_for_agent_locked(agent_id: uuid.UUID) -> None:
     """Drop the single oldest record belonging to ``agent_id``, across every
     URI. Caller must hold ``_lock``."""
-    for uri, records in _registry.items():
+    # Snapshot via `list(...)` (Argus round-2 SUGGESTION): this loop deletes
+    # from `_registry` mid-iteration. That's only safe today because the
+    # first match always `return`s immediately -- iterating the live dict
+    # directly would raise `RuntimeError: dictionary changed size during
+    # iteration` the moment a match isn't found on the very first URI.
+    for uri, records in list(_registry.items()):
         for index, record in enumerate(records):
             if record.agent_id == agent_id:
                 del records[index]
@@ -110,22 +125,47 @@ def _evict_oldest_for_agent_locked(agent_id: uuid.UUID) -> None:
                 return
 
 
-async def unsubscribe(uri: str, session: ServerSession) -> None:
-    """Remove ``session``'s subscription to ``uri``, if any. Idempotent."""
+async def is_subscribed(uri: str, session: ServerSession) -> bool:
+    """Non-mutating check: is ``session`` currently subscribed to ``uri``?
+
+    Used by ``main.py``'s unsubscribe handler to decide, BEFORE writing the
+    audit row, whether this call will actually change anything (Argus
+    round-2: reconciling the "audit before mutation" ordering fix with the
+    "skip the audit row for a no-op unsubscribe" fix means the no-op check
+    has to happen before either the audit write or the registry mutation).
+    """
     async with _lock:
         records = _registry.get(uri)
         if not records:
-            return
+            return False
+        return any(r.session_ref() is session for r in records)
+
+
+async def unsubscribe(uri: str, session: ServerSession) -> bool:
+    """Remove ``session``'s subscription to ``uri``, if any. Idempotent.
+
+    Returns ``True`` if a record was actually removed, ``False`` if this was
+    a no-op (nothing was registered for this ``(uri, session)`` pair) --
+    callers (``main.py``'s low-level handler) use this to skip writing an
+    audit row for a no-op unsubscribe (Argus round-2 SUGGESTION).
+    """
+    async with _lock:
+        records = _registry.get(uri)
+        if not records:
+            return False
         remaining = []
+        removed = False
         for record in records:
             if record.session_ref() is session:
                 _dec_count(record.agent_id)
+                removed = True
                 continue
             remaining.append(record)
         if remaining:
             _registry[uri] = remaining
         else:
             del _registry[uri]
+        return removed
 
 
 async def notify(uri: str, *, recipient_filter: Collection[uuid.UUID] | None = None) -> None:
@@ -146,7 +186,17 @@ async def notify(uri: str, *, recipient_filter: Collection[uuid.UUID] | None = N
     dead_or_failed: list[_Record] = []
     for record in records:
         if recipient_filter is not None and record.agent_id not in recipient_filter:
-            live.append(record)
+            # Argus round-2 SUGGESTION: still prune a dead weakref even
+            # though no send is attempted for a filtered-out agent -- without
+            # this, a record whose owning agent never again appears in a
+            # `recipient_filter` (e.g. it permanently left every
+            # conversation it's subscribed to) would never be pruned, since
+            # the only other prune trigger is a failed *send*, which this
+            # path never attempts.
+            if record.session_ref() is None:
+                dead_or_failed.append(record)
+            else:
+                live.append(record)
             continue
         session = record.session_ref()
         if session is None:
@@ -154,6 +204,14 @@ async def notify(uri: str, *, recipient_filter: Collection[uuid.UUID] | None = N
             continue
         try:
             await session.send_resource_updated(uri)  # type: ignore[arg-type]
+        except asyncio.CancelledError:
+            # BaseException, not Exception -- already excluded from the
+            # guard below under Python's actual exception hierarchy, but
+            # re-raised explicitly (matching service._fire_approval_notifier's
+            # established pattern) so this stays correct even if the
+            # `except Exception` below is ever accidentally broadened to
+            # `except BaseException`.
+            raise
         except Exception as exc:
             logger.warning(
                 "dropping subscription to %r for agent %s after failed notify: %s",
@@ -170,10 +228,20 @@ async def notify(uri: str, *, recipient_filter: Collection[uuid.UUID] | None = N
         async with _lock:
             current = _registry.get(uri)
             if current is not None:
+                # Argus round-2 BLOCKING catch: decrement only for records
+                # still actually present in this freshly re-locked snapshot,
+                # not unconditionally for every record in `dead_or_failed` --
+                # a concurrent `unsubscribe()` may have already removed (and
+                # decremented) one of these between the unlocked send loop
+                # above and this re-lock, and double-decrementing it here
+                # would under-count `agent_id`'s subscriptions.
                 dead_ids = {id(r) for r in dead_or_failed}
-                remaining = [r for r in current if id(r) not in dead_ids]
-                for record in dead_or_failed:
-                    _dec_count(record.agent_id)
+                remaining = []
+                for record in current:
+                    if id(record) in dead_ids:
+                        _dec_count(record.agent_id)
+                    else:
+                        remaining.append(record)
                 if remaining:
                     _registry[uri] = remaining
                 else:

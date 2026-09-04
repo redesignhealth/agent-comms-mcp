@@ -671,7 +671,7 @@ Read-only companion to the tool surface above — same `comms_server` provider, 
 underlying `service.py` functions, a second MCP transport (`resources/list`,
 `resources/templates/list`, `resources/read`) rather than a new authorization model.
 Phase A is reads only; subscribe/unsubscribe (MCP's `resources/subscribe`) is
-explicitly deferred to a later phase and does not exist yet.
+Phase B, described below.
 
 **Mount-prefix URI rewrite**: a resource registered in `providers/comms.py` as
 `comms://agents` is exposed by the ROOT server (after `mcp.mount(comms_server,
@@ -711,7 +711,75 @@ separately, by passing `ResourceError` into `_map_service_errors` at each call
 site (that helper is parameterized with the target exception class, defaulting
 to `ToolError` for the tools above).
 
-## 8. Security invariants
+### MCP resource subscribe/unsubscribe (TECH-5903 Phase B)
+
+Adds `resources/subscribe`/`resources/unsubscribe` on top of Phase A's read-only
+surface — a subscriber gets a `notifications/resources/updated` push instead of
+having to poll the corresponding resource.
+
+**Registry (`subscriptions.py`)**: process-local, in-memory, keyed by the exact
+canonical URI string (`subscriptions.conversation_uri`/`inbox_uri` — never a raw,
+caller-supplied string, which could differ in UUID casing from the canonical form
+the write-path notifiers use). No dependency on `db`/`service`: every notify call
+is handed an already-resolved recipient set by its caller, computed from that
+caller's own just-committed transaction. Deployment fit: this repo runs one ECS
+Fargate task (`desired_count=1`) with no shared pub/sub, so a process-local
+registry is correct-by-deployment — but it is also fully ephemeral: a
+deploy/restart, or a client re-initializing its MCP session, drops every
+subscription and the client must re-subscribe. Bounded per-agent
+(`MAX_SUBSCRIPTIONS_PER_AGENT`, oldest evicted first) so a departed agent that
+never triggers a failed send can't accumulate unbounded stale records.
+
+**Low-level handler registration (`main.py`)**: FastMCP's own `@comms_server.resource`
+decorator has no subscribe counterpart, so `_handle_subscribe_resource`/
+`_handle_unsubscribe_resource` are registered directly on the underlying
+low-level `mcp.server.lowlevel.Server` (`mcp._mcp_server`) via its own
+`subscribe_resource()`/`unsubscribe_resource()` decorators. This means they
+bypass `ScopeEnforcementMiddleware`/`ObservabilityMiddleware` entirely — all
+authorization is reimplemented once, in `providers.comms.authorize_resource_subscribe`,
+which both handlers call and nothing else. Pre-DB denials (missing token, missing
+scope, unknown URI, malformed UUID) still get a structured `logger.warning` for
+audit-signal purposes, since they never reach `service.deny_resource_subscribe`'s
+audited DB path.
+
+**Capability advertisement**: the SDK hardcodes `resources.subscribe=False` in
+`get_capabilities` even with subscribe/unsubscribe handlers registered
+(verified against the pinned fastmcp version) — `main.py` patches the bound
+method on this server instance, after registration, to advertise `subscribe=True`
+instead, or a spec-compliant client would never even attempt
+`resources/subscribe`.
+
+**Authorization rule — active-only (stricter than read) for conversation subscribe**:
+subscribing to a conversation URI requires the caller to be an `active`
+participant, not merely `invited` the way a plain resource *read* allows for
+metadata-only access — an `invited` participant that hasn't accepted yet must not
+learn message cadence via a content-free ping. Unsubscribing is the deliberate
+exception: it is permitted regardless of current status (`require_active=False`),
+since a departing agent removing its own already-registered subscription leaks
+nothing, and gating it the same as subscribe would make an already-registered
+subscription impossible for its own owner to ever clean up. Inbox URIs have no
+`invited`/`active` distinction to apply in either direction — just the same
+self-or-sibling check `agent_inbox_resource` uses.
+
+**Notification-firing write paths**: every write path that changes a
+conversation's or agent's inbox-relevant state calls
+`subscriptions.notify_conversation_event` post-commit, best-effort (never fails
+the request, mirroring `service._fire_approval_notifier`'s posture):
+
+| Write path | Conversation URI notified? | Inbox URI(s) notified |
+|---|---|---|
+| `comms_start_conversation` | No (didn't exist before this call) | every invited target |
+| `comms_post_message` | Yes (active participants) | every active participant except the sender |
+| `comms_accept` | Yes (active participants, now including the caller) | the caller |
+| `comms_decline_invite` | Yes (active participants) | the caller |
+| `comms_invite` | Yes (active participants) | the newly-invited target |
+| `comms_leave` | Yes (active participants, now excluding the caller) | the caller |
+| `main.decide_approval` (approve) | Yes (active participants) | active participants, per `service.decide_hold`'s `_notify_*` payload |
+
+A held-for-approval outcome (post_message/invite/start_conversation) fires no
+notification — nothing visible changed yet.
+
+
 
 1. Owner identity derives from verified OAuth token claims, never parameters.
 2. High-risk content crosses an ownership boundary only via an explicitly-approved
