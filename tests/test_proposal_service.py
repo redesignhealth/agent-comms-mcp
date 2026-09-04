@@ -751,9 +751,8 @@ class TestDecideProposal:
                 )
             )
             .scalars()
-            .first()
+            .one()
         )
-        assert audit_row is not None
         assert "apply cancelled before completion" in audit_row.detail["error"]
 
     async def test_cancellation_during_apply_resolves_to_apply_failed(
@@ -810,9 +809,8 @@ class TestDecideProposal:
                 )
             )
             .scalars()
-            .first()
+            .one()
         )
-        assert audit_row is not None
         assert "apply cancelled before completion" in audit_row.detail["error"]
 
     async def test_cancellation_with_message_uses_message_in_raw_error_only(
@@ -858,9 +856,8 @@ class TestDecideProposal:
                 )
             )
             .scalars()
-            .first()
+            .one()
         )
-        assert audit_row is not None
         assert "watchdog: 30s timeout" in audit_row.detail["error"]
 
     async def test_cancellation_racing_concurrent_resolution_reraises_without_terminal_write(

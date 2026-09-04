@@ -302,6 +302,26 @@ class TestProgressCommentBody:
         assert "token" not in text
         assert "secret123" not in text
 
+    def test_malformed_ipv6_url_raises_linear_api_error_not_value_error(self) -> None:
+        """Argus review round-11 suggestion: pins the no-stranding
+        contract at the actual call site where the round-10 BLOCKING bug
+        surfaced -- `citation_urls._safe_urlsplit` is unit-tested
+        directly, but nothing at THIS seam proved that a malformed URL
+        reaching `_progress_comment_body` (via `apply_progress_update`,
+        called from `service._apply_or_finalize_proposal_hold`) comes out
+        as a `LinearAPIError` for that function's `except
+        linear_client.LinearAPIError`/`except asyncio.CancelledError`
+        envelope to catch -- a bare `ValueError` escaping here is exactly
+        what stranded holds at `"applying"` before round-10's fix."""
+        with pytest.raises(LinearAPIError):
+            _progress_comment_body(
+                {
+                    "action_type": "open_ticket",
+                    "source_message_url": "https://[::1::2]/path",
+                },
+                "",
+            )
+
     def test_non_allowlisted_source_url_on_close_ticket_is_omitted_not_raised(self) -> None:
         """Argus review round-2 B3 (skip, don't raise) for close_ticket
         specifically: a present-but-invalid field must not block the

@@ -6096,7 +6096,7 @@ _APPLY_ERROR_GENERIC_MESSAGE = "Linear API returned an error"
 # changed from the machine-token `"apply_failed:cancelled"` (introduced
 # round-9, same PR/deploy cycle) to this human-readable string. No
 # production traffic exists yet for TECH-5873's decide/apply endpoint --
-# `proposal_holds` has zero live write traffic pre-TECH-5884/5884 (see
+# `proposal_holds` has zero live write traffic pre-TECH-5884 (see
 # migration `e2f7a91c5b34`'s own DEPLOYMENT note) -- so there is no
 # persisted row anywhere carrying the old value and no migration is
 # needed. This string is NOT meant to be machine-matched by any consumer
