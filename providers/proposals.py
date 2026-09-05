@@ -214,9 +214,16 @@ async def submit(
     except ValueError as exc:
         raise ToolError(f"invalid_request: {exc}") from None
 
-    # get_access_token() is guaranteed non-None here: _require_bot_sub()
-    # above already raised if it were (Argus review round-1 suggestion).
+    # _require_bot_sub() above already raised if get_access_token() were
+    # None (Argus review round-1 suggestion) -- but re-guard this second,
+    # independent contextvar lookup explicitly rather than assuming that
+    # guarantee still holds (Argus review round-2 suggestion): an
+    # unguarded second call would raise an unhandled AttributeError, not a
+    # clean ToolError, if a future FastMCP contextvar regression ever made
+    # this call return None where the earlier one didn't.
     token = get_access_token()
+    if token is None:
+        raise ToolError("no access token provided")
     owner_sub = service.resolve_proposal_owner_sub(token)
     async with get_session_factory()() as session:
         if owner_sub is None:

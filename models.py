@@ -810,6 +810,18 @@ class ProposalHold(Base):
         # query, or a future per-bot listing) -- see migration
         # 9a1c2d3e4f5b's docstring (S1).
         Index("idx_proposal_holds_bot_id_created_at", "proposed_by_bot_id", "created_at"),
+        # Backs service.list_proposals_for_bot's status-filtered per-bot
+        # listing (proposals_list_pending/proposals_list_history MCP
+        # tools) -- same convention as
+        # idx_proposal_holds_owner_sub_status_created_at above. Declared
+        # here too so a future `alembic revision --autogenerate` doesn't
+        # propose dropping it -- see migration b3d4e5f6a7c8's docstring.
+        Index(
+            "idx_proposal_holds_bot_id_status_created_at",
+            "proposed_by_bot_id",
+            "status",
+            "created_at",
+        ),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()

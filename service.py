@@ -6329,9 +6329,25 @@ PROPOSAL_TERMINAL_STATUSES: tuple[str, ...] = (
     "stale",
     "withdrawn",
 )
-assert set(PROPOSAL_TERMINAL_STATUSES) | {"pending", "applying", "approved"} == set(
-    PROPOSAL_HOLD_STATUSES
-), "PROPOSAL_TERMINAL_STATUSES is out of sync with PROPOSAL_HOLD_STATUSES -- update both together"
+_NON_TERMINAL_PROPOSAL_STATUSES = {"pending", "applying", "approved"}
+# `if`/`raise`, not a bare `assert` (Argus review round-2 suggestion) --
+# this module's own convention (see the migration-context bind check this
+# mirrors) is to never rely on a check that silently vanishes under
+# `python -O`. Checks BOTH completeness (every status in
+# PROPOSAL_HOLD_STATUSES is accounted for by one set or the other) AND
+# disjointness (no status is in both) -- a union-only check would pass even
+# if a status appeared in both sets, which would make `list_history` treat
+# an in-flight, non-terminal status as already-actioned.
+if set(PROPOSAL_TERMINAL_STATUSES) & _NON_TERMINAL_PROPOSAL_STATUSES:
+    raise AssertionError(
+        "PROPOSAL_TERMINAL_STATUSES overlaps with the non-terminal status set -- "
+        "a status cannot be both"
+    )
+if set(PROPOSAL_TERMINAL_STATUSES) | _NON_TERMINAL_PROPOSAL_STATUSES != set(PROPOSAL_HOLD_STATUSES):
+    raise AssertionError(
+        "PROPOSAL_TERMINAL_STATUSES is out of sync with PROPOSAL_HOLD_STATUSES -- "
+        "update both together"
+    )
 
 
 async def list_pending_proposal_holds(

@@ -1313,7 +1313,7 @@ and the raw HTTP routes stay live for existing non-MCP callers
 `list_history` are NOT a drop-in replacement for `GET /proposals/pending`:
 that HTTP route is a different, human-scoped listing
 (`service.list_pending_proposal_holds`, filtered by `owner_sub`,
-Okta-interactive only) — see below. All five tools are enrolled in
+Okta-interactive only) -- see below. All five tools are enrolled in
 `scopes.TOOL_SCOPES` under
 `comms:proposals:write` (the same scope the HTTP routes self-check), since
 `ScopeEnforcementMiddleware` fails closed on any mounted tool name that
