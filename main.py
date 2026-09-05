@@ -50,6 +50,7 @@ from observability import (
 )
 from plugins import validate_configuration as validate_plugin_configuration
 from providers.comms import ResourceSubscribeDeniedError, authorize_resource_subscribe, comms_server
+from providers.proposals import proposals_server
 from scopes import (
     PROPOSAL_SUBMIT_SCOPE,
     check_resource_scope,
@@ -426,6 +427,7 @@ mcp.add_middleware(ObservabilityMiddleware())
 mcp.add_middleware(ScopeEnforcementMiddleware())
 
 mcp.mount(comms_server, namespace="comms")
+mcp.mount(proposals_server, namespace="proposals")
 
 _RESOURCE_SUBSCRIBE_DENIAL_MESSAGE = "access_denied: not authorized for this resource"
 
@@ -672,7 +674,6 @@ async def health(request: Request) -> PlainTextResponse:
     return PlainTextResponse("ok")
 
 
-_MAX_DECISION_REASON_LENGTH = 2000
 _UNIFORM_HOLD_NOT_FOUND = {"error": "not_found"}
 
 
@@ -757,18 +758,6 @@ async def _authenticate_approval_caller(
             session, actor_sub=rejected_sub, surface=surface
         )
     return None, 403
-
-
-_MAX_PROPOSAL_STRING_FIELD_LENGTH = 4000
-# Argus review S1: `kind` is a category label (e.g. "linear_progress_update"),
-# not free text -- a much lower cap than the general string-field cap above.
-_MAX_PROPOSAL_KIND_LENGTH = 200
-# Argus review S2: `action` is an arbitrary JSONB payload with no size/depth
-# limit otherwise -- bound its serialized size, and separately cap the two
-# sub-fields used as dedup keys (target_id/action_type) since an oversized
-# value there would otherwise flow straight into the DB-level dedup index.
-_MAX_PROPOSAL_ACTION_BYTES = 16_384
-_MAX_PROPOSAL_ACTION_FIELD_LENGTH = 500
 
 
 async def _verify_agent_token(token_str: str) -> Any | None:
@@ -872,32 +861,6 @@ async def _authenticate_proposal_submitter(
     return None, None, 403
 
 
-def _resolve_proposal_owner_sub(token: Any) -> str | None:
-    """Best-effort ``owner_sub`` extraction from a verified bot token's
-    claims (TECH-5872) -- same "trust only a registry-backed verifier's
-    claim shape" posture as ``providers.comms._string_claim``, duplicated
-    here rather than imported since that helper is private to
-    ``providers.comms`` and takes a FastMCP ``AccessToken`` from a
-    different call site's variable naming, not because the logic differs.
-    """
-    value = token.claims.get("owner_sub")
-    if value is None:
-        return None
-    if not isinstance(value, str) or not value:
-        return None
-    return value
-
-
-def _validate_proposal_string_field(
-    name: str, value: Any, *, max_length: int = _MAX_PROPOSAL_STRING_FIELD_LENGTH
-) -> str:
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"{name} is required and must be a non-empty string")
-    if len(value) > max_length:
-        raise ValueError(f"{name} exceeds {max_length} characters")
-    return value
-
-
 @mcp.custom_route("/proposals", methods=["POST"])
 async def submit_proposal(request: Request) -> Response:
     """Bot-submission endpoint for a generalized action-approval proposal
@@ -936,8 +899,8 @@ async def submit_proposal(request: Request) -> Response:
 
     action = body.get("action")
     try:
-        kind = _validate_proposal_string_field(
-            "kind", body.get("kind"), max_length=_MAX_PROPOSAL_KIND_LENGTH
+        kind = service.validate_proposal_string_field(
+            "kind", body.get("kind"), max_length=service.MAX_PROPOSAL_KIND_LENGTH
         )
     except ValueError as exc:
         return JSONResponse({"error": "invalid_request", "detail": str(exc)}, status_code=422)
@@ -950,25 +913,25 @@ async def submit_proposal(request: Request) -> Response:
     # with no size/depth limit otherwise -- bound its serialized size, and
     # separately cap target_id/action_type since they flow straight into
     # the DB-level dedup index (idx_proposal_holds_pending_dedup).
-    if len(json.dumps(action)) > _MAX_PROPOSAL_ACTION_BYTES:
+    if len(json.dumps(action)) > service.MAX_PROPOSAL_ACTION_BYTES:
         return JSONResponse(
             {
                 "error": "invalid_request",
-                "detail": f"action exceeds {_MAX_PROPOSAL_ACTION_BYTES} bytes serialized",
+                "detail": f"action exceeds {service.MAX_PROPOSAL_ACTION_BYTES} bytes serialized",
             },
             status_code=422,
         )
     try:
-        rationale = _validate_proposal_string_field("rationale", body.get("rationale"))
-        target_fingerprint = _validate_proposal_string_field(
+        rationale = service.validate_proposal_string_field("rationale", body.get("rationale"))
+        target_fingerprint = service.validate_proposal_string_field(
             "target_fingerprint", body.get("target_fingerprint")
         )
         for action_field in ("target_id", "action_type"):
             if action_field in action:
-                _validate_proposal_string_field(
+                service.validate_proposal_string_field(
                     f"action.{action_field}",
                     action.get(action_field),
-                    max_length=_MAX_PROPOSAL_ACTION_FIELD_LENGTH,
+                    max_length=service.MAX_PROPOSAL_ACTION_FIELD_LENGTH,
                 )
     except ValueError as exc:
         return JSONResponse({"error": "invalid_request", "detail": str(exc)}, status_code=422)
@@ -991,7 +954,7 @@ async def submit_proposal(request: Request) -> Response:
     except ValueError as exc:
         return JSONResponse({"error": "invalid_request", "detail": str(exc)}, status_code=422)
 
-    owner_sub = _resolve_proposal_owner_sub(bot_token)
+    owner_sub = service.resolve_proposal_owner_sub(bot_token)
     if owner_sub is None:
         async with get_session_factory()() as session:
             agent = await service.get_agent_by_sub(session, bot_sub)
@@ -1155,11 +1118,11 @@ async def withdraw_proposal_route(request: Request) -> Response:
     if reason is not None:
         if not isinstance(reason, str):
             return JSONResponse({"error": "invalid_reason"}, status_code=422)
-        if len(reason) > _MAX_DECISION_REASON_LENGTH:
+        if len(reason) > service.MAX_DECISION_REASON_LENGTH:
             return JSONResponse(
                 {
                     "error": "invalid_reason",
-                    "detail": f"reason exceeds {_MAX_DECISION_REASON_LENGTH} characters",
+                    "detail": f"reason exceeds {service.MAX_DECISION_REASON_LENGTH} characters",
                 },
                 status_code=422,
             )
@@ -1227,11 +1190,12 @@ async def decide_proposal_route(request: Request) -> Response:
     if decision_note is not None:
         if not isinstance(decision_note, str):
             return JSONResponse({"error": "invalid_decision_note"}, status_code=422)
-        if len(decision_note) > _MAX_DECISION_REASON_LENGTH:
+        if len(decision_note) > service.MAX_DECISION_REASON_LENGTH:
+            max_len = service.MAX_DECISION_REASON_LENGTH
             return JSONResponse(
                 {
                     "error": "invalid_decision_note",
-                    "detail": f"decision_note exceeds {_MAX_DECISION_REASON_LENGTH} characters",
+                    "detail": f"decision_note exceeds {max_len} characters",
                 },
                 status_code=422,
             )
@@ -1301,11 +1265,11 @@ async def decide_approval(request: Request) -> Response:
     if reason is not None:
         if not isinstance(reason, str):
             return JSONResponse({"error": "invalid_reason"}, status_code=422)
-        if len(reason) > _MAX_DECISION_REASON_LENGTH:
+        if len(reason) > service.MAX_DECISION_REASON_LENGTH:
             return JSONResponse(
                 {
                     "error": "invalid_reason",
-                    "detail": f"reason exceeds {_MAX_DECISION_REASON_LENGTH} characters",
+                    "detail": f"reason exceeds {service.MAX_DECISION_REASON_LENGTH} characters",
                 },
                 status_code=422,
             )

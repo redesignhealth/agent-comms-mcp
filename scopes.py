@@ -118,6 +118,27 @@ TOOL_SCOPES: dict[str, str] = {
     # damage. Revisit if a rate limit consistent with the other mutating
     # tools' pattern is ever added.
     "comms_archive_conversation": "comms:write",
+    # --- proposals (provider: providers/proposals.py, namespace="proposals",
+    # TECH-6018 follow-up) ---
+    # All five reuse the SAME "comms:proposals:write" scope the raw HTTP
+    # routes already gate (PROPOSAL_SUBMIT_SCOPE below), rather than
+    # splitting into :read/:write -- the HTTP routes already conflate
+    # read+write under this one scope for every proposal action a bot can
+    # take, so introducing narrower tool-level granularity here would be a
+    # bigger, unrequested scope-model change (and would require re-minting
+    # every already-provisioned proposals token). ``proposals_submit``/
+    # ``get``/``list_pending``/``list_history``/``withdraw`` wrap the exact
+    # same service.py functions the HTTP routes call -- see
+    # providers/proposals.py's module docstring. ``decide`` (approve/
+    # reject) has NO tool counterpart: it requires an Okta-interactive
+    # caller (decision_page, never an MCP client) and is structurally
+    # unreachable by a bot's agent-jwt token (see
+    # ``service.decide_proposal``'s own docstring).
+    "proposals_submit": "comms:proposals:write",
+    "proposals_get": "comms:proposals:write",
+    "proposals_list_pending": "comms:proposals:write",
+    "proposals_list_history": "comms:proposals:write",
+    "proposals_withdraw": "comms:proposals:write",
 }
 
 
@@ -224,12 +245,16 @@ def check_resource_scope(token: AccessToken | None, uri: str) -> bool:
     return required in scopes_for_token(token)
 
 
-# Not in TOOL_SCOPES: ``POST /proposals`` (TECH-5872) is a non-MCP
-# ``mcp.custom_route`` in main.py, not a tool dispatched through
-# ``ScopeEnforcementMiddleware`` -- that route self-checks this scope
-# directly (see main.py's ``_authenticate_proposal_submitter``), the same
-# way ``/approvals/*``'s routes self-check interactivity rather than going
-# through this module's tool-dispatch machinery.
+# ``POST /proposals`` (TECH-5872) is a non-MCP ``mcp.custom_route`` in
+# main.py, not a tool dispatched through ``ScopeEnforcementMiddleware`` --
+# that route self-checks this scope directly (see main.py's
+# ``_authenticate_proposal_submitter``), the same way ``/approvals/*``'s
+# routes self-check interactivity rather than going through this module's
+# tool-dispatch machinery. This constant is ALSO now the literal value
+# hardcoded into the five ``proposals_*`` entries in ``TOOL_SCOPES`` above
+# (a plain string literal there, not a reference to this name, since
+# ``TOOL_SCOPES`` is defined before this module-level assignment runs) --
+# keep the two in sync by hand if this scope string ever changes.
 PROPOSAL_SUBMIT_SCOPE = "comms:proposals:write"
 
 
