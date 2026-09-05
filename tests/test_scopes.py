@@ -68,13 +68,18 @@ class TestToolScopesRegistry:
 
     def test_every_defined_scope_constant_is_mintable(self) -> None:
         """Argus review B3: every scope constant this codebase defines
-        (every TOOL_SCOPES value, plus the two standalone constants that
-        gate something OTHER than a TOOL_SCOPES-enrolled tool --
-        ``comms:admin`` and ``PROPOSAL_SUBMIT_SCOPE``) must be mintable via
-        ``mint_token``'s CLI. A scope missing from ``mint_token._VALID_
-        SCOPES`` can never legitimately be minted, making whatever it
-        gates permanently unreachable by any agent-jwt caller -- this is
-        exactly the hole B3 found for ``PROPOSAL_SUBMIT_SCOPE``."""
+        (every TOOL_SCOPES value, plus ``comms:admin``, the one standalone
+        constant that still gates something OTHER than a TOOL_SCOPES-
+        enrolled tool -- an in-handler parameter check, not a tool-
+        reachability gate) must be mintable via ``mint_token``'s CLI. A
+        scope missing from ``mint_token._VALID_SCOPES`` can never
+        legitimately be minted, making whatever it gates permanently
+        unreachable by any agent-jwt caller -- this is exactly the hole
+        B3 found for ``PROPOSAL_SUBMIT_SCOPE``. (``PROPOSAL_SUBMIT_SCOPE``
+        itself is no longer a standalone case as of TECH-6018's proposals
+        MCP tools -- its value now ALSO appears in TOOL_SCOPES via the
+        five ``proposals_*`` entries, though the constant still separately
+        self-gates the non-MCP ``POST /proposals`` route directly.)"""
         every_defined_scope = set(TOOL_SCOPES.values()) | {"comms:admin", PROPOSAL_SUBMIT_SCOPE}
         missing = every_defined_scope - mint_token._VALID_SCOPES
         assert not missing, f"scope(s) defined but not mintable: {missing}"

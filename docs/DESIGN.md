@@ -1286,6 +1286,60 @@ across two opposite auth postures:
   values so an arbitrary caller-supplied string can never become an audit
   action name.
 
+**Bot-facing MCP tool surface** (`providers/proposals.py`, mounted
+`namespace="proposals"` -- `proposals_submit`, `proposals_get`,
+`proposals_list_pending`, `proposals_list_history`, `proposals_withdraw`)
+[TECH-6018 follow-up]. A bot submitting/polling/listing/withdrawing its own
+proposals is exactly as bot-initiated as any `comms_*` action, so these are
+real `listTools()`-visible MCP tools, not just raw HTTP -- mirroring
+`providers/comms.py`'s shape (resolve identity -> open session -> call one
+`service.py` function -> map exceptions to `ToolError`) with one deliberate
+difference: no `get_agent_by_sub` / board-`Agent` resolution step for the
+submitting bot's OWN identity, since a proposing bot need not be a
+board-registered agent at all (see
+`main._authenticate_proposal_submitter`'s own docstring) -- identity comes
+straight from the verified token via `identity.try_resolve_email`, the same
+resolver the HTTP routes above already use for `bot_sub`. (`owner_sub` is a
+separate concern from the submitting bot's own identity: `proposals_submit`
+DOES conditionally call `service.get_agent_by_sub` as a fallback when the
+token's `owner_sub` claim is absent -- see `create_proposal`'s own
+`owner_sub` parameter.) These tools do NOT replace `POST /proposals` /
+`GET /proposals/{id}` / `GET /proposals/pending` / `POST
+/proposals/{id}/withdraw` -- `submit`/`get`/`withdraw` call the exact same
+`service.py` functions their HTTP-route equivalents do (`create_proposal`,
+`get_proposal_for_bot`, `withdraw_proposal`), so those three cannot drift,
+and the raw HTTP routes stay live for existing non-MCP callers
+(`linear-progress-bot`, `provision-agent` runbook docs). `list_pending`/
+`list_history` are NOT a drop-in replacement for `GET /proposals/pending`:
+that HTTP route is a different, human-scoped listing
+(`service.list_pending_proposal_holds`, filtered by `owner_sub`,
+Okta-interactive only) -- see below. All five tools are enrolled in
+`scopes.TOOL_SCOPES` under
+`comms:proposals:write` (the same scope the HTTP routes self-check), since
+`ScopeEnforcementMiddleware` fails closed on any mounted tool name that
+isn't registered there.
+
+`proposals_list_pending` and `proposals_list_history` are new --
+`service.list_proposals_for_bot` -- since a bot previously had no way to
+list its own proposals at all, only poll one by id. Both are sender-only
+(`WHERE proposed_by_bot_id = requesting_bot_sub`, never another bot's
+rows), ordered oldest-first, and clamp `limit` to [1, 200]. `list_pending`
+filters to `status = 'pending'`; `list_history` filters to
+`service.PROPOSAL_TERMINAL_STATUSES` (every status in
+`PROPOSAL_HOLD_STATUSES` except `pending`/`applying`/the never-persisted
+`approved`). Every row goes through the same `_bot_facing_proposal_dict`
+redaction every other bot-facing return path uses, so `decided_by_actor_id`
+is omitted from list results too whenever `decision_source == "human"`.
+
+`POST /proposals/{id}/decide` has, and will never have, a tool
+counterpart. It requires an Okta-interactive caller
+(`agent-comms-approvals`'s `decision_page`, a Starlette web app that calls
+this route directly via `httpx` -- never an MCP client) and is structurally
+unreachable by any bot's agent-jwt token by construction, not convention
+(`service.decide_proposal`'s own docstring: a bot can never reach that
+gate). Approving/rejecting a proposal is the one proposal action that
+stays human-only and HTTP-only.
+
 **Create-time dedup key: `(kind, proposed_by_bot_id, target_id,
 action_type)`** -- scoped to the SUBMITTING BOT. A resubmission matching an
 existing `status='pending'` row under this key UPDATEs it in place instead

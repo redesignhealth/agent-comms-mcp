@@ -429,3 +429,12 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
     # hypothetically reordered migration would make this comparison itself
     # fail rather than merely raising a different exception.
     assert two_type_predicate_pos < three_type_predicate_pos
+    # b3d4e5f6a7c8 (TECH-6018 follow-up, Argus review round-2 suggestion):
+    # the composite index backing service.list_proposals_for_bot's
+    # status-filtered per-bot listing -- same rationale as every other
+    # proposal_holds index assertion above: a typo in the index name or
+    # column order would otherwise be invisible to CI.
+    assert (
+        "CREATE INDEX IF NOT EXISTS idx_proposal_holds_bot_id_status_created_at "
+        "ON proposal_holds (proposed_by_bot_id, status, created_at)" in result.stdout
+    )

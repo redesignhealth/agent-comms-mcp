@@ -191,6 +191,7 @@ from exceptions import (
 )
 from models import (
     PROPOSAL_HOLD_LEVELS,
+    PROPOSAL_HOLD_STATUSES,
     Agent,
     ApprovalHold,
     AuditLog,
@@ -5919,6 +5920,60 @@ def validate_hold_level(value: str, name: str) -> str:
     return value
 
 
+MAX_PROPOSAL_STRING_FIELD_LENGTH = 4000
+# `kind` is a category label (e.g. "linear_progress_update"), not free text
+# -- a much lower cap than the general string-field cap above.
+MAX_PROPOSAL_KIND_LENGTH = 200
+# `action` is an arbitrary JSONB payload with no size/depth limit
+# otherwise -- bound its serialized size, and separately cap the two
+# sub-fields used as dedup keys (target_id/action_type) since an oversized
+# value there would otherwise flow straight into the DB-level dedup index.
+MAX_PROPOSAL_ACTION_BYTES = 16_384
+MAX_PROPOSAL_ACTION_FIELD_LENGTH = 500
+# Shared cap for the free-text `reason`/`decision_note` fields on withdraw
+# and decide -- both HTTP routes and the `proposals_withdraw` MCP tool.
+MAX_DECISION_REASON_LENGTH = 2000
+
+
+def resolve_proposal_owner_sub(token: Any) -> str | None:
+    """Best-effort ``owner_sub`` extraction from a verified bot token's
+    claims (TECH-5872) -- same "trust only a registry-backed verifier's
+    claim shape" posture as ``providers.comms._string_claim``, duplicated
+    here rather than imported since that helper is private to
+    ``providers.comms`` and takes a FastMCP ``AccessToken`` from a
+    different call site's variable naming, not because the logic differs.
+
+    Lives in this module (not ``main.py``, where it originated) so both
+    ``main.py``'s HTTP ``submit_proposal`` route AND
+    ``providers.proposals``'s ``proposals_submit`` MCP tool (TECH-6018
+    follow-up) can call the SAME function without either importing from
+    the other -- ``main.py`` already imports ``providers.proposals`` to
+    mount it, so the reverse import would be circular.
+    """
+    value = token.claims.get("owner_sub")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        return None
+    return value
+
+
+def validate_proposal_string_field(
+    name: str, value: Any, *, max_length: int = MAX_PROPOSAL_STRING_FIELD_LENGTH
+) -> str:
+    """Shared non-empty-string-with-a-length-cap check for proposal submission
+    fields (``rationale``, ``target_fingerprint``, ``kind``,
+    ``action.target_id``/``action.action_type``) -- same "one function, two
+    callers" rationale as ``resolve_proposal_owner_sub`` above: both
+    ``main.py``'s HTTP route and ``providers.proposals``'s MCP tool
+    (TECH-6018 follow-up) validate these fields identically."""
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{name} is required and must be a non-empty string")
+    if len(value) > max_length:
+        raise ValueError(f"{name} exceeds {max_length} characters")
+    return value
+
+
 def _proposal_dedup_where(
     *, kind: str, proposed_by_bot_id: str, target_id: str, action_type: str
 ) -> tuple[Any, ...]:
@@ -6252,6 +6307,49 @@ async def create_proposal(
     return _bot_facing_proposal_dict(resolved)
 
 
+# Every terminal proposal_holds status EXCEPT `"approved"`, which is never
+# actually persisted (see PROPOSAL_HOLD_STATUSES's own comment in
+# models.py) -- listing it here would be dead code, since no row can ever
+# be found at rest with this value. Used by `list_proposals_for_bot`'s
+# history-tool call site (`proposals_list_history`, providers/proposals.py)
+# to select every proposal that has left `pending`/`applying` for good.
+#
+# A positive enumeration (Argus review round-1 suggestion), not derived by
+# excluding `("pending", "applying", "approved")` from PROPOSAL_HOLD_STATUSES:
+# an exclusion-based derivation would silently enroll any FUTURE non-terminal
+# status (e.g. a `"cancelling"` transitional state) into `list_history` as an
+# already-actioned result the moment it's added to PROPOSAL_HOLD_STATUSES,
+# with no test failure to catch it. The assertion below pins this tuple
+# against PROPOSAL_HOLD_STATUSES instead, so an oversight fails loudly (at
+# import time) rather than silently misclassifying a new status.
+PROPOSAL_TERMINAL_STATUSES: tuple[str, ...] = (
+    "rejected",
+    "applied",
+    "apply_failed",
+    "stale",
+    "withdrawn",
+)
+_NON_TERMINAL_PROPOSAL_STATUSES = {"pending", "applying", "approved"}
+# `if`/`raise`, not a bare `assert` (Argus review round-2 suggestion) --
+# this module's own convention (see the migration-context bind check this
+# mirrors) is to never rely on a check that silently vanishes under
+# `python -O`. Checks BOTH completeness (every status in
+# PROPOSAL_HOLD_STATUSES is accounted for by one set or the other) AND
+# disjointness (no status is in both) -- a union-only check would pass even
+# if a status appeared in both sets, which would make `list_history` treat
+# an in-flight, non-terminal status as already-actioned.
+if set(PROPOSAL_TERMINAL_STATUSES) & _NON_TERMINAL_PROPOSAL_STATUSES:
+    raise AssertionError(
+        "PROPOSAL_TERMINAL_STATUSES overlaps with the non-terminal status set -- "
+        "a status cannot be both"
+    )
+if set(PROPOSAL_TERMINAL_STATUSES) | _NON_TERMINAL_PROPOSAL_STATUSES != set(PROPOSAL_HOLD_STATUSES):
+    raise AssertionError(
+        "PROPOSAL_TERMINAL_STATUSES is out of sync with PROPOSAL_HOLD_STATUSES -- "
+        "update both together"
+    )
+
+
 async def list_pending_proposal_holds(
     session: AsyncSession, *, owner_sub: str, limit: int = 50
 ) -> dict[str, Any]:
@@ -6398,6 +6496,47 @@ async def withdraw_proposal(
     # `decide_proposal`'s reject branch for the same pattern/reasoning.
     await session.refresh(hold)
     return _bot_facing_proposal_dict(hold)
+
+
+async def list_proposals_for_bot(
+    session: AsyncSession, *, requesting_bot_sub: str, statuses: Sequence[str], limit: int = 50
+) -> dict[str, Any]:
+    """Sender-only list of the SUBMITTING bot's own proposals, filtered to
+    ``statuses`` (``providers.proposals``'s ``proposals_list_pending``/
+    ``proposals_list_history`` MCP tools each pass a different, fixed
+    status set -- see that module). Mirrors
+    ``list_pending_proposal_holds``'s shape/limit-clamping exactly, but
+    scoped by ``proposed_by_bot_id`` (the SENDER), not ``owner_sub`` (the
+    board conversation owner who'd decide it) -- the same distinction
+    ``get_proposal_for_bot``/``withdraw_proposal`` already draw for
+    single-id lookups. A bot has never been required to be a
+    board-registered ``Agent`` to hold proposals (see
+    ``main._authenticate_proposal_submitter``'s own docstring) -- this
+    queries ``proposal_holds`` directly by the verified token's ``sub``
+    claim, with no ``Agent`` row involved at all.
+
+    Every row is redacted via ``_bot_facing_proposal_dict``, same as every
+    other bot-facing return path in this module (Argus review round-2
+    BLOCKING + round-3/4 follow-ups) -- a proposal in ``statuses`` can be
+    ``decision_source == "human"`` (a decided one, surfaced by the history
+    tool), so this list is exactly as exposed to a human reviewer's
+    identity leaking to the bot as any single-id lookup is.
+    """
+    limit = max(1, min(limit, 200))
+    stmt = (
+        select(ProposalHold)
+        .where(
+            ProposalHold.proposed_by_bot_id == requesting_bot_sub,
+            ProposalHold.status.in_(statuses),
+        )
+        .order_by(ProposalHold.created_at.asc())
+        .limit(limit + 1)
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    proposals = [_bot_facing_proposal_dict(hold) for hold in rows]
+    return {"proposals": proposals, "has_more": has_more}
 
 
 async def _find_proposal_hold(
@@ -8255,15 +8394,21 @@ __all__ = [
     "DEFAULT_RECONCILIATION_BATCH_SIZE",
     "MAX_APPROVAL_HOLDS_PER_MINUTE",
     "MAX_CONVERSATION_STARTS_PER_HOUR",
+    "MAX_DECISION_REASON_LENGTH",
     "MAX_LOOKUP_EMAIL_LENGTH",
     "MAX_MESSAGES_PER_CONVERSATION_PER_HOUR",
     "MAX_PROPOSALS_PER_BOT_PER_WINDOW",
+    "MAX_PROPOSAL_ACTION_BYTES",
+    "MAX_PROPOSAL_ACTION_FIELD_LENGTH",
+    "MAX_PROPOSAL_KIND_LENGTH",
+    "MAX_PROPOSAL_STRING_FIELD_LENGTH",
     "MAX_RECONCILIATION_BATCH_SIZE",
     "OWNERSHIP_CLIENTS",
     "OWNERSHIP_CLIENT_ENV_VAR",
     "PROPOSAL_HOLD_LEVELS",
     "PROPOSAL_RATE_LIMIT_WINDOW",
     "PROPOSAL_SUBMITTER_SURFACES",
+    "PROPOSAL_TERMINAL_STATUSES",
     "AgentTableOwnershipClient",
     "OwnershipClient",
     "OwnershipClientFactory",
@@ -8292,6 +8437,7 @@ __all__ = [
     "list_conversations",
     "list_pending_approval_holds",
     "list_pending_proposal_holds",
+    "list_proposals_for_bot",
     "lookup_agent_by_email",
     "may_assign",
     "may_invite",
@@ -8300,9 +8446,11 @@ __all__ = [
     "register_agent",
     "resolve_conversation_participant",
     "resolve_inbox_target",
+    "resolve_proposal_owner_sub",
     "start_conversation",
     "validate_hold_level",
     "validate_ownership_client_configuration",
+    "validate_proposal_string_field",
     "withdraw_proposal",
     "write_through_ownership",
 ]

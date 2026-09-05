@@ -65,6 +65,17 @@ from observability import log_auth_rejected
 #             ``tests/test_scopes.py::TestCommsAdminConsumers``, which
 #             will fail if a future PR adds a fourth without updating
 #             this comment.
+# ``POST /proposals`` (TECH-5872) is a non-MCP ``mcp.custom_route`` in
+# main.py, not a tool dispatched through ``ScopeEnforcementMiddleware`` --
+# that route self-checks this scope directly (see main.py's
+# ``_authenticate_proposal_submitter``), the same way ``/approvals/*``'s
+# routes self-check interactivity rather than going through this module's
+# tool-dispatch machinery. Defined here, above ``TOOL_SCOPES``, so the five
+# ``proposals_*`` entries below can reference this name directly rather than
+# hardcoding the string literal a second time.
+PROPOSAL_SUBMIT_SCOPE = "comms:proposals:write"
+
+
 TOOL_SCOPES: dict[str, str] = {
     # --- comms (provider: providers/comms.py, namespace="comms") ---
     "comms_whoami": "comms:read",
@@ -118,6 +129,28 @@ TOOL_SCOPES: dict[str, str] = {
     # damage. Revisit if a rate limit consistent with the other mutating
     # tools' pattern is ever added.
     "comms_archive_conversation": "comms:write",
+    # --- proposals (provider: providers/proposals.py, namespace="proposals",
+    # TECH-6018 follow-up) ---
+    # All five reuse the SAME PROPOSAL_SUBMIT_SCOPE (defined above this
+    # dict) the raw HTTP routes already gate, rather than splitting into
+    # :read/:write -- the HTTP routes already conflate read+write under
+    # this one scope for every proposal action a bot can take, so
+    # introducing narrower tool-level granularity here would be a bigger,
+    # unrequested scope-model change (and would require re-minting every
+    # already-provisioned proposals token). ``proposals_submit``/``get``/
+    # ``withdraw`` wrap the exact same service.py functions the HTTP
+    # routes call; ``list_pending``/``list_history`` are new bot-only
+    # capabilities with no HTTP route equivalent -- see
+    # providers/proposals.py's module docstring. ``decide`` (approve/
+    # reject) has NO tool counterpart: it requires an Okta-interactive
+    # caller (decision_page, never an MCP client) and is structurally
+    # unreachable by a bot's agent-jwt token (see
+    # ``service.decide_proposal``'s own docstring).
+    "proposals_submit": PROPOSAL_SUBMIT_SCOPE,
+    "proposals_get": PROPOSAL_SUBMIT_SCOPE,
+    "proposals_list_pending": PROPOSAL_SUBMIT_SCOPE,
+    "proposals_list_history": PROPOSAL_SUBMIT_SCOPE,
+    "proposals_withdraw": PROPOSAL_SUBMIT_SCOPE,
 }
 
 
@@ -222,15 +255,6 @@ def check_resource_scope(token: AccessToken | None, uri: str) -> bool:
     if required is None:
         return False
     return required in scopes_for_token(token)
-
-
-# Not in TOOL_SCOPES: ``POST /proposals`` (TECH-5872) is a non-MCP
-# ``mcp.custom_route`` in main.py, not a tool dispatched through
-# ``ScopeEnforcementMiddleware`` -- that route self-checks this scope
-# directly (see main.py's ``_authenticate_proposal_submitter``), the same
-# way ``/approvals/*``'s routes self-check interactivity rather than going
-# through this module's tool-dispatch machinery.
-PROPOSAL_SUBMIT_SCOPE = "comms:proposals:write"
 
 
 def is_interactive_token(token: AccessToken | None) -> bool:

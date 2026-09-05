@@ -33,6 +33,7 @@ from service import (
     _APPLY_ERROR_CANCELLED_MESSAGE,
     MAX_PROPOSALS_PER_BOT_PER_WINDOW,
     PROPOSAL_SUBMITTER_SURFACES,
+    PROPOSAL_TERMINAL_STATUSES,
     _redact_bot_facing_dict,
     _sanitize_apply_error,
     audit_denied_proposal_submission,
@@ -40,6 +41,7 @@ from service import (
     decide_proposal,
     get_proposal_for_bot,
     list_pending_proposal_holds,
+    list_proposals_for_bot,
     withdraw_proposal,
 )
 
@@ -1387,4 +1389,96 @@ class TestAuditDeniedProposalSubmission:
         assert (
             inspect.signature(audit_denied_proposal_submission).parameters["surface"].default
             == "submit"
+        )
+
+
+class TestListProposalsForBot:
+    """Direct unit coverage for ``list_proposals_for_bot`` (TECH-6018
+    follow-up, Argus review round-1 suggestion) -- previously only
+    exercised indirectly through the Postgres-dependent MCP tool tests in
+    ``tests/test_proposal_tools.py``, which skip when Postgres is
+    unreachable. This file already requires Postgres for every other test
+    (module-scoped Alembic chain), so this coverage isn't redundant with
+    that skip -- it's the same real-database idiom, just without a live
+    MCP client in the loop."""
+
+    async def test_scoped_to_requesting_bot_only(self, session: AsyncSession) -> None:
+        await _submit(session, proposed_by_bot_id="bot-a", action=_action(target_id="A"))
+        await _submit(session, proposed_by_bot_id="bot-b", action=_action(target_id="B"))
+
+        result = await list_proposals_for_bot(
+            session, requesting_bot_sub="bot-a", statuses=("pending",)
+        )
+        subs = {p["proposed_by_bot_id"] for p in result["proposals"]}
+        assert subs == {"bot-a"}
+
+    async def test_status_filter_applied(self, session: AsyncSession) -> None:
+        pending = await _submit(session, proposed_by_bot_id="bot-1", action=_action(target_id="C"))
+        withdrawn = await _submit(
+            session, proposed_by_bot_id="bot-1", action=_action(target_id="D")
+        )
+        await withdraw_proposal(
+            session,
+            hold_id=uuid.UUID(withdrawn["proposal_id"]),
+            requesting_bot_sub="bot-1",
+            reason=None,
+        )
+
+        pending_only = await list_proposals_for_bot(
+            session, requesting_bot_sub="bot-1", statuses=("pending",)
+        )
+        assert {p["proposal_id"] for p in pending_only["proposals"]} == {pending["proposal_id"]}
+
+        terminal_only = await list_proposals_for_bot(
+            session, requesting_bot_sub="bot-1", statuses=PROPOSAL_TERMINAL_STATUSES
+        )
+        assert {p["proposal_id"] for p in terminal_only["proposals"]} == {withdrawn["proposal_id"]}
+
+    async def test_limit_clamped_to_minimum_of_one(self, session: AsyncSession) -> None:
+        await _submit(session, proposed_by_bot_id="bot-1", action=_action(target_id="E"))
+        await _submit(session, proposed_by_bot_id="bot-1", action=_action(target_id="F"))
+
+        result = await list_proposals_for_bot(
+            session, requesting_bot_sub="bot-1", statuses=("pending",), limit=0
+        )
+        assert len(result["proposals"]) == 1
+
+    async def test_limit_clamped_to_maximum_of_200(self, session: AsyncSession) -> None:
+        await _submit(session, proposed_by_bot_id="bot-1", action=_action(target_id="G"))
+
+        result = await list_proposals_for_bot(
+            session, requesting_bot_sub="bot-1", statuses=("pending",), limit=500
+        )
+        assert result["has_more"] is False
+        assert len(result["proposals"]) == 1
+
+    async def test_has_more_true_when_more_rows_exist(self, session: AsyncSession) -> None:
+        for i in range(3):
+            await _submit(
+                session, proposed_by_bot_id="bot-1", action=_action(target_id=f"PAGE-{i}")
+            )
+
+        result = await list_proposals_for_bot(
+            session, requesting_bot_sub="bot-1", statuses=("pending",), limit=2
+        )
+        assert len(result["proposals"]) == 2
+        assert result["has_more"] is True
+
+    async def test_has_more_false_when_exactly_at_limit(self, session: AsyncSession) -> None:
+        for i in range(2):
+            await _submit(
+                session, proposed_by_bot_id="bot-1", action=_action(target_id=f"EXACT-{i}")
+            )
+
+        result = await list_proposals_for_bot(
+            session, requesting_bot_sub="bot-1", statuses=("pending",), limit=2
+        )
+        assert len(result["proposals"]) == 2
+        assert result["has_more"] is False
+
+    async def test_terminal_statuses_pinned_against_hold_statuses(self) -> None:
+        from models import PROPOSAL_HOLD_STATUSES
+
+        assert set(PROPOSAL_TERMINAL_STATUSES) | {"pending", "applying", "approved"} == set(
+            PROPOSAL_HOLD_STATUSES
         )
