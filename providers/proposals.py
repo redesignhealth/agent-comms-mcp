@@ -10,10 +10,18 @@ and withdraw one -- is a tool here, mounted as ``namespace="proposals"``
 bot-initiated comms action is a ``comms_*`` tool. These do NOT replace the
 existing ``POST /proposals`` / ``GET /proposals/{id}`` / ``GET
 /proposals/pending`` / ``POST /proposals/{id}/withdraw`` HTTP routes in
-``main.py`` -- both surfaces call the exact same ``service.py`` functions,
-so they cannot drift, and removing the HTTP routes would break the
-``linear-progress-bot`` integration and the ``provision-agent`` runbook
-docs that currently point at raw HTTP.
+``main.py``, and removing them would break the ``linear-progress-bot``
+integration and the ``provision-agent`` runbook docs that currently point
+at raw HTTP. ``submit``/``get``/``withdraw`` here call the exact same
+``service.py`` functions their HTTP-route equivalents do, so those three
+cannot drift between the two surfaces (Argus review round-1 correction:
+this "cannot drift" guarantee does NOT extend to ``list_pending``/
+``list_history`` below -- those are new BOT-scoped capabilities
+(``service.list_proposals_for_bot``, filtered by ``proposed_by_bot_id``)
+with no HTTP route equivalent; the existing ``GET /proposals/pending`` HTTP
+route is a DIFFERENT, human-scoped listing (``service.
+list_pending_proposal_holds``, filtered by ``owner_sub``, Okta-interactive
+only) that these two tools do not wrap or replace).
 
 ``decide`` (approve/reject a proposal) has NO tool counterpart here, and
 never will: it requires an Okta-interactive caller
@@ -37,6 +45,20 @@ Registration reminder (fail-closed ``TOOL_SCOPES``, see scopes.py): every
 tool added here MUST be enrolled in ``scopes.TOOL_SCOPES`` under its
 mounted name (``proposals_<tool>``) in the same change, or agent-jwt
 callers can never reach it.
+
+Audit-trail note (Argus review round-1 suggestion, intentionally not
+closed): a denial on the HTTP proposal routes (missing scope, wrong token
+type) writes a persisted ``audit_log`` row via
+``service.audit_denied_proposal_submission``. A denial on these MCP tools
+(a missing-scope ``ToolError`` from ``ScopeEnforcementMiddleware``, or the
+interactive-token/no-identity ``ToolError``s raised in ``_require_bot_sub``
+above) does not -- it only emits a transient observability event, the same
+posture ``providers/comms.py``'s tools already have relative to their own
+denial paths. This divergence is accepted rather than closed here: wiring
+an audit write into every ``ToolError`` raise below would need its own
+``PROPOSAL_SUBMITTER_SURFACES``-style surface taxonomy to stay
+distinguishable in the trail, which is a bigger change than this PR's
+scope.
 """
 
 from __future__ import annotations
@@ -55,6 +77,7 @@ import service
 from db import get_session_factory
 from exceptions import AccessDeniedError, HoldAlreadyDecidedError, RateLimitExceededError
 from identity import try_resolve_email
+from scopes import is_interactive_token
 
 proposals_server: FastMCP[Any] = FastMCP("proposals")
 
@@ -67,10 +90,23 @@ def _require_bot_sub() -> str:
     raw HTTP route. Deliberately does NOT resolve a board ``Agent`` row
     (see this module's own docstring) -- a proposing bot need not be
     registered on the board at all.
+
+    Rejects an interactive (Okta) caller outright (Argus review round-1
+    BLOCKING catch): ``ScopeEnforcementMiddleware`` lets an interactive
+    token bypass ``TOOL_SCOPES`` entirely (``is_interactive_token`` is a
+    deliberate scope-check bypass for browser users), so without this
+    explicit check here, ANY Okta-authenticated employee could call every
+    ``proposals_*`` tool with no scope at all -- the exact bot-only
+    guarantee the HTTP routes already enforce structurally via
+    ``main._authenticate_proposal_submitter`` -> ``_verify_agent_token``
+    (403 ``not_agent_token`` for a non-agent-jwt caller). This mirrors that
+    same structural check for the MCP transport.
     """
     token = get_access_token()
     if token is None:
         raise ToolError("no access token provided")
+    if is_interactive_token(token):
+        raise ToolError("proposals tools require a bot (agent-jwt) token")
     bot_sub = try_resolve_email(token)
     if bot_sub is None:
         raise ToolError("unable to resolve caller identity from token claims")
@@ -178,8 +214,10 @@ async def submit(
     except ValueError as exc:
         raise ToolError(f"invalid_request: {exc}") from None
 
+    # get_access_token() is guaranteed non-None here: _require_bot_sub()
+    # above already raised if it were (Argus review round-1 suggestion).
     token = get_access_token()
-    owner_sub = service.resolve_proposal_owner_sub(token) if token is not None else None
+    owner_sub = service.resolve_proposal_owner_sub(token)
     async with get_session_factory()() as session:
         if owner_sub is None:
             agent = await service.get_agent_by_sub(session, bot_sub)
@@ -229,6 +267,13 @@ async def list_pending(limit: int = 50) -> dict[str, Any]:
     first. Scoped to proposals THIS bot submitted -- never another bot's.
     ``limit`` is clamped to [1, 200]; ``has_more`` is ``True`` if more
     pending proposals exist beyond the returned page.
+
+    A proposal briefly disappears from this list, WITHOUT appearing in
+    ``proposals_list_history`` either, the moment a decide or the
+    TECH-5877 auto-judge claims it (transient ``applying`` status) -- it
+    reappears in ``list_history`` once that claim resolves to a terminal
+    status. This is not an error; poll ``proposals_get`` by id during that
+    window if you need the proposal's status specifically.
     """
     bot_sub = _require_bot_sub()
     async with get_session_factory()() as session, _map_proposal_errors():
@@ -247,6 +292,10 @@ async def list_history(limit: int = 50) -> dict[str, Any]:
     by a human -- that reviewer's identity is never disclosed to the
     submitting bot. ``limit`` is clamped to [1, 200]; ``has_more`` is
     ``True`` if more actioned proposals exist beyond the returned page.
+
+    A proposal in the transient ``applying`` status (claimed by a decide
+    or the TECH-5877 auto-judge, not yet resolved) does not appear here
+    either -- see ``proposals_list_pending``'s docstring for that gap.
     """
     bot_sub = _require_bot_sub()
     async with get_session_factory()() as session, _map_proposal_errors():

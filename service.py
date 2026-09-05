@@ -6312,13 +6312,26 @@ async def create_proposal(
 # models.py) -- listing it here would be dead code, since no row can ever
 # be found at rest with this value. Used by `list_proposals_for_bot`'s
 # history-tool call site (`proposals_list_history`, providers/proposals.py)
-# to select every proposal that has left `pending`/`applying` for good,
-# without hand-maintaining a second copy of "every status except the two
-# non-terminal ones" that could silently drift from PROPOSAL_HOLD_STATUSES
-# if a new terminal status is ever added.
-PROPOSAL_TERMINAL_STATUSES: tuple[str, ...] = tuple(
-    status for status in PROPOSAL_HOLD_STATUSES if status not in ("pending", "applying", "approved")
+# to select every proposal that has left `pending`/`applying` for good.
+#
+# A positive enumeration (Argus review round-1 suggestion), not derived by
+# excluding `("pending", "applying", "approved")` from PROPOSAL_HOLD_STATUSES:
+# an exclusion-based derivation would silently enroll any FUTURE non-terminal
+# status (e.g. a `"cancelling"` transitional state) into `list_history` as an
+# already-actioned result the moment it's added to PROPOSAL_HOLD_STATUSES,
+# with no test failure to catch it. The assertion below pins this tuple
+# against PROPOSAL_HOLD_STATUSES instead, so an oversight fails loudly (at
+# import time) rather than silently misclassifying a new status.
+PROPOSAL_TERMINAL_STATUSES: tuple[str, ...] = (
+    "rejected",
+    "applied",
+    "apply_failed",
+    "stale",
+    "withdrawn",
 )
+assert set(PROPOSAL_TERMINAL_STATUSES) | {"pending", "applying", "approved"} == set(
+    PROPOSAL_HOLD_STATUSES
+), "PROPOSAL_TERMINAL_STATUSES is out of sync with PROPOSAL_HOLD_STATUSES -- update both together"
 
 
 async def list_pending_proposal_holds(

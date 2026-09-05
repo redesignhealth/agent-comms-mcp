@@ -259,6 +259,54 @@ class TestScopeEnforcement:
         result = await _submit(main, test_session_factory, bot_sub="never-registered-bot")
         assert result["status"] in ("pending", "applied", "apply_failed")
 
+    async def test_interactive_caller_denied(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Argus review round-1 BLOCKING catch: unlike every ``comms_*``
+        tool, an interactive (Okta) token must NOT be able to reach these
+        tools at all -- ``ScopeEnforcementMiddleware`` lets interactive
+        callers bypass ``TOOL_SCOPES`` entirely, so ``_require_bot_sub``
+        must reject one outright."""
+        token = MagicMock()
+        token.claims = {
+            "iss": "https://example.okta.com/oauth2/default",
+            "email": "human@example.com",
+        }
+        token.scopes = []
+        token.client_id = "human@example.com"
+        with pytest.raises(ToolError, match="bot"):
+            await _call(main, test_session_factory, token, "proposals_list_pending")
+
+    async def test_missing_token_denied(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        with (
+            _OIDC_PATCH,
+            _ENV_PATCH,
+            patch("main.get_access_token", return_value=None),
+            patch("providers.proposals.get_access_token", return_value=None),
+            patch("providers.proposals.get_session_factory", return_value=test_session_factory),
+        ):
+            async with Client(main.mcp) as client:
+                with pytest.raises(ToolError):
+                    await client.call_tool("proposals_list_pending", {})
+
+    async def test_unresolvable_identity_denied(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        token = _token("bot-no-identity")
+        with (
+            _OIDC_PATCH,
+            _ENV_PATCH,
+            patch("main.get_access_token", return_value=token),
+            patch("providers.proposals.get_access_token", return_value=token),
+            patch("providers.proposals.get_session_factory", return_value=test_session_factory),
+            patch("providers.proposals.try_resolve_email", return_value=None),
+        ):
+            async with Client(main.mcp) as client:
+                with pytest.raises(ToolError, match="identity"):
+                    await client.call_tool("proposals_list_pending", {})
+
 
 # --- Submit / get / withdraw round-trips ----------------------------------------
 
@@ -339,6 +387,93 @@ class TestSubmitGetWithdraw:
                 {
                     "proposal_id": submitted["proposal_id"],
                     "reason": "x" * (service.MAX_DECISION_REASON_LENGTH + 1),
+                },
+            )
+
+    async def test_withdraw_another_bots_proposal_denied(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        submitted = await _submit(main, test_session_factory, bot_sub="bot-withdraw-owner")
+        other_token = _token("bot-withdraw-intruder")
+        with pytest.raises(ToolError):
+            await _call(
+                main,
+                test_session_factory,
+                other_token,
+                "proposals_withdraw",
+                {"proposal_id": submitted["proposal_id"]},
+            )
+
+    async def test_get_malformed_proposal_id_rejected(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        token = _token("bot-malformed-get")
+        with pytest.raises(ToolError, match="not a valid UUID"):
+            await _call(
+                main,
+                test_session_factory,
+                token,
+                "proposals_get",
+                {"proposal_id": "not-a-uuid"},
+            )
+
+    async def test_withdraw_malformed_proposal_id_rejected(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        token = _token("bot-malformed-withdraw")
+        with pytest.raises(ToolError, match="not a valid UUID"):
+            await _call(
+                main,
+                test_session_factory,
+                token,
+                "proposals_withdraw",
+                {"proposal_id": "not-a-uuid"},
+            )
+
+    async def test_withdraw_already_decided_proposal_rejected(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Verifies HoldAlreadyDecidedError -> ToolError mapping at the MCP
+        transport layer, not just the service layer (already covered in
+        test_proposal_service.py)."""
+        submitted = await _submit(main, test_session_factory, bot_sub="bot-double-withdraw")
+        token = _token("bot-double-withdraw")
+        await _call(
+            main,
+            test_session_factory,
+            token,
+            "proposals_withdraw",
+            {"proposal_id": submitted["proposal_id"]},
+        )
+        with pytest.raises(ToolError):
+            await _call(
+                main,
+                test_session_factory,
+                token,
+                "proposals_withdraw",
+                {"proposal_id": submitted["proposal_id"]},
+            )
+
+    async def test_owner_sub_unresolvable_rejected(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """No ``owner_sub`` claim on the token, and no matching board
+        ``Agent`` row to fall back to."""
+        token = _token("bot-no-owner-sub", owner_sub=None)
+        with pytest.raises(ToolError, match="owner_sub_unresolvable"):
+            await _call(
+                main,
+                test_session_factory,
+                token,
+                "proposals_submit",
+                {
+                    "kind": "linear_progress_update",
+                    "action": _action(),
+                    "rationale": "because reasons",
+                    "confidence": "medium",
+                    "importance": "medium",
+                    "impact": "medium",
+                    "target_fingerprint": "deadbeef",
                 },
             )
 
@@ -445,3 +580,45 @@ class TestListPendingAndHistory:
         history = await _call(main, test_session_factory, token, "proposals_list_history")
         assert len(history["proposals"]) == 1
         assert "decided_by_actor_id" not in history["proposals"][0]
+
+    async def test_list_pending_has_more_true_when_over_limit(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        bot_sub = "bot-pagination"
+        for i in range(3):
+            await _submit(
+                main, test_session_factory, bot_sub=bot_sub, action=_action(target_id=f"PAGE-{i}")
+            )
+
+        token = _token(bot_sub)
+        result = await _call(
+            main, test_session_factory, token, "proposals_list_pending", {"limit": 2}
+        )
+        assert len(result["proposals"]) == 2
+        assert result["has_more"] is True
+
+    async def test_list_pending_limit_clamped_to_minimum(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        bot_sub = "bot-limit-min"
+        await _submit(main, test_session_factory, bot_sub=bot_sub, action=_action(target_id="G"))
+        await _submit(main, test_session_factory, bot_sub=bot_sub, action=_action(target_id="H"))
+
+        token = _token(bot_sub)
+        result = await _call(
+            main, test_session_factory, token, "proposals_list_pending", {"limit": 0}
+        )
+        assert len(result["proposals"]) == 1
+
+    async def test_list_pending_limit_clamped_to_maximum(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        bot_sub = "bot-limit-max"
+        await _submit(main, test_session_factory, bot_sub=bot_sub, action=_action(target_id="I"))
+
+        token = _token(bot_sub)
+        result = await _call(
+            main, test_session_factory, token, "proposals_list_pending", {"limit": 201}
+        )
+        assert result["has_more"] is False
+        assert len(result["proposals"]) == 1

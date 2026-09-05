@@ -1294,17 +1294,27 @@ proposals is exactly as bot-initiated as any `comms_*` action, so these are
 real `listTools()`-visible MCP tools, not just raw HTTP -- mirroring
 `providers/comms.py`'s shape (resolve identity -> open session -> call one
 `service.py` function -> map exceptions to `ToolError`) with one deliberate
-difference: no `service.get_agent_by_sub` / board-`Agent` resolution step,
-since a proposing bot need not be a board-registered agent at all (see
-`main._authenticate_proposal_submitter`'s own docstring). Identity comes
+difference: no `get_agent_by_sub` / board-`Agent` resolution step for the
+submitting bot's OWN identity, since a proposing bot need not be a
+board-registered agent at all (see
+`main._authenticate_proposal_submitter`'s own docstring) -- identity comes
 straight from the verified token via `identity.try_resolve_email`, the same
-resolver the HTTP routes above already use for `bot_sub`. These tools do
-NOT replace `POST /proposals` / `GET /proposals/{id}` / `POST
-/proposals/{id}/withdraw` -- both surfaces call the exact same
-`service.py` functions (`create_proposal`, `get_proposal_for_bot`,
-`withdraw_proposal`), so they cannot drift, and the raw HTTP routes stay
-live for existing non-MCP callers (`linear-progress-bot`, `provision-agent`
-runbook docs). All five tools are enrolled in `scopes.TOOL_SCOPES` under
+resolver the HTTP routes above already use for `bot_sub`. (`owner_sub` is a
+separate concern from the submitting bot's own identity: `proposals_submit`
+DOES conditionally call `service.get_agent_by_sub` as a fallback when the
+token's `owner_sub` claim is absent -- see `create_proposal`'s own
+`owner_sub` parameter.) These tools do NOT replace `POST /proposals` /
+`GET /proposals/{id}` / `GET /proposals/pending` / `POST
+/proposals/{id}/withdraw` -- `submit`/`get`/`withdraw` call the exact same
+`service.py` functions their HTTP-route equivalents do (`create_proposal`,
+`get_proposal_for_bot`, `withdraw_proposal`), so those three cannot drift,
+and the raw HTTP routes stay live for existing non-MCP callers
+(`linear-progress-bot`, `provision-agent` runbook docs). `list_pending`/
+`list_history` are NOT a drop-in replacement for `GET /proposals/pending`:
+that HTTP route is a different, human-scoped listing
+(`service.list_pending_proposal_holds`, filtered by `owner_sub`,
+Okta-interactive only) — see below. All five tools are enrolled in
+`scopes.TOOL_SCOPES` under
 `comms:proposals:write` (the same scope the HTTP routes self-check), since
 `ScopeEnforcementMiddleware` fails closed on any mounted tool name that
 isn't registered there.

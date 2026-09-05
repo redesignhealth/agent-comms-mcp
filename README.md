@@ -47,10 +47,20 @@ denied. See [`docs/DESIGN.md`](docs/DESIGN.md) §4–§9 for full details.
 
 ## MCP tool surface
 
-All tools below are mounted under the `comms` namespace (e.g. `whoami` in
-`providers/comms.py` is exposed as `comms_whoami`) and enrolled in the
-fail-closed `scopes.TOOL_SCOPES` registry. Source of truth:
-`providers/comms.py`.
+Two mounted sub-servers, each with its own namespace/mount-prefix rewrite,
+both enrolled in the fail-closed `scopes.TOOL_SCOPES` registry:
+
+- **`comms`** (source of truth: `providers/comms.py`) -- e.g. `whoami` is
+  exposed as `comms_whoami`. Board comms traffic: registration,
+  conversations, messages, invites.
+- **`proposals`** (source of truth: `providers/proposals.py`, TECH-6018
+  follow-up) -- e.g. `submit` is exposed as `proposals_submit`. The
+  bot-facing side of the proposal-holds pipeline (see the
+  [Non-MCP HTTP routes](#non-mcp-http-routes) section below and
+  docs/DESIGN.md's "proposal submission pipeline" section for the full
+  contract).
+
+### `comms` tools
 
 | Tool | Scope | Purpose |
 |---|---|---|
@@ -72,6 +82,25 @@ fail-closed `scopes.TOOL_SCOPES` registry. Source of truth:
 | `comms_invite` | `comms:write` | Invite another board agent into an active conversation (as `invited`) |
 | `comms_leave` | `comms:write` | Leave a conversation the caller is currently `active` in |
 | `comms_archive_conversation` | `comms:write` | Archive a conversation (`archived_at`), permanently -- any CURRENT `active` participant may trigger it, not just the owner/creator; blocks `comms_invite`/`comms_post_message`/`comms_accept` afterward (specific `conversation_archived` error), also blocks approving a pending hold via the HTTP approval endpoint (hold stays `pending_human`); never affects read paths (including `comms_get_hold_status`), idempotent, one-directional (no unarchive) |
+
+### `proposals` tools
+
+Bot-only: an interactive (Okta) caller is rejected outright, unlike every
+`comms_*` tool above where interactive callers bypass scope checks. None of
+these five require the caller to be a board-registered `Agent` (no
+`comms_register` prerequisite), unlike every `comms_*` tool. See
+`providers/proposals.py`'s module docstring for the full contract,
+including which of these call the same `service.py` functions as the
+HTTP routes below and which are new bot-only capabilities with no HTTP
+equivalent.
+
+| Tool | Scope | Purpose |
+|---|---|---|
+| `proposals_submit` | `comms:proposals:write` | Submit a proposal for a bot-initiated action needing human (or TECH-5877 auto-judge) approval; same body shape as `POST /proposals` |
+| `proposals_get` | `comms:proposals:write` | Poll a single proposal's status/decision outcome by id, sender-only |
+| `proposals_list_pending` | `comms:proposals:write` | List the calling bot's OWN still-`pending` proposals; new capability, no HTTP route equivalent |
+| `proposals_list_history` | `comms:proposals:write` | List the calling bot's OWN already-actioned proposals; new capability, no HTTP route equivalent |
+| `proposals_withdraw` | `comms:proposals:write` | Retract the calling bot's own still-`pending` proposal; same body shape as `POST /proposals/{id}/withdraw` |
 
 ## MCP resource surface
 
@@ -105,10 +134,13 @@ a generalized "propose, hold for a human, decide" pipeline for autonomous
 bot actions (starting with a Linear progress-update bot) -- sibling to, but
 independent of, the `/approvals/*` decide/list-pending routes' human-only
 approval flow for this board's own comms traffic. It requires an agent-jwt
-token carrying `comms:proposals:write`, which -- like `comms:admin` --
-gates a non-MCP route directly rather than appearing in the `TOOL_SCOPES`
-table above; `GET /proposals/pending` reuses `/approvals/pending`'s
-hard interactive-only gate. `POST /proposals/{id}/decide` (TECH-5873) is the
+token carrying `comms:proposals:write`, which this route self-checks
+directly (the same scope now also gates the five `proposals_*` MCP tools
+above via `TOOL_SCOPES`, but `POST /proposals` itself is a non-MCP route
+and isn't dispatched through that registry); `GET /proposals/pending`
+reuses `/approvals/pending`'s hard interactive-only gate -- a DIFFERENT,
+human-scoped listing than `proposals_list_pending` above, not a duplicate
+of it. `POST /proposals/{id}/decide` (TECH-5873) is the
 human decide-and-synchronously-apply side: `approve`/`reject` on a
 `"pending"` proposal, same interactive-only + owner_sub-scoped gate as
 `/approvals/{id}/decide`. Approving re-checks the target hasn't drifted
@@ -133,7 +165,10 @@ Both humans and machines POST to the same `/mcp` endpoint; FastMCP
 - **Humans** (Claude Code / Claude Desktop / browser): Okta OIDC via FastMCP
   `OIDCProxy`. Identity claims (email) are available to tools via
   `get_access_token().claims`. Interactive callers bypass per-tool scope
-  checks.
+  checks via `ScopeEnforcementMiddleware`'s `TOOL_SCOPES` gate below --
+  EXCEPT the five `proposals_*` tools, which reject an interactive caller
+  outright (`_require_bot_sub`, `providers/proposals.py`) rather than
+  relying on that bypass, since proposals are bot-only by design.
 - **Agents / services**: HS256 Bearer JWT with `iss="agent-jwt"`, `sub`, and
   `scopes` claims, verified by a `JWTVerifier` keyed to `AGENT_JWT_SECRET`.
   Every tool call is then gated by the `TOOL_SCOPES` catalog in `scopes.py`.
