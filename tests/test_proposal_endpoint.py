@@ -153,6 +153,7 @@ async def client(
         routes=[
             Route("/proposals", main.submit_proposal, methods=["POST"]),
             Route("/proposals/pending", main.list_pending_proposals, methods=["GET"]),
+            Route("/proposals/history", main.list_proposal_history, methods=["GET"]),
             Route("/proposals/{proposal_id}", main.get_proposal, methods=["GET"]),
             Route(
                 "/proposals/{proposal_id}/withdraw",
@@ -761,6 +762,351 @@ class TestListPendingProposals:
         body = pending.json()
         assert len(body["proposals"]) == limit
         assert body["has_more"] is True
+
+
+class TestProposalHistoryAuthGate:
+    async def test_missing_token_returns_401(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, _provider = client
+        resp = await http_client.get("/proposals/history")
+        assert resp.status_code == 401
+
+    async def test_agent_jwt_token_returns_403(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        """Same hard interactive-only gate as ``GET /proposals/pending`` --
+        a bot's agent-jwt token can't list history either."""
+        http_client, provider = client
+        provider.tokens["agent-token"] = _agent_jwt_token(
+            "some-bot", scopes=["comms:proposals:write"]
+        )
+        resp = await http_client.get(
+            "/proposals/history", headers={"Authorization": "Bearer agent-token"}
+        )
+        assert resp.status_code == 403
+
+    async def test_agent_jwt_token_returns_403_even_with_comms_admin_scope(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        """Argus review round 1 (TECH-6030 PR), mirroring
+        ``TestListPendingAuthGate``'s own test of the same name: the
+        interactive-only gate has no scope escape hatch, not even
+        ``comms:admin``."""
+        http_client, provider = client
+        provider.tokens["agent-token"] = _agent_jwt_token(
+            "some-bot", scopes=["comms:admin", "comms:proposals:write"]
+        )
+        resp = await http_client.get(
+            "/proposals/history", headers={"Authorization": "Bearer agent-token"}
+        )
+        assert resp.status_code == 403
+
+    async def test_agent_jwt_rejection_is_audited(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        """Argus review round 1 (TECH-6030 PR), mirroring
+        ``TestListPendingAuthGate``'s own test of the same name: a bot's
+        agent-jwt token on this interactive-only route is denied AND the
+        denial is audited under its own ``surface="proposals_history"``
+        action name (distinct from ``pending``'s
+        ``denied.proposals_requires_interactive``), so the two routes'
+        bot-token denials stay distinguishable in the audit trail."""
+        http_client, provider = client
+        provider.tokens["agent-token"] = _agent_jwt_token("some-bot")
+        resp = await http_client.get(
+            "/proposals/history", headers={"Authorization": "Bearer agent-token"}
+        )
+        assert resp.status_code == 403
+
+        rows = (
+            (
+                await session.execute(
+                    select(AuditLog.action).where(
+                        AuditLog.action == "denied.proposals_history_requires_interactive"
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert rows
+
+
+class TestListProposalHistory:
+    async def test_owner_filtering(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider, owner_sub="owner-a@example.com")
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+        provider.tokens["other-human-token"] = _interactive_token("owner-b@example.com")
+
+        decide_resp = await http_client.post(
+            f"/proposals/{proposal_id}/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={"decision": "reject", "decision_note": "not needed"},
+        )
+        assert decide_resp.status_code == 200
+
+        own = await http_client.get(
+            "/proposals/history", headers={"Authorization": "Bearer human-token"}
+        )
+        assert own.status_code == 200
+        assert len(own.json()["proposals"]) == 1
+        assert own.json()["proposals"][0]["status"] == "rejected"
+
+        other = await http_client.get(
+            "/proposals/history", headers={"Authorization": "Bearer other-human-token"}
+        )
+        assert other.status_code == 200
+        assert other.json()["proposals"] == []
+
+    async def test_pending_proposals_excluded(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        await _submit_via_http(http_client, provider, owner_sub="owner-a@example.com")
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+
+        history = await http_client.get(
+            "/proposals/history", headers={"Authorization": "Bearer human-token"}
+        )
+        assert history.status_code == 200
+        assert history.json()["proposals"] == []
+
+        pending = await http_client.get(
+            "/proposals/pending", headers={"Authorization": "Bearer human-token"}
+        )
+        assert len(pending.json()["proposals"]) == 1
+
+    async def test_withdrawn_proposal_included(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider, owner_sub="owner-a@example.com")
+        withdraw_resp = await http_client.post(
+            f"/proposals/{proposal_id}/withdraw",
+            headers={"Authorization": "Bearer bot-token"},
+            json={"reason": "superseded"},
+        )
+        assert withdraw_resp.status_code == 200
+
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+        history = await http_client.get(
+            "/proposals/history", headers={"Authorization": "Bearer human-token"}
+        )
+        assert history.status_code == 200
+        body = history.json()["proposals"]
+        assert len(body) == 1
+        assert body[0]["status"] == "withdrawn"
+        assert body[0]["decided_by_actor_id"] == "bot-1"
+
+    async def test_invalid_limit_returns_422(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+
+        resp = await http_client.get(
+            "/proposals/history?limit=abc", headers={"Authorization": "Bearer human-token"}
+        )
+        assert resp.status_code == 422
+        assert resp.json()["error"] == "invalid_limit"
+
+    async def test_non_positive_limit_is_silently_clamped_to_one(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        """Argus review round 1 (TECH-6030 PR): ``limit=0``/``limit=-5``
+        parse as valid ints, so they never hit the 422 branch above --
+        document the actual (intentional) behavior, that the service layer
+        silently clamps them up to 1, rather than leaving it untested."""
+        http_client, provider = client
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+        for i in range(2):
+            proposal_id = await _submit_via_http(
+                http_client, provider, owner_sub="owner-a@example.com", target_id=f"TECH-{i}"
+            )
+            decide_resp = await http_client.post(
+                f"/proposals/{proposal_id}/decide",
+                headers={"Authorization": "Bearer human-token"},
+                json={"decision": "reject", "decision_note": "not needed"},
+            )
+            assert decide_resp.status_code == 200
+
+        for bad_limit in (0, -5):
+            resp = await http_client.get(
+                f"/proposals/history?limit={bad_limit}",
+                headers={"Authorization": "Bearer human-token"},
+            )
+            assert resp.status_code == 200
+            assert len(resp.json()["proposals"]) == 1
+
+    async def test_all_terminal_statuses_included(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        """Argus review round 1 (TECH-6030 PR), endpoint-level mirror of the
+        same-named service-layer test: drive one proposal each to
+        ``applied``/``apply_failed``/``stale`` via the live decide route and
+        confirm all three surface through ``GET /proposals/history``."""
+        from linear_client import LinearAPIError
+
+        http_client, provider = client
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+
+        applied_id = await _submit_via_http(
+            http_client, provider, owner_sub="owner-a@example.com", target_id="APPLIED"
+        )
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(return_value="fp1"),
+            ),
+            patch("service.linear_client.apply_progress_update", AsyncMock()),
+        ):
+            resp = await http_client.post(
+                f"/proposals/{applied_id}/decide",
+                headers={"Authorization": "Bearer human-token"},
+                json={"decision": "approve"},
+            )
+        assert resp.json()["status"] == "applied"
+
+        apply_failed_id = await _submit_via_http(
+            http_client, provider, owner_sub="owner-a@example.com", target_id="APPLY_FAILED"
+        )
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(return_value="fp1"),
+            ),
+            patch(
+                "service.linear_client.apply_progress_update",
+                AsyncMock(side_effect=LinearAPIError("linear unavailable")),
+            ),
+        ):
+            resp = await http_client.post(
+                f"/proposals/{apply_failed_id}/decide",
+                headers={"Authorization": "Bearer human-token"},
+                json={"decision": "approve"},
+            )
+        assert resp.json()["status"] == "apply_failed"
+
+        stale_id = await _submit_via_http(
+            http_client, provider, owner_sub="owner-a@example.com", target_id="STALE"
+        )
+        with patch(
+            "service.linear_client.fetch_current_fingerprint",
+            AsyncMock(return_value="a-completely-different-fingerprint"),
+        ):
+            resp = await http_client.post(
+                f"/proposals/{stale_id}/decide",
+                headers={"Authorization": "Bearer human-token"},
+                json={"decision": "approve"},
+            )
+        assert resp.json()["status"] == "stale"
+
+        history = await http_client.get(
+            "/proposals/history", headers={"Authorization": "Bearer human-token"}
+        )
+        assert history.status_code == 200
+        statuses_by_target = {
+            p["action"]["target_id"]: p["status"] for p in history.json()["proposals"]
+        }
+        assert statuses_by_target == {
+            "APPLIED": "applied",
+            "APPLY_FAILED": "apply_failed",
+            "STALE": "stale",
+        }
+
+    async def test_ordered_newest_decided_first(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        """Argus review round 1 (TECH-6030 PR), endpoint-level mirror of the
+        same-named service-layer test."""
+        http_client, provider = client
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+
+        first_id = await _submit_via_http(
+            http_client, provider, owner_sub="owner-a@example.com", target_id="FIRST"
+        )
+        await http_client.post(
+            f"/proposals/{first_id}/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={"decision": "reject", "decision_note": "not needed"},
+        )
+        second_id = await _submit_via_http(
+            http_client, provider, owner_sub="owner-a@example.com", target_id="SECOND"
+        )
+        await http_client.post(
+            f"/proposals/{second_id}/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={"decision": "reject", "decision_note": "not needed"},
+        )
+
+        history = await http_client.get(
+            "/proposals/history", headers={"Authorization": "Bearer human-token"}
+        )
+        target_ids = [p["action"]["target_id"] for p in history.json()["proposals"]]
+        assert target_ids == ["SECOND", "FIRST"]
+
+    async def test_has_more_true_when_more_than_limit_decided(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+
+        limit = 2
+        for i in range(limit + 1):
+            proposal_id = await _submit_via_http(
+                http_client, provider, owner_sub="owner-a@example.com", target_id=f"TECH-{i}"
+            )
+            decide_resp = await http_client.post(
+                f"/proposals/{proposal_id}/decide",
+                headers={"Authorization": "Bearer human-token"},
+                json={"decision": "reject", "decision_note": "not needed"},
+            )
+            assert decide_resp.status_code == 200
+
+        history = await http_client.get(
+            f"/proposals/history?limit={limit}",
+            headers={"Authorization": "Bearer human-token"},
+        )
+        assert history.status_code == 200
+        body = history.json()
+        assert len(body["proposals"]) == limit
+        assert body["has_more"] is True
+
+    async def test_has_more_false_when_at_or_below_limit(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        """Argus review round 1 (TECH-6030 PR): endpoint-level mirror of the
+        same-named service-layer test -- no prior test in this class
+        exercised the ``has_more=False`` path."""
+        http_client, provider = client
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+
+        limit = 2
+        for i in range(limit):
+            proposal_id = await _submit_via_http(
+                http_client, provider, owner_sub="owner-a@example.com", target_id=f"TECH-{i}"
+            )
+            decide_resp = await http_client.post(
+                f"/proposals/{proposal_id}/decide",
+                headers={"Authorization": "Bearer human-token"},
+                json={"decision": "reject", "decision_note": "not needed"},
+            )
+            assert decide_resp.status_code == 200
+
+        history = await http_client.get(
+            f"/proposals/history?limit={limit}",
+            headers={"Authorization": "Bearer human-token"},
+        )
+        assert history.status_code == 200
+        body = history.json()
+        assert len(body["proposals"]) == limit
+        assert body["has_more"] is False
 
 
 async def _submit_via_http(
@@ -1459,17 +1805,18 @@ class TestWithdrawProposalEndpoint:
 class TestProposalRouteRegistrationOrder:
     """Guards the route-ordering invariant ``get_proposal``'s own docstring
     depends on (Argus review suggestion): Starlette matches routes in
-    registration order, so ``/proposals/pending`` (static) MUST be
-    registered before ``/proposals/{proposal_id}`` (wildcard), or a GET to
-    ``/proposals/pending`` would resolve to ``get_proposal`` with
-    ``proposal_id="pending"`` instead of ``list_pending_proposals`` --
-    silently returning a uniform 404 for every caller instead of the
-    pending list. This module's own test fixture hand-builds an
+    registration order, so ``/proposals/pending``/``/proposals/history``
+    (static) MUST be registered before ``/proposals/{proposal_id}``
+    (wildcard), or a GET to either would resolve to ``get_proposal`` with
+    ``proposal_id="pending"``/``"history"`` instead of
+    ``list_pending_proposals``/``list_proposal_history`` -- silently
+    returning a uniform 404 for every caller instead of the intended
+    listing. This module's own test fixture hand-builds an
     independently-ordered ``Route`` list (see the ``client`` fixture
     above), so it can't catch a production ordering regression -- this
     test inspects ``main.mcp``'s ACTUAL registered routes instead."""
 
-    def test_pending_registered_before_wildcard_proposal_id(self) -> None:
+    def test_pending_and_history_registered_before_wildcard_proposal_id(self) -> None:
         main = _import_main()
         # `_additional_http_routes` is a private FastMCP attribute (Argus
         # review round-2 suggestion) -- a future FastMCP upgrade could
@@ -1483,5 +1830,7 @@ class TestProposalRouteRegistrationOrder:
             )
         paths = [getattr(route, "path", None) for route in main.mcp._additional_http_routes]
         assert "/proposals/pending" in paths
+        assert "/proposals/history" in paths
         assert "/proposals/{proposal_id}" in paths
         assert paths.index("/proposals/pending") < paths.index("/proposals/{proposal_id}")
+        assert paths.index("/proposals/history") < paths.index("/proposals/{proposal_id}")

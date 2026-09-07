@@ -41,6 +41,7 @@ from service import (
     decide_proposal,
     get_proposal_for_bot,
     list_pending_proposal_holds,
+    list_proposal_history_for_owner,
     list_proposals_for_bot,
     withdraw_proposal,
 )
@@ -571,6 +572,231 @@ class TestOwnerSubVisibility:
         await _submit(session, owner_sub="owner-a@example.com")
         result = await list_pending_proposal_holds(session, owner_sub="owner-nobody@example.com")
         assert result["proposals"] == []
+
+
+class TestListProposalHistoryForOwner:
+    """Service-layer coverage for ``list_proposal_history_for_owner``
+    (TECH-6030) -- mirrors ``TestOwnerSubVisibility`` above, but for the
+    terminal-status/human-history side rather than pending."""
+
+    async def test_caller_only_sees_own_owner_sub_decided_proposals(
+        self, session: AsyncSession
+    ) -> None:
+        submitted_a = await _submit(
+            session, owner_sub="owner-a@example.com", action=_action(target_id="T1")
+        )
+        submitted_b = await _submit(
+            session, owner_sub="owner-b@example.com", action=_action(target_id="T2")
+        )
+        await decide_proposal(
+            session,
+            approver_sub="owner-a@example.com",
+            hold_id=uuid.UUID(submitted_a["proposal_id"]),
+            decision="reject",
+            decision_note="not needed",
+        )
+        await decide_proposal(
+            session,
+            approver_sub="owner-b@example.com",
+            hold_id=uuid.UUID(submitted_b["proposal_id"]),
+            decision="reject",
+            decision_note="not needed",
+        )
+
+        result = await list_proposal_history_for_owner(session, owner_sub="owner-a@example.com")
+        assert len(result["proposals"]) == 1
+        assert result["proposals"][0]["action"]["target_id"] == "T1"
+
+    async def test_pending_proposals_excluded_from_history(self, session: AsyncSession) -> None:
+        await _submit(session, owner_sub="owner-a@example.com")
+        result = await list_proposal_history_for_owner(session, owner_sub="owner-a@example.com")
+        assert result["proposals"] == []
+
+    async def test_withdrawn_proposal_included_and_unredacted(self, session: AsyncSession) -> None:
+        """Unlike the bot-facing ``list_proposals_for_bot``, this human-
+        facing listing must NOT redact ``decided_by_actor_id`` -- the
+        reviewer is exactly who's entitled to see who/what decided it."""
+        submitted = await _submit(session, owner_sub="owner-a@example.com")
+        await withdraw_proposal(
+            session,
+            hold_id=uuid.UUID(submitted["proposal_id"]),
+            requesting_bot_sub="bot-1",
+            reason="stale",
+        )
+        result = await list_proposal_history_for_owner(session, owner_sub="owner-a@example.com")
+        assert len(result["proposals"]) == 1
+        assert result["proposals"][0]["status"] == "withdrawn"
+        assert result["proposals"][0]["decided_by_actor_id"] == "bot-1"
+
+    async def test_no_matching_owner_sub_returns_empty(self, session: AsyncSession) -> None:
+        submitted = await _submit(session, owner_sub="owner-a@example.com")
+        await decide_proposal(
+            session,
+            approver_sub="owner-a@example.com",
+            hold_id=uuid.UUID(submitted["proposal_id"]),
+            decision="reject",
+            decision_note="not needed",
+        )
+        result = await list_proposal_history_for_owner(
+            session, owner_sub="owner-nobody@example.com"
+        )
+        assert result["proposals"] == []
+
+    async def test_limit_clamped_and_has_more(self, session: AsyncSession) -> None:
+        limit = 2
+        for i in range(limit + 1):
+            submitted = await _submit(
+                session, owner_sub="owner-a@example.com", action=_action(target_id=f"T{i}")
+            )
+            await decide_proposal(
+                session,
+                approver_sub="owner-a@example.com",
+                hold_id=uuid.UUID(submitted["proposal_id"]),
+                decision="reject",
+                decision_note="not needed",
+            )
+
+        result = await list_proposal_history_for_owner(
+            session, owner_sub="owner-a@example.com", limit=limit
+        )
+        assert len(result["proposals"]) == limit
+        assert result["has_more"] is True
+
+    async def test_has_more_false_when_at_or_below_limit(self, session: AsyncSession) -> None:
+        """Argus review round 1 (TECH-6030 PR): the ``has_more=True`` path
+        above had no ``has_more=False`` counterpart, so an off-by-one in the
+        ``limit + 1`` fetch (e.g. dropping the ``+ 1``) would silently
+        return ``False`` for every query without failing a single test."""
+        limit = 2
+        for i in range(limit):
+            submitted = await _submit(
+                session, owner_sub="owner-a@example.com", action=_action(target_id=f"T{i}")
+            )
+            await decide_proposal(
+                session,
+                approver_sub="owner-a@example.com",
+                hold_id=uuid.UUID(submitted["proposal_id"]),
+                decision="reject",
+                decision_note="not needed",
+            )
+
+        result = await list_proposal_history_for_owner(
+            session, owner_sub="owner-a@example.com", limit=limit
+        )
+        assert len(result["proposals"]) == limit
+        assert result["has_more"] is False
+
+    async def test_ordered_newest_decided_first(self, session: AsyncSession) -> None:
+        """Argus review round 1 (TECH-6030 PR): unlike
+        ``list_pending_proposal_holds``'s oldest-first order, history is
+        ordered ``created_at`` DESC on purpose -- terminal rows accumulate
+        forever, so oldest-first plus the 200-row cap would eventually make
+        a reviewer's newest decisions permanently unreachable. Assert the
+        actual order, not just the count, so a regression back to ASC (or
+        no explicit order at all) fails a test."""
+        submitted_first = await _submit(
+            session, owner_sub="owner-a@example.com", action=_action(target_id="FIRST")
+        )
+        await decide_proposal(
+            session,
+            approver_sub="owner-a@example.com",
+            hold_id=uuid.UUID(submitted_first["proposal_id"]),
+            decision="reject",
+            decision_note="not needed",
+        )
+        submitted_second = await _submit(
+            session, owner_sub="owner-a@example.com", action=_action(target_id="SECOND")
+        )
+        await decide_proposal(
+            session,
+            approver_sub="owner-a@example.com",
+            hold_id=uuid.UUID(submitted_second["proposal_id"]),
+            decision="reject",
+            decision_note="not needed",
+        )
+
+        result = await list_proposal_history_for_owner(session, owner_sub="owner-a@example.com")
+        target_ids = [p["action"]["target_id"] for p in result["proposals"]]
+        assert target_ids == ["SECOND", "FIRST"]
+
+    async def test_all_terminal_statuses_included(self, session: AsyncSession) -> None:
+        """Argus review round 1 (TECH-6030 PR): the other tests in this
+        class only ever produce ``rejected``/``withdrawn`` rows, so a typo
+        in the ``.in_(PROPOSAL_TERMINAL_STATUSES)`` filter that silently
+        dropped ``applied``/``apply_failed``/``stale`` would pass every
+        other test in this file. Drive one proposal to each of the
+        remaining three terminal statuses via the same paths
+        ``TestDecideProposal`` uses below."""
+        applied_submitted = await _submit(
+            session,
+            owner_sub="owner-a@example.com",
+            action=_action(target_id="APPLIED"),
+            target_fingerprint="fp-match",
+        )
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(return_value="fp-match"),
+            ),
+            patch("service.linear_client.apply_progress_update", AsyncMock()),
+        ):
+            await decide_proposal(
+                session,
+                approver_sub="owner-a@example.com",
+                hold_id=uuid.UUID(applied_submitted["proposal_id"]),
+                decision="approve",
+                decision_note=None,
+            )
+
+        apply_failed_submitted = await _submit(
+            session,
+            owner_sub="owner-a@example.com",
+            action=_action(target_id="APPLY_FAILED"),
+            target_fingerprint="fp-match",
+        )
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(return_value="fp-match"),
+            ),
+            patch(
+                "service.linear_client.apply_progress_update",
+                AsyncMock(side_effect=LinearAPIError("linear is down")),
+            ),
+        ):
+            await decide_proposal(
+                session,
+                approver_sub="owner-a@example.com",
+                hold_id=uuid.UUID(apply_failed_submitted["proposal_id"]),
+                decision="approve",
+                decision_note=None,
+            )
+
+        stale_submitted = await _submit(
+            session,
+            owner_sub="owner-a@example.com",
+            action=_action(target_id="STALE"),
+            target_fingerprint="fp-original",
+        )
+        with patch(
+            "service.linear_client.fetch_current_fingerprint",
+            AsyncMock(return_value="fp-drifted"),
+        ):
+            await decide_proposal(
+                session,
+                approver_sub="owner-a@example.com",
+                hold_id=uuid.UUID(stale_submitted["proposal_id"]),
+                decision="approve",
+                decision_note=None,
+            )
+
+        result = await list_proposal_history_for_owner(session, owner_sub="owner-a@example.com")
+        statuses_by_target = {p["action"]["target_id"]: p["status"] for p in result["proposals"]}
+        assert statuses_by_target == {
+            "APPLIED": "applied",
+            "APPLY_FAILED": "apply_failed",
+            "STALE": "stale",
+        }
 
 
 class TestDecideProposal:

@@ -1229,11 +1229,11 @@ conversation creation outright, same as before this PR.
 member-only (non-owner). These map directly to `participants.role` and are checked
 before the state-machine transition.
 
-### The proposal submission pipeline (`POST /proposals`, `GET /proposals/pending`, `GET /proposals/{id}`, `POST /proposals/{id}/withdraw`, `POST /proposals/{id}/decide`) [TECH-5872/TECH-5875/TECH-5877/TECH-5873/TECH-6018]
+### The proposal submission pipeline (`POST /proposals`, `GET /proposals/pending`, `GET /proposals/history`, `GET /proposals/{id}`, `POST /proposals/{id}/withdraw`, `POST /proposals/{id}/decide`) [TECH-5872/TECH-5875/TECH-5877/TECH-5873/TECH-6018/TECH-6030]
 
 A sibling pipeline to the approval-holds one above, generalized to
 `proposal_holds` (§5) for autonomous bots' arbitrary actions rather than
-this board's own comms traffic. Four non-MCP `mcp.custom_route`s split
+this board's own comms traffic. Five non-MCP `mcp.custom_route`s split
 across two opposite auth postures:
 
 - **`POST /proposals`**, **`GET /proposals/{id}`** (TECH-6018), and
@@ -1285,6 +1285,32 @@ across two opposite auth postures:
   body either way. `service.ALLOWED_SURFACES` enumerates the three valid
   values so an arbitrary caller-supplied string can never become an audit
   action name.
+- **`GET /proposals/history`** (TECH-6030) is `GET /proposals/pending`'s
+  terminal-status sibling, added so `agent-comms-approvals`'s
+  `decision_page` can show a human reviewer their own already-decided (or
+  bot-withdrawn) proposals -- a gap that had existed since TECH-5876,
+  since a `ProposalHold` is never deleted on decision (only transitioned),
+  unlike comms `ApprovalHold`s, which decision_page mirrors into its own
+  `decided_holds` table. Same `_authenticate_approval_caller`
+  interactive-only, owner_sub-scoped gate as `pending` but its own
+  `surface="proposals_history"` (Argus review round 1 on this PR: reusing
+  `pending`'s `"proposals"` surface would have made bot-token denials on
+  the two routes indistinguishable in the audit trail), same `?limit=`
+  clamp-to-[1,200], but `service.list_proposal_history_for_owner` filters
+  `ProposalHold.owner_sub == owner_sub` AND `status IN
+  PROPOSAL_TERMINAL_STATUSES` instead of `status = 'pending'`, ordered
+  `created_at` DESC -- the opposite of `pending`'s oldest-first order,
+  deliberately: terminal rows accumulate forever (never deleted, only
+  transitioned), so with `pending`'s oldest-first order a reviewer with
+  more than 200 decided proposals would find every new decision
+  permanently unreachable past the cap; newest-first keeps the most
+  relevant history inside it instead. Returns via the unredacted
+  `service._proposal_dict` (never the bot-facing formatter) -- the human
+  reviewer who decided (or whose bot withdrew) the proposal is exactly
+  who's entitled to see `decided_by_actor_id`, unlike the bot-facing
+  surface's deliberate redaction of that same field. Must be registered
+  before the `/proposals/{id}` wildcard route, same ordering requirement
+  `pending` already has.
 
 **Bot-facing MCP tool surface** (`providers/proposals.py`, mounted
 `namespace="proposals"` -- `proposals_submit`, `proposals_get`,

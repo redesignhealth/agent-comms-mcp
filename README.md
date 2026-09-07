@@ -99,7 +99,7 @@ equivalent.
 | `proposals_submit` | `comms:proposals:write` | Submit a proposal for a bot-initiated action needing human (or TECH-5877 auto-judge) approval; same body shape as `POST /proposals` |
 | `proposals_get` | `comms:proposals:write` | Poll a single proposal's status/decision outcome by id, sender-only |
 | `proposals_list_pending` | `comms:proposals:write` | List the calling bot's OWN still-`pending` proposals; new capability, no HTTP route equivalent |
-| `proposals_list_history` | `comms:proposals:write` | List the calling bot's OWN already-actioned proposals; new capability, no HTTP route equivalent |
+| `proposals_list_history` | `comms:proposals:write` | List the calling bot's OWN already-actioned proposals; new capability, no bot-facing HTTP route equivalent (`GET /proposals/history` is the human-facing counterpart, scoped to `owner_sub` rather than the submitting bot) |
 | `proposals_withdraw` | `comms:proposals:write` | Retract the calling bot's own still-`pending` proposal; same body shape as `POST /proposals/{id}/withdraw` |
 
 ## MCP resource surface
@@ -140,7 +140,12 @@ above via `TOOL_SCOPES`, but `POST /proposals` itself is a non-MCP route
 and isn't dispatched through that registry); `GET /proposals/pending`
 reuses `/approvals/pending`'s hard interactive-only gate -- a DIFFERENT,
 human-scoped listing than `proposals_list_pending` above, not a duplicate
-of it. `POST /proposals/{id}/decide` (TECH-5873) is the
+of it. `GET /proposals/history` (TECH-6030) is `GET /proposals/pending`'s
+terminal-status sibling -- same interactive-only, owner_sub-scoped gate,
+but every already-decided (or bot-withdrawn) proposal instead of the
+still-pending ones; likewise a DIFFERENT, human-scoped listing than
+`proposals_list_history` above, not a duplicate of it. `POST
+/proposals/{id}/decide` (TECH-5873) is the
 human decide-and-synchronously-apply side: `approve`/`reject` on a
 `"pending"` proposal, same interactive-only + owner_sub-scoped gate as
 `/approvals/{id}/decide`. Approving re-checks the target hasn't drifted
