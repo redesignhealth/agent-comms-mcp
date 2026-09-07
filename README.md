@@ -99,7 +99,7 @@ equivalent.
 | `proposals_submit` | `comms:proposals:write` | Submit a proposal for a bot-initiated action needing human (or TECH-5877 auto-judge) approval; same body shape as `POST /proposals` |
 | `proposals_get` | `comms:proposals:write` | Poll a single proposal's status/decision outcome by id, sender-only |
 | `proposals_list_pending` | `comms:proposals:write` | List the calling bot's OWN still-`pending` proposals; new capability, no HTTP route equivalent |
-| `proposals_list_history` | `comms:proposals:write` | List the calling bot's OWN already-actioned proposals; new capability, no HTTP route equivalent |
+| `proposals_list_history` | `comms:proposals:write` | List the calling bot's OWN already-actioned proposals; new capability, no bot-facing HTTP route equivalent (`GET /proposals/history` is the human-facing counterpart, scoped to `owner_sub` rather than the submitting bot) |
 | `proposals_withdraw` | `comms:proposals:write` | Retract the calling bot's own still-`pending` proposal; same body shape as `POST /proposals/{id}/withdraw` |
 
 ## MCP resource surface

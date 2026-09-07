@@ -706,9 +706,10 @@ async def _authenticate_approval_caller(
     inspected and rejected it rather than merely failing to authenticate).
 
     ``surface`` (Argus review S6) distinguishes the denial audit action
-    across the three HTTP surfaces sharing this same gate: ``"approval"``
+    across the four HTTP surfaces sharing this same gate: ``"approval"``
     (default -- ``/approvals/*``), ``"proposals"`` (``GET
-    /proposals/pending``), and ``"proposals_decide"`` (``POST
+    /proposals/pending``), ``"proposals_history"`` (``GET
+    /proposals/history``, TECH-6030), and ``"proposals_decide"`` (``POST
     /proposals/{hold_id}/decide``) -- passed straight through to
     ``service.audit_denied_approval_requires_interactive`` (validated there
     against ``ALLOWED_SURFACES``) so the surfaces' denials are no longer
@@ -1025,9 +1026,14 @@ async def list_proposal_history(request: Request) -> Response:
     """List the caller's already-actioned proposal holds (TECH-6030) --
     same interactive-only, owner_sub-scoped auth gate as
     ``GET /proposals/pending`` above: a human reviewing proposals they've
-    already decided (or a bot withdrew), not a bot.
+    already decided (or a bot withdrew), not a bot. Uses its own
+    ``surface="proposals_history"`` (distinct from ``pending``'s
+    ``"proposals"``), per Argus review round 1 on this PR: reusing
+    ``"proposals"`` here would have made bot-token denials on this route
+    indistinguishable from ``/proposals/pending``'s in the audit trail,
+    exactly the ambiguity ``surface`` was introduced to eliminate.
     """
-    owner_sub, status = await _authenticate_approval_caller(request, surface="proposals")
+    owner_sub, status = await _authenticate_approval_caller(request, surface="proposals_history")
     if owner_sub is None:
         return JSONResponse({"error": "unauthorized"}, status_code=status)
 

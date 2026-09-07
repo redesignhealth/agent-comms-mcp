@@ -4962,18 +4962,19 @@ async def _fire_approval_notifier(
         await session.commit()
 
 
-ALLOWED_SURFACES = frozenset({"approval", "proposals", "proposals_decide"})
+ALLOWED_SURFACES = frozenset({"approval", "proposals", "proposals_history", "proposals_decide"})
 
 
 async def audit_denied_approval_requires_interactive(
     session: AsyncSession, *, actor_sub: str, surface: str = "approval"
 ) -> None:
     """Audit + commit ``denied.<surface>_requires_interactive`` -- the hard
-    interactive-token-only gate ``main.py`` reuses across three distinct HTTP
+    interactive-token-only gate ``main.py`` reuses across four distinct HTTP
     surfaces: ``/approvals/*`` (``surface="approval"``, the default),
-    ``GET /proposals/pending`` (``surface="proposals"``), and ``POST
-    /proposals/{hold_id}/decide`` (``surface="proposals_decide"``). Argus
-    review S6: these surfaces used to write the SAME action name
+    ``GET /proposals/pending`` (``surface="proposals"``), ``GET
+    /proposals/history`` (``surface="proposals_history"``, TECH-6030), and
+    ``POST /proposals/{hold_id}/decide`` (``surface="proposals_decide"``).
+    Argus review S6: these surfaces used to write the SAME action name
     (``denied.approval_requires_interactive``), making them indistinguishable
     in the audit trail even though they gate different resources -- the
     caller now threads its own surface through. ``surface`` is checked
@@ -6376,7 +6377,7 @@ async def list_proposal_history_for_owner(
 ) -> dict[str, Any]:
     """``GET /proposals/history`` (main.py, non-MCP, interactive+owner-gated
     -- TECH-6030): every already-actioned proposal (``PROPOSAL_TERMINAL_
-    STATUSES``) whose ``owner_sub`` snapshot matches the caller, oldest
+    STATUSES``) whose ``owner_sub`` snapshot matches the caller, newest
     first -- same owner_sub-scoped visibility pattern and limit-clamping as
     ``list_pending_proposal_holds`` above, just filtered to terminal
     statuses instead of ``'pending'``. Closes the gap decision_page's
@@ -6386,6 +6387,17 @@ async def list_proposal_history_for_owner(
     table -- unnecessary here, since ``ProposalHold`` rows are never
     deleted on decision, only transitioned; the board can answer this
     query directly).
+
+    Deliberately ``created_at`` DESC, NOT the oldest-first order
+    ``list_pending_proposal_holds`` uses -- Argus review round 1 on this
+    PR: pending rows self-limit (they leave the pending set as soon as
+    they're decided), but terminal rows accumulate forever, so an
+    oldest-first order plus this endpoint's fixed 200-row cap would make
+    every reviewer's most-recent decisions permanently unreachable once
+    they'd decided more than 200 proposals, with ``has_more`` stuck
+    ``True`` and no way to page past it (no offset/cursor param exists
+    yet). Newest-first keeps the actionable, most-relevant history inside
+    the cap instead.
 
     Returns via ``_proposal_dict`` (unredacted), NOT ``_bot_facing_proposal_
     dict`` -- this is the human reviewer's own view of a proposal they
@@ -6400,7 +6412,7 @@ async def list_proposal_history_for_owner(
             ProposalHold.owner_sub == owner_sub,
             ProposalHold.status.in_(PROPOSAL_TERMINAL_STATUSES),
         )
-        .order_by(ProposalHold.created_at.asc())
+        .order_by(ProposalHold.created_at.desc())
         .limit(limit + 1)
     )
     rows = (await session.execute(stmt)).scalars().all()
