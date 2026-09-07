@@ -1229,7 +1229,7 @@ conversation creation outright, same as before this PR.
 member-only (non-owner). These map directly to `participants.role` and are checked
 before the state-machine transition.
 
-### The proposal submission pipeline (`POST /proposals`, `GET /proposals/pending`, `GET /proposals/{id}`, `POST /proposals/{id}/withdraw`, `POST /proposals/{id}/decide`) [TECH-5872/TECH-5875/TECH-5877/TECH-5873/TECH-6018]
+### The proposal submission pipeline (`POST /proposals`, `GET /proposals/pending`, `GET /proposals/history`, `GET /proposals/{id}`, `POST /proposals/{id}/withdraw`, `POST /proposals/{id}/decide`) [TECH-5872/TECH-5875/TECH-5877/TECH-5873/TECH-6018/TECH-6030]
 
 A sibling pipeline to the approval-holds one above, generalized to
 `proposal_holds` (§5) for autonomous bots' arbitrary actions rather than
@@ -1285,6 +1285,23 @@ across two opposite auth postures:
   body either way. `service.ALLOWED_SURFACES` enumerates the three valid
   values so an arbitrary caller-supplied string can never become an audit
   action name.
+- **`GET /proposals/history`** (TECH-6030) is `GET /proposals/pending`'s
+  terminal-status sibling, added so `agent-comms-approvals`'s
+  `decision_page` can show a human reviewer their own already-decided (or
+  bot-withdrawn) proposals -- a gap that had existed since TECH-5876,
+  since a `ProposalHold` is never deleted on decision (only transitioned),
+  unlike comms `ApprovalHold`s, which decision_page mirrors into its own
+  `decided_holds` table. Same `_authenticate_approval_caller(surface=
+  "proposals")` gate, same `?limit=` clamp-to-[1,200] as `pending`, but
+  `service.list_proposal_history_for_owner` filters
+  `ProposalHold.owner_sub == owner_sub` AND `status IN
+  PROPOSAL_TERMINAL_STATUSES` instead of `status = 'pending'`. Returns via
+  the unredacted `service._proposal_dict` (never the bot-facing
+  formatter) -- the human reviewer who decided (or whose bot withdrew) the
+  proposal is exactly who's entitled to see `decided_by_actor_id`, unlike
+  the bot-facing surface's deliberate redaction of that same field. Must
+  be registered before the `/proposals/{id}` wildcard route, same
+  ordering requirement `pending` already has.
 
 **Bot-facing MCP tool surface** (`providers/proposals.py`, mounted
 `namespace="proposals"` -- `proposals_submit`, `proposals_get`,

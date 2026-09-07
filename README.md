@@ -140,7 +140,12 @@ above via `TOOL_SCOPES`, but `POST /proposals` itself is a non-MCP route
 and isn't dispatched through that registry); `GET /proposals/pending`
 reuses `/approvals/pending`'s hard interactive-only gate -- a DIFFERENT,
 human-scoped listing than `proposals_list_pending` above, not a duplicate
-of it. `POST /proposals/{id}/decide` (TECH-5873) is the
+of it. `GET /proposals/history` (TECH-6030) is `GET /proposals/pending`'s
+terminal-status sibling -- same interactive-only, owner_sub-scoped gate,
+but every already-decided (or bot-withdrawn) proposal instead of the
+still-pending ones; likewise a DIFFERENT, human-scoped listing than
+`proposals_list_history` above, not a duplicate of it. `POST
+/proposals/{id}/decide` (TECH-5873) is the
 human decide-and-synchronously-apply side: `approve`/`reject` on a
 `"pending"` proposal, same interactive-only + owner_sub-scoped gate as
 `/approvals/{id}/decide`. Approving re-checks the target hasn't drifted

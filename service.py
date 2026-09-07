@@ -6371,6 +6371,45 @@ async def list_pending_proposal_holds(
     return {"proposals": proposals, "has_more": has_more}
 
 
+async def list_proposal_history_for_owner(
+    session: AsyncSession, *, owner_sub: str, limit: int = 50
+) -> dict[str, Any]:
+    """``GET /proposals/history`` (main.py, non-MCP, interactive+owner-gated
+    -- TECH-6030): every already-actioned proposal (``PROPOSAL_TERMINAL_
+    STATUSES``) whose ``owner_sub`` snapshot matches the caller, oldest
+    first -- same owner_sub-scoped visibility pattern and limit-clamping as
+    ``list_pending_proposal_holds`` above, just filtered to terminal
+    statuses instead of ``'pending'``. Closes the gap decision_page's
+    Proposals tab has had since TECH-5876: that tab could only ever show
+    pending proposals, with no way to browse decided/withdrawn ones (unlike
+    comms holds, which decision_page mirrors into its own ``decided_holds``
+    table -- unnecessary here, since ``ProposalHold`` rows are never
+    deleted on decision, only transitioned; the board can answer this
+    query directly).
+
+    Returns via ``_proposal_dict`` (unredacted), NOT ``_bot_facing_proposal_
+    dict`` -- this is the human reviewer's own view of a proposal they
+    decided (or a bot withdrew), so ``decided_by_actor_id`` is exactly the
+    kind of information this caller is entitled to see, unlike the
+    bot-facing surface's deliberate redaction of that same field.
+    """
+    limit = max(1, min(limit, 200))
+    stmt = (
+        select(ProposalHold)
+        .where(
+            ProposalHold.owner_sub == owner_sub,
+            ProposalHold.status.in_(PROPOSAL_TERMINAL_STATUSES),
+        )
+        .order_by(ProposalHold.created_at.asc())
+        .limit(limit + 1)
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    proposals = [_proposal_dict(hold) for hold in rows]
+    return {"proposals": proposals, "has_more": has_more}
+
+
 async def get_proposal_for_bot(
     session: AsyncSession, *, hold_id: uuid.UUID, requesting_bot_sub: str
 ) -> dict[str, Any]:
@@ -8437,6 +8476,7 @@ __all__ = [
     "list_conversations",
     "list_pending_approval_holds",
     "list_pending_proposal_holds",
+    "list_proposal_history_for_owner",
     "list_proposals_for_bot",
     "lookup_agent_by_email",
     "may_assign",

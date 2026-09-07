@@ -1020,6 +1020,30 @@ async def list_pending_proposals(request: Request) -> Response:
     return JSONResponse(result, status_code=200)
 
 
+@mcp.custom_route("/proposals/history", methods=["GET"])
+async def list_proposal_history(request: Request) -> Response:
+    """List the caller's already-actioned proposal holds (TECH-6030) --
+    same interactive-only, owner_sub-scoped auth gate as
+    ``GET /proposals/pending`` above: a human reviewing proposals they've
+    already decided (or a bot withdrew), not a bot.
+    """
+    owner_sub, status = await _authenticate_approval_caller(request, surface="proposals")
+    if owner_sub is None:
+        return JSONResponse({"error": "unauthorized"}, status_code=status)
+
+    limit_str = request.query_params.get("limit")
+    try:
+        limit = int(limit_str) if limit_str is not None else 50
+    except ValueError:
+        return JSONResponse({"error": "invalid_limit"}, status_code=422)
+
+    async with get_session_factory()() as session:
+        result = await service.list_proposal_history_for_owner(
+            session, owner_sub=owner_sub, limit=limit
+        )
+    return JSONResponse(result, status_code=200)
+
+
 @mcp.custom_route("/proposals/{proposal_id}", methods=["GET"])
 async def get_proposal(request: Request) -> Response:
     """Let the SUBMITTING bot poll a proposal's current status/decision
@@ -1035,12 +1059,12 @@ async def get_proposal(request: Request) -> Response:
     different bot (anti-enumeration, same posture as
     ``/proposals/{hold_id}/decide``).
 
-    Registered AFTER ``GET /proposals/pending`` deliberately -- Starlette
-    matches routes in registration order, and ``/proposals/pending`` is a
-    static path that would otherwise be swallowed by this route's
-    ``{proposal_id}`` wildcard if this one came first (a GET to
-    ``/proposals/pending`` would resolve here with ``proposal_id="pending"``
-    instead).
+    Registered AFTER ``GET /proposals/pending`` and ``GET /proposals/history``
+    deliberately -- Starlette matches routes in registration order, and both
+    of those are static paths that would otherwise be swallowed by this
+    route's ``{proposal_id}`` wildcard if either came first (a GET to
+    ``/proposals/pending``/``/proposals/history`` would resolve here with
+    ``proposal_id="pending"``/``"history"`` instead).
     """
     bot_sub, bot_token, status = await _authenticate_proposal_submitter(request, surface="get")
     if bot_sub is None or bot_token is None:

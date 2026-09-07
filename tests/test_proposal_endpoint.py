@@ -153,6 +153,7 @@ async def client(
         routes=[
             Route("/proposals", main.submit_proposal, methods=["POST"]),
             Route("/proposals/pending", main.list_pending_proposals, methods=["GET"]),
+            Route("/proposals/history", main.list_proposal_history, methods=["GET"]),
             Route("/proposals/{proposal_id}", main.get_proposal, methods=["GET"]),
             Route(
                 "/proposals/{proposal_id}/withdraw",
@@ -759,6 +760,138 @@ class TestListPendingProposals:
         )
         assert pending.status_code == 200
         body = pending.json()
+        assert len(body["proposals"]) == limit
+        assert body["has_more"] is True
+
+
+class TestProposalHistoryAuthGate:
+    async def test_missing_token_returns_401(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, _provider = client
+        resp = await http_client.get("/proposals/history")
+        assert resp.status_code == 401
+
+    async def test_agent_jwt_token_returns_403(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        """Same hard interactive-only gate as ``GET /proposals/pending`` --
+        a bot's agent-jwt token can't list history either."""
+        http_client, provider = client
+        provider.tokens["agent-token"] = _agent_jwt_token(
+            "some-bot", scopes=["comms:proposals:write"]
+        )
+        resp = await http_client.get(
+            "/proposals/history", headers={"Authorization": "Bearer agent-token"}
+        )
+        assert resp.status_code == 403
+
+
+class TestListProposalHistory:
+    async def test_owner_filtering(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider, owner_sub="owner-a@example.com")
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+        provider.tokens["other-human-token"] = _interactive_token("owner-b@example.com")
+
+        decide_resp = await http_client.post(
+            f"/proposals/{proposal_id}/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={"decision": "reject", "decision_note": "not needed"},
+        )
+        assert decide_resp.status_code == 200
+
+        own = await http_client.get(
+            "/proposals/history", headers={"Authorization": "Bearer human-token"}
+        )
+        assert own.status_code == 200
+        assert len(own.json()["proposals"]) == 1
+        assert own.json()["proposals"][0]["status"] == "rejected"
+
+        other = await http_client.get(
+            "/proposals/history", headers={"Authorization": "Bearer other-human-token"}
+        )
+        assert other.status_code == 200
+        assert other.json()["proposals"] == []
+
+    async def test_pending_proposals_excluded(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        await _submit_via_http(http_client, provider, owner_sub="owner-a@example.com")
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+
+        history = await http_client.get(
+            "/proposals/history", headers={"Authorization": "Bearer human-token"}
+        )
+        assert history.status_code == 200
+        assert history.json()["proposals"] == []
+
+        pending = await http_client.get(
+            "/proposals/pending", headers={"Authorization": "Bearer human-token"}
+        )
+        assert len(pending.json()["proposals"]) == 1
+
+    async def test_withdrawn_proposal_included(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider, owner_sub="owner-a@example.com")
+        withdraw_resp = await http_client.post(
+            f"/proposals/{proposal_id}/withdraw",
+            headers={"Authorization": "Bearer bot-token"},
+            json={"reason": "superseded"},
+        )
+        assert withdraw_resp.status_code == 200
+
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+        history = await http_client.get(
+            "/proposals/history", headers={"Authorization": "Bearer human-token"}
+        )
+        assert history.status_code == 200
+        body = history.json()["proposals"]
+        assert len(body) == 1
+        assert body[0]["status"] == "withdrawn"
+        assert body[0]["decided_by_actor_id"] == "bot-1"
+
+    async def test_invalid_limit_returns_422(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+
+        resp = await http_client.get(
+            "/proposals/history?limit=abc", headers={"Authorization": "Bearer human-token"}
+        )
+        assert resp.status_code == 422
+        assert resp.json()["error"] == "invalid_limit"
+
+    async def test_has_more_true_when_more_than_limit_decided(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+
+        limit = 2
+        for i in range(limit + 1):
+            proposal_id = await _submit_via_http(
+                http_client, provider, owner_sub="owner-a@example.com", target_id=f"TECH-{i}"
+            )
+            decide_resp = await http_client.post(
+                f"/proposals/{proposal_id}/decide",
+                headers={"Authorization": "Bearer human-token"},
+                json={"decision": "reject", "decision_note": "not needed"},
+            )
+            assert decide_resp.status_code == 200
+
+        history = await http_client.get(
+            f"/proposals/history?limit={limit}",
+            headers={"Authorization": "Bearer human-token"},
+        )
+        assert history.status_code == 200
+        body = history.json()
         assert len(body["proposals"]) == limit
         assert body["has_more"] is True
 
@@ -1459,17 +1592,18 @@ class TestWithdrawProposalEndpoint:
 class TestProposalRouteRegistrationOrder:
     """Guards the route-ordering invariant ``get_proposal``'s own docstring
     depends on (Argus review suggestion): Starlette matches routes in
-    registration order, so ``/proposals/pending`` (static) MUST be
-    registered before ``/proposals/{proposal_id}`` (wildcard), or a GET to
-    ``/proposals/pending`` would resolve to ``get_proposal`` with
-    ``proposal_id="pending"`` instead of ``list_pending_proposals`` --
-    silently returning a uniform 404 for every caller instead of the
-    pending list. This module's own test fixture hand-builds an
+    registration order, so ``/proposals/pending``/``/proposals/history``
+    (static) MUST be registered before ``/proposals/{proposal_id}``
+    (wildcard), or a GET to either would resolve to ``get_proposal`` with
+    ``proposal_id="pending"``/``"history"`` instead of
+    ``list_pending_proposals``/``list_proposal_history`` -- silently
+    returning a uniform 404 for every caller instead of the intended
+    listing. This module's own test fixture hand-builds an
     independently-ordered ``Route`` list (see the ``client`` fixture
     above), so it can't catch a production ordering regression -- this
     test inspects ``main.mcp``'s ACTUAL registered routes instead."""
 
-    def test_pending_registered_before_wildcard_proposal_id(self) -> None:
+    def test_pending_and_history_registered_before_wildcard_proposal_id(self) -> None:
         main = _import_main()
         # `_additional_http_routes` is a private FastMCP attribute (Argus
         # review round-2 suggestion) -- a future FastMCP upgrade could
@@ -1483,5 +1617,7 @@ class TestProposalRouteRegistrationOrder:
             )
         paths = [getattr(route, "path", None) for route in main.mcp._additional_http_routes]
         assert "/proposals/pending" in paths
+        assert "/proposals/history" in paths
         assert "/proposals/{proposal_id}" in paths
         assert paths.index("/proposals/pending") < paths.index("/proposals/{proposal_id}")
+        assert paths.index("/proposals/history") < paths.index("/proposals/{proposal_id}")

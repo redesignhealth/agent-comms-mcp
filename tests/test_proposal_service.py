@@ -41,6 +41,7 @@ from service import (
     decide_proposal,
     get_proposal_for_bot,
     list_pending_proposal_holds,
+    list_proposal_history_for_owner,
     list_proposals_for_bot,
     withdraw_proposal,
 )
@@ -571,6 +572,95 @@ class TestOwnerSubVisibility:
         await _submit(session, owner_sub="owner-a@example.com")
         result = await list_pending_proposal_holds(session, owner_sub="owner-nobody@example.com")
         assert result["proposals"] == []
+
+
+class TestListProposalHistoryForOwner:
+    """Service-layer coverage for ``list_proposal_history_for_owner``
+    (TECH-6030) -- mirrors ``TestOwnerSubVisibility`` above, but for the
+    terminal-status/human-history side rather than pending."""
+
+    async def test_caller_only_sees_own_owner_sub_decided_proposals(
+        self, session: AsyncSession
+    ) -> None:
+        submitted_a = await _submit(
+            session, owner_sub="owner-a@example.com", action=_action(target_id="T1")
+        )
+        submitted_b = await _submit(
+            session, owner_sub="owner-b@example.com", action=_action(target_id="T2")
+        )
+        await decide_proposal(
+            session,
+            approver_sub="owner-a@example.com",
+            hold_id=uuid.UUID(submitted_a["proposal_id"]),
+            decision="reject",
+            decision_note="not needed",
+        )
+        await decide_proposal(
+            session,
+            approver_sub="owner-b@example.com",
+            hold_id=uuid.UUID(submitted_b["proposal_id"]),
+            decision="reject",
+            decision_note="not needed",
+        )
+
+        result = await list_proposal_history_for_owner(session, owner_sub="owner-a@example.com")
+        assert len(result["proposals"]) == 1
+        assert result["proposals"][0]["action"]["target_id"] == "T1"
+
+    async def test_pending_proposals_excluded_from_history(self, session: AsyncSession) -> None:
+        await _submit(session, owner_sub="owner-a@example.com")
+        result = await list_proposal_history_for_owner(session, owner_sub="owner-a@example.com")
+        assert result["proposals"] == []
+
+    async def test_withdrawn_proposal_included_and_unredacted(self, session: AsyncSession) -> None:
+        """Unlike the bot-facing ``list_proposals_for_bot``, this human-
+        facing listing must NOT redact ``decided_by_actor_id`` -- the
+        reviewer is exactly who's entitled to see who/what decided it."""
+        submitted = await _submit(session, owner_sub="owner-a@example.com")
+        await withdraw_proposal(
+            session,
+            hold_id=uuid.UUID(submitted["proposal_id"]),
+            requesting_bot_sub="bot-1",
+            reason="stale",
+        )
+        result = await list_proposal_history_for_owner(session, owner_sub="owner-a@example.com")
+        assert len(result["proposals"]) == 1
+        assert result["proposals"][0]["status"] == "withdrawn"
+        assert result["proposals"][0]["decided_by_actor_id"] == "bot-1"
+
+    async def test_no_matching_owner_sub_returns_empty(self, session: AsyncSession) -> None:
+        submitted = await _submit(session, owner_sub="owner-a@example.com")
+        await decide_proposal(
+            session,
+            approver_sub="owner-a@example.com",
+            hold_id=uuid.UUID(submitted["proposal_id"]),
+            decision="reject",
+            decision_note="not needed",
+        )
+        result = await list_proposal_history_for_owner(
+            session, owner_sub="owner-nobody@example.com"
+        )
+        assert result["proposals"] == []
+
+    async def test_limit_clamped_and_has_more(self, session: AsyncSession) -> None:
+        limit = 2
+        for i in range(limit + 1):
+            submitted = await _submit(
+                session, owner_sub="owner-a@example.com", action=_action(target_id=f"T{i}")
+            )
+            await decide_proposal(
+                session,
+                approver_sub="owner-a@example.com",
+                hold_id=uuid.UUID(submitted["proposal_id"]),
+                decision="reject",
+                decision_note="not needed",
+            )
+
+        result = await list_proposal_history_for_owner(
+            session, owner_sub="owner-a@example.com", limit=limit
+        )
+        assert len(result["proposals"]) == limit
+        assert result["has_more"] is True
 
 
 class TestDecideProposal:
