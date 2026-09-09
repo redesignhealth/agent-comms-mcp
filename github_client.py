@@ -4,11 +4,10 @@ request or branch (e.g. "is this PR still open", "does this branch still
 exist").
 
 Wired into ``service.py``'s ``(kind, action_type)``-keyed rule registry:
-``_rule_open_ticket``, ``_rule_start_ticket``, ``_rule_review_ticket``,
-``_rule_assign_ticket``, and ``_rule_label_ticket`` each call
-``parse_github_pull_request_url`` here (and, for every rule but
-``_rule_label_ticket``, ``fetch_pull_request`` too) to verify a cited PR
-before auto-approving.
+all five rules (``_rule_open_ticket``, ``_rule_start_ticket``,
+``_rule_review_ticket``, ``_rule_assign_ticket``, and
+``_rule_label_ticket``) call both ``parse_github_pull_request_url`` and
+``fetch_pull_request`` here to verify a cited PR before auto-approving.
 
 Credential: ``GITHUB_TOKEN`` env var, read directly (same
 "application code reads an env var" convention this repo already uses
@@ -32,7 +31,7 @@ from __future__ import annotations
 
 import os
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote
 
 import httpx
 
@@ -197,9 +196,8 @@ def parse_pull_request_url(url: str) -> tuple[str, str, int] | None:
     Prefer ``parse_github_pull_request_url`` below, which does both steps
     together -- calling this function directly on an unvalidated citation
     is exactly the host-confusion gap that function exists to close."""
-    try:
-        parsed = urlsplit(url)
-    except ValueError:
+    parsed = citation_urls._safe_urlsplit(url)
+    if parsed is None:
         return None
     parts = parsed.path.strip("/").split("/")
     if len(parts) != 4 or parts[2] != "pull":
@@ -237,8 +235,8 @@ def parse_github_pull_request_url(url: str) -> tuple[str, str, int] | None:
     ``parse_pull_request_url`` itself."""
     if not citation_urls.is_valid_citation_url(url):
         return None
-    parsed = urlsplit(url)
-    if parsed.hostname != "github.com":
+    parsed = citation_urls._safe_urlsplit(url)
+    if parsed is None or parsed.hostname != "github.com":
         return None
     return parse_pull_request_url(url)
 

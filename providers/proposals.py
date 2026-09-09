@@ -135,12 +135,13 @@ async def _map_proposal_errors() -> AsyncIterator[None]:
     already-claimed hold) are both specific-by-design (see their own
     docstrings in exceptions.py) and pass through unwrapped too.
 
-    ``linear_client.LinearAPIError`` (Argus review) is mapped the same
-    way: ``service.create_proposal``'s server-side target-fingerprint
-    fetch can fail for a caller-input reason (target_id doesn't exist)
-    or a Linear-side outage -- either way this must surface as a clear
-    ``ToolError``, matching ``main.py``'s HTTP-route mapping for the
-    same underlying failure, not an unmapped exception.
+    ``linear_client.LinearAPIError`` (Argus review round-3 B1) is
+    sanitized via ``service.sanitize_linear_submit_error``:
+    ``service.create_proposal``'s server-side target-fingerprint
+    fetch can fail for an unconfigured token, a transport failure,
+    or a Linear-side error -- sanitized so internal token env-var
+    names, transport internals, and GraphQL error payloads are never
+    leaked to the tool caller.
     """
     try:
         yield
@@ -149,7 +150,8 @@ async def _map_proposal_errors() -> AsyncIterator[None]:
     except (RateLimitExceededError, HoldAlreadyDecidedError, ValueError) as exc:
         raise ToolError(str(exc)) from None
     except linear_client.LinearAPIError as exc:
-        raise ToolError(str(exc)) from None
+        _status_code, _error_code, detail = service.sanitize_linear_submit_error(exc)
+        raise ToolError(detail) from None
 
 
 def _parse_proposal_id(proposal_id: str) -> uuid.UUID:

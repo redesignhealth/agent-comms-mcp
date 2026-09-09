@@ -1493,9 +1493,14 @@ Rules that resolve a Linear workflow state by name (`start_ticket`'s
 CASE-SENSITIVELY against the target team's real Linear workflow states
 (`resolve_workflow_state_id`) -- the target team's states must be named
 EXACTLY that, or the apply step fails cleanly with `LinearNotFoundError`
-(-> `apply_failed`), never a silent no-op. This is deliberately not
-bot-controllable via the action payload, to avoid letting a bot influence
-its own approval target.
+(-> `apply_failed`), never a silent no-op. Target workflow state is
+deliberately not bot-controllable via the action payload in auto-approval,
+to avoid letting a bot influence its own approval target:
+`start_ticket` and `review_ticket` hardcode their target states, while
+`open_ticket` auto-approval never honors a bot-specified `target_state`
+at all (auto-created issues always land in the team's default initial
+workflow state; if a proposal specifies a `target_state`, it is held for
+human review instead of auto-approved).
 
 The artifact-backed lanes use `github_client.py` (raw GitHub REST client,
 `GITHUB_TOKEN`) for PR lookup and URL parsing, `workflow_order.py` for the
@@ -1518,10 +1523,18 @@ terminal write landed.
 
 **Latency (Argus review round-4 suggestion, updated for the TECH-5877
 artifact-backed lanes):** `POST /proposals` was DB-only latency before
-TECH-5873 landed the auto-apply behavior above. For the `open_ticket`/
-`close_ticket` citation-backed lanes it can make up to two sequential Linear
-HTTP calls (fingerprint fetch, then the write) inline before responding. The
-`start_ticket`/`review_ticket` auto-approve path is worse: it can now make up
+TECH-5873 landed the auto-apply behavior above. For `close_ticket`, it
+can make up to two sequential Linear HTTP calls (submission-time fingerprint
+fetch, then the comment-posting write) inline before responding.
+
+`open_ticket` is fingerprint-exempt (`_PROPOSAL_FINGERPRINT_EXEMPT`, zero
+fingerprint fetches at submission or apply time), but makes up to four
+sequential round-trips across GitHub and Linear before responding: (1) rule-time
+GitHub `fetch_pull_request` (existence check), (2) apply-time `resolve_team_id`,
+(3) optionally apply-time `resolve_workflow_state_id`, and (4) the
+`create_ticket` (`issueCreate`) mutation itself.
+
+The `start_ticket`/`review_ticket` auto-approve path is worse: it can now make up
 to SEVEN sequential round-trips across two providers before responding --
 (1) the submission-time fingerprint fetch (`create_proposal`), (2) the
 GitHub PR fetch inside the rule, (3) the Linear `fetch_issue` call inside the
@@ -1586,24 +1599,22 @@ intentional -- a human approving IS the final authority this whole
 human-in-the-loop escape hatch exists for -- not an oversight or a gap to
 close later.
 
-**Fingerprint scheme is a cross-repo contract**
+**Fingerprint scheme is an internal contract**
 (`linear_client.compute_target_fingerprint`): a sha256 hex digest over a
 fixed, sorted set of Linear issue fields (state id/name, priority, assignee
 id). `updatedAt` is deliberately EXCLUDED (bug fix: Linear bumps it on
 any touch, which made staleness fire on unrelated activity). Staleness now
 means "the ticket's state/priority/assignee changed since the proposal was
 submitted," not "anything touched this ticket." `service.create_proposal`
-now computes and stores `target_fingerprint` server-side at submission
-time, and `_apply_or_finalize_proposal_hold` reuses the same function at
-apply time to check for drift. This function's own docstring is the single
-source of truth for the EXACT byte-level scheme (field set AND
-serialization: `json.dumps` args), not duplicated here (Argus review
-round-7 suggestion -- an earlier version of this section duplicated that
-docstring's serialization detail in prose, which is exactly the kind of
-copy that can silently drift from the one true source it claims to defer
-to). See `test_pinned_digest_for_fixed_input` in
-`tests/test_linear_client.py` for the exact digest this scheme produces for
-a fixed input.
+computes and stores `target_fingerprint` server-side at submission time,
+and `_apply_or_finalize_proposal_hold` reuses the same function at
+apply time to check for drift. The value is purely internal and server-computed
+(any caller-supplied `target_fingerprint` in the request body is ignored).
+This function's own docstring is the single source of truth for the EXACT
+byte-level scheme (field set AND serialization: `json.dumps` args), not
+duplicated here (Argus review round-7 suggestion). See
+`test_pinned_digest_for_fixed_input` in `tests/test_linear_client.py` for
+the exact digest this scheme produces for a fixed input.
 
 **One-time transitional cost of the fingerprint fix:** because the
 fingerprint computation changed (server-computed now, `updated_at` dropped

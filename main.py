@@ -1004,13 +1004,14 @@ async def submit_proposal(request: Request) -> Response:
         except ValueError as exc:
             return JSONResponse({"error": "invalid_request", "detail": str(exc)}, status_code=422)
         except linear_client.LinearAPIError as exc:
-            # Argus review: service.create_proposal's server-side
-            # target-fingerprint fetch (a Linear read, not a write) can
-            # fail for a caller-input reason (target_id doesn't exist) or
-            # a Linear-side outage -- either way this is a client-facing
-            # 422, matching the ValueError handling immediately above,
-            # not an unmapped 500.
-            return JSONResponse({"error": "invalid_request", "detail": str(exc)}, status_code=422)
+            # Argus review round-3 B1: service.create_proposal's server-side
+            # target-fingerprint fetch can fail for an unconfigured token,
+            # transport failure, or Linear-side error -- sanitized via
+            # service.sanitize_linear_submit_error so internal token env-var
+            # names, transport internals, and GraphQL error payloads are
+            # never leaked.
+            status_code, error_code, detail = service.sanitize_linear_submit_error(exc)
+            return JSONResponse({"error": error_code, "detail": detail}, status_code=status_code)
 
     return JSONResponse(result, status_code=200)
 

@@ -44,6 +44,7 @@ from service import (
     list_pending_proposal_holds,
     list_proposal_history_for_owner,
     list_proposals_for_bot,
+    sanitize_linear_submit_error,
     withdraw_proposal,
 )
 
@@ -997,22 +998,22 @@ class TestFourNewLanesIntegration:
     async def test_review_ticket_without_review_requested_stays_pending(
         self, session: AsyncSession, _default_fetch_current_fingerprint: AsyncMock
     ) -> None:
-        with patch(
-            "service.github_client.fetch_pull_request",
-            AsyncMock(
-                return_value={"state": "open", "requested_reviewers": [], "requested_teams": []}
-            ),
-        ):
+        mock_fetch_pr = AsyncMock(
+            return_value={"state": "open", "requested_reviewers": [], "requested_teams": []}
+        )
+        with patch("service.github_client.fetch_pull_request", mock_fetch_pr):
             result = await _submit(
                 session,
                 action=_action(
                     action_type="review_ticket",
                     target_id="TECH-1234",
                     review_pr_url="https://github.com/org/repo/pull/1",
+                    team="TECH",
                 ),
             )
         assert result["status"] == "pending"
         assert "decision_source" not in result
+        mock_fetch_pr.assert_awaited_once_with("org", "repo", 1)
 
     async def test_assign_ticket_with_mapped_author_matching_assignee_applies(
         self, session: AsyncSession
@@ -2019,6 +2020,34 @@ class TestSanitizeApplyError:
         types)."""
         exc = LinearAPIError("Linear API returned errors: field X is not configured on this team")
         assert _sanitize_apply_error(exc) == "Linear API returned an error"
+
+
+class TestSanitizeLinearSubmitError:
+    """Pure-function tests for ``sanitize_linear_submit_error`` (Argus review round-3 B1)."""
+
+    def test_token_missing_maps_to_500_and_server_configuration_error(self) -> None:
+        exc = LinearTokenMissingError("LINEAR_API_TOKEN is not configured")
+        assert sanitize_linear_submit_error(exc) == (
+            500,
+            "server_configuration_error",
+            "server configuration error",
+        )
+
+    def test_transport_error_maps_to_503_and_unavailable_message(self) -> None:
+        exc = LinearTransportError("Linear API request failed: connection refused")
+        assert sanitize_linear_submit_error(exc) == (
+            503,
+            "service_unavailable",
+            "Linear API unavailable",
+        )
+
+    def test_generic_linear_api_error_maps_to_422_and_generic_message(self) -> None:
+        exc = LinearAPIError("Linear API returned errors: field X is not configured on this team")
+        assert sanitize_linear_submit_error(exc) == (
+            422,
+            "invalid_request",
+            "Linear returned an error",
+        )
 
 
 class TestGetProposalForBot:

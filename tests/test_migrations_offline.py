@@ -456,3 +456,19 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
         "ck_proposal_holds_apply_result_consistency "
         "CHECK (apply_result IS NULL OR status = 'applied')" in result.stdout
     )
+    # 572b2b9a96d6 (Argus review on cf72736e07f5): replaces the plain
+    # ACCESS EXCLUSIVE check constraint with the safer two-step pattern:
+    # drop, re-add as NOT VALID, and VALIDATE CONSTRAINT.
+    assert (
+        "ALTER TABLE proposal_holds DROP CONSTRAINT ck_proposal_holds_apply_result_consistency"
+        in result.stdout
+    )
+    assert (
+        "ALTER TABLE proposal_holds ADD CONSTRAINT "
+        "ck_proposal_holds_apply_result_consistency "
+        "CHECK (apply_result IS NULL OR status = 'applied') NOT VALID" in result.stdout
+    )
+    assert (
+        "ALTER TABLE proposal_holds VALIDATE CONSTRAINT ck_proposal_holds_apply_result_consistency"
+        in result.stdout
+    )

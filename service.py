@@ -5995,6 +5995,15 @@ async def _rule_open_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
        local try/except for that, same "fail closed via
        ``create_proposal``'s wrapper" contract as
        ``_rule_start_ticket``'s own docstring documents.
+    4. ``action`` does NOT specify a ``target_state`` (i.e.
+       ``action.get("target_state") is None``) -- target workflow state
+       is deliberately not bot-controllable via the action payload in
+       auto-approval (closing the invariant gap noted in DESIGN.md).
+       Auto-approved issues always land in the team's default initial
+       workflow state (Linear omits stateId). If a proposal specifies a
+       ``target_state``, it is held for human review (``pending``)
+       instead of auto-approved, leaving it to a human reviewer to
+       approve issue creation into non-default states.
 
     A Slack permalink -- otherwise a valid citation URL under
     ``_is_valid_citation_url``'s general allowlist -- is deliberately NOT
@@ -6018,6 +6027,8 @@ async def _rule_open_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
         return "pending", None
     team = action.get("team")
     if not isinstance(team, str) or not team:
+        return "pending", None
+    if action.get("target_state") is not None:
         return "pending", None
     owner, repo, number = parsed
     await github_client.fetch_pull_request(owner, repo, number)
@@ -6221,12 +6232,18 @@ async def _rule_assign_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
     not a bare ``_is_valid_citation_url``/``parse_pull_request_url``
     chain -- see ``_rule_open_ticket``'s docstring for why that chain
     alone lets a Slack URL shaped like a PR path masquerade as a real
-    GitHub PR reference."""
+    GitHub PR reference. ``action["target_id"]`` must also be present
+    and non-empty -- checked BEFORE the PR fetch (Argus review: an earlier
+    version checked this AFTER ``fetch_pull_request``, wasting a
+    round-trip on a proposal that was always going to stay pending)."""
     citation = action.get("assignee_pr_url")
     if not isinstance(citation, str):
         return "pending", None
     parsed = github_client.parse_github_pull_request_url(citation)
     if parsed is None:
+        return "pending", None
+    target_id = action.get("target_id")
+    if not isinstance(target_id, str) or not target_id:
         return "pending", None
     owner, repo, number = parsed
     pull_request = await github_client.fetch_pull_request(owner, repo, number)
@@ -6240,9 +6257,6 @@ async def _rule_assign_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
     if action.get("assignee_id") != expected_assignee_id:
         return "pending", None
 
-    target_id = action.get("target_id")
-    if not isinstance(target_id, str) or not target_id:
-        return "pending", None
     if not _pull_request_references_ticket(pull_request, target_id):
         return "pending", None
     return (
@@ -7441,6 +7455,34 @@ def _sanitize_apply_error(exc: Exception) -> str:
     if isinstance(exc, linear_client.LinearTransportError):
         return _APPLY_ERROR_UNAVAILABLE_MESSAGE
     return _APPLY_ERROR_GENERIC_MESSAGE
+
+
+_SUBMIT_ERROR_TOKEN_MESSAGE = "server configuration error"
+_SUBMIT_ERROR_UNAVAILABLE_MESSAGE = "Linear API unavailable"
+_SUBMIT_ERROR_GENERIC_MESSAGE = "Linear returned an error"
+
+
+def sanitize_linear_submit_error(exc: Exception) -> tuple[int, str, str]:
+    """Map a submit-time ``LinearAPIError`` to a safe (status_code, error_code, detail)
+    tuple before returning it to callers at either entry point (HTTP
+    ``POST /proposals`` or FastMCP ``submit``) (Argus review round-3 B1).
+
+    Prevents leaking internal environment variable names (e.g. from
+    ``LinearTokenMissingError``), httpx transport internals (from
+    ``LinearTransportError``), or raw GraphQL error payloads (from
+    ``LinearAPIError``) to callers during the submission-time fingerprint
+    fetch.
+
+    Dispatches on exception TYPE, mirroring ``_sanitize_apply_error``:
+    - ``LinearTokenMissingError``: 500, "server_configuration_error", "server configuration error"
+    - ``LinearTransportError``: 503, "service_unavailable", "Linear API unavailable"
+    - other ``LinearAPIError``: 422, "invalid_request", "Linear returned an error"
+    """
+    if isinstance(exc, linear_client.LinearTokenMissingError):
+        return 500, "server_configuration_error", _SUBMIT_ERROR_TOKEN_MESSAGE
+    if isinstance(exc, linear_client.LinearTransportError):
+        return 503, "service_unavailable", _SUBMIT_ERROR_UNAVAILABLE_MESSAGE
+    return 422, "invalid_request", _SUBMIT_ERROR_GENERIC_MESSAGE
 
 
 def _cancellation_apply_error(exc: asyncio.CancelledError) -> str:

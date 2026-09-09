@@ -193,6 +193,47 @@ class TestOpenTicket:
         )
         assert status == "approved"
 
+    async def test_open_ticket_with_target_state_stays_pending_without_fetching_pr(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Argus review round-3 B3: target/workflow state is deliberately
+        not bot-controllable via the action payload in auto-approval. If
+        a proposal specifies a target_state, it is held for human review
+        (pending) instead of auto-approved. Checked before any network call."""
+        mock_fetch_pr = AsyncMock(return_value={"state": "open"})
+        monkeypatch.setattr(github_client, "fetch_pull_request", mock_fetch_pr)
+        status, _note = await evaluate_linear_progress_update_judge(
+            {
+                "action_type": "open_ticket",
+                "target_id": "https://github.com/org/repo/pull/1",
+                "title": "New issue title",
+                "team": "TECH",
+                "target_state": "Done",
+            }
+        )
+        assert status == "pending"
+        mock_fetch_pr.assert_not_awaited()
+
+    async def test_open_ticket_with_target_state_none_is_approved(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Explicit target_state=None behaves the same as omitting it --
+        auto-created issues land in the team's default workflow state."""
+        mock_fetch_pr = AsyncMock(return_value={"state": "open"})
+        monkeypatch.setattr(github_client, "fetch_pull_request", mock_fetch_pr)
+        status, note = await evaluate_linear_progress_update_judge(
+            {
+                "action_type": "open_ticket",
+                "target_id": "https://github.com/org/repo/pull/1",
+                "title": "New issue title",
+                "team": "TECH",
+                "target_state": None,
+            }
+        )
+        assert status == "approved"
+        assert note is not None
+        mock_fetch_pr.assert_awaited_once_with("org", "repo", 1)
+
     async def test_open_ticket_slack_hosted_pr_shaped_url_stays_pending(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -409,6 +450,25 @@ class TestStartTicket:
                 "action_type": "start_ticket",
                 "target_id": "TECH-1234",
                 "starting_pr_url": "https://evil.example/org/repo/pull/1",
+            }
+        )
+        assert status == "pending"
+        mock_fetch_pr.assert_not_awaited()
+
+    async def test_slack_hosted_pr_shaped_url_stays_pending(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Argus review round-3 S4: host-confusion hole -- a Slack URL shaped
+        like a GitHub PR path must not be treated as a real GitHub PR
+        reference just because it matches that path shape."""
+        mock_fetch_pr = AsyncMock()
+        monkeypatch.setattr(github_client, "fetch_pull_request", mock_fetch_pr)
+        status, _note = await evaluate_linear_progress_update_judge(
+            {
+                "action_type": "start_ticket",
+                "target_id": "TECH-1234",
+                "starting_pr_url": "https://redesignhealth.slack.com/org/repo/pull/1",
+                "team": "TECH",
             }
         )
         assert status == "pending"
@@ -652,6 +712,25 @@ class TestReviewTicket:
         )
         assert status == "pending"
         mock_fetch_issue.assert_not_awaited()
+
+    async def test_slack_hosted_pr_shaped_url_stays_pending(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Argus review round-3 S4: host-confusion hole -- a Slack URL shaped
+        like a GitHub PR path must not be treated as a real GitHub PR
+        reference just because it matches that path shape."""
+        mock_fetch_pr = AsyncMock()
+        monkeypatch.setattr(github_client, "fetch_pull_request", mock_fetch_pr)
+        status, _note = await evaluate_linear_progress_update_judge(
+            {
+                "action_type": "review_ticket",
+                "target_id": "TECH-1234",
+                "review_pr_url": "https://redesignhealth.slack.com/org/repo/pull/1",
+                "team": "TECH",
+            }
+        )
+        assert status == "pending"
+        mock_fetch_pr.assert_not_awaited()
 
     async def test_closed_pr_stays_pending(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
@@ -961,6 +1040,23 @@ class TestAssignTicket:
             {
                 "action_type": "assign_ticket",
                 "target_id": "TECH-1234",
+                "assignee_id": "user-uuid-1",
+            }
+        )
+        assert status == "pending"
+        mock_fetch_pr.assert_not_awaited()
+
+    async def test_missing_target_id_stays_pending_without_fetching_pr(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Argus review round-3 S6: target_id presence/non-empty must be
+        checked BEFORE any network call, not after fetch_pull_request."""
+        mock_fetch_pr = AsyncMock()
+        monkeypatch.setattr(github_client, "fetch_pull_request", mock_fetch_pr)
+        status, _note = await evaluate_linear_progress_update_judge(
+            {
+                "action_type": "assign_ticket",
+                "assignee_pr_url": "https://github.com/org/repo/pull/1",
                 "assignee_id": "user-uuid-1",
             }
         )

@@ -552,19 +552,47 @@ class TestSubmitGetWithdraw:
     async def test_linear_api_error_during_submission_raises_tool_error(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
-        """Argus review: ``service.create_proposal``'s server-side
-        target-fingerprint fetch is a real Linear read that can fail
-        (target doesn't exist, Linear unreachable) -- this must surface
-        as a ``ToolError``, matching ``main.py``'s HTTP-route mapping for
-        the same underlying failure, not an unmapped exception."""
+        """Argus review round-3 B1: service.create_proposal's server-side
+        target-fingerprint fetch can fail (target doesn't exist, Linear
+        error) -- must surface as a ToolError with a sanitized message."""
         from linear_client import LinearAPIError
 
         with patch(
             "service.linear_client.fetch_current_fingerprint",
             AsyncMock(side_effect=LinearAPIError("target issue does not exist")),
         ):
-            with pytest.raises(ToolError):
+            with pytest.raises(ToolError, match=r"^Linear returned an error$"):
                 await _submit(main, test_session_factory, bot_sub="bot-linear-error")
+
+    async def test_linear_token_missing_during_submission_raises_sanitized_tool_error(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Argus review round-3 B1: LinearTokenMissingError must raise ToolError
+        without leaking the internal env-var name."""
+        from linear_client import LinearTokenMissingError
+
+        with patch(
+            "service.linear_client.fetch_current_fingerprint",
+            AsyncMock(side_effect=LinearTokenMissingError("LINEAR_API_TOKEN is not configured")),
+        ):
+            with pytest.raises(ToolError, match=r"^server configuration error$"):
+                await _submit(main, test_session_factory, bot_sub="bot-token-error")
+
+    async def test_linear_transport_error_during_submission_raises_sanitized_tool_error(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Argus review round-3 B1: LinearTransportError must raise ToolError
+        without leaking transport internals."""
+        from linear_client import LinearTransportError
+
+        with patch(
+            "service.linear_client.fetch_current_fingerprint",
+            AsyncMock(
+                side_effect=LinearTransportError("Linear API request failed: connection refused")
+            ),
+        ):
+            with pytest.raises(ToolError, match=r"^Linear API unavailable$"):
+                await _submit(main, test_session_factory, bot_sub="bot-transport-error")
 
 
 # --- list_pending / list_history -------------------------------------------------

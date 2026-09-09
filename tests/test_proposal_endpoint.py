@@ -680,10 +680,10 @@ class TestSubmitProposal:
     async def test_linear_api_error_during_submission_returns_422(
         self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
     ) -> None:
-        """Argus review: ``service.create_proposal``'s server-side
-        target-fingerprint fetch is a real Linear read that can fail
-        (target doesn't exist, Linear unreachable) -- this must surface
-        as a client-facing 422, not an unmapped 500."""
+        """Argus review round-3 B1: service.create_proposal's server-side
+        target-fingerprint fetch can fail (target doesn't exist, Linear
+        error) -- must surface as a client-facing 422 with a sanitized
+        message, never the raw error string."""
         from linear_client import LinearAPIError
 
         http_client, provider = client
@@ -699,6 +699,53 @@ class TestSubmitProposal:
             )
         assert resp.status_code == 422
         assert resp.json()["error"] == "invalid_request"
+        assert resp.json()["detail"] == "Linear returned an error"
+
+    async def test_linear_token_missing_during_submission_returns_500_sanitized(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        """Argus review round-3 B1: LinearTokenMissingError must return 500
+        without leaking the internal env-var name."""
+        from linear_client import LinearTokenMissingError
+
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        with patch(
+            "service.linear_client.fetch_current_fingerprint",
+            AsyncMock(side_effect=LinearTokenMissingError("LINEAR_API_TOKEN is not configured")),
+        ):
+            resp = await http_client.post(
+                "/proposals", json=_PROPOSAL_BODY, headers={"Authorization": "Bearer bot-token"}
+            )
+        assert resp.status_code == 500
+        assert resp.json()["error"] == "server_configuration_error"
+        assert resp.json()["detail"] == "server configuration error"
+
+    async def test_linear_transport_error_during_submission_returns_503_sanitized(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        """Argus review round-3 B1: LinearTransportError must return 503
+        without leaking raw transport details."""
+        from linear_client import LinearTransportError
+
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        with patch(
+            "service.linear_client.fetch_current_fingerprint",
+            AsyncMock(
+                side_effect=LinearTransportError("Linear API request failed: connection refused")
+            ),
+        ):
+            resp = await http_client.post(
+                "/proposals", json=_PROPOSAL_BODY, headers={"Authorization": "Bearer bot-token"}
+            )
+        assert resp.status_code == 503
+        assert resp.json()["error"] == "service_unavailable"
+        assert resp.json()["detail"] == "Linear API unavailable"
 
 
 class TestListPendingAuthGate:
