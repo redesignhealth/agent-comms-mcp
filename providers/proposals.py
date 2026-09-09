@@ -159,7 +159,7 @@ async def submit(
     confidence: str,
     importance: str,
     impact: str,
-    target_fingerprint: str,
+    target_fingerprint: str = "",
 ) -> dict[str, Any]:
     """Submit a proposal for a bot-initiated action needing human (or
     TECH-5877 auto-judge) approval before it takes effect. Same body shape
@@ -181,11 +181,13 @@ async def submit(
     call's own response (``status`` will already be a terminal one, e.g.
     ``"applied"``), not left sitting at ``"pending"``.
 
-    ``target_fingerprint`` is DEPRECATED and ignored (bug fix): the value
-    actually stored is computed server-side, by re-fetching the target's
-    current fingerprint at submission time -- see
-    ``service.create_proposal``'s own docstring. Kept as an accepted
-    parameter only for backward compatibility with existing callers.
+    ``target_fingerprint`` is DEPRECATED, OPTIONAL, and ignored (bug
+    fix): the value actually stored is computed server-side, by
+    re-fetching the target's current fingerprint at submission time --
+    see ``service.create_proposal``'s own docstring. Omit it, or pass
+    ``""``, with no error; a caller that still sends a non-empty value
+    (for backward compatibility with existing callers) gets no special
+    treatment either -- it's accepted and silently ignored either way.
     """
     bot_sub = _require_bot_sub()
     if not isinstance(action, dict):
@@ -200,7 +202,7 @@ async def submit(
         )
         rationale = service.validate_proposal_string_field("rationale", rationale)
         target_fingerprint = service.validate_proposal_string_field(
-            "target_fingerprint", target_fingerprint
+            "target_fingerprint", target_fingerprint, required=False
         )
         for action_field in ("target_id", "action_type"):
             if action_field in action:

@@ -688,6 +688,17 @@ class TestProposalHoldsSchema:
         # a real Linear issue) -- apply_result is nullable JSONB, same
         # column type/nullability as `action`, just nullable.
         assert cols["apply_result"] == "jsonb"
+        async with engine.connect() as conn:
+            nullable = (
+                await conn.execute(
+                    text(
+                        "SELECT is_nullable FROM information_schema.columns "
+                        "WHERE table_schema = 'public' AND table_name = 'proposal_holds' "
+                        "AND column_name = 'apply_result'"
+                    )
+                )
+            ).scalar_one()
+        assert nullable == "YES"
 
     async def test_status_defaults_to_pending(self, engine: AsyncEngine) -> None:
         async with engine.connect() as conn:
@@ -918,6 +929,29 @@ class TestProposalHoldsSchema:
                             "VALUES ('linear_progress_update', 'test-bot', 'test-owner', "
                             "'{}'::jsonb, 'rationale', 'low', 'low', 'low', 'low', 'approved', "
                             "'human', 'test-actor', now(), now(), 'deadbeef')"
+                        )
+                    )
+
+    async def test_apply_result_consistency_check_constraint_rejects_non_applied(
+        self, engine: AsyncEngine
+    ) -> None:
+        """migration cf72736e07f5 -- ``apply_result`` set on a row that
+        isn't ``status='applied'`` must be rejected, same shape as
+        ``test_applied_at_consistency_check_constraint_rejects_non_applied``
+        above for the analogous ``applied_at`` invariant."""
+        async with engine.connect() as conn:
+            with pytest.raises(IntegrityError, match="ck_proposal_holds_apply_result_consistency"):
+                async with conn.begin():
+                    await conn.execute(
+                        text(
+                            "INSERT INTO proposal_holds "
+                            "(kind, proposed_by_bot_id, owner_sub, action, rationale, "
+                            "confidence, importance, impact, priority, status, "
+                            "decision_source, decided_by_actor_id, decided_at, "
+                            "apply_result, target_fingerprint) "
+                            "VALUES ('linear_progress_update', 'test-bot', 'test-owner', "
+                            "'{}'::jsonb, 'rationale', 'low', 'low', 'low', 'low', 'approved', "
+                            "'human', 'test-actor', now(), '{\"id\": \"x\"}'::jsonb, 'deadbeef')"
                         )
                     )
 

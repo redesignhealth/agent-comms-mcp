@@ -92,6 +92,43 @@ class TestFetchPullRequest:
         assert not isinstance(exc_info.value, GitHubTransportError)
         assert "404" in str(exc_info.value)
 
+    async def test_error_message_truncates_long_response_text(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Argus review (log injection hygiene): an arbitrarily large
+        response body must not blow up the exception message unbounded."""
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        long_body = "x" * 1000
+        response = httpx.Response(
+            500,
+            content=long_body.encode(),
+            request=httpx.Request("GET", f"{github_client._GITHUB_API_URL}/repos/org/repo/pulls/1"),
+        )
+        _set_fake_get(monkeypatch, response)
+        with pytest.raises(GitHubAPIError) as exc_info:
+            await fetch_pull_request("org", "repo", 1)
+        message = str(exc_info.value)
+        assert "x" * 1000 not in message
+        assert "...(truncated)" in message
+
+    async def test_error_message_strips_control_characters_from_owner(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Argus review (log injection hygiene): a crafted ``owner``/
+        ``repo`` containing an embedded newline (e.g. from a decoded
+        ``%0A`` in a URL path segment) must not be able to inject a
+        fake-looking log line into the exception message."""
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        response = httpx.Response(
+            404,
+            content=b'{"message": "Not Found"}',
+            request=httpx.Request("GET", f"{github_client._GITHUB_API_URL}/repos/org/repo/pulls/1"),
+        )
+        _set_fake_get(monkeypatch, response)
+        with pytest.raises(GitHubAPIError) as exc_info:
+            await fetch_pull_request("org\nFAKE LOG LINE injected", "repo", 1)
+        assert "\n" not in str(exc_info.value)
+
     async def test_missing_token_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(_TOKEN_ENV_VAR, raising=False)
         with pytest.raises(GitHubTokenMissingError):
@@ -183,6 +220,26 @@ class TestFetchBranch:
         with pytest.raises(GitHubAPIError) as exc_info:
             await fetch_branch("org", "repo", "main")
         assert not isinstance(exc_info.value, GitHubTransportError)
+
+    async def test_error_message_strips_control_characters_from_branch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Argus review (log injection hygiene): same as
+        ``TestFetchPullRequest.test_error_message_strips_control_
+        characters_from_owner``, but for ``fetch_branch``'s ``branch``
+        parameter."""
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        response = httpx.Response(
+            500,
+            content=b'{"message": "Internal Server Error"}',
+            request=httpx.Request(
+                "GET", f"{github_client._GITHUB_API_URL}/repos/org/repo/branches/main"
+            ),
+        )
+        _set_fake_get(monkeypatch, response)
+        with pytest.raises(GitHubAPIError) as exc_info:
+            await fetch_branch("org", "repo", "main\nFAKE LOG LINE injected")
+        assert "\n" not in str(exc_info.value)
 
     async def test_transport_failure_raises_transport_error(
         self, monkeypatch: pytest.MonkeyPatch

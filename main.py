@@ -869,7 +869,7 @@ async def submit_proposal(request: Request) -> Response:
     ``{"kind": str, "action": {..., "target_id": str, "action_type": str},
     "rationale": str, "confidence": "low"|"medium"|"high",
     "importance": "low"|"medium"|"high", "impact": "low"|"medium"|"high",
-    "target_fingerprint": str}``.
+    "target_fingerprint": str (optional, deprecated -- see below)}``.
 
     Auth: agent-jwt bearer token carrying ``comms:proposals:write`` (see
     ``_authenticate_proposal_submitter``) -- NOT the interactive-only gate
@@ -887,11 +887,14 @@ async def submit_proposal(request: Request) -> Response:
     Immediately judged by the TECH-5877 kind-scoped deterministic rules
     engine -- ``priority`` is always server-derived, never caller-supplied.
 
-    ``target_fingerprint`` in the body is DEPRECATED and ignored (bug
-    fix): the value actually stored is computed server-side, by
-    re-fetching the target's current fingerprint at submission time --
-    see ``service.create_proposal``'s own docstring. Kept as an accepted
-    body field only for backward compatibility with existing callers.
+    ``target_fingerprint`` in the body is DEPRECATED, OPTIONAL, and
+    ignored (bug fix): the value actually stored is computed
+    server-side, by re-fetching the target's current fingerprint at
+    submission time -- see ``service.create_proposal``'s own docstring.
+    A caller may omit it entirely, or send ``None``/an empty string, with
+    no error; a caller that still sends a non-empty value (for backward
+    compatibility with existing callers) gets no special treatment
+    either -- it's accepted and silently ignored either way.
     """
     bot_sub, bot_token, status = await _authenticate_proposal_submitter(request)
     if bot_sub is None or bot_token is None:
@@ -931,7 +934,7 @@ async def submit_proposal(request: Request) -> Response:
     try:
         rationale = service.validate_proposal_string_field("rationale", body.get("rationale"))
         target_fingerprint = service.validate_proposal_string_field(
-            "target_fingerprint", body.get("target_fingerprint")
+            "target_fingerprint", body.get("target_fingerprint"), required=False
         )
         for action_field in ("target_id", "action_type"):
             if action_field in action:

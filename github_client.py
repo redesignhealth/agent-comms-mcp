@@ -1,11 +1,12 @@
 """Thin GitHub REST API client (no SDK) -- mirrors ``linear_client.py``'s
-architecture for future auto-approve judge lanes that need to look at a
-pull request or branch (e.g. "is this PR still open", "does this branch
-still exist").
+architecture for the auto-approve judge lanes that need to look at a pull
+request or branch (e.g. "is this PR still open", "does this branch still
+exist").
 
-Standalone as of this writing: nothing in ``service.py``/the judge calls
-into this module yet. That wiring is follow-up work; this PR only adds
-the client.
+Wired into ``service.py``'s ``(kind, action_type)``-keyed rule registry:
+``_rule_start_ticket``, ``_rule_review_ticket``, and ``_rule_assign_ticket``
+each call ``fetch_pull_request``/``parse_pull_request_url`` here to verify
+a cited PR before auto-approving.
 
 Credential: ``GITHUB_TOKEN`` env var, read directly (same
 "application code reads an env var" convention this repo already uses
@@ -39,6 +40,31 @@ _GITHUB_REQUEST_TIMEOUT_SECONDS = 10.0
 # GitHub's REST API version header (pinned so a future GitHub-side default
 # bump doesn't silently change response shapes under us).
 _GITHUB_API_VERSION = "2022-11-28"
+
+# Argus review: log-injection hygiene. A raw GitHub response body can be
+# arbitrarily large (and, being attacker-influenced content, arbitrarily
+# crafted) -- truncated before ever being embedded in an exception message.
+_MAX_LOGGED_RESPONSE_TEXT_LENGTH = 200
+
+
+def _truncated_response_text(response: httpx.Response) -> str:
+    """``response.text``, truncated to ``_MAX_LOGGED_RESPONSE_TEXT_LENGTH``
+    characters -- safe to embed in an exception message regardless of how
+    large the real response body is."""
+    text = response.text
+    if len(text) > _MAX_LOGGED_RESPONSE_TEXT_LENGTH:
+        return text[:_MAX_LOGGED_RESPONSE_TEXT_LENGTH] + "...(truncated)"
+    return text
+
+
+def _sanitize_for_log(value: str) -> str:
+    """Strip non-printable characters (control characters, including an
+    embedded newline) from a URL-derived value (``owner``/``repo``/
+    ``branch``) before it is interpolated into any string that reaches a
+    log line or exception message -- a crafted URL containing an encoded
+    newline (``%0A``) in a path segment could otherwise inject
+    fake-looking log lines once that segment is decoded."""
+    return "".join(char for char in value if char.isprintable())
 
 
 class GitHubAPIError(Exception):
@@ -113,11 +139,12 @@ async def fetch_pull_request(owner: str, repo: str, number: int) -> dict[str, An
     on network failure, and ``GitHubTokenMissingError`` if ``GITHUB_TOKEN``
     isn't set. Never swallows errors -- callers need to see failures to
     fail closed."""
-    context = f"fetching PR {owner}/{repo}#{number}"
+    context = f"fetching PR {_sanitize_for_log(owner)}/{_sanitize_for_log(repo)}#{number}"
     response = await _get(f"/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/pulls/{number}")
     if not response.is_success:
         raise GitHubAPIError(
-            f"GitHub API returned {response.status_code} {context}: {response.text}"
+            f"GitHub API returned {response.status_code} {context}: "
+            f"{_truncated_response_text(response)}"
         )
     return _parse_json_body(response, context=context)
 
@@ -129,7 +156,10 @@ async def fetch_branch(owner: str, repo: str, branch: str) -> dict[str, Any] | N
     ``None`` specifically on a 404 -- a missing branch is a normal
     "absent" case, not an error. Any other non-2xx status, or a
     transport failure, still raises (same as ``fetch_pull_request``)."""
-    context = f"fetching branch {owner}/{repo}@{branch}"
+    context = (
+        f"fetching branch {_sanitize_for_log(owner)}/{_sanitize_for_log(repo)}"
+        f"@{_sanitize_for_log(branch)}"
+    )
     response = await _get(
         f"/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/branches/{quote(branch, safe='')}"
     )
@@ -137,7 +167,8 @@ async def fetch_branch(owner: str, repo: str, branch: str) -> dict[str, Any] | N
         return None
     if not response.is_success:
         raise GitHubAPIError(
-            f"GitHub API returned {response.status_code} {context}: {response.text}"
+            f"GitHub API returned {response.status_code} {context}: "
+            f"{_truncated_response_text(response)}"
         )
     return _parse_json_body(response, context=context)
 

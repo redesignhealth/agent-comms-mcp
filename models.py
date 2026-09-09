@@ -782,6 +782,14 @@ class ProposalHold(Base):
             "status = 'applied' OR applied_at IS NULL",
             name="ck_proposal_holds_applied_at_consistency",
         ),
+        # Same shape as ck_proposal_holds_applied_at_consistency above,
+        # for apply_result -- it is only ever written by
+        # service._apply_or_finalize_proposal_hold inside the same branch
+        # that sets status="applied" (migration cf72736e07f5).
+        CheckConstraint(
+            "apply_result IS NULL OR status = 'applied'",
+            name="ck_proposal_holds_apply_result_consistency",
+        ),
         # Backs a pending-queue listing (a future PR's endpoint/tool), same
         # shape as approval_holds' sender-scoped index -- ordered by
         # created_at within a status.

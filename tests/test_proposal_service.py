@@ -599,7 +599,14 @@ class TestJudgeIntegration:
         timeout) must never be mistaken for an "approved" verdict and must
         never crash ``create_proposal`` outright -- it resolves to
         "pending" instead, exactly like a rule that legitimately declined
-        to approve, and never reaches the Linear applier."""
+        to approve, and never reaches the Linear applier.
+
+        Bug fix: the judge-error decision_note (``"judge error:
+        RuntimeError"``) must be PERSISTED onto the row, not just logged --
+        otherwise this failure mode is indistinguishable from a
+        legitimately-held proposal via ``proposals_get``/the API-facing
+        dict, e.g. whenever GITHUB_TOKEN is unset for the three
+        GitHub-backed lanes."""
         raising_rule = AsyncMock(side_effect=RuntimeError("boom"))
         with (
             patch.dict(
@@ -619,12 +626,14 @@ class TestJudgeIntegration:
             )
         assert result["status"] == "pending"
         assert "decision_source" not in result
+        assert result["decision_note"] == "judge error: RuntimeError"
         raising_rule.assert_awaited_once()
         mock_apply.assert_not_awaited()
 
         rows = (await session.execute(select(ProposalHold))).scalars().all()
         assert len(rows) == 1
         assert rows[0].status == "pending"
+        assert rows[0].decision_note == "judge error: RuntimeError"
 
     async def test_unregistered_kind_raises(self, session: AsyncSession) -> None:
         """Argus review S7: an unrecognized ``kind`` now fails fast in
@@ -1003,10 +1012,12 @@ class TestFourNewLanesIntegration:
                 "service.linear_client.fetch_current_fingerprint",
                 AsyncMock(return_value="fp-stable"),
             ),
-            patch.dict(identity_map.GITHUB_LOGIN_TO_LINEAR_USER_ID, {"octocat": "user-uuid-1"}),
+            patch.object(
+                identity_map, "GITHUB_LOGIN_TO_LINEAR_USER_ID", {"octocat": "user-uuid-1"}
+            ),
             patch(
                 "service.github_client.fetch_pull_request",
-                AsyncMock(return_value={"user": {"login": "octocat"}}),
+                AsyncMock(return_value={"user": {"login": "octocat"}, "title": "Fix TECH-1234"}),
             ),
             patch(
                 "service.linear_client.apply_assign_ticket", AsyncMock(return_value=None)
@@ -1033,7 +1044,9 @@ class TestFourNewLanesIntegration:
         login must never auto-approve, even though the proposed
         ``assignee_id`` happens to match a DIFFERENT, mapped user."""
         with (
-            patch.dict(identity_map.GITHUB_LOGIN_TO_LINEAR_USER_ID, {"octocat": "user-uuid-1"}),
+            patch.object(
+                identity_map, "GITHUB_LOGIN_TO_LINEAR_USER_ID", {"octocat": "user-uuid-1"}
+            ),
             patch(
                 "service.github_client.fetch_pull_request",
                 AsyncMock(return_value={"user": {"login": "someone-else"}}),
@@ -1509,6 +1522,14 @@ class TestDecideProposal:
             )
         assert decided["status"] == "stale"
         mock_apply.assert_not_awaited()
+        # Sibling assertion to
+        # test_auto_apply_target_drift_sets_honest_stale_decision_note
+        # above, for the human-decide path: the same honest-stale note
+        # applies here too -- no Linear write happened, and this path
+        # passed no original decision_note to wrap for context.
+        assert decided["decision_note"] == (
+            "not applied: target changed after approval; no Linear write was performed"
+        )
 
     async def test_approve_linear_failure_sets_apply_failed(self, session: AsyncSession) -> None:
         with patch(

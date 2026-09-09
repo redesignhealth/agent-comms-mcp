@@ -5,10 +5,11 @@ Deliberately separate from ``state_machine.py``: that module is
 conversation-negotiation state (DESIGN.md §6/§4, the comms board's own
 ``active``/``completed``/``canceled``/``expired`` lifecycle) and has
 nothing to do with a Linear issue's workflow state. This module's
-``is_forward_transition`` is the one universal safety rule every future
-Linear auto-approve lane (``start_ticket``, ``review_ticket``, etc.) will
-depend on: no ``service.py``/judge call sites exist yet -- that wiring is
-follow-up work (this PR only adds the rule).
+``is_forward_transition`` is the one universal safety rule every Linear
+auto-approve lane depends on: ``service.py``'s ``_rule_start_ticket`` and
+``_rule_review_ticket`` both call it to confirm the ticket's current
+workflow state is strictly behind the lane's target state before
+auto-approving.
 
 Side-effect-free and dependency-free (no I/O, no imports beyond the
 standard library) so it is trivially unit-testable on its own.

@@ -556,6 +556,52 @@ class TestSubmitProposal:
         # top-level "priority": "low" in the request body.
         assert resp.json()["priority"] == "high"
 
+    async def test_target_fingerprint_in_body_is_ignored(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        """Bug fix: ``target_fingerprint`` in the request body is
+        DEPRECATED and ignored -- the value actually stored (and later
+        compared against at decide time) is always computed server-side.
+        Mirrors ``test_priority_in_body_is_ignored`` above for this
+        field: submit with a body value that could never match the
+        mocked server-computed fingerprint, then decide with that SAME
+        server-computed value re-fetched -- reaching ``"applied"`` (not
+        ``"stale"``) proves the server-computed value, not the body
+        value, was stored and matched."""
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+        body = {
+            **_PROPOSAL_BODY,
+            "action": {**_PROPOSAL_BODY["action"], "target_id": "TECH-FINGERPRINT-IGNORED"},
+            "target_fingerprint": "body-value",
+        }
+        with patch(
+            "service.linear_client.fetch_current_fingerprint",
+            AsyncMock(return_value="server-value"),
+        ):
+            resp = await http_client.post(
+                "/proposals", json=body, headers={"Authorization": "Bearer bot-token"}
+            )
+        assert resp.status_code == 200
+        proposal_id = resp.json()["proposal_id"]
+
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(return_value="server-value"),
+            ),
+            patch("service.linear_client.apply_progress_update", AsyncMock(return_value=None)),
+        ):
+            decide_resp = await http_client.post(
+                f"/proposals/{proposal_id}/decide",
+                headers={"Authorization": "Bearer human-token"},
+                json={"decision": "approve"},
+            )
+        assert decide_resp.json()["status"] == "applied"
+
     async def test_rate_limit_exceeded_returns_429(
         self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
     ) -> None:
@@ -1314,8 +1360,19 @@ class TestDecideProposalEndpoint:
     async def test_approve_stale_fingerprint_returns_stale_without_calling_linear_apply(
         self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
     ) -> None:
+        """Explicit submit-time fingerprint patch, matching
+        ``test_approve_matching_fingerprint_applies``/
+        ``test_approve_linear_failure_returns_apply_failed`` above --
+        self-contained rather than implicitly relying on the autouse
+        ``_default_fetch_current_fingerprint`` fixture's default value."""
         http_client, provider = client
-        proposal_id = await _submit_via_http(http_client, provider, owner_sub="owner-a@example.com")
+        with patch(
+            "service.linear_client.fetch_current_fingerprint",
+            AsyncMock(return_value="fp1"),
+        ):
+            proposal_id = await _submit_via_http(
+                http_client, provider, owner_sub="owner-a@example.com"
+            )
         provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
 
         with (

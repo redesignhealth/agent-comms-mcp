@@ -311,7 +311,8 @@ async def resolve_team_id(team_key: str) -> str:
 
     Raises ``LinearNotFoundError`` if no team matches ``team_key``."""
     data = await _post_graphql(_TEAM_BY_KEY_QUERY, {"key": team_key})
-    nodes = data.get("teams", {}).get("nodes", [])
+    teams = data.get("teams")
+    nodes = teams.get("nodes", []) if isinstance(teams, dict) else []
     if not nodes:
         raise LinearNotFoundError(f"Linear API returned no team for key={team_key!r}")
     team_id = nodes[0].get("id")
@@ -359,7 +360,8 @@ async def resolve_label_id(team_id: str, name: str) -> str:
     Raises ``LinearNotFoundError`` if no label on this team matches
     ``name``."""
     data = await _post_graphql(_LABEL_QUERY, {"teamId": team_id, "name": name})
-    nodes = data.get("issueLabels", {}).get("nodes", [])
+    issue_labels = data.get("issueLabels")
+    nodes = issue_labels.get("nodes", []) if isinstance(issue_labels, dict) else []
     if not nodes:
         raise LinearNotFoundError(
             f"Linear API returned no label named {name!r} for team_id={team_id!r}"
@@ -615,7 +617,8 @@ async def update_issue_state(issue_id: str, state_id: str) -> None:
     result = await _post_graphql(
         _ISSUE_UPDATE_MUTATION, {"id": issue_id, "input": {"stateId": state_id}}
     )
-    if not result.get("issueUpdate", {}).get("success"):
+    issue_update = result.get("issueUpdate")
+    if not isinstance(issue_update, dict) or not issue_update.get("success"):
         raise LinearAPIError("issueUpdate returned success=false")
 
 
@@ -635,7 +638,8 @@ async def update_issue_assignee(issue_id: str, assignee_id: str) -> None:
     result = await _post_graphql(
         _ISSUE_UPDATE_MUTATION, {"id": issue_id, "input": {"assigneeId": assignee_id}}
     )
-    if not result.get("issueUpdate", {}).get("success"):
+    issue_update = result.get("issueUpdate")
+    if not isinstance(issue_update, dict) or not issue_update.get("success"):
         raise LinearAPIError("issueUpdate returned success=false")
 
 
@@ -648,7 +652,8 @@ async def add_issue_label(issue_id: str, label_id: str) -> None:
 
     Raises ``LinearAPIError`` if the mutation reports ``success=false``."""
     result = await _post_graphql(_ISSUE_ADD_LABEL_MUTATION, {"id": issue_id, "labelId": label_id})
-    if not result.get("issueAddLabel", {}).get("success"):
+    issue_add_label = result.get("issueAddLabel")
+    if not isinstance(issue_add_label, dict) or not issue_add_label.get("success"):
         raise LinearAPIError("issueAddLabel returned success=false")
 
 

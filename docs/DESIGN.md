@@ -1489,16 +1489,32 @@ without it, a human decide call racing the auto-rule for the same
 just-inserted hold could reach the applier a second time before either
 terminal write landed.
 
-**Latency (Argus review round-4 suggestion):** `POST /proposals` was DB-only
-latency before TECH-5873 landed the auto-apply behavior above. On the
-auto-approved path it can now make up to two sequential Linear HTTP calls
-(fingerprint fetch, then the write) inline before responding, each bounded by
-`linear_client._LINEAR_REQUEST_TIMEOUT_SECONDS` -- worst case, tens of
-seconds, not the sub-second DB-only latency this endpoint had before. A
-client or load balancer with a short timeout tuned to the old behavior can
-time out mid-apply; the apply itself still completes server-side and the hold
-still resolves to a terminal status, but the caller's HTTP request may not
-see the response.
+**Latency (Argus review round-4 suggestion, updated for the TECH-5877
+artifact-backed lanes):** `POST /proposals` was DB-only latency before
+TECH-5873 landed the auto-apply behavior above. For the `open_ticket`/
+`close_ticket` citation-backed lanes it can make up to two sequential Linear
+HTTP calls (fingerprint fetch, then the write) inline before responding. The
+`start_ticket`/`review_ticket` auto-approve path is worse: it can now make up
+to SEVEN sequential round-trips across two providers before responding --
+(1) the submission-time fingerprint fetch (`create_proposal`), (2) the
+GitHub PR fetch inside the rule, (3) the Linear `fetch_issue` call inside the
+rule (both to check the forward-transition condition), (4) the apply-time
+fingerprint re-fetch (staleness check), (5) `resolve_team_id`, (6)
+`resolve_workflow_state_id`, and (7) the `issueUpdate` state-change mutation
+itself. Each Linear call is bounded by
+`linear_client._LINEAR_REQUEST_TIMEOUT_SECONDS` and each GitHub call by
+`github_client._GITHUB_REQUEST_TIMEOUT_SECONDS` (both 10 seconds as of this
+writing) -- worst case, over a minute of sequential latency, not the
+sub-second DB-only latency this endpoint had before TECH-5873. `assign_ticket`
+is shorter -- only FOUR round-trips ((1) submission-time fingerprint fetch,
+(2) the GitHub PR fetch, (3) the apply-time fingerprint re-fetch, (4) the
+`assigneeId` `issueUpdate` mutation) -- since this rule has no workflow-state
+concept and, unlike `start_ticket`/`review_ticket`, never fetches the Linear
+issue in the rule itself, and its applier never needs `resolve_team_id`/
+`resolve_workflow_state_id`. A client or load balancer with a short timeout
+tuned to the pre-TECH-5873 behavior can time out mid-apply; the apply itself
+still completes server-side and the hold still resolves to a terminal
+status, but the caller's HTTP request may not see the response.
 
 **`POST /proposals/{id}/decide`** (TECH-5873, `service.decide_proposal`) is
 the human decide-and-synchronously-apply endpoint for a still-`"pending"`
@@ -1525,6 +1541,17 @@ instead of mutating workflow state.
 `proposal_holds.apply_result`, so the bot learns the new `TECH-####`
 identifier from the proposal response rather than from a comment body.
 
+**Human approval bypasses all rule-level checks, by design.** `"approve"`
+here dispatches straight to the applier and never re-runs the
+kind/action_type-scoped rule (`_PROPOSAL_RULES`) that gates auto-approval --
+e.g. a human-approved `assign_ticket` applies whatever `assignee_id` the bot
+proposed with NO identity-map re-verification, and a human-approved
+`start_ticket`/`review_ticket` applies with no forward-transition check.
+Only the fingerprint/staleness check still runs on this path. This is
+intentional -- a human approving IS the final authority this whole
+human-in-the-loop escape hatch exists for -- not an oversight or a gap to
+close later.
+
 **Fingerprint scheme is a cross-repo contract**
 (`linear_client.compute_target_fingerprint`): a sha256 hex digest over a
 fixed, sorted set of Linear issue fields (state id/name, priority, assignee
@@ -1543,6 +1570,17 @@ copy that can silently drift from the one true source it claims to defer
 to). See `test_pinned_digest_for_fixed_input` in
 `tests/test_linear_client.py` for the exact digest this scheme produces for
 a fixed input.
+
+**One-time transitional cost of the fingerprint fix:** because the
+fingerprint computation changed (server-computed now, `updated_at` dropped
+from the hash -- see the bug-fix note above), every `status='pending'` row
+that existed BEFORE this fix deploys will deterministically resolve to
+`"stale"` the first time it's decided post-deploy -- a human clicking
+Approve on an old hold gets a 200 with no Linear write. This is an accepted,
+one-time cost, not a bug needing a data migration: the proposing bot simply
+resubmits (dedup lands it back on the same row, now with a fresh,
+correctly-computed fingerprint), and the new logic handles that fresh row
+correctly from then on.
 
 ### Configuration: pluggable seams
 

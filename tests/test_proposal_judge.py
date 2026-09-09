@@ -1,6 +1,6 @@
 """Unit tests for the TECH-5877 deterministic proposal judge.
 
-``service.evaluate_linear_progress_update_judge`` is a thin sync wrapper
+``service.evaluate_linear_progress_update_judge`` is a thin async wrapper
 (proposal ``action`` dict -> ``(status, decision_note)``) over the
 ``(kind, action_type)``-scoped async rule registry (``_PROPOSAL_RULES``/
 ``_PROPOSAL_KIND_DEFAULT_RULE``), independent of the HTTP layer and the DB
@@ -34,7 +34,6 @@ from service import (
     _PROPOSAL_RULES,
     _derive_proposal_priority,
     _rule_always_pending,
-    _run_proposal_rule_sync,
     evaluate_linear_progress_update_judge,
 )
 
@@ -83,31 +82,46 @@ _REPRESENTATIVE_ACTIONS: dict[str, list[tuple[dict[str, object], str]]] = {
 
 
 class TestOpenTicket:
-    def test_open_ticket_with_citation_target_id_is_approved(self) -> None:
+    async def test_open_ticket_with_citation_target_id_is_approved(self) -> None:
         """``target_id`` IS the citation for ``open_ticket`` -- see
         ``service._rule_open_ticket``'s docstring for the dedup/citation
         unification this replaces (a previously-separate
         ``source_message_url`` field is no longer read at all)."""
-        status, note = evaluate_linear_progress_update_judge(
+        status, note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "open_ticket",
-                "target_id": "https://redesignhealth.slack.com/archives/C1/p123",
+                "target_id": "https://github.com/org/repo/pull/1",
             }
         )
         assert status == "approved"
         assert note is not None
 
-    def test_open_ticket_without_citation_stays_pending(self) -> None:
-        status, note = evaluate_linear_progress_update_judge(
+    async def test_open_ticket_with_slack_only_citation_stays_pending(self) -> None:
+        """Argus review: ``open_ticket``'s whole intent is to document a
+        SHIPPED PR -- a Slack permalink, though a valid citation URL under
+        the GENERAL allowlist (``_is_valid_citation_url``, which also
+        accepts Slack for other action types), proves no such artifact
+        and must not auto-approve creating a brand-new Linear issue."""
+        status, note = await evaluate_linear_progress_update_judge(
+            {
+                "action_type": "open_ticket",
+                "target_id": "https://redesignhealth.slack.com/archives/C1/p123",
+            }
+        )
+        assert status == "pending"
+        assert note is None
+
+    async def test_open_ticket_without_citation_stays_pending(self) -> None:
+        status, note = await evaluate_linear_progress_update_judge(
             {"action_type": "open_ticket", "target_id": "TECH-1234"}
         )
         assert status == "pending"
         assert note is None
 
-    def test_open_ticket_with_only_confidence_is_not_sufficient(self) -> None:
+    async def test_open_ticket_with_only_confidence_is_not_sufficient(self) -> None:
         """A bare confidence score is explicitly NOT a valid substitute for
         a citable field (TECH-5877 spec)."""
-        status, _note = evaluate_linear_progress_update_judge(
+        status, _note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "open_ticket",
                 "target_id": "TECH-1234",
@@ -117,21 +131,21 @@ class TestOpenTicket:
         )
         assert status == "pending"
 
-    def test_open_ticket_with_empty_string_target_id_stays_pending(self) -> None:
+    async def test_open_ticket_with_empty_string_target_id_stays_pending(self) -> None:
         """``_extract_proposal_target`` rejects an empty-string
         ``target_id`` before the judge ever runs, but the judge must fail
         closed on one too (e.g. reached via a manual human approval path
         rather than ``create_proposal``)."""
-        status, _note = evaluate_linear_progress_update_judge(
+        status, _note = await evaluate_linear_progress_update_judge(
             {"action_type": "open_ticket", "target_id": ""}
         )
         assert status == "pending"
 
-    def test_open_ticket_with_resolving_pr_url_field_alone_stays_pending(self) -> None:
+    async def test_open_ticket_with_resolving_pr_url_field_alone_stays_pending(self) -> None:
         """``resolving_pr_url`` is a CLOSE-ticket citation field, not read
         by ``open_ticket`` at all -- a non-citation ``target_id`` must not
         be rescued by a valid citation sitting in a different field."""
-        status, _note = evaluate_linear_progress_update_judge(
+        status, _note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "open_ticket",
                 "target_id": "TECH-1234",
@@ -140,20 +154,20 @@ class TestOpenTicket:
         )
         assert status == "pending"
 
-    def test_open_ticket_with_whitespace_only_target_id_stays_pending(self) -> None:
+    async def test_open_ticket_with_whitespace_only_target_id_stays_pending(self) -> None:
         """Argus review B4: a whitespace-shaped string must not be
         treated as a real citation -- presence of ANY non-empty string
         was the exact hole B4 closes."""
-        status, _note = evaluate_linear_progress_update_judge(
+        status, _note = await evaluate_linear_progress_update_judge(
             {"action_type": "open_ticket", "target_id": "   "}
         )
         assert status == "pending"
 
-    def test_open_ticket_with_non_http_scheme_target_id_stays_pending(self) -> None:
+    async def test_open_ticket_with_non_http_scheme_target_id_stays_pending(self) -> None:
         """Argus review B4: a non-http(s) scheme (e.g. a bot writing its
         own internal ``bot://`` pointer) must not satisfy the citation
         check even though it is a well-formed, non-empty URL string."""
-        status, _note = evaluate_linear_progress_update_judge(
+        status, _note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "open_ticket",
                 "target_id": "ftp://redesignhealth.slack.com/archives/C1/p123",
@@ -161,12 +175,12 @@ class TestOpenTicket:
         )
         assert status == "pending"
 
-    def test_open_ticket_with_non_allowlisted_host_target_id_stays_pending(self) -> None:
+    async def test_open_ticket_with_non_allowlisted_host_target_id_stays_pending(self) -> None:
         """Argus review B4: an http(s) URL on a host OUTSIDE the
         slack.com/github.com allowlist (e.g. a bot's own fully-controlled
         domain) must not satisfy the citation check -- this is the exact
         self-approval hole presence-only checking left open."""
-        status, _note = evaluate_linear_progress_update_judge(
+        status, _note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "open_ticket",
                 "target_id": "https://not-slack-or-github.example/p123",
@@ -174,7 +188,7 @@ class TestOpenTicket:
         )
         assert status == "pending"
 
-    def test_open_ticket_bogus_non_url_target_id_never_approves_even_with_real_citation_elsewhere(
+    async def test_open_ticket_bogus_non_url_target_id_never_approves_even_with_real_citation_elsewhere(  # noqa: E501
         self,
     ) -> None:
         """The exact exploit this fix closes: a bot can no longer stash a
@@ -183,7 +197,7 @@ class TestOpenTicket:
         non-citation ``target_id`` for dedup purposes. Since the judge now
         reads ONLY ``target_id``, a bogus ``target_id`` never approves
         regardless of what else is in the action payload."""
-        status, note = evaluate_linear_progress_update_judge(
+        status, note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "open_ticket",
                 "target_id": "not-a-url-at-all",
@@ -195,8 +209,8 @@ class TestOpenTicket:
 
 
 class TestCloseTicket:
-    def test_close_ticket_with_source_message_url_is_approved(self) -> None:
-        status, note = evaluate_linear_progress_update_judge(
+    async def test_close_ticket_with_source_message_url_is_approved(self) -> None:
+        status, note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "close_ticket",
                 "target_id": "TECH-1234",
@@ -206,8 +220,8 @@ class TestCloseTicket:
         assert status == "approved"
         assert note is not None
 
-    def test_close_ticket_with_resolving_pr_url_is_approved(self) -> None:
-        status, note = evaluate_linear_progress_update_judge(
+    async def test_close_ticket_with_resolving_pr_url_is_approved(self) -> None:
+        status, note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "close_ticket",
                 "target_id": "TECH-1234",
@@ -217,8 +231,8 @@ class TestCloseTicket:
         assert status == "approved"
         assert note is not None
 
-    def test_close_ticket_without_either_citation_stays_pending(self) -> None:
-        status, note = evaluate_linear_progress_update_judge(
+    async def test_close_ticket_without_either_citation_stays_pending(self) -> None:
+        status, note = await evaluate_linear_progress_update_judge(
             {"action_type": "close_ticket", "target_id": "TECH-1234"}
         )
         assert status == "pending"
@@ -241,12 +255,14 @@ class TestStartTicket:
     to), same idiom as ``tests/test_linear_client.py``'s
     ``TestApplyOpenTicket``."""
 
-    def test_open_pr_and_backward_state_is_approved(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_open_pr_and_backward_state_is_approved(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         monkeypatch.setattr(github_client, "fetch_pull_request", AsyncMock(return_value=_OPEN_PR))
         monkeypatch.setattr(
             linear_client, "fetch_issue", AsyncMock(return_value={"state": _BACKLOG_STATE})
         )
-        status, note = evaluate_linear_progress_update_judge(
+        status, note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "start_ticket",
                 "target_id": "TECH-1234",
@@ -256,21 +272,21 @@ class TestStartTicket:
         assert status == "approved"
         assert note is not None
 
-    def test_without_citation_stays_pending(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_without_citation_stays_pending(self, monkeypatch: pytest.MonkeyPatch) -> None:
         mock_fetch_pr = AsyncMock(return_value=_OPEN_PR)
         monkeypatch.setattr(github_client, "fetch_pull_request", mock_fetch_pr)
-        status, _note = evaluate_linear_progress_update_judge(
+        status, _note = await evaluate_linear_progress_update_judge(
             {"action_type": "start_ticket", "target_id": "TECH-1234"}
         )
         assert status == "pending"
         mock_fetch_pr.assert_not_awaited()
 
-    def test_non_allowlisted_host_citation_stays_pending(
+    async def test_non_allowlisted_host_citation_stays_pending(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         mock_fetch_pr = AsyncMock(return_value=_OPEN_PR)
         monkeypatch.setattr(github_client, "fetch_pull_request", mock_fetch_pr)
-        status, _note = evaluate_linear_progress_update_judge(
+        status, _note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "start_ticket",
                 "target_id": "TECH-1234",
@@ -280,14 +296,16 @@ class TestStartTicket:
         assert status == "pending"
         mock_fetch_pr.assert_not_awaited()
 
-    def test_non_pr_shaped_github_url_stays_pending(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_non_pr_shaped_github_url_stays_pending(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """A valid, allowlisted ``github.com`` URL that isn't shaped like a
         PR URL (e.g. a branch URL) must not reach ``fetch_pull_request`` at
         all -- ``parse_pull_request_url`` returning ``None`` short-circuits
         first."""
         mock_fetch_pr = AsyncMock(return_value=_OPEN_PR)
         monkeypatch.setattr(github_client, "fetch_pull_request", mock_fetch_pr)
-        status, _note = evaluate_linear_progress_update_judge(
+        status, _note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "start_ticket",
                 "target_id": "TECH-1234",
@@ -297,11 +315,11 @@ class TestStartTicket:
         assert status == "pending"
         mock_fetch_pr.assert_not_awaited()
 
-    def test_closed_pr_stays_pending(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_closed_pr_stays_pending(self, monkeypatch: pytest.MonkeyPatch) -> None:
         mock_fetch_issue = AsyncMock(return_value={"state": _BACKLOG_STATE})
         monkeypatch.setattr(github_client, "fetch_pull_request", AsyncMock(return_value=_CLOSED_PR))
         monkeypatch.setattr(linear_client, "fetch_issue", mock_fetch_issue)
-        status, _note = evaluate_linear_progress_update_judge(
+        status, _note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "start_ticket",
                 "target_id": "TECH-1234",
@@ -311,13 +329,13 @@ class TestStartTicket:
         assert status == "pending"
         mock_fetch_issue.assert_not_awaited()
 
-    def test_missing_target_id_stays_pending_without_fetching_issue(
+    async def test_missing_target_id_stays_pending_without_fetching_issue(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         mock_fetch_issue = AsyncMock(return_value={"state": _BACKLOG_STATE})
         monkeypatch.setattr(github_client, "fetch_pull_request", AsyncMock(return_value=_OPEN_PR))
         monkeypatch.setattr(linear_client, "fetch_issue", mock_fetch_issue)
-        status, _note = evaluate_linear_progress_update_judge(
+        status, _note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "start_ticket",
                 "starting_pr_url": "https://github.com/org/repo/pull/1",
@@ -326,13 +344,15 @@ class TestStartTicket:
         assert status == "pending"
         mock_fetch_issue.assert_not_awaited()
 
-    def test_already_in_progress_state_stays_pending(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_already_in_progress_state_stays_pending(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Equal-rank (no-op) transition -- universal forward-only rule."""
         monkeypatch.setattr(github_client, "fetch_pull_request", AsyncMock(return_value=_OPEN_PR))
         monkeypatch.setattr(
             linear_client, "fetch_issue", AsyncMock(return_value={"state": _IN_PROGRESS_STATE})
         )
-        status, _note = evaluate_linear_progress_update_judge(
+        status, _note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "start_ticket",
                 "target_id": "TECH-1234",
@@ -341,14 +361,16 @@ class TestStartTicket:
         )
         assert status == "pending"
 
-    def test_state_past_in_progress_stays_pending(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_state_past_in_progress_stays_pending(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Backward transition (already Done) -- must never auto-approve
         moving a ticket "back" to In Progress."""
         monkeypatch.setattr(github_client, "fetch_pull_request", AsyncMock(return_value=_OPEN_PR))
         monkeypatch.setattr(
             linear_client, "fetch_issue", AsyncMock(return_value={"state": _DONE_STATE})
         )
-        status, _note = evaluate_linear_progress_update_judge(
+        status, _note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "start_ticket",
                 "target_id": "TECH-1234",
@@ -357,7 +379,7 @@ class TestStartTicket:
         )
         assert status == "pending"
 
-    def test_github_api_error_propagates(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_github_api_error_propagates(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The rule itself must not swallow a GitHub API failure -- it
         propagates uncaught here (this file exercises the rule directly);
         ``create_proposal``'s own fail-closed wrapper (covered generically
@@ -370,7 +392,7 @@ class TestStartTicket:
             AsyncMock(side_effect=GitHubAPIError("boom")),
         )
         with pytest.raises(GitHubAPIError):
-            evaluate_linear_progress_update_judge(
+            await evaluate_linear_progress_update_judge(
                 {
                     "action_type": "start_ticket",
                     "target_id": "TECH-1234",
@@ -378,13 +400,13 @@ class TestStartTicket:
                 }
             )
 
-    def test_linear_api_error_propagates(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_linear_api_error_propagates(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(github_client, "fetch_pull_request", AsyncMock(return_value=_OPEN_PR))
         monkeypatch.setattr(
             linear_client, "fetch_issue", AsyncMock(side_effect=LinearAPIError("boom"))
         )
         with pytest.raises(LinearAPIError):
-            evaluate_linear_progress_update_judge(
+            await evaluate_linear_progress_update_judge(
                 {
                     "action_type": "start_ticket",
                     "target_id": "TECH-1234",
@@ -398,7 +420,7 @@ class TestReviewTicket:
     same overall shape as ``TestStartTicket`` above, but additionally
     requires review-requested on the cited PR, and targets "In Review"."""
 
-    def test_open_pr_with_reviewers_requested_is_approved(
+    async def test_open_pr_with_reviewers_requested_is_approved(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(
@@ -415,7 +437,7 @@ class TestReviewTicket:
         monkeypatch.setattr(
             linear_client, "fetch_issue", AsyncMock(return_value={"state": _IN_PROGRESS_STATE})
         )
-        status, note = evaluate_linear_progress_update_judge(
+        status, note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "review_ticket",
                 "target_id": "TECH-1234",
@@ -425,7 +447,7 @@ class TestReviewTicket:
         assert status == "approved"
         assert note is not None
 
-    def test_open_pr_with_only_teams_requested_is_approved(
+    async def test_open_pr_with_only_teams_requested_is_approved(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """``requested_reviewers`` OR ``requested_teams`` -- either alone
@@ -444,7 +466,7 @@ class TestReviewTicket:
         monkeypatch.setattr(
             linear_client, "fetch_issue", AsyncMock(return_value={"state": _IN_PROGRESS_STATE})
         )
-        status, _note = evaluate_linear_progress_update_judge(
+        status, _note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "review_ticket",
                 "target_id": "TECH-1234",
@@ -453,7 +475,7 @@ class TestReviewTicket:
         )
         assert status == "approved"
 
-    def test_open_pr_with_no_review_requested_stays_pending(
+    async def test_open_pr_with_no_review_requested_stays_pending(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         mock_fetch_issue = AsyncMock(return_value={"state": _IN_PROGRESS_STATE})
@@ -465,7 +487,7 @@ class TestReviewTicket:
             ),
         )
         monkeypatch.setattr(linear_client, "fetch_issue", mock_fetch_issue)
-        status, _note = evaluate_linear_progress_update_judge(
+        status, _note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "review_ticket",
                 "target_id": "TECH-1234",
@@ -475,7 +497,7 @@ class TestReviewTicket:
         assert status == "pending"
         mock_fetch_issue.assert_not_awaited()
 
-    def test_closed_pr_stays_pending(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_closed_pr_stays_pending(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
             github_client,
             "fetch_pull_request",
@@ -487,7 +509,7 @@ class TestReviewTicket:
                 }
             ),
         )
-        status, _note = evaluate_linear_progress_update_judge(
+        status, _note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "review_ticket",
                 "target_id": "TECH-1234",
@@ -496,16 +518,18 @@ class TestReviewTicket:
         )
         assert status == "pending"
 
-    def test_without_citation_stays_pending(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_without_citation_stays_pending(self, monkeypatch: pytest.MonkeyPatch) -> None:
         mock_fetch_pr = AsyncMock()
         monkeypatch.setattr(github_client, "fetch_pull_request", mock_fetch_pr)
-        status, _note = evaluate_linear_progress_update_judge(
+        status, _note = await evaluate_linear_progress_update_judge(
             {"action_type": "review_ticket", "target_id": "TECH-1234"}
         )
         assert status == "pending"
         mock_fetch_pr.assert_not_awaited()
 
-    def test_already_in_review_state_stays_pending(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_already_in_review_state_stays_pending(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Equal-rank (no-op) transition."""
         monkeypatch.setattr(
             github_client,
@@ -523,7 +547,7 @@ class TestReviewTicket:
             "fetch_issue",
             AsyncMock(return_value={"state": {"id": "s3", "name": "In Review", "type": "started"}}),
         )
-        status, _note = evaluate_linear_progress_update_judge(
+        status, _note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "review_ticket",
                 "target_id": "TECH-1234",
@@ -532,7 +556,9 @@ class TestReviewTicket:
         )
         assert status == "pending"
 
-    def test_state_past_in_review_stays_pending(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_state_past_in_review_stays_pending(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Backward transition (already Done)."""
         monkeypatch.setattr(
             github_client,
@@ -548,7 +574,7 @@ class TestReviewTicket:
         monkeypatch.setattr(
             linear_client, "fetch_issue", AsyncMock(return_value={"state": _DONE_STATE})
         )
-        status, _note = evaluate_linear_progress_update_judge(
+        status, _note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "review_ticket",
                 "target_id": "TECH-1234",
@@ -557,14 +583,14 @@ class TestReviewTicket:
         )
         assert status == "pending"
 
-    def test_github_api_error_propagates(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_github_api_error_propagates(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
             github_client,
             "fetch_pull_request",
             AsyncMock(side_effect=GitHubAPIError("boom")),
         )
         with pytest.raises(GitHubAPIError):
-            evaluate_linear_progress_update_judge(
+            await evaluate_linear_progress_update_judge(
                 {
                     "action_type": "review_ticket",
                     "target_id": "TECH-1234",
@@ -577,9 +603,10 @@ class TestAssignTicket:
     """``(kind="linear_progress_update", action_type="assign_ticket")`` --
     no workflow-state concept: the PR's ACTUAL author (never a bot-asserted
     claim) must be present in ``identity_map.GITHUB_LOGIN_TO_LINEAR_USER_ID``
-    and map to the proposed ``assignee_id``."""
+    and map to the proposed ``assignee_id``, AND the cited PR must actually
+    reference ``target_id`` (the ticket being assigned)."""
 
-    def test_mapped_author_matching_assignee_is_approved(
+    async def test_mapped_author_matching_assignee_is_approved(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(
@@ -590,9 +617,9 @@ class TestAssignTicket:
         monkeypatch.setattr(
             github_client,
             "fetch_pull_request",
-            AsyncMock(return_value={"user": {"login": "octocat"}}),
+            AsyncMock(return_value={"user": {"login": "octocat"}, "title": "Fix TECH-1234"}),
         )
-        status, note = evaluate_linear_progress_update_judge(
+        status, note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "assign_ticket",
                 "target_id": "TECH-1234",
@@ -603,7 +630,7 @@ class TestAssignTicket:
         assert status == "approved"
         assert note is not None
 
-    def test_unmapped_login_stays_pending_even_if_assignee_id_coincidentally_matches(
+    async def test_unmapped_login_stays_pending_even_if_assignee_id_coincidentally_matches(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The exact self-approval hole this lane closes: the PR's real
@@ -621,7 +648,7 @@ class TestAssignTicket:
             "fetch_pull_request",
             AsyncMock(return_value={"user": {"login": "someone-else"}}),
         )
-        status, _note = evaluate_linear_progress_update_judge(
+        status, _note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "assign_ticket",
                 "target_id": "TECH-1234",
@@ -631,7 +658,7 @@ class TestAssignTicket:
         )
         assert status == "pending"
 
-    def test_mapped_login_with_mismatched_assignee_id_stays_pending(
+    async def test_mapped_login_with_mismatched_assignee_id_stays_pending(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(
@@ -644,7 +671,7 @@ class TestAssignTicket:
             "fetch_pull_request",
             AsyncMock(return_value={"user": {"login": "octocat"}}),
         )
-        status, _note = evaluate_linear_progress_update_judge(
+        status, _note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "assign_ticket",
                 "target_id": "TECH-1234",
@@ -654,7 +681,7 @@ class TestAssignTicket:
         )
         assert status == "pending"
 
-    def test_empty_identity_map_never_approves(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_empty_identity_map_never_approves(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Regression coverage for the placeholder/empty
         ``identity_map.GITHUB_LOGIN_TO_LINEAR_USER_ID`` this lane ships
         with today -- fails safe/inert by construction until populated."""
@@ -664,7 +691,7 @@ class TestAssignTicket:
             "fetch_pull_request",
             AsyncMock(return_value={"user": {"login": "octocat"}}),
         )
-        status, _note = evaluate_linear_progress_update_judge(
+        status, _note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "assign_ticket",
                 "target_id": "TECH-1234",
@@ -674,10 +701,10 @@ class TestAssignTicket:
         )
         assert status == "pending"
 
-    def test_without_citation_stays_pending(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_without_citation_stays_pending(self, monkeypatch: pytest.MonkeyPatch) -> None:
         mock_fetch_pr = AsyncMock()
         monkeypatch.setattr(github_client, "fetch_pull_request", mock_fetch_pr)
-        status, _note = evaluate_linear_progress_update_judge(
+        status, _note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "assign_ticket",
                 "target_id": "TECH-1234",
@@ -687,14 +714,16 @@ class TestAssignTicket:
         assert status == "pending"
         mock_fetch_pr.assert_not_awaited()
 
-    def test_missing_author_login_stays_pending(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_missing_author_login_stays_pending(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         monkeypatch.setattr(
             identity_map, "GITHUB_LOGIN_TO_LINEAR_USER_ID", {"octocat": "user-uuid-1"}
         )
         monkeypatch.setattr(
             github_client, "fetch_pull_request", AsyncMock(return_value={"user": None})
         )
-        status, _note = evaluate_linear_progress_update_judge(
+        status, _note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "assign_ticket",
                 "target_id": "TECH-1234",
@@ -704,7 +733,7 @@ class TestAssignTicket:
         )
         assert status == "pending"
 
-    def test_never_consults_workflow_order_or_fetches_issue(
+    async def test_never_consults_workflow_order_or_fetches_issue(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """No workflow-state concept applies to a reassignment -- this
@@ -716,10 +745,10 @@ class TestAssignTicket:
         monkeypatch.setattr(
             github_client,
             "fetch_pull_request",
-            AsyncMock(return_value={"user": {"login": "octocat"}}),
+            AsyncMock(return_value={"user": {"login": "octocat"}, "title": "Fix TECH-1234"}),
         )
         monkeypatch.setattr(linear_client, "fetch_issue", mock_fetch_issue)
-        status, _note = evaluate_linear_progress_update_judge(
+        status, _note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "assign_ticket",
                 "target_id": "TECH-1234",
@@ -730,14 +759,77 @@ class TestAssignTicket:
         assert status == "approved"
         mock_fetch_issue.assert_not_awaited()
 
-    def test_github_api_error_propagates(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_pr_not_referencing_target_ticket_stays_pending(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The scope gap this check closes: a correctly-mapped author is
+        NOT enough on its own -- the cited PR must also actually be ABOUT
+        ``target_id``, or any PR by that author could justify assigning
+        them to an unrelated ticket."""
+        monkeypatch.setattr(
+            identity_map, "GITHUB_LOGIN_TO_LINEAR_USER_ID", {"octocat": "user-uuid-1"}
+        )
+        monkeypatch.setattr(
+            github_client,
+            "fetch_pull_request",
+            AsyncMock(
+                return_value={
+                    "user": {"login": "octocat"},
+                    "title": "Fix something unrelated",
+                    "body": "no ticket reference here",
+                    "head": {"ref": "octocat/unrelated-fix"},
+                }
+            ),
+        )
+        status, _note = await evaluate_linear_progress_update_judge(
+            {
+                "action_type": "assign_ticket",
+                "target_id": "TECH-1234",
+                "assignee_pr_url": "https://github.com/org/repo/pull/1",
+                "assignee_id": "user-uuid-1",
+            }
+        )
+        assert status == "pending"
+
+    async def test_pr_referencing_target_ticket_in_head_ref_is_approved(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The reference check matches case-insensitively against
+        ``head.ref`` too, not just ``title``/``body`` -- a branch name
+        commonly lowercases the ticket id."""
+        monkeypatch.setattr(
+            identity_map, "GITHUB_LOGIN_TO_LINEAR_USER_ID", {"octocat": "user-uuid-1"}
+        )
+        monkeypatch.setattr(
+            github_client,
+            "fetch_pull_request",
+            AsyncMock(
+                return_value={
+                    "user": {"login": "octocat"},
+                    "title": "Fix something",
+                    "body": None,
+                    "head": {"ref": "octocat/tech-1234-fix"},
+                }
+            ),
+        )
+        status, _note = await evaluate_linear_progress_update_judge(
+            {
+                "action_type": "assign_ticket",
+                "target_id": "TECH-1234",
+                "assignee_pr_url": "https://github.com/org/repo/pull/1",
+                "assignee_id": "user-uuid-1",
+            }
+        )
+        assert status == "approved"
+
+    async def test_github_api_error_propagates(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
             github_client,
             "fetch_pull_request",
             AsyncMock(side_effect=GitHubAPIError("boom")),
         )
         with pytest.raises(GitHubAPIError):
-            evaluate_linear_progress_update_judge(
+            await evaluate_linear_progress_update_judge(
                 {
                     "action_type": "assign_ticket",
                     "target_id": "TECH-1234",
@@ -752,10 +844,10 @@ class TestLabelTicket:
     pure citation-URL-shape derivation, no GitHub API call, no
     workflow-state concept."""
 
-    def test_matching_label_is_approved(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_matching_label_is_approved(self, monkeypatch: pytest.MonkeyPatch) -> None:
         mock_fetch_pr = AsyncMock()
         monkeypatch.setattr(github_client, "fetch_pull_request", mock_fetch_pr)
-        status, note = evaluate_linear_progress_update_judge(
+        status, note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "label_ticket",
                 "target_id": "TECH-1234",
@@ -769,8 +861,8 @@ class TestLabelTicket:
         # cited URL's own path.
         mock_fetch_pr.assert_not_awaited()
 
-    def test_label_for_a_different_repo_stays_pending(self) -> None:
-        status, _note = evaluate_linear_progress_update_judge(
+    async def test_label_for_a_different_repo_stays_pending(self) -> None:
+        status, _note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "label_ticket",
                 "target_id": "TECH-1234",
@@ -780,8 +872,8 @@ class TestLabelTicket:
         )
         assert status == "pending"
 
-    def test_arbitrary_label_name_stays_pending(self) -> None:
-        status, _note = evaluate_linear_progress_update_judge(
+    async def test_arbitrary_label_name_stays_pending(self) -> None:
+        status, _note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "label_ticket",
                 "target_id": "TECH-1234",
@@ -791,8 +883,8 @@ class TestLabelTicket:
         )
         assert status == "pending"
 
-    def test_without_citation_stays_pending(self) -> None:
-        status, _note = evaluate_linear_progress_update_judge(
+    async def test_without_citation_stays_pending(self) -> None:
+        status, _note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "label_ticket",
                 "target_id": "TECH-1234",
@@ -801,8 +893,8 @@ class TestLabelTicket:
         )
         assert status == "pending"
 
-    def test_non_allowlisted_host_citation_stays_pending(self) -> None:
-        status, _note = evaluate_linear_progress_update_judge(
+    async def test_non_allowlisted_host_citation_stays_pending(self) -> None:
+        status, _note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "label_ticket",
                 "target_id": "TECH-1234",
@@ -812,8 +904,8 @@ class TestLabelTicket:
         )
         assert status == "pending"
 
-    def test_non_pr_shaped_github_url_stays_pending(self) -> None:
-        status, _note = evaluate_linear_progress_update_judge(
+    async def test_non_pr_shaped_github_url_stays_pending(self) -> None:
+        status, _note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "label_ticket",
                 "target_id": "TECH-1234",
@@ -825,8 +917,8 @@ class TestLabelTicket:
 
 
 class TestOtherActionTypes:
-    def test_status_change_short_of_closing_stays_pending_even_with_citation(self) -> None:
-        status, _note = evaluate_linear_progress_update_judge(
+    async def test_status_change_short_of_closing_stays_pending_even_with_citation(self) -> None:
+        status, _note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "update_status",
                 "target_id": "TECH-1234",
@@ -835,8 +927,8 @@ class TestOtherActionTypes:
         )
         assert status == "pending"
 
-    def test_project_reassignment_stays_pending_even_with_citation(self) -> None:
-        status, _note = evaluate_linear_progress_update_judge(
+    async def test_project_reassignment_stays_pending_even_with_citation(self) -> None:
+        status, _note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "reassign_project",
                 "target_id": "TECH-1234",
@@ -846,8 +938,8 @@ class TestOtherActionTypes:
         )
         assert status == "pending"
 
-    def test_priority_change_stays_pending_even_with_citation(self) -> None:
-        status, _note = evaluate_linear_progress_update_judge(
+    async def test_priority_change_stays_pending_even_with_citation(self) -> None:
+        status, _note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "change_priority",
                 "target_id": "TECH-1234",
@@ -856,8 +948,8 @@ class TestOtherActionTypes:
         )
         assert status == "pending"
 
-    def test_missing_action_type_stays_pending(self) -> None:
-        status, _note = evaluate_linear_progress_update_judge({"target_id": "TECH-1234"})
+    async def test_missing_action_type_stays_pending(self) -> None:
+        status, _note = await evaluate_linear_progress_update_judge({"target_id": "TECH-1234"})
         assert status == "pending"
 
 
@@ -930,23 +1022,22 @@ class TestRuleAlwaysPending:
     ``evaluate_linear_progress_update_judge``'s own dispatch (already
     covered indirectly by ``TestOtherActionTypes`` above)."""
 
-    def test_always_returns_pending_with_no_note(self) -> None:
-        status, note = _run_proposal_rule_sync(
-            _rule_always_pending, {"action_type": "reassign_project", "target_id": "TECH-1234"}
+    async def test_always_returns_pending_with_no_note(self) -> None:
+        status, note = await _rule_always_pending(
+            {"action_type": "reassign_project", "target_id": "TECH-1234"}
         )
         assert status == "pending"
         assert note is None
 
-    def test_ignores_citations(self) -> None:
+    async def test_ignores_citations(self) -> None:
         """Unlike _rule_open_ticket/_rule_close_ticket, this fallback never
         auto-approves regardless of what citation fields are present."""
-        status, _note = _run_proposal_rule_sync(
-            _rule_always_pending,
+        status, _note = await _rule_always_pending(
             {
                 "action_type": "reassign_project",
                 "target_id": "TECH-1234",
                 "source_message_url": "https://redesignhealth.slack.com/archives/C1/p1",
                 "resolving_pr_url": "https://github.com/org/repo/pull/1",
-            },
+            }
         )
         assert status == "pending"

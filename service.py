@@ -5934,23 +5934,22 @@ _is_valid_citation_url = citation_urls.is_valid_citation_url
 # monolithic per-``kind`` function branching internally on ``action_type``,
 # so a future lane (e.g. a new action_type) can be added as its own
 # independent rule instead of growing an ever-larger if/elif chain. Rules
-# are ``async def`` -- neither rule below actually ``await``s anything
-# YET, but the signature is set up for a future lane's real I/O (e.g. an
-# external API call to corroborate a citation) up front, rather than
-# changing every rule's signature again later. Typed as returning a
-# ``Coroutine`` (not the broader ``Awaitable``) specifically so
-# ``_run_proposal_rule_sync``'s ``asyncio.run(rule(action))`` below
-# type-checks -- ``asyncio.run`` only accepts a ``Coroutine``, and every
+# are ``async def`` -- ``_rule_start_ticket``/``_rule_review_ticket``/
+# ``_rule_assign_ticket`` below genuinely ``await`` real I/O (GitHub/Linear
+# API calls) to verify a cited artifact before auto-approving. Typed as
+# returning a ``Coroutine`` (not the broader ``Awaitable``) since every
 # rule registered here genuinely is one (an ``async def`` call always
-# returns a coroutine object).
+# returns a coroutine object) -- callers ``await`` it directly.
 ProposalRule = Callable[[dict[str, Any]], Coroutine[Any, Any, tuple[str, str | None]]]
 
 
 async def _rule_open_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
     """``(kind="linear_progress_update", action_type="open_ticket")`` rule
     (TECH-5877): auto-approve ONLY if ``action["target_id"]`` -- itself,
-    not a separate citation field -- is a valid citation URL (see
-    ``_is_valid_citation_url``). ``target_id`` IS the citation for
+    not a separate citation field -- is specifically a ``github.com`` PR
+    URL (``github_client.parse_pull_request_url``, after first passing
+    the general citation-URL allowlist check, ``_is_valid_citation_url``,
+    per that function's own docstring). ``target_id`` IS the citation for
     ``open_ticket`` (see ``_extract_proposal_target``'s docstring: it is
     the PR URL that originated the proposal, since there is no
     pre-existing Linear issue to target yet) and is also this
@@ -5962,16 +5961,28 @@ async def _rule_open_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
     creates its own Linear issue for the same underlying PR. Tying the
     judged field and the dedup key together structurally closes that: a
     bot can no longer vary the dedup key while keeping the judged citation
-    fixed, because they are now the same value. A bare confidence score,
-    free-text rationale, or an unlisted-host/non-http(s) URL is never
-    sufficient (self-reported ``confidence``/``importance``/``impact`` are
-    advisory only and are NOT inputs here -- see models.ProposalHold's
-    docstring). Never returns ``"rejected"`` -- this rule only ever clears
+    fixed, because they are now the same value.
+
+    A Slack permalink -- otherwise a valid citation URL under
+    ``_is_valid_citation_url``'s general allowlist -- is deliberately NOT
+    sufficient here (Argus review): ``open_ticket``'s whole intent is to
+    document a SHIPPED PR, and a bare Slack link proves no such artifact
+    exists. Every other unproven case (a bare confidence score, free-text
+    rationale, or an unlisted-host/non-http(s) URL; self-reported
+    ``confidence``/``importance``/``impact`` are advisory only and are NOT
+    inputs here -- see models.ProposalHold's docstring) is likewise never
+    sufficient. Never returns ``"rejected"`` -- this rule only ever clears
     a proposal for auto-apply or leaves it for a human, it does not reject
     on a bot's behalf."""
-    if _is_valid_citation_url(action.get("target_id")):
-        return "approved", "auto-approved: open-ticket proposal's target_id cites a valid PR URL"
-    return "pending", None
+    target_id = action.get("target_id")
+    if not isinstance(target_id, str) or not _is_valid_citation_url(target_id):
+        return "pending", None
+    if github_client.parse_pull_request_url(target_id) is None:
+        return "pending", None
+    return (
+        "approved",
+        "auto-approved: open-ticket proposal's target_id cites a github.com PR URL",
+    )
 
 
 async def _rule_close_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
@@ -6084,16 +6095,45 @@ async def _rule_review_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
     )
 
 
+def _pull_request_references_ticket(pull_request: dict[str, Any], target_id: str) -> bool:
+    """Whether ``pull_request`` (a ``github_client.fetch_pull_request``
+    response) actually references ``target_id`` (the ticket identifier,
+    e.g. ``"TECH-1234"``) anywhere in its ``head.ref``/``title``/``body`` --
+    checked case-insensitively, since a branch name commonly lowercases the
+    ticket id (e.g. ``"tech-1234-fix-x"``).
+
+    Closes a scope gap in ``_rule_assign_ticket`` (Argus review): verifying
+    the cited PR's author against the identity map proves WHO wrote the PR,
+    but not that the PR has anything to do with ``target_id`` -- without
+    this check, any PR by a mapped author could justify auto-assigning that
+    author to ANY unrelated ticket, not just ones they actually worked on."""
+    haystacks = (
+        (pull_request.get("head") or {}).get("ref"),
+        pull_request.get("title"),
+        pull_request.get("body"),
+    )
+    needle = target_id.casefold()
+    return any(
+        isinstance(haystack, str) and needle in haystack.casefold() for haystack in haystacks
+    )
+
+
 async def _rule_assign_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
     """``(kind="linear_progress_update", action_type="assign_ticket")``
-    rule (TECH-5877). Auto-approve ONLY if the PROPOSED assignee
-    (``action["assignee_id"]``) is the cited PR's ACTUAL author, verified
-    against the server-side ``identity_map.GITHUB_LOGIN_TO_LINEAR_USER_ID``
-    mapping -- NEVER a bot-asserted claim of who the author is. An
-    unmapped GitHub login can never auto-approve, no matter what
-    ``assignee_id`` the bot proposes (see ``identity_map.py``'s own
-    docstring: this closes a self-approval hole a bot could otherwise
-    exploit by fabricating an author-login-to-assignee match itself).
+    rule (TECH-5877). Auto-approve ONLY if BOTH hold:
+
+    1. The PROPOSED assignee (``action["assignee_id"]``) is the cited PR's
+       ACTUAL author, verified against the server-side
+       ``identity_map.GITHUB_LOGIN_TO_LINEAR_USER_ID`` mapping -- NEVER a
+       bot-asserted claim of who the author is. An unmapped GitHub login
+       can never auto-approve, no matter what ``assignee_id`` the bot
+       proposes (see ``identity_map.py``'s own docstring: this closes a
+       self-approval hole a bot could otherwise exploit by fabricating an
+       author-login-to-assignee match itself).
+    2. The cited PR actually REFERENCES ``target_id`` (``_pull_request_
+       references_ticket`` above) -- otherwise a PR by a correctly-mapped
+       author could justify assigning them to any unrelated ticket, not
+       just ones they actually worked on.
 
     No workflow-state/forward-transition concept applies here -- this
     isn't a state transition -- so unlike ``_rule_start_ticket``/
@@ -6116,9 +6156,16 @@ async def _rule_assign_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
         return "pending", None
     if action.get("assignee_id") != expected_assignee_id:
         return "pending", None
+
+    target_id = action.get("target_id")
+    if not isinstance(target_id, str) or not target_id:
+        return "pending", None
+    if not _pull_request_references_ticket(pull_request, target_id):
+        return "pending", None
     return (
         "approved",
-        "auto-approved: proposed assignee matches the cited PR author's mapped Linear user id",
+        "auto-approved: proposed assignee matches the cited PR author's mapped Linear user id, "
+        "and the PR references the target ticket",
     )
 
 
@@ -6185,26 +6232,12 @@ _PROPOSAL_KIND_DEFAULT_RULE: dict[str, ProposalRule] = {
 }
 
 
-def _run_proposal_rule_sync(rule: ProposalRule, action: dict[str, Any]) -> tuple[str, str | None]:
-    """Backward-compat shim: drives an ``async def`` rule to completion
-    synchronously. Exists only so pre-existing sync-calling test code
-    (``tests/test_proposal_judge.py``) can keep calling
-    ``evaluate_linear_progress_update_judge`` directly without going
-    ``async`` itself. Safe today because no rule registered above actually
-    ``await``s anything yet; ``create_proposal`` (the real, non-test call
-    site) never goes through this helper -- it ``await``s the rule
-    directly, same as any other coroutine, so this repo has no async-code-
-    calling-into-a-nested-event-loop hazard to worry about here."""
-    return asyncio.run(rule(action))
-
-
-def evaluate_linear_progress_update_judge(action: dict[str, Any]) -> tuple[str, str | None]:
-    """Thin sync wrapper over ``_PROPOSAL_RULES``/``_PROPOSAL_KIND_DEFAULT_RULE``
+async def evaluate_linear_progress_update_judge(action: dict[str, Any]) -> tuple[str, str | None]:
+    """Thin async wrapper over ``_PROPOSAL_RULES``/``_PROPOSAL_KIND_DEFAULT_RULE``
     for ``kind="linear_progress_update"``, kept for backward compatibility
-    with existing sync-calling test code (``tests/test_proposal_judge.py``)
-    -- see ``_run_proposal_rule_sync``. ``create_proposal`` itself no
-    longer calls this function; it looks up and ``await``s the registry
-    directly.
+    with existing test code (``tests/test_proposal_judge.py``).
+    ``create_proposal`` itself no longer calls this function; it looks up
+    and ``await``s the registry directly.
 
     Returns ``(status, decision_note)`` where ``status`` is either
     ``"approved"`` or ``"pending"`` -- never anything else. Dispatches on
@@ -6216,7 +6249,7 @@ def evaluate_linear_progress_update_judge(action: dict[str, Any]) -> tuple[str, 
     rule = _PROPOSAL_KIND_DEFAULT_RULE["linear_progress_update"]
     if isinstance(action_type, str):
         rule = _PROPOSAL_RULES.get(("linear_progress_update", action_type), rule)
-    return _run_proposal_rule_sync(rule, action)
+    return await rule(action)
 
 
 _PROPOSAL_JUDGE_DECIDED_BY = "system:judge"
@@ -6345,14 +6378,29 @@ def resolve_proposal_owner_sub(token: Any) -> str | None:
 
 
 def validate_proposal_string_field(
-    name: str, value: Any, *, max_length: int = MAX_PROPOSAL_STRING_FIELD_LENGTH
+    name: str,
+    value: Any,
+    *,
+    max_length: int = MAX_PROPOSAL_STRING_FIELD_LENGTH,
+    required: bool = True,
 ) -> str:
     """Shared non-empty-string-with-a-length-cap check for proposal submission
-    fields (``rationale``, ``target_fingerprint``, ``kind``,
-    ``action.target_id``/``action.action_type``) -- same "one function, two
-    callers" rationale as ``resolve_proposal_owner_sub`` above: both
-    ``main.py``'s HTTP route and ``providers.proposals``'s MCP tool
-    (TECH-6018 follow-up) validate these fields identically."""
+    fields (``rationale``, ``kind``, ``action.target_id``/
+    ``action.action_type``) -- same "one function, two callers" rationale
+    as ``resolve_proposal_owner_sub`` above: both ``main.py``'s HTTP route
+    and ``providers.proposals``'s MCP tool (TECH-6018 follow-up) validate
+    these fields identically.
+
+    ``required=False`` (used only by ``target_fingerprint``, which is
+    DEPRECATED and ignored -- see ``create_proposal``'s docstring) permits
+    an absent/``None``/empty ``value``, returning ``""`` in that case
+    instead of raising -- a caller taking the deprecation notice at face
+    value and simply omitting the field must not get a 422. A caller that
+    DOES still send a value gets the same non-empty-string-with-a-
+    length-cap check as before, for backward compat with existing
+    callers."""
+    if not required and (value is None or value == ""):
+        return ""
     if not isinstance(value, str) or not value:
         raise ValueError(f"{name} is required and must be a non-empty string")
     if len(value) > max_length:
@@ -6713,6 +6761,21 @@ async def create_proposal(
             exc_info=True,
         )
         judged_status, decision_note = "pending", f"judge error: {type(exc).__name__}"
+        # Bug fix: unlike a legitimately-pending judge verdict (always
+        # decision_note=None by convention -- see e.g. _rule_always_
+        # pending), THIS decision_note describes a real failure -- but
+        # nothing below persists it, so this row would otherwise fall
+        # through the `if not auto_approved` branch just below as an
+        # ordinary-looking status="pending" row, indistinguishable from a
+        # legitimately-held proposal. Write it onto the row now:
+        # decision_note is NOT part of `ck_proposal_holds_decision_
+        # consistency` (unlike decided_at/decided_by_actor_id/
+        # decision_source), so it can be set independent of status --
+        # making this failure visible via `proposals_get`/the API-facing
+        # dict for an operator to find.
+        hold.decision_note = decision_note
+        await session.commit()
+        await session.refresh(hold)
     auto_approved = judged_status == "approved" and hold.status == "pending"
 
     if not auto_approved:
@@ -7716,6 +7779,16 @@ async def decide_proposal(
     hold.decided_at = _now()
     hold.decision_note = decision_note
     await session.commit()
+    # By design: this dispatches straight to the applier and never re-runs
+    # the kind/action_type-scoped rule (``_PROPOSAL_RULES``) that would
+    # otherwise gate an auto-approval -- e.g. an approved ``assign_ticket``
+    # applies whatever ``assignee_id`` the bot proposed with NO identity-
+    # map re-verification, and an approved ``start_ticket``/``review_ticket``
+    # applies with no forward-transition check. A human approving here IS
+    # the final authority this whole human-in-the-loop escape hatch
+    # exists for; it deliberately bypasses every rule-level check, not
+    # just the fingerprint/staleness one below (see docs/DESIGN.md's
+    # decide/apply section).
     result = await _apply_or_finalize_proposal_hold(
         session,
         hold_id=hold_id,
