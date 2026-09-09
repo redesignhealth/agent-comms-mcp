@@ -270,6 +270,27 @@ if any required variable (`OKTA_ISSUER_URL`, `OKTA_CLIENT_ID`,
 is missing or empty. See `.env.example` for the full list. No secrets are committed
 anywhere in this repo.
 
+## CI and PR review
+
+`main` is protected by a GitHub ruleset requiring 1 approving review (no
+bypass actors). That review can come from either a human, or an automated
+Argus code-review APPROVE verdict: `.github/workflows/auto-approve.yml`
+runs on every PR push, and once CI (`.github/workflows/ci.yml`'s
+`ci-complete` summary check) has passed and the shared Argus review-storage
+API reports an APPROVE verdict at the PR's exact head SHA (from a
+`/argus-review-loop <pr_number>` run in a Claude Code session), it submits
+an approving review itself, pinned to that SHA. If Argus hasn't approved
+yet, the workflow instead comments on the PR asking the author to run
+`/argus-review-loop` and re-checks automatically on the next push.
+
+**Required repo secret:** `AWS_ROLE_ARN_ARGUS_GATE` -- an IAM role this
+workflow assumes via OIDC to read the Argus review-storage API key from
+SSM. Not yet set as of this writing (provisioned separately via
+`rh-data-platform` Terraform); until it is, the workflow's AWS-credentials
+step fails and no automated approval is ever submitted -- a safe,
+fail-closed default that just leaves PRs requiring a human review, same as
+today.
+
 ## Observability
 
 Structured JSON logs via `structlog` to stdout. Events follow the schema in

@@ -1,0 +1,367 @@
+# Lets an Argus code-review APPROVE verdict (from the `argus-review-loop`
+# Claude Code skill) satisfy this repo's branch ruleset (main requires 1
+# approving review, no bypass actors): once CI has passed and the shared
+# Argus review-storage API reports an APPROVE verdict at the PR's exact head
+# SHA, this workflow submits an approving PR review itself.
+#
+# This is a TRIMMED-DOWN port of the org-wide auto-approve.yml pattern used by
+# redesignhealth/vc-hub and redesignhealth/rh-lib. This repo has no
+# multi-agent GHA review matrix -- only the Argus gate below. There are exactly
+# two terminal outcomes: approve, or a "waiting on Argus" comment (a third,
+# implicit outcome -- CI hasn't passed yet -- is handled by simply not running
+# the Argus-check steps at all).
+#
+# Triggers on `workflow_run` (CI completion) rather than `pull_request` directly
+# so that the job executes under default-branch ref context (ref:refs/heads/main).
+# This satisfies the companion IAM role's branch-ref-only trust policy, which
+# prevents untrusted PR code from assuming the role to access production secrets.
+#
+# SECRET PREREQUISITE: AWS_ROLE_ARN_ARGUS_GATE is not yet set as a repo
+# secret -- it's being provisioned separately via rh-data-platform Terraform
+# (not yet applied as of this commit). Until it's set, the "Configure AWS
+# credentials" step below fails, so no Argus check runs and no approval is
+# ever submitted -- a safe, fail-closed default; PRs simply fall back to
+# requiring a human review, same as today.
+name: Auto-Approve PR (Argus)
+
+on:
+  workflow_run:
+    workflows: ["CI"]   # matches ci.yml's `name: CI`
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to check for auto-approval (manual re-trigger)"
+        required: true
+        type: number
+
+permissions:
+  pull-requests: write
+  issues: write
+  actions: read
+  checks: read
+  id-token: write
+
+jobs:
+  auto-approve:
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve PR number and SHA
+        id: pr
+        # Pinned to v7.0.1 for supply-chain safety (matches redesignhealth/.github's
+        # wait-for-ci action's own pin).
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          INPUT_PR_NUMBER: ${{ github.event.inputs.pr_number }}
+        with:
+          script: |
+            // workflow_dispatch: use input directly, skip workflow_run lookup
+            if (context.eventName === 'workflow_dispatch') {
+              const prNumber = parseInt(process.env.INPUT_PR_NUMBER, 10);
+              const pr = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+              });
+              if (pr.data.state !== 'open') {
+                core.setOutput('skip', 'true');
+                core.info(`PR #${prNumber} is not open (state: ${pr.data.state}). Skipping.`);
+                return;
+              }
+              const reviewedSha = pr.data.head.sha;
+              core.info(`workflow_dispatch: PR #${prNumber} SHA ${reviewedSha}`);
+              core.setOutput('number', prNumber);
+              core.setOutput('reviewed_sha', reviewedSha);
+              core.setOutput('skip', 'false');
+              return;
+            }
+
+            // workflow_run: get the workflow run that triggered this
+            const runData = await github.rest.actions.getWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.payload.workflow_run.id,
+            });
+
+            let reviewedSha = runData.data.head_sha;
+            let prNumber = runData.data.pull_requests?.[0]?.number;
+
+            // Fallback: pull_requests can be empty if the run triggered on a branch push
+            // before the PR was associated. Search for open PR by head branch.
+            if (!prNumber) {
+              const headBranch = runData.data.head_branch;
+              if (headBranch && headBranch !== 'main') {
+                // Use the workflow run's own head-repository owner, not context.repo.owner --
+                // for a fork-originated PR, the head repo owner is the fork's owner, so
+                // context.repo.owner would never match it.
+                const headOwner = runData.data.head_repository?.owner?.login ?? context.repo.owner;
+                core.info(`pull_requests empty, searching for open PR on branch: ${headOwner}:${headBranch}`);
+                const prs = await github.rest.pulls.list({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  head: `${headOwner}:${headBranch}`,
+                  state: 'open',
+                });
+
+                // Only consider PRs targeting this repo's actual default branch -- otherwise
+                // a same-named head branch with a different base could resolve to the wrong PR.
+                const defaultBranch = context.payload.repository?.default_branch;
+                if (!defaultBranch) {
+                  core.warning(`Unable to determine default branch from event payload for branch ${headOwner}:${headBranch} -- skipping resolution rather than guessing.`);
+                } else {
+                  const matchingPrs = prs.data.filter(pr => pr.base.ref === defaultBranch);
+
+                  if (matchingPrs.length > 1) {
+                    core.warning(`Found ${matchingPrs.length} open PRs for branch ${headOwner}:${headBranch} targeting ${defaultBranch} -- ambiguous match, skipping resolution rather than guessing.`);
+                  } else if (matchingPrs[0]) {
+                    prNumber = matchingPrs[0].number;
+                    // If headOwner !== context.repo.owner, this is a fork PR: the createReview
+                    // approval step below will still no-op safely for it (this repo's
+                    // GITHUB_TOKEN has no write access to a fork), but resolving the PR number
+                    // correctly still lets the "post approval required comment" step below write
+                    // a comment here (this repo's own issue tracker, not the fork's).
+                  }
+                }
+              }
+            }
+
+            if (!prNumber) {
+              core.setOutput('skip', 'true');
+              core.info('No open PR associated with this workflow run');
+              return;
+            }
+
+            // Validate that the reviewed SHA matches the PR's current HEAD.
+            // Prevents approving unreviewed code if new commits were pushed after CI ran.
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+
+            if (pr.data.state !== 'open') {
+              core.setOutput('skip', 'true');
+              core.info(`PR #${prNumber} is not open (state: ${pr.data.state}). Skipping.`);
+              return;
+            }
+
+            if (pr.data.head.sha !== reviewedSha) {
+              core.setOutput('skip', 'true');
+              core.info(`SHA mismatch: CI ran on ${reviewedSha} but PR HEAD is now ${pr.data.head.sha}. Skipping to avoid approving unreviewed code.`);
+              return;
+            }
+
+            core.setOutput('number', prNumber);
+            core.setOutput('reviewed_sha', reviewedSha);
+            core.setOutput('skip', 'false');
+
+      - name: Check CI status (workflow_dispatch)
+        if: steps.pr.outputs.skip != 'true' && github.event_name == 'workflow_dispatch'
+        id: ci
+        # Cross-repo composite action reference -- deliberately NOT vendored
+        # into this repo. Pinned to redesignhealth/.github main branch commit SHA.
+        uses: redesignhealth/.github/.github/actions/wait-for-ci@80b6e4471a5f6d2542907a8501ba67cf4bda18ad # main @ 2026-08-13
+        with:
+          sha: ${{ steps.pr.outputs.reviewed_sha }}
+          check-name: CI
+          max-retries: "10"
+          retry-delay-ms: "60000"
+
+      - name: Configure AWS credentials (Argus approval check)
+        if: steps.pr.outputs.skip != 'true' && (github.event_name == 'workflow_run' || steps.ci.outputs.passed == 'true')
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          # SECURITY: this role must stay branch/ref-restricted (never
+          # PR-assumable) since the next step reads the prod
+          # /general/prod/api-secret-key SSM parameter -- a PR-assumable role
+          # here would let untrusted PR code exfiltrate that secret.
+          # Triggering on workflow_run ensures this executes under default-branch
+          # ref context (ref:refs/heads/main), satisfying the IAM trust policy.
+          # AWS_ROLE_ARN_ARGUS_GATE is not yet provisioned -- see the
+          # top-of-file note; this step fails closed until it is.
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_ARGUS_GATE }}
+          aws-region: us-east-1
+
+      - name: Check Argus approval
+        if: steps.pr.outputs.skip != 'true' && (github.event_name == 'workflow_run' || steps.ci.outputs.passed == 'true')
+        id: argus
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          REVIEWED_SHA: ${{ steps.pr.outputs.reviewed_sha }}
+          # Use the actual repo slug, not a hardcoded name -- an earlier
+          # revision of the org-wide pattern hardcoded the wrong repo here.
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          API_KEY=$(aws ssm get-parameter \
+            --name /general/prod/api-secret-key \
+            --with-decryption \
+            --query 'Parameter.Value' --output text)
+          echo "::add-mask::$API_KEY"
+
+          # Don't use curl -f: a non-2xx response should resolve to "not
+          # approved" (falls through to the "waiting on Argus" comment step),
+          # not hard-fail this step and skip that comment entirely.
+          HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -H "X-API-Key: $API_KEY" \
+            "https://api.core.redesignhealth.com/api/v1/code-review/storage/reviews/${REPO}/${PR_NUMBER}")
+          HTTP_BODY=$(echo "$HTTP_RESPONSE" | head -n -1)
+          HTTP_STATUS=$(echo "$HTTP_RESPONSE" | tail -n 1)
+
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "Argus API returned HTTP $HTTP_STATUS for PR #${PR_NUMBER} — treating as not approved"
+            echo "approved=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          APPROVED=$(echo "$HTTP_BODY" | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          rounds = data.get('rounds', [])
+          reviewed_sha = '$REVIEWED_SHA'
+          approved = any(
+              r.get('verdict') == 'APPROVE' and r.get('sha') == reviewed_sha
+              for r in rounds
+          )
+          print('true' if approved else 'false')
+          ")
+
+          echo "approved=$APPROVED" >> "$GITHUB_OUTPUT"
+
+          if [ "$APPROVED" = "true" ]; then
+            echo "Argus approved PR #${PR_NUMBER} at SHA ${REVIEWED_SHA}"
+          else
+            echo "No Argus APPROVE verdict found for PR #${PR_NUMBER} at SHA ${REVIEWED_SHA}"
+          fi
+
+      - name: Auto-approve PR
+        if: steps.pr.outputs.skip != 'true' && (github.event_name == 'workflow_run' || steps.ci.outputs.passed == 'true') && steps.argus.outputs.approved == 'true'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          REVIEWED_SHA: ${{ steps.pr.outputs.reviewed_sha }}
+        with:
+          script: |
+            const prNumber = parseInt(process.env.PR_NUMBER, 10);
+            const reviewedSha = process.env.REVIEWED_SHA;
+            const shortSha = reviewedSha.substring(0, 7);
+
+            // Re-validate PR HEAD immediately before approving (TOCTOU guard).
+            // If new commits were pushed while CI or Argus was being checked,
+            // abort approval to avoid approving unreviewed code.
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+            if (pr.data.head.sha !== reviewedSha) {
+              core.warning(`PR HEAD changed from ${reviewedSha} to ${pr.data.head.sha} before approval could be submitted. Aborting auto-approval.`);
+              return;
+            }
+
+            // Pinned to the exact commit that was reviewed -- never approve
+            // if the PR has moved since CI/Argus were checked above.
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+              commit_id: reviewedSha,
+              event: 'APPROVE',
+              body: [
+                '## Auto-Approved (Argus)',
+                '',
+                `CI passed and Argus reached an APPROVE verdict for this PR at commit \`${shortSha}\`.`,
+                '',
+                '### Checks Passed',
+                '- CI (lint + type check + tests + Docker build)',
+                '- Argus: APPROVE',
+                '',
+                '---',
+                '*This auto-approval was generated by the Argus auto-approve workflow. A human reviewer may still review if desired.*',
+              ].join('\n'),
+            });
+
+            // Best-effort label -- create it first if it doesn't already
+            // exist on this repo, rather than assuming it does.
+            try {
+              await github.rest.issues.getLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'auto-approved',
+              });
+            } catch (e) {
+              if (e.status !== 404) throw e;
+              await github.rest.issues.createLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'auto-approved',
+                color: '0e8a16',
+                description: 'Automatically approved by the Argus auto-approve workflow',
+              });
+            }
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              labels: ['auto-approved'],
+            });
+
+            core.info(`PR #${prNumber} auto-approved at ${reviewedSha}`);
+
+      - name: Post Argus approval required
+        if: steps.pr.outputs.skip != 'true' && (github.event_name == 'workflow_run' || steps.ci.outputs.passed == 'true') && steps.argus.outputs.approved != 'true'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          REVIEWED_SHA: ${{ steps.pr.outputs.reviewed_sha }}
+        with:
+          script: |
+            const prNumber = parseInt(process.env.PR_NUMBER, 10);
+            const reviewedSha = process.env.REVIEWED_SHA;
+            const shortSha = reviewedSha.substring(0, 7);
+            const marker = `<!-- argus-gate-pending:${reviewedSha} -->`;
+
+            // De-duplicate: paginate through all comments to skip if already
+            // posted for this exact full SHA by github-actions[bot].
+            const existingComments = await github.paginate(
+              github.rest.issues.listComments,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+              }
+            );
+            const alreadyPosted = existingComments.some(c =>
+              c.user?.login === 'github-actions[bot]' &&
+              c.body?.includes(marker)
+            );
+            if (alreadyPosted) {
+              core.info(`Argus approval required comment already posted for SHA ${reviewedSha}, skipping duplicate`);
+              return;
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: [
+                marker,
+                '## Argus Approval Required',
+                '',
+                `No Argus APPROVE verdict found for this PR at SHA \`${shortSha}\`.`,
+                '',
+                'To unblock auto-approval:',
+                `1. In a Claude Code session, run: \`/argus-review-loop ${prNumber}\``,
+                '2. Iterate until Argus reaches an APPROVE verdict',
+                '3. This workflow re-checks automatically on the next push to this PR',
+                '',
+                'To bypass, request a human reviewer directly.',
+                '',
+                '---',
+                '*This check is enforced by the Argus auto-approve workflow.*',
+              ].join('\n'),
+            });
