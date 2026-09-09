@@ -419,6 +419,23 @@ class TestResolveTeamId:
         with pytest.raises(LinearNotFoundError, match="TECH"):
             await resolve_team_id("TECH")
 
+    async def test_multiple_matches_raises_defensively(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Argus review: same defensive multi-match guard as
+        ``resolve_workflow_state_id`` -- was missing here."""
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        response = httpx.Response(
+            200,
+            content=json.dumps(
+                {"data": {"teams": {"nodes": [{"id": "team-uuid-1"}, {"id": "team-uuid-2"}]}}}
+            ).encode(),
+            request=httpx.Request("POST", linear_client._LINEAR_API_URL),
+        )
+        _set_fake_post(monkeypatch, response)
+        with pytest.raises(LinearAPIError, match="expected exactly one"):
+            await resolve_team_id("TECH")
+
 
 class TestResolveWorkflowStateId:
     async def test_returns_id_for_found_state(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -510,6 +527,27 @@ class TestResolveLabelId:
         )
         _set_fake_post(monkeypatch, response)
         with pytest.raises(LinearNotFoundError, match="target:agent-comms-mcp"):
+            await resolve_label_id("team-uuid-1", "target:agent-comms-mcp")
+
+    async def test_multiple_matches_raises_defensively(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Argus review: same defensive multi-match guard as
+        ``resolve_workflow_state_id`` -- was missing here."""
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        response = httpx.Response(
+            200,
+            content=json.dumps(
+                {
+                    "data": {
+                        "issueLabels": {"nodes": [{"id": "label-uuid-1"}, {"id": "label-uuid-2"}]}
+                    }
+                }
+            ).encode(),
+            request=httpx.Request("POST", linear_client._LINEAR_API_URL),
+        )
+        _set_fake_post(monkeypatch, response)
+        with pytest.raises(LinearAPIError, match="expected exactly one"):
             await resolve_label_id("team-uuid-1", "target:agent-comms-mcp")
 
 

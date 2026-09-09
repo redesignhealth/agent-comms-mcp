@@ -440,3 +440,19 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
         "CREATE INDEX IF NOT EXISTS idx_proposal_holds_bot_id_status_created_at "
         "ON proposal_holds (proposed_by_bot_id, status, created_at)" in result.stdout
     )
+    # d88cc7e6e21b (TECH-5873 follow-up): the nullable apply_result JSONB
+    # column -- same rationale as every other proposal_holds DDL assertion
+    # above: a typo in the column name/type would otherwise be invisible
+    # to CI.
+    assert "ALTER TABLE proposal_holds ADD COLUMN IF NOT EXISTS apply_result JSONB" in (
+        result.stdout
+    )
+    # cf72736e07f5 (Argus review on d88cc7e6e21b): the CHECK constraint
+    # tying apply_result to status = 'applied', mirroring
+    # ck_proposal_holds_applied_at_consistency's own shape. Pins the exact
+    # constraint name and predicate text.
+    assert (
+        "ALTER TABLE proposal_holds ADD CONSTRAINT "
+        "ck_proposal_holds_apply_result_consistency "
+        "CHECK (apply_result IS NULL OR status = 'applied')" in result.stdout
+    )

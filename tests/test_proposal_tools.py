@@ -501,6 +501,71 @@ class TestSubmitGetWithdraw:
                 },
             )
 
+    async def test_target_fingerprint_argument_is_ignored(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        session: AsyncSession,
+    ) -> None:
+        """Mirrors ``tests/test_proposal_endpoint.py::TestSubmitProposal::
+        test_target_fingerprint_in_body_is_ignored`` for the MCP tool
+        path: a caller-supplied ``target_fingerprint`` is DEPRECATED and
+        ignored -- the value actually stored (and later compared against
+        at decide time) is always computed server-side. Submit with a
+        tool argument value that could never match the mocked
+        server-computed fingerprint, then decide (via
+        ``service.decide_proposal`` directly -- there is no MCP tool for
+        deciding, see this module's own docstring) with that SAME
+        server-computed value re-fetched -- reaching ``"applied"`` (not
+        ``"stale"``) proves the server-computed value, not the tool
+        argument, was stored and matched."""
+        with patch(
+            "service.linear_client.fetch_current_fingerprint",
+            AsyncMock(return_value="server-value"),
+        ):
+            submitted = await _submit(
+                main,
+                test_session_factory,
+                bot_sub="bot-fp-ignored",
+                owner_sub="owner-fp-ignored@example.com",
+                action=_action(target_id="TECH-FINGERPRINT-IGNORED"),
+                target_fingerprint="tool-argument-value",
+            )
+        assert submitted["status"] == "pending"
+
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(return_value="server-value"),
+            ),
+            patch("service.linear_client.apply_progress_update", AsyncMock(return_value=None)),
+        ):
+            decided = await decide_proposal(
+                session,
+                approver_sub="owner-fp-ignored@example.com",
+                hold_id=uuid.UUID(submitted["proposal_id"]),
+                decision="approve",
+                decision_note=None,
+            )
+        assert decided["status"] == "applied"
+
+    async def test_linear_api_error_during_submission_raises_tool_error(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Argus review: ``service.create_proposal``'s server-side
+        target-fingerprint fetch is a real Linear read that can fail
+        (target doesn't exist, Linear unreachable) -- this must surface
+        as a ``ToolError``, matching ``main.py``'s HTTP-route mapping for
+        the same underlying failure, not an unmapped exception."""
+        from linear_client import LinearAPIError
+
+        with patch(
+            "service.linear_client.fetch_current_fingerprint",
+            AsyncMock(side_effect=LinearAPIError("target issue does not exist")),
+        ):
+            with pytest.raises(ToolError):
+                await _submit(main, test_session_factory, bot_sub="bot-linear-error")
+
 
 # --- list_pending / list_history -------------------------------------------------
 

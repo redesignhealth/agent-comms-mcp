@@ -478,6 +478,10 @@ class TestJudgeIntegration:
             patch(
                 "service.linear_client.apply_progress_update", AsyncMock(return_value=None)
             ) as mock_apply_progress,
+            patch(
+                "service.github_client.fetch_pull_request",
+                AsyncMock(return_value={"state": "open"}),
+            ),
         ):
             result = await _submit(
                 session,
@@ -776,7 +780,13 @@ class TestJudgeIntegration:
             "identifier": "TECH-1000",
             "url": "https://linear.app/redesignhealth/issue/TECH-1000",
         }
-        with patch("service.linear_client.apply_open_ticket", AsyncMock(return_value=created)):
+        with (
+            patch("service.linear_client.apply_open_ticket", AsyncMock(return_value=created)),
+            patch(
+                "service.github_client.fetch_pull_request",
+                AsyncMock(return_value={"state": "open"}),
+            ),
+        ):
             second = await _submit(
                 session,
                 action=_action(
@@ -1073,6 +1083,10 @@ class TestFourNewLanesIntegration:
             patch(
                 "service.linear_client.apply_label_ticket", AsyncMock(return_value=None)
             ) as mock_apply,
+            patch(
+                "service.github_client.fetch_pull_request",
+                AsyncMock(return_value={"state": "open"}),
+            ),
         ):
             result = await _submit(
                 session,
@@ -1122,6 +1136,25 @@ class TestRateLimit:
         # bot-b's own limit is untouched by bot-a's volume.
         result = await _submit(session, proposed_by_bot_id="bot-b", action=_action())
         assert result["proposed_by_bot_id"] == "bot-b"
+
+    async def test_fingerprint_fetch_failure_does_not_burn_rate_limit_slot(
+        self, session: AsyncSession
+    ) -> None:
+        """Argus review: the target-fingerprint fetch now runs BEFORE the
+        rate-limit attempt marker is committed, so a Linear failure there
+        must not consume the bot's rate-limit budget for a proposal that
+        was never created -- a normal submission right after a full
+        window's worth of failed fetches must still succeed."""
+        with patch(
+            "service.linear_client.fetch_current_fingerprint",
+            AsyncMock(side_effect=LinearAPIError("boom")),
+        ):
+            for i in range(MAX_PROPOSALS_PER_BOT_PER_WINDOW + 1):
+                with pytest.raises(LinearAPIError):
+                    await _submit(session, action=_action(target_id=f"TECH-fail-{i}"))
+
+        result = await _submit(session, action=_action(target_id="TECH-ok"))
+        assert result["proposed_by_bot_id"] == "bot-1"
 
 
 class TestOwnerSubVisibility:

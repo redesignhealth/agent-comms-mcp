@@ -222,6 +222,31 @@ def compute_target_fingerprint(issue: dict[str, Any]) -> str:
     """Deterministic sha256 hex digest of the issue fields that matter for
     a ``linear_progress_update`` proposal's staleness check.
 
+    Whatever a caller submits as ``target_fingerprint`` (an HTTP/MCP
+    request body field of the same name) is IGNORED: ``service.
+    create_proposal`` always computes the stored value itself, server-side,
+    by calling this function (via ``fetch_current_fingerprint``) against
+    the target's CURRENT Linear state at submission time -- never trusting
+    a caller-supplied value. ``_apply_or_finalize_proposal_hold`` later
+    re-fetches the SAME way at apply/decide time and compares the two, so
+    the stored value and the value it's compared against always come from
+    this one function.
+
+    Historical context for why this function's field-set/serialization
+    contract is still pinned as precisely as it is, even though nothing
+    external feeds it anymore: earlier designs expected whatever SUBMITS
+    the original proposal (a Prefect flow, per the ticket) to compute
+    ``target_fingerprint`` itself and send it along, which would have made
+    this a genuine CROSS-REPO CONTRACT -- both sides would need to hash
+    the SAME field set the SAME way, or every decide would spuriously come
+    back ``stale``. That external-compute path was removed (a bot-supplied
+    hash can never independently equal what this function computes, so
+    every proposal was landing in ``"stale"`` deterministically, not from
+    an actual race -- see ``create_proposal``'s own docstring), but this
+    function's contract stayed exact rather than loosening, since it's
+    still the ONLY thing anything on either side of an apply/decide
+    fingerprint comparison ever calls.
+
     Field set: ``state_id``/``state_name``/``priority``/``assignee_id``
     only -- ``updatedAt`` is deliberately EXCLUDED (bug fix: it used to be
     part of this digest, but Linear bumps ``updatedAt`` on ANY touch,
@@ -230,24 +255,6 @@ def compute_target_fingerprint(issue: dict[str, Any]) -> str:
     meaningful change to the ticket). Staleness now means "someone else
     already moved this ticket's state/priority/assignee since the
     proposal was submitted," not "any touch happened."
-
-    CROSS-REPO CONTRACT: whatever submits the original proposal (a Prefect
-    flow, per the ticket) must compute ``target_fingerprint`` the SAME way,
-    over the SAME field set, or every decide will spuriously come back
-    ``stale``. THIS DOCSTRING is the single source of truth for that
-    scheme on the agent-comms-mcp side (Argus review round-8 suggestion:
-    ``docs/DESIGN.md``'s proposal decide/apply section intentionally
-    defers back to this docstring rather than duplicating it -- don't
-    re-point that cross-reference back here, or a cross-repo implementer
-    following it lands on a paragraph that only says "see the
-    docstring"). NOTE: as of the ``updatedAt``-removal bug fix above,
-    ``target_fingerprint`` is no longer trusted from whatever submits the
-    proposal at all -- ``service.create_proposal`` computes it itself via
-    ``fetch_current_fingerprint`` at submission time, ignoring any
-    caller-supplied value -- but this function's own field set/
-    serialization contract is unchanged by that and still matters for
-    anything that calls it directly (e.g. this repo's own apply-time
-    re-fetch).
 
     Exact serialization pinned here (Argus review round-5 S6 -- a
     same-inputs-different-bytes bug in either implementation would be
@@ -309,12 +316,21 @@ async def fetch_current_fingerprint(target_id: str) -> str:
 async def resolve_team_id(team_key: str) -> str:
     """Resolve a Linear team key (e.g. ``"TECH"``) to its internal team ID.
 
-    Raises ``LinearNotFoundError`` if no team matches ``team_key``."""
+    Raises ``LinearNotFoundError`` if no team matches ``team_key``, and
+    (defensively -- team keys should be unique workspace-wide, but this
+    is precision-critical for an auto-approve context, same reasoning as
+    ``resolve_workflow_state_id`` below) if MORE than one matches, rather
+    than silently picking one (Argus review: this guard existed on
+    ``resolve_workflow_state_id`` but was missing here)."""
     data = await _post_graphql(_TEAM_BY_KEY_QUERY, {"key": team_key})
     teams = data.get("teams")
     nodes = teams.get("nodes", []) if isinstance(teams, dict) else []
     if not nodes:
         raise LinearNotFoundError(f"Linear API returned no team for key={team_key!r}")
+    if len(nodes) > 1:
+        raise LinearAPIError(
+            f"Linear API returned {len(nodes)} teams for key={team_key!r}, expected exactly one"
+        )
     team_id = nodes[0].get("id")
     if not isinstance(team_id, str):
         raise LinearAPIError(f"Linear API returned a team with no id for key={team_key!r}")
@@ -358,13 +374,22 @@ async def resolve_label_id(team_id: str, name: str) -> str:
     in Linear).
 
     Raises ``LinearNotFoundError`` if no label on this team matches
-    ``name``."""
+    ``name``, and (defensively -- label names should be unique per team,
+    but this is precision-critical for an auto-approve context, same
+    reasoning as ``resolve_workflow_state_id`` above) if MORE than one
+    matches, rather than silently picking one (Argus review: this guard
+    existed on ``resolve_workflow_state_id`` but was missing here)."""
     data = await _post_graphql(_LABEL_QUERY, {"teamId": team_id, "name": name})
     issue_labels = data.get("issueLabels")
     nodes = issue_labels.get("nodes", []) if isinstance(issue_labels, dict) else []
     if not nodes:
         raise LinearNotFoundError(
             f"Linear API returned no label named {name!r} for team_id={team_id!r}"
+        )
+    if len(nodes) > 1:
+        raise LinearAPIError(
+            f"Linear API returned {len(nodes)} labels named {name!r} for team_id={team_id!r}, "
+            "expected exactly one"
         )
     label_id = nodes[0].get("id")
     if not isinstance(label_id, str):
@@ -677,6 +702,19 @@ async def apply_start_ticket(action: dict[str, Any], rationale: str) -> None:
     ``rationale`` is accepted for signature parity with the shared
     applier-dispatch call site (same as ``apply_open_ticket``) but is not
     itself written anywhere -- there is no comment-posting step here.
+
+    CASE-SENSITIVITY (Argus review: document, don't make bot-controllable):
+    the literal string ``"In Progress"`` below is matched against the
+    target team's real workflow state names via ``resolve_workflow_state_id``,
+    which is deliberately case-sensitive (see its own docstring). The
+    target Linear team's workflow state must be named EXACTLY
+    ``"In Progress"`` -- not ``"in progress"``, ``"In progress"``, or any
+    other casing/naming variant -- for this applier to succeed. This is
+    NOT bot-controllable via the action payload (that would let a bot
+    influence its own approval target, reintroducing a control gap this
+    design deliberately closes); a mismatch on a given team raises
+    ``LinearNotFoundError`` here, which resolves the hold to a clean
+    ``"apply_failed"``, never a silent no-op.
 
     Raises ``LinearAPIError`` on a missing/invalid ``target_id``/``team``,
     or on any failure from ``resolve_team_id``/``resolve_workflow_state_id``/

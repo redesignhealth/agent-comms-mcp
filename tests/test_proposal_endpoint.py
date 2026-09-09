@@ -677,6 +677,29 @@ class TestSubmitProposal:
         )
         assert rows
 
+    async def test_linear_api_error_during_submission_returns_422(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        """Argus review: ``service.create_proposal``'s server-side
+        target-fingerprint fetch is a real Linear read that can fail
+        (target doesn't exist, Linear unreachable) -- this must surface
+        as a client-facing 422, not an unmapped 500."""
+        from linear_client import LinearAPIError
+
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        with patch(
+            "service.linear_client.fetch_current_fingerprint",
+            AsyncMock(side_effect=LinearAPIError("target issue does not exist")),
+        ):
+            resp = await http_client.post(
+                "/proposals", json=_PROPOSAL_BODY, headers={"Authorization": "Bearer bot-token"}
+            )
+        assert resp.status_code == 422
+        assert resp.json()["error"] == "invalid_request"
+
 
 class TestListPendingAuthGate:
     async def test_missing_token_returns_401(

@@ -160,6 +160,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import re
 import uuid
 from collections.abc import Callable, Coroutine, Sequence
 from collections.abc import Set as AbstractSet
@@ -5945,23 +5946,55 @@ ProposalRule = Callable[[dict[str, Any]], Coroutine[Any, Any, tuple[str, str | N
 
 async def _rule_open_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
     """``(kind="linear_progress_update", action_type="open_ticket")`` rule
-    (TECH-5877): auto-approve ONLY if ``action["target_id"]`` -- itself,
-    not a separate citation field -- is specifically a ``github.com`` PR
-    URL (``github_client.parse_pull_request_url``, after first passing
-    the general citation-URL allowlist check, ``_is_valid_citation_url``,
-    per that function's own docstring). ``target_id`` IS the citation for
-    ``open_ticket`` (see ``_extract_proposal_target``'s docstring: it is
-    the PR URL that originated the proposal, since there is no
-    pre-existing Linear issue to target yet) and is also this
-    action_type's create-time dedup key. Validating a SEPARATE field here
-    (as an earlier version of this rule did, against
-    ``action["source_message_url"]``) let a bot cite a real PR there while
-    submitting arbitrarily many different ``target_id`` values, which
-    dedup has no way to catch -- each one auto-approves independently and
-    creates its own Linear issue for the same underlying PR. Tying the
-    judged field and the dedup key together structurally closes that: a
-    bot can no longer vary the dedup key while keeping the judged citation
-    fixed, because they are now the same value.
+    (TECH-5877): auto-approve ONLY if ALL of the following hold:
+
+    1. ``action["target_id"]`` -- itself, not a separate citation field --
+       is specifically a ``github.com`` PR URL, validated via
+       ``github_client.parse_github_pull_request_url`` (Argus review:
+       host-confusion hole -- this single helper both checks the general
+       citation-URL allowlist AND that the host is specifically
+       ``github.com``, not merely PR-*shaped*; chaining
+       ``_is_valid_citation_url``/``parse_pull_request_url`` directly, as
+       an earlier version of this rule did, let a Slack URL shaped like
+       ``https://xyz.slack.com/owner/repo/pull/123`` pass both checks and
+       be treated as a real GitHub PR reference). ``target_id`` IS the
+       citation for ``open_ticket`` (see ``_extract_proposal_target``'s
+       docstring: it is the PR URL that originated the proposal, since
+       there is no pre-existing Linear issue to target yet) and is also
+       this action_type's create-time dedup key. Validating a SEPARATE
+       field here (as an earlier version of this rule did, against
+       ``action["source_message_url"]``) let a bot cite a real PR there
+       while submitting arbitrarily many different ``target_id`` values,
+       which dedup has no way to catch -- each one auto-approves
+       independently and creates its own Linear issue for the same
+       underlying PR. Tying the judged field and the dedup key together
+       structurally closes that: a bot can no longer vary the dedup key
+       while keeping the judged citation fixed, because they are now the
+       same value.
+    2. ``action["title"]`` AND ``action["team"]`` (both applier-required
+       fields -- ``linear_client.apply_open_ticket`` raises
+       ``LinearAPIError`` on a missing/empty one of either) are present
+       and non-empty (Argus review: rule/applier precondition mismatch --
+       without this check, a proposal missing either could be
+       auto-approved here and then deterministically fail at apply
+       time).
+    3. The cited PR actually EXISTS -- verified via
+       ``github_client.fetch_pull_request`` (Argus review: this rule
+       previously approved on URL shape alone, never confirming the
+       cited PR was real; a fabricated but well-formed PR URL for a
+       nonexistent PR number would still trigger real Linear issue
+       creation). Deliberately does NOT gate on the PR's ``state``
+       (unlike ``_rule_start_ticket``/``_rule_review_ticket``, which
+       specifically need a PR still ``open``): ``open_ticket``'s purpose
+       is to document a SHIPPED PR, so by the time someone documents it
+       as a ticket the PR has very plausibly already been merged/closed
+       -- requiring ``state == "open"`` here would reject the expected
+       case, not just fabrications. Existence alone is the bar. A
+       ``github_client.GitHubAPIError`` (a genuine 404/not-found, a
+       transport failure, etc.) propagates uncaught -- this rule adds no
+       local try/except for that, same "fail closed via
+       ``create_proposal``'s wrapper" contract as
+       ``_rule_start_ticket``'s own docstring documents.
 
     A Slack permalink -- otherwise a valid citation URL under
     ``_is_valid_citation_url``'s general allowlist -- is deliberately NOT
@@ -5975,10 +6008,19 @@ async def _rule_open_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
     a proposal for auto-apply or leaves it for a human, it does not reject
     on a bot's behalf."""
     target_id = action.get("target_id")
-    if not isinstance(target_id, str) or not _is_valid_citation_url(target_id):
+    if not isinstance(target_id, str):
         return "pending", None
-    if github_client.parse_pull_request_url(target_id) is None:
+    parsed = github_client.parse_github_pull_request_url(target_id)
+    if parsed is None:
         return "pending", None
+    title = action.get("title")
+    if not isinstance(title, str) or not title:
+        return "pending", None
+    team = action.get("team")
+    if not isinstance(team, str) or not team:
+        return "pending", None
+    owner, repo, number = parsed
+    await github_client.fetch_pull_request(owner, repo, number)
     return (
         "approved",
         "auto-approved: open-ticket proposal's target_id cites a github.com PR URL",
@@ -6001,15 +6043,31 @@ async def _rule_close_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
 async def _rule_start_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
     """``(kind="linear_progress_update", action_type="start_ticket")`` rule
     (TECH-5877, target workflow state: "In Progress"). Auto-approve ONLY
-    if BOTH hold:
+    if ALL hold:
 
-    1. ``action["starting_pr_url"]`` is a valid citation URL
-       (``_is_valid_citation_url``) that parses as a GitHub PR URL
-       (``github_client.parse_pull_request_url``), AND that PR genuinely
-       exists and is still open (``github_client.fetch_pull_request``) --
-       an artifact proving work has actually begun, not a bot's own
-       say-so.
-    2. The ticket's CURRENT workflow state -- fetched fresh via
+    1. ``action["starting_pr_url"]`` is specifically a ``github.com`` PR
+       URL, validated via ``github_client.parse_github_pull_request_url``
+       (Argus review: host-confusion hole -- this single helper checks
+       BOTH the general citation-URL allowlist AND that the host is
+       specifically ``github.com``, not merely PR-*shaped*; a bare
+       ``_is_valid_citation_url``/``parse_pull_request_url`` chain, as an
+       earlier version of this rule used, would let a Slack URL shaped
+       like ``https://xyz.slack.com/owner/repo/pull/123`` pass both
+       checks and be treated as a real GitHub PR reference). ``action[
+       "target_id"]`` must also be present/non-empty -- checked BEFORE
+       any network call (Argus review: an earlier version checked this
+       AFTER ``fetch_pull_request``, wasting a round-trip on a proposal
+       that was always going to stay pending regardless of the PR
+       fetch's result). ``action["team"]`` (the applier's required field
+       -- ``linear_client.apply_start_ticket`` raises ``LinearAPIError``
+       on a missing/empty one) must likewise be present/non-empty before
+       any network call, so a proposal missing it never gets auto-approved
+       only to deterministically fail at apply time (Argus review:
+       rule/applier precondition mismatch).
+    2. That cited PR genuinely exists and is still open
+       (``github_client.fetch_pull_request``) -- an artifact proving work
+       has actually begun, not a bot's own say-so.
+    3. The ticket's CURRENT workflow state -- fetched fresh via
        ``linear_client.fetch_issue(action["target_id"])``, never trusted
        from the action payload itself -- is strictly BEHIND "In Progress"
        along the workflow (``workflow_order.is_forward_transition``), the
@@ -6025,19 +6083,23 @@ async def _rule_start_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
     Never returns ``"rejected"`` -- same "never rejects on a bot's behalf"
     contract as every other rule in this registry."""
     citation = action.get("starting_pr_url")
-    if not isinstance(citation, str) or not _is_valid_citation_url(citation):
+    if not isinstance(citation, str):
         return "pending", None
-    parsed = github_client.parse_pull_request_url(citation)
+    parsed = github_client.parse_github_pull_request_url(citation)
     if parsed is None:
         return "pending", None
+    target_id = action.get("target_id")
+    if not isinstance(target_id, str) or not target_id:
+        return "pending", None
+    team = action.get("team")
+    if not isinstance(team, str) or not team:
+        return "pending", None
+
     owner, repo, number = parsed
     pull_request = await github_client.fetch_pull_request(owner, repo, number)
     if pull_request.get("state") != "open":
         return "pending", None
 
-    target_id = action.get("target_id")
-    if not isinstance(target_id, str) or not target_id:
-        return "pending", None
     issue = await linear_client.fetch_issue(target_id)
     state = issue.get("state") or {}
     if not workflow_order.is_forward_transition(
@@ -6061,14 +6123,21 @@ async def _rule_review_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
     -- ``state == "open"`` AND (``requested_reviewers`` OR
     ``requested_teams``) non-empty -- and the forward-transition check
     targets "In Review" instead of "In Progress". See
-    ``_rule_start_ticket``'s docstring for the shared
-    citation/forward-transition/error-propagation contract."""
+    ``_rule_start_ticket``'s docstring for the shared citation/``target_id``/
+    ``team``/forward-transition/error-propagation contract."""
     citation = action.get("review_pr_url")
-    if not isinstance(citation, str) or not _is_valid_citation_url(citation):
+    if not isinstance(citation, str):
         return "pending", None
-    parsed = github_client.parse_pull_request_url(citation)
+    parsed = github_client.parse_github_pull_request_url(citation)
     if parsed is None:
         return "pending", None
+    target_id = action.get("target_id")
+    if not isinstance(target_id, str) or not target_id:
+        return "pending", None
+    team = action.get("team")
+    if not isinstance(team, str) or not team:
+        return "pending", None
+
     owner, repo, number = parsed
     pull_request = await github_client.fetch_pull_request(owner, repo, number)
     if pull_request.get("state") != "open":
@@ -6076,9 +6145,6 @@ async def _rule_review_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
     if not pull_request.get("requested_reviewers") and not pull_request.get("requested_teams"):
         return "pending", None
 
-    target_id = action.get("target_id")
-    if not isinstance(target_id, str) or not target_id:
-        return "pending", None
     issue = await linear_client.fetch_issue(target_id)
     state = issue.get("state") or {}
     if not workflow_order.is_forward_transition(
@@ -6106,16 +6172,26 @@ def _pull_request_references_ticket(pull_request: dict[str, Any], target_id: str
     the cited PR's author against the identity map proves WHO wrote the PR,
     but not that the PR has anything to do with ``target_id`` -- without
     this check, any PR by a mapped author could justify auto-assigning that
-    author to ANY unrelated ticket, not just ones they actually worked on."""
+    author to ANY unrelated ticket, not just ones they actually worked on.
+
+    Matches ``target_id`` as a complete TOKEN, not a plain substring
+    (Argus review: identifier collision) -- a bare ``needle in haystack``
+    check let ``"TECH-1"`` match inside ``"TECH-10"``/``"TECH-100"``/
+    ``"TECH-123"``, letting a PR that references a completely different,
+    unrelated ticket satisfy this check for the intended ticket just
+    because its identifier happens to be a numeric prefix of the real
+    one. ``\\b`` word-boundary anchors on both sides of the (regex-escaped)
+    identifier require it not be immediately adjacent to another
+    word character (``TECH-10``'s trailing ``0`` right after ``TECH-1``'s
+    ``1`` is such a character, so no boundary exists there -- the match
+    correctly fails)."""
     haystacks = (
         (pull_request.get("head") or {}).get("ref"),
         pull_request.get("title"),
         pull_request.get("body"),
     )
-    needle = target_id.casefold()
-    return any(
-        isinstance(haystack, str) and needle in haystack.casefold() for haystack in haystacks
-    )
+    pattern = re.compile(rf"\b{re.escape(target_id)}\b", re.IGNORECASE)
+    return any(isinstance(haystack, str) and pattern.search(haystack) for haystack in haystacks)
 
 
 async def _rule_assign_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
@@ -6138,11 +6214,18 @@ async def _rule_assign_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
     No workflow-state/forward-transition concept applies here -- this
     isn't a state transition -- so unlike ``_rule_start_ticket``/
     ``_rule_review_ticket`` above, this rule does not consult
-    ``workflow_order`` or fetch the Linear issue at all."""
+    ``workflow_order`` or fetch the Linear issue at all.
+
+    The citation is validated via ``github_client.
+    parse_github_pull_request_url`` (Argus review: host-confusion hole),
+    not a bare ``_is_valid_citation_url``/``parse_pull_request_url``
+    chain -- see ``_rule_open_ticket``'s docstring for why that chain
+    alone lets a Slack URL shaped like a PR path masquerade as a real
+    GitHub PR reference."""
     citation = action.get("assignee_pr_url")
-    if not isinstance(citation, str) or not _is_valid_citation_url(citation):
+    if not isinstance(citation, str):
         return "pending", None
-    parsed = github_client.parse_pull_request_url(citation)
+    parsed = github_client.parse_github_pull_request_url(citation)
     if parsed is None:
         return "pending", None
     owner, repo, number = parsed
@@ -6171,29 +6254,57 @@ async def _rule_assign_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
 
 async def _rule_label_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
     """``(kind="linear_progress_update", action_type="label_ticket")``
-    rule (TECH-5877). Auto-approve ONLY if the requested label
-    (``action["label_name"]``) is EXACTLY ``f"target:{repo}"``, where
-    ``repo`` is derived from the cited PR URL's (``action["labeling_pr_url"]``)
-    OWN path -- pure citation-URL-shape derivation, no GitHub API call
-    needed (the repo name is already in the URL; nothing further to
-    dereference). Still requires ``_is_valid_citation_url`` to have
-    validated the citation URL's host/scheme first, even though no network
-    call follows -- SSRF-adjacent hygiene, per ``github_client``'s own
-    module docstring: never parse an unvalidated URL with
-    ``parse_pull_request_url``.
+    rule (TECH-5877). Auto-approve ONLY if ALL of the following hold:
+
+    1. ``action["labeling_pr_url"]`` is specifically a ``github.com`` PR
+       URL, validated via ``github_client.parse_github_pull_request_url``
+       (Argus review: host-confusion hole -- see ``_rule_open_ticket``'s
+       docstring for why a bare ``_is_valid_citation_url``/
+       ``parse_pull_request_url`` chain, as an earlier version of this
+       rule used, lets a Slack URL shaped like a PR path masquerade as a
+       real GitHub PR reference).
+    2. The requested label (``action["label_name"]``) is EXACTLY
+       ``f"target:{repo}"``, where ``repo`` is derived from the cited PR
+       URL's OWN path -- pure citation-URL-shape derivation, no GitHub
+       API call needed for THIS check (the repo name is already in the
+       URL; nothing further to dereference).
+    3. ``action["team"]`` (the applier's required field --
+       ``linear_client.apply_label_ticket`` raises ``LinearAPIError`` on
+       a missing/empty one) is present and non-empty (Argus review:
+       rule/applier precondition mismatch).
+    4. The cited PR actually EXISTS -- verified via
+       ``github_client.fetch_pull_request`` (Argus review: since both the
+       cited URL and the requested label name are entirely bot-supplied,
+       a bot could otherwise always construct a syntactically-matching
+       pair -- a ``target:<repo>`` label plus a well-formed-but-possibly-
+       fake PR URL citing that repo -- with zero real artifact behind
+       it, defeating the "auto-approve only when a git artifact proves
+       it" principle this lane is supposed to follow). Deliberately does
+       NOT gate on the PR's ``state`` (unlike ``_rule_start_ticket``/
+       ``_rule_review_ticket``): labeling a ticket based on a PR that's
+       since been merged/closed is still a legitimate artifact-backed
+       case -- existence alone is the bar, same reasoning as
+       ``_rule_open_ticket``'s own existence-only check. A
+       ``github_client.GitHubAPIError`` propagates uncaught, same
+       fail-closed contract as every other rule in this registry.
 
     No workflow-state/forward-transition concept applies here either --
     see ``_rule_assign_ticket``'s docstring for the same reasoning."""
     citation = action.get("labeling_pr_url")
-    if not isinstance(citation, str) or not _is_valid_citation_url(citation):
+    if not isinstance(citation, str):
         return "pending", None
-    parsed = github_client.parse_pull_request_url(citation)
+    parsed = github_client.parse_github_pull_request_url(citation)
     if parsed is None:
         return "pending", None
-    _owner, repo, _number = parsed
+    owner, repo, number = parsed
 
     if action.get("label_name") != f"target:{repo}":
         return "pending", None
+    team = action.get("team")
+    if not isinstance(team, str) or not team:
+        return "pending", None
+
+    await github_client.fetch_pull_request(owner, repo, number)
     return (
         "approved",
         "auto-approved: requested label exactly matches target:<repo> derived from the cited PR",
@@ -6241,10 +6352,18 @@ async def evaluate_linear_progress_update_judge(action: dict[str, Any]) -> tuple
 
     Returns ``(status, decision_note)`` where ``status`` is either
     ``"approved"`` or ``"pending"`` -- never anything else. Dispatches on
-    ``action["action_type"]``: ``"open_ticket"``/``"close_ticket"`` each
-    have their own rule (see ``_rule_open_ticket``/``_rule_close_ticket``);
-    anything else (including a missing or non-string ``action_type``) falls
-    back to ``_rule_always_pending``."""
+    ``action["action_type"]``: ``"open_ticket"`` (``_rule_open_ticket``),
+    ``"close_ticket"`` (``_rule_close_ticket``), ``"start_ticket"``
+    (``_rule_start_ticket``), ``"review_ticket"`` (``_rule_review_ticket``),
+    ``"assign_ticket"`` (``_rule_assign_ticket``), and ``"label_ticket"``
+    (``_rule_label_ticket``) each have their own rule registered in
+    ``_PROPOSAL_RULES`` (Argus review: docstring update -- this list was
+    stale, predating the TECH-5877 lanes added after ``open_ticket``/
+    ``close_ticket``); anything else (including a missing or non-string
+    ``action_type``) falls back to ``_rule_always_pending``. All of the
+    above make live GitHub and/or Linear API calls during judging EXCEPT
+    ``close_ticket``, which is pure/offline (citation-URL-shape validation
+    only, no network I/O)."""
     action_type = action.get("action_type")
     rule = _PROPOSAL_KIND_DEFAULT_RULE["linear_progress_update"]
     if isinstance(action_type, str):
@@ -6613,6 +6732,15 @@ async def create_proposal(
     ``_extract_proposal_target``'s docstring), so there is nothing to
     fetch a fingerprint FOR.
 
+    This fingerprint fetch runs BEFORE the TECH-5875 per-bot rate-limit
+    attempt marker is committed (Argus review: rate-limit slot burned on
+    an unrelated Linear failure) -- it is itself an external I/O call
+    that can fail for reasons that have nothing to do with the
+    submitting bot's actual submission rate (Linear down, a bad
+    ``target_id``); charging it against the bot's rate-limit budget for
+    a proposal that was never even created would let a string of
+    Linear-side failures alone exhaust that budget.
+
     Enforces the TECH-5875 per-bot rate limit (recording this attempt in
     ``audit_log`` and committing immediately -- see
     ``_deny_rate_limited_proposals``'s docstring for why this must survive
@@ -6668,10 +6796,6 @@ async def create_proposal(
     target_id, action_type = _extract_proposal_target(action)
     priority = _derive_proposal_priority(kind, action)
 
-    await _deny_rate_limited_proposals(session, proposed_by_bot_id=proposed_by_bot_id)
-    _audit(session, actor_sub=proposed_by_bot_id, action=_PROPOSAL_SUBMISSION_ATTEMPT_ACTION)
-    await session.commit()
-
     # Bug fix: server-compute target_fingerprint here instead of trusting
     # the caller-supplied parameter of the same name (see this function's
     # docstring) -- reuses the SAME kind-scoped fingerprinter
@@ -6681,6 +6805,14 @@ async def create_proposal(
     # the two disagree. Deliberately NOT wrapped in a try/except -- a
     # LinearAPIError here (target doesn't exist, Linear unreachable)
     # propagates out of create_proposal uncaught.
+    #
+    # Argus review: this fetch runs BEFORE the rate-limit attempt marker
+    # below is audited + committed -- same "don't burn a rate-limit slot
+    # on a proposal that was never created" reasoning as the pure-
+    # validation ordering above, extended to this external I/O call: a
+    # LinearAPIError here (Linear down, a bad target_id) has nothing to
+    # do with the submitting bot's actual submission rate, so it must not
+    # consume that bot's rate-limit budget either.
     #
     # Critical fix (TECH-5873 redefinition): an exempted (kind,
     # action_type) pair -- open_ticket -- has no pre-existing target to
@@ -6695,6 +6827,10 @@ async def create_proposal(
     else:
         fingerprinter = getattr(linear_client, _PROPOSAL_FINGERPRINTER_NAMES[kind])
         target_fingerprint = await fingerprinter(target_id)
+
+    await _deny_rate_limited_proposals(session, proposed_by_bot_id=proposed_by_bot_id)
+    _audit(session, actor_sub=proposed_by_bot_id, action=_PROPOSAL_SUBMISSION_ATTEMPT_ACTION)
+    await session.commit()
 
     hold = await _dedup_or_insert_proposal(
         session,

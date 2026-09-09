@@ -1444,37 +1444,64 @@ registered. Any exception from a rule fails closed to `pending`.
 
 `kind="linear_progress_update"` currently has these rules:
 
-- `open_ticket`: citation-backed. `action.target_id` itself must be a valid
-  citation URL -- it is both the cited PR URL and the create-time dedup key,
-  deliberately unified so dedup can never be bypassed by varying `target_id`
-  while citing the same PR elsewhere. The apply step is redefined in place
-  to create a new Linear issue, not comment on an existing one, and this
-  pair is exempt from the normal fingerprint/staleness check.
+- `open_ticket`: artifact-backed. `action.target_id` itself must be a valid
+  `github.com` PR URL (validated via `github_client.
+  parse_github_pull_request_url`, not merely PR-*shaped* -- see the
+  host-confusion note below) -- it is both the cited PR URL and the
+  create-time dedup key, deliberately unified so dedup can never be
+  bypassed by varying `target_id` while citing the same PR elsewhere. The
+  cited PR must actually exist (a live `fetch_pull_request` call), but its
+  `state` is NOT gated -- a merged/closed PR is the expected case for
+  documenting a shipped PR, not just an open one. `action.title`/
+  `action.team` (the applier's required fields) must also be present. The
+  apply step is redefined in place to create a new Linear issue, not
+  comment on an existing one, and this pair is exempt from the normal
+  fingerprint/staleness check.
 - `close_ticket`: citation-backed. Either `source_message_url` or
   `resolving_pr_url` must be a valid citation URL.
 - `start_ticket`: artifact-backed. The cited GitHub PR must exist and be
-  open, and the issue's current workflow state must be strictly before
-  `In Progress`.
+  open, `action.team` must be present, and the issue's current workflow
+  state must be strictly before `In Progress`.
 - `review_ticket`: artifact-backed. The cited PR must exist, be open, and
-  have review requested, and the current workflow state must be strictly
-  before `In Review`.
+  have review requested, `action.team` must be present, and the current
+  workflow state must be strictly before `In Review`.
 - `assign_ticket`: artifact-backed. The cited PR's actual author must map,
   via `identity_map.py`, to the proposed Linear assignee id. The shipped
   mapping is empty, so this lane is inert until populated with real data.
 - `label_ticket`: artifact-backed. The requested label must be exactly
-  `target:<repo>` derived from the cited PR URL's repo.
+  `target:<repo>` derived from the cited PR URL's repo, `action.team` must
+  be present, and the cited PR must actually exist (a live
+  `fetch_pull_request` call, state not gated -- same "existence, not
+  openness" reasoning as `open_ticket` above).
 - Any other `action_type` stays pending via `_PROPOSAL_KIND_DEFAULT_RULE`.
 
 Unsupported changes stay human-only: priority changes, ticket cancellation,
 description edits, project assignment, and any workflow transition that is
 not strictly forward (or is a no-op) are held rather than auto-approved.
 
+Every lane above that treats a citation as a GitHub PR reference validates
+it through the single shared `github_client.parse_github_pull_request_url`
+helper -- which checks BOTH the general citation-URL allowlist AND that the
+host is specifically `github.com`, not merely PR-*shaped* -- rather than
+each rule chaining `citation_urls.is_valid_citation_url`/
+`parse_pull_request_url` itself; the latter, used alone, lets a
+`*.slack.com` URL shaped like a PR path (a valid citation host under the
+general allowlist) masquerade as a real GitHub PR reference.
+
+Rules that resolve a Linear workflow state by name (`start_ticket`'s
+`"In Progress"`, `review_ticket`'s `"In Review"`) match that name
+CASE-SENSITIVELY against the target team's real Linear workflow states
+(`resolve_workflow_state_id`) -- the target team's states must be named
+EXACTLY that, or the apply step fails cleanly with `LinearNotFoundError`
+(-> `apply_failed`), never a silent no-op. This is deliberately not
+bot-controllable via the action payload, to avoid letting a bot influence
+its own approval target.
+
 The artifact-backed lanes use `github_client.py` (raw GitHub REST client,
 `GITHUB_TOKEN`) for PR lookup and URL parsing, `workflow_order.py` for the
 forward-only workflow check, and `identity_map.py` for the assignee
-verification map. `start_ticket`, `review_ticket`, and `assign_ticket` make
-live GitHub API calls; `label_ticket` only needs the PR-URL parser because
-the repo name is already present in the cited URL.
+verification map. `open_ticket`, `start_ticket`, `review_ticket`,
+`assign_ticket`, and `label_ticket` all make live GitHub API calls.
 
 **An auto-approved verdict is applied synchronously, at submission time, by
 `create_proposal` itself**. `"approved"` is a value the DB CHECK constraint
@@ -1511,7 +1538,14 @@ is shorter -- only FOUR round-trips ((1) submission-time fingerprint fetch,
 `assigneeId` `issueUpdate` mutation) -- since this rule has no workflow-state
 concept and, unlike `start_ticket`/`review_ticket`, never fetches the Linear
 issue in the rule itself, and its applier never needs `resolve_team_id`/
-`resolve_workflow_state_id`. A client or load balancer with a short timeout
+`resolve_workflow_state_id`. `label_ticket` makes SIX round-trips (Argus
+review: this rule now also verifies the cited PR exists, per the same
+artifact-backed reasoning as `start_ticket`/`review_ticket`) -- (1) the
+submission-time fingerprint fetch, (2) the GitHub PR fetch inside the rule
+(existence check only, no forward-transition concept so no Linear
+`fetch_issue` call in the rule itself), (3) the apply-time fingerprint
+re-fetch, (4) `resolve_team_id`, (5) `resolve_label_id`, and (6) the
+`issueAddLabel` mutation. A client or load balancer with a short timeout
 tuned to the pre-TECH-5873 behavior can time out mid-apply; the apply itself
 still completes server-side and the hold still resolves to a terminal
 status, but the caller's HTTP request may not see the response.

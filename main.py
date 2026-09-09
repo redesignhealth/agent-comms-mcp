@@ -26,6 +26,7 @@ from pydantic import AnyUrl
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 
+import linear_client
 import plugins
 import service
 import subscriptions
@@ -1001,6 +1002,14 @@ async def submit_proposal(request: Request) -> Response:
             logger.warning("proposal submission rate-limited for proposed_by_bot_id=%s", bot_sub)
             return JSONResponse({"error": "rate_limited", "detail": str(exc)}, status_code=429)
         except ValueError as exc:
+            return JSONResponse({"error": "invalid_request", "detail": str(exc)}, status_code=422)
+        except linear_client.LinearAPIError as exc:
+            # Argus review: service.create_proposal's server-side
+            # target-fingerprint fetch (a Linear read, not a write) can
+            # fail for a caller-input reason (target_id doesn't exist) or
+            # a Linear-side outage -- either way this is a client-facing
+            # 422, matching the ValueError handling immediately above,
+            # not an unmapped 500.
             return JSONResponse({"error": "invalid_request", "detail": str(exc)}, status_code=422)
 
     return JSONResponse(result, status_code=200)

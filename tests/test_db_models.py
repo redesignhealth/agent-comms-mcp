@@ -1108,3 +1108,59 @@ class TestProposalHoldsSchema:
                 # Cleanup: this module has no autouse table-truncation fixture.
                 await session.delete(hold)
                 await session.commit()
+
+    async def test_orm_round_trip_approved_applied_with_apply_result(
+        self, engine: AsyncEngine
+    ) -> None:
+        """Positive-path mirror of
+        ``test_apply_result_consistency_check_constraint_rejects_non_applied``
+        above -- a row with ``status='applied'`` AND a populated
+        ``apply_result`` must commit successfully, same shape as
+        ``test_orm_round_trip_approved_applied``'s own ``applied_at``
+        coverage."""
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        session: AsyncSession
+        async with session_factory() as session:
+            hold = ProposalHold(
+                kind="linear_progress_update",
+                proposed_by_bot_id="test-bot",
+                owner_sub="test-owner",
+                action={"issue": "TECH-5871"},
+                rationale="because it needs doing",
+                confidence="medium",
+                importance="high",
+                impact="low",
+                priority="high",
+                status="approved",
+                decision_source="human",
+                decided_by_actor_id="test-actor",
+                decided_at=datetime.now(UTC),
+                target_fingerprint="deadbeef",
+            )
+            session.add(hold)
+            await session.commit()
+            await session.refresh(hold)
+            try:
+                assert hold.status == "approved"
+                assert hold.apply_result is None
+
+                # approved -> applied, with apply_result populated (e.g.
+                # apply_open_ticket's created-issue metadata).
+                apply_result = {"id": "issue-id", "identifier": "TECH-9999", "url": "https://x"}
+                hold.status = "applied"
+                hold.applied_at = datetime.now(UTC)
+                hold.apply_result = apply_result
+                await session.commit()
+                await session.refresh(hold)
+                assert hold.status == "applied"
+                assert hold.apply_result == apply_result
+
+                fetched = await session.get(ProposalHold, hold.id)
+                assert fetched is not None
+                assert fetched.status == "applied"
+                assert fetched.apply_result == apply_result
+            finally:
+                await session.rollback()
+                # Cleanup: this module has no autouse table-truncation fixture.
+                await session.delete(hold)
+                await session.commit()

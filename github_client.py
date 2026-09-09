@@ -4,9 +4,11 @@ request or branch (e.g. "is this PR still open", "does this branch still
 exist").
 
 Wired into ``service.py``'s ``(kind, action_type)``-keyed rule registry:
-``_rule_start_ticket``, ``_rule_review_ticket``, and ``_rule_assign_ticket``
-each call ``fetch_pull_request``/``parse_pull_request_url`` here to verify
-a cited PR before auto-approving.
+``_rule_open_ticket``, ``_rule_start_ticket``, ``_rule_review_ticket``,
+``_rule_assign_ticket``, and ``_rule_label_ticket`` each call
+``parse_github_pull_request_url`` here (and, for every rule but
+``_rule_label_ticket``, ``fetch_pull_request`` too) to verify a cited PR
+before auto-approving.
 
 Credential: ``GITHUB_TOKEN`` env var, read directly (same
 "application code reads an env var" convention this repo already uses
@@ -19,10 +21,11 @@ SECURITY (SSRF-adjacent): this module trusts its ``owner``/``repo``/
 validation of its own -- it will happily issue a request to
 ``api.github.com`` for whatever repo coordinates it is given. Any future
 caller that derives these from a URL supplied by an untrusted source
-(e.g. a citation on a bot-submitted proposal) MUST validate that URL with
-``citation_urls.is_valid_citation_url`` first -- ``parse_pull_request_url``
-below only parses PR-URL *structure*, it does not check the URL's host or
-scheme either.
+(e.g. a citation on a bot-submitted proposal) MUST use
+``parse_github_pull_request_url`` below, not ``parse_pull_request_url``
+directly -- the latter only parses PR-URL *structure*, it does not check
+the URL's host or scheme at all (see ``parse_github_pull_request_url``'s
+own docstring for the host-confusion gap that leaves open).
 """
 
 from __future__ import annotations
@@ -32,6 +35,8 @@ from typing import Any
 from urllib.parse import quote, urlsplit
 
 import httpx
+
+import citation_urls
 
 _GITHUB_API_URL = "https://api.github.com"
 _GITHUB_TOKEN_ENV_VAR = "GITHUB_TOKEN"
@@ -155,7 +160,13 @@ async def fetch_branch(owner: str, repo: str, branch: str) -> dict[str, Any] | N
     Returns the parsed response body if the branch exists. Returns
     ``None`` specifically on a 404 -- a missing branch is a normal
     "absent" case, not an error. Any other non-2xx status, or a
-    transport failure, still raises (same as ``fetch_pull_request``)."""
+    transport failure, still raises (same as ``fetch_pull_request``).
+
+    Exported (in ``__all__`` below) ahead of its first real caller (Argus
+    review: not dead code) -- only the PR-citation path has been wired up
+    for ``start_ticket``/``review_ticket``/etc so far; the original design
+    also allows citing a BRANCH directly (no open PR yet), which would
+    call this function once that lane is implemented."""
     context = (
         f"fetching branch {_sanitize_for_log(owner)}/{_sanitize_for_log(repo)}"
         f"@{_sanitize_for_log(branch)}"
@@ -182,7 +193,10 @@ def parse_pull_request_url(url: str) -> tuple[str, str, int] | None:
 
     Does NOT validate the URL's host or scheme -- that's
     ``citation_urls.is_valid_citation_url``'s job, and future callers
-    must run it BEFORE calling this function (see module docstring)."""
+    must run it BEFORE calling this function (see module docstring).
+    Prefer ``parse_github_pull_request_url`` below, which does both steps
+    together -- calling this function directly on an unvalidated citation
+    is exactly the host-confusion gap that function exists to close."""
     try:
         parsed = urlsplit(url)
     except ValueError:
@@ -196,11 +210,45 @@ def parse_pull_request_url(url: str) -> tuple[str, str, int] | None:
     return owner, repo, int(number_str)
 
 
+def parse_github_pull_request_url(url: str) -> tuple[str, str, int] | None:
+    """The single entry point every rule needing a GitHub PR citation
+    must use (Argus review finding: host-confusion hole).
+
+    ``parse_pull_request_url`` above only validates PR-URL *structure* --
+    by design, it never checks the URL's host, leaving that to the
+    caller (see its own docstring and this module's). But
+    ``citation_urls.is_valid_citation_url`` allows BOTH ``github.com``
+    and ``*.slack.com`` hosts, so a Slack URL shaped like
+    ``https://xyz.slack.com/owner/repo/pull/123`` passes it (valid Slack
+    host) AND then also successfully parses via
+    ``parse_pull_request_url`` (matches the PR path shape) -- letting a
+    Slack link masquerade as a real GitHub PR reference in any rule that
+    merely chains those two checks.
+
+    This function closes that gap in one place: it validates ``url`` is
+    BOTH a syntactically valid citation (``citation_urls.
+    is_valid_citation_url``) AND specifically hosted on ``github.com``
+    -- not merely PR-shaped -- and only then parses it. Returns ``None``
+    if either check fails. Every rule in ``service.py`` that treats a
+    citation as a GitHub PR reference (``_rule_open_ticket``,
+    ``_rule_start_ticket``, ``_rule_review_ticket``,
+    ``_rule_assign_ticket``, ``_rule_label_ticket``) must call this
+    instead of chaining ``is_valid_citation_url``/
+    ``parse_pull_request_url`` itself."""
+    if not citation_urls.is_valid_citation_url(url):
+        return None
+    parsed = urlsplit(url)
+    if parsed.hostname != "github.com":
+        return None
+    return parse_pull_request_url(url)
+
+
 __all__ = [
     "GitHubAPIError",
     "GitHubTokenMissingError",
     "GitHubTransportError",
     "fetch_branch",
     "fetch_pull_request",
+    "parse_github_pull_request_url",
     "parse_pull_request_url",
 ]

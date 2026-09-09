@@ -20,6 +20,7 @@ from github_client import (
     GitHubTransportError,
     fetch_branch,
     fetch_pull_request,
+    parse_github_pull_request_url,
     parse_pull_request_url,
 )
 
@@ -385,3 +386,38 @@ class TestParsePullRequestUrl:
 
     def test_malformed_ipv6_url_returns_none_not_raises(self) -> None:
         assert parse_pull_request_url("https://[::1::2]/org/repo/pull/1") is None
+
+
+class TestParseGithubPullRequestUrl:
+    """``parse_github_pull_request_url`` (Argus review: host-confusion
+    hole) -- the combined citation-validity + github.com-host + PR-shape
+    check every rule needing a GitHub PR citation must use instead of
+    chaining ``is_valid_citation_url``/``parse_pull_request_url`` itself."""
+
+    def test_valid_github_pr_url_parses(self) -> None:
+        result = parse_github_pull_request_url(
+            "https://github.com/redesignhealth/agent-comms-mcp/pull/42"
+        )
+        assert result == ("redesignhealth", "agent-comms-mcp", 42)
+
+    def test_slack_hosted_pr_shaped_url_returns_none(self) -> None:
+        # The exact host-confusion case this function exists to close: a
+        # Slack URL that happens to match the PR path shape must NOT
+        # parse as a GitHub PR reference, even though it's a valid
+        # citation URL under ``is_valid_citation_url``'s general
+        # allowlist (Slack is an allowed citation host).
+        result = parse_github_pull_request_url("https://xyz.slack.com/owner/repo/pull/123")
+        assert result is None
+
+    def test_untrusted_host_matching_path_shape_returns_none(self) -> None:
+        # Unlike bare `parse_pull_request_url`, an unallowlisted host
+        # (not even a Slack subdomain) must also be rejected -- it's not
+        # a valid citation URL at all.
+        result = parse_github_pull_request_url("https://evil.com/owner/repo/pull/123")
+        assert result is None
+
+    def test_non_pr_shape_on_github_host_returns_none(self) -> None:
+        assert parse_github_pull_request_url("https://github.com/org/repo/tree/main") is None
+
+    def test_malformed_ipv6_url_returns_none_not_raises(self) -> None:
+        assert parse_github_pull_request_url("https://[::1::2]/org/repo/pull/1") is None

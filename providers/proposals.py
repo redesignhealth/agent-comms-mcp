@@ -73,6 +73,7 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_access_token
 
+import linear_client
 import service
 from db import get_session_factory
 from exceptions import AccessDeniedError, HoldAlreadyDecidedError, RateLimitExceededError
@@ -133,12 +134,21 @@ async def _map_proposal_errors() -> AsyncIterator[None]:
     rate limit) and ``HoldAlreadyDecidedError`` (a withdraw racing an
     already-claimed hold) are both specific-by-design (see their own
     docstrings in exceptions.py) and pass through unwrapped too.
+
+    ``linear_client.LinearAPIError`` (Argus review) is mapped the same
+    way: ``service.create_proposal``'s server-side target-fingerprint
+    fetch can fail for a caller-input reason (target_id doesn't exist)
+    or a Linear-side outage -- either way this must surface as a clear
+    ``ToolError``, matching ``main.py``'s HTTP-route mapping for the
+    same underlying failure, not an unmapped exception.
     """
     try:
         yield
     except AccessDeniedError as exc:
         raise ToolError(str(exc)) from None
     except (RateLimitExceededError, HoldAlreadyDecidedError, ValueError) as exc:
+        raise ToolError(str(exc)) from None
+    except linear_client.LinearAPIError as exc:
         raise ToolError(str(exc)) from None
 
 
