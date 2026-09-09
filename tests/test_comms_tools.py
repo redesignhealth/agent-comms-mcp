@@ -22,7 +22,7 @@ import re
 import subprocess
 import sys
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -3521,6 +3521,96 @@ class TestScopesUnaffected:
         token = _token("scope-test-agent-2", scopes=["comms:read", "comms:write"])
         with pytest.raises(ToolError, match="requires elevated permissions"):
             await _call(main, test_session_factory, token, "comms_not_a_real_tool")
+
+
+# --- Gemini function-calling compatibility of the emitted JSON Schema -----------
+
+
+def _iter_schema_nodes(node: Any, path: str) -> Iterator[tuple[str, dict[str, Any]]]:
+    """Yield ``(path, dict)`` for every dict in a nested JSON-Schema value."""
+    if isinstance(node, dict):
+        yield path, node
+        for key, value in node.items():
+            yield from _iter_schema_nodes(value, f"{path}.{key}")
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            yield from _iter_schema_nodes(value, f"{path}[{index}]")
+
+
+class TestGeminiSchemaCompatibility:
+    """No tool may emit JSON Schema ``const``, at any nesting depth.
+
+    Google's Gemini function-calling API models ``FunctionDeclaration``
+    parameters as a protobuf ``Schema`` whose ``enum`` is a ``repeated
+    string``. Gemini-bound clients translate ``const`` into ``enum`` by
+    copying the raw value (``enum = [const]``) with no string coercion, so
+    a non-string ``const`` -- e.g. the ``{"type": "integer", "const": 1}``
+    that Pydantic emits for ``Literal[1]`` -- is rejected as
+    "Invalid value at '...properties[N].value.enum[0]' (TYPE_STRING), 1".
+
+    That failure rejects the ENTIRE tool list on the request, not just the
+    offending tool, so a single reintroduced non-string ``Literal[...]``
+    default on any parameter of any tool here breaks every tool for every
+    Gemini caller. Prefer a bounded ``Annotated[int, Field(ge=..., le=...)]``
+    (see ``providers.comms.SchemaVersion``) or a string-valued ``Literal``.
+    """
+
+    async def test_no_tool_emits_json_schema_const(self, main: Any) -> None:
+        offenders = [
+            (tool.name, path, node["const"])
+            for tool in await main.mcp.list_tools()
+            # to_mcp_tool() is the actual wire schema handed to clients.
+            for path, node in _iter_schema_nodes(tool.to_mcp_tool().inputSchema, "inputSchema")
+            if "const" in node
+        ]
+        assert offenders == [], (
+            "These tool parameters emit JSON Schema `const`, which breaks the whole "
+            f"tool list for Gemini callers: {offenders}"
+        )
+
+    @pytest.mark.parametrize("tool_name", ["comms_start_conversation", "comms_post_message"])
+    async def test_schema_version_is_a_bounded_int_not_a_const(
+        self, main: Any, tool_name: str
+    ) -> None:
+        tools = {t.name: t for t in await main.mcp.list_tools()}
+        prop = tools[tool_name].to_mcp_tool().inputSchema["properties"]["schema_version"]
+        assert prop == {"type": "integer", "minimum": 1, "maximum": 1, "default": 1}
+
+    @pytest.mark.parametrize("bad_version", [0, 2, 99, -1])
+    async def test_schema_version_still_rejects_non_1_at_the_tool_boundary(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        bad_version: int,
+    ) -> None:
+        """The `ge=1, le=1` bound must keep `Literal[1]`'s real validation.
+
+        Guards against "simplifying" ``SchemaVersion`` to a bare ``int``,
+        which would silently accept 0/2 here.
+
+        Asserts on the Pydantic bound-violation message specifically, NOT a
+        bare ``ToolError``: this call also trips the unregistered-agent
+        denial, so a bare ``pytest.raises(ToolError)`` passes even when the
+        bound is removed entirely (verified by mutation) and would be false
+        confidence.
+        """
+        token = _token("schema-version-bound-agent", scopes=["comms:read", "comms:write"])
+        with pytest.raises(
+            ToolError,
+            match=r"(?s)schema_version.*Input should be (greater|less) than or equal to 1",
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                token,
+                "comms_post_message",
+                {
+                    "conversation_id": str(uuid.uuid4()),
+                    "message_type": "note",
+                    "payload": {"text": "x"},
+                    "schema_version": bad_version,
+                },
+            )
 
 
 # --- availability_response's none_available branch, end-to-end -------------------

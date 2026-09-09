@@ -43,12 +43,13 @@ from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Annotated, Any
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ResourceError, ToolError
 from fastmcp.server.auth import AccessToken
 from fastmcp.server.dependencies import get_access_token
+from pydantic import Field
 from sqlalchemy.exc import InterfaceError, OperationalError
 
 import plugins
@@ -106,6 +107,32 @@ MAX_REVIEW_REASON_LENGTH = 2000
 # opt-in via APPROVAL_NOTIFIER, not required) -- a board that hasn't
 # configured a decision page must not have hold responses break.
 DECISION_PAGE_BASE_URL_ENV_VAR = "DECISION_PAGE_BASE_URL"
+
+# Wire-schema version accepted at the tool boundary. Deliberately expressed as
+# a bounded int (`ge=1, le=1`) rather than the more obvious `Literal[1]`:
+# Pydantic renders `Literal[1]` as JSON Schema `{"type": "integer", "const": 1}`,
+# and Google's Gemini function-calling API rejects the whole tool list when a
+# `const` reaches it. The chain is: a Gemini-bound client copies `const` into
+# `enum` (`enum = [const]`) without coercing the value, but Gemini's
+# `FunctionDeclaration.parameters` is a protobuf `Schema` whose `enum` is a
+# `repeated string` -- so an integer `1` fails validation with
+# "Invalid value at '...parameters.properties[N].value.enum[0]' (TYPE_STRING), 1"
+# and EVERY tool on the request is rejected, not just this one.
+#
+# `ge=1, le=1` emits `{"type": "integer", "minimum": 1, "maximum": 1}` instead
+# -- no `const`, and `minimum`/`maximum` are both valid Gemini `Schema` fields.
+# Runtime validation parity with `Literal[1]` is preserved on every case that
+# matters: 0 and 2 are still rejected by Pydantic here, before the service
+# layer is reached. The one intentional difference is that a JSON *string*
+# "1" is now coerced to 1 rather than rejected; the resulting value is still
+# exactly 1, so no downstream invariant changes.
+#
+# Do NOT "simplify" this to a bare `int = 1`: that accepts 0 and 2 at this
+# boundary, which is a real loosening. (`service.validate_payload`'s
+# `get_schema(message_type, schema_version)` lookup would still deny an
+# unregistered pair, but via a payload-validation error rather than this
+# boundary's argument validation.)
+SchemaVersion = Annotated[int, Field(ge=1, le=1)]
 
 
 def _decision_url(hold_id: str) -> str | None:
@@ -1068,7 +1095,7 @@ async def start_conversation(
     initial_message: dict[str, Any],
     message_type: str = "availability_request",
     expires_at: str | None = None,
-    schema_version: Literal[1] = 1,
+    schema_version: SchemaVersion = 1,
     agent_key: str | None = None,
 ) -> dict[str, Any]:
     """Open a conversation with N other agents, posting the seq-1 message.
@@ -1265,7 +1292,7 @@ async def post_message(
     conversation_id: str,
     message_type: str,
     payload: dict[str, Any],
-    schema_version: Literal[1] = 1,
+    schema_version: SchemaVersion = 1,
     agent_key: str | None = None,
     review_reason: str | None = None,
 ) -> dict[str, Any]:
