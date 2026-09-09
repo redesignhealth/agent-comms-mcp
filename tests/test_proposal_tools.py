@@ -25,7 +25,7 @@ import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
@@ -133,6 +133,27 @@ async def _clean_tables(engine: AsyncEngine) -> AsyncIterator[None]:
     yield
 
 
+_DEFAULT_SUBMIT_TIME_FINGERPRINT = "fp-submit-time-default"
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _default_fetch_current_fingerprint() -> AsyncIterator[AsyncMock]:
+    """Bug fix: ``proposals_submit`` -> ``service.create_proposal`` now
+    fetches the target's CURRENT fingerprint at submission time too
+    (server-computed, no longer trusting the caller-supplied
+    ``target_fingerprint`` tool argument -- see that function's own
+    docstring), not just at apply/decide time. None of the tests in this
+    file exercise the auto-judge/apply path (see this module's own
+    docstring -- that's ``tests/test_proposal_service.py``'s job), so a
+    single stable default here is all any test needs; it just keeps
+    submission from attempting a real network call."""
+    with patch(
+        "service.linear_client.fetch_current_fingerprint",
+        AsyncMock(return_value=_DEFAULT_SUBMIT_TIME_FINGERPRINT),
+    ) as mock:
+        yield mock
+
+
 @pytest.fixture
 def test_session_factory(
     engine: AsyncEngine,
@@ -191,8 +212,11 @@ def main() -> Any:
 
 
 def _action(
-    action_type: str = "open_ticket", target_id: str = "TECH-1234", **extra: Any
+    action_type: str = "close_ticket", target_id: str = "TECH-1234", **extra: Any
 ) -> dict[str, Any]:
+    # action_type default is "close_ticket", not "open_ticket" (TECH-5873
+    # redefinition) -- see the identical rationale in
+    # tests/test_proposal_service.py's own `_action` docstring.
     return {"action_type": action_type, "target_id": target_id, **extra}
 
 

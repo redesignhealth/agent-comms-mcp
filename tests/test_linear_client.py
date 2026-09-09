@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -19,14 +20,28 @@ import pytest
 import linear_client
 from linear_client import (
     LinearAPIError,
+    LinearNotFoundError,
     LinearTokenMissingError,
     LinearTransportError,
     _post_graphql,
     _progress_comment_body,
     _require_api_token,
+    add_issue_label,
+    apply_assign_ticket,
+    apply_label_ticket,
+    apply_open_ticket,
     apply_progress_update,
+    apply_review_ticket,
+    apply_start_ticket,
     compute_target_fingerprint,
+    create_ticket,
     fetch_current_fingerprint,
+    fetch_issue,
+    resolve_label_id,
+    resolve_team_id,
+    resolve_workflow_state_id,
+    update_issue_assignee,
+    update_issue_state,
 )
 
 _TOKEN_ENV_VAR = linear_client._LINEAR_API_TOKEN_ENV_VAR
@@ -168,7 +183,12 @@ class TestComputeTargetFingerprint:
         any accidental change to the fingerprint scheme -- a cross-repo
         contract with whatever submits the original proposal -- breaks
         this test loudly instead of silently causing spurious 'stale'
-        results everywhere."""
+        results everywhere. ``updatedAt`` is present in the input (a
+        realistic Linear payload always carries it) but is NOT part of
+        the digest (bug fix -- see ``compute_target_fingerprint``'s own
+        docstring) -- this pinned value would be unaffected by changing
+        it; see ``TestComputeTargetFingerprintFieldSensitivity`` below for
+        that specific assertion."""
         issue = {
             "state": {"id": "state-1", "name": "In Progress"},
             "priority": 2,
@@ -176,12 +196,141 @@ class TestComputeTargetFingerprint:
             "updatedAt": "2026-01-01T00:00:00.000Z",
         }
         digest = compute_target_fingerprint(issue)
-        assert digest == "20b5fc3acf309a4c67042819637b2a0244b0f6b8734e17b6f7a48aba0cea38b8"
+        assert digest == "cd8ec34e5c09e596c501942651f8a6f058d6153b911d714a1a7b8fa5d4be74c8"
 
     def test_missing_state_and_assignee_do_not_raise(self) -> None:
         digest = compute_target_fingerprint({"priority": None, "updatedAt": None})
         assert isinstance(digest, str)
         assert len(digest) == 64
+
+
+class TestComputeTargetFingerprintFieldSensitivity:
+    """End-to-end coverage against a realistic stubbed Linear issue
+    payload (bug fix regression test): the digest must be deterministic
+    and sensitive to each of the 4 fields that actually matter
+    (state/priority/assignee), but -- the whole point of the
+    ``updatedAt``-removal bug fix -- must NOT change when only
+    ``updatedAt`` changes, since Linear bumps that on any touch to the
+    issue, including this bot's own prior comment."""
+
+    @staticmethod
+    def _issue(**overrides: Any) -> dict[str, Any]:
+        base: dict[str, Any] = {
+            "id": "TECH-1234",
+            "state": {"id": "state-1", "name": "In Progress"},
+            "priority": 2,
+            "assignee": {"id": "user-1"},
+            "updatedAt": "2026-01-01T00:00:00.000Z",
+        }
+        base.update(overrides)
+        return base
+
+    def test_deterministic_for_the_same_input(self) -> None:
+        issue = self._issue()
+        assert compute_target_fingerprint(issue) == compute_target_fingerprint(issue)
+
+    def test_updated_at_alone_changing_does_not_change_digest(self) -> None:
+        original = compute_target_fingerprint(self._issue())
+        touched = compute_target_fingerprint(self._issue(updatedAt="2026-06-15T12:00:00.000Z"))
+        assert touched == original
+
+    def test_state_change_changes_digest(self) -> None:
+        original = compute_target_fingerprint(self._issue())
+        changed = compute_target_fingerprint(self._issue(state={"id": "state-2", "name": "Done"}))
+        assert changed != original
+
+    def test_priority_change_changes_digest(self) -> None:
+        original = compute_target_fingerprint(self._issue())
+        changed = compute_target_fingerprint(self._issue(priority=1))
+        assert changed != original
+
+    def test_assignee_change_changes_digest(self) -> None:
+        original = compute_target_fingerprint(self._issue())
+        changed = compute_target_fingerprint(self._issue(assignee={"id": "user-2"}))
+        assert changed != original
+
+    def test_state_type_field_does_not_affect_digest(self) -> None:
+        """The GraphQL query fetches ``state.type`` (added for future judge
+        rules that reason about workflow-state ordering -- see
+        ``workflow_order.is_forward_transition``), but
+        ``compute_target_fingerprint`` must remain fingerprint-neutral to
+        that field: it reads only ``state["id"]``/``state["name"]`` out of
+        ``state``, never ``state["type"]``. This asserts the digest is
+        identical whether or not ``type`` is present in the fetched issue
+        dict, for an otherwise-identical issue."""
+        without_type = compute_target_fingerprint(
+            self._issue(state={"id": "state-1", "name": "In Progress"})
+        )
+        with_type = compute_target_fingerprint(
+            self._issue(state={"id": "state-1", "name": "In Progress", "type": "started"})
+        )
+        assert with_type == without_type
+        # And it doesn't move the pinned digest either -- the value asserted
+        # in `test_pinned_digest_for_fixed_input` above must hold regardless
+        # of whether `state.type` is present in the input.
+        pinned_input = {
+            "state": {"id": "state-1", "name": "In Progress", "type": "started"},
+            "priority": 2,
+            "assignee": {"id": "user-1"},
+            "updatedAt": "2026-01-01T00:00:00.000Z",
+        }
+        assert (
+            compute_target_fingerprint(pinned_input)
+            == "cd8ec34e5c09e596c501942651f8a6f058d6153b911d714a1a7b8fa5d4be74c8"
+        )
+
+
+class TestFetchIssue:
+    """``fetch_issue`` is the raw issue fetch that both
+    ``fetch_current_fingerprint`` (below) and future judge rules build on."""
+
+    async def test_returns_raw_issue_dict(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        issue = {
+            "id": "TECH-1234",
+            "state": {"id": "s1", "name": "In Progress", "type": "started"},
+            "priority": 1,
+            "assignee": None,
+            "updatedAt": "2026-01-01T00:00:00.000Z",
+        }
+        response = httpx.Response(
+            200,
+            content=json.dumps({"data": {"issue": issue}}).encode(),
+            request=httpx.Request("POST", linear_client._LINEAR_API_URL),
+        )
+        _set_fake_post(monkeypatch, response)
+        assert await fetch_issue("TECH-1234") == issue
+
+    async def test_missing_issue_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        response = httpx.Response(
+            200,
+            content=json.dumps({"data": {"issue": None}}).encode(),
+            request=httpx.Request("POST", linear_client._LINEAR_API_URL),
+        )
+        _set_fake_post(monkeypatch, response)
+        with pytest.raises(LinearAPIError, match="no issue"):
+            await fetch_issue("TECH-1234")
+
+    async def test_query_requests_state_type(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The GraphQL query sent by ``fetch_issue`` must request
+        ``state.type`` -- future judge rules read it via
+        ``workflow_order.is_forward_transition``."""
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        captured: dict[str, Any] = {}
+
+        async def _capture(
+            self: httpx.AsyncClient, url: str, *, json: dict[str, object], headers: dict[str, str]
+        ) -> httpx.Response:
+            captured["json"] = json
+            body = (
+                b'{"data": {"issue": {"state": {"id": "s1", "name": "Todo", "type": "unstarted"}}}}'
+            )
+            return httpx.Response(200, content=body, request=httpx.Request("POST", url))
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", _capture)
+        await fetch_issue("TECH-1234")
+        assert "type" in captured["json"]["query"]
 
 
 class TestFetchCurrentFingerprint:
@@ -215,6 +364,153 @@ class TestFetchCurrentFingerprint:
         _set_fake_post(monkeypatch, response)
         with pytest.raises(LinearAPIError, match="no issue"):
             await fetch_current_fingerprint("TECH-1234")
+
+    async def test_unaffected_by_state_type_in_fetched_issue(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End-to-end version of
+        ``TestComputeTargetFingerprintFieldSensitivity.test_state_type_field_does_not_affect_digest``:
+        the fingerprint returned by ``fetch_current_fingerprint`` (which now
+        fetches ``state.type`` via ``fetch_issue``) is identical to what a
+        pre-``state.type`` fetch would have produced for the same
+        underlying issue."""
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        issue_without_type = {
+            "id": "TECH-1234",
+            "state": {"id": "s1", "name": "In Progress"},
+            "priority": 1,
+            "assignee": None,
+            "updatedAt": "2026-01-01T00:00:00.000Z",
+        }
+        issue_with_type = {
+            **issue_without_type,
+            "state": {**issue_without_type["state"], "type": "started"},
+        }
+
+        response = httpx.Response(
+            200,
+            content=json.dumps({"data": {"issue": issue_with_type}}).encode(),
+            request=httpx.Request("POST", linear_client._LINEAR_API_URL),
+        )
+        _set_fake_post(monkeypatch, response)
+        fingerprint_with_type = await fetch_current_fingerprint("TECH-1234")
+        assert fingerprint_with_type == compute_target_fingerprint(issue_without_type)
+
+
+class TestResolveTeamId:
+    async def test_returns_id_for_found_team(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        response = httpx.Response(
+            200,
+            content=json.dumps({"data": {"teams": {"nodes": [{"id": "team-uuid-1"}]}}}).encode(),
+            request=httpx.Request("POST", linear_client._LINEAR_API_URL),
+        )
+        _set_fake_post(monkeypatch, response)
+        assert await resolve_team_id("TECH") == "team-uuid-1"
+
+    async def test_no_match_raises_not_found(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        response = httpx.Response(
+            200,
+            content=json.dumps({"data": {"teams": {"nodes": []}}}).encode(),
+            request=httpx.Request("POST", linear_client._LINEAR_API_URL),
+        )
+        _set_fake_post(monkeypatch, response)
+        with pytest.raises(LinearNotFoundError, match="TECH"):
+            await resolve_team_id("TECH")
+
+
+class TestResolveWorkflowStateId:
+    async def test_returns_id_for_found_state(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        response = httpx.Response(
+            200,
+            content=json.dumps(
+                {"data": {"team": {"states": {"nodes": [{"id": "state-uuid-1"}]}}}}
+            ).encode(),
+            request=httpx.Request("POST", linear_client._LINEAR_API_URL),
+        )
+        _set_fake_post(monkeypatch, response)
+        assert await resolve_workflow_state_id("team-uuid-1", "In Progress") == "state-uuid-1"
+
+    async def test_no_match_raises_not_found(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        response = httpx.Response(
+            200,
+            content=json.dumps({"data": {"team": {"states": {"nodes": []}}}}).encode(),
+            request=httpx.Request("POST", linear_client._LINEAR_API_URL),
+        )
+        _set_fake_post(monkeypatch, response)
+        with pytest.raises(LinearNotFoundError, match="In Progress"):
+            await resolve_workflow_state_id("team-uuid-1", "In Progress")
+
+    async def test_multiple_matches_raises_defensively(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Argus-style defensiveness: this resolver feeds a future
+        auto-approve context where precision matters, so more than one
+        match must raise rather than silently pick the first."""
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        response = httpx.Response(
+            200,
+            content=json.dumps(
+                {
+                    "data": {
+                        "team": {
+                            "states": {"nodes": [{"id": "state-uuid-1"}, {"id": "state-uuid-2"}]}
+                        }
+                    }
+                }
+            ).encode(),
+            request=httpx.Request("POST", linear_client._LINEAR_API_URL),
+        )
+        _set_fake_post(monkeypatch, response)
+        with pytest.raises(LinearAPIError, match="expected exactly one"):
+            await resolve_workflow_state_id("team-uuid-1", "In Progress")
+
+    async def test_case_sensitive_no_folding(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The query filters with an exact ``eq`` comparator -- a
+        differently-cased request that Linear itself reports zero matches
+        for must not be silently case-folded into a match here."""
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        captured: dict[str, Any] = {}
+
+        async def _capture(
+            self: httpx.AsyncClient, url: str, *, json: dict[str, object], headers: dict[str, str]
+        ) -> httpx.Response:
+            captured["variables"] = json["variables"]
+            body = b'{"data": {"team": {"states": {"nodes": []}}}}'
+            return httpx.Response(200, content=body, request=httpx.Request("POST", url))
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", _capture)
+        with pytest.raises(LinearNotFoundError):
+            await resolve_workflow_state_id("team-uuid-1", "in progress")
+        assert captured["variables"]["name"] == "in progress"
+
+
+class TestResolveLabelId:
+    async def test_returns_id_for_found_label(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        response = httpx.Response(
+            200,
+            content=json.dumps(
+                {"data": {"issueLabels": {"nodes": [{"id": "label-uuid-1"}]}}}
+            ).encode(),
+            request=httpx.Request("POST", linear_client._LINEAR_API_URL),
+        )
+        _set_fake_post(monkeypatch, response)
+        assert await resolve_label_id("team-uuid-1", "target:agent-comms-mcp") == "label-uuid-1"
+
+    async def test_no_match_raises_not_found(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        response = httpx.Response(
+            200,
+            content=json.dumps({"data": {"issueLabels": {"nodes": []}}}).encode(),
+            request=httpx.Request("POST", linear_client._LINEAR_API_URL),
+        )
+        _set_fake_post(monkeypatch, response)
+        with pytest.raises(LinearNotFoundError, match="target:agent-comms-mcp"):
+            await resolve_label_id("team-uuid-1", "target:agent-comms-mcp")
 
 
 _VALID_SOURCE_URL = "https://redesignhealth.slack.com/archives/C1/p123"
@@ -519,3 +815,641 @@ class TestApplyProgressUpdate:
             "This is the human-authored rationale.",
         )
         assert "This is the human-authored rationale." in captured["json"]["variables"]["body"]
+
+
+_CREATED_ISSUE = {
+    "id": "issue-uuid-1",
+    "identifier": "TECH-999",
+    "url": "https://linear.app/redesignhealth/issue/TECH-999",
+}
+
+
+class TestCreateTicket:
+    """TECH-5873 redefinition: ``open_ticket`` creates a real Linear issue
+    instead of commenting on an existing one -- this is the mutation that
+    does it."""
+
+    async def test_returns_id_identifier_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        response = httpx.Response(
+            200,
+            content=json.dumps(
+                {"data": {"issueCreate": {"success": True, "issue": _CREATED_ISSUE}}}
+            ).encode(),
+            request=httpx.Request("POST", linear_client._LINEAR_API_URL),
+        )
+        _set_fake_post(monkeypatch, response)
+        result = await create_ticket(
+            title="Fix the thing", description="Details.", team_id="team-uuid-1"
+        )
+        assert result == _CREATED_ISSUE
+
+    async def test_required_fields_only_omits_optional_input_keys(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        captured: dict[str, Any] = {}
+        success_body = json.dumps(
+            {"data": {"issueCreate": {"success": True, "issue": _CREATED_ISSUE}}}
+        ).encode()
+
+        async def _capture(
+            self: httpx.AsyncClient, url: str, *, json: dict[str, object], headers: dict[str, str]
+        ) -> httpx.Response:
+            captured["variables"] = json["variables"]
+            return httpx.Response(200, content=success_body, request=httpx.Request("POST", url))
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", _capture)
+        await create_ticket(title="Fix the thing", description="Details.", team_id="team-uuid-1")
+        assert captured["variables"]["input"] == {
+            "teamId": "team-uuid-1",
+            "title": "Fix the thing",
+            "description": "Details.",
+        }
+
+    async def test_optional_fields_included_when_provided(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        captured: dict[str, Any] = {}
+        success_body = json.dumps(
+            {"data": {"issueCreate": {"success": True, "issue": _CREATED_ISSUE}}}
+        ).encode()
+
+        async def _capture(
+            self: httpx.AsyncClient, url: str, *, json: dict[str, object], headers: dict[str, str]
+        ) -> httpx.Response:
+            captured["variables"] = json["variables"]
+            return httpx.Response(200, content=success_body, request=httpx.Request("POST", url))
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", _capture)
+        await create_ticket(
+            title="Fix the thing",
+            description="Details.",
+            team_id="team-uuid-1",
+            project_id="project-uuid-1",
+            state_id="state-uuid-1",
+        )
+        assert captured["variables"]["input"] == {
+            "teamId": "team-uuid-1",
+            "title": "Fix the thing",
+            "description": "Details.",
+            "projectId": "project-uuid-1",
+            "stateId": "state-uuid-1",
+        }
+
+    async def test_success_false_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        response = httpx.Response(
+            200,
+            content=json.dumps({"data": {"issueCreate": {"success": False}}}).encode(),
+            request=httpx.Request("POST", linear_client._LINEAR_API_URL),
+        )
+        _set_fake_post(monkeypatch, response)
+        with pytest.raises(LinearAPIError, match="success=false"):
+            await create_ticket(title="T", description="D", team_id="team-uuid-1")
+
+    async def test_missing_issue_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        response = httpx.Response(
+            200,
+            content=json.dumps(
+                {"data": {"issueCreate": {"success": True, "issue": None}}}
+            ).encode(),
+            request=httpx.Request("POST", linear_client._LINEAR_API_URL),
+        )
+        _set_fake_post(monkeypatch, response)
+        with pytest.raises(LinearAPIError, match="no issue"):
+            await create_ticket(title="T", description="D", team_id="team-uuid-1")
+
+    async def test_incomplete_issue_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The mutation reported success and returned an issue, but that
+        issue is missing one of the three fields this function promises
+        to return -- must raise rather than return a partial result."""
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        response = httpx.Response(
+            200,
+            content=json.dumps(
+                {
+                    "data": {
+                        "issueCreate": {
+                            "success": True,
+                            "issue": {"id": "issue-uuid-1", "identifier": "TECH-999"},
+                        }
+                    }
+                }
+            ).encode(),
+            request=httpx.Request("POST", linear_client._LINEAR_API_URL),
+        )
+        _set_fake_post(monkeypatch, response)
+        with pytest.raises(LinearAPIError, match="incomplete issue"):
+            await create_ticket(title="T", description="D", team_id="team-uuid-1")
+
+    async def test_graphql_error_propagates_as_linear_api_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        response = httpx.Response(
+            200,
+            content=json.dumps({"errors": [{"message": "Team not found"}]}).encode(),
+            request=httpx.Request("POST", linear_client._LINEAR_API_URL),
+        )
+        _set_fake_post(monkeypatch, response)
+        with pytest.raises(LinearAPIError, match="Team not found"):
+            await create_ticket(title="T", description="D", team_id="team-uuid-1")
+
+
+class TestApplyOpenTicket:
+    """TECH-5873 redefinition: ``apply_open_ticket`` is the applier
+    ``service._apply_or_finalize_proposal_hold`` dispatches ``open_ticket``
+    to. These tests mock ``resolve_team_id``/``resolve_workflow_state_id``/
+    ``create_ticket`` directly (each already covered independently
+    elsewhere in this file) to isolate this function's own field-reading
+    and dispatch logic."""
+
+    async def test_resolves_team_and_creates_ticket_with_no_optional_fields(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_resolve_team = AsyncMock(return_value="team-uuid-1")
+        mock_resolve_state = AsyncMock()
+        mock_create_ticket = AsyncMock(return_value=_CREATED_ISSUE)
+        monkeypatch.setattr(linear_client, "resolve_team_id", mock_resolve_team)
+        monkeypatch.setattr(linear_client, "resolve_workflow_state_id", mock_resolve_state)
+        monkeypatch.setattr(linear_client, "create_ticket", mock_create_ticket)
+
+        result = await apply_open_ticket(
+            {
+                "target_id": "https://github.com/org/repo/pull/1",
+                "action_type": "open_ticket",
+                "title": "Fix the thing",
+                "team": "TECH",
+            },
+            "Because.",
+        )
+
+        mock_resolve_team.assert_awaited_once_with("TECH")
+        mock_resolve_state.assert_not_awaited()
+        mock_create_ticket.assert_awaited_once_with(
+            title="Fix the thing",
+            description="",
+            team_id="team-uuid-1",
+            project_id=None,
+            state_id=None,
+        )
+        assert result == _CREATED_ISSUE
+
+    async def test_resolves_workflow_state_when_target_state_given(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Passing ``target_state`` resolves it scoped to the ALREADY-
+        resolved team id, then feeds the resolved state id into
+        ``create_ticket`` -- letting a create-then-close proposal land the
+        issue directly in its target state via ONE mutation."""
+        mock_resolve_team = AsyncMock(return_value="team-uuid-1")
+        mock_resolve_state = AsyncMock(return_value="state-uuid-1")
+        mock_create_ticket = AsyncMock(return_value=_CREATED_ISSUE)
+        monkeypatch.setattr(linear_client, "resolve_team_id", mock_resolve_team)
+        monkeypatch.setattr(linear_client, "resolve_workflow_state_id", mock_resolve_state)
+        monkeypatch.setattr(linear_client, "create_ticket", mock_create_ticket)
+
+        result = await apply_open_ticket(
+            {
+                "target_id": "https://github.com/org/repo/pull/1",
+                "action_type": "open_ticket",
+                "title": "Fix the thing",
+                "description": "Details.",
+                "team": "TECH",
+                "project": "project-uuid-1",
+                "target_state": "Done",
+            },
+            "Because.",
+        )
+
+        mock_resolve_team.assert_awaited_once_with("TECH")
+        mock_resolve_state.assert_awaited_once_with("team-uuid-1", "Done")
+        mock_create_ticket.assert_awaited_once_with(
+            title="Fix the thing",
+            description="Details.",
+            team_id="team-uuid-1",
+            project_id="project-uuid-1",
+            state_id="state-uuid-1",
+        )
+        assert result == _CREATED_ISSUE
+
+    async def test_missing_title_raises_without_calling_linear(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_resolve_team = AsyncMock()
+        monkeypatch.setattr(linear_client, "resolve_team_id", mock_resolve_team)
+        with pytest.raises(LinearAPIError, match="title"):
+            await apply_open_ticket(
+                {"target_id": "https://github.com/org/repo/pull/1", "team": "TECH"}, "r"
+            )
+        mock_resolve_team.assert_not_awaited()
+
+    async def test_missing_team_raises_without_calling_linear(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_resolve_team = AsyncMock()
+        monkeypatch.setattr(linear_client, "resolve_team_id", mock_resolve_team)
+        with pytest.raises(LinearAPIError, match="team"):
+            await apply_open_ticket(
+                {"target_id": "https://github.com/org/repo/pull/1", "title": "Fix the thing"}, "r"
+            )
+        mock_resolve_team.assert_not_awaited()
+
+    async def test_resolve_team_id_failure_propagates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_create_ticket = AsyncMock()
+        monkeypatch.setattr(
+            linear_client, "resolve_team_id", AsyncMock(side_effect=LinearNotFoundError("no team"))
+        )
+        monkeypatch.setattr(linear_client, "create_ticket", mock_create_ticket)
+        with pytest.raises(LinearNotFoundError, match="no team"):
+            await apply_open_ticket(
+                {
+                    "target_id": "https://github.com/org/repo/pull/1",
+                    "title": "Fix the thing",
+                    "team": "TECH",
+                },
+                "r",
+            )
+        mock_create_ticket.assert_not_awaited()
+
+
+class TestUpdateIssueState:
+    """TECH-5877: moves an EXISTING issue to a new workflow state via
+    ``issueUpdate(input: { stateId })``."""
+
+    async def test_success_true_does_not_raise(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        response = httpx.Response(
+            200,
+            content=json.dumps({"data": {"issueUpdate": {"success": True}}}).encode(),
+            request=httpx.Request("POST", linear_client._LINEAR_API_URL),
+        )
+        _set_fake_post(monkeypatch, response)
+        await update_issue_state("issue-uuid-1", "state-uuid-1")
+
+    async def test_sends_only_state_id_in_input(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        captured: dict[str, Any] = {}
+        success_body = json.dumps({"data": {"issueUpdate": {"success": True}}}).encode()
+
+        async def _capture(
+            self: httpx.AsyncClient, url: str, *, json: dict[str, object], headers: dict[str, str]
+        ) -> httpx.Response:
+            captured["variables"] = json["variables"]
+            return httpx.Response(200, content=success_body, request=httpx.Request("POST", url))
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", _capture)
+        await update_issue_state("issue-uuid-1", "state-uuid-1")
+        assert captured["variables"] == {"id": "issue-uuid-1", "input": {"stateId": "state-uuid-1"}}
+
+    async def test_success_false_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        response = httpx.Response(
+            200,
+            content=json.dumps({"data": {"issueUpdate": {"success": False}}}).encode(),
+            request=httpx.Request("POST", linear_client._LINEAR_API_URL),
+        )
+        _set_fake_post(monkeypatch, response)
+        with pytest.raises(LinearAPIError, match="success=false"):
+            await update_issue_state("issue-uuid-1", "state-uuid-1")
+
+
+class TestUpdateIssueAssignee:
+    """TECH-5877: reassigns an EXISTING issue via
+    ``issueUpdate(input: { assigneeId })`` -- same mutation as
+    ``update_issue_state``, scoped to a different input field."""
+
+    async def test_success_true_does_not_raise(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        response = httpx.Response(
+            200,
+            content=json.dumps({"data": {"issueUpdate": {"success": True}}}).encode(),
+            request=httpx.Request("POST", linear_client._LINEAR_API_URL),
+        )
+        _set_fake_post(monkeypatch, response)
+        await update_issue_assignee("issue-uuid-1", "user-uuid-1")
+
+    async def test_sends_only_assignee_id_in_input(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        captured: dict[str, Any] = {}
+        success_body = json.dumps({"data": {"issueUpdate": {"success": True}}}).encode()
+
+        async def _capture(
+            self: httpx.AsyncClient, url: str, *, json: dict[str, object], headers: dict[str, str]
+        ) -> httpx.Response:
+            captured["variables"] = json["variables"]
+            return httpx.Response(200, content=success_body, request=httpx.Request("POST", url))
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", _capture)
+        await update_issue_assignee("issue-uuid-1", "user-uuid-1")
+        assert captured["variables"] == {
+            "id": "issue-uuid-1",
+            "input": {"assigneeId": "user-uuid-1"},
+        }
+
+    async def test_success_false_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        response = httpx.Response(
+            200,
+            content=json.dumps({"data": {"issueUpdate": {"success": False}}}).encode(),
+            request=httpx.Request("POST", linear_client._LINEAR_API_URL),
+        )
+        _set_fake_post(monkeypatch, response)
+        with pytest.raises(LinearAPIError, match="success=false"):
+            await update_issue_assignee("issue-uuid-1", "user-uuid-1")
+
+
+class TestAddIssueLabel:
+    """TECH-5877: adds a single label to an EXISTING issue via the
+    DEDICATED ``issueAddLabel(id, labelId)`` mutation -- NOT
+    ``issueUpdate(input: { labelIds })``, which REPLACES the issue's full
+    label set (see ``linear_client._ISSUE_ADD_LABEL_MUTATION``'s own
+    comment). This is the mechanism verified against Linear's real public
+    schema for this task; these tests pin that the QUERY SENT is the
+    dedicated mutation (not a ``labelIds``-based ``issueUpdate``), so a
+    future edit can't silently regress back to a replace-all-labels call
+    without failing here."""
+
+    async def test_success_true_does_not_raise(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        response = httpx.Response(
+            200,
+            content=json.dumps({"data": {"issueAddLabel": {"success": True}}}).encode(),
+            request=httpx.Request("POST", linear_client._LINEAR_API_URL),
+        )
+        _set_fake_post(monkeypatch, response)
+        await add_issue_label("issue-uuid-1", "label-uuid-1")
+
+    async def test_uses_dedicated_add_label_mutation_not_replace_all_labels(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        captured: dict[str, Any] = {}
+        success_body = json.dumps({"data": {"issueAddLabel": {"success": True}}}).encode()
+
+        async def _capture(
+            self: httpx.AsyncClient, url: str, *, json: dict[str, object], headers: dict[str, str]
+        ) -> httpx.Response:
+            captured["json"] = json
+            return httpx.Response(200, content=success_body, request=httpx.Request("POST", url))
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", _capture)
+        await add_issue_label("issue-uuid-1", "label-uuid-1")
+        assert "issueAddLabel" in captured["json"]["query"]
+        assert "labelIds" not in captured["json"]["query"]
+        assert captured["json"]["variables"] == {"id": "issue-uuid-1", "labelId": "label-uuid-1"}
+
+    async def test_success_false_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(_TOKEN_ENV_VAR, "tok123")
+        response = httpx.Response(
+            200,
+            content=json.dumps({"data": {"issueAddLabel": {"success": False}}}).encode(),
+            request=httpx.Request("POST", linear_client._LINEAR_API_URL),
+        )
+        _set_fake_post(monkeypatch, response)
+        with pytest.raises(LinearAPIError, match="success=false"):
+            await add_issue_label("issue-uuid-1", "label-uuid-1")
+
+
+class TestApplyStartTicket:
+    """TECH-5877: applier for ``action_type="start_ticket"`` -- resolves
+    team + "In Progress" state, then moves the issue there. Mocks
+    ``resolve_team_id``/``resolve_workflow_state_id``/``update_issue_state``
+    directly (each already covered independently elsewhere in this file),
+    same idiom as ``TestApplyOpenTicket``."""
+
+    async def test_resolves_team_and_in_progress_state_then_updates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_resolve_team = AsyncMock(return_value="team-uuid-1")
+        mock_resolve_state = AsyncMock(return_value="state-uuid-1")
+        mock_update_state = AsyncMock()
+        monkeypatch.setattr(linear_client, "resolve_team_id", mock_resolve_team)
+        monkeypatch.setattr(linear_client, "resolve_workflow_state_id", mock_resolve_state)
+        monkeypatch.setattr(linear_client, "update_issue_state", mock_update_state)
+
+        await apply_start_ticket(
+            {"target_id": "TECH-1234", "action_type": "start_ticket", "team": "TECH"}, "Because."
+        )
+
+        mock_resolve_team.assert_awaited_once_with("TECH")
+        mock_resolve_state.assert_awaited_once_with("team-uuid-1", "In Progress")
+        mock_update_state.assert_awaited_once_with("TECH-1234", "state-uuid-1")
+
+    async def test_missing_target_id_raises_without_calling_linear(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_resolve_team = AsyncMock()
+        monkeypatch.setattr(linear_client, "resolve_team_id", mock_resolve_team)
+        with pytest.raises(LinearAPIError, match="target_id"):
+            await apply_start_ticket({"action_type": "start_ticket", "team": "TECH"}, "r")
+        mock_resolve_team.assert_not_awaited()
+
+    async def test_missing_team_raises_without_calling_linear(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_resolve_team = AsyncMock()
+        monkeypatch.setattr(linear_client, "resolve_team_id", mock_resolve_team)
+        with pytest.raises(LinearAPIError, match="team"):
+            await apply_start_ticket({"target_id": "TECH-1234", "action_type": "start_ticket"}, "r")
+        mock_resolve_team.assert_not_awaited()
+
+    async def test_resolve_workflow_state_id_failure_propagates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_update_state = AsyncMock()
+        monkeypatch.setattr(linear_client, "resolve_team_id", AsyncMock(return_value="team-uuid-1"))
+        monkeypatch.setattr(
+            linear_client,
+            "resolve_workflow_state_id",
+            AsyncMock(side_effect=LinearNotFoundError("no state")),
+        )
+        monkeypatch.setattr(linear_client, "update_issue_state", mock_update_state)
+        with pytest.raises(LinearNotFoundError, match="no state"):
+            await apply_start_ticket(
+                {"target_id": "TECH-1234", "action_type": "start_ticket", "team": "TECH"}, "r"
+            )
+        mock_update_state.assert_not_awaited()
+
+
+class TestApplyReviewTicket:
+    """TECH-5877: applier for ``action_type="review_ticket"`` -- same
+    shape as ``TestApplyStartTicket`` above, but resolves "In Review"."""
+
+    async def test_resolves_team_and_in_review_state_then_updates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_resolve_team = AsyncMock(return_value="team-uuid-1")
+        mock_resolve_state = AsyncMock(return_value="state-uuid-2")
+        mock_update_state = AsyncMock()
+        monkeypatch.setattr(linear_client, "resolve_team_id", mock_resolve_team)
+        monkeypatch.setattr(linear_client, "resolve_workflow_state_id", mock_resolve_state)
+        monkeypatch.setattr(linear_client, "update_issue_state", mock_update_state)
+
+        await apply_review_ticket(
+            {"target_id": "TECH-1234", "action_type": "review_ticket", "team": "TECH"}, "Because."
+        )
+
+        mock_resolve_team.assert_awaited_once_with("TECH")
+        mock_resolve_state.assert_awaited_once_with("team-uuid-1", "In Review")
+        mock_update_state.assert_awaited_once_with("TECH-1234", "state-uuid-2")
+
+    async def test_missing_target_id_raises_without_calling_linear(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_resolve_team = AsyncMock()
+        monkeypatch.setattr(linear_client, "resolve_team_id", mock_resolve_team)
+        with pytest.raises(LinearAPIError, match="target_id"):
+            await apply_review_ticket({"action_type": "review_ticket", "team": "TECH"}, "r")
+        mock_resolve_team.assert_not_awaited()
+
+    async def test_missing_team_raises_without_calling_linear(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_resolve_team = AsyncMock()
+        monkeypatch.setattr(linear_client, "resolve_team_id", mock_resolve_team)
+        with pytest.raises(LinearAPIError, match="team"):
+            await apply_review_ticket(
+                {"target_id": "TECH-1234", "action_type": "review_ticket"}, "r"
+            )
+        mock_resolve_team.assert_not_awaited()
+
+
+class TestApplyAssignTicket:
+    """TECH-5877: applier for ``action_type="assign_ticket"`` -- reassigns
+    directly using ``action["assignee_id"]``, already a Linear internal
+    user id (no name resolution needed -- unlike team/state/label
+    elsewhere in this module)."""
+
+    async def test_updates_assignee_directly(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        mock_update_assignee = AsyncMock()
+        monkeypatch.setattr(linear_client, "update_issue_assignee", mock_update_assignee)
+
+        await apply_assign_ticket(
+            {
+                "target_id": "TECH-1234",
+                "action_type": "assign_ticket",
+                "assignee_id": "user-uuid-1",
+            },
+            "Because.",
+        )
+
+        mock_update_assignee.assert_awaited_once_with("TECH-1234", "user-uuid-1")
+
+    async def test_missing_target_id_raises_without_calling_linear(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_update_assignee = AsyncMock()
+        monkeypatch.setattr(linear_client, "update_issue_assignee", mock_update_assignee)
+        with pytest.raises(LinearAPIError, match="target_id"):
+            await apply_assign_ticket(
+                {"action_type": "assign_ticket", "assignee_id": "user-uuid-1"}, "r"
+            )
+        mock_update_assignee.assert_not_awaited()
+
+    async def test_missing_assignee_id_raises_without_calling_linear(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_update_assignee = AsyncMock()
+        monkeypatch.setattr(linear_client, "update_issue_assignee", mock_update_assignee)
+        with pytest.raises(LinearAPIError, match="assignee_id"):
+            await apply_assign_ticket(
+                {"target_id": "TECH-1234", "action_type": "assign_ticket"}, "r"
+            )
+        mock_update_assignee.assert_not_awaited()
+
+
+class TestApplyLabelTicket:
+    """TECH-5877: applier for ``action_type="label_ticket"`` -- resolves
+    team + label name, then adds it via the dedicated add-only mutation
+    (``add_issue_label``, NOT a replace-all-labels call)."""
+
+    async def test_resolves_team_and_label_then_adds(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        mock_resolve_team = AsyncMock(return_value="team-uuid-1")
+        mock_resolve_label = AsyncMock(return_value="label-uuid-1")
+        mock_add_label = AsyncMock()
+        monkeypatch.setattr(linear_client, "resolve_team_id", mock_resolve_team)
+        monkeypatch.setattr(linear_client, "resolve_label_id", mock_resolve_label)
+        monkeypatch.setattr(linear_client, "add_issue_label", mock_add_label)
+
+        await apply_label_ticket(
+            {
+                "target_id": "TECH-1234",
+                "action_type": "label_ticket",
+                "team": "TECH",
+                "label_name": "target:agent-comms-mcp",
+            },
+            "Because.",
+        )
+
+        mock_resolve_team.assert_awaited_once_with("TECH")
+        mock_resolve_label.assert_awaited_once_with("team-uuid-1", "target:agent-comms-mcp")
+        mock_add_label.assert_awaited_once_with("TECH-1234", "label-uuid-1")
+
+    async def test_missing_target_id_raises_without_calling_linear(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_resolve_team = AsyncMock()
+        monkeypatch.setattr(linear_client, "resolve_team_id", mock_resolve_team)
+        with pytest.raises(LinearAPIError, match="target_id"):
+            await apply_label_ticket(
+                {"action_type": "label_ticket", "team": "TECH", "label_name": "target:repo"}, "r"
+            )
+        mock_resolve_team.assert_not_awaited()
+
+    async def test_missing_team_raises_without_calling_linear(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_resolve_team = AsyncMock()
+        monkeypatch.setattr(linear_client, "resolve_team_id", mock_resolve_team)
+        with pytest.raises(LinearAPIError, match="team"):
+            await apply_label_ticket(
+                {
+                    "target_id": "TECH-1234",
+                    "action_type": "label_ticket",
+                    "label_name": "target:repo",
+                },
+                "r",
+            )
+        mock_resolve_team.assert_not_awaited()
+
+    async def test_missing_label_name_raises_without_calling_linear(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_resolve_team = AsyncMock(return_value="team-uuid-1")
+        mock_resolve_label = AsyncMock()
+        monkeypatch.setattr(linear_client, "resolve_team_id", mock_resolve_team)
+        monkeypatch.setattr(linear_client, "resolve_label_id", mock_resolve_label)
+        with pytest.raises(LinearAPIError, match="label_name"):
+            await apply_label_ticket(
+                {"target_id": "TECH-1234", "action_type": "label_ticket", "team": "TECH"}, "r"
+            )
+        mock_resolve_label.assert_not_awaited()
+
+    async def test_resolve_label_id_failure_propagates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_add_label = AsyncMock()
+        monkeypatch.setattr(linear_client, "resolve_team_id", AsyncMock(return_value="team-uuid-1"))
+        monkeypatch.setattr(
+            linear_client,
+            "resolve_label_id",
+            AsyncMock(side_effect=LinearNotFoundError("no label")),
+        )
+        monkeypatch.setattr(linear_client, "add_issue_label", mock_add_label)
+        with pytest.raises(LinearNotFoundError, match="no label"):
+            await apply_label_ticket(
+                {
+                    "target_id": "TECH-1234",
+                    "action_type": "label_ticket",
+                    "team": "TECH",
+                    "label_name": "target:agent-comms-mcp",
+                },
+                "r",
+            )
+        mock_add_label.assert_not_awaited()

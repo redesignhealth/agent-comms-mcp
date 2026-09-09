@@ -678,11 +678,16 @@ class TestProposalHoldsSchema:
             "target_fingerprint",
             "applied_at",
             "apply_error",
+            "apply_result",
             "created_at",
             "updated_at",
         ):
             assert expected in cols, f"proposal_holds.{expected} missing"
         assert cols["action"] == "jsonb"
+        # migration d88cc7e6e21b (TECH-5873 follow-up: open_ticket creates
+        # a real Linear issue) -- apply_result is nullable JSONB, same
+        # column type/nullability as `action`, just nullable.
+        assert cols["apply_result"] == "jsonb"
 
     async def test_status_defaults_to_pending(self, engine: AsyncEngine) -> None:
         async with engine.connect() as conn:

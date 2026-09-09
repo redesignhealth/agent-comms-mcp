@@ -26,6 +26,7 @@ from sqlalchemy import select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+import identity_map
 from exceptions import AccessDeniedError, HoldAlreadyDecidedError, RateLimitExceededError
 from linear_client import LinearAPIError, LinearTokenMissingError, LinearTransportError
 from models import AuditLog, ProposalHold
@@ -66,9 +67,43 @@ def session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
     return async_sessionmaker(engine, expire_on_commit=False)
 
 
+_DEFAULT_SUBMIT_TIME_FINGERPRINT = "fp-submit-time-default"
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _default_fetch_current_fingerprint() -> AsyncIterator[AsyncMock]:
+    """Bug fix: ``create_proposal`` now fetches the target's CURRENT
+    fingerprint at submission time too (server-computed, no longer
+    trusting the caller-supplied ``target_fingerprint`` -- see
+    ``service.create_proposal``'s own docstring), not just at apply/decide
+    time. Most tests in this file don't care what that submission-time
+    fingerprint actually is -- this gives them a stable default so
+    submission never attempts a real network call. Tests that DO care
+    about a specific match/mismatch between the submitted and later
+    re-fetched fingerprint override this via their own nested
+    ``patch(...)``, which layers over (and is restored back to this
+    default by) the ``with`` block below on exit."""
+    with patch(
+        "service.linear_client.fetch_current_fingerprint",
+        AsyncMock(return_value=_DEFAULT_SUBMIT_TIME_FINGERPRINT),
+    ) as mock:
+        yield mock
+
+
 def _action(
-    action_type: str = "open_ticket", target_id: str = "TECH-1234", **extra: Any
+    action_type: str = "close_ticket", target_id: str = "TECH-1234", **extra: Any
 ) -> dict[str, Any]:
+    """Default ``action_type`` is ``close_ticket``, not ``open_ticket``
+    (TECH-5873 redefinition): most tests using this helper's default are
+    exercising GENERIC proposal mechanics (dedup, rate limiting, the
+    fingerprint-check-then-apply-or-stale flow) via the pre-existing
+    comment-posting applier, not anything ``open_ticket``-specific --
+    ``open_ticket`` is now exempt from ALL of that (see
+    ``service._PROPOSAL_FINGERPRINT_EXEMPT``) and creates a real Linear
+    issue instead of commenting on ``target_id``, so it would silently
+    change what these tests are actually exercising. Tests that ARE about
+    ``open_ticket`` specifically pass ``action_type="open_ticket"``
+    explicitly (see ``TestJudgeIntegration``)."""
     return {"action_type": action_type, "target_id": target_id, **extra}
 
 
@@ -133,8 +168,22 @@ class TestDedup:
     async def test_matching_pending_row_updates_in_place_not_insert(
         self, session: AsyncSession
     ) -> None:
-        first = await _submit(session, rationale="first rationale", target_fingerprint="fp1")
-        second = await _submit(session, rationale="second rationale", target_fingerprint="fp2")
+        """``target_fingerprint`` is now server-computed at submission time
+        (bug fix) -- each submission's stored value comes from whatever
+        the (mocked) Linear fetch returns for THAT call, not a
+        caller-supplied literal, so the two submissions below use two
+        independent mock return values to prove the SECOND submission's
+        freshly re-fetched fingerprint is what ends up persisted."""
+        with patch(
+            "service.linear_client.fetch_current_fingerprint",
+            AsyncMock(return_value="fp1"),
+        ):
+            first = await _submit(session, rationale="first rationale")
+        with patch(
+            "service.linear_client.fetch_current_fingerprint",
+            AsyncMock(return_value="fp2"),
+        ):
+            second = await _submit(session, rationale="second rationale")
 
         rows = (await session.execute(select(ProposalHold))).scalars().all()
         assert len(rows) == 1
@@ -240,7 +289,7 @@ class TestDedup:
                 "service.linear_client.fetch_current_fingerprint",
                 AsyncMock(return_value="deadbeef"),
             ),
-            patch("service.linear_client.apply_progress_update", AsyncMock()),
+            patch("service.linear_client.apply_progress_update", AsyncMock(return_value=None)),
         ):
             first = await _submit(
                 session,
@@ -400,16 +449,166 @@ class TestServerDerivedPriority:
 
 
 class TestJudgeIntegration:
-    async def test_open_ticket_with_citation_is_auto_approved(self, session: AsyncSession) -> None:
-        """TECH-5873 Argus review B1: the judge's "approved" verdict is
-        never itself persisted -- it resolves synchronously to "applied"
-        here (matching fingerprint, successful Linear write)."""
+    async def test_open_ticket_with_citation_creates_issue_and_returns_apply_result(
+        self, session: AsyncSession, _default_fetch_current_fingerprint: AsyncMock
+    ) -> None:
+        """TECH-5873 redefinition: open_ticket's apply step now creates a
+        real Linear issue via ``linear_client.apply_open_ticket`` (never
+        ``apply_progress_update``, the comment-posting applier every OTHER
+        ``linear_progress_update`` action_type still uses), and is exempt
+        from the fingerprint/staleness check entirely -- its ``target_id``
+        is the PR URL that originated the proposal, not a pre-existing
+        Linear issue id, so there is nothing to fingerprint (see
+        ``service._PROPOSAL_FINGERPRINT_EXEMPT``). The judge's "approved"
+        verdict is never itself persisted (Argus review B1, pre-existing)
+        -- it resolves synchronously to "applied" here.
+
+        ``target_id`` is itself the citation the judge validates (see
+        ``service._rule_open_ticket``'s docstring) -- there is no separate
+        ``source_message_url``/similar field for open_ticket to carry."""
+        created = {
+            "id": "issue-uuid-1",
+            "identifier": "TECH-999",
+            "url": "https://linear.app/redesignhealth/issue/TECH-999",
+        }
         with (
             patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(return_value="deadbeef"),
+                "service.linear_client.apply_open_ticket", AsyncMock(return_value=created)
+            ) as mock_apply_open_ticket,
+            patch(
+                "service.linear_client.apply_progress_update", AsyncMock(return_value=None)
+            ) as mock_apply_progress,
+        ):
+            result = await _submit(
+                session,
+                action=_action(
+                    action_type="open_ticket",
+                    target_id="https://github.com/org/repo/pull/1",
+                    title="Fix the thing",
+                    team="TECH",
+                ),
+            )
+        assert result["status"] == "applied"
+        assert result["decision_source"] == "auto"
+        assert result["decided_by_actor_id"] == "system:judge"
+        assert result["apply_result"] == created
+        mock_apply_open_ticket.assert_awaited_once()
+        # Dispatch correctness: open_ticket must never reach the
+        # comment-posting applier every OTHER linear_progress_update
+        # action_type still uses.
+        mock_apply_progress.assert_not_awaited()
+        # Regression coverage for the fix (TECH-5873): the fingerprinter
+        # must never be called for open_ticket -- neither at submission
+        # time nor at apply time -- since its target_id was never a
+        # fingerprintable Linear issue id to begin with.
+        _default_fetch_current_fingerprint.assert_not_called()
+
+    async def test_open_ticket_without_citation_stays_pending(
+        self, session: AsyncSession, _default_fetch_current_fingerprint: AsyncMock
+    ) -> None:
+        """A ``target_id`` that isn't itself a valid citation URL (e.g. a
+        Linear-issue-id-shaped placeholder, not a PR URL) must not
+        auto-approve -- see ``service._rule_open_ticket``'s docstring:
+        ``target_id`` is now the ONLY field the rule reads."""
+        result = await _submit(
+            session,
+            action=_action(action_type="open_ticket", target_id="TECH-1234"),
+        )
+        assert result["status"] == "pending"
+        assert "decision_source" not in result
+        _default_fetch_current_fingerprint.assert_not_called()
+
+    async def test_open_ticket_bogus_target_id_never_auto_approves_via_other_citation_field(
+        self, session: AsyncSession, _default_fetch_current_fingerprint: AsyncMock
+    ) -> None:
+        """Regression test for the exact exploit this fix closes
+        (bug found in review): before it, the rule validated a SEPARATE
+        ``source_message_url`` field, so a bot could cite a real PR there
+        while submitting an arbitrary, non-citation ``target_id`` --
+        dedup (keyed on ``target_id``) could not catch this, and each
+        submission independently auto-approved and created its own
+        Linear issue for the same underlying PR. Since the rule now reads
+        ONLY ``target_id``, a bogus ``target_id`` never auto-approves no
+        matter what real citation sits in ``source_message_url``."""
+        with patch(
+            "service.linear_client.apply_open_ticket", AsyncMock()
+        ) as mock_apply_open_ticket:
+            result = await _submit(
+                session,
+                action=_action(
+                    action_type="open_ticket",
+                    target_id="not-a-citation-url",
+                    title="Fix the thing",
+                    team="TECH",
+                    source_message_url="https://github.com/org/repo/pull/99",
+                ),
+            )
+        assert result["status"] == "pending"
+        assert "decision_source" not in result
+        mock_apply_open_ticket.assert_not_awaited()
+        _default_fetch_current_fingerprint.assert_not_called()
+
+    async def test_open_ticket_varying_bogus_target_id_with_same_citation_elsewhere_stays_pending(
+        self, session: AsyncSession, _default_fetch_current_fingerprint: AsyncMock
+    ) -> None:
+        """Companion to the test above, at the level the original bug was
+        actually exploitable: varying ``target_id`` across submissions
+        while reusing the SAME real citation in ``source_message_url``
+        used to dedup-bypass into multiple auto-created Linear issues for
+        the same PR. Post-fix, neither submission auto-approves, so no
+        issue is created for either -- the exploit's payoff (multiple
+        auto-created issues for one PR) is gone, even though each
+        submission still lands in its own row (different ``target_id``
+        values are, correctly, not the same dedup key)."""
+        real_pr_url = "https://github.com/org/repo/pull/99"
+        with patch(
+            "service.linear_client.apply_open_ticket", AsyncMock()
+        ) as mock_apply_open_ticket:
+            first = await _submit(
+                session,
+                action=_action(
+                    action_type="open_ticket",
+                    target_id="bogus-dedup-key-1",
+                    title="Fix the thing",
+                    team="TECH",
+                    source_message_url=real_pr_url,
+                ),
+            )
+            second = await _submit(
+                session,
+                action=_action(
+                    action_type="open_ticket",
+                    target_id="bogus-dedup-key-2",
+                    title="Fix the thing",
+                    team="TECH",
+                    source_message_url=real_pr_url,
+                ),
+            )
+        assert first["status"] == "pending"
+        assert second["status"] == "pending"
+        mock_apply_open_ticket.assert_not_awaited()
+
+        rows = (await session.execute(select(ProposalHold))).scalars().all()
+        assert len(rows) == 2
+        assert {row.status for row in rows} == {"pending"}
+        _default_fetch_current_fingerprint.assert_not_called()
+
+    async def test_rule_exception_fails_closed_to_pending(self, session: AsyncSession) -> None:
+        """Registry refactor (fail-closed on rule errors): any exception a
+        rule raises (a future lane's real I/O failing, e.g. a transport
+        timeout) must never be mistaken for an "approved" verdict and must
+        never crash ``create_proposal`` outright -- it resolves to
+        "pending" instead, exactly like a rule that legitimately declined
+        to approve, and never reaches the Linear applier."""
+        raising_rule = AsyncMock(side_effect=RuntimeError("boom"))
+        with (
+            patch.dict(
+                "service._PROPOSAL_RULES",
+                {("linear_progress_update", "open_ticket"): raising_rule},
             ),
-            patch("service.linear_client.apply_progress_update", AsyncMock()) as mock_apply,
+            patch(
+                "service.linear_client.apply_progress_update", AsyncMock(return_value=None)
+            ) as mock_apply,
         ):
             result = await _submit(
                 session,
@@ -418,24 +617,22 @@ class TestJudgeIntegration:
                     source_message_url="https://redesignhealth.slack.com/archives/C1/p1",
                 ),
             )
-        assert result["status"] == "applied"
-        assert result["decision_source"] == "auto"
-        assert result["decided_by_actor_id"] == "system:judge"
-        mock_apply.assert_awaited_once()
-
-    async def test_open_ticket_without_citation_stays_pending(self, session: AsyncSession) -> None:
-        result = await _submit(session, action=_action(action_type="open_ticket"))
         assert result["status"] == "pending"
         assert "decision_source" not in result
+        raising_rule.assert_awaited_once()
+        mock_apply.assert_not_awaited()
+
+        rows = (await session.execute(select(ProposalHold))).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].status == "pending"
 
     async def test_unregistered_kind_raises(self, session: AsyncSession) -> None:
         """Argus review S7: an unrecognized ``kind`` now fails fast in
         ``_derive_proposal_priority`` (raising ``ValueError``, well before
-        the ``_PROPOSAL_JUDGES`` lookup this class otherwise covers) rather
-        than silently defaulting to a generic ``"medium"`` priority and
-        staying pending with no judge -- this replaces the pre-S7 version
-        of this test, which asserted that stays-pending-with-no-judge
-        fallback."""
+        the rule dispatch this class otherwise covers) rather than silently
+        defaulting to a generic ``"medium"`` priority and staying pending
+        with no rule -- this replaces the pre-S7 version of this test,
+        which asserted that stays-pending-with-no-judge fallback."""
         with pytest.raises(ValueError, match="unsupported kind"):
             await _submit(
                 session,
@@ -444,6 +641,44 @@ class TestJudgeIntegration:
                     source_message_url="https://redesignhealth.slack.com/archives/C1/p1"
                 ),
             )
+
+    async def test_submit_time_fingerprinter_failure_propagates_and_creates_no_row(
+        self, session: AsyncSession
+    ) -> None:
+        """Bug fix regression test: ``create_proposal`` now fetches the
+        target's current fingerprint server-side BEFORE creating or dedup'ing
+        the hold row. A ``LinearAPIError`` there (target missing, transport
+        failure) must propagate out of ``create_proposal`` uncaught, must not
+        create or update a ``ProposalHold`` row, and must never reach the
+        judge (rule) or the Linear applier. Uses the default action_type
+        (``close_ticket``, not exempt from fingerprinting -- see
+        ``_action``'s own docstring); the exempted case (``open_ticket``)
+        has its OWN regression coverage in ``TestJudgeIntegration``,
+        proving the opposite: that it does NOT hit the fingerprinter at
+        all, let alone fail here."""
+        mock_judge = AsyncMock(return_value=("approved", None))
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(side_effect=LinearAPIError("target issue does not exist")),
+            ) as mock_fingerprinter,
+            patch.dict(
+                "service._PROPOSAL_RULES",
+                {("linear_progress_update", "close_ticket"): mock_judge},
+            ),
+            patch(
+                "service.linear_client.apply_progress_update", AsyncMock(return_value=None)
+            ) as mock_apply,
+        ):
+            with pytest.raises(LinearAPIError, match="target issue does not exist"):
+                await _submit(session)
+
+        mock_fingerprinter.assert_awaited_once_with("TECH-1234")
+        mock_judge.assert_not_called()
+        mock_apply.assert_not_awaited()
+
+        rows = (await session.execute(select(ProposalHold))).scalars().all()
+        assert len(rows) == 0
 
     async def test_resubmit_with_citation_auto_approves_pending_row(
         self, session: AsyncSession
@@ -454,10 +689,15 @@ class TestJudgeIntegration:
         resubmission is expected to auto-approve the existing pending row
         in place -- this is not a new escalation path, so no additional
         guard is added for it; this test is the explicit regression
-        coverage the review asked for instead."""
-        first = await _submit(
-            session, action=_action(action_type="open_ticket", target_id="TECH-99")
-        )
+        coverage the review asked for instead. Uses the default
+        action_type (``close_ticket``) -- ``open_ticket``'s own version of
+        this same resubmit-dedups-then-applies scenario is covered
+        separately by ``TestJudgeIntegration::
+        test_open_ticket_resubmit_same_pr_url_dedups_then_creates_issue``,
+        since it exercises the create-issue applier and the
+        fingerprint-exemption path instead of this one's comment-posting
+        applier and normal fingerprint-match path."""
+        first = await _submit(session, action=_action(target_id="TECH-99"))
         assert first["status"] == "pending"
 
         with (
@@ -465,12 +705,11 @@ class TestJudgeIntegration:
                 "service.linear_client.fetch_current_fingerprint",
                 AsyncMock(return_value="deadbeef"),
             ),
-            patch("service.linear_client.apply_progress_update", AsyncMock()),
+            patch("service.linear_client.apply_progress_update", AsyncMock(return_value=None)),
         ):
             second = await _submit(
                 session,
                 action=_action(
-                    action_type="open_ticket",
                     target_id="TECH-99",
                     source_message_url="https://redesignhealth.slack.com/archives/C1/p1",
                 ),
@@ -482,6 +721,71 @@ class TestJudgeIntegration:
         rows = (await session.execute(select(ProposalHold))).scalars().all()
         assert len(rows) == 1
 
+    async def test_open_ticket_same_real_pr_citation_dedups_into_one_row(
+        self, session: AsyncSession, _default_fetch_current_fingerprint: AsyncMock
+    ) -> None:
+        """``open_ticket``-specific companion to
+        ``test_resubmit_with_citation_auto_approves_pending_row`` above,
+        adapted for the target_id/citation-unification fix (bug found in
+        review): a same-bot resubmission for the SAME real PR citation
+        (now ``target_id`` itself -- see ``service._rule_open_ticket``'s
+        docstring) dedups into the existing row -- the dedup
+        key/mechanism is unchanged (see
+        ``service._extract_proposal_target``'s docstring) -- and resolves
+        to ``"applied"`` via ``apply_open_ticket`` creating a real issue,
+        never via a fingerprint match (there is none to match against).
+
+        The first submission's rule is stubbed to stay pending (standing
+        in for a decision not yet made) purely so this test can exercise
+        the dedup-then-apply path against a real, UNCHANGING
+        ``target_id`` throughout -- since ``target_id`` is now the sole
+        judged field, a genuinely valid citation there approves on the
+        very first pass, so there is no honest way to keep the SAME real
+        citation pending across two submissions without stubbing the
+        rule for one of them."""
+        pr_url = "https://github.com/org/repo/pull/42"
+        stub_pending = AsyncMock(return_value=("pending", None))
+        with patch.dict(
+            "service._PROPOSAL_RULES",
+            {("linear_progress_update", "open_ticket"): stub_pending},
+        ):
+            first = await _submit(
+                session,
+                action=_action(
+                    action_type="open_ticket", target_id=pr_url, title="Fix the thing", team="TECH"
+                ),
+            )
+        assert first["status"] == "pending"
+        # Regression coverage (TECH-5873): submitting a genuinely NEW
+        # open_ticket proposal must never even attempt to fetch a
+        # fingerprint -- there is no pre-existing Linear issue to fetch
+        # one for.
+        _default_fetch_current_fingerprint.assert_not_called()
+
+        created = {
+            "id": "issue-uuid-2",
+            "identifier": "TECH-1000",
+            "url": "https://linear.app/redesignhealth/issue/TECH-1000",
+        }
+        with patch("service.linear_client.apply_open_ticket", AsyncMock(return_value=created)):
+            second = await _submit(
+                session,
+                action=_action(
+                    action_type="open_ticket",
+                    target_id=pr_url,
+                    title="Fix the thing",
+                    team="TECH",
+                ),
+            )
+        assert second["proposal_id"] == first["proposal_id"]
+        assert second["status"] == "applied"
+        assert second["decision_source"] == "auto"
+        assert second["apply_result"] == created
+
+        rows = (await session.execute(select(ProposalHold))).scalars().all()
+        assert len(rows) == 1
+        _default_fetch_current_fingerprint.assert_not_called()
+
     async def test_auto_apply_fingerprinter_failure_sets_apply_failed(
         self, session: AsyncSession
     ) -> None:
@@ -490,21 +794,36 @@ class TestJudgeIntegration:
         synchronous apply must resolve to ``apply_failed``, not propagate
         past ``create_proposal`` into a generic 500 -- the auto-apply
         path shares the same fingerprinter-wrapping bug the human-decide
-        path had."""
+        path had. Uses the default action_type (``close_ticket``): this is
+        a generic fingerprinter-wrapping mechanic, not anything
+        ``open_ticket``-specific -- ``open_ticket`` is exempt from the
+        fingerprinter entirely post-redefinition, so it can no longer
+        exercise this failure mode at all.
+
+        Two independent calls to the mocked fetch happen within this ONE
+        ``create_proposal`` call now (bug fix): the SUBMIT-time call that
+        computes the stored ``target_fingerprint`` (must succeed, or
+        ``create_proposal`` never even creates the row -- see its own
+        docstring), and the APPLY-time re-fetch this test is actually
+        about -- ``side_effect`` as a list lets the two disagree."""
         with (
             patch(
                 "service.linear_client.fetch_current_fingerprint",
                 AsyncMock(
-                    side_effect=LinearTokenMissingError("LINEAR_API_TOKEN is not configured")
+                    side_effect=[
+                        "fp-at-submit",
+                        LinearTokenMissingError("LINEAR_API_TOKEN is not configured"),
+                    ]
                 ),
             ),
-            patch("service.linear_client.apply_progress_update", AsyncMock()) as mock_apply,
+            patch(
+                "service.linear_client.apply_progress_update", AsyncMock(return_value=None)
+            ) as mock_apply,
         ):
             result = await _submit(
                 session,
                 action=_action(
-                    action_type="open_ticket",
-                    source_message_url="https://redesignhealth.slack.com/archives/C1/p1",
+                    source_message_url="https://redesignhealth.slack.com/archives/C1/p1"
                 ),
             )
         assert result["status"] == "apply_failed"
@@ -513,6 +832,264 @@ class TestJudgeIntegration:
         # a small allowlisted set (see `_sanitize_apply_error`).
         assert result["apply_error"] == "Linear API token not configured"
         mock_apply.assert_not_awaited()
+
+    async def test_auto_apply_target_drift_sets_honest_stale_decision_note(
+        self, session: AsyncSession
+    ) -> None:
+        """Bug fix regression test: a hold resolving to ``stale`` must
+        never carry a ``decision_note`` that reads as if a Linear write
+        happened. Pre-fix, the terminal write re-stamped the SAME
+        ``decision_note`` the auto-judge wrote at approval time verbatim
+        (e.g. ``"auto-approved: ..."``) onto a row where NO write ever
+        occurred. Drives that scenario directly: a target that drifted
+        between the submit-time fingerprint fetch and the immediately
+        following apply-time re-fetch, both within this one
+        ``create_proposal`` call (auto-judge synchronous apply). Uses the
+        default action_type (``close_ticket``): ``"stale"`` is
+        unreachable for ``open_ticket`` post-redefinition -- it is exempt
+        from the fingerprint/staleness check entirely (see
+        ``service._PROPOSAL_FINGERPRINT_EXEMPT``)."""
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(side_effect=["fp-at-submit", "fp-drifted-before-apply"]),
+            ),
+            patch(
+                "service.linear_client.apply_progress_update", AsyncMock(return_value=None)
+            ) as mock_apply,
+        ):
+            result = await _submit(
+                session,
+                action=_action(
+                    source_message_url="https://redesignhealth.slack.com/archives/C1/p1"
+                ),
+            )
+        assert result["status"] == "stale"
+        mock_apply.assert_not_awaited()
+        decision_note = result["decision_note"]
+        assert "no Linear write" in decision_note
+        # The original judge verdict is preserved for context, but must no
+        # longer be the WHOLE note -- that's what made the pre-fix row
+        # read as if the write succeeded.
+        assert "auto-approved: close-ticket proposal cites a valid citation" in decision_note
+        assert not decision_note.startswith("auto-approved")
+
+
+class TestFourNewLanesIntegration:
+    """TECH-5877 four new auto-approve lanes (``start_ticket``/
+    ``review_ticket``/``assign_ticket``/``label_ticket``) exercised
+    end-to-end through ``create_proposal``: submit -> judge -> (for these
+    four, unlike ``open_ticket``) apply-time fingerprint re-check -> real
+    Linear applier. Each rule's own approve/pending BEHAVIOR is already
+    exhaustively covered DB-free in ``tests/test_proposal_judge.py``; this
+    class only proves the full pipeline wiring (dispatch to the right
+    applier, priority, ``apply_result``) for one happy path and one
+    pending path per lane. The generic "a rule's exception fails closed to
+    pending" mechanism is covered once, kind-agnostically, by
+    ``test_rule_exception_fails_closed_to_pending`` above -- it patches
+    ``_PROPOSAL_RULES`` itself, so that coverage already extends to these
+    four lanes without needing a per-lane duplicate here."""
+
+    async def test_start_ticket_with_open_pr_and_backward_state_applies(
+        self, session: AsyncSession
+    ) -> None:
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(return_value="fp-stable"),
+            ),
+            patch(
+                "service.github_client.fetch_pull_request",
+                AsyncMock(return_value={"state": "open"}),
+            ),
+            patch(
+                "service.linear_client.fetch_issue",
+                AsyncMock(
+                    return_value={"state": {"id": "s0", "name": "Backlog", "type": "backlog"}}
+                ),
+            ),
+            patch(
+                "service.linear_client.apply_start_ticket", AsyncMock(return_value=None)
+            ) as mock_apply,
+        ):
+            result = await _submit(
+                session,
+                action=_action(
+                    action_type="start_ticket",
+                    target_id="TECH-1234",
+                    team="TECH",
+                    starting_pr_url="https://github.com/org/repo/pull/1",
+                ),
+            )
+        assert result["status"] == "applied"
+        assert result["decision_source"] == "auto"
+        assert result["priority"] == "low"
+        mock_apply.assert_awaited_once()
+
+    async def test_start_ticket_without_citation_stays_pending(
+        self, session: AsyncSession, _default_fetch_current_fingerprint: AsyncMock
+    ) -> None:
+        result = await _submit(
+            session, action=_action(action_type="start_ticket", target_id="TECH-1234")
+        )
+        assert result["status"] == "pending"
+        assert "decision_source" not in result
+
+    async def test_review_ticket_with_review_requested_applies(self, session: AsyncSession) -> None:
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(return_value="fp-stable"),
+            ),
+            patch(
+                "service.github_client.fetch_pull_request",
+                AsyncMock(
+                    return_value={
+                        "state": "open",
+                        "requested_reviewers": [{"login": "reviewer1"}],
+                        "requested_teams": [],
+                    }
+                ),
+            ),
+            patch(
+                "service.linear_client.fetch_issue",
+                AsyncMock(
+                    return_value={"state": {"id": "s1", "name": "In Progress", "type": "started"}}
+                ),
+            ),
+            patch(
+                "service.linear_client.apply_review_ticket", AsyncMock(return_value=None)
+            ) as mock_apply,
+        ):
+            result = await _submit(
+                session,
+                action=_action(
+                    action_type="review_ticket",
+                    target_id="TECH-1234",
+                    team="TECH",
+                    review_pr_url="https://github.com/org/repo/pull/1",
+                ),
+            )
+        assert result["status"] == "applied"
+        assert result["decision_source"] == "auto"
+        assert result["priority"] == "medium"
+        mock_apply.assert_awaited_once()
+
+    async def test_review_ticket_without_review_requested_stays_pending(
+        self, session: AsyncSession, _default_fetch_current_fingerprint: AsyncMock
+    ) -> None:
+        with patch(
+            "service.github_client.fetch_pull_request",
+            AsyncMock(
+                return_value={"state": "open", "requested_reviewers": [], "requested_teams": []}
+            ),
+        ):
+            result = await _submit(
+                session,
+                action=_action(
+                    action_type="review_ticket",
+                    target_id="TECH-1234",
+                    review_pr_url="https://github.com/org/repo/pull/1",
+                ),
+            )
+        assert result["status"] == "pending"
+        assert "decision_source" not in result
+
+    async def test_assign_ticket_with_mapped_author_matching_assignee_applies(
+        self, session: AsyncSession
+    ) -> None:
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(return_value="fp-stable"),
+            ),
+            patch.dict(identity_map.GITHUB_LOGIN_TO_LINEAR_USER_ID, {"octocat": "user-uuid-1"}),
+            patch(
+                "service.github_client.fetch_pull_request",
+                AsyncMock(return_value={"user": {"login": "octocat"}}),
+            ),
+            patch(
+                "service.linear_client.apply_assign_ticket", AsyncMock(return_value=None)
+            ) as mock_apply,
+        ):
+            result = await _submit(
+                session,
+                action=_action(
+                    action_type="assign_ticket",
+                    target_id="TECH-1234",
+                    assignee_pr_url="https://github.com/org/repo/pull/1",
+                    assignee_id="user-uuid-1",
+                ),
+            )
+        assert result["status"] == "applied"
+        assert result["decision_source"] == "auto"
+        assert result["priority"] == "low"
+        mock_apply.assert_awaited_once()
+
+    async def test_assign_ticket_with_unmapped_author_stays_pending(
+        self, session: AsyncSession, _default_fetch_current_fingerprint: AsyncMock
+    ) -> None:
+        """The self-approval hole this lane closes: an unmapped GitHub
+        login must never auto-approve, even though the proposed
+        ``assignee_id`` happens to match a DIFFERENT, mapped user."""
+        with (
+            patch.dict(identity_map.GITHUB_LOGIN_TO_LINEAR_USER_ID, {"octocat": "user-uuid-1"}),
+            patch(
+                "service.github_client.fetch_pull_request",
+                AsyncMock(return_value={"user": {"login": "someone-else"}}),
+            ),
+        ):
+            result = await _submit(
+                session,
+                action=_action(
+                    action_type="assign_ticket",
+                    target_id="TECH-1234",
+                    assignee_pr_url="https://github.com/org/repo/pull/1",
+                    assignee_id="user-uuid-1",
+                ),
+            )
+        assert result["status"] == "pending"
+        assert "decision_source" not in result
+
+    async def test_label_ticket_with_matching_label_applies(self, session: AsyncSession) -> None:
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(return_value="fp-stable"),
+            ),
+            patch(
+                "service.linear_client.apply_label_ticket", AsyncMock(return_value=None)
+            ) as mock_apply,
+        ):
+            result = await _submit(
+                session,
+                action=_action(
+                    action_type="label_ticket",
+                    target_id="TECH-1234",
+                    team="TECH",
+                    labeling_pr_url="https://github.com/org/my-repo/pull/5",
+                    label_name="target:my-repo",
+                ),
+            )
+        assert result["status"] == "applied"
+        assert result["decision_source"] == "auto"
+        assert result["priority"] == "low"
+        mock_apply.assert_awaited_once()
+
+    async def test_label_ticket_with_label_for_a_different_repo_stays_pending(
+        self, session: AsyncSession, _default_fetch_current_fingerprint: AsyncMock
+    ) -> None:
+        result = await _submit(
+            session,
+            action=_action(
+                action_type="label_ticket",
+                target_id="TECH-1234",
+                labeling_pr_url="https://github.com/org/my-repo/pull/5",
+                label_name="target:other-repo",
+            ),
+        )
+        assert result["status"] == "pending"
+        assert "decision_source" not in result
 
 
 class TestRateLimit:
@@ -556,7 +1133,7 @@ class TestOwnerSubVisibility:
                 "service.linear_client.fetch_current_fingerprint",
                 AsyncMock(return_value="deadbeef"),
             ),
-            patch("service.linear_client.apply_progress_update", AsyncMock()),
+            patch("service.linear_client.apply_progress_update", AsyncMock(return_value=None)),
         ):
             await _submit(
                 session,
@@ -726,19 +1303,30 @@ class TestListProposalHistoryForOwner:
         dropped ``applied``/``apply_failed``/``stale`` would pass every
         other test in this file. Drive one proposal to each of the
         remaining three terminal statuses via the same paths
-        ``TestDecideProposal`` uses below."""
-        applied_submitted = await _submit(
-            session,
-            owner_sub="owner-a@example.com",
-            action=_action(target_id="APPLIED"),
-            target_fingerprint="fp-match",
-        )
+        ``TestDecideProposal`` uses below.
+
+        ``target_fingerprint`` is server-computed at submission time now
+        (bug fix), so each submission below is wrapped in its own
+        ``fetch_current_fingerprint`` patch -- an independent mock call
+        site from the one the later ``decide_proposal`` call patches --
+        rather than trusting a caller-supplied literal. The APPLIED/
+        APPLY_FAILED cases use the SAME value at both call sites (a
+        genuinely unchanged target); STALE deliberately uses two
+        DIFFERENT values, to prove a real mismatch, not a shared
+        hardcoded string."""
+        with patch(
+            "service.linear_client.fetch_current_fingerprint",
+            AsyncMock(return_value="fp-applied-match"),
+        ):
+            applied_submitted = await _submit(
+                session, owner_sub="owner-a@example.com", action=_action(target_id="APPLIED")
+            )
         with (
             patch(
                 "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(return_value="fp-match"),
+                AsyncMock(return_value="fp-applied-match"),
             ),
-            patch("service.linear_client.apply_progress_update", AsyncMock()),
+            patch("service.linear_client.apply_progress_update", AsyncMock(return_value=None)),
         ):
             await decide_proposal(
                 session,
@@ -748,16 +1336,19 @@ class TestListProposalHistoryForOwner:
                 decision_note=None,
             )
 
-        apply_failed_submitted = await _submit(
-            session,
-            owner_sub="owner-a@example.com",
-            action=_action(target_id="APPLY_FAILED"),
-            target_fingerprint="fp-match",
-        )
+        with patch(
+            "service.linear_client.fetch_current_fingerprint",
+            AsyncMock(return_value="fp-apply-failed-match"),
+        ):
+            apply_failed_submitted = await _submit(
+                session,
+                owner_sub="owner-a@example.com",
+                action=_action(target_id="APPLY_FAILED"),
+            )
         with (
             patch(
                 "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(return_value="fp-match"),
+                AsyncMock(return_value="fp-apply-failed-match"),
             ),
             patch(
                 "service.linear_client.apply_progress_update",
@@ -772,12 +1363,13 @@ class TestListProposalHistoryForOwner:
                 decision_note=None,
             )
 
-        stale_submitted = await _submit(
-            session,
-            owner_sub="owner-a@example.com",
-            action=_action(target_id="STALE"),
-            target_fingerprint="fp-original",
-        )
+        with patch(
+            "service.linear_client.fetch_current_fingerprint",
+            AsyncMock(return_value="fp-original"),
+        ):
+            stale_submitted = await _submit(
+                session, owner_sub="owner-a@example.com", action=_action(target_id="STALE")
+            )
         with patch(
             "service.linear_client.fetch_current_fingerprint",
             AsyncMock(return_value="fp-drifted"),
@@ -857,13 +1449,24 @@ class TestDecideProposal:
     async def test_approve_matching_fingerprint_applies_and_calls_linear_once(
         self, session: AsyncSession
     ) -> None:
-        submitted = await _submit(session, target_fingerprint="fp-match")
+        """``target_fingerprint`` is server-computed at submission time now
+        (bug fix): the SUBMIT-time fetch and the later APPLY-time re-fetch
+        are two independent mock call sites here, not one hardcoded
+        literal shared between them -- both happen to return the same
+        value, representing a target that genuinely hasn't changed."""
+        with patch(
+            "service.linear_client.fetch_current_fingerprint",
+            AsyncMock(return_value="fp-match"),
+        ):
+            submitted = await _submit(session)
         with (
             patch(
                 "service.linear_client.fetch_current_fingerprint",
                 AsyncMock(return_value="fp-match"),
             ),
-            patch("service.linear_client.apply_progress_update", AsyncMock()) as mock_apply,
+            patch(
+                "service.linear_client.apply_progress_update", AsyncMock(return_value=None)
+            ) as mock_apply,
         ):
             decided = await decide_proposal(
                 session,
@@ -879,13 +1482,23 @@ class TestDecideProposal:
         mock_apply.assert_awaited_once_with(submitted["action"], "because reasons")
 
     async def test_approve_stale_fingerprint_skips_apply(self, session: AsyncSession) -> None:
-        submitted = await _submit(session, target_fingerprint="fp-original")
+        """The SUBMIT-time fetch and the APPLY-time re-fetch below are two
+        independent mock call sites returning two DIFFERENT values -- a
+        genuine mismatch, not a caller-supplied literal the test controls
+        on both ends."""
+        with patch(
+            "service.linear_client.fetch_current_fingerprint",
+            AsyncMock(return_value="fp-original"),
+        ):
+            submitted = await _submit(session)
         with (
             patch(
                 "service.linear_client.fetch_current_fingerprint",
                 AsyncMock(return_value="fp-drifted"),
             ),
-            patch("service.linear_client.apply_progress_update", AsyncMock()) as mock_apply,
+            patch(
+                "service.linear_client.apply_progress_update", AsyncMock(return_value=None)
+            ) as mock_apply,
         ):
             decided = await decide_proposal(
                 session,
@@ -898,7 +1511,11 @@ class TestDecideProposal:
         mock_apply.assert_not_awaited()
 
     async def test_approve_linear_failure_sets_apply_failed(self, session: AsyncSession) -> None:
-        submitted = await _submit(session, target_fingerprint="fp-match")
+        with patch(
+            "service.linear_client.fetch_current_fingerprint",
+            AsyncMock(return_value="fp-match"),
+        ):
+            submitted = await _submit(session)
         with (
             patch(
                 "service.linear_client.fetch_current_fingerprint",
@@ -923,14 +1540,16 @@ class TestDecideProposal:
         assert "applied_at" not in decided
 
     async def test_retrying_applied_hold_is_idempotent_no_op(self, session: AsyncSession) -> None:
-        submitted = await _submit(session, target_fingerprint="fp-match")
         with (
             patch(
                 "service.linear_client.fetch_current_fingerprint",
                 AsyncMock(return_value="fp-match"),
             ),
-            patch("service.linear_client.apply_progress_update", AsyncMock()) as mock_apply,
+            patch(
+                "service.linear_client.apply_progress_update", AsyncMock(return_value=None)
+            ) as mock_apply,
         ):
+            submitted = await _submit(session)
             first = await decide_proposal(
                 session,
                 approver_sub="owner-a@example.com",
@@ -984,7 +1603,9 @@ class TestDecideProposal:
                 "service.linear_client.fetch_current_fingerprint",
                 AsyncMock(side_effect=LinearAPIError("linear is down")),
             ),
-            patch("service.linear_client.apply_progress_update", AsyncMock()) as mock_apply,
+            patch(
+                "service.linear_client.apply_progress_update", AsyncMock(return_value=None)
+            ) as mock_apply,
         ):
             decided = await decide_proposal(
                 session,
@@ -1015,7 +1636,9 @@ class TestDecideProposal:
                 "service.linear_client.fetch_current_fingerprint",
                 AsyncMock(side_effect=asyncio.CancelledError()),
             ),
-            patch("service.linear_client.apply_progress_update", AsyncMock()) as mock_apply,
+            patch(
+                "service.linear_client.apply_progress_update", AsyncMock(return_value=None)
+            ) as mock_apply,
         ):
             with pytest.raises(asyncio.CancelledError):
                 await decide_proposal(
@@ -1066,7 +1689,11 @@ class TestDecideProposal:
         cancellation during the fingerprinter vs. during the applier are
         two distinct ``except asyncio.CancelledError`` sites in
         ``_apply_or_finalize_proposal_hold``."""
-        submitted = await _submit(session, target_fingerprint="fp-match")
+        with patch(
+            "service.linear_client.fetch_current_fingerprint",
+            AsyncMock(return_value="fp-match"),
+        ):
+            submitted = await _submit(session)
         hold_id = uuid.UUID(submitted["proposal_id"])
         with (
             patch(
@@ -1135,7 +1762,7 @@ class TestDecideProposal:
                 "service.linear_client.fetch_current_fingerprint",
                 AsyncMock(side_effect=asyncio.CancelledError("watchdog: 30s timeout")),
             ),
-            patch("service.linear_client.apply_progress_update", AsyncMock()),
+            patch("service.linear_client.apply_progress_update", AsyncMock(return_value=None)),
         ):
             with pytest.raises(asyncio.CancelledError):
                 await decide_proposal(
@@ -1198,7 +1825,9 @@ class TestDecideProposal:
                 "service.linear_client.fetch_current_fingerprint",
                 AsyncMock(side_effect=_mutate_then_cancel),
             ),
-            patch("service.linear_client.apply_progress_update", AsyncMock()) as mock_apply,
+            patch(
+                "service.linear_client.apply_progress_update", AsyncMock(return_value=None)
+            ) as mock_apply,
         ):
             with pytest.raises(asyncio.CancelledError):
                 await decide_proposal(
@@ -1227,7 +1856,11 @@ class TestDecideProposal:
         here via the fingerprinter mock's side effect), this call must
         raise 409, not silently return the concurrent state as its own
         200 (S4): this call never got to decide anything."""
-        submitted = await _submit(session, target_fingerprint="fp-match")
+        with patch(
+            "service.linear_client.fetch_current_fingerprint",
+            AsyncMock(return_value="fp-match"),
+        ):
+            submitted = await _submit(session)
         hold_id = uuid.UUID(submitted["proposal_id"])
 
         async def _mutate_then_fingerprint(_target_id: str) -> str:
@@ -1249,7 +1882,9 @@ class TestDecideProposal:
                 "service.linear_client.fetch_current_fingerprint",
                 AsyncMock(side_effect=_mutate_then_fingerprint),
             ),
-            patch("service.linear_client.apply_progress_update", AsyncMock()) as mock_apply,
+            patch(
+                "service.linear_client.apply_progress_update", AsyncMock(return_value=None)
+            ) as mock_apply,
         ):
             with pytest.raises(HoldAlreadyDecidedError) as exc_info:
                 await decide_proposal(
@@ -1287,7 +1922,9 @@ class TestDecideProposal:
         )
         await session.commit()
 
-        with patch("service.linear_client.apply_progress_update", AsyncMock()) as mock_apply:
+        with patch(
+            "service.linear_client.apply_progress_update", AsyncMock(return_value=None)
+        ) as mock_apply:
             with pytest.raises(HoldAlreadyDecidedError) as exc_info:
                 await decide_proposal(
                     session,

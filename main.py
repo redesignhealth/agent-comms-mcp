@@ -886,6 +886,12 @@ async def submit_proposal(request: Request) -> Response:
     bot's pending proposal.
     Immediately judged by the TECH-5877 kind-scoped deterministic rules
     engine -- ``priority`` is always server-derived, never caller-supplied.
+
+    ``target_fingerprint`` in the body is DEPRECATED and ignored (bug
+    fix): the value actually stored is computed server-side, by
+    re-fetching the target's current fingerprint at submission time --
+    see ``service.create_proposal``'s own docstring. Kept as an accepted
+    body field only for backward compatibility with existing callers.
     """
     bot_sub, bot_token, status = await _authenticate_proposal_submitter(request)
     if bot_sub is None or bot_token is None:

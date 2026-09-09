@@ -1,10 +1,20 @@
 """Thin Linear API client for synchronously applying decided
 ``proposal_holds`` of ``kind="linear_progress_update"`` (TECH-5873).
 
-Deliberately narrow -- two functions, ``fetch_current_fingerprint`` and
+Originally narrow -- two functions, ``fetch_current_fingerprint`` and
 ``apply_progress_update`` -- so ``service.decide_proposal`` can mock this
 module wholesale in tests (this repo has no CI, let alone a Linear sandbox,
 so nothing here is ever exercised against the real API in automated tests).
+Since grown ``fetch_issue`` (the raw fetch ``fetch_current_fingerprint`` now
+wraps) and three read-only ``resolve_*`` lookups (team/workflow-state/label),
+all three of which are now exercised: ``resolve_team_id``/
+``resolve_workflow_state_id`` by ``apply_open_ticket`` below (TECH-5873
+follow-up: ``open_ticket`` creates a brand-new Linear issue rather than
+commenting on a pre-existing one, so its applier needs to resolve a team
+KEY and, optionally, a workflow state NAME to Linear's internal IDs before
+it can create anything) and now also by ``apply_start_ticket``/
+``apply_review_ticket``/``apply_label_ticket`` (TECH-5877 follow-up auto-
+approve lanes) below; ``resolve_label_id`` by ``apply_label_ticket``.
 
 Called directly from agent-comms-mcp, not proxied back through whatever
 Prefect flow originally submitted the proposal -- that flow run is long
@@ -40,10 +50,36 @@ _ISSUE_QUERY = """
 query Issue($id: String!) {
   issue(id: $id) {
     id
-    state { id name }
+    state { id name type }
     priority
     assignee { id }
     updatedAt
+  }
+}
+"""
+
+_TEAM_BY_KEY_QUERY = """
+query TeamByKey($key: String!) {
+  teams(filter: { key: { eq: $key } }) {
+    nodes { id }
+  }
+}
+"""
+
+_TEAM_WORKFLOW_STATES_QUERY = """
+query TeamWorkflowStates($teamId: String!, $name: String!) {
+  team(id: $teamId) {
+    states(filter: { name: { eq: $name } }) {
+      nodes { id }
+    }
+  }
+}
+"""
+
+_LABEL_QUERY = """
+query LabelByName($teamId: String!, $name: String!) {
+  issueLabels(filter: { name: { eq: $name }, team: { id: { eq: $teamId } } }) {
+    nodes { id }
   }
 }
 """
@@ -56,18 +92,63 @@ mutation CreateComment($issueId: String!, $body: String!) {
 }
 """
 
+_ISSUE_CREATE_MUTATION = """
+mutation IssueCreate($input: IssueCreateInput!) {
+  issueCreate(input: $input) {
+    success
+    issue { id identifier url }
+  }
+}
+"""
+
+# Verified against Linear's real public GraphQL schema
+# (raw.githubusercontent.com/linear/linear/master/packages/sdk/src/schema.graphql,
+# same source used to verify every other mutation/query in this file) --
+# not guessed. ``issueUpdate(id, input: IssueUpdateInput!)`` covers both
+# the state-transition (``stateId``) and reassignment (``assigneeId``)
+# writes below; each call site scopes its own ``input`` to just the one
+# field it's changing, leaving every other field on the issue untouched.
+_ISSUE_UPDATE_MUTATION = """
+mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) {
+  issueUpdate(id: $id, input: $input) {
+    success
+  }
+}
+"""
+
+# TECH-5877 auto-approve lanes: adding a single label to an issue.
+# Deliberately NOT ``issueUpdate(input: { labelIds })`` -- per
+# ``IssueUpdateInput``'s own schema comment, ``labelIds`` REPLACES the
+# issue's full label set rather than adding to it (``addedLabelIds``/
+# ``removedLabelIds`` are the incremental alternative on that same input,
+# but this dedicated mutation is simpler and needs no separate fetch of
+# the issue's current labels first). Verified against the real schema:
+# ``issueAddLabel(id, labelId): IssuePayload!`` exists as a first-class
+# mutation for exactly this one-label-at-a-time case.
+_ISSUE_ADD_LABEL_MUTATION = """
+mutation IssueAddLabel($id: String!, $labelId: String!) {
+  issueAddLabel(id: $id, labelId: $labelId) {
+    success
+  }
+}
+"""
+
 # Design decision (TECH-5873, not fully specified by the ticket): the
-# actual Linear "write" for kind="linear_progress_update" is a comment
-# posted to the target issue, not an issue-state mutation -- this is a
-# progress-reporting bot (the name says so), and the two action_types the
-# judge understands (open_ticket/close_ticket -- see
-# citation_urls.CLOSE_TICKET_ACTION_TYPES for the close-ticket set, shared
-# with service.py to avoid semantic drift since Argus review round-4 S1)
-# read as "report that a ticket was opened/closed", not "mutate this
-# issue's workflow state" -- mutating state would additionally require
-# resolving a team-specific workflow state id, which the action payload
-# doesn't carry. A future kind that genuinely needs a state transition
-# gets its own applier function.
+# actual Linear "write" for kind="linear_progress_update"'s close_ticket
+# action_type is a comment posted to the target issue, not an issue-state
+# mutation -- this is a progress-reporting bot (the name says so), and
+# close_ticket (see citation_urls.CLOSE_TICKET_ACTION_TYPES for the
+# close-ticket set, shared with service.py to avoid semantic drift since
+# Argus review round-4 S1) reads as "report that a ticket was closed", not
+# "mutate this issue's workflow state" -- mutating state would
+# additionally require resolving a team-specific workflow state id, which
+# the action payload doesn't carry.
+#
+# open_ticket is the deliberate exception (redefined in place -- see
+# apply_open_ticket below): there is no pre-existing issue to comment on,
+# so its "write" genuinely IS an issue-creation mutation. A future kind
+# that needs a state transition on an EXISTING issue still gets its own
+# applier function, same as this reasoning always intended.
 
 
 class LinearAPIError(Exception):
@@ -92,6 +173,15 @@ class LinearTransportError(LinearAPIError):
     non-JSON body) -- as opposed to a well-formed response Linear returned
     with an error payload. A typed subclass (Argus review round-6
     suggestion) for the same reason as ``LinearTokenMissingError``."""
+
+
+class LinearNotFoundError(LinearAPIError):
+    """A ``resolve_*`` lookup (team key, workflow state name, label name)
+    found zero matching Linear records. A typed subclass, same convention
+    as ``LinearTokenMissingError``/``LinearTransportError`` above, so
+    future callers (a judge rule resolving a team/state/label at
+    auto-approve time) can distinguish "this name doesn't exist" from a
+    generic API failure."""
 
 
 def _require_api_token() -> str:
@@ -132,6 +222,15 @@ def compute_target_fingerprint(issue: dict[str, Any]) -> str:
     """Deterministic sha256 hex digest of the issue fields that matter for
     a ``linear_progress_update`` proposal's staleness check.
 
+    Field set: ``state_id``/``state_name``/``priority``/``assignee_id``
+    only -- ``updatedAt`` is deliberately EXCLUDED (bug fix: it used to be
+    part of this digest, but Linear bumps ``updatedAt`` on ANY touch,
+    including this same bot's own prior comment on the issue, so including
+    it made staleness fire on unrelated activity, not just on a
+    meaningful change to the ticket). Staleness now means "someone else
+    already moved this ticket's state/priority/assignee since the
+    proposal was submitted," not "any touch happened."
+
     CROSS-REPO CONTRACT: whatever submits the original proposal (a Prefect
     flow, per the ticket) must compute ``target_fingerprint`` the SAME way,
     over the SAME field set, or every decide will spuriously come back
@@ -141,7 +240,14 @@ def compute_target_fingerprint(issue: dict[str, Any]) -> str:
     defers back to this docstring rather than duplicating it -- don't
     re-point that cross-reference back here, or a cross-repo implementer
     following it lands on a paragraph that only says "see the
-    docstring").
+    docstring"). NOTE: as of the ``updatedAt``-removal bug fix above,
+    ``target_fingerprint`` is no longer trusted from whatever submits the
+    proposal at all -- ``service.create_proposal`` computes it itself via
+    ``fetch_current_fingerprint`` at submission time, ignoring any
+    caller-supplied value -- but this function's own field set/
+    serialization contract is unchanged by that and still matters for
+    anything that calls it directly (e.g. this repo's own apply-time
+    re-fetch).
 
     Exact serialization pinned here (Argus review round-5 S6 -- a
     same-inputs-different-bytes bug in either implementation would be
@@ -149,10 +255,8 @@ def compute_target_fingerprint(issue: dict[str, Any]) -> str:
     intentionally explicit rather than "whatever ``json.dumps`` happens to
     do"): ``json.dumps(..., sort_keys=True)`` with the library DEFAULT
     ``separators`` (``", "``/``": "``, i.e. a space after both `,` and `:`)
-    and DEFAULT ``ensure_ascii=True``; ``updated_at`` is the raw
-    ``updatedAt`` string as Linear's GraphQL API returns it (an ISO-8601
-    timestamp), not re-parsed or re-formatted. A cross-repo implementation
-    must match all of the above, not just the field set -- see
+    and DEFAULT ``ensure_ascii=True``. A cross-repo implementation must
+    match all of the above, not just the field set -- see
     ``test_pinned_digest_for_fixed_input`` in ``tests/test_linear_client.py``
     for the exact digest this scheme produces for a fixed input, which
     would need updating (with the other side of the contract) if any of
@@ -166,23 +270,104 @@ def compute_target_fingerprint(issue: dict[str, Any]) -> str:
             "state_name": state.get("name"),
             "priority": issue.get("priority"),
             "assignee_id": assignee.get("id"),
-            "updated_at": issue.get("updatedAt"),
         },
         sort_keys=True,
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-async def fetch_current_fingerprint(target_id: str) -> str:
-    """Fetch the current Linear issue state for ``target_id`` and return
-    its fingerprint (``compute_target_fingerprint``) -- used by
-    ``service.decide_proposal`` to detect drift since submission, before
-    applying anything."""
+async def fetch_issue(target_id: str) -> dict[str, Any]:
+    """Fetch the current state of a Linear issue for ``target_id``. Returns
+    the raw parsed GraphQL response fields (``state`` id/name/type,
+    ``priority``, ``assignee`` id, ``updatedAt``).
+
+    Used both by ``fetch_current_fingerprint`` below (staleness
+    fingerprinting -- see ``compute_target_fingerprint``'s docstring for
+    exactly which of these fields feed the hash) and by future judge
+    rules that need to reason about the issue's current workflow state
+    (``state.type``, via ``workflow_order.is_forward_transition``) --
+    that field is fetched here but is NOT part of the fingerprint (see
+    ``compute_target_fingerprint``'s docstring's field set)."""
     data = await _post_graphql(_ISSUE_QUERY, {"id": target_id})
     issue = data.get("issue")
     if not isinstance(issue, dict):
         raise LinearAPIError(f"Linear API returned no issue for id={target_id!r}")
-    return compute_target_fingerprint(issue)
+    return issue
+
+
+async def fetch_current_fingerprint(target_id: str) -> str:
+    """Fetch the current Linear issue state for ``target_id`` and return
+    its fingerprint (``compute_target_fingerprint``) -- called both by
+    ``service.create_proposal`` (to compute the fingerprint stored at
+    submission time, ignoring any caller-supplied ``target_fingerprint``)
+    and by ``service._apply_or_finalize_proposal_hold`` (``decide_proposal``/
+    the auto-judge's own apply) to detect drift since submission, before
+    applying anything."""
+    return compute_target_fingerprint(await fetch_issue(target_id))
+
+
+async def resolve_team_id(team_key: str) -> str:
+    """Resolve a Linear team key (e.g. ``"TECH"``) to its internal team ID.
+
+    Raises ``LinearNotFoundError`` if no team matches ``team_key``."""
+    data = await _post_graphql(_TEAM_BY_KEY_QUERY, {"key": team_key})
+    nodes = data.get("teams", {}).get("nodes", [])
+    if not nodes:
+        raise LinearNotFoundError(f"Linear API returned no team for key={team_key!r}")
+    team_id = nodes[0].get("id")
+    if not isinstance(team_id, str):
+        raise LinearAPIError(f"Linear API returned a team with no id for key={team_key!r}")
+    return team_id
+
+
+async def resolve_workflow_state_id(team_id: str, state_name: str) -> str:
+    """Resolve a workflow state NAME (e.g. ``"In Progress"``) to its
+    internal state ID, scoped to ``team_id`` (Linear workflow states are
+    per-team).
+
+    Matches ``state_name`` case-sensitively against Linear's exact display
+    name -- deliberately not case-folded, since that could produce a false
+    match. Raises ``LinearNotFoundError`` if no state on this team matches,
+    and (defensively -- state names should be unique per team, but this is
+    precision-critical for a future auto-approve context) if MORE than one
+    matches, rather than silently picking one."""
+    data = await _post_graphql(_TEAM_WORKFLOW_STATES_QUERY, {"teamId": team_id, "name": state_name})
+    team = data.get("team")
+    nodes = team.get("states", {}).get("nodes", []) if isinstance(team, dict) else []
+    if not nodes:
+        raise LinearNotFoundError(
+            f"Linear API returned no workflow state named {state_name!r} for team_id={team_id!r}"
+        )
+    if len(nodes) > 1:
+        raise LinearAPIError(
+            f"Linear API returned {len(nodes)} workflow states named {state_name!r} for "
+            f"team_id={team_id!r}, expected exactly one"
+        )
+    state_id = nodes[0].get("id")
+    if not isinstance(state_id, str):
+        raise LinearAPIError(
+            f"Linear API returned a workflow state with no id for name={state_name!r}"
+        )
+    return state_id
+
+
+async def resolve_label_id(team_id: str, name: str) -> str:
+    """Resolve a label NAME (e.g. ``"target:agent-comms-mcp"``) to its
+    internal label ID, scoped to ``team_id`` (labels can be team-specific
+    in Linear).
+
+    Raises ``LinearNotFoundError`` if no label on this team matches
+    ``name``."""
+    data = await _post_graphql(_LABEL_QUERY, {"teamId": team_id, "name": name})
+    nodes = data.get("issueLabels", {}).get("nodes", [])
+    if not nodes:
+        raise LinearNotFoundError(
+            f"Linear API returned no label named {name!r} for team_id={team_id!r}"
+        )
+    label_id = nodes[0].get("id")
+    if not isinstance(label_id, str):
+        raise LinearAPIError(f"Linear API returned a label with no id for name={name!r}")
+    return label_id
 
 
 def _omit_invalid_url_instead_of_raising(action_type: str, key: str) -> bool:
@@ -291,11 +476,308 @@ async def apply_progress_update(action: dict[str, Any], rationale: str) -> None:
         raise LinearAPIError("commentCreate returned success=false")
 
 
+async def create_ticket(
+    *,
+    title: str,
+    description: str,
+    team_id: str,
+    project_id: str | None = None,
+    state_id: str | None = None,
+) -> dict[str, str]:
+    """Create a Linear issue in ONE mutation, optionally landing it
+    directly in a target workflow state (so a create-then-close proposal
+    collapses into a single Linear write instead of two).
+
+    ``team_id``/``project_id``/``state_id`` are all Linear's internal IDs
+    (UUIDs), NOT human-readable names/keys -- resolve a team KEY or a
+    workflow state NAME via ``resolve_team_id``/``resolve_workflow_state_id``
+    before calling this. ``project_id`` is accepted as-is with no
+    resolution step here (see ``apply_open_ticket``'s docstring for why).
+
+    Returns ``{"id": ..., "identifier": ..., "url": ...}`` for the created
+    issue (``identifier`` is the human-readable ``TECH-####`` form).
+    Raises ``LinearAPIError`` if the mutation reports ``success=false`` or
+    omits any of those three fields on the returned issue -- same
+    fail-fast posture as every other function in this module; never
+    returns a partial result."""
+    issue_input: dict[str, Any] = {"teamId": team_id, "title": title, "description": description}
+    if project_id is not None:
+        issue_input["projectId"] = project_id
+    if state_id is not None:
+        issue_input["stateId"] = state_id
+    data = await _post_graphql(_ISSUE_CREATE_MUTATION, {"input": issue_input})
+    payload = data.get("issueCreate")
+    if not isinstance(payload, dict) or not payload.get("success"):
+        raise LinearAPIError("issueCreate returned success=false")
+    issue = payload.get("issue")
+    if not isinstance(issue, dict):
+        raise LinearAPIError("Linear API returned no issue from issueCreate")
+    issue_id, identifier, url = issue.get("id"), issue.get("identifier"), issue.get("url")
+    if not isinstance(issue_id, str) or not isinstance(identifier, str) or not isinstance(url, str):
+        raise LinearAPIError("Linear API returned an incomplete issue from issueCreate")
+    return {"id": issue_id, "identifier": identifier, "url": url}
+
+
+async def apply_open_ticket(action: dict[str, Any], rationale: str) -> dict[str, Any]:
+    """Applier for ``kind="linear_progress_update"``, ``action_type=
+    "open_ticket"`` (TECH-5873 redefinition): creates the Linear issue
+    described by ``action`` and returns metadata about what was created.
+    Called ONLY after staleness has already been checked by the caller --
+    though ``open_ticket`` is exempt from that check entirely (there is no
+    pre-existing target to have gone stale; see
+    ``service._PROPOSAL_FINGERPRINT_EXEMPT``), so in practice this is
+    always called unconditionally once the proposal is approved.
+
+    Expected ``action`` shape (beyond ``target_id``/``action_type``, which
+    ``service._extract_proposal_target`` already requires -- ``target_id``
+    is the PR URL that originated this proposal, per that function's own
+    docstring, and is NOT read by this applier at all):
+
+    - ``"title"`` (str, required): the new issue's title.
+    - ``"description"`` (str, optional, default ``""``): the new issue's
+      description, in markdown.
+    - ``"team"`` (str, required): the target team's KEY (e.g. ``"TECH"``),
+      NOT its internal UUID -- resolved via ``resolve_team_id``.
+    - ``"project"`` (str, optional): a raw Linear PROJECT ID to file the
+      issue under. Accepted as-is, no name resolution -- unlike
+      ``team``/``target_state``, a project has no per-team-scoped lookup
+      analogous to ``resolve_team_id``/``resolve_workflow_state_id`` in
+      this module today, so the caller is expected to already have the
+      ID (e.g. from whatever created the underlying proposal).
+    - ``"target_state"`` (str, optional): a workflow state NAME (e.g.
+      ``"Done"``) to create the issue directly into, resolved via
+      ``resolve_workflow_state_id`` scoped to the resolved team. Passing
+      this lets a create-then-close proposal collapse into the ONE
+      ``create_ticket`` mutation instead of a create followed by a
+      separate close.
+
+    ``rationale`` (the top-level ``ProposalHold`` column, same convention
+    as ``apply_progress_update``) is accepted for signature parity with
+    the shared applier-dispatch call site (``service.
+    _apply_or_finalize_proposal_hold`` always calls ``applier(action,
+    rationale)``) but is not itself written anywhere on the created issue
+    today -- there is no comment-posting step here to put it in.
+
+    Returns the created issue's ``{"id", "identifier", "url"}`` (see
+    ``create_ticket``) -- this dict flows back through
+    ``_apply_or_finalize_proposal_hold`` into ``hold.apply_result`` (see
+    ``models.ProposalHold``), the only way a caller learns the new
+    issue's ``TECH-####`` identifier.
+
+    Raises ``LinearAPIError`` on a missing/invalid ``title``/``team``, or
+    on any failure from ``resolve_team_id``/``resolve_workflow_state_id``/
+    ``create_ticket`` -- never a raw ``KeyError``/``TypeError``, matching
+    this module's "every function here only ever raises ``LinearAPIError``
+    (or a subclass)" contract, which ``_apply_or_finalize_proposal_hold``'s
+    exception handling depends on."""
+    title = action.get("title")
+    if not isinstance(title, str) or not title:
+        raise LinearAPIError("action.title is required and must be a non-empty string")
+    team = action.get("team")
+    if not isinstance(team, str) or not team:
+        raise LinearAPIError("action.team is required and must be a non-empty string")
+    description = action.get("description", "")
+    if not isinstance(description, str):
+        raise LinearAPIError("action.description must be a string")
+    project_id = action.get("project")
+    if project_id is not None and not isinstance(project_id, str):
+        raise LinearAPIError("action.project must be a string")
+    target_state = action.get("target_state")
+    if target_state is not None and not isinstance(target_state, str):
+        raise LinearAPIError("action.target_state must be a string")
+
+    team_id = await resolve_team_id(team)
+    state_id = (
+        await resolve_workflow_state_id(team_id, target_state) if target_state is not None else None
+    )
+    return await create_ticket(
+        title=title,
+        description=description,
+        team_id=team_id,
+        project_id=project_id,
+        state_id=state_id,
+    )
+
+
+async def update_issue_state(issue_id: str, state_id: str) -> None:
+    """Move an EXISTING Linear issue to a new workflow state via
+    ``issueUpdate(input: { stateId })`` (see ``_ISSUE_UPDATE_MUTATION``'s
+    comment for the schema-verification note).
+
+    ``issue_id``/``state_id`` are both Linear's internal IDs -- resolve a
+    workflow state NAME to its ID via ``resolve_workflow_state_id`` (scoped
+    to the issue's team, resolved via ``resolve_team_id``) before calling
+    this. Used by ``apply_start_ticket``/``apply_review_ticket`` below (the
+    ``start_ticket``/``review_ticket`` action_types move an existing issue
+    to "In Progress"/"In Review" respectively).
+
+    Raises ``LinearAPIError`` if the mutation reports ``success=false``."""
+    result = await _post_graphql(
+        _ISSUE_UPDATE_MUTATION, {"id": issue_id, "input": {"stateId": state_id}}
+    )
+    if not result.get("issueUpdate", {}).get("success"):
+        raise LinearAPIError("issueUpdate returned success=false")
+
+
+async def update_issue_assignee(issue_id: str, assignee_id: str) -> None:
+    """Reassign an EXISTING Linear issue via
+    ``issueUpdate(input: { assigneeId })`` -- the same mutation as
+    ``update_issue_state`` above, scoped to just the ``assigneeId`` field.
+
+    ``assignee_id`` is already a Linear internal user ID -- there is no
+    name to resolve here (unlike ``team``/workflow-state-name/label-name
+    elsewhere in this module), since the auto-approve rule that feeds this
+    (``service._rule_assign_ticket``) already verified the proposed id
+    against a GitHub-login identity map before approving. Used by
+    ``apply_assign_ticket`` below.
+
+    Raises ``LinearAPIError`` if the mutation reports ``success=false``."""
+    result = await _post_graphql(
+        _ISSUE_UPDATE_MUTATION, {"id": issue_id, "input": {"assigneeId": assignee_id}}
+    )
+    if not result.get("issueUpdate", {}).get("success"):
+        raise LinearAPIError("issueUpdate returned success=false")
+
+
+async def add_issue_label(issue_id: str, label_id: str) -> None:
+    """Add a single label to an EXISTING Linear issue via the DEDICATED
+    ``issueAddLabel(id, labelId)`` mutation -- see
+    ``_ISSUE_ADD_LABEL_MUTATION``'s comment for why this does NOT use
+    ``issueUpdate``'s replace-all-labels ``labelIds`` field. Used by
+    ``apply_label_ticket`` below.
+
+    Raises ``LinearAPIError`` if the mutation reports ``success=false``."""
+    result = await _post_graphql(_ISSUE_ADD_LABEL_MUTATION, {"id": issue_id, "labelId": label_id})
+    if not result.get("issueAddLabel", {}).get("success"):
+        raise LinearAPIError("issueAddLabel returned success=false")
+
+
+async def apply_start_ticket(action: dict[str, Any], rationale: str) -> None:
+    """Applier for ``kind="linear_progress_update"``, ``action_type=
+    "start_ticket"`` (TECH-5877): moves an EXISTING issue to "In Progress".
+    Called ONLY after staleness has already been checked by the caller --
+    unlike ``open_ticket``, ``start_ticket`` is NOT in
+    ``service._PROPOSAL_FINGERPRINT_EXEMPT``: its ``target_id`` IS a
+    pre-existing Linear issue id, so the normal re-fetch/staleness
+    comparison applies before this is ever called.
+
+    Expected ``action`` fields (beyond ``target_id``, already required by
+    ``service._extract_proposal_target``):
+
+    - ``"team"`` (str, required): the issue's team KEY (e.g. ``"TECH"``),
+      resolved via ``resolve_team_id`` -- workflow states are per-team in
+      Linear, so this is needed to resolve "In Progress" scoped to the
+      right team.
+
+    ``rationale`` is accepted for signature parity with the shared
+    applier-dispatch call site (same as ``apply_open_ticket``) but is not
+    itself written anywhere -- there is no comment-posting step here.
+
+    Raises ``LinearAPIError`` on a missing/invalid ``target_id``/``team``,
+    or on any failure from ``resolve_team_id``/``resolve_workflow_state_id``/
+    ``update_issue_state`` -- never a raw ``KeyError``/``TypeError``,
+    matching this module's established contract (see
+    ``apply_open_ticket``'s own docstring)."""
+    target_id = action.get("target_id")
+    if not isinstance(target_id, str) or not target_id:
+        raise LinearAPIError("action.target_id is required and must be a non-empty string")
+    team = action.get("team")
+    if not isinstance(team, str) or not team:
+        raise LinearAPIError("action.team is required and must be a non-empty string")
+
+    team_id = await resolve_team_id(team)
+    state_id = await resolve_workflow_state_id(team_id, "In Progress")
+    await update_issue_state(target_id, state_id)
+
+
+async def apply_review_ticket(action: dict[str, Any], rationale: str) -> None:
+    """Applier for ``action_type="review_ticket"`` (TECH-5877) -- same
+    shape as ``apply_start_ticket`` above, but moves the issue to
+    "In Review" instead of "In Progress". See that function's docstring
+    for the shared field/staleness/error-handling contract."""
+    target_id = action.get("target_id")
+    if not isinstance(target_id, str) or not target_id:
+        raise LinearAPIError("action.target_id is required and must be a non-empty string")
+    team = action.get("team")
+    if not isinstance(team, str) or not team:
+        raise LinearAPIError("action.team is required and must be a non-empty string")
+
+    team_id = await resolve_team_id(team)
+    state_id = await resolve_workflow_state_id(team_id, "In Review")
+    await update_issue_state(target_id, state_id)
+
+
+async def apply_assign_ticket(action: dict[str, Any], rationale: str) -> None:
+    """Applier for ``action_type="assign_ticket"`` (TECH-5877) -- reassigns
+    an existing issue to ``action["assignee_id"]``, already a Linear
+    internal user ID (the judge rule that approved this,
+    ``service._rule_assign_ticket``, already verified it against a
+    GitHub-login identity map -- no resolution step needed here, unlike
+    ``team``/workflow-state/label names elsewhere in this module).
+
+    Raises ``LinearAPIError`` on a missing/invalid ``target_id``/
+    ``assignee_id``, or on any failure from ``update_issue_assignee``."""
+    target_id = action.get("target_id")
+    if not isinstance(target_id, str) or not target_id:
+        raise LinearAPIError("action.target_id is required and must be a non-empty string")
+    assignee_id = action.get("assignee_id")
+    if not isinstance(assignee_id, str) or not assignee_id:
+        raise LinearAPIError("action.assignee_id is required and must be a non-empty string")
+
+    await update_issue_assignee(target_id, assignee_id)
+
+
+async def apply_label_ticket(action: dict[str, Any], rationale: str) -> None:
+    """Applier for ``action_type="label_ticket"`` (TECH-5877) -- adds
+    ``action["label_name"]`` to an existing issue via ``add_issue_label``
+    (the dedicated add-only mutation -- see that function's docstring for
+    why this does NOT use ``issueUpdate``'s replace-all-labels
+    ``labelIds`` field).
+
+    Expected ``action`` fields (beyond ``target_id``/``label_name``):
+
+    - ``"team"`` (str, required): the label's team KEY, resolved via
+      ``resolve_team_id`` -- labels can be team-scoped in Linear, so this
+      is needed to resolve ``label_name`` scoped to the right team via
+      ``resolve_label_id``.
+
+    Raises ``LinearAPIError`` on a missing/invalid ``target_id``/``team``/
+    ``label_name``, or on any failure from ``resolve_team_id``/
+    ``resolve_label_id``/``add_issue_label``."""
+    target_id = action.get("target_id")
+    if not isinstance(target_id, str) or not target_id:
+        raise LinearAPIError("action.target_id is required and must be a non-empty string")
+    team = action.get("team")
+    if not isinstance(team, str) or not team:
+        raise LinearAPIError("action.team is required and must be a non-empty string")
+    label_name = action.get("label_name")
+    if not isinstance(label_name, str) or not label_name:
+        raise LinearAPIError("action.label_name is required and must be a non-empty string")
+
+    team_id = await resolve_team_id(team)
+    label_id = await resolve_label_id(team_id, label_name)
+    await add_issue_label(target_id, label_id)
+
+
 __all__ = [
     "LinearAPIError",
+    "LinearNotFoundError",
     "LinearTokenMissingError",
     "LinearTransportError",
+    "add_issue_label",
+    "apply_assign_ticket",
+    "apply_label_ticket",
+    "apply_open_ticket",
     "apply_progress_update",
+    "apply_review_ticket",
+    "apply_start_ticket",
     "compute_target_fingerprint",
+    "create_ticket",
     "fetch_current_fingerprint",
+    "fetch_issue",
+    "resolve_label_id",
+    "resolve_team_id",
+    "resolve_workflow_state_id",
+    "update_issue_assignee",
+    "update_issue_state",
 ]
