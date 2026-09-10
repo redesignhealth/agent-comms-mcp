@@ -49,6 +49,17 @@ on:
         type: number
 
 concurrency:
+  # NOTE: the workflow_run path keys on head_branch while the
+  # workflow_dispatch path keys on pr_number, so these two trigger paths do
+  # NOT serialize against each other. This is intentional, not an oversight:
+  # `concurrency:` is evaluated before any step runs, so it cannot reference
+  # a step output (e.g. a PR number resolved from workflow_run's raw event
+  # context) -- there is no clean way to unify these two paths' keys given
+  # that structural constraint. This grouping is only a best-effort
+  # throughput optimization to reduce redundant runs; the actual correctness
+  # guarantee against duplicate approvals is the review-dedup check in the
+  # "Auto-approve PR" job step below. Do not attempt a workaround here that
+  # reintroduces fragility.
   group: "auto-approve-${{ github.event.workflow_run.head_branch || github.event.inputs.pr_number }}"
   # Do not cancel an in-flight run: the TOCTOU SHA guards below already
   # handle staleness correctly, so cancellation would only risk killing a
@@ -243,16 +254,25 @@ jobs:
             --query 'Parameter.Value' --output text)
 
           if [ -z "$API_KEY" ]; then
-            echo "::error::SSM parameter /general/prod/api-secret-key returned an empty value"
-            exit 1
+            # A non-zero exit here would skip the later "Post Argus approval
+            # required" step too (it's gated on this step succeeding),
+            # producing total silence on a genuine SSM misconfiguration.
+            # Match the non-2xx HTTP response case below instead: fall
+            # through to "not approved" so the fallback comment still posts.
+            echo "::warning::Argus API key parameter returned an empty value -- treating as not approved"
+            echo "approved=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
           # Workflow commands like ::add-mask:: are only recognized on
           # stdout, not stderr -- must run before $API_KEY is used anywhere.
           # Mask every line so embedded newlines do not leave partial credentials unmasked.
+          # Trailing `|| true`: a read-loop can exit non-zero on its final
+          # iteration in some shells, which would otherwise fail this whole
+          # step under `set -e`.
           printf '%s\n' "$API_KEY" | while IFS= read -r line; do
             [ -n "$line" ] && echo "::add-mask::$line"
-          done
+          done || true
 
           # Don't use curl -f: a non-2xx response should resolve to "not
           # approved" (falls through to the "waiting on Argus" comment step),
@@ -300,10 +320,74 @@ jobs:
             const prNumber = parseInt(process.env.PR_NUMBER, 10);
             const reviewedSha = process.env.REVIEWED_SHA;
             const shortSha = reviewedSha.substring(0, 7);
+            const marker = `<!-- argus-gate-approval:${reviewedSha} -->`;
+
+            // Best-effort label -- create it first if it doesn't already
+            // exist on this repo, rather than assuming it does. Factored out
+            // so it can also be (re-)applied on the already-approved path
+            // below, in case a prior run approved but failed before reaching
+            // this point.
+            async function applyAutoApprovedLabel() {
+              try {
+                await github.rest.issues.getLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: 'auto-approved',
+                });
+              } catch (e) {
+                if (e.status !== 404) throw e;
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: 'auto-approved',
+                  color: '0e8a16',
+                  description: 'Automatically approved by the Argus auto-approve workflow',
+                });
+              }
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                labels: ['auto-approved'],
+              });
+            }
+
+            // De-duplicate FIRST, before the TOCTOU HEAD re-check below:
+            // paginating through reviews can take multiple sequential API
+            // round-trips, so doing this check AFTER the HEAD check (as an
+            // earlier round did) reopens the exact TOCTOU window that check
+            // exists to close -- createReview would still fire afterward
+            // pinned to the now-stale reviewedSha. Match on this workflow's
+            // own marker (not just bot identity/commit_id/state), so some
+            // other github-actions[bot]-attributed approval on this repo
+            // can't be mistaken for this gate's own.
+            const existingReviews = await github.paginate(
+              github.rest.pulls.listReviews,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+              }
+            );
+            const alreadyApproved = existingReviews.some(review =>
+              review.commit_id === reviewedSha &&
+              review.user?.login === 'github-actions[bot]' &&
+              review.state === 'APPROVED' &&
+              review.body?.includes(marker)
+            );
+            if (alreadyApproved) {
+              core.info(`PR #${prNumber} already approved at SHA ${reviewedSha} by github-actions[bot], skipping duplicate review`);
+              // Still (re-)apply the label -- a prior run may have approved
+              // successfully but failed before reaching label application.
+              await applyAutoApprovedLabel();
+              return;
+            }
 
             // Re-validate PR HEAD immediately before approving (TOCTOU guard).
             // If new commits were pushed while CI or Argus was being checked,
-            // abort approval to avoid approving unreviewed code.
+            // abort approval to avoid approving unreviewed code. Kept as the
+            // LAST check before createReview, with nothing of meaningful
+            // latency in between, so this is the freshest possible signal.
             const pr = await github.rest.pulls.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -325,26 +409,6 @@ jobs:
               return;
             }
 
-            // De-duplicate: paginate through all reviews to skip if already
-            // approved for this exact full SHA by github-actions[bot].
-            const existingReviews = await github.paginate(
-              github.rest.pulls.listReviews,
-              {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                pull_number: prNumber,
-              }
-            );
-            const alreadyApproved = existingReviews.some(review =>
-              review.commit_id === reviewedSha &&
-              review.user?.login === 'github-actions[bot]' &&
-              review.state === 'APPROVED'
-            );
-            if (alreadyApproved) {
-              core.info(`PR #${prNumber} already approved at SHA ${reviewedSha} by github-actions[bot], skipping duplicate review`);
-              return;
-            }
-
             // Pinned to the exact commit that was reviewed -- never approve
             // if the PR has moved since CI/Argus were checked above.
             await github.rest.pulls.createReview({
@@ -354,6 +418,7 @@ jobs:
               commit_id: reviewedSha,
               event: 'APPROVE',
               body: [
+                marker,
                 '## Auto-Approved (Argus)',
                 '',
                 `CI passed and Argus reached an APPROVE verdict for this PR at commit \`${shortSha}\`.`,
@@ -367,30 +432,7 @@ jobs:
               ].join('\n'),
             });
 
-            // Best-effort label -- create it first if it doesn't already
-            // exist on this repo, rather than assuming it does.
-            try {
-              await github.rest.issues.getLabel({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                name: 'auto-approved',
-              });
-            } catch (e) {
-              if (e.status !== 404) throw e;
-              await github.rest.issues.createLabel({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                name: 'auto-approved',
-                color: '0e8a16',
-                description: 'Automatically approved by the Argus auto-approve workflow',
-              });
-            }
-            await github.rest.issues.addLabels({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: prNumber,
-              labels: ['auto-approved'],
-            });
+            await applyAutoApprovedLabel();
 
             core.info(`PR #${prNumber} auto-approved at ${reviewedSha}`);
 
