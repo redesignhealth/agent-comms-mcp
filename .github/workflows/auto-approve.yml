@@ -9,7 +9,7 @@
 # multi-agent GHA review matrix -- only the Argus gate below. There are exactly
 # three terminal outcomes: approve, a "waiting on Argus" comment, or an
 # infra-failure comment (bad/missing AWS credentials, a misconfigured Argus
-# API key, or the Argus API itself being unreachable) -- a fourth, implicit
+# API key, or the Argus API being unreachable or returning a server error) -- a fourth, implicit
 # outcome -- CI hasn't passed yet -- is handled by simply not running the
 # Argus-check steps at all.
 #
@@ -226,8 +226,9 @@ jobs:
           # Triggering on workflow_run ensures this executes under default-branch
           # ref context (ref:refs/heads/main), satisfying the IAM trust policy.
           # The role is provisioned via redesignhealth/rh-data-platform#8896;
-          # until applied, this step continues on error and subsequent steps
-          # are skipped -- a safe, fail-closed default.
+          # until applied, this step continues on error, the "Post Argus approval
+          # required" step posts an "Argus Auto-Approval Unavailable" comment,
+          # and PRs fall back to a human review -- a safe, fail-closed default.
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/rh-argus-gate-2
           aws-region: us-east-1
 
@@ -280,7 +281,7 @@ jobs:
             if [ -n "$line" ]; then
               echo "::add-mask::$line"
             fi
-          done || true
+          done
 
           # Don't use curl -f: a non-2xx response should resolve to "not
           # approved" (falls through to the "waiting on Argus" comment step),
@@ -305,7 +306,8 @@ jobs:
                 echo "infra_failure=true" >> "$GITHUB_OUTPUT"
                 ;;
               [1-9][0-9][0-9])
-                # Other 4xx (e.g. 404) -- an ordinary "not approved".
+                # Other numeric status (non-401/403 4xx; in theory also
+                # 1xx/2xx/3xx not matched above) -- treat as ordinary not-approved.
                 ;;
               *)
                 # Empty or non-numeric status means curl itself failed (e.g.
@@ -317,7 +319,7 @@ jobs:
             exit 0
           fi
 
-          APPROVED=$(echo "$HTTP_BODY" | python3 -c "
+          if ! APPROVED=$(echo "$HTTP_BODY" | python3 -c "
           import json, os, sys
           data = json.load(sys.stdin)
           rounds = data.get('rounds', [])
@@ -327,7 +329,12 @@ jobs:
               for r in rounds
           )
           print('true' if approved else 'false')
-          ")
+          "); then
+            echo "::error::Failed to parse Argus API response as JSON for PR #${PR_NUMBER} -- treating as not approved (infra failure)"
+            echo "approved=false" >> "$GITHUB_OUTPUT"
+            echo "infra_failure=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           echo "approved=$APPROVED" >> "$GITHUB_OUTPUT"
 
@@ -514,7 +521,7 @@ jobs:
                   marker,
                   '## Argus Auto-Approval Unavailable',
                   '',
-                  'Auto-approval could not run: the Argus API key is misconfigured (SSM/IAM issue) -- this needs platform-team attention, not another `/argus-review-loop` run.',
+                  'Auto-approval could not run: bad/missing AWS credentials, a misconfigured Argus API key, or the Argus API being unreachable or returning a server error -- this needs platform-team attention, not another `/argus-review-loop` run.',
                   '',
                   'To bypass, request a human reviewer directly.',
                   '',

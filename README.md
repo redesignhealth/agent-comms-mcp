@@ -290,10 +290,10 @@ this PR:
   this SHA yet. Run `/argus-review-loop <pr_number>` in a Claude Code session
   and push again.
 - **"Argus Auto-Approval Unavailable"** -- an infra failure (bad/missing AWS
-  credentials, a misconfigured Argus API key, or the Argus API itself being
-  unreachable) prevented the check from running at all. Running
-  `/argus-review-loop` again will not help; this needs platform-team
-  attention, or a human reviewer in the meantime.
+  credentials, a misconfigured Argus API key, or the Argus API being
+  unreachable or returning a server error (5xx)) prevented the check from
+  running at all. Running `/argus-review-loop` again will not help; this needs
+  platform-team attention, or a human reviewer in the meantime.
 
 Both comments share a single per-SHA marker, so a later run updates the
 existing comment in place rather than posting a second, contradictory one.
