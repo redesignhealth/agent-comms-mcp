@@ -395,7 +395,7 @@ docker compose up --build
 | `DECISION_PAGE_BASE_URL` | Base URL of the separate `agent-comms-approvals-decision-page` service. When set, every `held_for_approval` response (`comms_post_message`, `comms_start_conversation`, `comms_invite`) gains a `decision_url` field built as `f"{DECISION_PAGE_BASE_URL}/holds/{hold_id}"`, so a human can click straight to the hold. Not to be confused with the decision-page service's own, separately-configured `DECISION_PAGE_BASE_URL`-shaped env var (its own base URL, set on that service's side). Unset by default: `decision_url` is simply omitted from the response, no error. |
 | `LINEAR_API_TOKEN` | A Linear **personal API token** (not an OAuth workspace token -- see `.env.example`; the client sends it unprefixed, without a `Bearer` prefix) for `linear_client.py`'s direct Linear API calls, used when a `POST /proposals/{id}/decide` approval or an auto-approved submission applies a `linear_progress_update` proposal. The server runs without it, but any such apply resolves to `apply_failed` if it's unset. |
 | `GITHUB_TOKEN` | A GitHub personal access token (fine-grained, read-only `pull_requests` + `contents`) for `github_client.py`'s direct GitHub API calls, used by the `open_ticket`/`start_ticket`/`review_ticket`/`assign_ticket`/`label_ticket` auto-approve judge lanes (`service.py`) to verify a cited PR before approving. Sent as `Authorization: Bearer <token>` (unlike `LINEAR_API_TOKEN` above, which is sent raw). If unset, those lanes fail closed -- they silently stay `"pending"` rather than crashing or auto-approving; see `service.py`'s judge error-handling docstring. |
-| `PROPOSAL_OPEN_TICKET_TEAM_ALLOWLIST` | A JSON array of Linear team KEYS (e.g. `["TECH"]`) the `open_ticket` auto-approve judge lane (`service._rule_open_ticket`) is allowed to auto-create an issue into, for `team_allowlist.py`'s server-side allowlist -- `action["team"]` is bot-asserted and, unlike the other auto-approve lanes, `open_ticket` has no pre-existing target to cross-check it against. A malformed value logs a warning and falls back to an empty set; an unset or empty env var falls back silently to an empty set (neither is fatal) -- an empty set is always safe, but it leaves `open_ticket` permanently inert (never auto-approves) until populated with real data. |
+| `PROPOSAL_OPEN_TICKET_TEAM_ALLOWLIST` | A JSON array of Linear team KEYS (e.g. `["TECH"]`) the `open_ticket` auto-approve judge lane (`service._rule_open_ticket`) is allowed to auto-create an issue into, for `team_allowlist.py`'s server-side allowlist -- `open_ticket` creates a brand-new issue with no existing ticket to anchor to at all (whereas the other auto-approve lanes at least require a real PR referencing an existing target ticket), so an allowlist is required to bound which team receives newly-created issues. A malformed value logs a warning and falls back to an empty set; an unset or empty env var falls back silently to an empty set (neither is fatal) -- an empty set is always safe, but it leaves `open_ticket` permanently inert (never auto-approves) until populated with real data. |
 
 > [!WARNING]
 > **Deployment prerequisites for the approve/apply and auto-approve paths (TECH-5874).** In ECS
@@ -426,6 +426,10 @@ docker compose up --build
 >   container's environment (or in SSM).
 > - On a real approve/auto-apply test, confirm `apply_error` is absent and the
 >   proposal transitions to `"applied"`, not silently remaining `"pending"`.
+> - Note (TECH-6153): `/reclaw-comms/{env}/github-login-to-linear-user-id-json` (and
+>   its ECS task-definition env-var wiring) in `rh-data-platform`'s Terraform is
+>   now orphaned following the removal of assignee identity verification and
+>   should be cleaned up in a follow-up there.
 
 `entrypoint.sh` runs `alembic upgrade head` automatically on every container
 start, so migrations apply before the server accepts traffic.

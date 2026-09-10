@@ -1469,22 +1469,30 @@ registered. Any exception from a rule fails closed to `pending`.
   have review requested, `action.team` must be present, and the current
   workflow state must be strictly before `In Review`.
 - `assign_ticket`: artifact-backed. The cited PR must exist and actually
-  reference `target_id`, and `action.assignee_id` must be present.
-  **Design decision, not an oversight:** this lane deliberately does NOT
-  cross-check the proposed assignee against the cited PR's actual author.
-  An earlier version did, via a server-side GitHub-login-to-Linear-user-id
-  map (closing a self-approval hole where a bot could fabricate an
-  author-to-assignee match to justify assigning itself/an accomplice), but
-  the product owner has since decided that requirement is unnecessary: this
-  service tracks outstanding work, not a credit/attribution system, so who
-  ends up assigned is not worth cross-checking -- only that a real,
-  on-topic PR exists. A future review should read this as an intentional,
-  accepted tradeoff, not a newly-discovered gap.
+  reference `target_id`, and `action.assignee_id` must be present and a
+  valid UUID string.
+  **Design decision (TECH-6153), not an oversight:** this lane deliberately
+  enforces NEITHER attribution NOR authorization on the proposed assignee.
+  An earlier version required the proposed assignee to match the cited PR's
+  actual author via a server-side GitHub-login-to-Linear-user-id map (closing
+  a self-approval hole where a bot could fabricate an author-to-assignee match
+  to justify assigning itself/an accomplice). Per Linear decision record
+  **TECH-6153**, the product owner explicitly confirmed that BOTH attribution
+  and authorization constraints are removed: (a) attribution: who gets
+  assigned is not cross-checked against who authored the PR, because this
+  service tracks outstanding work rather than acting as a credit/attribution
+  system; and (b) authorization: there is NO authorization anchor at all on
+  who can be assigned -- no team-membership check and no bound on which
+  Linear user UUID the bot proposes. A bot can cite any real PR referencing
+  the target ticket and assign it to any Linear user it names. A future review
+  should read this as a confirmed, deliberate, doubly-considered tradeoff
+  (per TECH-6153), not a newly-discovered gap.
 - `label_ticket`: artifact-backed. The requested label must be exactly
   `target:<repo>` derived from the cited PR URL's repo, `action.team` must
   be present, and the cited PR must actually exist (a live
   `fetch_pull_request` call, state not gated -- same "existence, not
-  openness" reasoning as `open_ticket` above).
+  openness" reasoning as `open_ticket` above) and actually reference
+  `target_id`.
 - Any other `action_type` stays pending via `_PROPOSAL_KIND_DEFAULT_RULE`.
 
 Unsupported changes stay human-only: priority changes, ticket cancellation,

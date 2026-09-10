@@ -654,12 +654,18 @@ async def update_issue_assignee(issue_id: str, assignee_id: str) -> None:
 
     ``assignee_id`` is already a Linear internal user ID -- there is no
     name to resolve here (unlike ``team``/workflow-state-name/label-name
-    elsewhere in this module). The auto-approve rule that feeds this
-    (``service._rule_assign_ticket``) already verified that a real,
-    existing PR was cited and that PR actually references the target
-    ticket (via ``_pull_request_references_ticket``) before approving --
-    not that the assignee matches the PR's author. Used by
-    ``apply_assign_ticket`` below.
+    elsewhere in this module). Per TECH-6153, the auto-approve rule that
+    feeds this (``service._rule_assign_ticket``) verifies that a real,
+    existing PR was cited and actually references the target ticket
+    (via ``_pull_request_references_ticket``), but deliberately enforces
+    neither attribution nor authorization: (a) the assignee's identity
+    is not verified against the PR author (this service tracks outstanding
+    work, not credit/attribution), and (b) there is no authorization anchor
+    at all on who can be assigned -- no team-membership check and no bound
+    on which Linear user UUID the bot proposes. A bot can cite any real PR
+    referencing the target ticket and assign it to any Linear user it names,
+    a confirmed, deliberate, doubly-considered tradeoff per TECH-6153.
+    Used by ``apply_assign_ticket`` below.
 
     Raises ``LinearAPIError`` if the mutation reports ``success=false``."""
     result = await _post_graphql(
@@ -755,12 +761,21 @@ async def apply_review_ticket(action: dict[str, Any], rationale: str) -> None:
 async def apply_assign_ticket(action: dict[str, Any], rationale: str) -> None:
     """Applier for ``action_type="assign_ticket"`` (TECH-5877) -- reassigns
     an existing issue to ``action["assignee_id"]``, already a Linear
-    internal user ID (the judge rule that approved this,
-    ``service._rule_assign_ticket``, already verified that a real, existing
-    PR was cited and that PR actually references the target ticket via
-    ``_pull_request_references_ticket`` -- not that the assignee matches
-    the PR's author; no resolution step needed here, unlike
+    internal user ID (no resolution step needed here, unlike
     ``team``/workflow-state/label names elsewhere in this module).
+
+    Per TECH-6153, the judge rule that approved this
+    (``service._rule_assign_ticket``) verified that a real, existing PR was
+    cited and actually references the target ticket via
+    ``_pull_request_references_ticket``, but deliberately enforces neither
+    attribution nor authorization: (a) the assignee's identity is not
+    verified against the PR author (this service tracks outstanding work,
+    not a credit/attribution system), and (b) there is no authorization
+    anchor at all on who can be assigned -- no team-membership check and
+    no bound on which Linear user UUID the bot proposes. A bot can cite any
+    real PR referencing the target ticket and assign it to any Linear user
+    it names, a confirmed, deliberate, doubly-considered tradeoff per
+    TECH-6153.
 
     Raises ``LinearAPIError`` on a missing/invalid ``target_id``/
     ``assignee_id``, or on any failure from ``update_issue_assignee``."""

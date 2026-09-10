@@ -1319,7 +1319,7 @@ class TestFourNewLanesIntegration:
                     action_type="assign_ticket",
                     target_id="TECH-1234",
                     assignee_pr_url="https://github.com/org/repo/pull/1",
-                    assignee_id="user-uuid-1",
+                    assignee_id="11111111-1111-1111-1111-111111111111",
                 ),
             )
         assert result["status"] == "applied"
@@ -1354,7 +1354,38 @@ class TestFourNewLanesIntegration:
                     action_type="assign_ticket",
                     target_id="TECH-1234",
                     assignee_pr_url="https://github.com/org/repo/pull/1",
-                    assignee_id="some-arbitrary-linear-user-id",
+                    assignee_id="22222222-2222-2222-2222-222222222222",
+                ),
+            )
+        assert result["status"] == "applied"
+        assert result["decision_source"] == "auto"
+        mock_apply.assert_awaited_once()
+
+    async def test_assign_ticket_with_pr_missing_user_field_applies(
+        self, session: AsyncSession
+    ) -> None:
+        """Behavioral contract at integration level: a PR with no 'user'
+        field at all auto-approves and applies cleanly."""
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(return_value="fp-stable"),
+            ),
+            patch(
+                "service.github_client.fetch_pull_request",
+                AsyncMock(return_value={"title": "Fix TECH-1234"}),
+            ),
+            patch(
+                "service.linear_client.apply_assign_ticket", AsyncMock(return_value=None)
+            ) as mock_apply,
+        ):
+            result = await _submit(
+                session,
+                action=_action(
+                    action_type="assign_ticket",
+                    target_id="TECH-1234",
+                    assignee_pr_url="https://github.com/org/repo/pull/1",
+                    assignee_id="11111111-1111-1111-1111-111111111111",
                 ),
             )
         assert result["status"] == "applied"
@@ -1376,7 +1407,7 @@ class TestFourNewLanesIntegration:
                     action_type="assign_ticket",
                     target_id="TECH-1234",
                     assignee_pr_url="https://github.com/org/repo/pull/1",
-                    assignee_id="user-uuid-1",
+                    assignee_id="11111111-1111-1111-1111-111111111111",
                 ),
             )
         assert result["status"] == "pending"

@@ -1112,12 +1112,13 @@ class TestAssignTicket:
     """``(kind="linear_progress_update", action_type="assign_ticket")`` --
     no workflow-state concept: the cited PR must actually EXIST and
     REFERENCE ``target_id`` (the ticket being assigned), and
-    ``assignee_id`` must be present. Design decision, not an oversight:
-    this lane deliberately does NOT verify that ``assignee_id``
-    corresponds to the cited PR's actual author -- see
-    ``service._rule_assign_ticket``'s docstring for the full design
-    rationale (this service tracks outstanding work, not a
-    credit/attribution system)."""
+    ``assignee_id`` must be present and a valid UUID string. Design
+    decision (TECH-6153), not an oversight: this lane deliberately
+    enforces neither attribution nor authorization on the proposed
+    assignee -- see ``service._rule_assign_ticket``'s docstring for the
+    full design rationale (this service tracks outstanding work, not a
+    credit/attribution system; no authorization anchor bounds who can be
+    assigned)."""
 
     async def test_valid_pr_referencing_target_with_assignee_is_approved(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1132,7 +1133,7 @@ class TestAssignTicket:
                 "action_type": "assign_ticket",
                 "target_id": "TECH-1234",
                 "assignee_pr_url": "https://github.com/org/repo/pull/1",
-                "assignee_id": "user-uuid-1",
+                "assignee_id": "11111111-1111-1111-1111-111111111111",
             }
         )
         assert status == "approved"
@@ -1157,7 +1158,51 @@ class TestAssignTicket:
                 "action_type": "assign_ticket",
                 "target_id": "TECH-1234",
                 "assignee_pr_url": "https://github.com/org/repo/pull/1",
-                "assignee_id": "some-arbitrary-linear-user-id",
+                "assignee_id": "22222222-2222-2222-2222-222222222222",
+            }
+        )
+        assert status == "approved"
+        assert note is not None
+
+    async def test_pr_payload_without_user_key_is_approved(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The behavioral contract of dropping author verification: the
+        PR payload's author/user field is never read at all -- a PR with no
+        'user' key whatsoever is approved so long as it references the
+        target ticket."""
+        monkeypatch.setattr(
+            github_client,
+            "fetch_pull_request",
+            AsyncMock(return_value={"title": "Fix TECH-1234"}),
+        )
+        status, note = await evaluate_linear_progress_update_judge(
+            {
+                "action_type": "assign_ticket",
+                "target_id": "TECH-1234",
+                "assignee_pr_url": "https://github.com/org/repo/pull/1",
+                "assignee_id": "11111111-1111-1111-1111-111111111111",
+            }
+        )
+        assert status == "approved"
+        assert note is not None
+
+    async def test_pr_payload_with_null_user_is_approved(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Distinct edge case from missing key: a PR with 'user': None
+        (explicit null) is also approved without error or rejection."""
+        monkeypatch.setattr(
+            github_client,
+            "fetch_pull_request",
+            AsyncMock(return_value={"user": None, "title": "Fix TECH-1234"}),
+        )
+        status, note = await evaluate_linear_progress_update_judge(
+            {
+                "action_type": "assign_ticket",
+                "target_id": "TECH-1234",
+                "assignee_pr_url": "https://github.com/org/repo/pull/1",
+                "assignee_id": "11111111-1111-1111-1111-111111111111",
             }
         )
         assert status == "approved"
@@ -1170,7 +1215,7 @@ class TestAssignTicket:
             {
                 "action_type": "assign_ticket",
                 "target_id": "TECH-1234",
-                "assignee_id": "user-uuid-1",
+                "assignee_id": "11111111-1111-1111-1111-111111111111",
             }
         )
         assert status == "pending"
@@ -1187,7 +1232,7 @@ class TestAssignTicket:
             {
                 "action_type": "assign_ticket",
                 "assignee_pr_url": "https://github.com/org/repo/pull/1",
-                "assignee_id": "user-uuid-1",
+                "assignee_id": "11111111-1111-1111-1111-111111111111",
             }
         )
         assert status == "pending"
@@ -1211,6 +1256,25 @@ class TestAssignTicket:
         assert status == "pending"
         mock_fetch_pr.assert_not_awaited()
 
+    async def test_invalid_uuid_assignee_id_stays_pending_without_fetching_pr(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``assignee_id`` must be a syntactically valid UUID string -- checked
+        BEFORE any network call to avoid wasting round-trips on a malformed
+        proposal."""
+        mock_fetch_pr = AsyncMock()
+        monkeypatch.setattr(github_client, "fetch_pull_request", mock_fetch_pr)
+        status, _note = await evaluate_linear_progress_update_judge(
+            {
+                "action_type": "assign_ticket",
+                "target_id": "TECH-1234",
+                "assignee_pr_url": "https://github.com/org/repo/pull/1",
+                "assignee_id": "not-a-valid-uuid",
+            }
+        )
+        assert status == "pending"
+        mock_fetch_pr.assert_not_awaited()
+
     async def test_slack_hosted_pr_shaped_url_stays_pending(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1224,7 +1288,7 @@ class TestAssignTicket:
                 "action_type": "assign_ticket",
                 "target_id": "TECH-1234",
                 "assignee_pr_url": "https://redesignhealth.slack.com/org/repo/pull/1",
-                "assignee_id": "user-uuid-1",
+                "assignee_id": "11111111-1111-1111-1111-111111111111",
             }
         )
         assert status == "pending"
@@ -1247,7 +1311,7 @@ class TestAssignTicket:
                 "action_type": "assign_ticket",
                 "target_id": "TECH-1234",
                 "assignee_pr_url": "https://github.com/org/repo/pull/1",
-                "assignee_id": "user-uuid-1",
+                "assignee_id": "11111111-1111-1111-1111-111111111111",
             }
         )
         assert status == "approved"
@@ -1276,7 +1340,7 @@ class TestAssignTicket:
                 "action_type": "assign_ticket",
                 "target_id": "TECH-1234",
                 "assignee_pr_url": "https://github.com/org/repo/pull/1",
-                "assignee_id": "user-uuid-1",
+                "assignee_id": "11111111-1111-1111-1111-111111111111",
             }
         )
         assert status == "pending"
@@ -1304,7 +1368,7 @@ class TestAssignTicket:
                 "action_type": "assign_ticket",
                 "target_id": "TECH-1234",
                 "assignee_pr_url": "https://github.com/org/repo/pull/1",
-                "assignee_id": "user-uuid-1",
+                "assignee_id": "11111111-1111-1111-1111-111111111111",
             }
         )
         assert status == "approved"
@@ -1321,7 +1385,7 @@ class TestAssignTicket:
                     "action_type": "assign_ticket",
                     "target_id": "TECH-1234",
                     "assignee_pr_url": "https://github.com/org/repo/pull/1",
-                    "assignee_id": "user-uuid-1",
+                    "assignee_id": "11111111-1111-1111-1111-111111111111",
                 }
             )
 

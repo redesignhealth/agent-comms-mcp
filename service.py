@@ -6218,11 +6218,13 @@ def _pull_request_references_ticket(pull_request: dict[str, Any], target_id: str
     checked case-insensitively, since a branch name commonly lowercases the
     ticket id (e.g. ``"tech-1234-fix-x"``).
 
-    Closes a scope gap shared by ``_rule_assign_ticket``/``_rule_label_ticket``
-    (Argus review): a cited PR merely EXISTING proves an artifact is real,
-    but not that the artifact has anything to do with ``target_id`` --
-    without this check, any real PR could justify mutating ANY unrelated
-    ticket, not just the one it actually pertains to.
+    Closes a scope gap shared by all four auto-approve rules that require a
+    cited PR to reference the target ticket (``_rule_start_ticket``,
+    ``_rule_review_ticket``, ``_rule_assign_ticket``, and
+    ``_rule_label_ticket``; Argus review): a cited PR merely EXISTING proves
+    an artifact is real, but not that the artifact has anything to do with
+    ``target_id`` -- without this check, any real PR could justify mutating
+    ANY unrelated ticket, not just the one it actually pertains to.
 
     Matches ``target_id`` as a complete TOKEN, not a plain substring
     (Argus review: identifier collision) -- a bare ``needle in haystack``
@@ -6255,14 +6257,15 @@ async def _rule_assign_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
        ``parse_pull_request_url`` chain alone lets a Slack URL shaped like
        a PR path masquerade as a real GitHub PR reference).
     2. ``action["target_id"]`` and ``action["assignee_id"]`` are both
-       present and non-empty -- checked BEFORE the PR fetch (Argus review:
+       present and non-empty, and ``action["assignee_id"]`` is a valid
+       UUID string -- checked BEFORE the PR fetch (Argus review:
        an earlier version checked ``target_id`` AFTER
        ``fetch_pull_request``, wasting a round-trip on a proposal that was
-       always going to stay pending regardless of the PR fetch's result).
-       ``assignee_id`` is required simply because the applier
-       (``linear_client.apply_assign_ticket``) needs SOME value to
-       actually assign the ticket to -- see the design decision below for
-       what this rule deliberately does NOT verify about it.
+       always going to stay pending regardless of the PR fetch's result;
+       the UUID format check similarly avoids burning network calls or
+       an apply attempt on a syntactically malformed id). See the design
+       decision below for what this rule deliberately does NOT verify
+       about ``assignee_id``.
     3. The cited PR actually EXISTS (``github_client.fetch_pull_request``
        -- an artifact, not a bot's own say-so) and actually REFERENCES
        ``target_id`` (``_pull_request_references_ticket`` above) --
@@ -6270,22 +6273,32 @@ async def _rule_assign_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
        this ticket to anyone, not just a ticket that PR actually pertains
        to.
 
-    Design decision -- assignee identity is intentionally NOT verified
-    (do not read this as a newly-discovered gap; it is a deliberate,
-    considered removal, not an oversight): an earlier version of this
-    rule additionally required ``action["assignee_id"]`` to match the
+    Design decision (TECH-6153) -- assignee attribution AND authorization
+    are intentionally NOT verified (do not read this as a newly-discovered
+    gap; it is a deliberate, confirmed, doubly-considered tradeoff, not an
+    oversight, per Linear decision record TECH-6153): an earlier version of
+    this rule additionally required ``action["assignee_id"]`` to match the
     cited PR's ACTUAL author, cross-checked against a server-side
     GitHub-login-to-Linear-user-id mapping module that has SINCE BEEN
     DELETED from this codebase -- closing a self-approval hole where a
     bot could otherwise fabricate an author-to-assignee match to justify
-    assigning itself (or an accomplice) to a ticket. The product owner
-    has since made a deliberate call to drop that requirement: this
-    service tracks OUTSTANDING WORK, not a credit/attribution system, so
-    who ends up assigned is not something worth cross-checking -- the
-    only bar that still matters is that a real PR exists and actually
-    references the target ticket (point 3 above), same as it always has.
-    A bot can now propose ANY ``assignee_id`` alongside a real, on-topic
-    PR and have it auto-approved, regardless of who authored that PR.
+    assigning itself (or an accomplice) to a ticket.
+
+    Per TECH-6153, the product owner explicitly confirmed that BOTH
+    attribution and authorization constraints are removed:
+    (a) Attribution: the assignee's identity is not verified against the
+        PR author -- this service tracks outstanding work, not a credit or
+        attribution system, so who ends up assigned is not something worth
+        cross-checking against who wrote the code.
+    (b) Authorization: there is NO authorization anchor at all on who can
+        be assigned -- no team-membership check, and no bound on which
+        Linear user UUID the bot proposes.
+    A bot can cite any real PR referencing the target ticket and assign it
+    to any Linear user it names (provided ``assignee_id`` is syntactically
+    a valid UUID). The only gate that still matters is that a real PR exists
+    and actually references the target ticket (point 3 above). This
+    absence of both attribution and authorization boundaries is an
+    intentional, accepted tradeoff.
 
     No workflow-state/forward-transition concept applies here -- this
     isn't a state transition -- so unlike ``_rule_start_ticket``/
@@ -6302,6 +6315,10 @@ async def _rule_assign_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
         return "pending", None
     assignee_id = action.get("assignee_id")
     if not isinstance(assignee_id, str) or not assignee_id:
+        return "pending", None
+    try:
+        uuid.UUID(assignee_id)
+    except ValueError:
         return "pending", None
 
     owner, repo, number = parsed
@@ -8124,9 +8141,14 @@ async def decide_proposal(
     # the kind/action_type-scoped rule (``_PROPOSAL_RULES``) that would
     # otherwise gate an auto-approval -- e.g. an approved ``assign_ticket``
     # applies whatever ``assignee_id`` the bot proposed with NO PR-exists/
-    # PR-references-ticket re-verification, and an approved ``start_ticket``/
-    # ``review_ticket`` applies with no forward-transition check. A human
-    # approving here IS
+    # PR-references-ticket re-verification (and even in auto-approval, per
+    # TECH-6153, neither attribution against the PR author nor any
+    # authorization anchor/team-membership bound is enforced -- a bot can
+    # cite any real PR referencing the target ticket and assign it to any
+    # Linear user UUID it names, a confirmed deliberate tradeoff since
+    # this service tracks outstanding work rather than credit/attribution),
+    # and an approved ``start_ticket``/``review_ticket`` applies with no
+    # forward-transition check. A human approving here IS
     # the final authority this whole human-in-the-loop escape hatch
     # exists for; it deliberately bypasses every rule-level check, not
     # just the fingerprint/staleness one below (see docs/DESIGN.md's
