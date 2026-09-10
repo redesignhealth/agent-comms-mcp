@@ -241,9 +241,18 @@ jobs:
             --name /general/prod/api-secret-key \
             --with-decryption \
             --query 'Parameter.Value' --output text)
+
+          if [ -z "$API_KEY" ]; then
+            echo "::error::SSM parameter /general/prod/api-secret-key returned an empty value"
+            exit 1
+          fi
+
           # Workflow commands like ::add-mask:: are only recognized on
           # stdout, not stderr -- must run before $API_KEY is used anywhere.
-          echo "::add-mask::$API_KEY"
+          # Mask every line so embedded newlines do not leave partial credentials unmasked.
+          printf '%s\n' "$API_KEY" | while IFS= read -r line; do
+            [ -n "$line" ] && echo "::add-mask::$line"
+          done
 
           # Don't use curl -f: a non-2xx response should resolve to "not
           # approved" (falls through to the "waiting on Argus" comment step),
@@ -313,6 +322,26 @@ jobs:
             const headOwner = pr.data.head.repo?.owner?.login;
             if (headOwner !== context.repo.owner) {
               core.info(`PR #${prNumber} originates from a fork (${headOwner ?? 'unknown'}). Skipping auto-approval.`);
+              return;
+            }
+
+            // De-duplicate: paginate through all reviews to skip if already
+            // approved for this exact full SHA by github-actions[bot].
+            const existingReviews = await github.paginate(
+              github.rest.pulls.listReviews,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+              }
+            );
+            const alreadyApproved = existingReviews.some(review =>
+              review.commit_id === reviewedSha &&
+              review.user?.login === 'github-actions[bot]' &&
+              review.state === 'APPROVED'
+            );
+            if (alreadyApproved) {
+              core.info(`PR #${prNumber} already approved at SHA ${reviewedSha} by github-actions[bot], skipping duplicate review`);
               return;
             }
 
