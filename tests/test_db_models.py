@@ -678,11 +678,27 @@ class TestProposalHoldsSchema:
             "target_fingerprint",
             "applied_at",
             "apply_error",
+            "apply_result",
             "created_at",
             "updated_at",
         ):
             assert expected in cols, f"proposal_holds.{expected} missing"
         assert cols["action"] == "jsonb"
+        # migration d88cc7e6e21b (TECH-5873 follow-up: open_ticket creates
+        # a real Linear issue) -- apply_result is nullable JSONB, same
+        # column type/nullability as `action`, just nullable.
+        assert cols["apply_result"] == "jsonb"
+        async with engine.connect() as conn:
+            nullable = (
+                await conn.execute(
+                    text(
+                        "SELECT is_nullable FROM information_schema.columns "
+                        "WHERE table_schema = 'public' AND table_name = 'proposal_holds' "
+                        "AND column_name = 'apply_result'"
+                    )
+                )
+            ).scalar_one()
+        assert nullable == "YES"
 
     async def test_status_defaults_to_pending(self, engine: AsyncEngine) -> None:
         async with engine.connect() as conn:
@@ -916,6 +932,29 @@ class TestProposalHoldsSchema:
                         )
                     )
 
+    async def test_apply_result_consistency_check_constraint_rejects_non_applied(
+        self, engine: AsyncEngine
+    ) -> None:
+        """migration cf72736e07f5 -- ``apply_result`` set on a row that
+        isn't ``status='applied'`` must be rejected, same shape as
+        ``test_applied_at_consistency_check_constraint_rejects_non_applied``
+        above for the analogous ``applied_at`` invariant."""
+        async with engine.connect() as conn:
+            with pytest.raises(IntegrityError, match="ck_proposal_holds_apply_result_consistency"):
+                async with conn.begin():
+                    await conn.execute(
+                        text(
+                            "INSERT INTO proposal_holds "
+                            "(kind, proposed_by_bot_id, owner_sub, action, rationale, "
+                            "confidence, importance, impact, priority, status, "
+                            "decision_source, decided_by_actor_id, decided_at, "
+                            "apply_result, target_fingerprint) "
+                            "VALUES ('linear_progress_update', 'test-bot', 'test-owner', "
+                            "'{}'::jsonb, 'rationale', 'low', 'low', 'low', 'low', 'approved', "
+                            "'human', 'test-actor', now(), '{\"id\": \"x\"}'::jsonb, 'deadbeef')"
+                        )
+                    )
+
     async def test_round_trip_insert_and_read(self, engine: AsyncEngine) -> None:
         """Full round-trip through raw SQL (this module never mocks the
         database): insert a minimal pending proposal hold, decide it, and
@@ -1064,6 +1103,62 @@ class TestProposalHoldsSchema:
                 assert fetched is not None
                 assert fetched.status == "applied"
                 assert fetched.applied_at is not None
+            finally:
+                await session.rollback()
+                # Cleanup: this module has no autouse table-truncation fixture.
+                await session.delete(hold)
+                await session.commit()
+
+    async def test_orm_round_trip_approved_applied_with_apply_result(
+        self, engine: AsyncEngine
+    ) -> None:
+        """Positive-path mirror of
+        ``test_apply_result_consistency_check_constraint_rejects_non_applied``
+        above -- a row with ``status='applied'`` AND a populated
+        ``apply_result`` must commit successfully, same shape as
+        ``test_orm_round_trip_approved_applied``'s own ``applied_at``
+        coverage."""
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        session: AsyncSession
+        async with session_factory() as session:
+            hold = ProposalHold(
+                kind="linear_progress_update",
+                proposed_by_bot_id="test-bot",
+                owner_sub="test-owner",
+                action={"issue": "TECH-5871"},
+                rationale="because it needs doing",
+                confidence="medium",
+                importance="high",
+                impact="low",
+                priority="high",
+                status="approved",
+                decision_source="human",
+                decided_by_actor_id="test-actor",
+                decided_at=datetime.now(UTC),
+                target_fingerprint="deadbeef",
+            )
+            session.add(hold)
+            await session.commit()
+            await session.refresh(hold)
+            try:
+                assert hold.status == "approved"
+                assert hold.apply_result is None
+
+                # approved -> applied, with apply_result populated (e.g.
+                # apply_open_ticket's created-issue metadata).
+                apply_result = {"id": "issue-id", "identifier": "TECH-9999", "url": "https://x"}
+                hold.status = "applied"
+                hold.applied_at = datetime.now(UTC)
+                hold.apply_result = apply_result
+                await session.commit()
+                await session.refresh(hold)
+                assert hold.status == "applied"
+                assert hold.apply_result == apply_result
+
+                fetched = await session.get(ProposalHold, hold.id)
+                assert fetched is not None
+                assert fetched.status == "applied"
+                assert fetched.apply_result == apply_result
             finally:
                 await session.rollback()
                 # Cleanup: this module has no autouse table-truncation fixture.

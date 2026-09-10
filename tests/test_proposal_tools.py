@@ -25,7 +25,7 @@ import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
@@ -133,6 +133,27 @@ async def _clean_tables(engine: AsyncEngine) -> AsyncIterator[None]:
     yield
 
 
+_DEFAULT_SUBMIT_TIME_FINGERPRINT = "fp-submit-time-default"
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _default_fetch_current_fingerprint() -> AsyncIterator[AsyncMock]:
+    """Bug fix: ``proposals_submit`` -> ``service.create_proposal`` now
+    fetches the target's CURRENT fingerprint at submission time too
+    (server-computed, no longer trusting the caller-supplied
+    ``target_fingerprint`` tool argument -- see that function's own
+    docstring), not just at apply/decide time. None of the tests in this
+    file exercise the auto-judge/apply path (see this module's own
+    docstring -- that's ``tests/test_proposal_service.py``'s job), so a
+    single stable default here is all any test needs; it just keeps
+    submission from attempting a real network call."""
+    with patch(
+        "service.linear_client.fetch_current_fingerprint",
+        AsyncMock(return_value=_DEFAULT_SUBMIT_TIME_FINGERPRINT),
+    ) as mock:
+        yield mock
+
+
 @pytest.fixture
 def test_session_factory(
     engine: AsyncEngine,
@@ -191,8 +212,11 @@ def main() -> Any:
 
 
 def _action(
-    action_type: str = "open_ticket", target_id: str = "TECH-1234", **extra: Any
+    action_type: str = "close_ticket", target_id: str = "TECH-1234", **extra: Any
 ) -> dict[str, Any]:
+    # action_type default is "close_ticket", not "open_ticket" (TECH-5873
+    # redefinition) -- see the identical rationale in
+    # tests/test_proposal_service.py's own `_action` docstring.
     return {"action_type": action_type, "target_id": target_id, **extra}
 
 
@@ -476,6 +500,99 @@ class TestSubmitGetWithdraw:
                     "target_fingerprint": "deadbeef",
                 },
             )
+
+    async def test_target_fingerprint_argument_is_ignored(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        session: AsyncSession,
+    ) -> None:
+        """Mirrors ``tests/test_proposal_endpoint.py::TestSubmitProposal::
+        test_target_fingerprint_in_body_is_ignored`` for the MCP tool
+        path: a caller-supplied ``target_fingerprint`` is DEPRECATED and
+        ignored -- the value actually stored (and later compared against
+        at decide time) is always computed server-side. Submit with a
+        tool argument value that could never match the mocked
+        server-computed fingerprint, then decide (via
+        ``service.decide_proposal`` directly -- there is no MCP tool for
+        deciding, see this module's own docstring) with that SAME
+        server-computed value re-fetched -- reaching ``"applied"`` (not
+        ``"stale"``) proves the server-computed value, not the tool
+        argument, was stored and matched."""
+        with patch(
+            "service.linear_client.fetch_current_fingerprint",
+            AsyncMock(return_value="server-value"),
+        ):
+            submitted = await _submit(
+                main,
+                test_session_factory,
+                bot_sub="bot-fp-ignored",
+                owner_sub="owner-fp-ignored@example.com",
+                action=_action(target_id="TECH-FINGERPRINT-IGNORED"),
+                target_fingerprint="tool-argument-value",
+            )
+        assert submitted["status"] == "pending"
+
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(return_value="server-value"),
+            ),
+            patch("service.linear_client.apply_progress_update", AsyncMock(return_value=None)),
+        ):
+            decided = await decide_proposal(
+                session,
+                approver_sub="owner-fp-ignored@example.com",
+                hold_id=uuid.UUID(submitted["proposal_id"]),
+                decision="approve",
+                decision_note=None,
+            )
+        assert decided["status"] == "applied"
+
+    async def test_linear_api_error_during_submission_raises_tool_error(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Argus review round-3 B1: service.create_proposal's server-side
+        target-fingerprint fetch can fail (target doesn't exist, Linear
+        error) -- must surface as a ToolError with a sanitized message."""
+        from linear_client import LinearAPIError
+
+        with patch(
+            "service.linear_client.fetch_current_fingerprint",
+            AsyncMock(side_effect=LinearAPIError("target issue does not exist")),
+        ):
+            with pytest.raises(ToolError, match=r"^Linear returned an error$"):
+                await _submit(main, test_session_factory, bot_sub="bot-linear-error")
+
+    async def test_linear_token_missing_during_submission_raises_sanitized_tool_error(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Argus review round-3 B1: LinearTokenMissingError must raise ToolError
+        without leaking the internal env-var name."""
+        from linear_client import LinearTokenMissingError
+
+        with patch(
+            "service.linear_client.fetch_current_fingerprint",
+            AsyncMock(side_effect=LinearTokenMissingError("LINEAR_API_TOKEN is not configured")),
+        ):
+            with pytest.raises(ToolError, match=r"^server configuration error$"):
+                await _submit(main, test_session_factory, bot_sub="bot-token-error")
+
+    async def test_linear_transport_error_during_submission_raises_sanitized_tool_error(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Argus review round-3 B1: LinearTransportError must raise ToolError
+        without leaking transport internals."""
+        from linear_client import LinearTransportError
+
+        with patch(
+            "service.linear_client.fetch_current_fingerprint",
+            AsyncMock(
+                side_effect=LinearTransportError("Linear API request failed: connection refused")
+            ),
+        ):
+            with pytest.raises(ToolError, match=r"^Linear API unavailable$"):
+                await _submit(main, test_session_factory, bot_sub="bot-transport-error")
 
 
 # --- list_pending / list_history -------------------------------------------------

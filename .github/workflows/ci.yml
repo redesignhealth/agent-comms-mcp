@@ -62,8 +62,15 @@ jobs:
         # installs from a wheel. Catches a future regression (e.g. the
         # file moving out of `providers/`, or the pyproject.toml
         # package-data stanza being dropped) before it reaches PyPI.
+        #
+        # Also installs the built wheel into a fresh throwaway virtualenv
+        # and verifies `import main` and `import service` succeed. Testing
+        # `main` verifies the published console-script entrypoint (and
+        # transitively imports service, subscriptions, and other modules
+        # listed in py-modules); testing `service` directly ensures the
+        # core service module is importable.
         run: |
-          rm -rf dist/
+          rm -rf dist/ build/
           uv build --wheel
           uv run python -c "
           import glob, zipfile
@@ -78,6 +85,24 @@ jobs:
               )
           print(f'OK: providers/instruction_registry.json present in {whl}')
           "
+          VENV=$(mktemp -d)
+          trap 'rm -rf "$VENV"' EXIT
+          uv venv "$VENV"
+          uv pip install --python "$VENV" dist/*.whl
+          (cd "$VENV" && "$VENV/bin/python" -P -c "
+          import os, tempfile, unittest.mock
+          os.environ.update({
+              'OKTA_ISSUER_URL': 'https://example.okta.com',
+              'OKTA_CLIENT_ID': 'ci',
+              'OKTA_CLIENT_SECRET': 'ci',
+              'MCP_JWT_SECRET': 'ci-jwt-secret-stable',
+              'AGENT_JWT_SECRET': 'ci-agent-jwt-secret-long-enough-for-hs256',
+              'MCP_TOKEN_STORAGE_PATH': tempfile.mkdtemp(),
+          })
+          with unittest.mock.patch('fastmcp.server.auth.oidc_proxy.OIDCProxy.get_oidc_configuration'):
+              import main, service
+          ")
+          echo "OK: main and service imported successfully from installed wheel"
 
   test:
     name: Tests

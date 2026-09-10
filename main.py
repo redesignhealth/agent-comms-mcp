@@ -26,6 +26,7 @@ from pydantic import AnyUrl
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 
+import linear_client
 import plugins
 import service
 import subscriptions
@@ -869,7 +870,7 @@ async def submit_proposal(request: Request) -> Response:
     ``{"kind": str, "action": {..., "target_id": str, "action_type": str},
     "rationale": str, "confidence": "low"|"medium"|"high",
     "importance": "low"|"medium"|"high", "impact": "low"|"medium"|"high",
-    "target_fingerprint": str}``.
+    "target_fingerprint": str (optional, deprecated -- see below)}``.
 
     Auth: agent-jwt bearer token carrying ``comms:proposals:write`` (see
     ``_authenticate_proposal_submitter``) -- NOT the interactive-only gate
@@ -886,6 +887,15 @@ async def submit_proposal(request: Request) -> Response:
     bot's pending proposal.
     Immediately judged by the TECH-5877 kind-scoped deterministic rules
     engine -- ``priority`` is always server-derived, never caller-supplied.
+
+    ``target_fingerprint`` in the body is DEPRECATED, OPTIONAL, and
+    ignored (bug fix): the value actually stored is computed
+    server-side, by re-fetching the target's current fingerprint at
+    submission time -- see ``service.create_proposal``'s own docstring.
+    A caller may omit it entirely, or send ``None``/an empty string, with
+    no error; a caller that still sends a non-empty value (for backward
+    compatibility with existing callers) gets no special treatment
+    either -- it's accepted and silently ignored either way.
     """
     bot_sub, bot_token, status = await _authenticate_proposal_submitter(request)
     if bot_sub is None or bot_token is None:
@@ -925,7 +935,7 @@ async def submit_proposal(request: Request) -> Response:
     try:
         rationale = service.validate_proposal_string_field("rationale", body.get("rationale"))
         target_fingerprint = service.validate_proposal_string_field(
-            "target_fingerprint", body.get("target_fingerprint")
+            "target_fingerprint", body.get("target_fingerprint"), required=False
         )
         for action_field in ("target_id", "action_type"):
             if action_field in action:
@@ -993,6 +1003,15 @@ async def submit_proposal(request: Request) -> Response:
             return JSONResponse({"error": "rate_limited", "detail": str(exc)}, status_code=429)
         except ValueError as exc:
             return JSONResponse({"error": "invalid_request", "detail": str(exc)}, status_code=422)
+        except linear_client.LinearAPIError as exc:
+            # Argus review round-3 B1: service.create_proposal's server-side
+            # target-fingerprint fetch can fail for an unconfigured token,
+            # transport failure, or Linear-side error -- sanitized via
+            # service.sanitize_linear_submit_error so internal token env-var
+            # names, transport internals, and GraphQL error payloads are
+            # never leaked.
+            status_code, error_code, detail = service.sanitize_linear_submit_error(exc)
+            return JSONResponse({"error": error_code, "detail": detail}, status_code=status_code)
 
     return JSONResponse(result, status_code=200)
 

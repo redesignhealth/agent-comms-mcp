@@ -73,6 +73,7 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_access_token
 
+import linear_client
 import service
 from db import get_session_factory
 from exceptions import AccessDeniedError, HoldAlreadyDecidedError, RateLimitExceededError
@@ -133,6 +134,14 @@ async def _map_proposal_errors() -> AsyncIterator[None]:
     rate limit) and ``HoldAlreadyDecidedError`` (a withdraw racing an
     already-claimed hold) are both specific-by-design (see their own
     docstrings in exceptions.py) and pass through unwrapped too.
+
+    ``linear_client.LinearAPIError`` (Argus review round-3 B1) is
+    sanitized via ``service.sanitize_linear_submit_error``:
+    ``service.create_proposal``'s server-side target-fingerprint
+    fetch can fail for an unconfigured token, a transport failure,
+    or a Linear-side error -- sanitized so internal token env-var
+    names, transport internals, and GraphQL error payloads are never
+    leaked to the tool caller.
     """
     try:
         yield
@@ -140,6 +149,9 @@ async def _map_proposal_errors() -> AsyncIterator[None]:
         raise ToolError(str(exc)) from None
     except (RateLimitExceededError, HoldAlreadyDecidedError, ValueError) as exc:
         raise ToolError(str(exc)) from None
+    except linear_client.LinearAPIError as exc:
+        _status_code, _error_code, detail = service.sanitize_linear_submit_error(exc)
+        raise ToolError(detail) from None
 
 
 def _parse_proposal_id(proposal_id: str) -> uuid.UUID:
@@ -159,7 +171,7 @@ async def submit(
     confidence: str,
     importance: str,
     impact: str,
-    target_fingerprint: str,
+    target_fingerprint: str = "",
 ) -> dict[str, Any]:
     """Submit a proposal for a bot-initiated action needing human (or
     TECH-5877 auto-judge) approval before it takes effect. Same body shape
@@ -180,6 +192,14 @@ async def submit(
     engine -- a proposal that clears it resolves synchronously in this
     call's own response (``status`` will already be a terminal one, e.g.
     ``"applied"``), not left sitting at ``"pending"``.
+
+    ``target_fingerprint`` is DEPRECATED, OPTIONAL, and ignored (bug
+    fix): the value actually stored is computed server-side, by
+    re-fetching the target's current fingerprint at submission time --
+    see ``service.create_proposal``'s own docstring. Omit it, or pass
+    ``""``, with no error; a caller that still sends a non-empty value
+    (for backward compatibility with existing callers) gets no special
+    treatment either -- it's accepted and silently ignored either way.
     """
     bot_sub = _require_bot_sub()
     if not isinstance(action, dict):
@@ -194,7 +214,7 @@ async def submit(
         )
         rationale = service.validate_proposal_string_field("rationale", rationale)
         target_fingerprint = service.validate_proposal_string_field(
-            "target_fingerprint", target_fingerprint
+            "target_fingerprint", target_fingerprint, required=False
         )
         for action_field in ("target_id", "action_type"):
             if action_field in action:

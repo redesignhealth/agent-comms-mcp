@@ -296,30 +296,32 @@ approval_holds id, conversation_id, sender_agent_id, target_agent_id (nullable
  `participants` row instead of a `messages` row (see §9 Axis 1's free-text
  invite-approval rule and models.ApprovalHold's class docstring)
 proposal_holds id, kind (at the DB level an open TEXT column -- NOT
- CHECK-constrained, same convention as conversations.type/messages.type --
- but narrower in practice: the service currently only admits
- kind="linear_progress_update"; `service._derive_proposal_priority` raises
- 422 for any other kind, so adding a new kind requires both a new
- `_derive_proposal_priority` branch and a registered judge in
- `_PROPOSAL_JUDGES`, not just a row insert), proposed_by_bot_id (opaque, NOT an FK
- to agents -- proposers need not be board-registered), owner_sub
- (snapshotted at creation, same convention as approval_holds.owner_sub),
- action jsonb, rationale, confidence/importance/impact(low|medium|high,
- self-reported, advisory only), priority(low|medium|high, server-derived
- from kind+action -- never caller-supplied, despite sharing a vocabulary
- with the three self-reported columns), status(pending|approved|applying|
- rejected|applied|apply_failed|stale|withdrawn), decision_source(human|
- auto|bot -- `bot` added TECH-6018, marking a decision made by the
- SUBMITTING bot itself; reachable only via withdraw, since a bot can
- never reach `decide_proposal` at all),
+CHECK-constrained, same convention as conversations.type/messages.type --
+but narrower in practice: the service currently only admits
+kind="linear_progress_update"; `service._derive_proposal_priority` raises
+422 for any other kind, so adding a new kind requires both a new
+`_derive_proposal_priority` branch and at least one registered rule in
+`_PROPOSAL_RULES`/`_PROPOSAL_KIND_DEFAULT_RULE`, not just a row insert), proposed_by_bot_id (opaque, NOT an FK
+to agents -- proposers need not be board-registered), owner_sub
+(snapshotted at creation, same convention as approval_holds.owner_sub),
+action jsonb, rationale, confidence/importance/impact(low|medium|high,
+self-reported, advisory only), priority(low|medium|high, server-derived
+from kind+action_type -- never caller-supplied, despite sharing a vocabulary
+with the three self-reported columns), status(pending|approved|applying|
+rejected|applied|apply_failed|stale|withdrawn), decision_source(human|
+auto|bot -- `bot` added TECH-6018, marking a decision made by the
+SUBMITTING bot itself; reachable only via withdraw, since a bot can
+never reach `decide_proposal` at all),
  decided_by_actor_id, decided_at, decision_note, target_fingerprint
- (sha256 hex digest of the target's state at proposal time, for detecting
- staleness at apply time), applied_at, apply_error, timestamps
- -- MUTABLE (status flips). A sibling table to approval_holds, not a
- variant of it: approval_holds stays the message/invite-diversion pipeline
- for this board's own comms traffic (TECH-5389/TECH-5735); proposal_holds
- generalizes the same "propose, hold for a human, decide, apply" shape to
- any autonomous bot's arbitrary action, keyed by an open `kind`
+   (sha256 hex digest computed at proposal submission time from the
+   target's current state, for detecting staleness at apply time),
+   applied_at, apply_error, apply_result (nullable JSONB carrying the
+   applier's return value when it has one), timestamps
+  -- MUTABLE (status flips). A sibling table to approval_holds, not a
+  variant of it: approval_holds stays the message/invite-diversion pipeline
+  for this board's own comms traffic (TECH-5389/TECH-5735); proposal_holds
+  generalizes the same "propose, hold for a human, decide, apply" shape to
+  any autonomous bot's arbitrary action, keyed by an open `kind`
  discriminator. Lifecycle (updated TECH-5873 Argus review round-2/3 B1):
  pending -> applying (a transient but PERSISTED claim -- see below --
  written by whichever caller, human decide or the TECH-5877 auto-judge,
@@ -1434,172 +1436,228 @@ at unlimited frequency. The attempt marker is written and committed
 immediately, before the dedup lookup, so it survives a later
 rollback-and-retry on the unique-index race above.
 
-**The auto-approval judge** (TECH-5877, `service._PROPOSAL_JUDGES`, keyed
-by `kind`) is a deterministic rules engine, not an LLM, run once
-immediately after every insert/update: write intent must be judged outside
-the proposing agent, so a bot can never self-approve its own proposal. The
-one registered judge today, `evaluate_linear_progress_update_judge`
-(`kind="linear_progress_update"`), auto-approves opening a ticket only if
-`action.source_message_url` is a valid citation, and closing a ticket if
-EITHER `source_message_url` or `action.resolving_pr_url` is. "Valid
-citation" means an `http(s)` URL whose host is `github.com` or a
-`*.slack.com` subdomain -- presence of any non-empty string is
-deliberately NOT sufficient (that gap would let a bot self-approve by
-writing an arbitrary string, including a URL on a host it fully controls,
-into either field). Every kind that reaches the judge lookup is guaranteed
-to be `"linear_progress_update"` -- `_derive_proposal_priority` already
-raised 422 for anything else earlier in the request -- so the judge
-lookup itself can never miss; there is no live "kind with no registered
-judge" path today. The judge's OR semantics for closing a ticket (EITHER
-field valid is sufficient) are matched at apply time in
-`linear_client._progress_comment_body`: a present-but-invalid URL field
-is OMITTED from the Linear comment, not treated as a reason to fail the
-whole apply (Argus review round-2 B3) -- the applier previously
-enforced AND semantics (raising if ANY present field failed validation),
-which meant a judge-approved proposal with one valid and one invalid URL
-would deterministically hit `"apply_failed"` with no retry path through
-decide. Because dedup is scoped to the submitting bot, a bot
-progressively refining its OWN pending proposal by adding a valid citation
-on resubmission is expected to auto-approve on that pass -- this is a
-bot completing its own proposal, not a new escalation path.
+**The proposal rule registry** (TECH-5877) is deterministic and async, not
+LLM-based. `create_proposal` inserts or updates the hold, then looks up and
+awaits exactly one `(kind, action_type)` rule in `_PROPOSAL_RULES`, falling
+back to `_PROPOSAL_KIND_DEFAULT_RULE[kind]` when no action-specific rule is
+registered. Any exception from a rule fails closed to `pending`.
 
-**An auto-approved verdict is applied synchronously, at submission time,
-by `create_proposal` itself** (Argus review round-2 B1 -- a behavior
-change from the judge landing in TECH-5877; the judge originally only
-set `status="approved"` with nothing downstream to ever apply it, which
-Argus caught as leaving every auto-approved hold permanently stranded and
-invisible). `"approved"` is a value the DB CHECK constraint still
-accepts but is NEVER actually persisted: `create_proposal` immediately
-CLAIMS the row (writes `status="applying"` under a fresh row lock and
-commits, releasing the lock before any external call) and then runs the
-SAME fingerprint-check-then-apply-or-stale helper
-(`service._apply_or_finalize_proposal_hold`) that `POST /proposals/{id}/decide`'s
-human-approve path uses, resolving the hold to `"applied"`/
+`kind="linear_progress_update"` currently has these rules:
+
+- `open_ticket`: artifact-backed. `action.target_id` itself must be a valid
+  `github.com` PR URL (validated via `github_client.
+  parse_github_pull_request_url`, not merely PR-*shaped* -- see the
+  host-confusion note below) -- it is both the cited PR URL and the
+  create-time dedup key, deliberately unified so dedup can never be
+  bypassed by varying `target_id` while citing the same PR elsewhere. The
+  cited PR must actually exist (a live `fetch_pull_request` call), but its
+  `state` is NOT gated -- a merged/closed PR is the expected case for
+  documenting a shipped PR, not just an open one. `action.title`/
+  `action.team` (the applier's required fields) must also be present, AND
+  `action.team` must additionally be on the server-side allowlist
+  (`team_allowlist.py`, `PROPOSAL_OPEN_TICKET_TEAM_ALLOWLIST`) -- inert
+  (never auto-approves) when that allowlist is unset/empty. The apply step
+  is redefined in place to create a new Linear issue, not comment on an
+  existing one, and this pair is exempt from the normal fingerprint/
+  staleness check.
+- `close_ticket`: citation-backed. Either `source_message_url` or
+  `resolving_pr_url` must be a valid citation URL.
+- `start_ticket`: artifact-backed. The cited GitHub PR must exist and be
+  open, `action.team` must be present, and the issue's current workflow
+  state must be strictly before `In Progress`.
+- `review_ticket`: artifact-backed. The cited PR must exist, be open, and
+  have review requested, `action.team` must be present, and the current
+  workflow state must be strictly before `In Review`.
+- `assign_ticket`: artifact-backed. The cited PR's actual author must map,
+  via `identity_map.py`, to the proposed Linear assignee id. The shipped
+  mapping is empty, so this lane is inert until populated with real data.
+- `label_ticket`: artifact-backed. The requested label must be exactly
+  `target:<repo>` derived from the cited PR URL's repo, `action.team` must
+  be present, and the cited PR must actually exist (a live
+  `fetch_pull_request` call, state not gated -- same "existence, not
+  openness" reasoning as `open_ticket` above).
+- Any other `action_type` stays pending via `_PROPOSAL_KIND_DEFAULT_RULE`.
+
+Unsupported changes stay human-only: priority changes, ticket cancellation,
+description edits, project assignment, and any workflow transition that is
+not strictly forward (or is a no-op) are held rather than auto-approved.
+
+Every lane above that treats a citation as a GitHub PR reference validates
+it through the single shared `github_client.parse_github_pull_request_url`
+helper -- which checks BOTH the general citation-URL allowlist AND that the
+host is specifically `github.com`, not merely PR-*shaped* -- rather than
+each rule chaining `citation_urls.is_valid_citation_url`/
+`parse_pull_request_url` itself; the latter, used alone, lets a
+`*.slack.com` URL shaped like a PR path (a valid citation host under the
+general allowlist) masquerade as a real GitHub PR reference.
+
+Rules that resolve a Linear workflow state by name (`start_ticket`'s
+`"In Progress"`, `review_ticket`'s `"In Review"`) match that name
+CASE-SENSITIVELY against the target team's real Linear workflow states
+(`resolve_workflow_state_id`) -- the target team's states must be named
+EXACTLY that, or the apply step fails cleanly with `LinearNotFoundError`
+(-> `apply_failed`), never a silent no-op. Target workflow state is
+deliberately not bot-controllable via the action payload in auto-approval,
+to avoid letting a bot influence its own approval target:
+`start_ticket` and `review_ticket` hardcode their target states, while
+`open_ticket` auto-approval never honors a bot-specified `target_state`
+at all (auto-created issues always land in the team's default initial
+workflow state; if a proposal specifies a `target_state`, it is held for
+human review instead of auto-approved).
+
+**`action.team` scope is DEFERRED for `start_ticket`/`review_ticket`/
+`label_ticket` (unlike `open_ticket`, closed above via
+`team_allowlist.py`).** These three rules never cross-check the
+bot-asserted `action.team` against the target ticket's ACTUAL team --
+`team` is only ever used to scope a NAME lookup (`resolve_workflow_
+state_id` for the hardcoded `"In Progress"`/`"In Review"` state name in
+`start_ticket`/`review_ticket`, or `resolve_label_id` for the label name in
+`label_ticket`), never to choose which ticket gets mutated (always
+`target_id`, fetched fresh via `fetch_issue`/`update_issue_state`/
+`add_issue_label`) or the destination state/label name (both
+server-derived: hardcoded for the state names, a separate `label_name`
+field for labels). Linear's workflow states are strictly per-team
+(`WorkflowState.team: Team!` in Linear's own public GraphQL schema), so a
+false `team` naming a team with no matching state/label name fails cleanly
+with `LinearNotFoundError` -> `apply_failed`; a team that DOES happen to
+have a same-named state/label would at worst apply that OTHER team's
+object -- Linear's API is expected (not confirmed with a live call) to
+reject this on `issueUpdate`/`issueAddLabel` as a cross-team mismatch
+anyway, since `target_id` and the resolved `stateId`/`labelId` would then
+belong to different teams. `open_ticket` is NOT deferred the same way
+because it has no pre-existing artifact bounding the destination team at
+all -- it CREATES a brand-new issue, so an unconstrained `team` there picks
+the team outright, not merely a name to look up within one. Closing this
+remaining gap for the other three (cross-checking `action.team` against
+`target_id`'s real team) is tracked as follow-up work (TECH-6150), deferred because it
+requires extending `linear_client._ISSUE_QUERY` with `team { key }`, which
+touches `compute_target_fingerprint`'s hashed field set and needs its own
+fingerprint-stability test coverage.
+
+The artifact-backed lanes use `github_client.py` (raw GitHub REST client,
+`GITHUB_TOKEN`) for PR lookup and URL parsing, `workflow_order.py` for the
+forward-only workflow check, and `identity_map.py` for the assignee
+verification map. `open_ticket`, `start_ticket`, `review_ticket`,
+`assign_ticket`, and `label_ticket` all make live GitHub API calls.
+
+**An auto-approved verdict is applied synchronously, at submission time, by
+`create_proposal` itself**. `"approved"` is a value the DB CHECK constraint
+still accepts but is never persisted at rest: `create_proposal` immediately
+claims the row (writes `status="applying"` under a fresh row lock and
+commits, releasing the lock before any external call) and then runs the same
+fingerprint-check-then-apply-or-stale helper that `POST /proposals/{id}/decide`
+uses for human approval, resolving the hold to `"applied"`/
 `"apply_failed"`/`"stale"` before `POST /proposals` returns. The
 `"applying"` claim exists specifically to prevent a double Linear write:
-without it, a human decide call racing the auto-judge for the SAME
-just-inserted hold could observe `status="pending"` under its own lock,
-release that lock, and reach the applier a second time before either
-call's terminal write landed -- the DB-level dedup on the terminal write
-alone stops a double DB row update, but not a duplicate Linear API call
-already in flight. A second caller that acquires the lock after the
-claim observes `"applying"`, not `"pending"`, and raises
-`HoldAlreadyDecidedError` (`decide_proposal`) or reloads and returns the
-now-current state (`create_proposal`, which never "decides" anything --
-it just reports the hold's already-resolved status) instead of ever
-reaching the fingerprinter/applier itself.
+without it, a human decide call racing the auto-rule for the same
+just-inserted hold could reach the applier a second time before either
+terminal write landed.
 
-**Latency (Argus review round-4 suggestion):** `POST /proposals` was
-DB-only latency before TECH-5873 landed the auto-apply behavior above.
-On the auto-approved path it can now make up to two sequential Linear
-HTTP calls (fingerprint fetch, then the write) inline before responding,
-each bounded by `linear_client._LINEAR_REQUEST_TIMEOUT_SECONDS` -- worst
-case, tens of seconds, not the sub-second DB-only latency this endpoint
-had before. A client or load balancer with a short timeout tuned to the
-old behavior can time out mid-apply; the apply itself still completes
-server-side and the hold still resolves to a terminal status, but the
-caller's HTTP request may not see the response. Any client integrating
-against this endpoint should set a timeout comfortably longer than
-`linear_client._LINEAR_REQUEST_TIMEOUT_SECONDS * 2`.
+**Latency (Argus review round-4 suggestion, updated for the TECH-5877
+artifact-backed lanes):** `POST /proposals` was DB-only latency before
+TECH-5873 landed the auto-apply behavior above. For `close_ticket`, it
+can make up to two sequential Linear HTTP calls (submission-time fingerprint
+fetch, then the comment-posting write) inline before responding.
+
+`open_ticket` is fingerprint-exempt (`_PROPOSAL_FINGERPRINT_EXEMPT`, zero
+fingerprint fetches at submission or apply time), but makes up to four
+sequential round-trips across GitHub and Linear before responding: (1) rule-time
+GitHub `fetch_pull_request` (existence check), (2) apply-time `resolve_team_id`,
+(3) optionally apply-time `resolve_workflow_state_id`, and (4) the
+`create_ticket` (`issueCreate`) mutation itself.
+
+The `start_ticket`/`review_ticket` auto-approve path is worse: it can now make up
+to SEVEN sequential round-trips across two providers before responding --
+(1) the submission-time fingerprint fetch (`create_proposal`), (2) the
+GitHub PR fetch inside the rule, (3) the Linear `fetch_issue` call inside the
+rule (both to check the forward-transition condition), (4) the apply-time
+fingerprint re-fetch (staleness check), (5) `resolve_team_id`, (6)
+`resolve_workflow_state_id`, and (7) the `issueUpdate` state-change mutation
+itself. Each Linear call is bounded by
+`linear_client._LINEAR_REQUEST_TIMEOUT_SECONDS` and each GitHub call by
+`github_client._GITHUB_REQUEST_TIMEOUT_SECONDS` (both 10 seconds as of this
+writing) -- worst case, over a minute of sequential latency, not the
+sub-second DB-only latency this endpoint had before TECH-5873. `assign_ticket`
+is shorter -- only FOUR round-trips ((1) submission-time fingerprint fetch,
+(2) the GitHub PR fetch, (3) the apply-time fingerprint re-fetch, (4) the
+`assigneeId` `issueUpdate` mutation) -- since this rule has no workflow-state
+concept and, unlike `start_ticket`/`review_ticket`, never fetches the Linear
+issue in the rule itself, and its applier never needs `resolve_team_id`/
+`resolve_workflow_state_id`. `label_ticket` makes SIX round-trips (Argus
+review: this rule now also verifies the cited PR exists, per the same
+artifact-backed reasoning as `start_ticket`/`review_ticket`) -- (1) the
+submission-time fingerprint fetch, (2) the GitHub PR fetch inside the rule
+(existence check only, no forward-transition concept so no Linear
+`fetch_issue` call in the rule itself), (3) the apply-time fingerprint
+re-fetch, (4) `resolve_team_id`, (5) `resolve_label_id`, and (6) the
+`issueAddLabel` mutation. A client or load balancer with a short timeout
+tuned to the pre-TECH-5873 behavior can time out mid-apply; the apply itself
+still completes server-side and the hold still resolves to a terminal
+status, but the caller's HTTP request may not see the response.
 
 **`POST /proposals/{id}/decide`** (TECH-5873, `service.decide_proposal`) is
 the human decide-and-synchronously-apply endpoint for a still-`"pending"`
 proposal. Same hard interactive-only gate and uniform-404
-unknown-hold-or-not-your-hold posture as `/approvals/{id}/decide`
-(`_authenticate_approval_caller`, `surface="proposals_decide"`) -- a bot can
-never reach this route at all regardless of scope, which is what makes a bot
-self-approving its own proposal structurally impossible here too, same as
-the submission-side judge's "never trusts the proposer" posture above.
+unknown-hold-or-not-your-hold posture as `/approvals/{id}/decide` -- a bot
+can never reach this route at all regardless of scope, which is what makes a
+bot self-approving its own proposal structurally impossible here too.
 
 Status transitions from `"pending"`: `"rejected"` (requires a non-empty
 `decision_note`, 400/`ValueError` otherwise, never touches the target
-system), or on `"approve"`:
+system), or on `"approve"` the shared helper re-fetches the current target
+state, compares it to `hold.target_fingerprint`, and either marks the hold
+`"stale"` or runs the kind/action_type-specific applier. `apply_open_ticket`
+creates the issue via `issueCreate` and returns `{"id", "identifier",
+"url"}`; `apply_start_ticket`/`apply_review_ticket` move an existing issue
+with `issueUpdate(stateId)`; `apply_assign_ticket` updates `assigneeId`; and
+`apply_label_ticket` uses the dedicated `issueAddLabel` mutation so it never
+clobbers existing labels. `apply_progress_update` remains the comment-posting
+fallback for `close_ticket` and any other lane that still writes a note
+instead of mutating workflow state.
 
-0. CLAIM the row: write `status="applying"` (+ decision fields) under the
-   row lock acquired for the initial status check, and commit -- releasing
-   that lock before either of the two external calls below (Argus review
-   S1), and closing the double-Linear-write race described above (Argus
-   review round-2 B1).
-1. Re-fetch the target's CURRENT state via a kind-scoped fingerprinter
-   (`service._PROPOSAL_FINGERPRINTER_NAMES`, looked up by attribute name on
-   `linear_client` rather than a bound function reference -- see that
-   dict's own comment for why) and compare against `hold.target_fingerprint`
-   (computed by whatever submitted the proposal, at submission time).
-   Mismatch -> `"stale"`, no write attempted. A `linear_client.LinearAPIError`
-   raised BY THE FINGERPRINTER ITSELF (missing `LINEAR_API_TOKEN`, transport
-   failure, Linear-side error) is caught the same way as an applier failure
-   below (Argus review round-2 B2 -- originally only the applier call was
-   wrapped, so a fingerprinter failure propagated past this endpoint
-   entirely into a generic 500, instead of the documented graceful
-   `"apply_failed"` degradation).
-2. Match -> the kind-scoped applier (`_PROPOSAL_APPLIER_NAMES`,
-   `linear_client.apply_progress_update` for
-   `kind="linear_progress_update"`) executes the real write. Success ->
-   `"applied"` (+ `applied_at`). A raised `linear_client.LinearAPIError` OR
-   a caught `asyncio.CancelledError` -> `"apply_failed"` (+ `apply_error`
-   set to one of FOUR fixed, allowlisted strings, Argus review round-9
-   suggestion -- corrected from an earlier "THREE" count that missed the
-   cancellation case added in round-7/8: `"Linear API token not
-   configured"` / `"Linear API unavailable"` / `"Linear API returned an
-   error"` (via `service._sanitize_apply_error` for a `LinearAPIError`) /
-   `"Apply cancelled before completion"` (the fixed
-   `service._APPLY_ERROR_CANCELLED_MESSAGE` constant for a
-   `CancelledError` -- Argus review round-8 BLOCKING fix: an enriched,
-   caller-supplied `task.cancel(msg=...)` message must NEVER reach
-   `apply_error` itself, only the internal `raw_apply_error`/audit-log
-   path below) -- Argus review round-5 S4: the raw exception text is
-   never returned over the API, since any authenticated caller of this
-   endpoint can reach it, not just an operator with Linear/infra access;
-   the full unredacted text is instead captured into a `raw_apply_error`
-   local and logged server-side at WARNING (and persisted to the
-   `proposal.apply_failed` audit-log row's `detail.error` field), Argus
-   review round-6 B1 -- this is a normal 200 response, not a raised
-   exception, since the DECIDE itself succeeded even though the apply did
-   not; the hold stays queryable for a human to retry via a fresh proposal
-   resubmission.
+`open_ticket` is the only action_type whose apply result is retained:
+`apply_open_ticket` stores the created issue's `{id, identifier, url}` in
+`proposal_holds.apply_result`, so the bot learns the new `TECH-####`
+identifier from the proposal response rather than from a comment body.
 
-Idempotent on an already-`"applied"` hold: a retried decide call (timeout +
-client retry, double-click) returns the existing applied state verbatim,
-without re-running the judge/fingerprint/apply logic and without a second
-write. Any OTHER non-`"pending"` status (`"rejected"`/`"applying"`/
-`"apply_failed"`/`"stale"`) is NOT retryable through this same call -- it
-raises `HoldAlreadyDecidedError` (-> 409), including in the (normally
-unreachable, since the claim above already serializes access) case where
-something else resolves the SAME hold between this call's own claim and
-its terminal write (Argus review round-2 S4 -- this call never got to
-decide anything, so it must not report the concurrent winner's result as
-its own 200). Recovering from `"apply_failed"`/`"stale"` requires a fresh
-`POST /proposals` resubmission, out of scope for this ticket.
+**Human approval bypasses all rule-level checks, by design.** `"approve"`
+here dispatches straight to the applier and never re-runs the
+kind/action_type-scoped rule (`_PROPOSAL_RULES`) that gates auto-approval --
+e.g. a human-approved `assign_ticket` applies whatever `assignee_id` the bot
+proposed with NO identity-map re-verification, and a human-approved
+`start_ticket`/`review_ticket` applies with no forward-transition check.
+Only the fingerprint/staleness check still runs on this path. This is
+intentional -- a human approving IS the final authority this whole
+human-in-the-loop escape hatch exists for -- not an oversight or a gap to
+close later.
 
-**Linear write, called directly, not proxied through Prefect** -- by decide
-time the Prefect flow run that originally submitted the proposal is long
-gone, so `linear_client.py` calls the Linear GraphQL API directly from
-agent-comms-mcp using the `LINEAR_API_TOKEN` env var (SSM
-`/reclaw-comms/{env}/linear-api-token`, TECH-5874), the same
-"Terraform-injected env var, never fetched from SSM by application code"
-convention as `OKTA_CLIENT_SECRET`/`MCP_JWT_SECRET`/`AGENT_JWT_SECRET`. The
-actual write for `kind="linear_progress_update"` is a comment posted to the
-target issue (`linear_client.apply_progress_update`) -- a design choice, not
-fully specified by the ticket: this is a progress-REPORTING bot, and the
-two action_types the judge understands read as "report that a ticket was
-opened/closed", not "mutate this issue's workflow state" (which would
-additionally require resolving a team-specific workflow-state id the action
-payload doesn't carry).
-
-**Fingerprint scheme is a cross-repo contract**
+**Fingerprint scheme is an internal contract**
 (`linear_client.compute_target_fingerprint`): a sha256 hex digest over a
 fixed, sorted set of Linear issue fields (state id/name, priority, assignee
-id, `updatedAt`). Whatever submits the original proposal (the Prefect flow)
-MUST compute `target_fingerprint` the same way over the same fields, or
-every decide will spuriously come back `"stale"` -- this function's own
-docstring is the single source of truth for the EXACT byte-level scheme
-(field set AND serialization: `json.dumps` args, `updated_at` format),
-not duplicated here (Argus review round-7 suggestion -- an earlier
-version of this section duplicated that docstring's serialization detail
-in prose, which is exactly the kind of copy that can silently drift from
-the one true source it claims to defer to). See
+id). `updatedAt` is deliberately EXCLUDED (bug fix: Linear bumps it on
+any touch, which made staleness fire on unrelated activity). Staleness now
+means "the ticket's state/priority/assignee changed since the proposal was
+submitted," not "anything touched this ticket." `service.create_proposal`
+computes and stores `target_fingerprint` server-side at submission time,
+and `_apply_or_finalize_proposal_hold` reuses the same function at
+apply time to check for drift. The value is purely internal and server-computed
+(any caller-supplied `target_fingerprint` in the request body is ignored).
+This function's own docstring is the single source of truth for the EXACT
+byte-level scheme (field set AND serialization: `json.dumps` args), not
+duplicated here (Argus review round-7 suggestion). See
 `test_pinned_digest_for_fixed_input` in `tests/test_linear_client.py` for
 the exact digest this scheme produces for a fixed input.
+
+**One-time transitional cost of the fingerprint fix:** because the
+fingerprint computation changed (server-computed now, `updated_at` dropped
+from the hash -- see the bug-fix note above), every `status='pending'` row
+that existed BEFORE this fix deploys will deterministically resolve to
+`"stale"` the first time it's decided post-deploy -- a human clicking
+Approve on an old hold gets a 200 with no Linear write. This is an accepted,
+one-time cost, not a bug needing a data migration: the proposing bot simply
+resubmits (dedup lands it back on the same row, now with a fresh,
+correctly-computed fingerprint), and the new logic handles that fresh row
+correctly from then on.
 
 ### Configuration: pluggable seams
 

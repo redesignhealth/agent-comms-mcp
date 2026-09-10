@@ -394,23 +394,44 @@ docker compose up --build
 |---|---|
 | `DECISION_PAGE_BASE_URL` | Base URL of the separate `agent-comms-approvals-decision-page` service. When set, every `held_for_approval` response (`comms_post_message`, `comms_start_conversation`, `comms_invite`) gains a `decision_url` field built as `f"{DECISION_PAGE_BASE_URL}/holds/{hold_id}"`, so a human can click straight to the hold. Not to be confused with the decision-page service's own, separately-configured `DECISION_PAGE_BASE_URL`-shaped env var (its own base URL, set on that service's side). Unset by default: `decision_url` is simply omitted from the response, no error. |
 | `LINEAR_API_TOKEN` | A Linear **personal API token** (not an OAuth workspace token -- see `.env.example`; the client sends it unprefixed, without a `Bearer` prefix) for `linear_client.py`'s direct Linear API calls, used when a `POST /proposals/{id}/decide` approval or an auto-approved submission applies a `linear_progress_update` proposal. The server runs without it, but any such apply resolves to `apply_failed` if it's unset. |
+| `GITHUB_TOKEN` | A GitHub personal access token (fine-grained, read-only `pull_requests` + `contents`) for `github_client.py`'s direct GitHub API calls, used by the `open_ticket`/`start_ticket`/`review_ticket`/`assign_ticket`/`label_ticket` auto-approve judge lanes (`service.py`) to verify a cited PR before approving. Sent as `Authorization: Bearer <token>` (unlike `LINEAR_API_TOKEN` above, which is sent raw). If unset, those lanes fail closed -- they silently stay `"pending"` rather than crashing or auto-approving; see `service.py`'s judge error-handling docstring. |
+| `GITHUB_LOGIN_TO_LINEAR_USER_ID_JSON` | A JSON object (e.g. `{"octocat": "user-uuid-1"}`) mapping GitHub logins to Linear user IDs, for `identity_map.py`'s server-side identity map -- used by the `assign_ticket` auto-approve judge lane (`service._rule_assign_ticket`) to verify the cited PR's ACTUAL author against the proposed assignee. A malformed value logs a warning and falls back to an empty map; an unset or empty env var falls back silently to an empty map (neither is fatal) -- an empty map is always safe, but it leaves `assign_ticket` permanently inert (never auto-approves) until populated with real data. |
+| `PROPOSAL_OPEN_TICKET_TEAM_ALLOWLIST` | A JSON array of Linear team KEYS (e.g. `["TECH"]`) the `open_ticket` auto-approve judge lane (`service._rule_open_ticket`) is allowed to auto-create an issue into, for `team_allowlist.py`'s server-side allowlist -- `action["team"]` is bot-asserted and, unlike the other auto-approve lanes, `open_ticket` has no pre-existing target to cross-check it against. A malformed value logs a warning and falls back to an empty set; an unset or empty env var falls back silently to an empty set (neither is fatal) -- an empty set is always safe, but it leaves `open_ticket` permanently inert (never auto-approves) until populated with real data. |
 
 > [!WARNING]
-> **Deployment prerequisite for the approve/apply path (TECH-5874).** In ECS
-> environments, `LINEAR_API_TOKEN` is provisioned via SSM
-> (`/reclaw-comms/{env}/linear-api-token`) by `rh-data-platform`'s Terraform
-> -- a SEPARATE repo/deploy from this one. **Landing this repo's TECH-5873
-> code does not itself provision the credential.** Until that Terraform
-> lands and applies, every approve/auto-apply of a `linear_progress_update`
-> proposal resolves to `"apply_failed"` with a normal HTTP 200 (not an
-> error response -- see the decide/apply section above), which is easy to
-> misread as "it worked" during a deploy verification pass that only
-> checks the status code.
+> **Deployment prerequisites for the approve/apply and auto-approve paths (TECH-5874).** In ECS
+> environments, credentials and configs are provisioned via SSM by
+> `rh-data-platform`'s Terraform -- a SEPARATE repo/deploy from this one.
+> **Landing this repo's code does not itself provision these variables.**
 >
-> **Pre-deploy checklist:** confirm `apply_error` is absent on a real
-> approve/auto-apply, or check that `LINEAR_API_TOKEN` is actually set in
-> the running container's environment -- not just that the response is
-> 200 (Argus review round-4 suggestion, round-5 S7).
+> - `LINEAR_API_TOKEN` (`/reclaw-comms/{env}/linear-api-token`): until
+>   provisioned, every approve/auto-apply of a `linear_progress_update`
+>   proposal resolves to `"apply_failed"` with a normal HTTP 200 (not an
+>   error response -- see the decide/apply section above), which is easy to
+>   misread as "it worked" during a deploy verification pass that only checks
+>   the status code.
+> - `GITHUB_TOKEN` (`/reclaw-comms/{env}/github-token`): until provisioned,
+>   all five GitHub-backed lanes (`open_ticket`, `start_ticket`,
+>   `review_ticket`, `assign_ticket`, `label_ticket`) fail closed silently --
+>   proposals stay `"pending"` with an HTTP 200 response and NO `apply_error`.
+>   Confirming only that `apply_error` is absent will deceptively pass in
+>   this broken state.
+> - `GITHUB_LOGIN_TO_LINEAR_USER_ID_JSON`
+>   (`/reclaw-comms/{env}/github-login-to-linear-user-id-json`): if absent or
+>   empty, `assign_ticket` auto-approval is silently disabled forever with no
+>   observable error.
+> - `PROPOSAL_OPEN_TICKET_TEAM_ALLOWLIST`
+>   (`/reclaw-comms/{env}/proposal-open-ticket-team-allowlist`): if absent or
+>   empty, `open_ticket` auto-approval is silently disabled forever with no
+>   observable error.
+>
+> **Pre-deploy checklist:**
+> - Confirm `LINEAR_API_TOKEN`, `GITHUB_TOKEN`,
+>   `GITHUB_LOGIN_TO_LINEAR_USER_ID_JSON`, and
+>   `PROPOSAL_OPEN_TICKET_TEAM_ALLOWLIST` are actually set in the running
+>   container's environment (or in SSM).
+> - On a real approve/auto-apply test, confirm `apply_error` is absent and the
+>   proposal transitions to `"applied"`, not silently remaining `"pending"`.
 
 `entrypoint.sh` runs `alembic upgrade head` automatically on every container
 start, so migrations apply before the server accepts traffic.

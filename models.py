@@ -726,8 +726,8 @@ class ProposalHold(Base):
     ``kind`` other than ``"linear_progress_update"`` -- e.g. a proposal
     with ``kind="arc_board_change"`` will 422 at submission time even
     though the column would happily store it. Adding a new kind requires
-    both a new ``_derive_proposal_priority`` branch and a registered judge
-    in ``_PROPOSAL_JUDGES``, not just writing the row.
+    both a new ``_derive_proposal_priority`` branch and a registered rule
+    in ``_PROPOSAL_KIND_DEFAULT_RULE``, not just writing the row.
 
     ``owner_sub`` is snapshotted at creation time from the proposing bot's
     verified owner claim (falling back to the agent-owner registry, same
@@ -781,6 +781,14 @@ class ProposalHold(Base):
         CheckConstraint(
             "status = 'applied' OR applied_at IS NULL",
             name="ck_proposal_holds_applied_at_consistency",
+        ),
+        # Same shape as ck_proposal_holds_applied_at_consistency above,
+        # for apply_result -- it is only ever written by
+        # service._apply_or_finalize_proposal_hold inside the same branch
+        # that sets status="applied" (migration cf72736e07f5).
+        CheckConstraint(
+            "apply_result IS NULL OR status = 'applied'",
+            name="ck_proposal_holds_apply_result_consistency",
         ),
         # Backs a pending-queue listing (a future PR's endpoint/tool), same
         # shape as approval_holds' sender-scoped index -- ordered by
@@ -849,6 +857,15 @@ class ProposalHold(Base):
     target_fingerprint: Mapped[str] = mapped_column(Text, nullable=False)
     applied_at: Mapped[datetime | None] = mapped_column(nullable=True)
     apply_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Metadata a kind-scoped applier returns on a successful apply -- e.g.
+    # `linear_client.apply_open_ticket`'s `{"id", "identifier", "url"}` for
+    # the Linear issue it just created (TECH-5873 redefinition). Nullable
+    # and set only when the applier actually returns something non-None;
+    # `apply_progress_update` (the comment-posting applier) always returns
+    # `None`, so this stays unset for every `close_ticket`/other
+    # `linear_progress_update` row -- see `service._apply_or_finalize_
+    # proposal_hold`.
+    apply_result: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _updated_at()
 
