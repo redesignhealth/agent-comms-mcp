@@ -7,9 +7,11 @@
 # This is a TRIMMED-DOWN port of the org-wide auto-approve.yml pattern used by
 # redesignhealth/vc-hub and redesignhealth/rh-lib. This repo has no
 # multi-agent GHA review matrix -- only the Argus gate below. There are exactly
-# two terminal outcomes: approve, or a "waiting on Argus" comment (a third,
-# implicit outcome -- CI hasn't passed yet -- is handled by simply not running
-# the Argus-check steps at all).
+# three terminal outcomes: approve, a "waiting on Argus" comment, or an
+# infra-failure comment (bad/missing AWS credentials, a misconfigured Argus
+# API key, or the Argus API itself being unreachable) -- a fourth, implicit
+# outcome -- CI hasn't passed yet -- is handled by simply not running the
+# Argus-check steps at all.
 #
 # Triggers on `workflow_run` (CI completion) rather than `pull_request` directly
 # so that the job executes under default-branch ref context (ref:refs/heads/main).
@@ -22,8 +24,9 @@
 # The role ARN is composed inline using this repo's existing `AWS_ACCOUNT_ID`
 # secret: `arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/rh-argus-gate-2`.
 # Until that role is provisioned and applied, the "Configure AWS credentials"
-# step continues on error, and subsequent steps are skipped -- a safe, fail-closed
-# default; PRs simply fall back to requiring a human review, same as today.
+# step continues on error, the "Post Argus approval required" step posts an
+# infra-failure comment explaining the situation, and PRs fall back to
+# requiring a human review, same as today -- a safe, fail-closed default.
 #
 # This hardcodes a cross-repo coupling to that Terraform provisioning: if the
 # role is ever renamed on the rh-data-platform side, the `role-to-assume`
@@ -251,7 +254,8 @@ jobs:
           API_KEY=$(aws ssm get-parameter \
             --name /general/prod/api-secret-key \
             --with-decryption \
-            --query 'Parameter.Value' --output text 2>/dev/null) || API_KEY=""
+            --query 'Parameter.Value' --output text 2>ssm_err.txt) || { cat ssm_err.txt >&2; API_KEY=""; }
+          rm -f ssm_err.txt
 
           if [ -z "$API_KEY" ]; then
             # A non-zero exit here would skip the later "Post Argus approval
@@ -267,11 +271,11 @@ jobs:
 
           # Workflow commands like ::add-mask:: are only recognized on
           # stdout, not stderr -- must run before $API_KEY is used anywhere.
-          # Primary guaranteed mask for the entire secret value:
-          echo "::add-mask::$API_KEY"
-
-          # Line-by-line masking as defense-in-depth so embedded newlines
-          # do not leave individual lines unmasked in logs.
+          # Mask line-by-line (not the whole value in one ::add-mask:: call):
+          # GitHub Actions parses ::add-mask:: from stdout line-by-line, so a
+          # single whole-value echo would only mask up to the first embedded
+          # newline, leaving any later lines of a multi-line value unmasked.
+          # This loop handles both single-line and multi-line values correctly.
           printf '%s\n' "$API_KEY" | while IFS= read -r line; do
             if [ -n "$line" ]; then
               echo "::add-mask::$line"
@@ -280,16 +284,36 @@ jobs:
 
           # Don't use curl -f: a non-2xx response should resolve to "not
           # approved" (falls through to the "waiting on Argus" comment step),
-          # not hard-fail this step and skip that comment entirely.
+          # not hard-fail this step and skip that comment entirely. A network
+          # failure (DNS, connection refused, timeout) leaves HTTP_RESPONSE
+          # empty rather than killing the script under `set -e`, so it falls
+          # into the same handling below with an empty HTTP_STATUS.
           HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" \
             -H "X-API-Key: $API_KEY" \
-            "https://api.core.redesignhealth.com/api/v1/code-review/storage/reviews/${REPO}/${PR_NUMBER}")
+            "https://api.core.redesignhealth.com/api/v1/code-review/storage/reviews/${REPO}/${PR_NUMBER}") || HTTP_RESPONSE=""
           HTTP_BODY=$(echo "$HTTP_RESPONSE" | head -n -1)
           HTTP_STATUS=$(echo "$HTTP_RESPONSE" | tail -n 1)
 
           if [ "$HTTP_STATUS" != "200" ]; then
             echo "Argus API returned HTTP $HTTP_STATUS for PR #${PR_NUMBER} -- treating as not approved"
             echo "approved=false" >> "$GITHUB_OUTPUT"
+            case "$HTTP_STATUS" in
+              401|403|5[0-9][0-9])
+                # Bad/rotated credential, or the Argus API itself is down --
+                # re-running /argus-review-loop can't fix either; route to
+                # the platform-team-escalation comment instead.
+                echo "infra_failure=true" >> "$GITHUB_OUTPUT"
+                ;;
+              [1-9][0-9][0-9])
+                # Other 4xx (e.g. 404) -- an ordinary "not approved".
+                ;;
+              *)
+                # Empty or non-numeric status means curl itself failed (e.g.
+                # a network error) -- also route to the platform-team
+                # escalation comment.
+                echo "infra_failure=true" >> "$GITHUB_OUTPUT"
+                ;;
+            esac
             exit 0
           fi
 
@@ -459,48 +483,38 @@ jobs:
             core.info(`PR #${prNumber} auto-approved at ${reviewedSha}`);
 
       - name: Post Argus approval required
-        if: steps.aws.outcome == 'success' && steps.pr.outputs.skip != 'true' && (github.event_name == 'workflow_run' || steps.ci.outputs.passed == 'true') && steps.argus.outputs.approved != 'true'
+        if: steps.pr.outputs.skip != 'true' && (github.event_name == 'workflow_run' || steps.ci.outputs.passed == 'true') && (steps.aws.outcome == 'failure' || (steps.aws.outcome == 'success' && steps.argus.outputs.approved != 'true'))
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         env:
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           REVIEWED_SHA: ${{ steps.pr.outputs.reviewed_sha }}
+          AWS_OUTCOME: ${{ steps.aws.outcome }}
           INFRA_FAILURE: ${{ steps.argus.outputs.infra_failure }}
         with:
           script: |
             const prNumber = parseInt(process.env.PR_NUMBER, 10);
             const reviewedSha = process.env.REVIEWED_SHA;
             const shortSha = reviewedSha.substring(0, 7);
-            const isInfraFailure = process.env.INFRA_FAILURE === 'true';
-            const marker = isInfraFailure
-              ? `<!-- argus-gate-infra-failure:${reviewedSha} -->`
-              : `<!-- argus-gate-pending:${reviewedSha} -->`;
-
-            // De-duplicate: paginate through all comments to skip if already
-            // posted for this exact full SHA by github-actions[bot].
-            const existingComments = await github.paginate(
-              github.rest.issues.listComments,
-              {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: prNumber,
-              }
-            );
-            const alreadyPosted = existingComments.some(c =>
-              c.user?.login === 'github-actions[bot]' &&
-              c.user?.type === 'Bot' &&
-              c.body?.includes(marker)
-            );
-            if (alreadyPosted) {
-              core.info(`Argus ${isInfraFailure ? 'infra failure' : 'approval required'} comment already posted for SHA ${reviewedSha}, skipping duplicate`);
-              return;
-            }
+            // AWS_OUTCOME === 'failure' means the "Configure AWS credentials"
+            // step itself couldn't even run (e.g. the IAM role isn't
+            // provisioned yet) -- that's an infra failure too, same as a bad
+            // SSM key or a non-2xx Argus API response.
+            const isInfraFailure = process.env.AWS_OUTCOME === 'failure' || process.env.INFRA_FAILURE === 'true';
+            // Single marker per SHA regardless of variant: an earlier
+            // revision used two separate markers (argus-gate-pending vs
+            // argus-gate-infra-failure), so a later run whose situation had
+            // changed couldn't find its own variant's marker and posted a
+            // second, contradictory comment alongside the first. The comment
+            // body (updated in place below, not re-posted) is what
+            // distinguishes which variant currently applies.
+            const marker = `<!-- argus-gate:${reviewedSha} -->`;
 
             const commentBody = isInfraFailure
               ? [
                   marker,
                   '## Argus Auto-Approval Unavailable',
                   '',
-                  'Auto-approval could not run: the Argus API key is misconfigured (SSM/IAM issue) — this needs platform-team attention, not another `/argus-review-loop` run.',
+                  'Auto-approval could not run: the Argus API key is misconfigured (SSM/IAM issue) -- this needs platform-team attention, not another `/argus-review-loop` run.',
                   '',
                   'To bypass, request a human reviewer directly.',
                   '',
@@ -523,6 +537,40 @@ jobs:
                   '---',
                   '*This check is enforced by the Argus auto-approve workflow.*',
                 ].join('\n');
+
+            // Find any existing argus-gate comment for this SHA (either
+            // variant -- they now share one marker) and update it in place
+            // rather than posting a new one, so the PR never accumulates
+            // more than one argus-gate comment per SHA and it always
+            // reflects the most recent situation.
+            const existingComments = await github.paginate(
+              github.rest.issues.listComments,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+              }
+            );
+            const existing = existingComments.find(c =>
+              c.user?.login === 'github-actions[bot]' &&
+              c.user?.type === 'Bot' &&
+              c.body?.includes(marker)
+            );
+
+            if (existing) {
+              if (existing.body === commentBody) {
+                core.info(`Argus gate comment for SHA ${reviewedSha} already up to date, skipping`);
+                return;
+              }
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: commentBody,
+              });
+              core.info(`Updated Argus gate comment for SHA ${reviewedSha} (${isInfraFailure ? 'infra failure' : 'approval required'})`);
+              return;
+            }
 
             await github.rest.issues.createComment({
               owner: context.repo.owner,

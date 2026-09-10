@@ -282,9 +282,21 @@ i.e. `.github/workflows/ci.yml`'s `name:`), or manually via
 the shared Argus review-storage API reports an APPROVE verdict at the PR's
 exact head SHA (from a `/argus-review-loop <pr_number>` run in a Claude Code
 session), it submits an approving review itself, pinned to that SHA. If Argus
-hasn't approved yet, the workflow instead comments on the PR asking the author
-to run `/argus-review-loop` and re-checks automatically when CI completes
-after the next push to this PR.
+hasn't approved yet, the workflow instead posts one of two comments on the
+PR, and re-checks automatically when CI completes after the next push to
+this PR:
+
+- **"Argus Approval Required"** -- no Argus APPROVE verdict was found for
+  this SHA yet. Run `/argus-review-loop <pr_number>` in a Claude Code session
+  and push again.
+- **"Argus Auto-Approval Unavailable"** -- an infra failure (bad/missing AWS
+  credentials, a misconfigured Argus API key, or the Argus API itself being
+  unreachable) prevented the check from running at all. Running
+  `/argus-review-loop` again will not help; this needs platform-team
+  attention, or a human reviewer in the meantime.
+
+Both comments share a single per-SHA marker, so a later run updates the
+existing comment in place rather than posting a second, contradictory one.
 
 > [!WARNING]
 > **Do not switch `auto-approve.yml` to trigger on `pull_request` directly.**
@@ -302,8 +314,9 @@ The role and its branch-ref-only trust policy are provisioned via
 The role grants access to read the Argus review-storage API key from the
 `/general/prod/api-secret-key` SSM parameter (with KMS decryption). Until that
 role is applied, the workflow's AWS credential configuration step continues on
-error and downstream approval steps are skipped -- a safe, fail-closed default
-that leaves PRs requiring a human review, same as today.
+error, the "Argus Auto-Approval Unavailable" comment above is posted on the
+PR, and PRs fall back to requiring a human review -- a safe, fail-closed
+default.
 
 ## Observability
 
