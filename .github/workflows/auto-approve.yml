@@ -205,14 +205,72 @@ jobs:
       - name: Check CI status (workflow_dispatch)
         if: steps.pr.outputs.skip != 'true' && github.event_name == 'workflow_dispatch'
         id: ci
-        # Cross-repo composite action reference -- deliberately NOT vendored
-        # into this repo. Pinned to redesignhealth/.github main branch commit SHA.
-        uses: redesignhealth/.github/.github/actions/wait-for-ci@80b6e4471a5f6d2542907a8501ba67cf4bda18ad # main @ 2026-08-13
+        # Verbatim inline port of redesignhealth/.github@80b6e4471a5f6d2542907a8501ba67cf4bda18ad's
+        # `wait-for-ci` composite action. GitHub Actions resolves every `uses:`
+        # reference in a job at job-setup time, before any step-level `if:` is
+        # evaluated -- so the cross-repo reference this replaced broke EVERY run
+        # of this job (including workflow_run-triggered runs that never even
+        # reach this step), even though redesignhealth/.github's Actions access
+        # level is already `organization`. Do not re-introduce a cross-repo
+        # `uses:` in this job.
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          INPUT_SHA: ${{ steps.pr.outputs.reviewed_sha }}
+          INPUT_CHECK_NAME: "All checks passed"
+          INPUT_MAX_RETRIES: "10"
+          INPUT_RETRY_DELAY_MS: "60000"
         with:
-          sha: ${{ steps.pr.outputs.reviewed_sha }}
-          check-name: "All checks passed"
-          max-retries: "10"
-          retry-delay-ms: "60000"
+          script: |
+            const sha = process.env.INPUT_SHA;
+            const checkName = process.env.INPUT_CHECK_NAME;
+            const MAX_RETRIES = parseInt(process.env.INPUT_MAX_RETRIES, 10);
+            const RETRY_DELAY_MS = parseInt(process.env.INPUT_RETRY_DELAY_MS, 10);
+
+            for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+              let allCheckRuns = [];
+              let totalCount = null;
+              let page = 1;
+              while (true) {
+                const resp = await github.rest.checks.listForRef({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: sha,
+                  per_page: 100,
+                  page,
+                });
+                if (totalCount === null) totalCount = resp.data.total_count;
+                allCheckRuns.push(...resp.data.check_runs);
+                // Exit when we've fetched all known runs or the last page was short.
+                if (allCheckRuns.length >= totalCount || resp.data.check_runs.length < 100) break;
+                page++;
+              }
+
+              // findLast: API returns oldest-first; we want the most recent run
+              // in case CI was re-triggered after a failure.
+              const ciCheck = allCheckRuns.findLast(cr => cr?.name === checkName);
+
+              if (ciCheck?.conclusion === 'success') {
+                core.info(`CI passed on attempt ${attempt} (check: ${ciCheck.name})`);
+                core.setOutput('passed', 'true');
+                return;
+              }
+
+              if (ciCheck?.conclusion === 'failure') {
+                core.info(`CI failed (check: ${ciCheck?.name || checkName}) -- skipping`);
+                core.setOutput('passed', 'false');
+                return;
+              }
+
+              const status = ciCheck?.status || 'not found';
+              const conclusion = ciCheck?.conclusion || 'none';
+              if (attempt < MAX_RETRIES) {
+                core.info(`CI not complete (status=${status}, conclusion=${conclusion}, check=${ciCheck?.name || checkName}), retrying in ${RETRY_DELAY_MS / 1000}s (${attempt}/${MAX_RETRIES})`);
+                await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
+              } else {
+                core.warning(`CI did not complete after ${MAX_RETRIES} attempts -- skipping`);
+                core.setOutput('passed', 'false');
+              }
+            }
 
       - name: Configure AWS credentials (Argus approval check)
         id: aws
