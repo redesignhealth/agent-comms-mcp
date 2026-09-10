@@ -248,6 +248,47 @@ class TestOpenTicket:
         assert note is not None
         mock_fetch_pr.assert_awaited_once_with("org", "repo", 1)
 
+    async def test_open_ticket_with_project_stays_pending_without_fetching_pr(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Project placement is deliberately not bot-controllable via the
+        action payload in auto-approval. If a proposal specifies a project,
+        it is held for human review (pending) instead of auto-approved.
+        Checked before any network call."""
+        mock_fetch_pr = AsyncMock(return_value={"state": "open"})
+        monkeypatch.setattr(github_client, "fetch_pull_request", mock_fetch_pr)
+        status, _note = await evaluate_linear_progress_update_judge(
+            {
+                "action_type": "open_ticket",
+                "target_id": "https://github.com/org/repo/pull/1",
+                "title": "New issue title",
+                "team": "TECH",
+                "project": "project-uuid-or-name",
+            }
+        )
+        assert status == "pending"
+        mock_fetch_pr.assert_not_awaited()
+
+    async def test_open_ticket_with_project_none_is_approved(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Explicit project=None behaves the same as omitting it --
+        auto-created issues are created without a project assignment."""
+        mock_fetch_pr = AsyncMock(return_value={"state": "open"})
+        monkeypatch.setattr(github_client, "fetch_pull_request", mock_fetch_pr)
+        status, note = await evaluate_linear_progress_update_judge(
+            {
+                "action_type": "open_ticket",
+                "target_id": "https://github.com/org/repo/pull/1",
+                "title": "New issue title",
+                "team": "TECH",
+                "project": None,
+            }
+        )
+        assert status == "approved"
+        assert note is not None
+        mock_fetch_pr.assert_awaited_once_with("org", "repo", 1)
+
     async def test_open_ticket_slack_hosted_pr_shaped_url_stays_pending(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

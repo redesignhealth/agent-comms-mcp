@@ -1529,7 +1529,7 @@ because it has no pre-existing artifact bounding the destination team at
 all -- it CREATES a brand-new issue, so an unconstrained `team` there picks
 the team outright, not merely a name to look up within one. Closing this
 remaining gap for the other three (cross-checking `action.team` against
-`target_id`'s real team) is tracked as follow-up work, deferred because it
+`target_id`'s real team) is tracked as follow-up work (TECH-6150), deferred because it
 requires extending `linear_client._ISSUE_QUERY` with `team { key }`, which
 touches `compute_target_fingerprint`'s hashed field set and needs its own
 fingerprint-stability test coverage.

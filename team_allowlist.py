@@ -27,15 +27,16 @@ Matching is CASE-SENSITIVE, exact-string equality -- consistent with
 ``linear_client.resolve_team_id``'s own exact-match team-key filter (Linear
 team keys are matched as literal strings there too, never case-folded).
 
-FAIL CLOSED, NOT FAIL-THE-WHOLE-SERVICE: if the env var is absent, empty, or
-fails to parse as a JSON array of non-empty strings, this module logs a
-warning and falls back to a genuinely empty immutable ``frozenset`` -- same
-"inert by construction until populated" posture as ``identity_map.py``'s
-own mapping. An empty allowlist means ``open_ticket`` NEVER auto-approves
-(every proposal is held for a human instead), which is always the safe
-default -- this one optional env var being malformed or unset must never
-crash the whole service at import time, and must never fail OPEN into
-allowing auto-approval for every team.
+FAIL CLOSED, NOT FAIL-THE-WHOLE-SERVICE: an unset or empty env var falls
+back silently to a genuinely empty immutable ``frozenset`` (no warning); a
+malformed value (invalid JSON, not a JSON array, or containing non-string or
+empty-string elements) logs a warning and falls back to the same empty set
+-- same "inert by construction until populated" posture as
+``identity_map.py``'s own mapping. An empty allowlist means ``open_ticket``
+NEVER auto-approves (every proposal is held for a human instead), which is
+always the safe default -- this one optional env var being malformed or unset
+must never crash the whole service at import time, and must never fail OPEN
+into allowing auto-approval for every team.
 """
 
 from __future__ import annotations
@@ -51,10 +52,10 @@ _ENV_VAR = "PROPOSAL_OPEN_TICKET_TEAM_ALLOWLIST"
 
 def _parse_team_allowlist(raw: str | None) -> frozenset[str]:
     """Parse ``raw`` (the ``_ENV_VAR`` env var's value) into an immutable
-    set of allowed Linear team keys. Returns an empty ``frozenset`` --
-    logging a warning, never raising -- if ``raw`` is absent/empty, is not
-    valid JSON, is not a JSON array, or contains any non-string or
-    empty-string element."""
+    set of allowed Linear team keys. An unset or empty value falls back
+    silently to an empty ``frozenset`` (no warning). A malformed value
+    (not valid JSON, not a JSON array, or containing any non-string or
+    empty-string element) logs a warning and falls back to an empty set."""
     if not raw:
         return frozenset()
     try:

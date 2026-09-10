@@ -6019,6 +6019,16 @@ async def _rule_open_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
        ``target_state``, it is held for human review (``pending``)
        instead of auto-approved, leaving it to a human reviewer to
        approve issue creation into non-default states.
+    5. ``action`` does NOT specify a ``project`` (i.e.
+       ``action.get("project") is None``) -- project placement is
+       deliberately not bot-controllable via the action payload in
+       auto-approval (same class of placement/routing field as
+       ``target_state``; ``linear_client.apply_open_ticket`` accepts
+       ``project`` as-is with no name resolution). Auto-approved issues
+       are created without a project assignment. If a proposal specifies a
+       ``project``, it is held for human review (``pending``) instead of
+       auto-approved, leaving it to a human reviewer to approve issue
+       creation into specific projects.
 
     A Slack permalink -- otherwise a valid citation URL under
     ``_is_valid_citation_url``'s general allowlist -- is deliberately NOT
@@ -6046,6 +6056,8 @@ async def _rule_open_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
     if team not in team_allowlist.OPEN_TICKET_TEAM_ALLOWLIST:
         return "pending", None
     if action.get("target_state") is not None:
+        return "pending", None
+    if action.get("project") is not None:
         return "pending", None
     owner, repo, number = parsed
     await github_client.fetch_pull_request(owner, repo, number)

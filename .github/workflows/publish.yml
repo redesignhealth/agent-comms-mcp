@@ -58,9 +58,6 @@ jobs:
         # after the GitHub release already exists just to run a stdlib-only
         # script -- a sync failure here would leave a broken release (exists
         # on GitHub, never published to PyPI) for no benefit.
-        #
-        # Also installs the built wheel into a fresh throwaway virtualenv
-        # and verifies `import service` succeeds before publishing.
         run: |
           python3 -c "
           import glob, zipfile
@@ -75,11 +72,5 @@ jobs:
               )
           print(f'OK: providers/instruction_registry.json present in {whl}')
           "
-          VENV=$(mktemp -d)
-          trap 'rm -rf "$VENV"' EXIT
-          uv venv "$VENV"
-          uv pip install --python "$VENV" dist/*.whl
-          (cd "$VENV" && "$VENV/bin/python" -P -c "import service")
-          echo "OK: service imported successfully from installed wheel"
 
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1, resolved 2026-09-01

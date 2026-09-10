@@ -64,8 +64,11 @@ jobs:
         # package-data stanza being dropped) before it reaches PyPI.
         #
         # Also installs the built wheel into a fresh throwaway virtualenv
-        # and verifies `import service` succeeds, asserting that all modules
-        # imported by service (including py-modules) are present in the wheel.
+        # and verifies `import main` and `import service` succeed. Testing
+        # `main` verifies the published console-script entrypoint (and
+        # transitively imports service, subscriptions, and other modules
+        # listed in py-modules); testing `service` directly ensures the
+        # core service module is importable.
         run: |
           rm -rf dist/ build/
           uv build --wheel
@@ -86,8 +89,20 @@ jobs:
           trap 'rm -rf "$VENV"' EXIT
           uv venv "$VENV"
           uv pip install --python "$VENV" dist/*.whl
-          (cd "$VENV" && "$VENV/bin/python" -P -c "import service")
-          echo "OK: service imported successfully from installed wheel"
+          (cd "$VENV" && "$VENV/bin/python" -P -c "
+          import os, tempfile, unittest.mock
+          os.environ.update({
+              'OKTA_ISSUER_URL': 'https://example.okta.com',
+              'OKTA_CLIENT_ID': 'ci',
+              'OKTA_CLIENT_SECRET': 'ci',
+              'MCP_JWT_SECRET': 'ci-jwt-secret-stable',
+              'AGENT_JWT_SECRET': 'ci-agent-jwt-secret-long-enough-for-hs256',
+              'MCP_TOKEN_STORAGE_PATH': tempfile.mkdtemp(),
+          })
+          with unittest.mock.patch('fastmcp.server.auth.oidc_proxy.OIDCProxy.get_oidc_configuration'):
+              import main, service
+          ")
+          echo "OK: main and service imported successfully from installed wheel"
 
   test:
     name: Tests
