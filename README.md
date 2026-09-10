@@ -291,8 +291,9 @@ this PR:
   and push again.
 - **"Argus Auto-Approval Unavailable"** -- an infra failure (bad/missing AWS
   credentials, a misconfigured Argus API key, or the Argus API being
-  unreachable or returning a server error (5xx)) prevented the check from
-  running at all. Running `/argus-review-loop` again will not help; this needs
+  unreachable, returning a server error (5xx), or returning a
+  malformed/unparseable response body) prevented the check from running at
+  all. Running `/argus-review-loop` again will not help; this needs
   platform-team attention, or a human reviewer in the meantime.
 
 Both comments share a single per-SHA marker, so a later run updates the

@@ -6,10 +6,11 @@
 #
 # This is a TRIMMED-DOWN port of the org-wide auto-approve.yml pattern used by
 # redesignhealth/vc-hub and redesignhealth/rh-lib. This repo has no
-# multi-agent GHA review matrix -- only the Argus gate below. There are exactly
-# three terminal outcomes: approve, a "waiting on Argus" comment, or an
-# infra-failure comment (bad/missing AWS credentials, a misconfigured Argus
-# API key, or the Argus API being unreachable or returning a server error) -- a fourth, implicit
+# multi-agent GHA review matrix -- only the Argus gate below. There are
+# exactly three terminal outcomes: approve, a "waiting on Argus" comment, or
+# an infra-failure comment (bad/missing AWS credentials, a misconfigured Argus
+# API key, or the Argus API being unreachable, returning a server error, or
+# returning a malformed/unparseable response body) -- a fourth, implicit
 # outcome -- CI hasn't passed yet -- is handled by simply not running the
 # Argus-check steps at all.
 #
@@ -521,7 +522,7 @@ jobs:
                   marker,
                   '## Argus Auto-Approval Unavailable',
                   '',
-                  'Auto-approval could not run: bad/missing AWS credentials, a misconfigured Argus API key, or the Argus API being unreachable or returning a server error -- this needs platform-team attention, not another `/argus-review-loop` run.',
+                  'Auto-approval could not run: bad/missing AWS credentials, a misconfigured Argus API key, or the Argus API being unreachable, returning a server error (5xx), or returning a malformed/unparseable response body -- this needs platform-team attention, not another `/argus-review-loop` run.',
                   '',
                   'To bypass, request a human reviewer directly.',
                   '',
