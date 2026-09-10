@@ -14,10 +14,8 @@ auto-approved, no matter what else about the proposal checks out.
 
 Built from the ``PROPOSAL_OPEN_TICKET_TEAM_ALLOWLIST`` env var (a JSON
 array of strings, e.g. ``["TECH"]``) -- same "Terraform injects the env
-var, application code never calls SSM directly" convention, and the same
-JSON-array-of-strings shape as this module's sibling ``identity_map.py``
-(which uses a JSON object instead, since it maps keys to values rather
-than enumerating a set) -- parsed ONCE at module import time into an
+var, application code never calls SSM directly" convention this repo uses
+for other server-side config -- parsed ONCE at module import time into an
 immutable ``frozenset``, rather than a mutable module-level container: a
 plain ``set``/``list`` literal is a server-side trust anchor any importer
 could mutate at runtime, and hardcoding this directly in source permanently
@@ -31,12 +29,13 @@ FAIL CLOSED, NOT FAIL-THE-WHOLE-SERVICE: an unset or empty env var falls
 back silently to a genuinely empty immutable ``frozenset`` (no warning); a
 malformed value (invalid JSON, not a JSON array, or containing non-string or
 empty-string elements) logs a warning and falls back to the same empty set
--- same "inert by construction until populated" posture as
-``identity_map.py``'s own mapping. An empty allowlist means ``open_ticket``
-NEVER auto-approves (every proposal is held for a human instead), which is
-always the safe default -- this one optional env var being malformed or unset
-must never crash the whole service at import time, and must never fail OPEN
-into allowing auto-approval for every team.
+-- "inert by construction until populated": an unset or malformed value
+always falls back to an empty, safe set rather than crashing or failing
+open. An empty allowlist means ``open_ticket`` NEVER auto-approves (every
+proposal is held for a human instead), which is always the safe default --
+this one optional env var being malformed or unset must never crash the
+whole service at import time, and must never fail OPEN into allowing
+auto-approval for every team.
 """
 
 from __future__ import annotations

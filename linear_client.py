@@ -34,6 +34,7 @@ import hashlib
 import json
 import logging
 import os
+import uuid
 from typing import Any
 
 import httpx
@@ -654,10 +655,18 @@ async def update_issue_assignee(issue_id: str, assignee_id: str) -> None:
 
     ``assignee_id`` is already a Linear internal user ID -- there is no
     name to resolve here (unlike ``team``/workflow-state-name/label-name
-    elsewhere in this module), since the auto-approve rule that feeds this
-    (``service._rule_assign_ticket``) already verified the proposed id
-    against a GitHub-login identity map before approving. Used by
-    ``apply_assign_ticket`` below.
+    elsewhere in this module). Per TECH-6153, the auto-approve rule that
+    feeds this (``service._rule_assign_ticket``) verifies that a real,
+    existing PR was cited and actually references the target ticket
+    (via ``_pull_request_references_ticket``), but deliberately enforces
+    neither attribution nor authorization: (a) the assignee's identity
+    is not verified against the PR author (this service tracks outstanding
+    work, not credit/attribution), and (b) there is no authorization anchor
+    at all on who can be assigned -- no team-membership check and no bound
+    on which Linear user UUID the bot proposes. A bot can cite any real PR
+    referencing the target ticket and assign it to any Linear user it names,
+    a confirmed, deliberate, doubly-considered tradeoff per TECH-6153.
+    Used by ``apply_assign_ticket`` below.
 
     Raises ``LinearAPIError`` if the mutation reports ``success=false``."""
     result = await _post_graphql(
@@ -753,19 +762,44 @@ async def apply_review_ticket(action: dict[str, Any], rationale: str) -> None:
 async def apply_assign_ticket(action: dict[str, Any], rationale: str) -> None:
     """Applier for ``action_type="assign_ticket"`` (TECH-5877) -- reassigns
     an existing issue to ``action["assignee_id"]``, already a Linear
-    internal user ID (the judge rule that approved this,
-    ``service._rule_assign_ticket``, already verified it against a
-    GitHub-login identity map -- no resolution step needed here, unlike
+    internal user ID (no resolution step needed here, unlike
     ``team``/workflow-state/label names elsewhere in this module).
 
+    Per TECH-6153, the judge rule that approved this
+    (``service._rule_assign_ticket``) verified that a real, existing PR was
+    cited and actually references the target ticket via
+    ``_pull_request_references_ticket``, but deliberately enforces neither
+    attribution nor authorization: (a) the assignee's identity is not
+    verified against the PR author (this service tracks outstanding work,
+    not a credit/attribution system), and (b) there is no authorization
+    anchor at all on who can be assigned -- no team-membership check and
+    no bound on which Linear user UUID the bot proposes. A bot can cite any
+    real PR referencing the target ticket and assign it to any Linear user
+    it names, a confirmed, deliberate, doubly-considered tradeoff per
+    TECH-6153.
+
+    ``assignee_id`` is normalized to canonical dashed-lowercase form
+    (``str(uuid.UUID(...))``) before being sent to Linear -- this both
+    accepts non-canonical spellings (braced, ``urn:uuid:`` prefix,
+    dashless, mixed case) and is defense-in-depth against a malformed
+    ``assignee_id`` reaching this point via a human-approved hold, which
+    never re-runs the judge rule's own UUID format check
+    (``service._rule_assign_ticket``) -- ``service.decide_proposal``'s
+    human-approval branch dispatches straight to this applier.
+
     Raises ``LinearAPIError`` on a missing/invalid ``target_id``/
-    ``assignee_id``, or on any failure from ``update_issue_assignee``."""
+    ``assignee_id`` (including a syntactically invalid UUID), or on any
+    failure from ``update_issue_assignee``."""
     target_id = action.get("target_id")
     if not isinstance(target_id, str) or not target_id:
         raise LinearAPIError("action.target_id is required and must be a non-empty string")
     assignee_id = action.get("assignee_id")
     if not isinstance(assignee_id, str) or not assignee_id:
         raise LinearAPIError("action.assignee_id is required and must be a non-empty string")
+    try:
+        assignee_id = str(uuid.UUID(assignee_id))
+    except ValueError as exc:
+        raise LinearAPIError("action.assignee_id must be a valid UUID string") from exc
 
     await update_issue_assignee(target_id, assignee_id)
 

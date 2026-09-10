@@ -14,7 +14,6 @@ from unittest.mock import AsyncMock
 import pytest
 
 import github_client
-import identity_map
 import linear_client
 import service
 from github_client import GitHubAPIError
@@ -1111,105 +1110,107 @@ class TestPullRequestReferencesTicket:
 
 class TestAssignTicket:
     """``(kind="linear_progress_update", action_type="assign_ticket")`` --
-    no workflow-state concept: the PR's ACTUAL author (never a bot-asserted
-    claim) must be present in ``identity_map.GITHUB_LOGIN_TO_LINEAR_USER_ID``
-    and map to the proposed ``assignee_id``, AND the cited PR must actually
-    reference ``target_id`` (the ticket being assigned)."""
+    no workflow-state concept: the cited PR must actually EXIST and
+    REFERENCE ``target_id`` (the ticket being assigned), and
+    ``assignee_id`` must be present and a valid UUID string. Design
+    decision (TECH-6153), not an oversight: this lane deliberately
+    enforces neither attribution nor authorization on the proposed
+    assignee -- see ``service._rule_assign_ticket``'s docstring for the
+    full design rationale (this service tracks outstanding work, not a
+    credit/attribution system; no authorization anchor bounds who can be
+    assigned)."""
 
-    async def test_mapped_author_matching_assignee_is_approved(
+    async def test_valid_pr_referencing_target_with_assignee_is_approved(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(
-            identity_map,
-            "GITHUB_LOGIN_TO_LINEAR_USER_ID",
-            {"octocat": "user-uuid-1"},
+        mock_fetch_pr = AsyncMock(
+            return_value={"user": {"login": "octocat"}, "title": "Fix TECH-1234"}
         )
         monkeypatch.setattr(
             github_client,
             "fetch_pull_request",
-            AsyncMock(return_value={"user": {"login": "octocat"}, "title": "Fix TECH-1234"}),
+            mock_fetch_pr,
         )
         status, note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "assign_ticket",
                 "target_id": "TECH-1234",
                 "assignee_pr_url": "https://github.com/org/repo/pull/1",
-                "assignee_id": "user-uuid-1",
+                "assignee_id": "11111111-1111-1111-1111-111111111111",
             }
         )
         assert status == "approved"
-        assert note is not None
+        assert note is not None and "assign-ticket proposal cites a real pr" in note.lower()
+        mock_fetch_pr.assert_awaited_once()
 
-    async def test_unmapped_login_stays_pending_even_if_assignee_id_coincidentally_matches(
+    async def test_assignee_different_from_pr_author_is_still_approved(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The exact self-approval hole this lane closes: the PR's real
-        author ("someone-else") is NOT in the identity map, so a bot
-        proposing ``assignee_id="user-uuid-1"`` (which happens to be some
-        OTHER, mapped user's id) must never auto-approve on that
-        coincidence alone."""
-        monkeypatch.setattr(
-            identity_map,
-            "GITHUB_LOGIN_TO_LINEAR_USER_ID",
-            {"octocat": "user-uuid-1"},
-        )
+        """The actual behavior change: this lane used to require
+        ``assignee_id`` to match the cited PR's actual author (via a
+        server-side identity map, now removed). It no longer does -- a PR
+        authored by one GitHub login can now back an assignment to an
+        entirely unrelated Linear user id, as long as the PR references
+        the target ticket."""
         monkeypatch.setattr(
             github_client,
             "fetch_pull_request",
-            AsyncMock(return_value={"user": {"login": "someone-else"}}),
+            AsyncMock(return_value={"user": {"login": "someone-else"}, "title": "Fix TECH-1234"}),
         )
-        status, _note = await evaluate_linear_progress_update_judge(
+        status, note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "assign_ticket",
                 "target_id": "TECH-1234",
                 "assignee_pr_url": "https://github.com/org/repo/pull/1",
-                "assignee_id": "user-uuid-1",
+                "assignee_id": "22222222-2222-2222-2222-222222222222",
             }
         )
-        assert status == "pending"
+        assert status == "approved"
+        assert note is not None and "assign-ticket proposal cites a real pr" in note.lower()
 
-    async def test_mapped_login_with_mismatched_assignee_id_stays_pending(
+    async def test_pr_payload_without_user_key_is_approved(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(
-            identity_map,
-            "GITHUB_LOGIN_TO_LINEAR_USER_ID",
-            {"octocat": "user-uuid-1"},
-        )
+        """The behavioral contract of dropping author verification: the
+        PR payload's author/user field is never read at all -- a PR with no
+        'user' key whatsoever is approved so long as it references the
+        target ticket."""
         monkeypatch.setattr(
             github_client,
             "fetch_pull_request",
-            AsyncMock(return_value={"user": {"login": "octocat"}}),
+            AsyncMock(return_value={"title": "Fix TECH-1234"}),
         )
-        status, _note = await evaluate_linear_progress_update_judge(
+        status, note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "assign_ticket",
                 "target_id": "TECH-1234",
                 "assignee_pr_url": "https://github.com/org/repo/pull/1",
-                "assignee_id": "user-uuid-2",
+                "assignee_id": "11111111-1111-1111-1111-111111111111",
             }
         )
-        assert status == "pending"
+        assert status == "approved"
+        assert note is not None and "assign-ticket proposal cites a real pr" in note.lower()
 
-    async def test_empty_identity_map_never_approves(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Regression coverage for the placeholder/empty
-        ``identity_map.GITHUB_LOGIN_TO_LINEAR_USER_ID`` this lane ships
-        with today -- fails safe/inert by construction until populated."""
-        monkeypatch.setattr(identity_map, "GITHUB_LOGIN_TO_LINEAR_USER_ID", {})
+    async def test_pr_payload_with_null_user_is_approved(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Distinct edge case from missing key: a PR with 'user': None
+        (explicit null) is also approved without error or rejection."""
         monkeypatch.setattr(
             github_client,
             "fetch_pull_request",
-            AsyncMock(return_value={"user": {"login": "octocat"}}),
+            AsyncMock(return_value={"user": None, "title": "Fix TECH-1234"}),
         )
-        status, _note = await evaluate_linear_progress_update_judge(
+        status, note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "assign_ticket",
                 "target_id": "TECH-1234",
                 "assignee_pr_url": "https://github.com/org/repo/pull/1",
-                "assignee_id": "user-uuid-1",
+                "assignee_id": "11111111-1111-1111-1111-111111111111",
             }
         )
-        assert status == "pending"
+        assert status == "approved"
+        assert note is not None and "assign-ticket proposal cites a real pr" in note.lower()
 
     async def test_without_citation_stays_pending(self, monkeypatch: pytest.MonkeyPatch) -> None:
         mock_fetch_pr = AsyncMock()
@@ -1218,7 +1219,7 @@ class TestAssignTicket:
             {
                 "action_type": "assign_ticket",
                 "target_id": "TECH-1234",
-                "assignee_id": "user-uuid-1",
+                "assignee_id": "11111111-1111-1111-1111-111111111111",
             }
         )
         assert status == "pending"
@@ -1235,11 +1236,82 @@ class TestAssignTicket:
             {
                 "action_type": "assign_ticket",
                 "assignee_pr_url": "https://github.com/org/repo/pull/1",
-                "assignee_id": "user-uuid-1",
+                "assignee_id": "11111111-1111-1111-1111-111111111111",
             }
         )
         assert status == "pending"
         mock_fetch_pr.assert_not_awaited()
+
+    async def test_missing_assignee_id_stays_pending_without_fetching_pr(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``assignee_id`` must be present/non-empty -- checked BEFORE any
+        network call, same ordering convention as ``target_id`` above --
+        the applier needs SOME value to actually assign the ticket to."""
+        mock_fetch_pr = AsyncMock()
+        monkeypatch.setattr(github_client, "fetch_pull_request", mock_fetch_pr)
+        status, _note = await evaluate_linear_progress_update_judge(
+            {
+                "action_type": "assign_ticket",
+                "target_id": "TECH-1234",
+                "assignee_pr_url": "https://github.com/org/repo/pull/1",
+            }
+        )
+        assert status == "pending"
+        mock_fetch_pr.assert_not_awaited()
+
+    async def test_invalid_uuid_assignee_id_stays_pending_without_fetching_pr(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``assignee_id`` must be a syntactically valid UUID string -- checked
+        BEFORE any network call to avoid wasting round-trips on a malformed
+        proposal."""
+        mock_fetch_pr = AsyncMock()
+        monkeypatch.setattr(github_client, "fetch_pull_request", mock_fetch_pr)
+        status, _note = await evaluate_linear_progress_update_judge(
+            {
+                "action_type": "assign_ticket",
+                "target_id": "TECH-1234",
+                "assignee_pr_url": "https://github.com/org/repo/pull/1",
+                "assignee_id": "not-a-valid-uuid",
+            }
+        )
+        assert status == "pending"
+        mock_fetch_pr.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        "assignee_id",
+        [
+            "{11111111-1111-1111-1111-111111111111}",
+            "urn:uuid:11111111-1111-1111-1111-111111111111",
+            "11111111111111111111111111111111",
+            "11111111-1111-1111-1111-11111111111A",
+        ],
+        ids=["braced", "urn-prefix", "dashless", "mixed-case"],
+    )
+    async def test_non_canonical_but_valid_uuid_assignee_id_is_approved(
+        self, monkeypatch: pytest.MonkeyPatch, assignee_id: str
+    ) -> None:
+        """``uuid.UUID()`` accepts several non-canonical spellings of the
+        same UUID (braces, a ``urn:uuid:`` prefix, no dashes, mixed case)
+        -- the rule only checks that ``assignee_id`` is a syntactically
+        valid UUID, so a non-canonical spelling still approves. Normalizing
+        to canonical form for the actual Linear write happens downstream in
+        ``linear_client.apply_assign_ticket``, not here."""
+        monkeypatch.setattr(
+            github_client,
+            "fetch_pull_request",
+            AsyncMock(return_value={"user": {"login": "octocat"}, "title": "Fix TECH-1234"}),
+        )
+        action = {
+            "action_type": "assign_ticket",
+            "target_id": "TECH-1234",
+            "assignee_pr_url": "https://github.com/org/repo/pull/1",
+            "assignee_id": assignee_id,
+        }
+        status, note = await evaluate_linear_progress_update_judge(action)
+        assert status == "approved"
+        assert note is not None and "assign-ticket proposal cites a real pr" in note.lower()
 
     async def test_slack_hosted_pr_shaped_url_stays_pending(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1254,30 +1326,11 @@ class TestAssignTicket:
                 "action_type": "assign_ticket",
                 "target_id": "TECH-1234",
                 "assignee_pr_url": "https://redesignhealth.slack.com/org/repo/pull/1",
-                "assignee_id": "user-uuid-1",
+                "assignee_id": "11111111-1111-1111-1111-111111111111",
             }
         )
         assert status == "pending"
         mock_fetch_pr.assert_not_awaited()
-
-    async def test_missing_author_login_stays_pending(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(
-            identity_map, "GITHUB_LOGIN_TO_LINEAR_USER_ID", {"octocat": "user-uuid-1"}
-        )
-        monkeypatch.setattr(
-            github_client, "fetch_pull_request", AsyncMock(return_value={"user": None})
-        )
-        status, _note = await evaluate_linear_progress_update_judge(
-            {
-                "action_type": "assign_ticket",
-                "target_id": "TECH-1234",
-                "assignee_pr_url": "https://github.com/org/repo/pull/1",
-                "assignee_id": "user-uuid-1",
-            }
-        )
-        assert status == "pending"
 
     async def test_never_consults_workflow_order_or_fetches_issue(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1285,9 +1338,6 @@ class TestAssignTicket:
         """No workflow-state concept applies to a reassignment -- this
         rule must never fetch the Linear issue at all."""
         mock_fetch_issue = AsyncMock()
-        monkeypatch.setattr(
-            identity_map, "GITHUB_LOGIN_TO_LINEAR_USER_ID", {"octocat": "user-uuid-1"}
-        )
         monkeypatch.setattr(
             github_client,
             "fetch_pull_request",
@@ -1299,7 +1349,7 @@ class TestAssignTicket:
                 "action_type": "assign_ticket",
                 "target_id": "TECH-1234",
                 "assignee_pr_url": "https://github.com/org/repo/pull/1",
-                "assignee_id": "user-uuid-1",
+                "assignee_id": "11111111-1111-1111-1111-111111111111",
             }
         )
         assert status == "approved"
@@ -1308,13 +1358,9 @@ class TestAssignTicket:
     async def test_pr_not_referencing_target_ticket_stays_pending(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The scope gap this check closes: a correctly-mapped author is
-        NOT enough on its own -- the cited PR must also actually be ABOUT
-        ``target_id``, or any PR by that author could justify assigning
-        them to an unrelated ticket."""
-        monkeypatch.setattr(
-            identity_map, "GITHUB_LOGIN_TO_LINEAR_USER_ID", {"octocat": "user-uuid-1"}
-        )
+        """The scope gap this check closes: a real PR existing is NOT
+        enough on its own -- it must also actually be ABOUT ``target_id``,
+        or any real PR could justify assigning an unrelated ticket."""
         monkeypatch.setattr(
             github_client,
             "fetch_pull_request",
@@ -1332,7 +1378,7 @@ class TestAssignTicket:
                 "action_type": "assign_ticket",
                 "target_id": "TECH-1234",
                 "assignee_pr_url": "https://github.com/org/repo/pull/1",
-                "assignee_id": "user-uuid-1",
+                "assignee_id": "11111111-1111-1111-1111-111111111111",
             }
         )
         assert status == "pending"
@@ -1343,9 +1389,6 @@ class TestAssignTicket:
         """The reference check matches case-insensitively against
         ``head.ref`` too, not just ``title``/``body`` -- a branch name
         commonly lowercases the ticket id."""
-        monkeypatch.setattr(
-            identity_map, "GITHUB_LOGIN_TO_LINEAR_USER_ID", {"octocat": "user-uuid-1"}
-        )
         monkeypatch.setattr(
             github_client,
             "fetch_pull_request",
@@ -1363,7 +1406,7 @@ class TestAssignTicket:
                 "action_type": "assign_ticket",
                 "target_id": "TECH-1234",
                 "assignee_pr_url": "https://github.com/org/repo/pull/1",
-                "assignee_id": "user-uuid-1",
+                "assignee_id": "11111111-1111-1111-1111-111111111111",
             }
         )
         assert status == "approved"
@@ -1380,7 +1423,7 @@ class TestAssignTicket:
                     "action_type": "assign_ticket",
                     "target_id": "TECH-1234",
                     "assignee_pr_url": "https://github.com/org/repo/pull/1",
-                    "assignee_id": "user-uuid-1",
+                    "assignee_id": "11111111-1111-1111-1111-111111111111",
                 }
             )
 

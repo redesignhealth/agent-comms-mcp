@@ -73,7 +73,7 @@ testpaths = ["tests"]
 
 [tool.setuptools]
 py-modules = [
-    "auth", "citation_urls", "db", "exceptions", "github_client", "identity", "identity_map",
+    "auth", "citation_urls", "db", "exceptions", "github_client", "identity",
     "linear_client", "main", "migrate", "mint_token", "models", "observability", "plugins",
     "scopes", "schemas", "service", "state_machine", "subscriptions", "team_allowlist",
     "workflow_order",
