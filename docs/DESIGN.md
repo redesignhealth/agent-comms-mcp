@@ -1453,10 +1453,13 @@ registered. Any exception from a rule fails closed to `pending`.
   cited PR must actually exist (a live `fetch_pull_request` call), but its
   `state` is NOT gated -- a merged/closed PR is the expected case for
   documenting a shipped PR, not just an open one. `action.title`/
-  `action.team` (the applier's required fields) must also be present. The
-  apply step is redefined in place to create a new Linear issue, not
-  comment on an existing one, and this pair is exempt from the normal
-  fingerprint/staleness check.
+  `action.team` (the applier's required fields) must also be present, AND
+  `action.team` must additionally be on the server-side allowlist
+  (`team_allowlist.py`, `PROPOSAL_OPEN_TICKET_TEAM_ALLOWLIST`) -- inert
+  (never auto-approves) when that allowlist is unset/empty. The apply step
+  is redefined in place to create a new Linear issue, not comment on an
+  existing one, and this pair is exempt from the normal fingerprint/
+  staleness check.
 - `close_ticket`: citation-backed. Either `source_message_url` or
   `resolving_pr_url` must be a valid citation URL.
 - `start_ticket`: artifact-backed. The cited GitHub PR must exist and be
@@ -1501,6 +1504,35 @@ to avoid letting a bot influence its own approval target:
 at all (auto-created issues always land in the team's default initial
 workflow state; if a proposal specifies a `target_state`, it is held for
 human review instead of auto-approved).
+
+**`action.team` scope is DEFERRED for `start_ticket`/`review_ticket`/
+`label_ticket` (unlike `open_ticket`, closed above via
+`team_allowlist.py`).** These three rules never cross-check the
+bot-asserted `action.team` against the target ticket's ACTUAL team --
+`team` is only ever used to scope a NAME lookup (`resolve_workflow_
+state_id` for the hardcoded `"In Progress"`/`"In Review"` state name in
+`start_ticket`/`review_ticket`, or `resolve_label_id` for the label name in
+`label_ticket`), never to choose which ticket gets mutated (always
+`target_id`, fetched fresh via `fetch_issue`/`update_issue_state`/
+`add_issue_label`) or the destination state/label name (both
+server-derived: hardcoded for the state names, a separate `label_name`
+field for labels). Linear's workflow states are strictly per-team
+(`WorkflowState.team: Team!` in Linear's own public GraphQL schema), so a
+false `team` naming a team with no matching state/label name fails cleanly
+with `LinearNotFoundError` -> `apply_failed`; a team that DOES happen to
+have a same-named state/label would at worst apply that OTHER team's
+object -- Linear's API is expected (not confirmed with a live call) to
+reject this on `issueUpdate`/`issueAddLabel` as a cross-team mismatch
+anyway, since `target_id` and the resolved `stateId`/`labelId` would then
+belong to different teams. `open_ticket` is NOT deferred the same way
+because it has no pre-existing artifact bounding the destination team at
+all -- it CREATES a brand-new issue, so an unconstrained `team` there picks
+the team outright, not merely a name to look up within one. Closing this
+remaining gap for the other three (cross-checking `action.team` against
+`target_id`'s real team) is tracked as follow-up work, deferred because it
+requires extending `linear_client._ISSUE_QUERY` with `team { key }`, which
+touches `compute_target_fingerprint`'s hashed field set and needs its own
+fingerprint-stability test coverage.
 
 The artifact-backed lanes use `github_client.py` (raw GitHub REST client,
 `GITHUB_TOKEN`) for PR lookup and URL parsing, `workflow_order.py` for the

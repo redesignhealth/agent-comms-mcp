@@ -75,7 +75,7 @@ testpaths = ["tests"]
 py-modules = [
     "auth", "citation_urls", "db", "exceptions", "github_client", "identity", "identity_map",
     "linear_client", "main", "migrate", "mint_token", "models", "observability", "plugins",
-    "scopes", "schemas", "service", "state_machine", "workflow_order",
+    "scopes", "schemas", "service", "state_machine", "team_allowlist", "workflow_order",
 ]
 packages = ["providers", "migrations", "migrations.versions"]
 

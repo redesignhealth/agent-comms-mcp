@@ -158,8 +158,8 @@ raised — logged, never fails the triggering call).
 from __future__ import annotations
 
 import asyncio
-import copy
 import itertools
+import json
 import logging
 import re
 import uuid
@@ -176,6 +176,7 @@ import citation_urls
 import github_client
 import identity_map
 import linear_client
+import team_allowlist
 import workflow_order
 from exceptions import (
     AccessDeniedError,
@@ -5978,7 +5979,20 @@ async def _rule_open_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
        and non-empty (Argus review: rule/applier precondition mismatch --
        without this check, a proposal missing either could be
        auto-approved here and then deterministically fail at apply
-       time).
+       time), AND ``action["team"]`` is additionally a member of
+       ``team_allowlist.OPEN_TICKET_TEAM_ALLOWLIST`` (case-sensitive exact
+       match, same convention as ``linear_client.resolve_team_id``'s own
+       team-key filter). ``team`` here is entirely bot-asserted, and
+       unlike the state-transition rules below (``_rule_start_ticket``/
+       ``_rule_review_ticket``/``_rule_label_ticket``, which mutate a
+       pre-existing ``target_id`` whose real team already bounds where
+       the write can land -- see ``docs/DESIGN.md``'s deferred-scope note
+       for those three), ``open_ticket`` creates a brand-new issue with
+       no pre-existing artifact to cross-check a team against at all: an
+       unconstrained ``team`` would let a bot get an issue auto-created
+       on ANY Linear team just by naming it in the action payload. This
+       check runs BEFORE the PR-existence fetch below, so a team not on
+       the allowlist never burns that network round-trip either.
     3. The cited PR actually EXISTS -- verified via
        ``github_client.fetch_pull_request`` (Argus review: this rule
        previously approved on URL shape alone, never confirming the
@@ -6028,6 +6042,8 @@ async def _rule_open_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
         return "pending", None
     team = action.get("team")
     if not isinstance(team, str) or not team:
+        return "pending", None
+    if team not in team_allowlist.OPEN_TICKET_TEAM_ALLOWLIST:
         return "pending", None
     if action.get("target_state") is not None:
         return "pending", None
@@ -6637,9 +6653,20 @@ def _proposal_resubmission_snapshot(hold: ProposalHold) -> tuple[Any, ...]:
     when that verdict is about to be applied. The two functions must
     enumerate the same field set; kept adjacent in the file so they
     don't drift out of sync.
+
+    ``action`` is round-tripped through ``json.loads(json.dumps(...))``
+    rather than ``copy.deepcopy``'d, because the two snapshots compared
+    via CAS are not guaranteed to originate from the same kind of object:
+    one side may be a plain in-memory dict (never refreshed from the DB),
+    the other a value asyncpg decoded from a JSONB column. A raw
+    ``deepcopy`` would preserve a difference between the two (e.g. a
+    nested tuple vs. the list JSONB always decodes it as) that has
+    nothing to do with an actual concurrent resubmission, causing a
+    false-mismatch. Forcing both sides through the same JSON decode path
+    normalizes that away.
     """
     return (
-        copy.deepcopy(hold.action),
+        json.loads(json.dumps(hold.action)),
         hold.rationale,
         hold.confidence,
         hold.importance,
@@ -6812,12 +6839,20 @@ async def create_proposal(
     or elsewhere is never trusted or persisted as ``priority``.
 
     Immediately after the row is inserted/updated, this function commits
-    and refreshes it (releasing the DB connection -- same commit-before-
-    external-I/O pattern as ``_apply_or_finalize_proposal_hold``, see that
-    function's docstring), then looks up and ``await``s the TECH-5877
-    ``(kind, action_type)``-scoped rule (``_PROPOSAL_RULES``, falling back
-    to ``_PROPOSAL_KIND_DEFAULT_RULE`` for any action_type with no specific
-    rule registered) exactly once. Every ``kind`` that reaches this point
+    it -- releasing the DB connection, same commit-before-external-I/O
+    pattern as ``_apply_or_finalize_proposal_hold``, see that function's
+    docstring -- WITHOUT refreshing it (bug fix: a pool connection must
+    not be held across the upcoming rule call, and a refresh here would
+    require checking one back out just to hand it right back). It then
+    snapshots the still-unrefreshed in-memory row (``_proposal_resubmission_
+    snapshot``) and looks up and ``await``s the TECH-5877 ``(kind,
+    action_type)``-scoped rule (``_PROPOSAL_RULES``, falling back to
+    ``_PROPOSAL_KIND_DEFAULT_RULE`` for any action_type with no specific
+    rule registered) exactly once, with no DB connection held for the
+    duration. Only after the rule (and, on an "approved" verdict, the
+    apply path it triggers) has returned does this function refresh the
+    row once, so later reads of DB-server-populated columns (notably
+    ``updated_at``) see current values. Every ``kind`` that reaches this point
     is guaranteed to be ``"linear_progress_update"`` -- ``_derive_proposal_
     priority`` above already raised (422) for any other kind, so the
     default-rule lookup here can never miss; there is no live "kind with
@@ -6914,19 +6949,27 @@ async def create_proposal(
     # docstring) -- rules are `async def` precisely so a future lane can
     # perform a real ~10s external call here; holding the connection open
     # across that call would pin one of db.py's pool slots for the
-    # duration. Refresh so server-defaulted columns (created_at/updated_at
-    # on a fresh INSERT; updated_at's onupdate on the dedup UPDATE path)
-    # are populated from the DB before _proposal_dict reads them -- neither
-    # is fetched automatically via RETURNING on flush for this mapper, so
-    # skipping this would try to lazy-load them post-commit, which
-    # asyncpg's AsyncSession cannot do outside an explicit await.
+    # duration. Deliberately NOT followed by a `session.refresh(hold)`
+    # here (bug fix): a refresh is itself a round-trip that would have to
+    # check a connection back out of the pool, so doing it right before
+    # handing control to the rule call below would defeat the entire
+    # point of committing first -- one of db.py's pool slots would sit
+    # pinned across the rule's ~10s+ external I/O regardless. The single
+    # refresh this function needs happens once, after the rule (and the
+    # apply path it may trigger) has returned -- see the `session.refresh
+    # (hold)` call further below, right before `auto_approved` is computed.
     await session.commit()
-    await session.refresh(hold)
 
     # Snapshot the exact payload the rule below is about to judge, so
     # _claim_proposal_hold_for_applying can detect (and abandon rather
     # than misapply) a verdict computed against a payload a concurrent
-    # resubmission has since superseded.
+    # resubmission has since superseded. Taken from `hold` as it stands
+    # in memory immediately post-commit (no refresh -- see above);
+    # comparability against the later `FOR UPDATE` re-fetch inside
+    # `_claim_proposal_hold_for_applying` is guaranteed not by refresh
+    # ordering but by the JSON round-trip `_proposal_resubmission_
+    # snapshot` itself applies to `action` on both sides of that CAS
+    # comparison.
     judged_payload = _proposal_resubmission_snapshot(hold)
 
     # Reaching this point guarantees kind == "linear_progress_update":
@@ -6981,7 +7024,23 @@ async def create_proposal(
         # dict for an operator to find.
         hold.decision_note = decision_note
         await session.commit()
-        await session.refresh(hold)
+    # The single refresh for this function -- deliberately placed here,
+    # AFTER the rule call has returned (whichever branch above ran) and
+    # its own commit (if any) has landed, rather than before it, so no DB
+    # pool connection is held across the rule's external I/O (see the
+    # comment above `judged_payload`'s assignment). It exists because
+    # SQLAlchemy leaves `updated_at` unloaded after an ORM UPDATE: that
+    # column's `onupdate` is a SQL-expression (`text("now()")`), and
+    # `eager_defaults` only fetches server-generated values back via
+    # RETURNING on INSERT, not on UPDATE. Without this, `_proposal_dict`'s
+    # read of `hold.updated_at` on the `if not auto_approved` return path
+    # just below would try to lazy-load it, which raises `MissingGreenlet`
+    # specifically on the dedup-resubmission (UPDATE) path -- a fresh
+    # INSERT happens to work without this refresh, but relying on that
+    # INSERT/UPDATE asymmetry instead of refreshing unconditionally here
+    # would be exactly the kind of path-dependent bug this comment exists
+    # to prevent a future edit from reintroducing.
+    await session.refresh(hold)
     auto_approved = judged_status == "approved" and hold.status == "pending"
 
     if not auto_approved:

@@ -16,6 +16,7 @@ import pytest
 import github_client
 import identity_map
 import linear_client
+import service
 from github_client import GitHubAPIError
 
 # This test intentionally imports private (underscore-prefixed) symbols from
@@ -28,11 +29,12 @@ from github_client import GitHubAPIError
 # be updated to match -- expect that rename to surface only as a test-
 # collection failure here, not a runtime error elsewhere.
 from linear_client import LinearAPIError
-from models import PROPOSAL_HOLD_LEVELS
+from models import PROPOSAL_HOLD_LEVELS, ProposalHold
 from service import (
     _PROPOSAL_KIND_DEFAULT_RULE,
     _PROPOSAL_RULES,
     _derive_proposal_priority,
+    _proposal_resubmission_snapshot,
     _pull_request_references_ticket,
     _rule_always_pending,
     evaluate_linear_progress_update_judge,
@@ -83,6 +85,18 @@ _REPRESENTATIVE_ACTIONS: dict[str, list[tuple[dict[str, object], str]]] = {
 
 
 class TestOpenTicket:
+    @pytest.fixture(autouse=True)
+    def _allow_tech_team(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Every payload in this class uses ``team="TECH"`` -- populate the
+        server-side allowlist (Problem 2 fix) with exactly that team so
+        the pre-existing tests in this class keep exercising their
+        original (non-team-scope) behavior, same as before that fix
+        landed. ``test_team_not_on_allowlist_*`` below overrides this
+        per-test where the allowlist itself is what's under test."""
+        monkeypatch.setattr(
+            service.team_allowlist, "OPEN_TICKET_TEAM_ALLOWLIST", frozenset({"TECH"})
+        )
+
     async def test_open_ticket_with_citation_target_id_is_approved(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -364,6 +378,70 @@ class TestOpenTicket:
         )
         assert status == "pending"
         assert note is None
+
+    async def test_open_ticket_team_not_on_allowlist_stays_pending_without_fetching_pr(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Problem 2 fix: ``action.team`` is entirely bot-asserted, and
+        ``open_ticket`` has no pre-existing target to cross-check it
+        against -- a team outside the server-side allowlist (populated by
+        the class-scoped ``_allow_tech_team`` fixture with only "TECH")
+        must never auto-approve, no matter what else about the proposal
+        checks out. Checked before any network call, same ordering as
+        this rule's other early-exit checks."""
+        mock_fetch_pr = AsyncMock(return_value={"state": "open"})
+        monkeypatch.setattr(github_client, "fetch_pull_request", mock_fetch_pr)
+        status, _note = await evaluate_linear_progress_update_judge(
+            {
+                "action_type": "open_ticket",
+                "target_id": "https://github.com/org/repo/pull/1",
+                "title": "New issue title",
+                "team": "OTHER",
+            }
+        )
+        assert status == "pending"
+        mock_fetch_pr.assert_not_awaited()
+
+    async def test_open_ticket_empty_allowlist_stays_pending(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Fail-closed/inert-by-default guarantee: an empty allowlist
+        (the default when ``PROPOSAL_OPEN_TICKET_TEAM_ALLOWLIST`` is unset
+        or malformed) must leave ``open_ticket`` permanently unable to
+        auto-approve, even for an otherwise entirely valid proposal."""
+        monkeypatch.setattr(service.team_allowlist, "OPEN_TICKET_TEAM_ALLOWLIST", frozenset())
+        monkeypatch.setattr(
+            github_client, "fetch_pull_request", AsyncMock(return_value={"state": "open"})
+        )
+        status, _note = await evaluate_linear_progress_update_judge(
+            {
+                "action_type": "open_ticket",
+                "target_id": "https://github.com/org/repo/pull/1",
+                "title": "New issue title",
+                "team": "TECH",
+            }
+        )
+        assert status == "pending"
+
+    async def test_open_ticket_team_allowlist_match_is_case_sensitive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``team_allowlist.py`` matches case-sensitively (consistent with
+        ``linear_client.resolve_team_id``'s own exact-match team-key
+        filter) -- a lowercase variant of an allowlisted team must not
+        match."""
+        mock_fetch_pr = AsyncMock(return_value={"state": "open"})
+        monkeypatch.setattr(github_client, "fetch_pull_request", mock_fetch_pr)
+        status, _note = await evaluate_linear_progress_update_judge(
+            {
+                "action_type": "open_ticket",
+                "target_id": "https://github.com/org/repo/pull/1",
+                "title": "New issue title",
+                "team": "tech",
+            }
+        )
+        assert status == "pending"
+        mock_fetch_pr.assert_not_awaited()
 
 
 class TestCloseTicket:
@@ -1585,3 +1663,33 @@ class TestRuleAlwaysPending:
             }
         )
         assert status == "pending"
+
+
+class TestProposalResubmissionSnapshot:
+    """Pins the JSON-normalization behavior of
+    ``_proposal_resubmission_snapshot`` (Problem 1 fix) -- no DB needed,
+    a plain in-memory ``ProposalHold`` is enough. Guards against
+    ``copy.deepcopy`` silently creeping back in: a raw deepcopy would
+    preserve a nested ``tuple`` in ``action`` as-is, which would then
+    fail to compare equal against the SAME logical value once it has
+    round-tripped through a real JSONB column (asyncpg always decodes a
+    JSON array as a ``list``, never a ``tuple``) -- exactly the kind of
+    false CAS mismatch this normalization exists to prevent."""
+
+    def test_nested_tuple_in_action_is_normalized_to_a_list(self) -> None:
+        hold = ProposalHold(
+            kind="linear_progress_update",
+            proposed_by_bot_id="bot-1",
+            owner_sub="owner-a@example.com",
+            action={"nested": ("a", "b")},
+            rationale="because reasons",
+            confidence="medium",
+            importance="medium",
+            impact="medium",
+            priority="medium",
+            target_fingerprint="deadbeef",
+        )
+        snapshot = _proposal_resubmission_snapshot(hold)
+        action_snapshot = snapshot[0]
+        assert action_snapshot == {"nested": ["a", "b"]}
+        assert isinstance(action_snapshot["nested"], list)

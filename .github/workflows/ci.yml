@@ -62,8 +62,12 @@ jobs:
         # installs from a wheel. Catches a future regression (e.g. the
         # file moving out of `providers/`, or the pyproject.toml
         # package-data stanza being dropped) before it reaches PyPI.
+        #
+        # Also installs the built wheel into a fresh throwaway virtualenv
+        # and verifies `import service` succeeds, asserting that all modules
+        # imported by service (including py-modules) are present in the wheel.
         run: |
-          rm -rf dist/
+          rm -rf dist/ build/
           uv build --wheel
           uv run python -c "
           import glob, zipfile
@@ -78,6 +82,12 @@ jobs:
               )
           print(f'OK: providers/instruction_registry.json present in {whl}')
           "
+          VENV=$(mktemp -d)
+          trap 'rm -rf "$VENV"' EXIT
+          uv venv "$VENV"
+          uv pip install --python "$VENV" dist/*.whl
+          (cd "$VENV" && "$VENV/bin/python" -P -c "import service")
+          echo "OK: service imported successfully from installed wheel"
 
   test:
     name: Tests

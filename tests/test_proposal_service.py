@@ -27,6 +27,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 import identity_map
+import service
 from exceptions import AccessDeniedError, HoldAlreadyDecidedError, RateLimitExceededError
 from linear_client import LinearAPIError, LinearTokenMissingError, LinearTransportError
 from models import AuditLog, ProposalHold
@@ -89,6 +90,20 @@ async def _default_fetch_current_fingerprint() -> AsyncIterator[AsyncMock]:
         AsyncMock(return_value=_DEFAULT_SUBMIT_TIME_FINGERPRINT),
     ) as mock:
         yield mock
+
+
+@pytest.fixture(autouse=True)
+def _allow_tech_team(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Problem 2 fix: ``open_ticket`` auto-approval now additionally
+    requires ``action.team`` to be on a server-side allowlist
+    (``team_allowlist.OPEN_TICKET_TEAM_ALLOWLIST``), which defaults to
+    empty. Every ``open_ticket`` test in this module uses ``team="TECH"``
+    -- populate the allowlist with exactly that so those tests keep
+    driving the judge to ``"approved"``/``"applied"`` as before. Harmless
+    for every other test in this module (``start_ticket``/
+    ``review_ticket``/``label_ticket``/etc. are unaffected by this
+    allowlist -- only ``_rule_open_ticket`` consults it)."""
+    monkeypatch.setattr(service.team_allowlist, "OPEN_TICKET_TEAM_ALLOWLIST", frozenset({"TECH"}))
 
 
 def _action(
@@ -1020,6 +1035,83 @@ class TestJudgeIntegration:
         # read as if the write succeeded.
         assert "auto-approved: close-ticket proposal cites a valid citation" in decision_note
         assert not decision_note.startswith("auto-approved")
+
+    async def test_no_pool_connection_is_held_while_the_rule_runs(
+        self, session: AsyncSession
+    ) -> None:
+        """Problem 1 fix (session.refresh(hold) previously held a DB pool
+        connection across the rule's external I/O): ``create_proposal``
+        must commit and release its connection BEFORE awaiting the rule,
+        not check one back out again via a refresh just to sit idle
+        across that call. Sampled from inside a stubbed rule -- the only
+        place that can observe the pool's state DURING the rule call
+        itself, rather than merely before/after it.
+
+        Exercised on both branches of ``_dedup_or_insert_proposal``: a
+        fresh INSERT, then a dedup-UPDATE resubmission against the same
+        pending row. The UPDATE path is the one that previously needed
+        the (now-removed) pre-rule refresh to populate ``updated_at``,
+        making it the branch most likely to regress if
+        ``session.refresh(hold)`` before the rule call is ever
+        re-added."""
+        checked_out_during_rule: list[int] = []
+
+        async def _rule_sampling_pool_checkout(action: dict[str, Any]) -> tuple[str, str | None]:
+            checked_out_during_rule.append(session.get_bind().pool.checkedout())
+            return "pending", None
+
+        with patch.dict(
+            "service._PROPOSAL_RULES",
+            {("linear_progress_update", "close_ticket"): _rule_sampling_pool_checkout},
+        ):
+            # Fresh INSERT.
+            first = await _submit(session, action=_action(target_id="TECH-POOL-CHECKOUT"))
+            # Dedup UPDATE: same (bot, target_id, action_type) resubmitted
+            # against the still-pending row from the INSERT above.
+            second = await _submit(session, action=_action(target_id="TECH-POOL-CHECKOUT"))
+
+        assert first["status"] == "pending"
+        assert second["status"] == "pending"
+        assert checked_out_during_rule == [0, 0]
+
+    async def test_dedup_resubmission_response_carries_a_fresh_updated_at(
+        self, session: AsyncSession
+    ) -> None:
+        """Change 1.4 regression guard: the single post-rule
+        ``session.refresh(hold)`` must run even on the dedup-UPDATE path.
+        SQLAlchemy leaves ``updated_at`` unloaded after an ORM UPDATE
+        (its ``onupdate`` is a SQL expression, and ``eager_defaults`` only
+        covers INSERT via RETURNING) -- without the refresh,
+        ``_proposal_dict``'s read of ``hold.updated_at`` would raise
+        ``MissingGreenlet`` on this exact path, an acceptable/expected
+        failure mode for this regression."""
+        stub_pending = AsyncMock(return_value=("pending", None))
+        with patch.dict(
+            "service._PROPOSAL_RULES",
+            {("linear_progress_update", "close_ticket"): stub_pending},
+        ):
+            first = await _submit(
+                session,
+                rationale="first rationale",
+                action=_action(target_id="TECH-FRESH-UPDATED-AT"),
+            )
+            # A DIFFERENT rationale than the first call's, so the dedup
+            # UPDATE actually changes a column value -- SQLAlchemy skips
+            # emitting an UPDATE at all (and therefore never fires
+            # `onupdate`) when every column it would set is `==` the
+            # currently-loaded value, which the resubmission above would
+            # otherwise be if it resubmitted byte-identical field values.
+            second = await _submit(
+                session,
+                rationale="second rationale",
+                action=_action(target_id="TECH-FRESH-UPDATED-AT"),
+            )
+
+        assert "updated_at" in first
+        assert "updated_at" in second
+        first_updated_at = datetime.fromisoformat(first["updated_at"])
+        second_updated_at = datetime.fromisoformat(second["updated_at"])
+        assert second_updated_at > first_updated_at
 
 
 class TestFourNewLanesIntegration:
