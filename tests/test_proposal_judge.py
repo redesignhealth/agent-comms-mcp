@@ -1123,10 +1123,13 @@ class TestAssignTicket:
     async def test_valid_pr_referencing_target_with_assignee_is_approved(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        mock_fetch_pr = AsyncMock(
+            return_value={"user": {"login": "octocat"}, "title": "Fix TECH-1234"}
+        )
         monkeypatch.setattr(
             github_client,
             "fetch_pull_request",
-            AsyncMock(return_value={"user": {"login": "octocat"}, "title": "Fix TECH-1234"}),
+            mock_fetch_pr,
         )
         status, note = await evaluate_linear_progress_update_judge(
             {
@@ -1137,7 +1140,8 @@ class TestAssignTicket:
             }
         )
         assert status == "approved"
-        assert note is not None
+        assert note is not None and "assign-ticket proposal cites a real pr" in note.lower()
+        mock_fetch_pr.assert_awaited_once()
 
     async def test_assignee_different_from_pr_author_is_still_approved(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1162,7 +1166,7 @@ class TestAssignTicket:
             }
         )
         assert status == "approved"
-        assert note is not None
+        assert note is not None and "assign-ticket proposal cites a real pr" in note.lower()
 
     async def test_pr_payload_without_user_key_is_approved(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1185,7 +1189,7 @@ class TestAssignTicket:
             }
         )
         assert status == "approved"
-        assert note is not None
+        assert note is not None and "assign-ticket proposal cites a real pr" in note.lower()
 
     async def test_pr_payload_with_null_user_is_approved(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1206,7 +1210,7 @@ class TestAssignTicket:
             }
         )
         assert status == "approved"
-        assert note is not None
+        assert note is not None and "assign-ticket proposal cites a real pr" in note.lower()
 
     async def test_without_citation_stays_pending(self, monkeypatch: pytest.MonkeyPatch) -> None:
         mock_fetch_pr = AsyncMock()
@@ -1275,8 +1279,18 @@ class TestAssignTicket:
         assert status == "pending"
         mock_fetch_pr.assert_not_awaited()
 
+    @pytest.mark.parametrize(
+        "assignee_id",
+        [
+            "{11111111-1111-1111-1111-111111111111}",
+            "urn:uuid:11111111-1111-1111-1111-111111111111",
+            "11111111111111111111111111111111",
+            "11111111-1111-1111-1111-11111111111A",
+        ],
+        ids=["braced", "urn-prefix", "dashless", "mixed-case"],
+    )
     async def test_non_canonical_but_valid_uuid_assignee_id_is_approved(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, assignee_id: str
     ) -> None:
         """``uuid.UUID()`` accepts several non-canonical spellings of the
         same UUID (braces, a ``urn:uuid:`` prefix, no dashes, mixed case)
@@ -1293,11 +1307,11 @@ class TestAssignTicket:
             "action_type": "assign_ticket",
             "target_id": "TECH-1234",
             "assignee_pr_url": "https://github.com/org/repo/pull/1",
-            "assignee_id": "{11111111-1111-1111-1111-111111111111}",
+            "assignee_id": assignee_id,
         }
         status, note = await evaluate_linear_progress_update_judge(action)
         assert status == "approved"
-        assert note is not None
+        assert note is not None and "assign-ticket proposal cites a real pr" in note.lower()
 
     async def test_slack_hosted_pr_shaped_url_stays_pending(
         self, monkeypatch: pytest.MonkeyPatch

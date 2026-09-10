@@ -2355,6 +2355,72 @@ class TestDecideProposal:
         assert exc_info.value.status == "applying"
         mock_apply.assert_not_awaited()
 
+    async def test_approve_assign_ticket_with_non_canonical_uuid_normalizes_and_applies(
+        self, session: AsyncSession
+    ) -> None:
+        """A human-approved ``assign_ticket`` proposal bypasses the judge
+        rule's format check entirely (dispatching straight to the
+        applier) -- ``linear_client.apply_assign_ticket`` normalizes non-canonical
+        UUID spellings (e.g. braced form) to canonical lowercase-dashed form
+        before making the Linear API call."""
+        with patch(
+            "service.linear_client.update_issue_assignee", AsyncMock(return_value=None)
+        ) as mock_update_assignee:
+            submitted = await _submit(
+                session,
+                action=_action(
+                    action_type="assign_ticket",
+                    target_id="TECH-1234",
+                    assignee_id="{11111111-1111-1111-1111-111111111111}",
+                ),
+            )
+            assert submitted["status"] == "pending"
+
+            decided = await decide_proposal(
+                session,
+                approver_sub="owner-a@example.com",
+                hold_id=uuid.UUID(submitted["proposal_id"]),
+                decision="approve",
+                decision_note=None,
+            )
+        assert decided["status"] == "applied"
+        assert "applied_at" in decided
+        mock_update_assignee.assert_awaited_once_with(
+            "TECH-1234", "11111111-1111-1111-1111-111111111111"
+        )
+
+    async def test_approve_assign_ticket_with_invalid_uuid_sets_apply_failed(
+        self, session: AsyncSession
+    ) -> None:
+        """A human-approved ``assign_ticket`` proposal with a genuinely
+        malformed (non-UUID) ``assignee_id`` fails in the applier with
+        ``LinearAPIError``, which resolves the hold to ``apply_failed``
+        gracefully rather than crashing or silently applying."""
+        with patch(
+            "service.linear_client.update_issue_assignee", AsyncMock(return_value=None)
+        ) as mock_update_assignee:
+            submitted = await _submit(
+                session,
+                action=_action(
+                    action_type="assign_ticket",
+                    target_id="TECH-1234",
+                    assignee_id="not-a-uuid",
+                ),
+            )
+            assert submitted["status"] == "pending"
+
+            decided = await decide_proposal(
+                session,
+                approver_sub="owner-a@example.com",
+                hold_id=uuid.UUID(submitted["proposal_id"]),
+                decision="approve",
+                decision_note=None,
+            )
+        assert decided["status"] == "apply_failed"
+        assert "applied_at" not in decided
+        assert decided["apply_error"] == "Linear API returned an error"
+        mock_update_assignee.assert_not_awaited()
+
 
 class TestSanitizeApplyError:
     """Pure-function tests for ``_sanitize_apply_error`` -- no DB needed,

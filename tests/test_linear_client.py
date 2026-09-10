@@ -1407,8 +1407,30 @@ class TestApplyAssignTicket:
             )
         mock_update_assignee.assert_not_awaited()
 
+    @pytest.mark.parametrize(
+        ("assignee_id", "expected"),
+        [
+            (
+                "{11111111-1111-1111-1111-111111111111}",
+                "11111111-1111-1111-1111-111111111111",
+            ),
+            (
+                "urn:uuid:11111111-1111-1111-1111-111111111111",
+                "11111111-1111-1111-1111-111111111111",
+            ),
+            (
+                "11111111111111111111111111111111",
+                "11111111-1111-1111-1111-111111111111",
+            ),
+            (
+                "11111111-1111-1111-1111-11111111111A",
+                "11111111-1111-1111-1111-11111111111a",
+            ),
+        ],
+        ids=["braced", "urn-prefix", "dashless", "mixed-case"],
+    )
     async def test_non_canonical_uuid_assignee_id_is_normalized_before_linear_call(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, assignee_id: str, expected: str
     ) -> None:
         mock_update_assignee = AsyncMock()
         monkeypatch.setattr(linear_client, "update_issue_assignee", mock_update_assignee)
@@ -1417,14 +1439,12 @@ class TestApplyAssignTicket:
             {
                 "target_id": "TECH-1234",
                 "action_type": "assign_ticket",
-                "assignee_id": "{11111111-1111-1111-1111-111111111111}",
+                "assignee_id": assignee_id,
             },
             "Because.",
         )
 
-        mock_update_assignee.assert_awaited_once_with(
-            "TECH-1234", "11111111-1111-1111-1111-111111111111"
-        )
+        mock_update_assignee.assert_awaited_once_with("TECH-1234", expected)
 
     async def test_invalid_uuid_assignee_id_raises_without_calling_linear(
         self, monkeypatch: pytest.MonkeyPatch
