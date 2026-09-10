@@ -39,7 +39,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TIMESTAMP, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-from schemas import MAX_DISPLAY_NAME_LENGTH
+from schemas import MAX_CONVERSATION_NAME_LENGTH, MAX_DISPLAY_NAME_LENGTH
 
 # Closed vocabularies (CHECK-constrained). Conversation/message *types* are
 # open vocabularies owned by schemas.py.
@@ -383,6 +383,13 @@ class Conversation(Base):
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
+    # Optional human-readable label, settable at creation and renameable by
+    # any active participant (DESIGN.md §4/§5). Nullable with no synthesized
+    # default: an omitted name stays NULL rather than being derived from
+    # participants (which would go stale on invite/leave). String(N) rather
+    # than the module's usual TEXT, matching Agent.display_name -- the
+    # standing convention for a length-capped human label.
+    name: Mapped[str | None] = mapped_column(String(MAX_CONVERSATION_NAME_LENGTH), nullable=True)
     type: Mapped[str] = mapped_column(Text, nullable=False)
     state: Mapped[str] = mapped_column(Text, nullable=False)
     created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("agents.id"), nullable=False)

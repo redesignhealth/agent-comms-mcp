@@ -56,6 +56,7 @@ from exceptions import (
 from models import Agent, ApprovalHold, AuditLog, Conversation, Message, Participant
 from schemas import (
     MAX_ACCEPTED_TYPE_LENGTH,
+    MAX_CONVERSATION_NAME_LENGTH,
     MAX_PAYLOAD_BYTES,
     MAX_REGISTERED_SCHEMA_VERSION,
     MESSAGE_TYPES,
@@ -86,6 +87,7 @@ from service import (
     list_conversations,
     reconcile_agent_ownership,
     register_agent,
+    rename_conversation,
     resolve_inbox_target,
     set_agent_shared,
     write_through_ownership,
@@ -1872,6 +1874,153 @@ class TestStartConversation:
             message_type="task_cancel",
         )
         assert conversation.state == "canceled"
+
+    async def test_start_conversation_persists_name(self, session: AsyncSession) -> None:
+        owner = await _register(session, "owner-name-1")
+        target = await _register(session, "target-name-1")
+
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            name="Q3 scheduling sync",
+        )
+        assert conversation.name == "Q3 scheduling sync"
+        refreshed = await session.get(Conversation, conversation.id)
+        assert refreshed is not None
+        assert refreshed.name == "Q3 scheduling sync"
+
+    async def test_start_conversation_without_name_leaves_it_null(
+        self, session: AsyncSession
+    ) -> None:
+        """No synthesized default -- an omitted name stays NULL rather
+        than being derived from the participant set (service.py's
+        start_conversation docstring)."""
+        owner = await _register(session, "owner-name-2")
+        target = await _register(session, "target-name-2")
+
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+        )
+        assert conversation.name is None
+
+    async def test_conversation_dict_emits_null_name_when_unset(
+        self, session: AsyncSession
+    ) -> None:
+        """The response contract is to always emit the "name" key, null
+        when unset -- never omit it (service.py's _conversation_dict)."""
+        owner = await _register(session, "owner-name-3")
+        target = await _register(session, "target-name-3")
+
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+        )
+        conversation_dict = _service._conversation_dict(conversation)
+        assert "name" in conversation_dict
+        assert conversation_dict["name"] is None
+
+    async def test_start_conversation_name_is_stripped(self, session: AsyncSession) -> None:
+        owner = await _register(session, "owner-name-4")
+        target = await _register(session, "target-name-4")
+
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            name="  padded name  ",
+        )
+        assert conversation.name == "padded name"
+
+    async def test_start_conversation_blank_name_rejected(self, session: AsyncSession) -> None:
+        owner = await _register(session, "owner-name-5")
+        target = await _register(session, "target-name-5")
+
+        with pytest.raises(ValueError, match="name must be non-empty"):
+            await start_conversation(
+                session,
+                actor_sub=owner.sub,
+                initiator_agent_id=owner.id,
+                conversation_type="open",
+                target_agent_ids=[target.id],
+                initial_message=_request_payload(),
+                name="   ",
+            )
+
+    async def test_start_conversation_over_length_name_rejected(
+        self, session: AsyncSession
+    ) -> None:
+        owner = await _register(session, "owner-name-6")
+        target = await _register(session, "target-name-6")
+
+        with pytest.raises(ValueError, match="exceeds"):
+            await start_conversation(
+                session,
+                actor_sub=owner.sub,
+                initiator_agent_id=owner.id,
+                conversation_type="open",
+                target_agent_ids=[target.id],
+                initial_message=_request_payload(),
+                name="x" * (MAX_CONVERSATION_NAME_LENGTH + 1),
+            )
+
+    async def test_start_conversation_name_with_control_character_rejected(
+        self, session: AsyncSession
+    ) -> None:
+        owner = await _register(session, "owner-name-7")
+        target = await _register(session, "target-name-7")
+
+        with pytest.raises(ValueError, match="control characters"):
+            await start_conversation(
+                session,
+                actor_sub=owner.sub,
+                initiator_agent_id=owner.id,
+                conversation_type="open",
+                target_agent_ids=[target.id],
+                initial_message=_request_payload(),
+                name="bad\x00name",
+            )
+
+    async def test_start_conversation_audit_detail_records_name(
+        self, session: AsyncSession
+    ) -> None:
+        owner = await _register(session, "owner-name-8")
+        target = await _register(session, "target-name-8")
+
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            name="Audited name",
+        )
+        row = (
+            await session.execute(
+                select(AuditLog).where(
+                    AuditLog.conversation_id == conversation.id,
+                    AuditLog.action == "conversation.start",
+                )
+            )
+        ).scalar_one()
+        assert row.detail is not None
+        assert row.detail["name"] == "Audited name"
 
 
 class TestSchemaVersionNegotiation:
@@ -4339,6 +4488,315 @@ class TestArchiveConversation:
         assert len(rows) == 1
 
 
+# --- rename_conversation ---------------------------------------------------------
+
+
+class TestRenameConversation:
+    async def _active_owner_and_conversation(
+        self, session: AsyncSession, owner_sub: str, target_sub: str
+    ) -> Any:
+        owner = await _register(session, owner_sub)
+        target = await _register(session, target_sub)
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+        )
+        return owner, target, conversation
+
+    async def test_rename_conversation_by_owner(self, session: AsyncSession) -> None:
+        owner, _target, conversation = await self._active_owner_and_conversation(
+            session, "ren-owner-1", "ren-target-1"
+        )
+        renamed = await rename_conversation(
+            session,
+            actor_sub=owner.sub,
+            agent_id=owner.id,
+            conversation_id=conversation.id,
+            name="New name",
+        )
+        assert renamed.name == "New name"
+        refreshed = await session.get(Conversation, conversation.id)
+        assert refreshed is not None
+        assert refreshed.name == "New name"
+
+    async def test_rename_conversation_by_non_owner_active_participant_allowed(
+        self, session: AsyncSession
+    ) -> None:
+        """Pins the permission model: any ACTIVE participant may rename,
+        not just the owner (DESIGN.md §4's invite precedent, service.py's
+        may_rename)."""
+        _owner, target, conversation = await self._active_owner_and_conversation(
+            session, "ren-owner-2", "ren-target-2"
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        renamed = await rename_conversation(
+            session,
+            actor_sub=target.sub,
+            agent_id=target.id,
+            conversation_id=conversation.id,
+            name="Renamed by member",
+        )
+        assert renamed.name == "Renamed by member"
+
+    async def test_rename_conversation_records_previous_name(self, session: AsyncSession) -> None:
+        owner, _target, conversation = await self._active_owner_and_conversation(
+            session, "ren-owner-3", "ren-target-3"
+        )
+        await rename_conversation(
+            session,
+            actor_sub=owner.sub,
+            agent_id=owner.id,
+            conversation_id=conversation.id,
+            name="First name",
+        )
+        await rename_conversation(
+            session,
+            actor_sub=owner.sub,
+            agent_id=owner.id,
+            conversation_id=conversation.id,
+            name="Second name",
+        )
+        rows = (
+            (
+                await session.execute(
+                    select(AuditLog)
+                    .where(
+                        AuditLog.conversation_id == conversation.id,
+                        AuditLog.action == "conversation.rename",
+                    )
+                    .order_by(AuditLog.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 2
+        assert rows[0].detail == {"name": "First name", "previous": None}
+        assert rows[1].detail == {"name": "Second name", "previous": "First name"}
+
+    async def test_rename_conversation_by_invited_participant_denied(
+        self, session: AsyncSession
+    ) -> None:
+        _owner, target, conversation = await self._active_owner_and_conversation(
+            session, "ren-owner-4", "ren-target-4"
+        )
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await rename_conversation(
+                session,
+                actor_sub=target.sub,
+                agent_id=target.id,
+                conversation_id=conversation.id,
+                name="Not allowed yet",
+            )
+        assert exc_info.value.reason == "denied.wrong_state.invited"
+        assert str(exc_info.value) == "access_denied: not authorized for this resource"
+
+    async def test_rename_conversation_by_non_member_denied_uniformly(
+        self, session: AsyncSession
+    ) -> None:
+        _owner, _target, conversation = await self._active_owner_and_conversation(
+            session, "ren-owner-5", "ren-target-5"
+        )
+        outsider = await _register(session, "ren-outsider-5")
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await rename_conversation(
+                session,
+                actor_sub=outsider.sub,
+                agent_id=outsider.id,
+                conversation_id=conversation.id,
+                name="Not a member",
+            )
+        assert exc_info.value.reason == "denied.not_member"
+        assert str(exc_info.value) == "access_denied: not authorized for this resource"
+
+    async def test_rename_conversation_unknown_conversation_denied_uniformly(
+        self, session: AsyncSession
+    ) -> None:
+        owner = await _register(session, "ren-owner-6")
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await rename_conversation(
+                session,
+                actor_sub=owner.sub,
+                agent_id=owner.id,
+                conversation_id=uuid.uuid4(),
+                name="Ghost conversation",
+            )
+        assert exc_info.value.reason == "denied.not_member"
+        assert str(exc_info.value) == "access_denied: not authorized for this resource"
+
+    async def test_rename_conversation_after_leaving_denied(self, session: AsyncSession) -> None:
+        _owner, target, conversation = await self._active_owner_and_conversation(
+            session, "ren-owner-7", "ren-target-7"
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        await leave(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await rename_conversation(
+                session,
+                actor_sub=target.sub,
+                agent_id=target.id,
+                conversation_id=conversation.id,
+                name="After leaving",
+            )
+        assert exc_info.value.reason == "denied.wrong_state.left"
+
+    async def test_rename_conversation_over_length_rejected(self, session: AsyncSession) -> None:
+        owner, _target, conversation = await self._active_owner_and_conversation(
+            session, "ren-owner-8", "ren-target-8"
+        )
+        with pytest.raises(ValueError, match="exceeds"):
+            await rename_conversation(
+                session,
+                actor_sub=owner.sub,
+                agent_id=owner.id,
+                conversation_id=conversation.id,
+                name="x" * (MAX_CONVERSATION_NAME_LENGTH + 1),
+            )
+
+    async def test_rename_conversation_advances_updated_at(self, session: AsyncSession) -> None:
+        owner, _target, conversation = await self._active_owner_and_conversation(
+            session, "ren-owner-9", "ren-target-9"
+        )
+        before = conversation.updated_at
+        await rename_conversation(
+            session,
+            actor_sub=owner.sub,
+            agent_id=owner.id,
+            conversation_id=conversation.id,
+            name="Bumps updated_at",
+        )
+        # updated_at's onupdate is a server-side ``text("now()")`` clause
+        # (models.py's _updated_at helper), not a Python-side callable, so
+        # the already-cached ORM object (identity-mapped, expire_on_commit
+        # is False for this fixture's session) does not reflect it without
+        # an explicit refresh -- a plain session.get() would just return
+        # the same stale in-memory object.
+        after = (
+            await session.execute(
+                text("SELECT updated_at FROM conversations WHERE id = :cid"),
+                {"cid": conversation.id},
+            )
+        ).scalar_one()
+        assert after > before
+
+    async def test_rename_conversation_does_not_require_active_conversation_state(
+        self, session: AsyncSession
+    ) -> None:
+        """Unlike invite/post_message, rename does not check
+        conversation.state -- a completed conversation can still be
+        relabeled (service.py's rename_conversation docstring)."""
+        owner, _target, conversation = await self._active_owner_and_conversation(
+            session, "ren-owner-10", "ren-target-10"
+        )
+        await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="confirm",
+            payload=_confirm_payload(),
+        )
+        refreshed = await session.get(Conversation, conversation.id)
+        assert refreshed is not None
+        assert refreshed.state == "completed"
+
+        renamed = await rename_conversation(
+            session,
+            actor_sub=owner.sub,
+            agent_id=owner.id,
+            conversation_id=conversation.id,
+            name="Renamed after completion",
+        )
+        assert renamed.name == "Renamed after completion"
+
+    async def test_rename_conversation_blank_name_rejected(self, session: AsyncSession) -> None:
+        owner, _target, conversation = await self._active_owner_and_conversation(
+            session, "ren-owner-11", "ren-target-11"
+        )
+        with pytest.raises(ValueError, match="name must be non-empty"):
+            await rename_conversation(
+                session,
+                actor_sub=owner.sub,
+                agent_id=owner.id,
+                conversation_id=conversation.id,
+                name="   ",
+            )
+
+    async def test_rename_conversation_name_with_control_character_rejected(
+        self, session: AsyncSession
+    ) -> None:
+        owner, _target, conversation = await self._active_owner_and_conversation(
+            session, "ren-owner-12", "ren-target-12"
+        )
+        with pytest.raises(ValueError, match="control characters"):
+            await rename_conversation(
+                session,
+                actor_sub=owner.sub,
+                agent_id=owner.id,
+                conversation_id=conversation.id,
+                name="bad\x00name",
+            )
+
+    async def test_rename_conversation_on_archived_conversation_succeeds(
+        self, session: AsyncSession
+    ) -> None:
+        """Pins the documented behavior: an archived conversation can
+        still be renamed (rename does not check conversation.state, and
+        archiving is orthogonal to it)."""
+        owner, _target, conversation = await self._active_owner_and_conversation(
+            session, "ren-owner-13", "ren-target-13"
+        )
+        await archive_conversation(
+            session, actor_sub=owner.sub, agent_id=owner.id, conversation_id=conversation.id
+        )
+        renamed = await rename_conversation(
+            session,
+            actor_sub=owner.sub,
+            agent_id=owner.id,
+            conversation_id=conversation.id,
+            name="Renamed after archive",
+        )
+        assert renamed.name == "Renamed after archive"
+
+    async def test_rename_conversation_audit_detail_records_stripped_name(
+        self, session: AsyncSession
+    ) -> None:
+        owner, _target, conversation = await self._active_owner_and_conversation(
+            session, "ren-owner-14", "ren-target-14"
+        )
+        await rename_conversation(
+            session,
+            actor_sub=owner.sub,
+            agent_id=owner.id,
+            conversation_id=conversation.id,
+            name="  My Conversation  ",
+        )
+        refreshed = await session.get(Conversation, conversation.id)
+        assert refreshed is not None
+        assert refreshed.name == "My Conversation"
+
+        row = (
+            await session.execute(
+                select(AuditLog).where(
+                    AuditLog.conversation_id == conversation.id,
+                    AuditLog.action == "conversation.rename",
+                )
+            )
+        ).scalar_one()
+        assert row.detail is not None
+        assert row.detail["name"] == "My Conversation"
+
+
 # --- get_conversation ----------------------------------------------------------
 
 
@@ -4355,6 +4813,28 @@ class TestGetConversation:
             initial_message=_request_payload(),
         )
         return owner, target, conversation
+
+    async def test_conversation_name_surfaces_in_get_conversation(
+        self, session: AsyncSession
+    ) -> None:
+        owner = await _register(session, "gc-name-owner")
+        target = await _register(session, "gc-name-target")
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            name="Get-conversation name",
+        )
+        result = await get_conversation(
+            session,
+            actor_sub=owner.sub,
+            caller_agent_id=owner.id,
+            conversation_id=conversation.id,
+        )
+        assert result["conversation"]["name"] == "Get-conversation name"
 
     async def test_invited_caller_gets_metadata_only(self, session: AsyncSession) -> None:
         _, target, conversation = await self._start(session, "gc-owner-1", "gc-target-1")
@@ -7921,6 +8401,42 @@ class TestInbox:
             "total_count": 0,
         }
 
+    async def test_conversation_name_surfaces_in_inbox_unread_and_pending_invites(
+        self, session: AsyncSession
+    ) -> None:
+        agent = await _register(session, "inbox-name-1")
+        active_sender = await _register(session, "inbox-name-active-sender")
+        pending_sender = await _register(session, "inbox-name-pending-sender")
+
+        active_conversation = await start_conversation(
+            session,
+            actor_sub=active_sender.sub,
+            initiator_agent_id=active_sender.id,
+            conversation_type="open",
+            target_agent_ids=[agent.id],
+            initial_message=_request_payload(),
+            name="Unread name",
+        )
+        await accept_invite(
+            session,
+            actor_sub=agent.sub,
+            agent_id=agent.id,
+            conversation_id=active_conversation.id,
+        )
+        await start_conversation(
+            session,
+            actor_sub=pending_sender.sub,
+            initiator_agent_id=pending_sender.id,
+            conversation_type="open",
+            target_agent_ids=[agent.id],
+            initial_message=_request_payload(),
+            name="Pending invite name",
+        )
+
+        result = await inbox(session, caller_agent_id=agent.id)
+        assert result["unread"][0]["name"] == "Unread name"
+        assert result["pending_invites"][0]["name"] == "Pending invite name"
+
     async def test_unread_across_multiple_conversations(self, session: AsyncSession) -> None:
         agent = await _register(session, "inbox-unread-1")
         senders = [await _register(session, f"inbox-sender-{i}") for i in range(2)]
@@ -8545,6 +9061,25 @@ class TestListConversations:
         result = await list_conversations(session, caller_agent_id=creator.id)
         ids = [c["conversation_id"] for c in result["conversations"]]
         assert str(conv.id) in ids
+
+    async def test_conversation_name_surfaces_in_list_conversations(
+        self, session: AsyncSession
+    ) -> None:
+        creator = await _register(session, "listconv-name-creator")
+        target = await _register(session, "listconv-name-target")
+        conv = await start_conversation(
+            session,
+            actor_sub=creator.sub,
+            initiator_agent_id=creator.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            name="List-conversations name",
+        )
+        result = await list_conversations(session, caller_agent_id=creator.id)
+        matches = [c for c in result["conversations"] if c["conversation_id"] == str(conv.id)]
+        assert len(matches) == 1
+        assert matches[0]["name"] == "List-conversations name"
 
     async def test_invited_participant_sees_conversation(self, session: AsyncSession) -> None:
         creator = await _register(session, "listconv-inviter")

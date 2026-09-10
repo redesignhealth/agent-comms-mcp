@@ -233,6 +233,7 @@ from schemas import (
     CONVERSATION_TYPES,
     MAX_ACCEPTED_TYPE_LENGTH,
     MAX_ACCEPTED_TYPES,
+    MAX_CONVERSATION_NAME_LENGTH,
     MAX_DISPLAY_NAME_LENGTH,
     MAX_REGISTERED_SCHEMA_VERSION,
     MESSAGE_TYPES,
@@ -1369,6 +1370,16 @@ def may_invite(inviter_participant_status: str) -> bool:
     return inviter_participant_status == "active"
 
 
+def may_rename(participant_status: str) -> bool:
+    """v1 rename policy: any ACTIVE participant may rename the conversation.
+
+    Mirrors ``may_invite`` above -- a plain status predicate, deliberately
+    not owner-gated (DESIGN.md §4), kept trivial to unit-test and to
+    tighten later as a policy change, not a migration.
+    """
+    return participant_status == "active"
+
+
 # --- Serialization helpers ------------------------------------------------------
 
 
@@ -1403,6 +1414,7 @@ def _conversation_dict(conversation: Conversation) -> dict[str, Any]:
         state = "expired"
     return {
         "conversation_id": str(conversation.id),
+        "name": conversation.name,
         "type": conversation.type,
         "state": state,
         "created_by": str(conversation.created_by),
@@ -1447,6 +1459,33 @@ def validate_schema_version_range(min_schema_version: int, max_schema_version: i
         raise ValueError("min_schema_version must be >= 1")
     if min_schema_version > max_schema_version:
         raise ValueError("min_schema_version must be <= max_schema_version")
+
+
+def validate_conversation_name(name: str | None) -> str | None:
+    """Shared validation for the optional ``conversations.name`` label.
+
+    Called from BOTH ``start_conversation``/``rename_conversation`` (below)
+    and the tool layer (``providers/comms.py``) as a pre-check -- same
+    reasoning as ``validate_schema_version_range`` above: one place to
+    tighten, not two independently-drifting guards. ``None`` passes through
+    unchanged (an omitted name stays ``NULL``, never synthesized -- see
+    DESIGN.md §5). Raises ``ValueError`` for malformed input: empty after
+    stripping surrounding whitespace, over ``MAX_CONVERSATION_NAME_LENGTH``
+    characters, or containing an ASCII control character (mirrors
+    ``providers.comms._validate_agent_key``'s control-character loop, but
+    deliberately does NOT reuse that function's ``[A-Za-z0-9._-]`` allowlist
+    -- a human-facing label needs spaces/punctuation/non-ASCII).
+    """
+    if name is None:
+        return None
+    name = name.strip()
+    if not name:
+        raise ValueError("name must be non-empty if provided")
+    if len(name) > MAX_CONVERSATION_NAME_LENGTH:
+        raise ValueError(f"name exceeds {MAX_CONVERSATION_NAME_LENGTH} characters")
+    if any(ord(c) < 32 or ord(c) == 127 for c in name):
+        raise ValueError("name must not contain control characters")
+    return name
 
 
 def _agent_key_from_sub(sub: str, base_sub: str) -> str | None:
@@ -3078,6 +3117,7 @@ async def start_conversation(
     schema_version: int = 1,
     expires_at: datetime | None = None,
     owner_sub_claim: str | None = None,
+    name: str | None = None,
 ) -> Conversation:
     """Open a conversation with N other agents; post the seq-1 message.
 
@@ -3087,6 +3127,13 @@ async def start_conversation(
     active on creation"). ``initial_message``/``message_type`` are
     validated via ``schemas.validate_payload`` against
     ``(message_type, schema_version)`` before anything is persisted.
+
+    ``name`` is an optional human-readable label (``conversations.name``,
+    max ``schemas.MAX_CONVERSATION_NAME_LENGTH`` characters), permitted on
+    every conversation type including ``open`` (DESIGN.md §8 invariant 3's
+    narrow free-text carve-out). Left ``NULL`` if omitted — never
+    synthesized from the participant set. Renameable later by any
+    ``active`` participant via ``rename_conversation``.
 
     Admission (``_authorize_conversation_open``) is evaluated over the
     FULL participant set at once — ``internal``
@@ -3108,11 +3155,15 @@ async def start_conversation(
     no wire schema version falls inside every participant's declared
     ``[min_schema_version, max_schema_version]`` range;
     ``schemas.PayloadValidationError`` if ``initial_message`` fails schema
-    validation.
+    validation. Also raises ``ValueError`` (via ``validate_conversation_name``)
+    for a malformed optional ``name`` -- empty after stripping, over
+    ``schemas.MAX_CONVERSATION_NAME_LENGTH`` characters, or containing an
+    ASCII control character.
     """
     initiator = await _require_active_agent(
         session, actor_sub=actor_sub, agent_id=initiator_agent_id
     )
+    name = validate_conversation_name(name)
     # An agent may never post the service-synthesized marker type directly
     # as its own opener (TECH-5389 PR2 §6) -- checked early, before rate
     # limits, so forging an attempt doesn't consume rate-limit budget.
@@ -3282,6 +3333,7 @@ async def start_conversation(
 
     now = _now()
     conversation = Conversation(
+        name=name,
         type=conversation_type,
         state="active",
         created_by=initiator.id,
@@ -3343,6 +3395,7 @@ async def start_conversation(
                 "type": conversation_type,
                 "target_agent_ids": [str(t) for t in target_ids],
                 "owner_snapshot": owner_snapshot,
+                "name": name,
             },
         )
         result = await _divert_high_risk_message(
@@ -3437,6 +3490,7 @@ async def start_conversation(
             "type": conversation_type,
             "target_agent_ids": [str(t) for t in target_ids],
             "owner_snapshot": owner_snapshot,
+            "name": name,
         },
     )
     _audit(
@@ -4095,6 +4149,66 @@ async def archive_conversation(
         action="conversation.archive",
         agent_id=agent_id,
         conversation_id=conversation.id,
+    )
+    await session.commit()
+    return conversation
+
+
+async def rename_conversation(
+    session: AsyncSession,
+    *,
+    actor_sub: str,
+    agent_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    name: str,
+) -> Conversation:
+    """Set/replace the conversation's human-readable label.
+
+    Requires the caller to currently be an ``active`` participant
+    (``may_rename`` — v1: any active member, same status-gated posture as
+    ``may_invite``, tightenable to owner-only later without a migration —
+    DESIGN.md §4). Unlike ``invite``/``post_message``, this does NOT check
+    ``conversation.state`` — a completed/expired conversation can still be
+    relabeled, since renaming is metadata bookkeeping, not a conversation
+    transition. ``name`` is required (unlike ``start_conversation``'s
+    optional param): clearing an existing name back to ``NULL`` is out of
+    scope for v1.
+
+    Raises ``ValueError`` (via ``validate_conversation_name``) for
+    malformed input -- empty after stripping, over
+    ``schemas.MAX_CONVERSATION_NAME_LENGTH`` characters, or containing an
+    ASCII control character. Raises ``AccessDeniedError`` (uniform) if the
+    caller is not a participant, or is a participant in any status other
+    than ``active`` -- identical denial shape to every other
+    ``_load_participant_for_transition`` caller.
+    """
+    conversation, participant = await _load_participant_for_transition(
+        session,
+        actor_sub=actor_sub,
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+        required_status="active",
+    )
+    if not may_rename(participant.status):  # pragma: no cover — v1 always True here
+        await _deny(
+            session,
+            actor_sub=actor_sub,
+            action="denied.rename_not_allowed",
+            agent_id=agent_id,
+            conversation_id=conversation.id,
+        )
+    validated = validate_conversation_name(name)
+    if validated is None:
+        raise ValueError("name must not be None")
+    previous = conversation.name
+    conversation.name = validated
+    _audit(
+        session,
+        actor_sub=actor_sub,
+        action="conversation.rename",
+        agent_id=agent_id,
+        conversation_id=conversation.id,
+        detail={"name": validated, "previous": previous},
     )
     await session.commit()
     return conversation
@@ -8493,13 +8607,16 @@ __all__ = [
     "lookup_agent_by_email",
     "may_assign",
     "may_invite",
+    "may_rename",
     "post_message",
     "reconcile_agent_ownership",
     "register_agent",
+    "rename_conversation",
     "resolve_conversation_participant",
     "resolve_inbox_target",
     "resolve_proposal_owner_sub",
     "start_conversation",
+    "validate_conversation_name",
     "validate_hold_level",
     "validate_ownership_client_configuration",
     "validate_proposal_string_field",

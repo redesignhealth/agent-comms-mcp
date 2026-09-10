@@ -1093,6 +1093,7 @@ async def start_conversation(
     conversation_type: str,
     target_agent_ids: list[str],
     initial_message: dict[str, Any],
+    name: str | None = None,
     message_type: str = "availability_request",
     expires_at: str | None = None,
     schema_version: SchemaVersion = 1,
@@ -1111,6 +1112,13 @@ async def start_conversation(
       fails (e.g. registry timeout), the board fails open -- the target is
       treated as active, so a registry outage never blocks conversation
       admission, only temporarily suspends retirement enforcement.
+    - ``name``: optional human-readable label for the conversation, max 120
+      characters. Permitted on every ``conversation_type`` including
+      ``open`` -- visible to every participant once they can see the
+      conversation at all (invited or active), including across an
+      ownership boundary. Left unset (``null``) if omitted; never derived
+      from the participant list. Renameable later via
+      ``comms_rename_conversation`` by any active participant.
     - ``message_type``: type of the opening message. Default:
       ``availability_request``. All valid types: ``availability_request``,
       ``availability_response``, ``counter_proposal``, ``confirm``,
@@ -1176,6 +1184,14 @@ async def start_conversation(
             "invalid_request: expires_at may not be more than "
             f"{service.MAX_CONVERSATION_TTL} from now"
         )
+    # Same reasoning as the schema-version-range pre-check in `register`
+    # above: without this, a malformed name falls through to
+    # service.start_conversation's bare ValueError, which
+    # _map_service_errors collapses into a generic, unhelpful message.
+    try:
+        service.validate_conversation_name(name)
+    except ValueError as exc:
+        raise ToolError(f"invalid_request: {exc}") from None
 
     owner_sub_claim = token.claims.get("owner_sub")
 
@@ -1199,10 +1215,12 @@ async def start_conversation(
                 expires_at=expires_dt,
                 schema_version=schema_version,
                 owner_sub_claim=owner_sub_claim,
+                name=name,
             )
 
     result: dict[str, Any] = {
         "conversation_id": str(conversation.id),
+        "name": conversation.name,
         "type": conversation.type,
         "state": conversation.state,
         "created_by": str(conversation.created_by),
@@ -1879,6 +1897,51 @@ async def invite(
         response["auto_approved"] = True
         response["hold_id"] = str(auto_approved_hold_id)
     return response
+
+
+@comms_server.tool
+async def rename_conversation(
+    conversation_id: str, name: str, agent_key: str | None = None
+) -> dict[str, Any]:
+    """Set/replace a conversation's human-readable label.
+
+    Caller must currently be ``active`` (uniform denial otherwise). Any
+    active participant may rename -- not just the owner, matching
+    ``comms_invite``'s permission posture. Unlike ``comms_invite``/
+    ``comms_post_message``, this does not require the conversation itself
+    to still be ``active`` -- a completed/expired conversation can still
+    be relabeled.
+
+    - ``name``: required, max 120 characters, non-empty after stripping
+      surrounding whitespace, no ASCII control characters. Visible to
+      every participant who can already see the conversation (invited or
+      active), including across an ownership boundary in an ``open``
+      conversation. There is no way to clear a name back to unset via this
+      tool.
+    """
+    token = _require_token()
+    base_sub = _require_identity(token)
+    agent_key = _validate_agent_key(agent_key)
+    sub = _compose_sub(base_sub, agent_key)
+    conv_id = _parse_uuid("conversation_id", conversation_id)
+    # Same reasoning as the pre-check in `start_conversation` above.
+    try:
+        service.validate_conversation_name(name)
+    except ValueError as exc:
+        raise ToolError(f"invalid_request: {exc}") from None
+
+    async with get_session_factory()() as session:
+        caller = await _resolve_caller_agent(session, sub, token)
+        async with _map_service_errors():
+            conversation = await service.rename_conversation(
+                session,
+                actor_sub=sub,
+                agent_id=caller.id,
+                conversation_id=conv_id,
+                name=name,
+            )
+
+    return {"conversation_id": str(conv_id), "name": conversation.name}
 
 
 @comms_server.tool

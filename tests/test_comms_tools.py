@@ -2168,6 +2168,37 @@ class TestRateLimitAndSchemaErrors:
                 },
             )
 
+    async def test_start_conversation_over_length_name_gives_actionable_error(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Same reasoning as the sibling expires_at-ceiling test above: a
+        too-long ``name`` must not fall through to the generic
+        ``_map_service_errors``-collapsed ``ValueError`` message."""
+        from schemas import MAX_CONVERSATION_NAME_LENGTH
+
+        await _register(main, test_session_factory, "name-len-owner")
+        await _register(main, test_session_factory, "name-len-target")
+        token_owner = _token("name-len-owner")
+
+        list_result = await _call(main, test_session_factory, token_owner, "comms_list_agents")
+        target_id = next(
+            a["agent_id"] for a in list_result["agents"] if a["sub"] == "name-len-target"
+        )
+
+        with pytest.raises(ToolError, match="exceeds"):
+            await _call(
+                main,
+                test_session_factory,
+                token_owner,
+                "comms_start_conversation",
+                {
+                    "conversation_type": "open",
+                    "target_agent_ids": [target_id],
+                    "initial_message": _availability_request(),
+                    "name": "x" * (MAX_CONVERSATION_NAME_LENGTH + 1),
+                },
+            )
+
     async def test_negative_since_seq_rejected(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
@@ -3232,6 +3263,219 @@ class TestArchiveConversation:
         assert status["status"] == "pending_human"
 
 
+class TestConversationName:
+    async def test_start_conversation_with_name_round_trips(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        await _register(main, test_session_factory, "name-rt-owner")
+        await _register(main, test_session_factory, "name-rt-target")
+        token_owner = _token("name-rt-owner")
+
+        list_result = await _call(main, test_session_factory, token_owner, "comms_list_agents")
+        target_id = next(
+            a["agent_id"] for a in list_result["agents"] if a["sub"] == "name-rt-target"
+        )
+
+        started = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [target_id],
+                "initial_message": _availability_request(),
+                "name": "Round-trip name",
+            },
+        )
+        assert started["name"] == "Round-trip name"
+
+        fetched = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_get_conversation",
+            {"conversation_id": started["conversation_id"]},
+        )
+        assert fetched["conversation"]["name"] == "Round-trip name"
+
+    async def test_rename_conversation_end_to_end(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        await _register(main, test_session_factory, "rename-e2e-owner")
+        await _register(main, test_session_factory, "rename-e2e-target")
+        token_owner = _token("rename-e2e-owner")
+        token_target = _token("rename-e2e-target")
+
+        list_result = await _call(main, test_session_factory, token_owner, "comms_list_agents")
+        target_id = next(
+            a["agent_id"] for a in list_result["agents"] if a["sub"] == "rename-e2e-target"
+        )
+
+        started = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [target_id],
+                "initial_message": _availability_request(),
+            },
+        )
+        conversation_id = started["conversation_id"]
+        await _call(
+            main,
+            test_session_factory,
+            token_target,
+            "comms_accept",
+            {"conversation_id": conversation_id},
+        )
+
+        # Any active participant may rename -- not just the owner.
+        renamed = await _call(
+            main,
+            test_session_factory,
+            token_target,
+            "comms_rename_conversation",
+            {"conversation_id": conversation_id, "name": "Renamed by member"},
+        )
+        assert renamed == {"conversation_id": conversation_id, "name": "Renamed by member"}
+
+        fetched = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_get_conversation",
+            {"conversation_id": conversation_id},
+        )
+        assert fetched["conversation"]["name"] == "Renamed by member"
+
+    async def test_rename_conversation_denied_uniformly_for_non_member(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        await _register(main, test_session_factory, "rename-deny-owner")
+        await _register(main, test_session_factory, "rename-deny-target")
+        await _register(main, test_session_factory, "rename-deny-outsider")
+        token_owner = _token("rename-deny-owner")
+        token_outsider = _token("rename-deny-outsider")
+
+        list_result = await _call(main, test_session_factory, token_owner, "comms_list_agents")
+        target_id = next(
+            a["agent_id"] for a in list_result["agents"] if a["sub"] == "rename-deny-target"
+        )
+        started = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [target_id],
+                "initial_message": _availability_request(),
+            },
+        )
+
+        with pytest.raises(
+            ToolError, match=re.escape("access_denied: not authorized for this resource")
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                token_outsider,
+                "comms_rename_conversation",
+                {"conversation_id": started["conversation_id"], "name": "Not allowed"},
+            )
+
+    async def test_rename_conversation_requires_write_scope(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        await _register(main, test_session_factory, "rename-scope-owner")
+        token_owner = _token("rename-scope-owner")
+        # comms:read only -- comms_rename_conversation requires comms:write.
+        read_only_token = _token("rename-scope-owner", scopes=["comms:read"])
+
+        with pytest.raises(ToolError, match="requires elevated permissions"):
+            await _call(
+                main,
+                test_session_factory,
+                read_only_token,
+                "comms_rename_conversation",
+                {"conversation_id": str(uuid.uuid4()), "name": "Nope"},
+            )
+        # Sanity: the owner token (comms:read + comms:write, _token's
+        # default) is unaffected by the scope check above.
+        assert token_owner.claims["scopes"] == ["comms:read", "comms:write"]
+
+    async def test_rename_conversation_over_length_name_gives_actionable_error(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Mirrors ``test_start_conversation_over_length_name_gives_actionable_error``:
+        a too-long ``name`` on rename must not fall through to the generic
+        ``_map_service_errors``-collapsed ``ValueError`` message."""
+        from schemas import MAX_CONVERSATION_NAME_LENGTH
+
+        await _register(main, test_session_factory, "rename-len-owner")
+        await _register(main, test_session_factory, "rename-len-target")
+        token_owner = _token("rename-len-owner")
+
+        list_result = await _call(main, test_session_factory, token_owner, "comms_list_agents")
+        target_id = next(
+            a["agent_id"] for a in list_result["agents"] if a["sub"] == "rename-len-target"
+        )
+        started = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [target_id],
+                "initial_message": _availability_request(),
+            },
+        )
+
+        with pytest.raises(ToolError, match="exceeds"):
+            await _call(
+                main,
+                test_session_factory,
+                token_owner,
+                "comms_rename_conversation",
+                {
+                    "conversation_id": started["conversation_id"],
+                    "name": "x" * (MAX_CONVERSATION_NAME_LENGTH + 1),
+                },
+            )
+
+    async def test_inbox_surfaces_conversation_name(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        await _register(main, test_session_factory, "inbox-name-owner")
+        await _register(main, test_session_factory, "inbox-name-target")
+        token_owner = _token("inbox-name-owner")
+        token_target = _token("inbox-name-target")
+
+        list_result = await _call(main, test_session_factory, token_owner, "comms_list_agents")
+        target_id = next(
+            a["agent_id"] for a in list_result["agents"] if a["sub"] == "inbox-name-target"
+        )
+        await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [target_id],
+                "initial_message": _availability_request(),
+                "name": "Pending in inbox",
+            },
+        )
+
+        result = await _call(main, test_session_factory, token_target, "comms_inbox")
+        assert result["pending_invites"][0]["name"] == "Pending in inbox"
+
+
 class TestTaskLifecycleToolLayer:
     """End-to-end coverage for tasks-as-conversations: task_assign opens a
     conversation, task_report/task_complete/task_decline/task_cancel drive
@@ -3493,6 +3737,7 @@ class TestScopesUnaffected:
             "comms_accept",
             "comms_decline_invite",
             "comms_invite",
+            "comms_rename_conversation",
             "comms_leave",
             "comms_archive_conversation",
             "comms_get_hold_status",
