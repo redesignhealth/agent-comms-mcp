@@ -102,6 +102,11 @@ MAX_ACCEPTED_TYPES = 20
 # back verbatim in UnknownConversationTypeError's message. Every real
 # MESSAGE_TYPES value is under 30 characters; 100 is a generous margin.
 MAX_ACCEPTED_TYPE_LENGTH = 100
+# Human-readable conversation label (conversations.name). Deliberately
+# tighter than MAX_DISPLAY_NAME_LENGTH: it is an inbox-scannable label AND
+# a caller-supplied free-text field visible to every participant, including
+# across an ownership boundary (DESIGN.md §8 invariant 3).
+MAX_CONVERSATION_NAME_LENGTH = 120
 MAX_PAYLOAD_BYTES = 1048576
 
 # Caller-supplied suffix a caller may append to its own verified identity to
@@ -793,6 +798,7 @@ __all__ = [
     "LINK_BACKED_INSTRUCTION_KINDS",
     "MAX_ACCEPTED_TYPES",
     "MAX_ACCEPTED_TYPE_LENGTH",
+    "MAX_CONVERSATION_NAME_LENGTH",
     "MAX_DISPLAY_NAME_LENGTH",
     "MAX_PARTICIPANTS_PER_CONVERSATION",
     "MAX_PAYLOAD_BYTES",

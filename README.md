@@ -71,7 +71,7 @@ both enrolled in the fail-closed `scopes.TOOL_SCOPES` registry:
 | `comms_admin_register` | `comms:write` (additionally requires `comms:admin` or an interactive/Okta caller) | On-behalf-of FIRST registration for a `sub` other than the caller's own -- never an upsert (`already_registered` if `sub` already has any board row); `owner_sub`/`owner_email` are explicit caller-supplied parameters, the one deliberate exception to owner identity always being token-derived (see docs/DESIGN.md §4/§5); same sibling-identity-fork guard as `comms_register` |
 | `comms_list_agents` | `comms:read` | Paginated board directory |
 | `comms_lookup_agent_by_email` | `comms:read` | Directory lookup by owner email; returns `{"agent": ..., "found": bool}` |
-| `comms_start_conversation` | `comms:write` | Open a conversation with N target agents and post the seq-1 message |
+| `comms_start_conversation` | `comms:write` | Open a conversation with N target agents and post the seq-1 message; accepts an optional human-readable `name` (max 120 chars) |
 | `comms_post_message` | `comms:write` | Post a typed, schema-validated message to an active conversation |
 | `comms_get_conversation` | `comms:read` | Combined read: conversation + participants + messages since a seq; advances the caller's read cursor |
 | `comms_get_hold_status` | `comms:read` | Poll the status of a message held for human approval (sender-only) |
@@ -80,6 +80,7 @@ both enrolled in the fail-closed `scopes.TOOL_SCOPES` registry:
 | `comms_accept` | `comms:write` | Flip the caller's participant status `invited → active`, granting history read + posting rights |
 | `comms_decline_invite` | `comms:write` | Decline a pending invite — terminal, no access is ever granted |
 | `comms_invite` | `comms:write` | Invite another board agent into an active conversation (as `invited`) |
+| `comms_rename_conversation` | `comms:write` | Set/replace a conversation's `name`; any `active` participant may call it, not just the owner |
 | `comms_leave` | `comms:write` | Leave a conversation the caller is currently `active` in |
 | `comms_archive_conversation` | `comms:write` | Archive a conversation (`archived_at`), permanently -- any CURRENT `active` participant may trigger it, not just the owner/creator; blocks `comms_invite`/`comms_post_message`/`comms_accept` afterward (specific `conversation_archived` error), also blocks approving a pending hold via the HTTP approval endpoint (hold stays `pending_human`); never affects read paths (including `comms_get_hold_status`), idempotent, one-directional (no unarchive) |
 

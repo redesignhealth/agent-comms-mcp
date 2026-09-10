@@ -35,7 +35,7 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from models import ProposalHold
-from schemas import MAX_DISPLAY_NAME_LENGTH
+from schemas import MAX_CONVERSATION_NAME_LENGTH, MAX_DISPLAY_NAME_LENGTH
 
 SERVICE_ROOT = Path(__file__).parent.parent
 
@@ -301,6 +301,7 @@ class TestSchema:
         cols = await _columns(engine, "conversations")
         for expected in (
             "id",
+            "name",
             "type",
             "state",
             "created_by",
@@ -325,6 +326,30 @@ class TestSchema:
                 )
             )
             assert result.scalar_one() == "YES"
+
+    async def test_conversations_name_column_is_nullable_varchar_120(
+        self, engine: AsyncEngine
+    ) -> None:
+        """Migration d885dda2ffda: ``name`` is a nullable, length-capped
+        human label -- NULL for an unnamed conversation, not derived."""
+        cols = await _columns(engine, "conversations")
+        assert cols["name"] == "character varying"
+        max_length = await _column_max_length(engine, "conversations", "name")
+        assert max_length == MAX_CONVERSATION_NAME_LENGTH, (
+            "conversations.name character_maximum_length is None or wrong "
+            "-- has migration d885dda2ffda been applied?"
+        )
+        async with engine.connect() as conn:
+            nullable = (
+                await conn.execute(
+                    text(
+                        "SELECT is_nullable FROM information_schema.columns "
+                        "WHERE table_schema = 'public' AND table_name = 'conversations' "
+                        "AND column_name = 'name'"
+                    )
+                )
+            ).scalar_one_or_none()
+        assert nullable == "YES"
 
     async def test_participants_columns_and_invite_accept_model(self, engine: AsyncEngine) -> None:
         cols = await _columns(engine, "participants")

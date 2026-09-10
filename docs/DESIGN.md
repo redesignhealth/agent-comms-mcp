@@ -205,6 +205,17 @@ agent-token access gate. It never gates human users.
  owner-only as a policy change, without a migration). New invitees also start as
  `invited`: no unilateral disclosure. This applies uniformly regardless of who does
  the inviting.
+- **Any active member may rename the conversation** (`comms_rename_conversation`,
+ `may_rename` in `service.py`, TECH-6120). Same status-gated posture as invite
+ above -- a judgment call, not a settled design decision -- and tightenable to
+ owner-only as a policy change, without a migration, if that turns out to be
+ wrong. Renaming does not require `conversation.state == "active"`: a
+ completed/canceled/expired conversation can still be relabeled, since it's
+ metadata bookkeeping, not a conversation transition. Unlike archiving (below),
+ renaming has no interaction with `archived_at` either -- an archived
+ conversation can still be renamed, since renaming carries no read/write
+ access implications the way `comms_invite`/`comms_post_message`/
+ `comms_accept` do.
 - **Acceptance gates visibility as well as participation.** An `invited` participant
  can see minimal metadata (conversation type, who invited them, current member
  list) but **not** message history or content. Calling `comms_accept` flips
@@ -240,7 +251,8 @@ agents id, sub UNIQUE, owner_sub, owner_email, display_name,
  is_shared boolean (default false, frozen against self-re-registration,
  admin-mutable via comms_set_agent_shared),
  bound_at, timestamps
-conversations id, type, state(active|completed|canceled|expired),
+conversations id, name (nullable, max 120 chars, TECH-6120 -- see below), type,
+ state(active|completed|canceled|expired),
  created_by, expires_at, owner_snapshot jsonb (nullable),
  archived_at (nullable timestamptz, TECH-5887 -- see below), timestamps
 participants (conversation_id, agent_id) UNIQUE, role(owner|member),
@@ -540,6 +552,22 @@ Design notes:
  mistaken archive has no in-band recovery -- add a reactivation path later,
  with its own authorization gate, if a real need for one arises.
 
+- `conversations.name` (TECH-6120) is an optional human-readable label, settable at
+ `comms_start_conversation` time and renameable afterward via
+ `comms_rename_conversation` (see §4). Nullable with **no synthesized
+ default**: an omitted name stays `NULL` rather than being derived from the
+ participant set, which would go stale the moment `comms_invite`/`comms_leave`
+ changes membership. `_conversation_dict` (the shared projection behind
+ `comms_get_conversation`, `comms_list_conversations`, and both halves of
+ `comms_inbox`) always emits the `"name"` key, `null` when unset -- never
+ omits it. Capped at 120 characters (`schemas.MAX_CONVERSATION_NAME_LENGTH`,
+ deliberately tighter than `MAX_DISPLAY_NAME_LENGTH`) and validated by the
+ single shared `service.validate_conversation_name` (stripped, non-empty,
+ no ASCII control characters) -- called from both the tool layer and
+ `start_conversation`/`rename_conversation` themselves, so tightening the
+ rule in one place tightens it everywhere. This is a new free-text field;
+ see §8 invariant 3 for the carve-out it required.
+
 - **On-behalf-of registration (`comms_admin_register`)**: `comms_register` always
  derives `sub` from the CALLING token's own verified identity (§4's "owner
  identity ... never accepted as a parameter" invariant) -- by design, nothing can
@@ -698,7 +726,7 @@ scroll-to-load-more use case.
 | `comms_admin_register` | comms:write | on-behalf-of FIRST registration for a `sub` other than the caller's own -- additionally requires comms:admin OR an interactive/Okta caller (see §5's "On-behalf-of registration" note). Distinct from `comms_register` (always self, idempotent) and `comms_set_agent_shared` (corrects `is_shared` on an agent that already exists): this is a genuine new-identity registration path for a `sub` that has never registered itself. Never an upsert -- fails with `already_registered` if `sub` already has a board row (any status) |
 | `comms_list_agents` | comms:read | directory (internal domain, enumeration acceptable). Returns agent UUIDs used as target identifiers in other tools. A registry-retired agent (`ACTIVE_CHECKER` seam, TECH-5703, §"Configuration: pluggable seams") is excluded from results, though its row is never deleted; `total_count` still reflects every board-registered agent regardless of retirement status. Retirement is filtered AFTER pagination is computed from the raw rows, so a page can return fewer than `limit` agents (including zero) while `has_more` is still `true` -- callers must page until `has_more` is `false`, not until `agents` is empty |
 | `comms_lookup_agent_by_email` | comms:read | directory lookup by owner email; `{"agent": ..., "found": bool}`. O(1) targeted equivalent of paginating `comms_list_agents` -- see §10's enumeration-posture note. A registry-retired agent resolves to the same not-found shape as an unregistered email (TECH-5703) |
-| `comms_start_conversation` | comms:write | type + up to 50 target agent UUIDs (from `comms_list_agents`) + initial request payload. **Two response shapes** (TECH-5389): the normal conversation-created shape, or (if the opener was high-risk) that same shape plus a `held_for_approval`/`hold_id`/`hold_status`/`risk_reason` block (plus `decision_url` when `DECISION_PAGE_BASE_URL` is configured) — the conversation is created anyway, opened with a service-synthesized `conversation_opened` marker at seq 1, and the real content is held (§9). A registry-retired target (TECH-5703) raises a specific "agent retired" error instead of the uniform unknown-agent denial |
+| `comms_start_conversation` | comms:write | type + up to 50 target agent UUIDs (from `comms_list_agents`) + initial request payload; optional `name` (max 120 chars, permitted on every conversation type including `open`, see §5/§8; TECH-6120). **Two response shapes** (TECH-5389): the normal conversation-created shape, or (if the opener was high-risk) that same shape plus a `held_for_approval`/`hold_id`/`hold_status`/`risk_reason` block (plus `decision_url` when `DECISION_PAGE_BASE_URL` is configured) — the conversation is created anyway, opened with a service-synthesized `conversation_opened` marker at seq 1, and the real content is held (§9). A registry-retired target (TECH-5703) raises a specific "agent retired" error instead of the uniform unknown-agent denial |
 | `comms_post_message` | comms:write | typed, schema-validated, state-machine-checked. **Two response shapes**: the normal posted-message shape (unchanged; gains `auto_approved`/`hold_id` if a configured auto-approver cleared a high-risk send inline), or `{"held_for_approval": true, "hold_id", "conversation_id", "status", "risk_reason", "expires_at", "created_at"}` (plus `decision_url` when `DECISION_PAGE_BASE_URL` is configured) -- not an error -- when the send is diverted to a hold (§9). Optional `review_reason` (max 2000 chars, TECH-5786) forces the held shape unconditionally, overriding the `RiskScorer` verdict (including in `internal` conversations, which otherwise never reach a hold) -- the hold's `risk_reason` becomes `"agent_requested"`, distinct from every scorer-produced value so it can never be auto-cleared by an `AutoApprover` rule that special-cases `"boundary_crossing"`; the reason string itself is recorded in the audit log, not on the hold/status response. Rejects with the specific `conversation_archived` error (TECH-5887, see `comms_archive_conversation`'s own row) if the conversation has been archived, checked before every conversation-level gate (state, rate limits, message legality) |
 | `comms_get_hold_status` | comms:read | poll a held message OR invite's approval status (`kind`: `message`/`invite`, TECH-5735); sender-only (uniform `access_denied` otherwise -- for an invite hold, "sender" is the INVITER). Returns status, risk_reason (this row names only the TECH-5786-relevant values -- `"boundary_crossing"`, `"note_history_requires_approval"`, and, per TECH-5786, `"agent_requested"` when the sender forced the hold via `comms_post_message`'s `review_reason` rather than a genuine scorer verdict; see §5's `audit_log` row for the complete set including `"open_conversation"`), timestamps, and (once decided) `decision_reason` plus, for `kind=message`, `message_id`/`message_seq` (present whenever `message_id` is set on the hold row -- only ever set at message-creation time on the approve/auto_approve path, never on reject/expiry), or for `kind=invite`, `target_agent_id` (always present, not gated on decision) and `participant_status` (present whenever a `Participant` row exists for the target, including a `rejected` hold whose target was admitted via a different path -- not gated on this hold's own decision). **Deliberately the only MCP-side surface for this pipeline** -- approve/reject/list-pending are non-MCP HTTP endpoints (§9), by design: an agent must never be able to approve its own high-risk content (or its own invite), so there is no MCP tool that could even attempt it |
 | `comms_get_conversation` | comms:read | combined read: conversation + participants + messages since seq, capped at `MAX_MESSAGES_PER_GET_CONVERSATION` (500) per call. Advances caller's `last_read_seq` when messages are returned and the page's own max seq exceeds the current cursor. When `has_more` is `true`, continue with `since_seq=page_max_seq` (the returned page's own max seq) -- NOT `since_seq=last_read_seq`, which is the caller's persisted cursor and can already be ahead of a page being re-read at a lower `since_seq` (TECH-5377). For an `invited` (not yet accepted) caller, returns metadata only: no messages, `has_more` always `false`, plus `invited_by` (the agent ID that invited the caller, whether named at `comms_start_conversation` time or added later via `comms_invite`). `participants.invited_by` is nullable at the schema level with no `CHECK` constraint tying it to `status`; both current code paths that create an `invited`-status row always set it, a code-level convention only, not a schema-enforced guarantee -- the service layer's own defensive `if participant.invited_by else None` reflects that (Argus round-5 SUGGESTION: an earlier version of this row overstated it as unreachable) |
@@ -708,6 +736,7 @@ scroll-to-load-more use case.
 | `comms_decline_invite` | comms:write | declines a pending invite: terminal, no access is ever granted. Requires caller to currently be `invited`. Distinct from `comms_leave` (which covers already-`active` members), keeping the audit trail clean |
 | `comms_invite` | comms:write | adds a target as `invited` (not `active`); a registry-retired target (TECH-5703) raises the same specific "agent retired" error `comms_start_conversation` does. `internal` additionally never admits an `is_shared` target (TECH-5735, §9 Axis 1). **Two response shapes**, same convention as `comms_post_message`: the normal invited-participant shape (`conversation_id`, `target_agent_id`, `status`, `invited_by`, plus `auto_approved: true` + `hold_id` when an `AutoApprover` cleared an invite hold inline rather than this being the ordinary no-hold path), or — if the conversation already has any `note`, `instruction_share`, or `docs` history (`plugins.BARRIER_SENSITIVE_TYPES`, TECH-5735/TECH-5822/TECH-5998) — `{"held_for_approval": true, "hold_id", "conversation_id", "status", "risk_reason", "expires_at", "created_at"}` (plus `decision_url` when `DECISION_PAGE_BASE_URL` is configured) (§9 Axis 1's free-text invite-approval rule) — admitting a new participant grants it full retroactive history read the moment it accepts, so that requires human approval first, same as a high-risk message does. Rejects with the specific `conversation_archived` error (TECH-5887, see `comms_archive_conversation`'s own row) if the conversation has been archived |
 | `comms_leave` | comms:write | leave: covers already-active members |
+| `comms_rename_conversation` | comms:write | set/replace `conversations.name` (required, max 120 chars; TECH-6120); any `active` participant may call it, not just the owner (same status-gated posture as `comms_invite`, see §4); does not require the conversation itself to still be `active`, and is unaffected by `archived_at` (an archived conversation can still be renamed); audited as `conversation.rename` with the previous value |
 | `comms_archive_conversation` | comms:write | archive a conversation (TECH-5887): sets `archived_at`, permanently. Any CURRENT `active` participant may trigger it (symmetric across the whole conversation, not gated to owner/creator) -- distinct from `comms_leave`, which only ever changes the CALLER's own participant row. Once archived: `comms_invite`/`comms_post_message`/`comms_accept` all reject with the specific `conversation_archived` error (not the uniform denial); also blocks approving a pending hold via the HTTP approval endpoint's `decide_hold` (the hold stays `pending_human`, a human can still reject it) -- the only one of the four blocked surfaces that isn't an MCP tool. Every read path (`comms_get_conversation`/`comms_inbox`/`comms_list_conversations`, and `comms_get_hold_status`) is completely unaffected -- archiving is not a delete or a redaction, every past message stays fully readable. Idempotent (re-archiving is a silent no-op, `archived_at` unchanged); one-directional -- no unarchive tool |
 
 ### MCP resource surface (TECH-5903 Phase A)
@@ -877,6 +906,21 @@ notify) even though the caller's actual opening content is held — only
  failure (an unscorable message) still hard-denies via `denied.risk_unscored`
  — it never floods
  the human approval queue with unscorable holds, and it never fails open.
+ `conversations.name` (TECH-6120) is a SEPARATE, narrower free-text carve-out
+ with a materially different posture from the three above: it is a
+ conversation-level label (not a message payload), capped at 120 characters
+ (vs. `note`'s 4000), and it is permitted OUTRIGHT on every conversation type
+ including `open` -- it never routes through the approval-hold pipeline the
+ way a boundary-crossing `note`/`instruction_share`/`docs` message does. This
+ is accepted because: it is author-chosen metadata *about* a conversation the
+ counterparty is already IN (visible only once they can already see the
+ conversation at all, invited or active), not extracted resource data pulled
+ across the boundary; the current deployment's perimeter is a single internal
+ trust domain (§10 -- no external counterparties yet); and it will be
+ revisited when the grants layer lands for external counterparties (§4). The
+ value is stored verbatim in `audit_log.detail` on both `conversation.start`
+ and `conversation.rename`. Like `note`, it is provisional pending the
+ quarantine pipeline (§10).
 4. Uniform denial messages. Existence of unauthorized resources is never revealed.
  The decide/list-pending HTTP endpoints (§9) extend this with a hard,
  structural interactive-token-only gate (no agent-jwt scope escape hatch —
@@ -2143,7 +2187,13 @@ inverse of `e1db7c2e6b70`'s (safe) widening.
  extraction step. A sandboxed tool-less-extraction scorer/auto-approver
  implementation remains a possible future plugin (the pluggable seams this PR
  introduces are exactly where it would land), but nothing in this codebase
- builds one today.
+ builds one today. `conversations.name` (§5/§8, TECH-6120) is in scope for
+ this pipeline eventually too, same as `note` -- it is accepted today only
+ because the deployment's perimeter is a single internal trust domain (see
+ the grants-layer bullet above), and unlike `note` it isn't even gated by the
+ approval-hold mechanism -- it's permitted outright on every conversation
+ type today, which is precisely why it will need this same eventual
+ treatment.
 - **Federation/A2A**: the lifecycle and card-like `accepted_types` are shaped for it.
 - **Owner-only invites**: policy flip on the existing role field.
 - **`ACTIVE_CHECKER` ordering vs. the authorization gate**: in `start_conversation`,
