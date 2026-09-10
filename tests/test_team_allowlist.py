@@ -4,8 +4,8 @@ bot-asserted `action.team` was previously unverified against anything).
 Most cases are covered against ``_parse_team_allowlist`` directly -- a pure
 function, no env var/reimport needed. One test reloads the module to prove
 the module-level ``OPEN_TICKET_TEAM_ALLOWLIST`` constant is actually wired
-from the real env var at import time -- same ``monkeypatch.setenv`` +
-``importlib.reload`` idiom as ``tests/test_identity_map.py``.
+from the real env var at import time via the standard
+``monkeypatch.setenv`` + ``importlib.reload`` idiom.
 """
 
 from __future__ import annotations

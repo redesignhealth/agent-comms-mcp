@@ -174,7 +174,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 import citation_urls
 import github_client
-import identity_map
 import linear_client
 import team_allowlist
 import workflow_order
@@ -6219,11 +6218,11 @@ def _pull_request_references_ticket(pull_request: dict[str, Any], target_id: str
     checked case-insensitively, since a branch name commonly lowercases the
     ticket id (e.g. ``"tech-1234-fix-x"``).
 
-    Closes a scope gap in ``_rule_assign_ticket`` (Argus review): verifying
-    the cited PR's author against the identity map proves WHO wrote the PR,
-    but not that the PR has anything to do with ``target_id`` -- without
-    this check, any PR by a mapped author could justify auto-assigning that
-    author to ANY unrelated ticket, not just ones they actually worked on.
+    Closes a scope gap shared by ``_rule_assign_ticket``/``_rule_label_ticket``
+    (Argus review): a cited PR merely EXISTING proves an artifact is real,
+    but not that the artifact has anything to do with ``target_id`` --
+    without this check, any real PR could justify mutating ANY unrelated
+    ticket, not just the one it actually pertains to.
 
     Matches ``target_id`` as a complete TOKEN, not a plain substring
     (Argus review: identifier collision) -- a bare ``needle in haystack``
@@ -6247,35 +6246,51 @@ def _pull_request_references_ticket(pull_request: dict[str, Any], target_id: str
 
 async def _rule_assign_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
     """``(kind="linear_progress_update", action_type="assign_ticket")``
-    rule (TECH-5877). Auto-approve ONLY if BOTH hold:
+    rule (TECH-5877). Auto-approve ONLY if ALL of the following hold:
 
-    1. The PROPOSED assignee (``action["assignee_id"]``) is the cited PR's
-       ACTUAL author, verified against the server-side
-       ``identity_map.GITHUB_LOGIN_TO_LINEAR_USER_ID`` mapping -- NEVER a
-       bot-asserted claim of who the author is. An unmapped GitHub login
-       can never auto-approve, no matter what ``assignee_id`` the bot
-       proposes (see ``identity_map.py``'s own docstring: this closes a
-       self-approval hole a bot could otherwise exploit by fabricating an
-       author-login-to-assignee match itself).
-    2. The cited PR actually REFERENCES ``target_id`` (``_pull_request_
-       references_ticket`` above) -- otherwise a PR by a correctly-mapped
-       author could justify assigning them to any unrelated ticket, not
-       just ones they actually worked on.
+    1. ``action["assignee_pr_url"]`` is specifically a ``github.com`` PR
+       URL, validated via ``github_client.parse_github_pull_request_url``
+       (Argus review: host-confusion hole -- see ``_rule_open_ticket``'s
+       docstring for why a bare ``_is_valid_citation_url``/
+       ``parse_pull_request_url`` chain alone lets a Slack URL shaped like
+       a PR path masquerade as a real GitHub PR reference).
+    2. ``action["target_id"]`` and ``action["assignee_id"]`` are both
+       present and non-empty -- checked BEFORE the PR fetch (Argus review:
+       an earlier version checked ``target_id`` AFTER
+       ``fetch_pull_request``, wasting a round-trip on a proposal that was
+       always going to stay pending regardless of the PR fetch's result).
+       ``assignee_id`` is required simply because the applier
+       (``linear_client.apply_assign_ticket``) needs SOME value to
+       actually assign the ticket to -- see the design decision below for
+       what this rule deliberately does NOT verify about it.
+    3. The cited PR actually EXISTS (``github_client.fetch_pull_request``
+       -- an artifact, not a bot's own say-so) and actually REFERENCES
+       ``target_id`` (``_pull_request_references_ticket`` above) --
+       otherwise a real PR on ANY unrelated ticket could justify assigning
+       this ticket to anyone, not just a ticket that PR actually pertains
+       to.
+
+    Design decision -- assignee identity is intentionally NOT verified
+    (do not read this as a newly-discovered gap; it is a deliberate,
+    considered removal, not an oversight): an earlier version of this
+    rule additionally required ``action["assignee_id"]`` to match the
+    cited PR's ACTUAL author, cross-checked against a server-side
+    GitHub-login-to-Linear-user-id mapping module that has SINCE BEEN
+    DELETED from this codebase -- closing a self-approval hole where a
+    bot could otherwise fabricate an author-to-assignee match to justify
+    assigning itself (or an accomplice) to a ticket. The product owner
+    has since made a deliberate call to drop that requirement: this
+    service tracks OUTSTANDING WORK, not a credit/attribution system, so
+    who ends up assigned is not something worth cross-checking -- the
+    only bar that still matters is that a real PR exists and actually
+    references the target ticket (point 3 above), same as it always has.
+    A bot can now propose ANY ``assignee_id`` alongside a real, on-topic
+    PR and have it auto-approved, regardless of who authored that PR.
 
     No workflow-state/forward-transition concept applies here -- this
     isn't a state transition -- so unlike ``_rule_start_ticket``/
     ``_rule_review_ticket`` above, this rule does not consult
-    ``workflow_order`` or fetch the Linear issue at all.
-
-    The citation is validated via ``github_client.
-    parse_github_pull_request_url`` (Argus review: host-confusion hole),
-    not a bare ``_is_valid_citation_url``/``parse_pull_request_url``
-    chain -- see ``_rule_open_ticket``'s docstring for why that chain
-    alone lets a Slack URL shaped like a PR path masquerade as a real
-    GitHub PR reference. ``action["target_id"]`` must also be present
-    and non-empty -- checked BEFORE the PR fetch (Argus review: an earlier
-    version checked this AFTER ``fetch_pull_request``, wasting a
-    round-trip on a proposal that was always going to stay pending)."""
+    ``workflow_order`` or fetch the Linear issue at all."""
     citation = action.get("assignee_pr_url")
     if not isinstance(citation, str):
         return "pending", None
@@ -6285,24 +6300,17 @@ async def _rule_assign_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
     target_id = action.get("target_id")
     if not isinstance(target_id, str) or not target_id:
         return "pending", None
+    assignee_id = action.get("assignee_id")
+    if not isinstance(assignee_id, str) or not assignee_id:
+        return "pending", None
+
     owner, repo, number = parsed
     pull_request = await github_client.fetch_pull_request(owner, repo, number)
-    author_login = (pull_request.get("user") or {}).get("login")
-    if not isinstance(author_login, str) or not author_login:
-        return "pending", None
-
-    expected_assignee_id = identity_map.GITHUB_LOGIN_TO_LINEAR_USER_ID.get(author_login)
-    if expected_assignee_id is None:
-        return "pending", None
-    if action.get("assignee_id") != expected_assignee_id:
-        return "pending", None
-
     if not _pull_request_references_ticket(pull_request, target_id):
         return "pending", None
     return (
         "approved",
-        "auto-approved: proposed assignee matches the cited PR author's mapped Linear user id, "
-        "and the PR references the target ticket",
+        "auto-approved: assign-ticket proposal cites a real PR that references the target ticket",
     )
 
 
@@ -8115,9 +8123,10 @@ async def decide_proposal(
     # By design: this dispatches straight to the applier and never re-runs
     # the kind/action_type-scoped rule (``_PROPOSAL_RULES``) that would
     # otherwise gate an auto-approval -- e.g. an approved ``assign_ticket``
-    # applies whatever ``assignee_id`` the bot proposed with NO identity-
-    # map re-verification, and an approved ``start_ticket``/``review_ticket``
-    # applies with no forward-transition check. A human approving here IS
+    # applies whatever ``assignee_id`` the bot proposed with NO PR-exists/
+    # PR-references-ticket re-verification, and an approved ``start_ticket``/
+    # ``review_ticket`` applies with no forward-transition check. A human
+    # approving here IS
     # the final authority this whole human-in-the-loop escape hatch
     # exists for; it deliberately bypasses every rule-level check, not
     # just the fingerprint/staleness one below (see docs/DESIGN.md's

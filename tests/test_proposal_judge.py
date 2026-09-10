@@ -14,7 +14,6 @@ from unittest.mock import AsyncMock
 import pytest
 
 import github_client
-import identity_map
 import linear_client
 import service
 from github_client import GitHubAPIError
@@ -1111,19 +1110,18 @@ class TestPullRequestReferencesTicket:
 
 class TestAssignTicket:
     """``(kind="linear_progress_update", action_type="assign_ticket")`` --
-    no workflow-state concept: the PR's ACTUAL author (never a bot-asserted
-    claim) must be present in ``identity_map.GITHUB_LOGIN_TO_LINEAR_USER_ID``
-    and map to the proposed ``assignee_id``, AND the cited PR must actually
-    reference ``target_id`` (the ticket being assigned)."""
+    no workflow-state concept: the cited PR must actually EXIST and
+    REFERENCE ``target_id`` (the ticket being assigned), and
+    ``assignee_id`` must be present. Design decision, not an oversight:
+    this lane deliberately does NOT verify that ``assignee_id``
+    corresponds to the cited PR's actual author -- see
+    ``service._rule_assign_ticket``'s docstring for the full design
+    rationale (this service tracks outstanding work, not a
+    credit/attribution system)."""
 
-    async def test_mapped_author_matching_assignee_is_approved(
+    async def test_valid_pr_referencing_target_with_assignee_is_approved(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(
-            identity_map,
-            "GITHUB_LOGIN_TO_LINEAR_USER_ID",
-            {"octocat": "user-uuid-1"},
-        )
         monkeypatch.setattr(
             github_client,
             "fetch_pull_request",
@@ -1140,76 +1138,30 @@ class TestAssignTicket:
         assert status == "approved"
         assert note is not None
 
-    async def test_unmapped_login_stays_pending_even_if_assignee_id_coincidentally_matches(
+    async def test_assignee_different_from_pr_author_is_still_approved(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The exact self-approval hole this lane closes: the PR's real
-        author ("someone-else") is NOT in the identity map, so a bot
-        proposing ``assignee_id="user-uuid-1"`` (which happens to be some
-        OTHER, mapped user's id) must never auto-approve on that
-        coincidence alone."""
-        monkeypatch.setattr(
-            identity_map,
-            "GITHUB_LOGIN_TO_LINEAR_USER_ID",
-            {"octocat": "user-uuid-1"},
-        )
+        """The actual behavior change: this lane used to require
+        ``assignee_id`` to match the cited PR's actual author (via a
+        server-side identity map, now removed). It no longer does -- a PR
+        authored by one GitHub login can now back an assignment to an
+        entirely unrelated Linear user id, as long as the PR references
+        the target ticket."""
         monkeypatch.setattr(
             github_client,
             "fetch_pull_request",
-            AsyncMock(return_value={"user": {"login": "someone-else"}}),
+            AsyncMock(return_value={"user": {"login": "someone-else"}, "title": "Fix TECH-1234"}),
         )
-        status, _note = await evaluate_linear_progress_update_judge(
+        status, note = await evaluate_linear_progress_update_judge(
             {
                 "action_type": "assign_ticket",
                 "target_id": "TECH-1234",
                 "assignee_pr_url": "https://github.com/org/repo/pull/1",
-                "assignee_id": "user-uuid-1",
+                "assignee_id": "some-arbitrary-linear-user-id",
             }
         )
-        assert status == "pending"
-
-    async def test_mapped_login_with_mismatched_assignee_id_stays_pending(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(
-            identity_map,
-            "GITHUB_LOGIN_TO_LINEAR_USER_ID",
-            {"octocat": "user-uuid-1"},
-        )
-        monkeypatch.setattr(
-            github_client,
-            "fetch_pull_request",
-            AsyncMock(return_value={"user": {"login": "octocat"}}),
-        )
-        status, _note = await evaluate_linear_progress_update_judge(
-            {
-                "action_type": "assign_ticket",
-                "target_id": "TECH-1234",
-                "assignee_pr_url": "https://github.com/org/repo/pull/1",
-                "assignee_id": "user-uuid-2",
-            }
-        )
-        assert status == "pending"
-
-    async def test_empty_identity_map_never_approves(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Regression coverage for the placeholder/empty
-        ``identity_map.GITHUB_LOGIN_TO_LINEAR_USER_ID`` this lane ships
-        with today -- fails safe/inert by construction until populated."""
-        monkeypatch.setattr(identity_map, "GITHUB_LOGIN_TO_LINEAR_USER_ID", {})
-        monkeypatch.setattr(
-            github_client,
-            "fetch_pull_request",
-            AsyncMock(return_value={"user": {"login": "octocat"}}),
-        )
-        status, _note = await evaluate_linear_progress_update_judge(
-            {
-                "action_type": "assign_ticket",
-                "target_id": "TECH-1234",
-                "assignee_pr_url": "https://github.com/org/repo/pull/1",
-                "assignee_id": "user-uuid-1",
-            }
-        )
-        assert status == "pending"
+        assert status == "approved"
+        assert note is not None
 
     async def test_without_citation_stays_pending(self, monkeypatch: pytest.MonkeyPatch) -> None:
         mock_fetch_pr = AsyncMock()
@@ -1241,6 +1193,24 @@ class TestAssignTicket:
         assert status == "pending"
         mock_fetch_pr.assert_not_awaited()
 
+    async def test_missing_assignee_id_stays_pending_without_fetching_pr(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``assignee_id`` must be present/non-empty -- checked BEFORE any
+        network call, same ordering convention as ``target_id`` above --
+        the applier needs SOME value to actually assign the ticket to."""
+        mock_fetch_pr = AsyncMock()
+        monkeypatch.setattr(github_client, "fetch_pull_request", mock_fetch_pr)
+        status, _note = await evaluate_linear_progress_update_judge(
+            {
+                "action_type": "assign_ticket",
+                "target_id": "TECH-1234",
+                "assignee_pr_url": "https://github.com/org/repo/pull/1",
+            }
+        )
+        assert status == "pending"
+        mock_fetch_pr.assert_not_awaited()
+
     async def test_slack_hosted_pr_shaped_url_stays_pending(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1260,34 +1230,12 @@ class TestAssignTicket:
         assert status == "pending"
         mock_fetch_pr.assert_not_awaited()
 
-    async def test_missing_author_login_stays_pending(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(
-            identity_map, "GITHUB_LOGIN_TO_LINEAR_USER_ID", {"octocat": "user-uuid-1"}
-        )
-        monkeypatch.setattr(
-            github_client, "fetch_pull_request", AsyncMock(return_value={"user": None})
-        )
-        status, _note = await evaluate_linear_progress_update_judge(
-            {
-                "action_type": "assign_ticket",
-                "target_id": "TECH-1234",
-                "assignee_pr_url": "https://github.com/org/repo/pull/1",
-                "assignee_id": "user-uuid-1",
-            }
-        )
-        assert status == "pending"
-
     async def test_never_consults_workflow_order_or_fetches_issue(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """No workflow-state concept applies to a reassignment -- this
         rule must never fetch the Linear issue at all."""
         mock_fetch_issue = AsyncMock()
-        monkeypatch.setattr(
-            identity_map, "GITHUB_LOGIN_TO_LINEAR_USER_ID", {"octocat": "user-uuid-1"}
-        )
         monkeypatch.setattr(
             github_client,
             "fetch_pull_request",
@@ -1308,13 +1256,9 @@ class TestAssignTicket:
     async def test_pr_not_referencing_target_ticket_stays_pending(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The scope gap this check closes: a correctly-mapped author is
-        NOT enough on its own -- the cited PR must also actually be ABOUT
-        ``target_id``, or any PR by that author could justify assigning
-        them to an unrelated ticket."""
-        monkeypatch.setattr(
-            identity_map, "GITHUB_LOGIN_TO_LINEAR_USER_ID", {"octocat": "user-uuid-1"}
-        )
+        """The scope gap this check closes: a real PR existing is NOT
+        enough on its own -- it must also actually be ABOUT ``target_id``,
+        or any real PR could justify assigning an unrelated ticket."""
         monkeypatch.setattr(
             github_client,
             "fetch_pull_request",
@@ -1343,9 +1287,6 @@ class TestAssignTicket:
         """The reference check matches case-insensitively against
         ``head.ref`` too, not just ``title``/``body`` -- a branch name
         commonly lowercases the ticket id."""
-        monkeypatch.setattr(
-            identity_map, "GITHUB_LOGIN_TO_LINEAR_USER_ID", {"octocat": "user-uuid-1"}
-        )
         monkeypatch.setattr(
             github_client,
             "fetch_pull_request",

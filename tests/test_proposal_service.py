@@ -26,7 +26,6 @@ from sqlalchemy import select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-import identity_map
 import service
 from exceptions import AccessDeniedError, HoldAlreadyDecidedError, RateLimitExceededError
 from linear_client import LinearAPIError, LinearTokenMissingError, LinearTransportError
@@ -1298,16 +1297,13 @@ class TestFourNewLanesIntegration:
         assert "decision_source" not in result
         mock_fetch_pr.assert_awaited_once_with("org", "repo", 1)
 
-    async def test_assign_ticket_with_mapped_author_matching_assignee_applies(
+    async def test_assign_ticket_with_valid_pr_and_assignee_applies(
         self, session: AsyncSession
     ) -> None:
         with (
             patch(
                 "service.linear_client.fetch_current_fingerprint",
                 AsyncMock(return_value="fp-stable"),
-            ),
-            patch.object(
-                identity_map, "GITHUB_LOGIN_TO_LINEAR_USER_ID", {"octocat": "user-uuid-1"}
             ),
             patch(
                 "service.github_client.fetch_pull_request",
@@ -1331,20 +1327,48 @@ class TestFourNewLanesIntegration:
         assert result["priority"] == "low"
         mock_apply.assert_awaited_once()
 
-    async def test_assign_ticket_with_unmapped_author_stays_pending(
-        self, session: AsyncSession, _default_fetch_current_fingerprint: AsyncMock
+    async def test_assign_ticket_with_assignee_different_from_pr_author_applies(
+        self, session: AsyncSession
     ) -> None:
-        """The self-approval hole this lane closes: an unmapped GitHub
-        login must never auto-approve, even though the proposed
-        ``assignee_id`` happens to match a DIFFERENT, mapped user."""
+        """Design decision, not a regression: this lane no longer verifies
+        that ``assignee_id`` corresponds to the cited PR's actual author
+        (see ``service._rule_assign_ticket``'s docstring) -- a PR authored
+        by "octocat" can back an assignment to an entirely unrelated
+        Linear user id, as long as it references the target ticket."""
         with (
-            patch.object(
-                identity_map, "GITHUB_LOGIN_TO_LINEAR_USER_ID", {"octocat": "user-uuid-1"}
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(return_value="fp-stable"),
             ),
             patch(
                 "service.github_client.fetch_pull_request",
-                AsyncMock(return_value={"user": {"login": "someone-else"}}),
+                AsyncMock(return_value={"user": {"login": "octocat"}, "title": "Fix TECH-1234"}),
             ),
+            patch(
+                "service.linear_client.apply_assign_ticket", AsyncMock(return_value=None)
+            ) as mock_apply,
+        ):
+            result = await _submit(
+                session,
+                action=_action(
+                    action_type="assign_ticket",
+                    target_id="TECH-1234",
+                    assignee_pr_url="https://github.com/org/repo/pull/1",
+                    assignee_id="some-arbitrary-linear-user-id",
+                ),
+            )
+        assert result["status"] == "applied"
+        assert result["decision_source"] == "auto"
+        mock_apply.assert_awaited_once()
+
+    async def test_assign_ticket_with_pr_not_referencing_target_stays_pending(
+        self, session: AsyncSession, _default_fetch_current_fingerprint: AsyncMock
+    ) -> None:
+        """The real-artifact bar that stays: a real PR existing is NOT
+        enough -- it must actually reference ``target_id``."""
+        with patch(
+            "service.github_client.fetch_pull_request",
+            AsyncMock(return_value={"user": {"login": "octocat"}, "title": "Unrelated fix"}),
         ):
             result = await _submit(
                 session,

@@ -654,9 +654,11 @@ async def update_issue_assignee(issue_id: str, assignee_id: str) -> None:
 
     ``assignee_id`` is already a Linear internal user ID -- there is no
     name to resolve here (unlike ``team``/workflow-state-name/label-name
-    elsewhere in this module), since the auto-approve rule that feeds this
-    (``service._rule_assign_ticket``) already verified the proposed id
-    against a GitHub-login identity map before approving. Used by
+    elsewhere in this module). The auto-approve rule that feeds this
+    (``service._rule_assign_ticket``) already verified that a real,
+    existing PR was cited and that PR actually references the target
+    ticket (via ``_pull_request_references_ticket``) before approving --
+    not that the assignee matches the PR's author. Used by
     ``apply_assign_ticket`` below.
 
     Raises ``LinearAPIError`` if the mutation reports ``success=false``."""
@@ -754,8 +756,10 @@ async def apply_assign_ticket(action: dict[str, Any], rationale: str) -> None:
     """Applier for ``action_type="assign_ticket"`` (TECH-5877) -- reassigns
     an existing issue to ``action["assignee_id"]``, already a Linear
     internal user ID (the judge rule that approved this,
-    ``service._rule_assign_ticket``, already verified it against a
-    GitHub-login identity map -- no resolution step needed here, unlike
+    ``service._rule_assign_ticket``, already verified that a real, existing
+    PR was cited and that PR actually references the target ticket via
+    ``_pull_request_references_ticket`` -- not that the assignee matches
+    the PR's author; no resolution step needed here, unlike
     ``team``/workflow-state/label names elsewhere in this module).
 
     Raises ``LinearAPIError`` on a missing/invalid ``target_id``/

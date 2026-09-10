@@ -1468,9 +1468,18 @@ registered. Any exception from a rule fails closed to `pending`.
 - `review_ticket`: artifact-backed. The cited PR must exist, be open, and
   have review requested, `action.team` must be present, and the current
   workflow state must be strictly before `In Review`.
-- `assign_ticket`: artifact-backed. The cited PR's actual author must map,
-  via `identity_map.py`, to the proposed Linear assignee id. The shipped
-  mapping is empty, so this lane is inert until populated with real data.
+- `assign_ticket`: artifact-backed. The cited PR must exist and actually
+  reference `target_id`, and `action.assignee_id` must be present.
+  **Design decision, not an oversight:** this lane deliberately does NOT
+  cross-check the proposed assignee against the cited PR's actual author.
+  An earlier version did, via a server-side GitHub-login-to-Linear-user-id
+  map (closing a self-approval hole where a bot could fabricate an
+  author-to-assignee match to justify assigning itself/an accomplice), but
+  the product owner has since decided that requirement is unnecessary: this
+  service tracks outstanding work, not a credit/attribution system, so who
+  ends up assigned is not worth cross-checking -- only that a real,
+  on-topic PR exists. A future review should read this as an intentional,
+  accepted tradeoff, not a newly-discovered gap.
 - `label_ticket`: artifact-backed. The requested label must be exactly
   `target:<repo>` derived from the cited PR URL's repo, `action.team` must
   be present, and the cited PR must actually exist (a live
@@ -1535,10 +1544,10 @@ touches `compute_target_fingerprint`'s hashed field set and needs its own
 fingerprint-stability test coverage.
 
 The artifact-backed lanes use `github_client.py` (raw GitHub REST client,
-`GITHUB_TOKEN`) for PR lookup and URL parsing, `workflow_order.py` for the
-forward-only workflow check, and `identity_map.py` for the assignee
-verification map. `open_ticket`, `start_ticket`, `review_ticket`,
-`assign_ticket`, and `label_ticket` all make live GitHub API calls.
+`GITHUB_TOKEN`) for PR lookup and URL parsing, and `workflow_order.py` for
+the forward-only workflow check. `open_ticket`, `start_ticket`,
+`review_ticket`, `assign_ticket`, and `label_ticket` all make live GitHub
+API calls.
 
 **An auto-approved verdict is applied synchronously, at submission time, by
 `create_proposal` itself**. `"approved"` is a value the DB CHECK constraint
@@ -1624,12 +1633,12 @@ identifier from the proposal response rather than from a comment body.
 here dispatches straight to the applier and never re-runs the
 kind/action_type-scoped rule (`_PROPOSAL_RULES`) that gates auto-approval --
 e.g. a human-approved `assign_ticket` applies whatever `assignee_id` the bot
-proposed with NO identity-map re-verification, and a human-approved
-`start_ticket`/`review_ticket` applies with no forward-transition check.
-Only the fingerprint/staleness check still runs on this path. This is
-intentional -- a human approving IS the final authority this whole
-human-in-the-loop escape hatch exists for -- not an oversight or a gap to
-close later.
+proposed with no re-verification that a cited PR exists or references the
+target ticket, and a human-approved `start_ticket`/`review_ticket` applies
+with no forward-transition check. Only the fingerprint/staleness check
+still runs on this path. This is intentional -- a human approving IS the
+final authority this whole human-in-the-loop escape hatch exists for -- not
+an oversight or a gap to close later.
 
 **Fingerprint scheme is an internal contract**
 (`linear_client.compute_target_fingerprint`): a sha256 hex digest over a

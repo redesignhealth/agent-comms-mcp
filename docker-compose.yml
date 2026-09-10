@@ -33,11 +33,9 @@ services:
       # Same "genuinely optional" reasoning as LINEAR_API_TOKEN above:
       # unset, the `open_ticket`/`start_ticket`/`review_ticket`/
       # `assign_ticket`/`label_ticket` auto-approve lanes (GITHUB_TOKEN)
-      # and the `assign_ticket` identity map
-      # (GITHUB_LOGIN_TO_LINEAR_USER_ID_JSON) both fail closed rather than
-      # crash the server -- see README.md's environment-variable table.
+      # fail closed rather than crash the server -- see README.md's
+      # environment-variable table.
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
-      GITHUB_LOGIN_TO_LINEAR_USER_ID_JSON: ${GITHUB_LOGIN_TO_LINEAR_USER_ID_JSON:-}
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/agent_comms
     volumes:
       - token-storage:/data
