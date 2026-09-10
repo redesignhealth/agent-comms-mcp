@@ -275,9 +275,10 @@ anywhere in this repo.
 `main` is protected by a GitHub ruleset requiring 1 approving review (no
 bypass actors). That review can come from either a human, or an automated
 Argus code-review APPROVE verdict: `.github/workflows/auto-approve.yml`
-fires on CI completion via `workflow_run` (listening for
-`.github/workflows/ci.yml`), or manually via `workflow_dispatch`. Once CI
-(`.github/workflows/ci.yml`'s `CI / All checks passed` check) has passed and
+fires on CI completion via `workflow_run` (listening for the `CI` workflow,
+i.e. `.github/workflows/ci.yml`'s `name:`), or manually via
+`workflow_dispatch`. Once CI (`.github/workflows/ci.yml`'s
+`All checks passed` check) has passed and
 the shared Argus review-storage API reports an APPROVE verdict at the PR's
 exact head SHA (from a `/argus-review-loop <pr_number>` run in a Claude Code
 session), it submits an approving review itself, pinned to that SHA. If Argus

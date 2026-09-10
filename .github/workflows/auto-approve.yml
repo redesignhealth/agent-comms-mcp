@@ -24,11 +24,22 @@
 # Until that role is provisioned and applied, the "Configure AWS credentials"
 # step continues on error, and subsequent steps are skipped -- a safe, fail-closed
 # default; PRs simply fall back to requiring a human review, same as today.
+#
+# This hardcodes a cross-repo coupling to that Terraform provisioning: if the
+# role is ever renamed on the rh-data-platform side, the `role-to-assume`
+# line in the "Configure AWS credentials" step below is the only place in
+# this repo that needs updating to match.
 name: Auto-Approve PR (Argus)
 
 on:
   workflow_run:
-    workflows: [".github/workflows/ci.yml"]   # filename prevents silent breakage on workflow name change
+    # VERIFIED: `on.workflow_run.workflows` matches on the target workflow's
+    # `name:` field (its display name), NOT its file path -- unlike
+    # `gh run list --workflow` and similar CLI/API calls elsewhere in this
+    # repo, which do accept a filename. Must match ci.yml's `name: CI`.
+    # Do not "fix" this by keying on file path again -- that was tried in an
+    # earlier round and silently disabled this trigger entirely.
+    workflows: ["CI"]
     types: [completed]
   workflow_dispatch:
     inputs:
@@ -39,7 +50,10 @@ on:
 
 concurrency:
   group: "auto-approve-${{ github.event.workflow_run.head_branch || github.event.inputs.pr_number }}"
-  cancel-in-progress: true
+  # Do not cancel an in-flight run: the TOCTOU SHA guards below already
+  # handle staleness correctly, so cancellation would only risk killing a
+  # valid run mid-way with no completed comment/approval either way.
+  cancel-in-progress: false
 
 # Default all jobs to no permissions; each job opts in to exactly what it needs.
 permissions: {}
@@ -181,7 +195,7 @@ jobs:
         uses: redesignhealth/.github/.github/actions/wait-for-ci@80b6e4471a5f6d2542907a8501ba67cf4bda18ad # main @ 2026-08-13
         with:
           sha: ${{ steps.pr.outputs.reviewed_sha }}
-          check-name: "CI / All checks passed"
+          check-name: "All checks passed"
           max-retries: "10"
           retry-delay-ms: "60000"
 
@@ -203,6 +217,14 @@ jobs:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/rh-argus-gate-2
           aws-region: us-east-1
 
+      - name: Warn on AWS credentials failure
+        # continue-on-error above keeps this job non-failing during the
+        # provisioning gap (see IAM PREREQUISITE note at top of file), but
+        # that also means a genuine misconfiguration would otherwise fail
+        # silently with no diagnostic signal -- surface it here instead.
+        if: steps.aws.outcome == 'failure' && steps.pr.outputs.skip != 'true' && (github.event_name == 'workflow_run' || steps.ci.outputs.passed == 'true')
+        run: echo "::warning::Failed to assume rh-argus-gate-2 IAM role -- Argus auto-approval is disabled until this is fixed. See README.md's 'CI and PR review' section for IAM prerequisites."
+
       - name: Check Argus approval
         if: steps.aws.outcome == 'success' && steps.pr.outputs.skip != 'true' && (github.event_name == 'workflow_run' || steps.ci.outputs.passed == 'true')
         id: argus
@@ -218,10 +240,10 @@ jobs:
           API_KEY=$(aws ssm get-parameter \
             --name /general/prod/api-secret-key \
             --with-decryption \
-            --query 'Parameter.Value' --output text | while IFS= read -r val; do
-              echo "::add-mask::$val" >&2
-              printf '%s' "$val"
-            done)
+            --query 'Parameter.Value' --output text)
+          # Workflow commands like ::add-mask:: are only recognized on
+          # stdout, not stderr -- must run before $API_KEY is used anywhere.
+          echo "::add-mask::$API_KEY"
 
           # Don't use curl -f: a non-2xx response should resolve to "not
           # approved" (falls through to the "waiting on Argus" comment step),

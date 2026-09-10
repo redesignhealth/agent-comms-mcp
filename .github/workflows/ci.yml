@@ -139,10 +139,12 @@ jobs:
       - name: Build image
         run: docker build -t agent-comms-mcp:${{ github.sha }} .
 
-  # Summary job -- single stable check name ("CI / All checks passed") for auto-approve.yml's
-  # wait-for-ci step to poll, since lint/test/build above are three separate
-  # parallel checks with no combined gate otherwise (redesignhealth/.github's
-  # wait-for-ci action documents this exact ci-complete convention).
+  # Summary job -- single stable check name ("All checks passed", no workflow-name
+  # prefix -- verified against real GitHub API check-run data) for
+  # auto-approve.yml's wait-for-ci step to poll, since lint/test/build above
+  # are three separate parallel checks with no combined gate otherwise
+  # (redesignhealth/.github's wait-for-ci action documents this exact
+  # ci-complete convention).
   ci-complete:
     name: All checks passed
     needs: [lint, test, build]
