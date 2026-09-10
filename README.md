@@ -275,21 +275,34 @@ anywhere in this repo.
 `main` is protected by a GitHub ruleset requiring 1 approving review (no
 bypass actors). That review can come from either a human, or an automated
 Argus code-review APPROVE verdict: `.github/workflows/auto-approve.yml`
-runs on every PR push, and once CI (`.github/workflows/ci.yml`'s
-`ci-complete` summary check) has passed and the shared Argus review-storage
-API reports an APPROVE verdict at the PR's exact head SHA (from a
-`/argus-review-loop <pr_number>` run in a Claude Code session), it submits
-an approving review itself, pinned to that SHA. If Argus hasn't approved
-yet, the workflow instead comments on the PR asking the author to run
-`/argus-review-loop` and re-checks automatically on the next push.
+fires on CI completion via `workflow_run` (listening for
+`.github/workflows/ci.yml`), or manually via `workflow_dispatch`. Once CI
+(`.github/workflows/ci.yml`'s `CI / All checks passed` check) has passed and
+the shared Argus review-storage API reports an APPROVE verdict at the PR's
+exact head SHA (from a `/argus-review-loop <pr_number>` run in a Claude Code
+session), it submits an approving review itself, pinned to that SHA. If Argus
+hasn't approved yet, the workflow instead comments on the PR asking the author
+to run `/argus-review-loop` and re-checks automatically when CI completes
+after the next push to this PR.
 
-**Required repo secret:** `AWS_ROLE_ARN_ARGUS_GATE` -- an IAM role this
-workflow assumes via OIDC to read the Argus review-storage API key from
-SSM. Not yet set as of this writing (provisioned separately via
-`rh-data-platform` Terraform); until it is, the workflow's AWS-credentials
-step fails and no automated approval is ever submitted -- a safe,
-fail-closed default that just leaves PRs requiring a human review, same as
-today.
+> [!WARNING]
+> **Do not switch `auto-approve.yml` to trigger on `pull_request` directly.**
+> Triggering on `workflow_run` ensures that the job executes under default-branch
+> ref context (`refs/heads/main`), which is required to satisfy the companion
+> IAM role's branch-ref-only trust policy and prevent untrusted PR code from
+> assuming the role to access production secrets.
+
+**IAM and secret dependencies:** This workflow reuses this repo's existing
+`AWS_ACCOUNT_ID` secret to assume the shared `rh-argus-gate-2` IAM role via
+OIDC (`arn:aws:iam::<AWS_ACCOUNT_ID>:role/rh-argus-gate-2`), pinned directly
+in the workflow file (no separate `AWS_ROLE_ARN_ARGUS_GATE` secret is needed).
+The role and its branch-ref-only trust policy are provisioned via
+[redesignhealth/rh-data-platform#8896](https://github.com/redesignhealth/rh-data-platform/pull/8896).
+The role grants access to read the Argus review-storage API key from the
+`/general/prod/api-secret-key` SSM parameter (with KMS decryption). Until that
+role is applied, the workflow's AWS credential configuration step continues on
+error and downstream approval steps are skipped -- a safe, fail-closed default
+that leaves PRs requiring a human review, same as today.
 
 ## Observability
 
