@@ -1,7 +1,7 @@
 """add apply_result to proposal_holds
 
 Revision ID: d88cc7e6e21b
-Revises: b3d4e5f6a7c8
+Revises: d885dda2ffda
 Create Date: 2026-09-09 00:00:00.000000
 
 TECH-5873 follow-up: ``open_ticket`` (``kind="linear_progress_update"``)

@@ -397,7 +397,7 @@ class TestCloseTicket:
         assert note is None
 
 
-_OPEN_PR = {"state": "open"}
+_OPEN_PR = {"state": "open", "title": "Fix TECH-1234"}
 _CLOSED_PR = {"state": "closed"}
 _BACKLOG_STATE = {"id": "s0", "name": "Backlog", "type": "backlog"}
 _IN_PROGRESS_STATE = {"id": "s1", "name": "In Progress", "type": "started"}
@@ -496,6 +496,31 @@ class TestStartTicket:
     async def test_closed_pr_stays_pending(self, monkeypatch: pytest.MonkeyPatch) -> None:
         mock_fetch_issue = AsyncMock(return_value={"state": _BACKLOG_STATE})
         monkeypatch.setattr(github_client, "fetch_pull_request", AsyncMock(return_value=_CLOSED_PR))
+        monkeypatch.setattr(linear_client, "fetch_issue", mock_fetch_issue)
+        status, _note = await evaluate_linear_progress_update_judge(
+            {
+                "action_type": "start_ticket",
+                "target_id": "TECH-1234",
+                "starting_pr_url": "https://github.com/org/repo/pull/1",
+                "team": "TECH",
+            }
+        )
+        assert status == "pending"
+        mock_fetch_issue.assert_not_awaited()
+
+    async def test_open_pr_not_referencing_target_ticket_stays_pending(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An open PR that doesn't reference ``target_id`` anywhere in its
+        ``head.ref``/``title``/``body`` must not justify advancing this
+        ticket to In Progress -- otherwise any open PR on an unrelated
+        ticket could be cited."""
+        mock_fetch_issue = AsyncMock(return_value={"state": _BACKLOG_STATE})
+        monkeypatch.setattr(
+            github_client,
+            "fetch_pull_request",
+            AsyncMock(return_value={"state": "open", "title": "Fix something unrelated"}),
+        )
         monkeypatch.setattr(linear_client, "fetch_issue", mock_fetch_issue)
         status, _note = await evaluate_linear_progress_update_judge(
             {
@@ -644,6 +669,7 @@ class TestReviewTicket:
                     "state": "open",
                     "requested_reviewers": [{"login": "reviewer1"}],
                     "requested_teams": [],
+                    "title": "Fix TECH-1234",
                 }
             ),
         )
@@ -674,6 +700,7 @@ class TestReviewTicket:
                     "state": "open",
                     "requested_reviewers": [],
                     "requested_teams": [{"slug": "team1"}],
+                    "title": "Fix TECH-1234",
                 }
             ),
         )
@@ -753,6 +780,38 @@ class TestReviewTicket:
             }
         )
         assert status == "pending"
+
+    async def test_open_pr_with_review_requested_but_not_referencing_target_ticket_stays_pending(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An open PR with review requested that doesn't reference
+        ``target_id`` anywhere in its ``head.ref``/``title``/``body``
+        must not justify advancing this ticket to In Review -- otherwise
+        any such PR on an unrelated ticket could be cited."""
+        mock_fetch_issue = AsyncMock(return_value={"state": _IN_PROGRESS_STATE})
+        monkeypatch.setattr(
+            github_client,
+            "fetch_pull_request",
+            AsyncMock(
+                return_value={
+                    "state": "open",
+                    "requested_reviewers": [{"login": "reviewer1"}],
+                    "requested_teams": [],
+                    "title": "Fix something unrelated",
+                }
+            ),
+        )
+        monkeypatch.setattr(linear_client, "fetch_issue", mock_fetch_issue)
+        status, _note = await evaluate_linear_progress_update_judge(
+            {
+                "action_type": "review_ticket",
+                "target_id": "TECH-1234",
+                "review_pr_url": "https://github.com/org/repo/pull/1",
+                "team": "TECH",
+            }
+        )
+        assert status == "pending"
+        mock_fetch_issue.assert_not_awaited()
 
     async def test_without_citation_stays_pending(self, monkeypatch: pytest.MonkeyPatch) -> None:
         mock_fetch_pr = AsyncMock()
@@ -1216,7 +1275,7 @@ class TestLabelTicket:
     artifact behind it)."""
 
     async def test_matching_label_is_approved(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        mock_fetch_pr = AsyncMock(return_value={"state": "open"})
+        mock_fetch_pr = AsyncMock(return_value={"state": "open", "title": "Fix TECH-1234"})
         monkeypatch.setattr(github_client, "fetch_pull_request", mock_fetch_pr)
         status, note = await evaluate_linear_progress_update_judge(
             {
@@ -1363,7 +1422,7 @@ class TestLabelTicket:
         monkeypatch.setattr(
             github_client,
             "fetch_pull_request",
-            AsyncMock(return_value={"state": "closed", "merged": True}),
+            AsyncMock(return_value={"state": "closed", "merged": True, "title": "Fix TECH-1234"}),
         )
         status, _note = await evaluate_linear_progress_update_judge(
             {
@@ -1375,6 +1434,30 @@ class TestLabelTicket:
             }
         )
         assert status == "approved"
+
+    async def test_pr_not_referencing_target_ticket_stays_pending(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A PR that exists and matches the ``target:<repo>`` label but
+        doesn't reference ``target_id`` anywhere in its
+        ``head.ref``/``title``/``body`` must not justify labeling this
+        ticket -- otherwise any PR in a given repo could label any
+        unrelated ticket with that repo's target label."""
+        monkeypatch.setattr(
+            github_client,
+            "fetch_pull_request",
+            AsyncMock(return_value={"state": "open", "title": "Fix something unrelated"}),
+        )
+        status, _note = await evaluate_linear_progress_update_judge(
+            {
+                "action_type": "label_ticket",
+                "target_id": "TECH-1234",
+                "labeling_pr_url": "https://github.com/org/my-repo/pull/5",
+                "label_name": "target:my-repo",
+                "team": "TECH",
+            }
+        )
+        assert status == "pending"
 
 
 class TestOtherActionTypes:

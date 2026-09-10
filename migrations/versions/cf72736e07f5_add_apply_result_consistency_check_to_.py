@@ -16,9 +16,16 @@ comment -- "only set when the applier actually returned something...
 never overwrite with None"), so no existing row can violate this on
 apply; safe to add directly, no backfill needed.
 
-DEPLOYMENT: purely additive (a new CHECK constraint on a column no
-existing row can violate, per the invariant above) -- safe for a normal
-rolling deploy in either direction, same as ``d88cc7e6e21b`` itself.
+DEPLOYMENT: added ``NOT VALID`` (``postgresql_not_valid=True``), so this
+migration only takes a brief ``ACCESS EXCLUSIVE`` lock to add the
+constraint's catalog entry -- no table scan, since ``NOT VALID`` skips
+checking existing rows (it's still enforced against every new
+INSERT/UPDATE from this point on). The scan that validates existing rows
+is deferred to the next migration (``572b2b9a96d6``), which runs it
+outside this migration's ambient transaction so it can take the much
+lighter ``SHARE UPDATE EXCLUSIVE`` lock instead of ``ACCESS EXCLUSIVE``.
+Safe for a normal rolling deploy in either direction, same as
+``d88cc7e6e21b`` itself.
 """
 
 from __future__ import annotations
@@ -38,6 +45,7 @@ def upgrade() -> None:
         "ck_proposal_holds_apply_result_consistency",
         "proposal_holds",
         "apply_result IS NULL OR status = 'applied'",
+        postgresql_not_valid=True,
     )
 
 

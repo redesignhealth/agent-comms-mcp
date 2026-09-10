@@ -449,26 +449,44 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
     )
     # cf72736e07f5 (Argus review on d88cc7e6e21b): the CHECK constraint
     # tying apply_result to status = 'applied', mirroring
-    # ck_proposal_holds_applied_at_consistency's own shape. Pins the exact
-    # constraint name and predicate text.
-    assert (
-        "ALTER TABLE proposal_holds ADD CONSTRAINT "
-        "ck_proposal_holds_apply_result_consistency "
-        "CHECK (apply_result IS NULL OR status = 'applied')" in result.stdout
-    )
-    # 572b2b9a96d6 (Argus review on cf72736e07f5): replaces the plain
-    # ACCESS EXCLUSIVE check constraint with the safer two-step pattern:
-    # drop, re-add as NOT VALID, and VALIDATE CONSTRAINT.
-    assert (
-        "ALTER TABLE proposal_holds DROP CONSTRAINT ck_proposal_holds_apply_result_consistency"
-        in result.stdout
-    )
+    # ck_proposal_holds_applied_at_consistency's own shape. Added NOT VALID
+    # (Argus review on cf72736e07f5 itself -- see 572b2b9a96d6) so this
+    # migration takes only a brief ACCESS EXCLUSIVE lock with no table
+    # scan; the scan is deferred to 572b2b9a96d6's VALIDATE CONSTRAINT.
     assert (
         "ALTER TABLE proposal_holds ADD CONSTRAINT "
         "ck_proposal_holds_apply_result_consistency "
         "CHECK (apply_result IS NULL OR status = 'applied') NOT VALID" in result.stdout
     )
+    # 572b2b9a96d6 (Argus review on cf72736e07f5): originally re-implemented
+    # the constraint via DROP + re-ADD ... NOT VALID + VALIDATE, all in this
+    # same ambient transaction -- which still ran VALIDATE under the ACCESS
+    # EXCLUSIVE lock the ADD took, fully negating the point. Now cf72736e07f5
+    # itself adds the constraint NOT VALID directly (assertion above), so
+    # this migration only issues the VALIDATE step and the DROP/re-ADD no
+    # longer appears anywhere in the output.
+    assert result.stdout.count("ADD CONSTRAINT ck_proposal_holds_apply_result_consistency") == 1
+    assert "DROP CONSTRAINT ck_proposal_holds_apply_result_consistency" not in result.stdout
     assert (
         "ALTER TABLE proposal_holds VALIDATE CONSTRAINT ck_proposal_holds_apply_result_consistency"
         in result.stdout
     )
+    # The VALIDATE step must run in a genuinely SEPARATE transaction from
+    # cf72736e07f5's ADD CONSTRAINT ... NOT VALID -- that's the whole point
+    # of the fix (see a9faca2517d7's own COMMIT/BEGIN-bracketing assertion
+    # above for the established non-vacuous idiom this mirrors): search for
+    # each anchor from the START of the output, and require a COMMIT to fall
+    # strictly between the NOT VALID add and the VALIDATE, so a regression
+    # that put both back in the same transaction (or reordered them) fails
+    # this assertion rather than merely satisfying an `in result.stdout`
+    # substring check that can't see transaction boundaries at all.
+    not_valid_pos = result.stdout.index(
+        "ALTER TABLE proposal_holds ADD CONSTRAINT "
+        "ck_proposal_holds_apply_result_consistency "
+        "CHECK (apply_result IS NULL OR status = 'applied') NOT VALID;"
+    )
+    validate_pos = result.stdout.index(
+        "ALTER TABLE proposal_holds VALIDATE CONSTRAINT ck_proposal_holds_apply_result_consistency;"
+    )
+    commit_pos = result.stdout.index("COMMIT;", not_valid_pos)
+    assert not_valid_pos < commit_pos < validate_pos

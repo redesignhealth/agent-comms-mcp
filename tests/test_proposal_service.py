@@ -735,6 +735,133 @@ class TestJudgeIntegration:
         rows = (await session.execute(select(ProposalHold))).scalars().all()
         assert len(rows) == 1
 
+    async def test_resubmission_during_judging_abandons_stale_verdict(
+        self, session: AsyncSession, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Regression test for the judged-payload vs. applied-payload race.
+
+        While a rule is judging a proposal's payload (which can take up to ~20s
+        of external I/O with no lock held), a concurrent same-bot resubmission
+        can mutate the pending row in place via ``_apply_proposal_resubmission``.
+        The compare-and-swap guard in ``_claim_proposal_hold_for_applying``
+        detects that the payload changed between judging and claim, abandoning
+        the stale verdict rather than applying it to the new payload.
+        """
+        initial_action = _action(target_id="TECH-CAS-1", note="initial")
+        stub_pending = AsyncMock(return_value=("pending", None))
+        with patch.dict(
+            "service._PROPOSAL_RULES",
+            {("linear_progress_update", "close_ticket"): stub_pending},
+        ):
+            first = await _submit(session, action=initial_action)
+        assert first["status"] == "pending"
+        hold_id = uuid.UUID(first["proposal_id"])
+
+        resubmitted_action = _action(
+            target_id="TECH-CAS-1",
+            note="judged_by_rule",
+            source_message_url="https://redesignhealth.slack.com/archives/C1/p1",
+        )
+        concurrent_action = _action(
+            target_id="TECH-CAS-1",
+            note="concurrent_resubmission_payload",
+            source_message_url="https://redesignhealth.slack.com/archives/C1/p2",
+        )
+
+        async def _rule_mutating_concurrently(action: dict[str, Any]) -> tuple[str, str | None]:
+            # Simulate a concurrent resubmission that overwrites the row's action
+            # in place during the judging window.
+            async with session_factory() as other_session:
+                await other_session.execute(
+                    update(ProposalHold)
+                    .where(ProposalHold.id == hold_id)
+                    .values(action=concurrent_action)
+                )
+                await other_session.commit()
+            return "approved", "auto-approved: stubbed"
+
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(return_value="deadbeef"),
+            ),
+            patch(
+                "service.linear_client.apply_progress_update",
+                AsyncMock(return_value=None),
+            ) as mock_apply,
+            patch.dict(
+                "service._PROPOSAL_RULES",
+                {("linear_progress_update", "close_ticket"): _rule_mutating_concurrently},
+            ),
+        ):
+            second = await _submit(session, action=resubmitted_action)
+
+        mock_apply.assert_not_awaited()
+        assert second["proposal_id"] == str(hold_id)
+        assert second["status"] == "pending"
+
+        row = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        assert row.status == "pending"
+        assert row.action == concurrent_action
+
+    async def test_resubmission_mutating_fingerprint_during_judging_abandons_stale_verdict(
+        self, session: AsyncSession, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Variant proving the CAS guard covers target_fingerprint mutation
+        as well as action mutation."""
+        initial_action = _action(target_id="TECH-CAS-2")
+        stub_pending = AsyncMock(return_value=("pending", None))
+        with patch.dict(
+            "service._PROPOSAL_RULES",
+            {("linear_progress_update", "close_ticket"): stub_pending},
+        ):
+            first = await _submit(session, action=initial_action)
+        assert first["status"] == "pending"
+        hold_id = uuid.UUID(first["proposal_id"])
+
+        resubmitted_action = _action(
+            target_id="TECH-CAS-2",
+            source_message_url="https://redesignhealth.slack.com/archives/C1/p1",
+        )
+
+        async def _rule_mutating_fingerprint(action: dict[str, Any]) -> tuple[str, str | None]:
+            async with session_factory() as other_session:
+                await other_session.execute(
+                    update(ProposalHold)
+                    .where(ProposalHold.id == hold_id)
+                    .values(target_fingerprint="fp-concurrent-updated")
+                )
+                await other_session.commit()
+            return "approved", "auto-approved: stubbed"
+
+        with (
+            patch(
+                "service.linear_client.fetch_current_fingerprint",
+                AsyncMock(return_value="deadbeef"),
+            ),
+            patch(
+                "service.linear_client.apply_progress_update",
+                AsyncMock(return_value=None),
+            ) as mock_apply,
+            patch.dict(
+                "service._PROPOSAL_RULES",
+                {("linear_progress_update", "close_ticket"): _rule_mutating_fingerprint},
+            ),
+        ):
+            second = await _submit(session, action=resubmitted_action)
+
+        mock_apply.assert_not_awaited()
+        assert second["proposal_id"] == str(hold_id)
+        assert second["status"] == "pending"
+
+        row = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        assert row.status == "pending"
+        assert row.target_fingerprint == "fp-concurrent-updated"
+
     async def test_open_ticket_same_real_pr_citation_dedups_into_one_row(
         self, session: AsyncSession, _default_fetch_current_fingerprint: AsyncMock
     ) -> None:
@@ -920,7 +1047,7 @@ class TestFourNewLanesIntegration:
             ),
             patch(
                 "service.github_client.fetch_pull_request",
-                AsyncMock(return_value={"state": "open"}),
+                AsyncMock(return_value={"state": "open", "title": "Fix TECH-1234"}),
             ),
             patch(
                 "service.linear_client.fetch_issue",
@@ -946,6 +1073,34 @@ class TestFourNewLanesIntegration:
         assert result["priority"] == "low"
         mock_apply.assert_awaited_once()
 
+    async def test_start_ticket_with_pr_not_referencing_ticket_stays_pending(
+        self, session: AsyncSession
+    ) -> None:
+        with (
+            patch(
+                "service.github_client.fetch_pull_request",
+                AsyncMock(return_value={"state": "open", "title": "Unrelated PR title"}),
+            ),
+            patch(
+                "service.linear_client.fetch_issue",
+                AsyncMock(
+                    return_value={"state": {"id": "s0", "name": "Backlog", "type": "backlog"}}
+                ),
+            ) as mock_fetch_issue,
+        ):
+            result = await _submit(
+                session,
+                action=_action(
+                    action_type="start_ticket",
+                    target_id="TECH-1234",
+                    team="TECH",
+                    starting_pr_url="https://github.com/org/repo/pull/1",
+                ),
+            )
+        assert result["status"] == "pending"
+        assert "decision_source" not in result
+        mock_fetch_issue.assert_not_awaited()
+
     async def test_start_ticket_without_citation_stays_pending(
         self, session: AsyncSession, _default_fetch_current_fingerprint: AsyncMock
     ) -> None:
@@ -966,6 +1121,7 @@ class TestFourNewLanesIntegration:
                 AsyncMock(
                     return_value={
                         "state": "open",
+                        "title": "Fix TECH-1234",
                         "requested_reviewers": [{"login": "reviewer1"}],
                         "requested_teams": [],
                     }
@@ -994,6 +1150,41 @@ class TestFourNewLanesIntegration:
         assert result["decision_source"] == "auto"
         assert result["priority"] == "medium"
         mock_apply.assert_awaited_once()
+
+    async def test_review_ticket_with_pr_not_referencing_ticket_stays_pending(
+        self, session: AsyncSession
+    ) -> None:
+        with (
+            patch(
+                "service.github_client.fetch_pull_request",
+                AsyncMock(
+                    return_value={
+                        "state": "open",
+                        "title": "Unrelated PR title",
+                        "requested_reviewers": [{"login": "reviewer1"}],
+                        "requested_teams": [],
+                    }
+                ),
+            ),
+            patch(
+                "service.linear_client.fetch_issue",
+                AsyncMock(
+                    return_value={"state": {"id": "s1", "name": "In Progress", "type": "started"}}
+                ),
+            ) as mock_fetch_issue,
+        ):
+            result = await _submit(
+                session,
+                action=_action(
+                    action_type="review_ticket",
+                    target_id="TECH-1234",
+                    team="TECH",
+                    review_pr_url="https://github.com/org/repo/pull/1",
+                ),
+            )
+        assert result["status"] == "pending"
+        assert "decision_source" not in result
+        mock_fetch_issue.assert_not_awaited()
 
     async def test_review_ticket_without_review_requested_stays_pending(
         self, session: AsyncSession, _default_fetch_current_fingerprint: AsyncMock
@@ -1086,7 +1277,7 @@ class TestFourNewLanesIntegration:
             ) as mock_apply,
             patch(
                 "service.github_client.fetch_pull_request",
-                AsyncMock(return_value={"state": "open"}),
+                AsyncMock(return_value={"state": "open", "title": "Fix TECH-1234"}),
             ),
         ):
             result = await _submit(
@@ -1103,6 +1294,32 @@ class TestFourNewLanesIntegration:
         assert result["decision_source"] == "auto"
         assert result["priority"] == "low"
         mock_apply.assert_awaited_once()
+
+    async def test_label_ticket_with_pr_not_referencing_ticket_stays_pending(
+        self, session: AsyncSession
+    ) -> None:
+        with (
+            patch(
+                "service.linear_client.apply_label_ticket", AsyncMock(return_value=None)
+            ) as mock_apply,
+            patch(
+                "service.github_client.fetch_pull_request",
+                AsyncMock(return_value={"state": "open", "title": "Unrelated PR title"}),
+            ),
+        ):
+            result = await _submit(
+                session,
+                action=_action(
+                    action_type="label_ticket",
+                    target_id="TECH-1234",
+                    team="TECH",
+                    labeling_pr_url="https://github.com/org/my-repo/pull/5",
+                    label_name="target:my-repo",
+                ),
+            )
+        assert result["status"] == "pending"
+        assert "decision_source" not in result
+        mock_apply.assert_not_awaited()
 
     async def test_label_ticket_with_label_for_a_different_repo_stays_pending(
         self, session: AsyncSession, _default_fetch_current_fingerprint: AsyncMock

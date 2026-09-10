@@ -158,6 +158,7 @@ raised — logged, never fails the triggering call).
 from __future__ import annotations
 
 import asyncio
+import copy
 import itertools
 import logging
 import re
@@ -5911,7 +5912,7 @@ def _derive_proposal_priority(kind: str, action: dict[str, Any]) -> str:
     )
 
 
-# TECH-5877: exactly two auto-approval rules, scoped to
+# TECH-5877: six auto-approval rules, scoped to
 # kind="linear_progress_update" only -- a deterministic rules engine, not an
 # LLM judge, because write intent must be judged outside the proposing
 # agent (a bot must never self-approve its own proposal). A future kind
@@ -6078,7 +6079,11 @@ async def _rule_start_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
     2. That cited PR genuinely exists and is still open
        (``github_client.fetch_pull_request``) -- an artifact proving work
        has actually begun, not a bot's own say-so.
-    3. The ticket's CURRENT workflow state -- fetched fresh via
+    3. That cited PR actually REFERENCES ``target_id`` (``_pull_request_
+       references_ticket`` below) -- otherwise an open PR on ANY unrelated
+       ticket could justify advancing this ticket to In Progress, not just
+       one it actually worked on.
+    4. The ticket's CURRENT workflow state -- fetched fresh via
        ``linear_client.fetch_issue(action["target_id"])``, never trusted
        from the action payload itself -- is strictly BEHIND "In Progress"
        along the workflow (``workflow_order.is_forward_transition``), the
@@ -6110,6 +6115,8 @@ async def _rule_start_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
     pull_request = await github_client.fetch_pull_request(owner, repo, number)
     if pull_request.get("state") != "open":
         return "pending", None
+    if not _pull_request_references_ticket(pull_request, target_id):
+        return "pending", None
 
     issue = await linear_client.fetch_issue(target_id)
     state = issue.get("state") or {}
@@ -6132,10 +6139,13 @@ async def _rule_review_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
     shape as ``_rule_start_ticket`` above, but the cited PR
     (``action["review_pr_url"]``) must additionally show review requested
     -- ``state == "open"`` AND (``requested_reviewers`` OR
-    ``requested_teams``) non-empty -- and the forward-transition check
-    targets "In Review" instead of "In Progress". See
-    ``_rule_start_ticket``'s docstring for the shared citation/``target_id``/
-    ``team``/forward-transition/error-propagation contract."""
+    ``requested_teams``) non-empty -- and must actually REFERENCE
+    ``target_id`` (``_pull_request_references_ticket`` below) -- otherwise
+    a PR with review requested could justify advancing any unrelated
+    ticket to In Review, not just one it actually worked on. The
+    forward-transition check targets "In Review" instead of "In Progress".
+    See ``_rule_start_ticket``'s docstring for the shared citation/
+    ``target_id``/``team``/forward-transition/error-propagation contract."""
     citation = action.get("review_pr_url")
     if not isinstance(citation, str):
         return "pending", None
@@ -6154,6 +6164,8 @@ async def _rule_review_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
     if pull_request.get("state") != "open":
         return "pending", None
     if not pull_request.get("requested_reviewers") and not pull_request.get("requested_teams"):
+        return "pending", None
+    if not _pull_request_references_ticket(pull_request, target_id):
         return "pending", None
 
     issue = await linear_client.fetch_issue(target_id)
@@ -6282,11 +6294,13 @@ async def _rule_label_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
        URL's OWN path -- pure citation-URL-shape derivation, no GitHub
        API call needed for THIS check (the repo name is already in the
        URL; nothing further to dereference).
-    3. ``action["team"]`` (the applier's required field --
+    3. ``action["target_id"]`` is present and non-empty -- checked BEFORE
+       the PR fetch (same ordering reasoning as ``_rule_assign_ticket``).
+    4. ``action["team"]`` (the applier's required field --
        ``linear_client.apply_label_ticket`` raises ``LinearAPIError`` on
        a missing/empty one) is present and non-empty (Argus review:
        rule/applier precondition mismatch).
-    4. The cited PR actually EXISTS -- verified via
+    5. The cited PR actually EXISTS -- verified via
        ``github_client.fetch_pull_request`` (Argus review: since both the
        cited URL and the requested label name are entirely bot-supplied,
        a bot could otherwise always construct a syntactically-matching
@@ -6301,6 +6315,10 @@ async def _rule_label_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
        ``_rule_open_ticket``'s own existence-only check. A
        ``github_client.GitHubAPIError`` propagates uncaught, same
        fail-closed contract as every other rule in this registry.
+    6. The cited PR actually REFERENCES ``target_id`` (``_pull_request_
+       references_ticket`` above) -- otherwise a PR in a given repo could
+       justify labeling any unrelated ticket with that repo's target
+       label, not just ones touched by that PR.
 
     No workflow-state/forward-transition concept applies here either --
     see ``_rule_assign_ticket``'s docstring for the same reasoning."""
@@ -6314,11 +6332,16 @@ async def _rule_label_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
 
     if action.get("label_name") != f"target:{repo}":
         return "pending", None
+    target_id = action.get("target_id")
+    if not isinstance(target_id, str) or not target_id:
+        return "pending", None
     team = action.get("team")
     if not isinstance(team, str) or not team:
         return "pending", None
 
-    await github_client.fetch_pull_request(owner, repo, number)
+    pull_request = await github_client.fetch_pull_request(owner, repo, number)
+    if not _pull_request_references_ticket(pull_request, target_id):
+        return "pending", None
     return (
         "approved",
         "auto-approved: requested label exactly matches target:<repo> derived from the cited PR",
@@ -6606,6 +6629,26 @@ def _apply_proposal_resubmission(
     hold.target_fingerprint = target_fingerprint
 
 
+def _proposal_resubmission_snapshot(hold: ProposalHold) -> tuple[Any, ...]:
+    """Snapshot of exactly the columns ``_apply_proposal_resubmission``
+    (directly above) overwrites on a same-bot resubmission -- used to
+    detect, via compare-and-swap in ``_claim_proposal_hold_for_applying``,
+    whether a hold's payload changed between when a rule judged it and
+    when that verdict is about to be applied. The two functions must
+    enumerate the same field set; kept adjacent in the file so they
+    don't drift out of sync.
+    """
+    return (
+        copy.deepcopy(hold.action),
+        hold.rationale,
+        hold.confidence,
+        hold.importance,
+        hold.impact,
+        hold.priority,
+        hold.target_fingerprint,
+    )
+
+
 async def _dedup_or_insert_proposal(
     session: AsyncSession,
     *,
@@ -6782,7 +6825,10 @@ async def create_proposal(
     raises (e.g. a future lane's real I/O failing) is caught and treated
     as ``"pending"`` -- fail closed, never mistaken for an "approved"
     verdict, and never left to crash this function with the hold in a bad
-    state.
+    state. A verdict is only applied if the payload is unchanged at
+    claim time; abandoning a stale verdict when a concurrent
+    resubmission has superseded it is safe because that resubmitting
+    call independently judges and drives the new payload.
 
     A rule verdict of ``"approved"`` is never itself persisted (Argus
     review B1): a hold left sitting at rest with ``status="approved"``
@@ -6877,6 +6923,12 @@ async def create_proposal(
     await session.commit()
     await session.refresh(hold)
 
+    # Snapshot the exact payload the rule below is about to judge, so
+    # _claim_proposal_hold_for_applying can detect (and abandon rather
+    # than misapply) a verdict computed against a payload a concurrent
+    # resubmission has since superseded.
+    judged_payload = _proposal_resubmission_snapshot(hold)
+
     # Reaching this point guarantees kind == "linear_progress_update":
     # _derive_proposal_priority above already raised for every other kind,
     # so the default-rule lookup below is guaranteed to hit (no "kind with
@@ -6893,7 +6945,11 @@ async def create_proposal(
         # explicitly (same convention as `_fire_approval_notifier`'s own
         # defensive catch) so this stays correct even if the `except
         # Exception` below is ever accidentally broadened to `except
-        # BaseException`.
+        # BaseException`. A bare re-raise is correct here (unlike
+        # `_apply_or_finalize_proposal_hold`): a cancellation mid-apply
+        # strands a row at a non-terminal "applying" status, whereas the
+        # row here remains at "pending" -- already a legitimate,
+        # decidable, resubmittable resting state with no stranding risk.
         raise
     except Exception as exc:
         # Fail closed: any exception from the rule (a future lane's real
@@ -6946,13 +7002,23 @@ async def create_proposal(
         decided_by_actor_id=_PROPOSAL_JUDGE_DECIDED_BY,
         decision_source="auto",
         decision_note=decision_note,
+        expected_payload=judged_payload,
     )
     if not claimed:
-        # Something else (e.g. a human decide call) claimed this SAME
-        # hold between the commit above and this claim attempt, in the
-        # brief window before any caller could plausibly have learned
-        # this hold's id. Reload and return its current state rather
-        # than raising on a race this function did not cause.
+        # Two distinct causes reach here, both meaning "do not apply this
+        # verdict":
+        # 1. A concurrent claim: something else (e.g. a human decide call)
+        #    claimed this SAME hold between the commit above and this claim
+        #    attempt.
+        # 2. A same-bot resubmission: while the rule above was judging the
+        #    initial payload, a concurrent resubmission updated the pending
+        #    row in place (`expected_payload` mismatch), superseding the
+        #    judged payload. In this case, the resubmitting call is itself
+        #    independently judging and driving the new payload forward, so
+        #    abandoning this stale verdict and returning current state here
+        #    is complete behavior, not a dropped proposal.
+        # Reload and return its current state rather than raising on a race
+        # this function did not cause.
         resolved = await _find_proposal_hold(session, hold.id)
         if resolved is None:
             raise AssertionError("invariant violation: hold vanished after its own commit")
@@ -7351,6 +7417,7 @@ async def _claim_proposal_hold_for_applying(
     decided_by_actor_id: str,
     decision_source: str,
     decision_note: str | None,
+    expected_payload: tuple[Any, ...] | None = None,
 ) -> bool:
     """Claims a still-``"pending"`` hold for synchronous apply by writing
     ``status="applying"`` under a fresh ``FOR UPDATE`` and committing
@@ -7371,15 +7438,32 @@ async def _claim_proposal_hold_for_applying(
     terminal write; that's a monotonic no-op overwrite, not a
     correctness issue.
 
+    When ``expected_payload`` is provided (from ``_proposal_resubmission_
+    snapshot`` taken prior to judging in ``create_proposal``), this function
+    also verifies via compare-and-swap that the hold's payload was not
+    mutated in place by a concurrent resubmission while judging was in
+    flight. Passing ``None`` preserves the status-only check unchanged.
+
     Returns ``True`` if this call claimed the row (caller should proceed
     to ``_apply_or_finalize_proposal_hold`` with
-    ``expected_status="applying"``), ``False`` if the row was no longer
-    ``"pending"`` when re-checked under the lock (caller should reload
-    and return the hold's current state instead)."""
+    ``expected_status="applying"``). Returns ``False`` if either the row
+    was no longer ``"pending"`` when re-checked under the lock (already
+    claimed by another caller), OR its payload was superseded by a
+    resubmission (``expected_payload`` mismatch) -- both causes mean
+    "don't apply this verdict", and the caller should reload and return
+    the hold's current state instead."""
     hold = await _find_proposal_hold(session, hold_id, for_update=True)
     if hold is None:
         raise AssertionError("invariant violation: hold vanished before it could be claimed")
     if hold.status != "pending":
+        await session.commit()
+        return False
+    if expected_payload is not None and _proposal_resubmission_snapshot(hold) != expected_payload:
+        logger.warning(
+            "proposal hold %s was resubmitted while its judge verdict was in flight; "
+            "abandoning that verdict rather than applying it to the new payload",
+            hold_id,
+        )
         await session.commit()
         return False
     hold.status = "applying"
