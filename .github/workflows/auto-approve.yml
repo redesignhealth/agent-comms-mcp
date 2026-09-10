@@ -251,7 +251,7 @@ jobs:
           API_KEY=$(aws ssm get-parameter \
             --name /general/prod/api-secret-key \
             --with-decryption \
-            --query 'Parameter.Value' --output text)
+            --query 'Parameter.Value' --output text 2>/dev/null) || API_KEY=""
 
           if [ -z "$API_KEY" ]; then
             # A non-zero exit here would skip the later "Post Argus approval
@@ -259,19 +259,23 @@ jobs:
             # producing total silence on a genuine SSM misconfiguration.
             # Match the non-2xx HTTP response case below instead: fall
             # through to "not approved" so the fallback comment still posts.
-            echo "::warning::Argus API key parameter returned an empty value -- treating as not approved"
+            echo "::error::Argus API key parameter could not be retrieved or returned an empty value -- treating as not approved (infra failure)"
             echo "approved=false" >> "$GITHUB_OUTPUT"
+            echo "infra_failure=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           # Workflow commands like ::add-mask:: are only recognized on
           # stdout, not stderr -- must run before $API_KEY is used anywhere.
-          # Mask every line so embedded newlines do not leave partial credentials unmasked.
-          # Trailing `|| true`: a read-loop can exit non-zero on its final
-          # iteration in some shells, which would otherwise fail this whole
-          # step under `set -e`.
+          # Primary guaranteed mask for the entire secret value:
+          echo "::add-mask::$API_KEY"
+
+          # Line-by-line masking as defense-in-depth so embedded newlines
+          # do not leave individual lines unmasked in logs.
           printf '%s\n' "$API_KEY" | while IFS= read -r line; do
-            [ -n "$line" ] && echo "::add-mask::$line"
+            if [ -n "$line" ]; then
+              echo "::add-mask::$line"
+            fi
           done || true
 
           # Don't use curl -f: a non-2xx response should resolve to "not
@@ -336,13 +340,19 @@ jobs:
                 });
               } catch (e) {
                 if (e.status !== 404) throw e;
-                await github.rest.issues.createLabel({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  name: 'auto-approved',
-                  color: '0e8a16',
-                  description: 'Automatically approved by the Argus auto-approve workflow',
-                });
+                try {
+                  await github.rest.issues.createLabel({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    name: 'auto-approved',
+                    color: '0e8a16',
+                    description: 'Automatically approved by the Argus auto-approve workflow',
+                  });
+                } catch (createErr) {
+                  // Catch 422 ("Validation Failed: already_exists") if a concurrent
+                  // run created the label between our getLabel 404 and createLabel.
+                  if (createErr.status !== 422) throw createErr;
+                }
               }
               await github.rest.issues.addLabels({
                 owner: context.repo.owner,
@@ -377,6 +387,18 @@ jobs:
             );
             if (alreadyApproved) {
               core.info(`PR #${prNumber} already approved at SHA ${reviewedSha} by github-actions[bot], skipping duplicate review`);
+              // Re-check HEAD freshness before applying/retrying the label.
+              // If dismiss_stale_reviews_on_push has dismissed the earlier approval
+              // because HEAD moved past reviewedSha, do not apply the label.
+              const pr = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+              });
+              if (pr.data.head.sha !== reviewedSha) {
+                core.info(`PR HEAD changed from ${reviewedSha} to ${pr.data.head.sha} since prior approval. Skipping label application.`);
+                return;
+              }
               // Still (re-)apply the label -- a prior run may have approved
               // successfully but failed before reaching label application.
               await applyAutoApprovedLabel();
@@ -442,12 +464,16 @@ jobs:
         env:
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           REVIEWED_SHA: ${{ steps.pr.outputs.reviewed_sha }}
+          INFRA_FAILURE: ${{ steps.argus.outputs.infra_failure }}
         with:
           script: |
             const prNumber = parseInt(process.env.PR_NUMBER, 10);
             const reviewedSha = process.env.REVIEWED_SHA;
             const shortSha = reviewedSha.substring(0, 7);
-            const marker = `<!-- argus-gate-pending:${reviewedSha} -->`;
+            const isInfraFailure = process.env.INFRA_FAILURE === 'true';
+            const marker = isInfraFailure
+              ? `<!-- argus-gate-infra-failure:${reviewedSha} -->`
+              : `<!-- argus-gate-pending:${reviewedSha} -->`;
 
             // De-duplicate: paginate through all comments to skip if already
             // posted for this exact full SHA by github-actions[bot].
@@ -465,28 +491,42 @@ jobs:
               c.body?.includes(marker)
             );
             if (alreadyPosted) {
-              core.info(`Argus approval required comment already posted for SHA ${reviewedSha}, skipping duplicate`);
+              core.info(`Argus ${isInfraFailure ? 'infra failure' : 'approval required'} comment already posted for SHA ${reviewedSha}, skipping duplicate`);
               return;
             }
+
+            const commentBody = isInfraFailure
+              ? [
+                  marker,
+                  '## Argus Auto-Approval Unavailable',
+                  '',
+                  'Auto-approval could not run: the Argus API key is misconfigured (SSM/IAM issue) — this needs platform-team attention, not another `/argus-review-loop` run.',
+                  '',
+                  'To bypass, request a human reviewer directly.',
+                  '',
+                  '---',
+                  '*This check is enforced by the Argus auto-approve workflow.*',
+                ].join('\n')
+              : [
+                  marker,
+                  '## Argus Approval Required',
+                  '',
+                  `No Argus APPROVE verdict found for this PR at SHA \`${shortSha}\`.`,
+                  '',
+                  'To unblock auto-approval:',
+                  `1. In a Claude Code session, run: \`/argus-review-loop ${prNumber}\``,
+                  '2. Iterate until Argus reaches an APPROVE verdict',
+                  '3. This workflow re-checks automatically when CI completes after the next push to this PR',
+                  '',
+                  'To bypass, request a human reviewer directly.',
+                  '',
+                  '---',
+                  '*This check is enforced by the Argus auto-approve workflow.*',
+                ].join('\n');
 
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: prNumber,
-              body: [
-                marker,
-                '## Argus Approval Required',
-                '',
-                `No Argus APPROVE verdict found for this PR at SHA \`${shortSha}\`.`,
-                '',
-                'To unblock auto-approval:',
-                `1. In a Claude Code session, run: \`/argus-review-loop ${prNumber}\``,
-                '2. Iterate until Argus reaches an APPROVE verdict',
-                '3. This workflow re-checks automatically when CI completes after the next push to this PR',
-                '',
-                'To bypass, request a human reviewer directly.',
-                '',
-                '---',
-                '*This check is enforced by the Argus auto-approve workflow.*',
-              ].join('\n'),
+              body: commentBody,
             });
