@@ -271,6 +271,55 @@ if any required variable (`OKTA_ISSUER_URL`, `OKTA_CLIENT_ID`,
 is missing or empty. See `.env.example` for the full list. No secrets are committed
 anywhere in this repo.
 
+## CI and PR review
+
+`main` is protected by a GitHub ruleset requiring 1 approving review (no
+bypass actors). That review can come from either a human, or an automated
+Argus code-review APPROVE verdict: `.github/workflows/auto-approve.yml`
+fires on CI completion via `workflow_run` (listening for the `CI` workflow,
+i.e. `.github/workflows/ci.yml`'s `name:`), or manually via
+`workflow_dispatch`. Once CI (`.github/workflows/ci.yml`'s
+`All checks passed` check) has passed and
+the shared Argus review-storage API reports an APPROVE verdict at the PR's
+exact head SHA (from a `/argus-review-loop <pr_number>` run in a Claude Code
+session), it submits an approving review itself, pinned to that SHA. If Argus
+hasn't approved yet, the workflow instead posts one of two comments on the
+PR, and re-checks automatically when CI completes after the next push to
+this PR:
+
+- **"Argus Approval Required"** -- no Argus APPROVE verdict was found for
+  this SHA yet. Run `/argus-review-loop <pr_number>` in a Claude Code session
+  and push again.
+- **"Argus Auto-Approval Unavailable"** -- an infra failure (bad/missing AWS
+  credentials, a misconfigured Argus API key, or the Argus API being
+  unreachable, returning a server error (5xx), or returning a
+  malformed/unparseable response body) prevented the check from running at
+  all. Running `/argus-review-loop` again will not help; this needs
+  platform-team attention, or a human reviewer in the meantime.
+
+Both comments share a single per-SHA marker, so a later run updates the
+existing comment in place rather than posting a second, contradictory one.
+
+> [!WARNING]
+> **Do not switch `auto-approve.yml` to trigger on `pull_request` directly.**
+> Triggering on `workflow_run` ensures that the job executes under default-branch
+> ref context (`refs/heads/main`), which is required to satisfy the companion
+> IAM role's branch-ref-only trust policy and prevent untrusted PR code from
+> assuming the role to access production secrets.
+
+**IAM and secret dependencies:** This workflow reuses this repo's existing
+`AWS_ACCOUNT_ID` secret to assume the shared `rh-argus-gate-2` IAM role via
+OIDC (`arn:aws:iam::<AWS_ACCOUNT_ID>:role/rh-argus-gate-2`), pinned directly
+in the workflow file (no separate `AWS_ROLE_ARN_ARGUS_GATE` secret is needed).
+The role and its branch-ref-only trust policy are provisioned via
+[redesignhealth/rh-data-platform#8896](https://github.com/redesignhealth/rh-data-platform/pull/8896).
+The role grants access to read the Argus review-storage API key from the
+`/general/prod/api-secret-key` SSM parameter (with KMS decryption). Until that
+role is applied, the workflow's AWS credential configuration step continues on
+error, the "Argus Auto-Approval Unavailable" comment above is posted on the
+PR, and PRs fall back to requiring a human review -- a safe, fail-closed
+default.
+
 ## Observability
 
 Structured JSON logs via `structlog` to stdout. Events follow the schema in
