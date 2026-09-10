@@ -426,10 +426,16 @@ docker compose up --build
 >   container's environment (or in SSM).
 > - On a real approve/auto-apply test, confirm `apply_error` is absent and the
 >   proposal transitions to `"applied"`, not silently remaining `"pending"`.
-> - Note (TECH-6153): `/reclaw-comms/{env}/github-login-to-linear-user-id-json` (and
->   its ECS task-definition env-var wiring) in `rh-data-platform`'s Terraform is
->   now orphaned following the removal of assignee identity verification and
->   should be cleaned up in a follow-up there.
+> - Note: `/reclaw-comms/{env}/github-login-to-linear-user-id-json` (and its ECS
+>   task-definition env-var wiring) in `rh-data-platform`'s Terraform is now
+>   orphaned following the removal of assignee identity verification (design
+>   decision record: TECH-6153) -- tracked for removal in **TECH-6155**. When
+>   removing it, the ECS task-definition wiring must go FIRST: (1) remove the
+>   SSM parameter reference from the task definition and deploy the updated
+>   revision, THEN (2) delete the SSM parameter itself. ECS resolves SSM
+>   parameter ARNs at task-launch time, so deleting the parameter before the
+>   task definition stops referencing it makes every subsequent task launch
+>   hard-fail with a parameter-resolution error.
 
 `entrypoint.sh` runs `alembic upgrade head` automatically on every container
 start, so migrations apply before the server accepts traffic.

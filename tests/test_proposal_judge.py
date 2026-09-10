@@ -1275,6 +1275,30 @@ class TestAssignTicket:
         assert status == "pending"
         mock_fetch_pr.assert_not_awaited()
 
+    async def test_non_canonical_but_valid_uuid_assignee_id_is_approved(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``uuid.UUID()`` accepts several non-canonical spellings of the
+        same UUID (braces, a ``urn:uuid:`` prefix, no dashes, mixed case)
+        -- the rule only checks that ``assignee_id`` is a syntactically
+        valid UUID, so a non-canonical spelling still approves. Normalizing
+        to canonical form for the actual Linear write happens downstream in
+        ``linear_client.apply_assign_ticket``, not here."""
+        monkeypatch.setattr(
+            github_client,
+            "fetch_pull_request",
+            AsyncMock(return_value={"user": {"login": "octocat"}, "title": "Fix TECH-1234"}),
+        )
+        action = {
+            "action_type": "assign_ticket",
+            "target_id": "TECH-1234",
+            "assignee_pr_url": "https://github.com/org/repo/pull/1",
+            "assignee_id": "{11111111-1111-1111-1111-111111111111}",
+        }
+        status, note = await evaluate_linear_progress_update_judge(action)
+        assert status == "approved"
+        assert note is not None
+
     async def test_slack_hosted_pr_shaped_url_stays_pending(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
