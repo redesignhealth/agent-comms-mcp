@@ -4719,6 +4719,83 @@ class TestRenameConversation:
         )
         assert renamed.name == "Renamed after completion"
 
+    async def test_rename_conversation_blank_name_rejected(self, session: AsyncSession) -> None:
+        owner, _target, conversation = await self._active_owner_and_conversation(
+            session, "ren-owner-11", "ren-target-11"
+        )
+        with pytest.raises(ValueError, match="name must be non-empty"):
+            await rename_conversation(
+                session,
+                actor_sub=owner.sub,
+                agent_id=owner.id,
+                conversation_id=conversation.id,
+                name="   ",
+            )
+
+    async def test_rename_conversation_name_with_control_character_rejected(
+        self, session: AsyncSession
+    ) -> None:
+        owner, _target, conversation = await self._active_owner_and_conversation(
+            session, "ren-owner-12", "ren-target-12"
+        )
+        with pytest.raises(ValueError, match="control characters"):
+            await rename_conversation(
+                session,
+                actor_sub=owner.sub,
+                agent_id=owner.id,
+                conversation_id=conversation.id,
+                name="bad\x00name",
+            )
+
+    async def test_rename_conversation_on_archived_conversation_succeeds(
+        self, session: AsyncSession
+    ) -> None:
+        """Pins the documented behavior: an archived conversation can
+        still be renamed (rename does not check conversation.state, and
+        archiving is orthogonal to it)."""
+        owner, _target, conversation = await self._active_owner_and_conversation(
+            session, "ren-owner-13", "ren-target-13"
+        )
+        await archive_conversation(
+            session, actor_sub=owner.sub, agent_id=owner.id, conversation_id=conversation.id
+        )
+        renamed = await rename_conversation(
+            session,
+            actor_sub=owner.sub,
+            agent_id=owner.id,
+            conversation_id=conversation.id,
+            name="Renamed after archive",
+        )
+        assert renamed.name == "Renamed after archive"
+
+    async def test_rename_conversation_audit_detail_records_stripped_name(
+        self, session: AsyncSession
+    ) -> None:
+        owner, _target, conversation = await self._active_owner_and_conversation(
+            session, "ren-owner-14", "ren-target-14"
+        )
+        await rename_conversation(
+            session,
+            actor_sub=owner.sub,
+            agent_id=owner.id,
+            conversation_id=conversation.id,
+            name="  My Conversation  ",
+        )
+        refreshed = await session.get(Conversation, conversation.id)
+        assert refreshed is not None
+        assert refreshed.name == "My Conversation"
+
+        row = (
+            await session.execute(
+                select(AuditLog).where(
+                    AuditLog.conversation_id == conversation.id,
+                    AuditLog.action == "conversation.rename",
+                )
+            )
+        ).scalar_one()
+        assert row.detail is not None
+        assert row.detail["name"] == "My Conversation"
+
 
 # --- get_conversation ----------------------------------------------------------
 

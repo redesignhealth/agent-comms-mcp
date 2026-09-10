@@ -1931,7 +1931,7 @@ async def rename_conversation(
         raise ToolError(f"invalid_request: {exc}") from None
 
     async with get_session_factory()() as session:
-        caller = await _resolve_caller_agent(session, sub)
+        caller = await _resolve_caller_agent(session, sub, token)
         async with _map_service_errors():
             conversation = await service.rename_conversation(
                 session,
@@ -1941,7 +1941,7 @@ async def rename_conversation(
                 name=name,
             )
 
-    return {"conversation_id": conversation_id, "name": conversation.name}
+    return {"conversation_id": str(conv_id), "name": conversation.name}
 
 
 @comms_server.tool

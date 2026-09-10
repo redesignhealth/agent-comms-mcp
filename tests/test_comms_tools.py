@@ -2168,6 +2168,37 @@ class TestRateLimitAndSchemaErrors:
                 },
             )
 
+    async def test_start_conversation_over_length_name_gives_actionable_error(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Same reasoning as the sibling expires_at-ceiling test above: a
+        too-long ``name`` must not fall through to the generic
+        ``_map_service_errors``-collapsed ``ValueError`` message."""
+        from schemas import MAX_CONVERSATION_NAME_LENGTH
+
+        await _register(main, test_session_factory, "name-len-owner")
+        await _register(main, test_session_factory, "name-len-target")
+        token_owner = _token("name-len-owner")
+
+        list_result = await _call(main, test_session_factory, token_owner, "comms_list_agents")
+        target_id = next(
+            a["agent_id"] for a in list_result["agents"] if a["sub"] == "name-len-target"
+        )
+
+        with pytest.raises(ToolError, match="exceeds"):
+            await _call(
+                main,
+                test_session_factory,
+                token_owner,
+                "comms_start_conversation",
+                {
+                    "conversation_type": "open",
+                    "target_agent_ids": [target_id],
+                    "initial_message": _availability_request(),
+                    "name": "x" * (MAX_CONVERSATION_NAME_LENGTH + 1),
+                },
+            )
+
     async def test_negative_since_seq_rejected(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
@@ -2425,37 +2456,6 @@ _fake_shared_owner_client_factory_instance: Any = None
 
 def _fake_shared_owner_client_factory() -> Any:
     return lambda session: _fake_shared_owner_client_factory_instance
-
-    async def test_start_conversation_over_length_name_gives_actionable_error(
-        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
-    ) -> None:
-        """Same reasoning as the sibling expires_at-ceiling test above: a
-        too-long ``name`` must not fall through to the generic
-        ``_map_service_errors``-collapsed ``ValueError`` message."""
-        from schemas import MAX_CONVERSATION_NAME_LENGTH
-
-        await _register(main, test_session_factory, "name-len-owner")
-        await _register(main, test_session_factory, "name-len-target")
-        token_owner = _token("name-len-owner")
-
-        list_result = await _call(main, test_session_factory, token_owner, "comms_list_agents")
-        target_id = next(
-            a["agent_id"] for a in list_result["agents"] if a["sub"] == "name-len-target"
-        )
-
-        with pytest.raises(ToolError, match="exceeds"):
-            await _call(
-                main,
-                test_session_factory,
-                token_owner,
-                "comms_start_conversation",
-                {
-                    "conversation_type": "open",
-                    "target_agent_ids": [target_id],
-                    "initial_message": _availability_request(),
-                    "name": "x" * (MAX_CONVERSATION_NAME_LENGTH + 1),
-                },
-            )
 
 
 # --- Membership mutation tools: invite / leave / decline_invite ---------------------
@@ -3406,6 +3406,46 @@ class TestConversationName:
         # Sanity: the owner token (comms:read + comms:write, _token's
         # default) is unaffected by the scope check above.
         assert token_owner.claims["scopes"] == ["comms:read", "comms:write"]
+
+    async def test_rename_conversation_over_length_name_gives_actionable_error(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Mirrors ``test_start_conversation_over_length_name_gives_actionable_error``:
+        a too-long ``name`` on rename must not fall through to the generic
+        ``_map_service_errors``-collapsed ``ValueError`` message."""
+        from schemas import MAX_CONVERSATION_NAME_LENGTH
+
+        await _register(main, test_session_factory, "rename-len-owner")
+        await _register(main, test_session_factory, "rename-len-target")
+        token_owner = _token("rename-len-owner")
+
+        list_result = await _call(main, test_session_factory, token_owner, "comms_list_agents")
+        target_id = next(
+            a["agent_id"] for a in list_result["agents"] if a["sub"] == "rename-len-target"
+        )
+        started = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [target_id],
+                "initial_message": _availability_request(),
+            },
+        )
+
+        with pytest.raises(ToolError, match="exceeds"):
+            await _call(
+                main,
+                test_session_factory,
+                token_owner,
+                "comms_rename_conversation",
+                {
+                    "conversation_id": started["conversation_id"],
+                    "name": "x" * (MAX_CONVERSATION_NAME_LENGTH + 1),
+                },
+            )
 
     async def test_inbox_surfaces_conversation_name(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]

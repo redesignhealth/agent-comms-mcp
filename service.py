@@ -3395,6 +3395,7 @@ async def start_conversation(
                 "type": conversation_type,
                 "target_agent_ids": [str(t) for t in target_ids],
                 "owner_snapshot": owner_snapshot,
+                "name": name,
             },
         )
         result = await _divert_high_risk_message(
@@ -4197,7 +4198,8 @@ async def rename_conversation(
             conversation_id=conversation.id,
         )
     validated = validate_conversation_name(name)
-    assert validated is not None  # name is required here, unlike start_conversation's optional
+    if validated is None:
+        raise ValueError("name must not be None")
     previous = conversation.name
     conversation.name = validated
     _audit(

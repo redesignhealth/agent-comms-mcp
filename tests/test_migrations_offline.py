@@ -50,7 +50,7 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
     assert "DROP TABLE IF EXISTS public.tasks" in result.stdout
     assert "ALTER TABLE public.audit_log DROP COLUMN IF EXISTS task_id" in result.stdout
     # conversations.name column (TECH-6120)
-    assert "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS name" in result.stdout
+    assert "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS name VARCHAR(120)" in result.stdout
     # pre-flight guard against dropping non-empty tasks rows
     assert "tasks table is not empty" in result.stdout
     # upgrade()'s index drops are schema-qualified
