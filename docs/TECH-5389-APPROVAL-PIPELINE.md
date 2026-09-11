@@ -68,6 +68,9 @@ seams like `OwnershipClient`, no plugin frameworks):
   fail-fast `database_url()` call), never lazily on the first post.
 - Env vars + defaults (**confirmed**): `RISK_SCORER=boundary_v1`,
   `AUTO_APPROVER=escalate_all`, `APPROVAL_NOTIFIER=log_only`.
+- `AUTO_APPROVER` runs in-process because it performs judgment only (it may use read-only
+  lookups, but never an external write); see [`docs/DESIGN.md`](DESIGN.md)'s judgment-vs-action
+  boundary.
 - **Injection follows the `ownership_client` precedent**: `providers/comms.py` resolves
   the configured singletons and passes them as parameters into
   `service.post_message(...)` / `service.start_conversation(...)` (service stays
