@@ -2073,6 +2073,101 @@ async def archive_conversation(
     }
 
 
+@comms_server.tool
+async def extend_conversation(
+    conversation_id: str,
+    expires_at: str | None = None,
+    extend_by_days: int | None = None,
+    agent_key: str | None = None,
+) -> dict[str, Any]:
+    """Extend conversation expiry (TECH-6195): updates ``expires_at``.
+
+    Any CURRENTLY ``active`` participant may extend the conversation --
+    not just its ``owner`` role or original ``created_by`` agent. Requires
+    the caller to currently be ``active`` on this conversation (uniform
+    ``access_denied`` otherwise, identical whether the caller was never a
+    participant, is still ``invited``, or has ``left``/``declined``).
+
+    Parameters:
+    - ``conversation_id``: UUID string of the conversation to extend.
+    - ``expires_at``: absolute ISO 8601 timezone-aware datetime string.
+    - ``extend_by_days``: relative extension in days (1..90), relative to
+      ``max(current expires_at, now())``.
+    - ``agent_key``: optional key when running multiple agents under one token.
+
+    Exactly one of ``expires_at`` or ``extend_by_days`` must be provided.
+
+    Rules & behavior:
+    - Extend-only: cannot shorten expiry (``new_expires_at <= current expires_at``
+      is rejected). New expiry must also be strictly in the future (``new_expires_at > now()``).
+    - Ceiling: bounded by the rolling 90-day ``MAX_CONVERSATION_TTL`` ceiling
+      (``new_expires_at - now() <= 90 days``).
+    - Resurrection: an ``expired`` conversation (or an ``active`` one past
+      its deadline) is extended and resurrected back to ``active`` state,
+      making it postable again.
+    - Rejections: ``completed`` and ``canceled`` conversations are rejected with
+      ``invalid_conversation_state``. Archived conversations are rejected with
+      ``conversation_archived``.
+    - Non-idempotent: unlike ``comms_archive_conversation`` (which is idempotent),
+      repeating a call with an unchanged expiry fails the shortening check.
+    """
+    token = _require_token()
+    base_sub = _require_identity(token)
+    agent_key = _validate_agent_key(agent_key)
+    sub = _compose_sub(base_sub, agent_key)
+    conv_id = _parse_uuid("conversation_id", conversation_id)
+
+    if (expires_at is None and extend_by_days is None) or (
+        expires_at is not None and extend_by_days is not None
+    ):
+        raise ToolError("invalid_request: provide exactly one of expires_at or extend_by_days")
+
+    if extend_by_days is not None and (
+        isinstance(extend_by_days, bool)
+        or not isinstance(extend_by_days, int)
+        or not (1 <= extend_by_days <= 90)
+    ):
+        raise ToolError("invalid_request: extend_by_days must be between 1 and 90")
+
+    expires_dt = None
+    if expires_at is not None:
+        expires_dt = _parse_expires_at(expires_at)
+        assert expires_dt is not None
+        if expires_dt <= datetime.now(UTC):
+            raise ToolError("invalid_request: expires_at must be in the future")
+        if expires_dt - datetime.now(UTC) > service.MAX_CONVERSATION_TTL:
+            raise ToolError(
+                "invalid_request: expires_at may not be more than "
+                f"{service.MAX_CONVERSATION_TTL} from now"
+            )
+
+    async with get_session_factory()() as session:
+        caller = await _resolve_caller_agent(session, sub, token)
+        async with _map_service_errors():
+            try:
+                conversation = await service.extend_conversation(
+                    session,
+                    actor_sub=sub,
+                    agent_id=caller.id,
+                    conversation_id=conv_id,
+                    expires_at=expires_dt,
+                    extend_by_days=extend_by_days,
+                )
+            except ValueError as exc:
+                raise ToolError(f"invalid_request: {exc}") from None
+        active_ids = await _get_active_participant_agent_ids_or_empty(session, conv_id)
+
+    await subscriptions.notify_conversation_event(conv_id, active_agent_ids=active_ids)
+    return {
+        "conversation_id": conversation_id,
+        "agent_id": str(caller.id),
+        "expires_at": _iso(conversation.expires_at),
+        "previous_expires_at": _iso(getattr(conversation, "previous_expires_at", None)),
+        "state": conversation.state,
+        "resurrected": getattr(conversation, "resurrected", False),
+    }
+
+
 # --- Resources (reads-only mirror of a subset of the tools above) -----------------
 #
 # Phase A (TECH-5903): plain reads, no subscribe/unsubscribe. Every resource

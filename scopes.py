@@ -130,6 +130,10 @@ TOOL_SCOPES: dict[str, str] = {
     # damage. Revisit if a rate limit consistent with the other mutating
     # tools' pattern is ever added.
     "comms_archive_conversation": "comms:write",
+    # TECH-6195: extending expiry is a mutating, symmetric-permission
+    # action mirroring comms_archive_conversation -- any active member may
+    # trigger it, so it uses the baseline comms:write scope.
+    "comms_extend_conversation": "comms:write",
     # --- proposals (provider: providers/proposals.py, namespace="proposals",
     # TECH-6018 follow-up) ---
     # All five reuse the SAME PROPOSAL_SUBMIT_SCOPE (defined above this

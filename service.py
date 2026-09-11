@@ -1391,6 +1391,17 @@ def may_rename(participant_status: str) -> bool:
     return participant_status == "active"
 
 
+def may_extend(participant_status: str) -> bool:
+    """v1 extend policy: any ACTIVE member may extend conversation expiry.
+
+    Deliberately a plain predicate over just the participant's status
+    (not the whole ``Participant``/``Conversation`` objects) so it stays
+    trivial to unit-test and to tighten later (e.g. owner-only extends)
+    as a policy change, not a migration — mirroring ``may_invite``.
+    """
+    return participant_status == "active"
+
+
 # --- Serialization helpers ------------------------------------------------------
 
 
@@ -4263,6 +4274,139 @@ async def rename_conversation(
         conversation_id=conversation.id,
         detail={"name": validated, "previous": previous},
     )
+    await session.commit()
+    return conversation
+
+
+async def extend_conversation(
+    session: AsyncSession,
+    *,
+    actor_sub: str,
+    agent_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    new_expires_at: datetime | None = None,
+    expires_at: datetime | None = None,
+    extend_by_days: int | None = None,
+) -> Conversation:
+    """Extend conversation expiry (TECH-6195): updates ``expires_at``, a
+    whole-conversation, symmetric-permission action mirroring
+    ``archive_conversation``.
+
+    Any CURRENTLY ``active`` participant may extend the conversation, not
+    just its ``owner`` role or its ``created_by`` agent (see ``may_extend``).
+    Requires ``required_status="active"``: an ``invited``-but-not-yet-accepted,
+    ``left``, or ``declined`` participant (or a non-participant) gets the
+    uniform ``AccessDeniedError``, exactly as any other write against this
+    conversation would.
+
+    Extend-only: cannot shorten expiry (``new_expires_at <= conversation.expires_at``
+    is rejected with ValueError). Must be strictly in the future (``new_expires_at > now()``)
+    and bounded by the rolling 90-day ceiling (``new_expires_at - now() <= MAX_CONVERSATION_TTL``).
+
+    Resurrection: extending an ``expired`` conversation (or an ``active`` one
+    past its deadline, which lazily flips to ``expired`` on access) resurrects
+    its state back to ``"active"`` and makes it postable again.
+    Extending a ``completed`` or ``canceled`` conversation is rejected with
+    ``InvalidConversationStateError``.
+    Extending an archived conversation (``archived_at is not None``) is rejected
+    with ``ConversationArchivedError`` (audited as ``denied.archived.extend``).
+
+    Non-idempotent: unlike ``archive_conversation`` (which is idempotent --
+    a repeat call on an already-archived conversation is a silent no-op),
+    ``extend_conversation`` is parameterized, and a repeat call with an
+    unchanged ``expires_at`` correctly fails the "reject shortening/same value"
+    check.
+    """
+    target_expires_at = new_expires_at if new_expires_at is not None else expires_at
+    if (target_expires_at is None and extend_by_days is None) or (
+        target_expires_at is not None and extend_by_days is not None
+    ):
+        raise ValueError("provide exactly one of expires_at or extend_by_days")
+
+    if extend_by_days is not None and (
+        isinstance(extend_by_days, bool)
+        or not isinstance(extend_by_days, int)
+        or not (1 <= extend_by_days <= 90)
+    ):
+        raise ValueError("extend_by_days must be an integer between 1 and 90")
+
+    if target_expires_at is not None and target_expires_at.tzinfo is None:
+        raise ValueError("expires_at must be timezone-aware")
+
+    conversation, participant = await _load_participant_for_transition(
+        session,
+        actor_sub=actor_sub,
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+        required_status="active",
+        for_update=True,
+    )
+    if not may_extend(participant.status):  # pragma: no cover — v1 always True here
+        await _deny(
+            session,
+            actor_sub=actor_sub,
+            action="denied.extend_not_allowed",
+            agent_id=agent_id,
+            conversation_id=conversation.id,
+        )
+
+    if conversation.archived_at is not None:
+        await _deny_archived(
+            session,
+            actor_sub=actor_sub,
+            agent_id=agent_id,
+            conversation_id=conversation.id,
+            action="denied.archived.extend",
+        )
+
+    if conversation.state in ("completed", "canceled"):
+        await _deny_bad_state(
+            session,
+            actor_sub=actor_sub,
+            agent_id=agent_id,
+            conversation_id=conversation.id,
+            current_state=conversation.state,
+            message_type="extend",
+        )
+
+    now = _now()
+    if extend_by_days is not None:
+        base_dt = max(conversation.expires_at, now)
+        computed_new_expires_at = base_dt + timedelta(days=extend_by_days)
+    else:
+        assert target_expires_at is not None
+        computed_new_expires_at = target_expires_at
+
+    if computed_new_expires_at <= now:
+        raise ValueError("new expires_at must be in the future")
+    if computed_new_expires_at <= conversation.expires_at:
+        raise ValueError("new expires_at must be greater than current expires_at")
+    if computed_new_expires_at - now > MAX_CONVERSATION_TTL:
+        raise ValueError(f"expires_at may not be more than {MAX_CONVERSATION_TTL} from now")
+
+    previous_expires_at = conversation.expires_at
+    previous_state = conversation.state
+    resurrected = previous_state == "expired"
+
+    if resurrected:
+        conversation.state = "active"
+    conversation.expires_at = computed_new_expires_at
+
+    _audit(
+        session,
+        actor_sub=actor_sub,
+        action="conversation.extend",
+        agent_id=agent_id,
+        conversation_id=conversation.id,
+        detail={
+            "previous_expires_at": _iso(previous_expires_at),
+            "new_expires_at": _iso(computed_new_expires_at),
+            "previous_state": previous_state,
+            "resurrected": resurrected,
+        },
+    )
+    conversation.previous_expires_at = previous_expires_at  # type: ignore[attr-defined]
+    conversation.resurrected = resurrected  # type: ignore[attr-defined]
     await session.commit()
     return conversation
 
@@ -9387,6 +9531,7 @@ __all__ = [
     "decline_invite",
     "deny_resource_subscribe",
     "deregister_agent",
+    "extend_conversation",
     "get_active_participant_agent_ids",
     "get_agent_by_sub",
     "get_conversation",
@@ -9404,6 +9549,7 @@ __all__ = [
     "list_proposals_for_bot",
     "lookup_agent_by_email",
     "may_assign",
+    "may_extend",
     "may_invite",
     "may_rename",
     "post_message",

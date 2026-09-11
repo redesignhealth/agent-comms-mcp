@@ -3520,6 +3520,274 @@ class TestConversationName:
         assert result["pending_invites"][0]["name"] == "Pending in inbox"
 
 
+class TestExtendConversation:
+    """TECH-6195: ``comms_extend_conversation`` end-to-end coverage through
+    the real mounted tool stack."""
+
+    async def _start_open_conversation(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        *,
+        owner_sub: str,
+        member_sub: str,
+        expires_at: str | None = None,
+    ) -> tuple[str, dict[str, str]]:
+        await _register(main, test_session_factory, owner_sub)
+        await _register(main, test_session_factory, member_sub)
+        token_owner = _token(owner_sub)
+        list_result = await _call(main, test_session_factory, token_owner, "comms_list_agents")
+        ids = {a["sub"]: a["agent_id"] for a in list_result["agents"]}
+        payload: dict[str, Any] = {
+            "conversation_type": "open",
+            "target_agent_ids": [ids[member_sub]],
+            "initial_message": _availability_request(),
+        }
+        if expires_at is not None:
+            payload["expires_at"] = expires_at
+        started = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_start_conversation",
+            payload,
+        )
+        return started["conversation_id"], ids
+
+    async def test_active_participant_can_extend(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        conversation_id, ids = await self._start_open_conversation(
+            main,
+            test_session_factory,
+            owner_sub="ext-tool-owner-1",
+            member_sub="ext-tool-member-1",
+        )
+        token_member = _token("ext-tool-member-1")
+        await _call(
+            main,
+            test_session_factory,
+            token_member,
+            "comms_accept",
+            {"conversation_id": conversation_id},
+        )
+
+        # Member extends by 10 days
+        result = await _call(
+            main,
+            test_session_factory,
+            token_member,
+            "comms_extend_conversation",
+            {"conversation_id": conversation_id, "extend_by_days": 10},
+        )
+        assert result["conversation_id"] == conversation_id
+        assert result["agent_id"] == ids["ext-tool-member-1"]
+        assert result["state"] == "active"
+        assert result["resurrected"] is False
+        assert result["previous_expires_at"] is not None
+        assert result["expires_at"] is not None
+
+    async def test_extend_with_absolute_expires_at(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        conversation_id, ids = await self._start_open_conversation(
+            main,
+            test_session_factory,
+            owner_sub="ext-tool-owner-2",
+            member_sub="ext-tool-member-2",
+        )
+        token_owner = _token("ext-tool-owner-2")
+        new_dt = datetime.now(UTC) + timedelta(days=20)
+        result = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_extend_conversation",
+            {"conversation_id": conversation_id, "expires_at": new_dt.isoformat()},
+        )
+        assert result["conversation_id"] == conversation_id
+        assert result["agent_id"] == ids["ext-tool-owner-2"]
+        assert result["state"] == "active"
+        assert result["resurrected"] is False
+
+    async def test_parameter_validation_errors(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        conversation_id, _ids = await self._start_open_conversation(
+            main,
+            test_session_factory,
+            owner_sub="ext-tool-owner-3",
+            member_sub="ext-tool-member-3",
+        )
+        token_owner = _token("ext-tool-owner-3")
+
+        # Both provided
+        with pytest.raises(
+            ToolError, match="invalid_request: provide exactly one of expires_at or extend_by_days"
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                token_owner,
+                "comms_extend_conversation",
+                {
+                    "conversation_id": conversation_id,
+                    "expires_at": (datetime.now(UTC) + timedelta(days=20)).isoformat(),
+                    "extend_by_days": 10,
+                },
+            )
+
+        # Neither provided
+        with pytest.raises(
+            ToolError, match="invalid_request: provide exactly one of expires_at or extend_by_days"
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                token_owner,
+                "comms_extend_conversation",
+                {"conversation_id": conversation_id},
+            )
+
+        # extend_by_days out of bounds
+        with pytest.raises(
+            ToolError, match="invalid_request: extend_by_days must be between 1 and 90"
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                token_owner,
+                "comms_extend_conversation",
+                {"conversation_id": conversation_id, "extend_by_days": 0},
+            )
+
+        with pytest.raises(
+            ToolError, match="invalid_request: extend_by_days must be between 1 and 90"
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                token_owner,
+                "comms_extend_conversation",
+                {"conversation_id": conversation_id, "extend_by_days": 95},
+            )
+
+        # expires_at in past
+        with pytest.raises(ToolError, match="invalid_request: expires_at must be in the future"):
+            await _call(
+                main,
+                test_session_factory,
+                token_owner,
+                "comms_extend_conversation",
+                {
+                    "conversation_id": conversation_id,
+                    "expires_at": (datetime.now(UTC) - timedelta(days=1)).isoformat(),
+                },
+            )
+
+        # expires_at beyond 90 days
+        with pytest.raises(ToolError, match="invalid_request: expires_at may not be more than"):
+            await _call(
+                main,
+                test_session_factory,
+                token_owner,
+                "comms_extend_conversation",
+                {
+                    "conversation_id": conversation_id,
+                    "expires_at": (datetime.now(UTC) + timedelta(days=95)).isoformat(),
+                },
+            )
+
+        # Shortening
+        with pytest.raises(
+            ToolError,
+            match="invalid_request: new expires_at must be greater than current expires_at",
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                token_owner,
+                "comms_extend_conversation",
+                {
+                    "conversation_id": conversation_id,
+                    "expires_at": (datetime.now(UTC) + timedelta(days=1)).isoformat(),
+                },
+            )
+
+    async def test_read_only_token_denied(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        conversation_id, _ids = await self._start_open_conversation(
+            main,
+            test_session_factory,
+            owner_sub="ext-tool-owner-4",
+            member_sub="ext-tool-member-4",
+        )
+        token_ro = _token("ext-tool-owner-4", scopes=["comms:read"])
+        with pytest.raises(ToolError, match="requires elevated permissions"):
+            await _call(
+                main,
+                test_session_factory,
+                token_ro,
+                "comms_extend_conversation",
+                {"conversation_id": conversation_id, "extend_by_days": 10},
+            )
+
+    async def test_expired_conversation_resurrected_and_reappears_in_default_list_conversations(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        past_iso = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
+        conversation_id, _ids = await self._start_open_conversation(
+            main,
+            test_session_factory,
+            owner_sub="ext-tool-owner-5",
+            member_sub="ext-tool-member-5",
+            expires_at=past_iso,
+        )
+        token_owner = _token("ext-tool-owner-5")
+
+        # In default comms_list_conversations, expired conversations are excluded
+        listing_before = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_list_conversations",
+            {},
+        )
+        found_before = any(
+            c["conversation_id"] == conversation_id for c in listing_before["conversations"]
+        )
+        assert not found_before
+
+        # Extend and resurrect
+        extended = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_extend_conversation",
+            {"conversation_id": conversation_id, "extend_by_days": 7},
+        )
+        assert extended["state"] == "active"
+        assert extended["resurrected"] is True
+
+        # Now in default comms_list_conversations, the conversation reappears!
+        listing_after = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_list_conversations",
+            {},
+        )
+        found_after = any(
+            c["conversation_id"] == conversation_id for c in listing_after["conversations"]
+        )
+        assert found_after
+        matching = next(
+            c for c in listing_after["conversations"] if c["conversation_id"] == conversation_id
+        )
+        assert matching["state"] == "active"
+
+
 class TestTaskLifecycleToolLayer:
     """End-to-end coverage for tasks-as-conversations: task_assign opens a
     conversation, task_report/task_complete/task_decline/task_cancel drive

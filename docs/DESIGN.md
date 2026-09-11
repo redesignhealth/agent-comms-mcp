@@ -673,20 +673,52 @@ Design notes:
  with its own authorization gate, if a real need for one arises.
 
 - `conversations.name` (TECH-6120) is an optional human-readable label, settable at
- `comms_start_conversation` time and renameable afterward via
- `comms_rename_conversation` (see §4). Nullable with **no synthesized
- default**: an omitted name stays `NULL` rather than being derived from the
- participant set, which would go stale the moment `comms_invite`/`comms_leave`
- changes membership. `_conversation_dict` (the shared projection behind
- `comms_get_conversation`, `comms_list_conversations`, and both halves of
- `comms_inbox`) always emits the `"name"` key, `null` when unset -- never
- omits it. Capped at 120 characters (`schemas.MAX_CONVERSATION_NAME_LENGTH`,
- deliberately tighter than `MAX_DISPLAY_NAME_LENGTH`) and validated by the
- single shared `service.validate_conversation_name` (stripped, non-empty,
- no ASCII control characters) -- called from both the tool layer and
- `start_conversation`/`rename_conversation` themselves, so tightening the
- rule in one place tightens it everywhere. This is a new free-text field;
- see §8 invariant 3 for the carve-out it required.
+  `comms_start_conversation` time and renameable afterward via
+  `comms_rename_conversation` (see §4). Nullable with **no synthesized
+  default**: an omitted name stays `NULL` rather than being derived from the
+  participant set, which would go stale the moment `comms_invite`/`comms_leave`
+  changes membership. `_conversation_dict` (the shared projection behind
+  `comms_get_conversation`, `comms_list_conversations`, and both halves of
+  `comms_inbox`) always emits the `"name"` key, `null` when unset -- never
+  omits it. Capped at 120 characters (`schemas.MAX_CONVERSATION_NAME_LENGTH`,
+  deliberately tighter than `MAX_DISPLAY_NAME_LENGTH`) and validated by the
+  single shared `service.validate_conversation_name` (stripped, non-empty,
+  no ASCII control characters) -- called from both the tool layer and
+  `start_conversation`/`rename_conversation` themselves, so tightening the
+  rule in one place tightens it everywhere. This is a new free-text field;
+  see §8 invariant 3 for the carve-out it required.
+
+- **Extending a conversation (`comms_extend_conversation`, TECH-6195)**: updates
+  `conversations.expires_at`, a whole-conversation action symmetric across
+  every CURRENTLY `active` participant (`may_extend`), mirroring
+  `comms_archive_conversation`. Gated to active participants only;
+  non-participants, `invited`, and `left`/`declined` participants receive the
+  uniform `AccessDeniedError`. Key rules and behaviors:
+  - **Extend-only with rolling 90-day ceiling**: new expiry must satisfy
+    `new_expires_at - now() <= MAX_CONVERSATION_TTL` (90 days, reusing the
+    creation ceiling constant).
+  - **No shortening**: rejects with an `invalid_request`-style error when
+    `new_expires_at <= conversation.expires_at`. Also requires
+    `new_expires_at > now()`.
+  - **Parameterized**: accepts either an absolute ISO 8601 timezone-aware
+    `expires_at` or relative `extend_by_days` (1..90), where `extend_by_days` is
+    computed relative to `max(current expires_at, now())` (so extending a
+    lapsed conversation by N days means N days from now, not from the stale past
+    deadline). Exactly one must be provided.
+  - **Resurrection**: extending an `expired` conversation (or an `active` one
+    past its deadline, which lazily flips to `expired` on touch) extends its expiry
+    AND resurrects `state` back to `"active"`, making it postable again and
+    causing it to reappear in default `comms_list_conversations` listings.
+  - **Rejections**: extending a `completed` or `canceled` conversation is
+    rejected with `InvalidConversationStateError`. Extending an archived
+    conversation (`archived_at IS NOT NULL`) is rejected with
+    `ConversationArchivedError` (`denied.archived.extend`).
+  - **Non-idempotent**: unlike `comms_archive_conversation`, repeating an extend
+    with an unchanged `expires_at` fails the "reject shortening/same value" check.
+  - **Audit**: logged under `conversation.extend` with `previous_expires_at`,
+    `new_expires_at`, `previous_state`, and `resurrected: bool`. If resurrecting
+    an `active`-but-past-deadline conversation, lazy expiry emits a
+    `conversation.expire` audit row immediately followed by `conversation.extend`.
 
 - **On-behalf-of registration (`comms_admin_register`)**: `comms_register` always
  derives `sub` from the CALLING token's own verified identity (§4's "owner
@@ -858,6 +890,7 @@ scroll-to-load-more use case.
 | `comms_leave` | comms:write | leave: covers already-active members |
 | `comms_rename_conversation` | comms:write | set/replace `conversations.name` (required, max 120 chars; TECH-6120); any `active` participant may call it, not just the owner (same status-gated posture as `comms_invite`, see §4); does not require the conversation itself to still be `active`, and is unaffected by `archived_at` (an archived conversation can still be renamed); audited as `conversation.rename` with the previous value |
 | `comms_archive_conversation` | comms:write | archive a conversation (TECH-5887): sets `archived_at`, permanently. Any CURRENT `active` participant may trigger it (symmetric across the whole conversation, not gated to owner/creator) -- distinct from `comms_leave`, which only ever changes the CALLER's own participant row. Once archived: `comms_invite`/`comms_post_message`/`comms_accept` all reject with the specific `conversation_archived` error (not the uniform denial); also blocks approving a pending hold via the HTTP approval endpoint's `decide_hold` (the hold stays `pending_human`, a human can still reject it) -- the only one of the four blocked surfaces that isn't an MCP tool. Archiving never hides history or per-conversation access (`comms_get_conversation`/`comms_inbox`, and `comms_get_hold_status`) -- archiving is not a delete or a redaction, every past message stays fully readable. It does remove the conversation from the default `comms_list_conversations` browse listing, recoverable via `include_archived=true`. Idempotent (re-archiving is a silent no-op, `archived_at` unchanged); one-directional -- no unarchive tool |
+| `comms_extend_conversation` | comms:write | extend conversation expiry (`expires_at`) by an absolute datetime or relative days (`extend_by_days`, 1..90), rolling up to the 90-day `MAX_CONVERSATION_TTL` ceiling from now; any CURRENT `active` participant may trigger it; cannot shorten expiry; resurrects `expired` conversations back to `active`; rejects `completed`, `canceled`, or `archived` conversations; not idempotent |
 
 ### MCP resource surface (TECH-5903 Phase A)
 
@@ -971,6 +1004,7 @@ the request, mirroring `service._fire_approval_notifier`'s posture):
 | `main.decide_approval` (approve, message hold) | Yes (active participants) | every active participant |
 | `main.decide_approval` (approve, invite hold) | Yes (active participants, pre-existing — the newly-admitted target isn't active yet) | only the newly-invited target |
 | `comms_archive_conversation` | Yes (active participants) | none |
+| `comms_extend_conversation` | Yes (active participants) | none |
 
 A held-for-approval outcome (post_message/invite) fires no notification —
 nothing visible changed yet. `comms_start_conversation`'s held branch is
@@ -2090,9 +2124,13 @@ All three are overridable via the `expires_at` parameter at conversation creatio
 up to a `MAX_CONVERSATION_TTL` ceiling of ninety days from the time the request is
 validated (TECH-5377; not from creation time -- several `await`s, admission checks
 and rate-limit queries, separate validation from the actual DB insert, so the check
-runs against an earlier timestamp than the row's own `created_at`). There is
-deliberately no floor: an already-past `expires_at` is valid test tooling for
-constructing pre-expired conversations without sleeping.
+runs against an earlier timestamp than the row's own `created_at`). The same 90-day
+ceiling (`MAX_CONVERSATION_TTL`) bounds extension via `comms_extend_conversation`
+(TECH-6195), rolling from the time of the extend call rather than from original
+creation. There is deliberately no floor at creation: an already-past `expires_at`
+is valid test tooling for constructing pre-expired conversations without sleeping
+(though `comms_extend_conversation` strictly enforces that new expiry must be in the
+future and cannot shorten current expiry).
 A completed or canceled conversation's `expires_at` is not retroactively cleared:
 it simply becomes irrelevant once the conversation is terminal. See "Known gap:
 no retention/archival policy" below -- this ceiling bounds how far `expires_at`
