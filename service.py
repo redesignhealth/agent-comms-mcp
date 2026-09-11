@@ -352,6 +352,26 @@ MAX_MESSAGES_PER_GET_CONVERSATION = 500
 MAX_UNREAD_CONVERSATIONS_PER_INBOX = 100
 MAX_PENDING_INVITES_PER_INBOX = 100
 
+# TECH-6197: a "fresh" ``get_conversation`` call -- both ``since`` and
+# ``since_seq`` omitted -- previously returned the entire message history
+# from the beginning. It now defaults to only the last
+# GET_CONVERSATION_DEFAULT_LOOKBACK_HOURS of history (plus an anchor-
+# triggered context band, see GET_CONVERSATION_DEFAULT_CONTEXT_HOURS below
+# and get_conversation's docstring for the exact rule). This default is
+# applied ONLY when the caller omits BOTH params -- an explicit `since_seq`
+# continuation call with no `since` gets no timestamp bound at all (today's
+# behavior, unchanged), and an explicit `since` (e.g. the epoch) is the
+# documented escape hatch back to true full history.
+GET_CONVERSATION_DEFAULT_LOOKBACK_HOURS = 72
+# Default width, in hours, of the anchor-triggered "context" band pulled in
+# immediately before the resolved `since` timestamp -- included only when
+# at least one message actually falls at/after `since` (the "anchor").
+GET_CONVERSATION_DEFAULT_CONTEXT_HOURS = 24
+# Upper bound on a caller-supplied `context_hours` -- same rationale as
+# MAX_CONVERSATION_TTL: without a ceiling, a caller could turn what's meant
+# to be a small "recent context" pull into an unbounded historical scan.
+GET_CONVERSATION_MAX_CONTEXT_HOURS = 168  # 7 days
+
 # Approval-holds pipeline (TECH-5389 PR2). TTL/rate-limit values confirmed
 # in the plan doc §5. The rate limit is counted from approval_holds.created_at
 # per sender -- same table-count pattern as every other rate limit in this
@@ -8625,7 +8645,9 @@ async def get_conversation(
     actor_sub: str,
     caller_agent_id: uuid.UUID,
     conversation_id: uuid.UUID,
-    since_seq: int = 0,
+    since_seq: int | None = None,
+    since: datetime | None = None,
+    context_hours: int = GET_CONVERSATION_DEFAULT_CONTEXT_HOURS,
     mark_read: bool = True,
 ) -> dict[str, Any]:
     """Combined read: conversation + participants + messages since ``since_seq``.
@@ -8668,7 +8690,64 @@ async def get_conversation(
     participant, or who previously left/declined, gets the uniform
     ``AccessDeniedError`` — identical to a non-existent conversation
     (DESIGN.md §4/§8).
+
+    **TECH-6197 -- ``since``/``context_hours`` (time-window default)**:
+    ``since_seq`` alone is a *cursor* (an opaque "I've already seen up to
+    here" continuation token); ``since``/``context_hours`` are a
+    *timestamp* filter, layered underneath as an orthogonal AND'd bound
+    on ``Message.created_at``. Distinguishing "omitted" from "explicitly
+    0" for ``since_seq`` is why its default changed from ``0`` to
+    ``None`` -- resolution:
+
+    - Caller passes ``since`` (must be timezone-aware, else ``ValueError``):
+      used directly as the timestamp lower bound. An also-explicit
+      ``since_seq`` still applies too (AND'd), exactly as before.
+    - Caller omits ``since`` but explicitly passes ``since_seq``
+      (including ``since_seq=0``): NO timestamp bound is applied at all --
+      this is the existing "continuation" pagination path and behaves
+      identically to pre-TECH-6197 code (full history from that seq
+      onward, no context-window concept in play).
+    - Caller omits BOTH: a new default timestamp bound is applied
+      automatically, ``since = now() - GET_CONVERSATION_DEFAULT_LOOKBACK_HOURS``
+      (72h) -- this is the new default behavior for a plain, argument-free
+      call. ``since_was_defaulted`` in the response distinguishes this
+      case from an explicit ``since``. To get true full history on a
+      fresh call, pass an explicitly old ``since`` (e.g. the epoch).
+
+    **Anchor-triggered context window**: context is suppressed whenever
+    ``since_seq`` is explicitly provided by the caller, even when ``since``
+    is ALSO explicitly provided -- explicit ``since_seq`` (any value,
+    including ``0``) is the sole signal that this is a continuation/
+    pagination call, and no context band is ever pulled on that path.
+    Context only applies when ``since_seq`` is entirely omitted (whether
+    ``since`` is explicit or defaulted). Whenever a timestamp bound is in
+    effect (explicit ``since`` OR the 72h default) AND ``since_seq`` was
+    omitted, the "in-window" set is ``created_at >= since``. If the
+    in-window set is non-empty, messages with
+    ``since - context_hours <= created_at < since`` are ADDITIONALLY
+    included and flagged ``"context": true`` (in-window messages carry no
+    ``"context"`` key at all). If the in-window set is EMPTY, no context
+    band is pulled and no messages are returned -- an anchor is required
+    to trigger the context pull. Worked example with the 72h/24h
+    defaults: messages at 70h-ago and 74h-ago -- BOTH returned (70h-ago is
+    in-window; 74h-ago falls in the `[72h, 96h)` context band anchored off
+    it), 74h-ago flagged ``"context": true``. Messages at 74h-ago and
+    76h-ago -- NEITHER returned (nothing is in-window to anchor a context
+    pull off of). ``context_hours=0`` means no context is ever pulled;
+    must be ``>= 0`` and ``<= GET_CONVERSATION_MAX_CONTEXT_HOURS``, else
+    ``ValueError``. The context band is itself capped at
+    ``MAX_MESSAGES_PER_GET_CONVERSATION`` (keeping the messages closest to
+    ``since`` on truncation) but does not participate in ``has_more``/
+    ``page_max_seq`` -- those reflect the in-window page only, exactly as
+    before; context messages are purely additive background.
     """
+    if since is not None and since.tzinfo is None:
+        raise ValueError("since must be timezone-aware")
+    if context_hours < 0:
+        raise ValueError("context_hours must be >= 0")
+    if context_hours > GET_CONVERSATION_MAX_CONTEXT_HOURS:
+        raise ValueError(f"context_hours may not exceed {GET_CONVERSATION_MAX_CONTEXT_HOURS}")
+
     conversation, participant = await _load_participant_for_read(
         session,
         actor_sub=actor_sub,
@@ -8707,17 +8786,43 @@ async def get_conversation(
             "invited_by": str(participant.invited_by) if participant.invited_by else None,
         }
 
+    # TECH-6197: `since_seq=None` (omitted) vs an explicit int (including 0)
+    # must be distinguishable -- see the docstring's resolution rules above.
+    # `resolved_since_seq` is the concrete int the seq-based query/paging
+    # logic below needs either way.
+    since_seq_explicit = since_seq is not None
+    resolved_since_seq = since_seq if since_seq is not None else 0
+
+    since_was_defaulted = False
+    since_ts: datetime | None
+    if since is not None:
+        since_ts = since
+    elif since_seq_explicit:
+        # Explicit continuation call with no `since` -- no timestamp bound
+        # and no context-window concept at all; identical to pre-TECH-6197
+        # behavior.
+        since_ts = None
+    else:
+        # A genuinely "fresh" call (both omitted): the new default.
+        since_ts = _now() - timedelta(hours=GET_CONVERSATION_DEFAULT_LOOKBACK_HOURS)
+        since_was_defaulted = True
+
+    in_window_stmt = (
+        select(Message, Agent.sub)
+        .join(Agent, Agent.id == Message.sender_id)
+        .where(Message.conversation_id == conversation.id, Message.seq > resolved_since_seq)
+    )
+    if since_ts is not None:
+        in_window_stmt = in_window_stmt.where(Message.created_at >= since_ts)
     msg_rows = (
         await session.execute(
-            select(Message, Agent.sub)
-            .join(Agent, Agent.id == Message.sender_id)
-            .where(Message.conversation_id == conversation.id, Message.seq > since_seq)
-            .order_by(Message.seq)
-            .limit(MAX_MESSAGES_PER_GET_CONVERSATION + 1)
+            in_window_stmt.order_by(Message.seq).limit(MAX_MESSAGES_PER_GET_CONVERSATION + 1)
         )
     ).all()
     # Fetch one extra row to detect truncation, then trim -- same pattern as
-    # list_agents (TECH-5377).
+    # list_agents (TECH-5377). `has_more`/`page_max_seq` reflect ONLY this
+    # in-window page -- the context band pulled in below is purely
+    # additive background and never participates in pagination.
     has_more = len(msg_rows) > MAX_MESSAGES_PER_GET_CONVERSATION
     msg_rows = msg_rows[:MAX_MESSAGES_PER_GET_CONVERSATION]
     # The max seq actually IN this trimmed page -- distinct from
@@ -8729,7 +8834,39 @@ async def get_conversation(
     # would silently skip every message between page_max_seq and that
     # cursor. Falls back to `since_seq` itself on an empty page, so
     # `since_seq=page_max_seq` is always a safe (no-op) re-call.
-    page_max_seq = max((m.seq for m, _ in msg_rows), default=since_seq)
+    page_max_seq = max((m.seq for m, _ in msg_rows), default=resolved_since_seq)
+
+    # TECH-6197 anchor-triggered context band: only pulled in when a
+    # timestamp bound is actually in effect AND this is a "fresh" read
+    # (no explicit `since_seq` continuation cursor) AND at least one
+    # message anchors it (landed in-window). An empty in-window set pulls
+    # in NO context at all (see docstring point 3), and continuation
+    # pages must not repeat the context band. `context_hours=0` naturally
+    # yields an empty (lower-bound == upper-bound) band with no special
+    # case needed.
+    context_rows: list[Any] = []
+    if since_ts is not None and not since_seq_explicit and msg_rows and context_hours > 0:
+        context_lower_bound = since_ts - timedelta(hours=context_hours)
+        context_rows = list(
+            (
+                await session.execute(
+                    select(Message, Agent.sub)
+                    .join(Agent, Agent.id == Message.sender_id)
+                    .where(
+                        Message.conversation_id == conversation.id,
+                        Message.created_at >= context_lower_bound,
+                        Message.created_at < since_ts,
+                    )
+                    # Closest-to-`since` messages kept on truncation --
+                    # descending, capped, then reversed back to ascending
+                    # below for the normal seq-ascending response order.
+                    .order_by(Message.seq.desc())
+                    .limit(MAX_MESSAGES_PER_GET_CONVERSATION)
+                )
+            ).all()
+        )
+        context_rows.reverse()
+
     # last_read_seq only ever advances forward, never regresses on an
     # older-history re-read (page_max_seq can be below the existing cursor
     # in exactly that case). `msg_rows and` is load-bearing, not redundant
@@ -8740,25 +8877,42 @@ async def get_conversation(
     # last_read_seq=10, permanently hiding seqs 4-10 from inbox's `HAVING
     # max(seq) > last_read_seq` for messages that were never delivered to
     # this caller. The docstring's own contract ("only if any messages
-    # were returned") requires this guard.
+    # were returned") requires this guard. Deliberately keyed on `msg_rows`
+    # (in-window only), not the combined context+in-window list -- context
+    # messages are background re-shown from before `since` and must not by
+    # themselves drive the read cursor.
     if mark_read and msg_rows and page_max_seq > participant.last_read_seq:
         participant.last_read_seq = page_max_seq
     await session.commit()
 
+    combined_messages = [_message_dict(m, sender_sub) for m, sender_sub in context_rows]
+    for context_message in combined_messages:
+        context_message["context"] = True
+    combined_messages.extend(_message_dict(m, sender_sub) for m, sender_sub in msg_rows)
+
     return {
         "conversation": _conversation_dict(conversation),
         "participants": participants_view,
-        "messages": [_message_dict(m, sender_sub) for m, sender_sub in msg_rows],
+        "messages": combined_messages,
         "invited": False,
-        # Page-scoped, capped at MAX_MESSAGES_PER_GET_CONVERSATION -- NOT
-        # the conversation's true total message count (Argus round-1
-        # SUGGESTION: the prior name was misleading for direct service
-        # callers even though the tools layer already renamed it to
-        # `messages_returned`).
-        "messages_in_page": len(msg_rows),
+        # Page-scoped -- NOT the conversation's true total message count
+        # (Argus round-1 SUGGESTION: the prior name was misleading for
+        # direct service callers even though the tools layer already
+        # renamed it to `messages_returned`). Includes any context
+        # messages (TECH-6197): the in-window band and the context band
+        # are each independently capped at MAX_MESSAGES_PER_GET_CONVERSATION,
+        # so this combined count can be up to ~2x that cap, not a single
+        # 500 ceiling.
+        "messages_in_page": len(combined_messages),
         "has_more": has_more,
         "page_max_seq": page_max_seq,
         "last_read_seq": participant.last_read_seq,
+        # TECH-6197: True only on the "both since and since_seq omitted"
+        # path -- lets a caller tell "you got the new 72h default" apart
+        # from "you got exactly what you asked for" (explicit `since`, or
+        # an explicit `since_seq` continuation with no timestamp concept
+        # at all).
+        "since_was_defaulted": since_was_defaulted,
     }
 
 
