@@ -393,6 +393,22 @@ class AgentAlreadyRegisteredError(Exception):
         self.sub = sub
 
 
+class ProposalTargetUnavailableError(Exception):
+    """Raised by ``service.create_proposal`` when the configured
+    ``plugins.ProposalJudge`` reports ``FINGERPRINT_UNAVAILABLE`` at submit
+    time. Carries the plugin's already-sanitized ``(status_code,
+    error_code, detail)`` so ``main.py``/``providers/proposals.py`` can map
+    it straight to an HTTP response without either module importing a
+    client for whatever external system the configured judge talks to --
+    the board no longer knows or cares what that system is."""
+
+    def __init__(self, *, status_code: int, error_code: str, detail: str) -> None:
+        super().__init__(detail)
+        self.status_code = status_code
+        self.error_code = error_code
+        self.detail = detail
+
+
 __all__ = [
     "AccessDeniedError",
     "AgentAlreadyRegisteredError",
@@ -405,6 +421,7 @@ __all__ = [
     "HoldAwaitingAutoReviewError",
     "HoldExpiredError",
     "InvalidConversationStateError",
+    "ProposalTargetUnavailableError",
     "RateLimitExceededError",
     "SchemaVersionMismatchError",
     "SiblingIdentityExistsError",

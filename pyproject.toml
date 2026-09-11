@@ -1,6 +1,6 @@
 [project]
 name = "agent-comms-mcp"
-version = "0.7.1"
+version = "0.7.2"
 description = "MCP service for permissioned, structured agent-to-agent communications"
 license = {text = "MIT"}
 readme = "README.md"
@@ -73,10 +73,9 @@ testpaths = ["tests"]
 
 [tool.setuptools]
 py-modules = [
-    "auth", "citation_urls", "db", "exceptions", "github_client", "identity",
-    "linear_client", "main", "migrate", "mint_token", "models", "observability", "plugins",
-    "scopes", "schemas", "service", "state_machine", "subscriptions", "team_allowlist",
-    "workflow_order",
+    "auth", "db", "exceptions", "identity",
+    "main", "migrate", "mint_token", "models", "observability", "plugins",
+    "scopes", "schemas", "service", "state_machine", "subscriptions",
 ]
 packages = ["providers", "migrations", "migrations.versions"]
 

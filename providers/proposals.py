@@ -73,10 +73,15 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_access_token
 
-import linear_client
+import plugins
 import service
 from db import get_session_factory
-from exceptions import AccessDeniedError, HoldAlreadyDecidedError, RateLimitExceededError
+from exceptions import (
+    AccessDeniedError,
+    HoldAlreadyDecidedError,
+    ProposalTargetUnavailableError,
+    RateLimitExceededError,
+)
 from identity import try_resolve_email
 from scopes import is_interactive_token
 
@@ -135,13 +140,13 @@ async def _map_proposal_errors() -> AsyncIterator[None]:
     already-claimed hold) are both specific-by-design (see their own
     docstrings in exceptions.py) and pass through unwrapped too.
 
-    ``linear_client.LinearAPIError`` (Argus review round-3 B1) is
-    sanitized via ``service.sanitize_linear_submit_error``:
-    ``service.create_proposal``'s server-side target-fingerprint
-    fetch can fail for an unconfigured token, a transport failure,
-    or a Linear-side error -- sanitized so internal token env-var
-    names, transport internals, and GraphQL error payloads are never
-    leaked to the tool caller.
+    ``exceptions.ProposalTargetUnavailableError`` (Argus review round-3 B1)
+    is raised by ``service.create_proposal`` when the configured
+    ``plugins.ProposalJudge``'s server-side target-fingerprint fetch fails
+    (an unconfigured credential, a transport failure, or a target-side
+    error) -- its ``detail`` is already sanitized by the judge, so internal
+    credential names, transport internals, and raw upstream error payloads
+    are never leaked to the tool caller.
     """
     try:
         yield
@@ -149,9 +154,8 @@ async def _map_proposal_errors() -> AsyncIterator[None]:
         raise ToolError(str(exc)) from None
     except (RateLimitExceededError, HoldAlreadyDecidedError, ValueError) as exc:
         raise ToolError(str(exc)) from None
-    except linear_client.LinearAPIError as exc:
-        _status_code, _error_code, detail = service.sanitize_linear_submit_error(exc)
-        raise ToolError(detail) from None
+    except ProposalTargetUnavailableError as exc:
+        raise ToolError(exc.detail) from None
 
 
 def _parse_proposal_id(proposal_id: str) -> uuid.UUID:
@@ -265,6 +269,7 @@ async def submit(
                 confidence=confidence,
                 importance=importance,
                 impact=impact,
+                judge=plugins.get_proposal_judge(),
                 target_fingerprint=target_fingerprint,
             )
 

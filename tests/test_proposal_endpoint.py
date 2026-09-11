@@ -15,7 +15,7 @@ import sys
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
@@ -25,7 +25,18 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from starlette.applications import Starlette
 from starlette.routing import Route
 
+import plugins
 from models import AuditLog
+from plugins import (
+    FINGERPRINT_DIGEST,
+    FINGERPRINT_UNAVAILABLE,
+    ProposalApplyOutcome,
+    ProposalClassification,
+    ProposalFingerprint,
+    ProposalTargetError,
+    ProposalVerdict,
+)
+from tests.proposal_judge_fakes import FakeProposalJudge
 
 # Real-Postgres fixtures (database_url, _migrated_schema, engine) are shared
 # via tests/conftest.py (Argus review S15) -- this module opts in explicitly
@@ -50,24 +61,25 @@ def test_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession
 _DEFAULT_SUBMIT_TIME_FINGERPRINT = "fp-submit-time-default"
 
 
-@pytest_asyncio.fixture(autouse=True)
-async def _default_fetch_current_fingerprint() -> AsyncIterator[AsyncMock]:
-    """Bug fix: ``POST /proposals`` -> ``service.create_proposal`` now
-    fetches the target's CURRENT fingerprint at submission time too
-    (server-computed, no longer trusting the caller-supplied
-    ``target_fingerprint`` body field -- see that function's own
-    docstring), not just at apply/decide time. Most tests in this file
-    don't care what that submission-time fingerprint actually is -- this
-    gives them a stable default so submission never attempts a real
-    network call. Tests that DO care about a specific match/mismatch
-    between the submitted and later re-fetched fingerprint override this
-    via their own nested ``patch(...)``, which layers over (and is
-    restored back to this default by) the ``with`` block below on exit."""
-    with patch(
-        "service.linear_client.fetch_current_fingerprint",
-        AsyncMock(return_value=_DEFAULT_SUBMIT_TIME_FINGERPRINT),
-    ) as mock:
-        yield mock
+@pytest.fixture(autouse=True)
+def _default_proposal_judge(monkeypatch: pytest.MonkeyPatch) -> FakeProposalJudge:
+    """Every proposal route in ``main.py`` resolves
+    ``plugins.get_proposal_judge()`` fresh per request -- monkeypatch it to
+    always return the SAME ``FakeProposalJudge`` instance for the duration
+    of one test, so a test can reconfigure its attributes (read at call
+    time, not construction time) to drive a specific submit/decide outcome
+    across multiple requests in the same test. Defaults to a stable digest
+    fingerprint and a never-approves verdict, mirroring
+    ``_DEFAULT_SUBMIT_TIME_FINGERPRINT``'s old role. Tests that DO care
+    about a specific fingerprint match/mismatch or apply outcome
+    reconfigure this fixture's returned object directly."""
+    fake = FakeProposalJudge(
+        fingerprint_result=ProposalFingerprint(
+            status=FINGERPRINT_DIGEST, digest=_DEFAULT_SUBMIT_TIME_FINGERPRINT
+        )
+    )
+    monkeypatch.setattr(plugins, "get_proposal_judge", lambda: fake)
+    return fake
 
 
 # ``session`` fixture lives in tests/conftest.py (Argus review S10 -- this
@@ -201,11 +213,9 @@ async def client(
 # action_type is "close_ticket", not "open_ticket" (TECH-5873
 # redefinition): every test in this file using this default body is
 # exercising GENERIC HTTP-layer mechanics (auth gates, validation,
-# dedup, pending/history listing) via the pre-existing comment-posting
-# applier, not anything open_ticket-specific -- open_ticket now creates a
-# real Linear issue and is exempt from the fingerprint/staleness check
-# entirely (see service._PROPOSAL_FINGERPRINT_EXEMPT), which would
-# silently change what these tests exercise if left as the default.
+# dedup, pending/history listing) against the fixture's own
+# FakeProposalJudge, not any real judge's rule content -- kept as
+# "close_ticket" for continuity with the pre-seam default body shape.
 _PROPOSAL_BODY = {
     "kind": "linear_progress_update",
     "action": {"action_type": "close_ticket", "target_id": "TECH-1"},
@@ -501,18 +511,20 @@ class TestSubmitProposal:
         assert "exceeds" in resp.json()["detail"]
 
     async def test_unsupported_kind_returns_422_not_500(
-        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        _default_proposal_judge: FakeProposalJudge,
     ) -> None:
-        """``kind`` is an open TEXT column at the DB level, but the service
-        only admits "linear_progress_update" today (``_derive_proposal_priority``
-        raises for anything else). DESIGN.md/models.py previously advertised
-        "arc_board_change" as a valid example kind even though the service
-        never actually accepted it -- a caller following that (incorrect)
-        documentation must get a client-error 422, not an unhandled 500."""
+        """``kind`` is an open TEXT column at the DB level; whether it's
+        admitted at all is entirely up to the configured judge's
+        ``classify()``, which raises ``ValueError`` for a kind it doesn't
+        recognize -- must surface as a client-error 422, not an unhandled
+        500."""
         http_client, provider = client
         provider.tokens["bot-token"] = _agent_jwt_token(
             "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
         )
+        _default_proposal_judge.classify_raises = ValueError("unsupported kind: 'arc_board_change'")
         body = {**_PROPOSAL_BODY, "kind": "arc_board_change"}
         resp = await http_client.post(
             "/proposals", json=body, headers={"Authorization": "Bearer bot-token"}
@@ -537,12 +549,15 @@ class TestSubmitProposal:
         assert resp.status_code == 403
 
     async def test_priority_in_body_is_ignored(
-        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        _default_proposal_judge: FakeProposalJudge,
     ) -> None:
         http_client, provider = client
         provider.tokens["bot-token"] = _agent_jwt_token(
             "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
         )
+        _default_proposal_judge.classify_result = ProposalClassification(priority="high")
         body = {
             **_PROPOSAL_BODY,
             "action": {**_PROPOSAL_BODY["action"], "action_type": "close_ticket"},
@@ -552,19 +567,21 @@ class TestSubmitProposal:
             "/proposals", json=body, headers={"Authorization": "Bearer bot-token"}
         )
         assert resp.status_code == 200
-        # close_ticket server-derives "high" regardless of the caller's
+        # The judge server-derives "high" regardless of the caller's
         # top-level "priority": "low" in the request body.
         assert resp.json()["priority"] == "high"
 
     async def test_target_fingerprint_in_body_is_ignored(
-        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        _default_proposal_judge: FakeProposalJudge,
     ) -> None:
         """Bug fix: ``target_fingerprint`` in the request body is
         DEPRECATED and ignored -- the value actually stored (and later
         compared against at decide time) is always computed server-side.
         Mirrors ``test_priority_in_body_is_ignored`` above for this
         field: submit with a body value that could never match the
-        mocked server-computed fingerprint, then decide with that SAME
+        judge's server-computed fingerprint, then decide with that SAME
         server-computed value re-fetched -- reaching ``"applied"`` (not
         ``"stale"``) proves the server-computed value, not the body
         value, was stored and matched."""
@@ -578,28 +595,23 @@ class TestSubmitProposal:
             "action": {**_PROPOSAL_BODY["action"], "target_id": "TECH-FINGERPRINT-IGNORED"},
             "target_fingerprint": "body-value",
         }
-        with patch(
-            "service.linear_client.fetch_current_fingerprint",
-            AsyncMock(return_value="server-value"),
-        ):
-            resp = await http_client.post(
-                "/proposals", json=body, headers={"Authorization": "Bearer bot-token"}
-            )
+        _default_proposal_judge.fingerprint_result = ProposalFingerprint(
+            status=FINGERPRINT_DIGEST, digest="server-value"
+        )
+        resp = await http_client.post(
+            "/proposals", json=body, headers={"Authorization": "Bearer bot-token"}
+        )
         assert resp.status_code == 200
         proposal_id = resp.json()["proposal_id"]
 
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(return_value="server-value"),
-            ),
-            patch("service.linear_client.apply_progress_update", AsyncMock(return_value=None)),
-        ):
-            decide_resp = await http_client.post(
-                f"/proposals/{proposal_id}/decide",
-                headers={"Authorization": "Bearer human-token"},
-                json={"decision": "approve"},
-            )
+        _default_proposal_judge.apply_result = ProposalApplyOutcome(
+            applied=True, result=None, caller_error=None, log_detail=None
+        )
+        decide_resp = await http_client.post(
+            f"/proposals/{proposal_id}/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={"decision": "approve"},
+        )
         assert decide_resp.json()["status"] == "applied"
 
     async def test_rate_limit_exceeded_returns_429(
@@ -677,72 +689,86 @@ class TestSubmitProposal:
         )
         assert rows
 
-    async def test_linear_api_error_during_submission_returns_422(
-        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    async def test_fingerprint_unavailable_during_submission_returns_422(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        _default_proposal_judge: FakeProposalJudge,
     ) -> None:
         """Argus review round-3 B1: service.create_proposal's server-side
-        target-fingerprint fetch can fail (target doesn't exist, Linear
-        error) -- must surface as a client-facing 422 with a sanitized
-        message, never the raw error string."""
-        from linear_client import LinearAPIError
-
+        target-fingerprint fetch can fail (target doesn't exist, target
+        system error) -- must surface as a client-facing status code with
+        the judge's own sanitized message, never a raw error string."""
         http_client, provider = client
         provider.tokens["bot-token"] = _agent_jwt_token(
             "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
         )
-        with patch(
-            "service.linear_client.fetch_current_fingerprint",
-            AsyncMock(side_effect=LinearAPIError("target issue does not exist")),
-        ):
-            resp = await http_client.post(
-                "/proposals", json=_PROPOSAL_BODY, headers={"Authorization": "Bearer bot-token"}
-            )
+        _default_proposal_judge.fingerprint_result = ProposalFingerprint(
+            status=FINGERPRINT_UNAVAILABLE,
+            error=ProposalTargetError(
+                status_code=422,
+                error_code="invalid_request",
+                detail="Linear returned an error",
+                log_detail="target issue does not exist",
+            ),
+        )
+        resp = await http_client.post(
+            "/proposals", json=_PROPOSAL_BODY, headers={"Authorization": "Bearer bot-token"}
+        )
         assert resp.status_code == 422
         assert resp.json()["error"] == "invalid_request"
         assert resp.json()["detail"] == "Linear returned an error"
 
-    async def test_linear_token_missing_during_submission_returns_500_sanitized(
-        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    async def test_fingerprint_unavailable_during_submission_returns_500_sanitized(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        _default_proposal_judge: FakeProposalJudge,
     ) -> None:
-        """Argus review round-3 B1: LinearTokenMissingError must return 500
-        without leaking the internal env-var name."""
-        from linear_client import LinearTokenMissingError
-
+        """Argus review round-3 B1: a missing-credential-shaped judge
+        failure must return 500 without leaking the internal env-var
+        name."""
         http_client, provider = client
         provider.tokens["bot-token"] = _agent_jwt_token(
             "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
         )
-        with patch(
-            "service.linear_client.fetch_current_fingerprint",
-            AsyncMock(side_effect=LinearTokenMissingError("LINEAR_API_TOKEN is not configured")),
-        ):
-            resp = await http_client.post(
-                "/proposals", json=_PROPOSAL_BODY, headers={"Authorization": "Bearer bot-token"}
-            )
+        _default_proposal_judge.fingerprint_result = ProposalFingerprint(
+            status=FINGERPRINT_UNAVAILABLE,
+            error=ProposalTargetError(
+                status_code=500,
+                error_code="server_configuration_error",
+                detail="server configuration error",
+                log_detail="LINEAR_API_TOKEN is not configured",
+            ),
+        )
+        resp = await http_client.post(
+            "/proposals", json=_PROPOSAL_BODY, headers={"Authorization": "Bearer bot-token"}
+        )
         assert resp.status_code == 500
         assert resp.json()["error"] == "server_configuration_error"
         assert resp.json()["detail"] == "server configuration error"
 
-    async def test_linear_transport_error_during_submission_returns_503_sanitized(
-        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    async def test_fingerprint_unavailable_during_submission_returns_503_sanitized(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        _default_proposal_judge: FakeProposalJudge,
     ) -> None:
-        """Argus review round-3 B1: LinearTransportError must return 503
-        without leaking raw transport details."""
-        from linear_client import LinearTransportError
-
+        """Argus review round-3 B1: a transport-failure-shaped judge
+        failure must return 503 without leaking raw transport details."""
         http_client, provider = client
         provider.tokens["bot-token"] = _agent_jwt_token(
             "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
         )
-        with patch(
-            "service.linear_client.fetch_current_fingerprint",
-            AsyncMock(
-                side_effect=LinearTransportError("Linear API request failed: connection refused")
+        _default_proposal_judge.fingerprint_result = ProposalFingerprint(
+            status=FINGERPRINT_UNAVAILABLE,
+            error=ProposalTargetError(
+                status_code=503,
+                error_code="service_unavailable",
+                detail="Linear API unavailable",
+                log_detail="Linear API request failed: connection refused",
             ),
-        ):
-            resp = await http_client.post(
-                "/proposals", json=_PROPOSAL_BODY, headers={"Authorization": "Bearer bot-token"}
-            )
+        )
+        resp = await http_client.post(
+            "/proposals", json=_PROPOSAL_BODY, headers={"Authorization": "Bearer bot-token"}
+        )
         assert resp.status_code == 503
         assert resp.json()["error"] == "service_unavailable"
         assert resp.json()["detail"] == "Linear API unavailable"
@@ -828,7 +854,9 @@ class TestListPendingProposals:
         assert other.json()["proposals"] == []
 
     async def test_approved_proposals_excluded(
-        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        _default_proposal_judge: FakeProposalJudge,
     ) -> None:
         http_client, provider = client
         provider.tokens["bot-token"] = _agent_jwt_token(
@@ -843,20 +871,19 @@ class TestListPendingProposals:
                 "source_message_url": "https://redesignhealth.slack.com/archives/C1/p1",
             },
         }
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(return_value=_PROPOSAL_BODY["target_fingerprint"]),
-            ),
-            patch("service.linear_client.apply_progress_update", AsyncMock(return_value=None)),
-        ):
-            submit_resp = await http_client.post(
-                "/proposals", json=body, headers={"Authorization": "Bearer bot-token"}
-            )
+        _default_proposal_judge.judge_result = ProposalVerdict(
+            approved=True, decision_note="auto-approved"
+        )
+        _default_proposal_judge.apply_result = ProposalApplyOutcome(
+            applied=True, result=None, caller_error=None, log_detail=None
+        )
+        submit_resp = await http_client.post(
+            "/proposals", json=body, headers={"Authorization": "Bearer bot-token"}
+        )
         assert submit_resp.status_code == 200
         # TECH-5873 Argus review B1: the auto-judge's "approved" verdict is
         # never itself persisted -- it resolves synchronously to "applied"
-        # here (matching fingerprint, successful Linear write).
+        # here (matching fingerprint, successful write).
         assert submit_resp.json()["status"] == "applied"
 
         pending = await http_client.get(
@@ -1092,87 +1119,74 @@ class TestListProposalHistory:
             assert len(resp.json()["proposals"]) == 1
 
     async def test_all_terminal_statuses_included(
-        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        _default_proposal_judge: FakeProposalJudge,
     ) -> None:
         """Argus review round 1 (TECH-6030 PR), endpoint-level mirror of the
         same-named service-layer test: drive one proposal each to
         ``applied``/``apply_failed``/``stale`` via the live decide route and
         confirm all three surface through ``GET /proposals/history``.
 
-        ``target_fingerprint`` is server-computed at submission time now
-        (bug fix), so each submission below is wrapped in its own
-        ``fetch_current_fingerprint`` patch -- an independent mock call
-        site from the one the later decide route patches -- rather than
+        ``target_fingerprint`` is server-computed at submission time via
+        the injected judge, so each submission below reconfigures the
+        shared fixture judge's fingerprint independently -- rather than
         trusting the (now-ignored) request body field. The APPLIED/
-        APPLY_FAILED cases use the SAME value at both call sites (a
-        genuinely unchanged target); STALE deliberately uses two
-        DIFFERENT values, to prove a real mismatch."""
-        from linear_client import LinearAPIError
-
+        APPLY_FAILED cases use the SAME digest at both submit and decide
+        time (a genuinely unchanged target); STALE deliberately uses two
+        DIFFERENT digests, to prove a real mismatch."""
         http_client, provider = client
         provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
 
-        with patch(
-            "service.linear_client.fetch_current_fingerprint",
-            AsyncMock(return_value="fp-applied-match"),
-        ):
-            applied_id = await _submit_via_http(
-                http_client, provider, owner_sub="owner-a@example.com", target_id="APPLIED"
-            )
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(return_value="fp-applied-match"),
-            ),
-            patch("service.linear_client.apply_progress_update", AsyncMock(return_value=None)),
-        ):
-            resp = await http_client.post(
-                f"/proposals/{applied_id}/decide",
-                headers={"Authorization": "Bearer human-token"},
-                json={"decision": "approve"},
-            )
+        _default_proposal_judge.fingerprint_result = ProposalFingerprint(
+            status=FINGERPRINT_DIGEST, digest="fp-applied-match"
+        )
+        applied_id = await _submit_via_http(
+            http_client, provider, owner_sub="owner-a@example.com", target_id="APPLIED"
+        )
+        _default_proposal_judge.apply_result = ProposalApplyOutcome(
+            applied=True, result=None, caller_error=None, log_detail=None
+        )
+        resp = await http_client.post(
+            f"/proposals/{applied_id}/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={"decision": "approve"},
+        )
         assert resp.json()["status"] == "applied"
 
-        with patch(
-            "service.linear_client.fetch_current_fingerprint",
-            AsyncMock(return_value="fp-apply-failed-match"),
-        ):
-            apply_failed_id = await _submit_via_http(
-                http_client, provider, owner_sub="owner-a@example.com", target_id="APPLY_FAILED"
-            )
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(return_value="fp-apply-failed-match"),
-            ),
-            patch(
-                "service.linear_client.apply_progress_update",
-                AsyncMock(side_effect=LinearAPIError("linear unavailable")),
-            ),
-        ):
-            resp = await http_client.post(
-                f"/proposals/{apply_failed_id}/decide",
-                headers={"Authorization": "Bearer human-token"},
-                json={"decision": "approve"},
-            )
+        _default_proposal_judge.fingerprint_result = ProposalFingerprint(
+            status=FINGERPRINT_DIGEST, digest="fp-apply-failed-match"
+        )
+        apply_failed_id = await _submit_via_http(
+            http_client, provider, owner_sub="owner-a@example.com", target_id="APPLY_FAILED"
+        )
+        _default_proposal_judge.apply_result = ProposalApplyOutcome(
+            applied=False,
+            result=None,
+            caller_error="Linear API returned an error",
+            log_detail="linear unavailable",
+        )
+        resp = await http_client.post(
+            f"/proposals/{apply_failed_id}/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={"decision": "approve"},
+        )
         assert resp.json()["status"] == "apply_failed"
 
-        with patch(
-            "service.linear_client.fetch_current_fingerprint",
-            AsyncMock(return_value="fp-original"),
-        ):
-            stale_id = await _submit_via_http(
-                http_client, provider, owner_sub="owner-a@example.com", target_id="STALE"
-            )
-        with patch(
-            "service.linear_client.fetch_current_fingerprint",
-            AsyncMock(return_value="a-completely-different-fingerprint"),
-        ):
-            resp = await http_client.post(
-                f"/proposals/{stale_id}/decide",
-                headers={"Authorization": "Bearer human-token"},
-                json={"decision": "approve"},
-            )
+        _default_proposal_judge.fingerprint_result = ProposalFingerprint(
+            status=FINGERPRINT_DIGEST, digest="fp-original"
+        )
+        stale_id = await _submit_via_http(
+            http_client, provider, owner_sub="owner-a@example.com", target_id="STALE"
+        )
+        _default_proposal_judge.fingerprint_result = ProposalFingerprint(
+            status=FINGERPRINT_DIGEST, digest="a-completely-different-fingerprint"
+        )
+        resp = await http_client.post(
+            f"/proposals/{stale_id}/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={"decision": "approve"},
+        )
         assert resp.json()["status"] == "stale"
 
         history = await http_client.get(
@@ -1392,148 +1406,124 @@ class TestDecideProposalEndpoint:
         assert body["decision_note"] == "not needed"
 
     async def test_approve_matching_fingerprint_applies(
-        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        _default_proposal_judge: FakeProposalJudge,
     ) -> None:
-        """``target_fingerprint`` is server-computed at submission time now
-        (bug fix): the submit and the later decide below patch the fetch
-        independently -- two mock call sites, not one hardcoded literal --
-        and happen to agree, representing a target that hasn't changed."""
+        """``target_fingerprint`` is server-computed at submission time via
+        the injected judge: the submit and the later decide below share
+        the SAME fixture judge instance and happen to agree on the digest,
+        representing a target that hasn't changed."""
         http_client, provider = client
-        with patch(
-            "service.linear_client.fetch_current_fingerprint",
-            AsyncMock(return_value="fp1"),
-        ):
-            proposal_id = await _submit_via_http(
-                http_client, provider, owner_sub="owner-a@example.com"
-            )
+        _default_proposal_judge.fingerprint_result = ProposalFingerprint(
+            status=FINGERPRINT_DIGEST, digest="fp1"
+        )
+        proposal_id = await _submit_via_http(http_client, provider, owner_sub="owner-a@example.com")
         provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
 
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(return_value="fp1"),
-            ),
-            patch(
-                "service.linear_client.apply_progress_update", AsyncMock(return_value=None)
-            ) as mock_apply,
-        ):
-            resp = await http_client.post(
-                f"/proposals/{proposal_id}/decide",
-                headers={"Authorization": "Bearer human-token"},
-                json={"decision": "approve"},
-            )
+        _default_proposal_judge.apply_result = ProposalApplyOutcome(
+            applied=True, result=None, caller_error=None, log_detail=None
+        )
+        resp = await http_client.post(
+            f"/proposals/{proposal_id}/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={"decision": "approve"},
+        )
         assert resp.status_code == 200
         body = resp.json()
         assert body["status"] == "applied"
-        mock_apply.assert_awaited_once()
+        assert len(_default_proposal_judge.apply_calls) == 1
 
-    async def test_approve_stale_fingerprint_returns_stale_without_calling_linear_apply(
-        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    async def test_approve_stale_fingerprint_returns_stale_without_calling_apply(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        _default_proposal_judge: FakeProposalJudge,
     ) -> None:
-        """Explicit submit-time fingerprint patch, matching
+        """Explicit submit-time fingerprint, matching
         ``test_approve_matching_fingerprint_applies``/
-        ``test_approve_linear_failure_returns_apply_failed`` above --
+        ``test_approve_apply_failure_returns_apply_failed`` above --
         self-contained rather than implicitly relying on the autouse
-        ``_default_fetch_current_fingerprint`` fixture's default value."""
+        ``_default_proposal_judge`` fixture's default digest."""
         http_client, provider = client
-        with patch(
-            "service.linear_client.fetch_current_fingerprint",
-            AsyncMock(return_value="fp1"),
-        ):
-            proposal_id = await _submit_via_http(
-                http_client, provider, owner_sub="owner-a@example.com"
-            )
+        _default_proposal_judge.fingerprint_result = ProposalFingerprint(
+            status=FINGERPRINT_DIGEST, digest="fp1"
+        )
+        proposal_id = await _submit_via_http(http_client, provider, owner_sub="owner-a@example.com")
         provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
 
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(return_value="a-completely-different-fingerprint"),
-            ),
-            patch(
-                "service.linear_client.apply_progress_update", AsyncMock(return_value=None)
-            ) as mock_apply,
-        ):
-            resp = await http_client.post(
-                f"/proposals/{proposal_id}/decide",
-                headers={"Authorization": "Bearer human-token"},
-                json={"decision": "approve"},
-            )
+        _default_proposal_judge.fingerprint_result = ProposalFingerprint(
+            status=FINGERPRINT_DIGEST, digest="a-completely-different-fingerprint"
+        )
+        resp = await http_client.post(
+            f"/proposals/{proposal_id}/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={"decision": "approve"},
+        )
         assert resp.status_code == 200
         assert resp.json()["status"] == "stale"
-        mock_apply.assert_not_awaited()
+        assert _default_proposal_judge.apply_calls == []
 
-    async def test_approve_linear_failure_returns_apply_failed(
-        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    async def test_approve_apply_failure_returns_apply_failed(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        _default_proposal_judge: FakeProposalJudge,
     ) -> None:
-        from linear_client import LinearAPIError
-
         http_client, provider = client
-        with patch(
-            "service.linear_client.fetch_current_fingerprint",
-            AsyncMock(return_value="fp1"),
-        ):
-            proposal_id = await _submit_via_http(
-                http_client, provider, owner_sub="owner-a@example.com"
-            )
+        _default_proposal_judge.fingerprint_result = ProposalFingerprint(
+            status=FINGERPRINT_DIGEST, digest="fp1"
+        )
+        proposal_id = await _submit_via_http(http_client, provider, owner_sub="owner-a@example.com")
         provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
 
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(return_value="fp1"),
-            ),
-            patch(
-                "service.linear_client.apply_progress_update",
-                AsyncMock(side_effect=LinearAPIError("linear unavailable")),
-            ),
-        ):
-            resp = await http_client.post(
-                f"/proposals/{proposal_id}/decide",
-                headers={"Authorization": "Bearer human-token"},
-                json={"decision": "approve"},
-            )
+        _default_proposal_judge.apply_result = ProposalApplyOutcome(
+            applied=False,
+            result=None,
+            caller_error="Linear API returned an error",
+            log_detail="linear unavailable",
+        )
+        resp = await http_client.post(
+            f"/proposals/{proposal_id}/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={"decision": "approve"},
+        )
         assert resp.status_code == 200
         body = resp.json()
         assert body["status"] == "apply_failed"
-        # Argus review round-5 S4: the raw LinearAPIError message is no
-        # longer returned verbatim to API callers -- unrecognized messages
-        # map to the generic allowlisted message (see `_sanitize_apply_error`).
+        # Argus review round-5 S4: the raw upstream message is no longer
+        # returned verbatim to API callers -- only the judge's own
+        # allowlisted caller_error is.
         assert body["apply_error"] == "Linear API returned an error"
 
-    async def test_retrying_applied_hold_does_not_double_call_linear(
-        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    async def test_retrying_applied_hold_does_not_double_apply(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        _default_proposal_judge: FakeProposalJudge,
     ) -> None:
         http_client, provider = client
         provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+        _default_proposal_judge.fingerprint_result = ProposalFingerprint(
+            status=FINGERPRINT_DIGEST, digest="fp1"
+        )
+        _default_proposal_judge.apply_result = ProposalApplyOutcome(
+            applied=True, result=None, caller_error=None, log_detail=None
+        )
 
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(return_value="fp1"),
-            ),
-            patch(
-                "service.linear_client.apply_progress_update", AsyncMock(return_value=None)
-            ) as mock_apply,
-        ):
-            proposal_id = await _submit_via_http(
-                http_client, provider, owner_sub="owner-a@example.com"
-            )
-            first = await http_client.post(
-                f"/proposals/{proposal_id}/decide",
-                headers={"Authorization": "Bearer human-token"},
-                json={"decision": "approve"},
-            )
-            second = await http_client.post(
-                f"/proposals/{proposal_id}/decide",
-                headers={"Authorization": "Bearer human-token"},
-                json={"decision": "approve"},
-            )
+        proposal_id = await _submit_via_http(http_client, provider, owner_sub="owner-a@example.com")
+        first = await http_client.post(
+            f"/proposals/{proposal_id}/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={"decision": "approve"},
+        )
+        second = await http_client.post(
+            f"/proposals/{proposal_id}/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={"decision": "approve"},
+        )
         assert first.status_code == 200
         assert second.status_code == 200
         assert first.json()["status"] == "applied"
         assert second.json()["status"] == "applied"
-        mock_apply.assert_awaited_once()
+        assert len(_default_proposal_judge.apply_calls) == 1
 
     async def test_deciding_already_rejected_hold_returns_409(
         self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
