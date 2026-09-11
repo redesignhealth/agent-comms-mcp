@@ -696,15 +696,19 @@ Design notes:
   uniform `AccessDeniedError`. Key rules and behaviors:
   - **Extend-only with rolling 90-day ceiling**: new expiry must satisfy
     `new_expires_at - now() <= MAX_CONVERSATION_TTL` (90 days, reusing the
-    creation ceiling constant).
-  - **No shortening**: rejects with an `invalid_request`-style error when
+    creation ceiling constant); exceeding this raises `InvalidExtendError`
+    (mapped to `invalid_request: ...` at the tool layer).
+  - **No shortening**: rejects with `InvalidExtendError` (mapped to
+    `invalid_request: new expires_at must be greater than current expires_at`) when
     `new_expires_at <= conversation.expires_at`. Also requires
     `new_expires_at > now()`.
   - **Parameterized**: accepts either an absolute ISO 8601 timezone-aware
     `expires_at` or relative `extend_by_days` (1..90), where `extend_by_days` is
     computed relative to `max(current expires_at, now())` (so extending a
     lapsed conversation by N days means N days from now, not from the stale past
-    deadline). Exactly one must be provided.
+    deadline). Exactly one must be provided; parameter violations raise
+    `InvalidExtendError` (or tool-layer pre-checks), consistently prefixed with
+    `invalid_request: `.
   - **Resurrection**: extending an `expired` conversation (or an `active` one
     past its deadline, which lazily flips to `expired` on touch) extends its expiry
     AND resurrects `state` back to `"active"`, making it postable again and
@@ -712,7 +716,10 @@ Design notes:
   - **Rejections**: extending a `completed` or `canceled` conversation is
     rejected with `InvalidConversationStateError`. Extending an archived
     conversation (`archived_at IS NOT NULL`) is rejected with
-    `ConversationArchivedError` (`denied.archived.extend`).
+    `ConversationArchivedError` (`denied.archived.extend`). Validation-class
+    failures (shortening, non-future expiry, TTL ceiling, invalid parameter
+    combination) are rejected with `InvalidExtendError` (mapped with
+    `invalid_request: ` prefix at the tool boundary).
   - **Non-idempotent**: unlike `comms_archive_conversation`, repeating an extend
     with an unchanged `expires_at` fails the "reject shortening/same value" check.
   - **Audit**: logged under `conversation.extend` with `previous_expires_at`,
@@ -890,7 +897,7 @@ scroll-to-load-more use case.
 | `comms_leave` | comms:write | leave: covers already-active members |
 | `comms_rename_conversation` | comms:write | set/replace `conversations.name` (required, max 120 chars; TECH-6120); any `active` participant may call it, not just the owner (same status-gated posture as `comms_invite`, see §4); does not require the conversation itself to still be `active`, and is unaffected by `archived_at` (an archived conversation can still be renamed); audited as `conversation.rename` with the previous value |
 | `comms_archive_conversation` | comms:write | archive a conversation (TECH-5887): sets `archived_at`, permanently. Any CURRENT `active` participant may trigger it (symmetric across the whole conversation, not gated to owner/creator) -- distinct from `comms_leave`, which only ever changes the CALLER's own participant row. Once archived: `comms_invite`/`comms_post_message`/`comms_accept` all reject with the specific `conversation_archived` error (not the uniform denial); also blocks approving a pending hold via the HTTP approval endpoint's `decide_hold` (the hold stays `pending_human`, a human can still reject it) -- the only one of the four blocked surfaces that isn't an MCP tool. Archiving never hides history or per-conversation access (`comms_get_conversation`/`comms_inbox`, and `comms_get_hold_status`) -- archiving is not a delete or a redaction, every past message stays fully readable. It does remove the conversation from the default `comms_list_conversations` browse listing, recoverable via `include_archived=true`. Idempotent (re-archiving is a silent no-op, `archived_at` unchanged); one-directional -- no unarchive tool |
-| `comms_extend_conversation` | comms:write | extend conversation expiry (`expires_at`) by an absolute datetime or relative days (`extend_by_days`, 1..90), rolling up to the 90-day `MAX_CONVERSATION_TTL` ceiling from now; any CURRENT `active` participant may trigger it; cannot shorten expiry; resurrects `expired` conversations back to `active`; rejects `completed`, `canceled`, or `archived` conversations; not idempotent |
+| `comms_extend_conversation` | comms:write | extend conversation expiry (`expires_at`) by an absolute datetime or relative days (`extend_by_days`, 1..90), rolling up to the 90-day `MAX_CONVERSATION_TTL` ceiling from now; any CURRENT `active` participant may trigger it; cannot shorten expiry; resurrects `expired` conversations back to `active`; rejects `completed`, `canceled`, or `archived` conversations; validation errors raise `InvalidExtendError` (mapped with `invalid_request: `); not idempotent |
 
 ### MCP resource surface (TECH-5903 Phase A)
 
@@ -1387,7 +1394,7 @@ under its ORIGINAL type/schema_version/payload, flip the hold, single commit.
 Reject stores the decision and posts no message. Approve additionally
 raises the specific `conversation_archived` error (TECH-5887, same
 `ConversationArchivedError` `comms_invite`/`comms_post_message`/
-`comms_accept` raise, see `comms_archive_conversation`'s §7 row) if the
+`comms_accept`/`comms_extend_conversation` raise, see `comms_archive_conversation`'s §7 row) if the
 conversation has since been archived -- a hold can sit `pending_human` for
 up to `APPROVAL_HOLD_TTL` (7 days), so without this check, approving a
 message- or invite-kind hold after archiving would still insert a new

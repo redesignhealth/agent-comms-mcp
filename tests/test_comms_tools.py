@@ -3613,6 +3613,8 @@ class TestExtendConversation:
     async def test_parameter_validation_errors(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
+        import service
+
         conversation_id, _ids = await self._start_open_conversation(
             main,
             test_session_factory,
@@ -3700,12 +3702,13 @@ class TestExtendConversation:
 
         # Shortening -- this validation lives in service.extend_conversation
         # (it needs the DB-loaded current expires_at), raised as
-        # InvalidExtendError and passed through _map_service_errors
-        # verbatim (no "invalid_request:" prefix, unlike the tool-layer's
-        # own pre-checks above).
+        # InvalidExtendError and mapped through _map_service_errors with the
+        # "invalid_request:" prefix matching the tool-layer pre-checks.
         with pytest.raises(
             ToolError,
-            match="new expires_at must be greater than current expires_at",
+            match=re.escape(
+                "invalid_request: new expires_at must be greater than current expires_at"
+            ),
         ):
             await _call(
                 main,
@@ -3715,6 +3718,66 @@ class TestExtendConversation:
                 {
                     "conversation_id": conversation_id,
                     "expires_at": (datetime.now(UTC) + timedelta(days=1)).isoformat(),
+                },
+            )
+
+        # TTL ceiling reached via extend_by_days -- this validation lives in
+        # service.extend_conversation (extend_by_days=85 passes the 1..90
+        # tool pre-check, but 7 + 85 = 92 days exceeds MAX_CONVERSATION_TTL),
+        # raised as InvalidExtendError and mapped through _map_service_errors
+        # with the "invalid_request:" prefix.
+        with pytest.raises(
+            ToolError,
+            match=re.escape(
+                f"invalid_request: expires_at may not be more than "
+                f"{service.MAX_CONVERSATION_TTL} from now"
+            ),
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                token_owner,
+                "comms_extend_conversation",
+                {
+                    "conversation_id": conversation_id,
+                    "extend_by_days": 85,
+                },
+            )
+
+    async def test_extend_by_days_rejected_ttl_ceiling(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """A relative extension via `extend_by_days` that passes the 1..90
+        tool-layer check but exceeds the 90-day MAX_CONVERSATION_TTL ceiling
+        when added to the current expiry must fail with an `invalid_request:`-
+        prefixed ToolError from InvalidExtendError."""
+        import service
+
+        now = datetime.now(UTC)
+        # Conversation starts with expiry 10 days out; 10 + 85 = 95 > 90 days.
+        conversation_id, _ids = await self._start_open_conversation(
+            main,
+            test_session_factory,
+            owner_sub="ext-tool-owner-3b",
+            member_sub="ext-tool-member-3b",
+            expires_at=(now + timedelta(days=10)).isoformat(),
+        )
+        token_owner = _token("ext-tool-owner-3b")
+        with pytest.raises(
+            ToolError,
+            match=re.escape(
+                f"invalid_request: expires_at may not be more than "
+                f"{service.MAX_CONVERSATION_TTL} from now"
+            ),
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                token_owner,
+                "comms_extend_conversation",
+                {
+                    "conversation_id": conversation_id,
+                    "extend_by_days": 85,
                 },
             )
 

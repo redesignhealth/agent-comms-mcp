@@ -41,9 +41,12 @@ service/tools boundary:
 - ``InvalidExtendError`` (TECH-6195): ``comms_extend_conversation`` request-
   shape/business-rule validation failure (bad parameter combination,
   out-of-range ``extend_by_days``, shortening/ceiling rejection). Kept
-  distinct and specific, same reasoning as ``InvalidConversationStateError``
-  — every case describes only the caller's own request or a conversation it
-  is already an authorized active participant of.
+  distinct and specific: parameter-shape checks run pre-auth and describe
+  only the caller's own inputs (leaking no conversation or participant state),
+  while business-rule checks (shortening, ceiling, future-expiry) run
+  post-auth once the caller has already been verified as an active
+  participant with legitimate access to the conversation's current state.
+  Mapped with an ``invalid_request: `` prefix at the tool boundary.
 
 - ``ConversationArchivedError`` (TECH-5887): ``comms_invite``/
   ``comms_post_message``/``comms_accept`` targeted a conversation that has
@@ -170,15 +173,24 @@ class InvalidExtendError(Exception):
     ceiling violation (``new_expires_at - now() > MAX_CONVERSATION_TTL``).
 
     Specific and client-actionable by design, unlike the generic bare-
-    ``ValueError`` mapping ``_map_service_errors`` otherwise applies: every
-    one of these describes only the CALLER's own supplied parameters (or,
-    for the ceiling/shortening cases, a conversation the caller is already
-    an authorized active participant of and can already read the current
-    ``expires_at`` for via ``comms_get_conversation``), never another
-    agent/conversation's secret state -- so there is nothing to enumerate
-    by naming the real cause here, and the caller needs the specific
-    message (not a generic "could not be processed") to know which
-    parameter to fix and retry.
+    ``ValueError`` mapping ``_map_service_errors`` otherwise applies.
+    Validation sites are split across authorization:
+    - Pre-auth checks (neither or both of ``expires_at``/``extend_by_days``
+      supplied, out-of-range ``extend_by_days``, non-timezone-aware
+      ``expires_at``) validate the caller's own parameters before DB lookup
+      and leak no conversation or participant state.
+    - Post-auth checks (shortening/no-op expiry, non-future expiry,
+      ceiling violation relative to current expiry) run after
+      ``_load_participant_for_transition`` has confirmed the caller is
+      already an authorized active participant with legitimate read access to
+      the conversation's current state via ``comms_get_conversation``.
+
+    In both cases, there is nothing to enumerate by naming the real cause,
+    and the caller needs the specific message (not a generic "could not be
+    processed") to know which parameter to fix and retry. At the tool boundary,
+    ``providers.comms._map_service_errors`` prepends an ``invalid_request: ``
+    prefix, ensuring a consistent error message shape across tool-layer
+    pre-checks and service-layer validations.
     """
 
 

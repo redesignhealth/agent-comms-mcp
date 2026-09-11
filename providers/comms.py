@@ -378,8 +378,9 @@ async def _map_service_errors(error_cls: type[Exception] = ToolError) -> AsyncIt
     is the same story as ``InvalidConversationStateError``: the caller
     already has legitimate read access to the conversation's archived
     status. ``InvalidExtendError`` (TECH-6195, ``comms_extend_conversation``)
-    is likewise specific and client-safe by design -- see its own
-    docstring in exceptions.py.
+    is likewise specific and client-safe by design -- mapped with an
+    ``invalid_request: `` prefix matching the tool-layer pre-checks (see
+    its own docstring in exceptions.py).
 
     A bare ``ValueError`` is different: the service layer raises it for
     internal parameter-shape problems (e.g. an empty ``display_name`` or
@@ -394,9 +395,13 @@ async def _map_service_errors(error_cls: type[Exception] = ToolError) -> AsyncIt
         yield
     except AccessDeniedError as exc:
         raise error_cls(str(exc)) from None
+    except InvalidExtendError as exc:
+        msg = str(exc)
+        if not msg.startswith("invalid_request: "):
+            msg = f"invalid_request: {msg}"
+        raise error_cls(msg) from None
     except (
         InvalidConversationStateError,
-        InvalidExtendError,
         RateLimitExceededError,
         PayloadValidationError,
         UnknownConversationTypeError,

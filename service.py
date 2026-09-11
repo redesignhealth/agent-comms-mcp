@@ -4318,7 +4318,8 @@ async def extend_conversation(
     conversation would.
 
     Extend-only: cannot shorten expiry (``new_expires_at <= conversation.expires_at``
-    is rejected with ValueError). Must be strictly in the future (``new_expires_at > now()``)
+    is rejected with ``InvalidExtendError``, mapped to an ``invalid_request: ``-prefixed
+    error at the tool boundary). Must be strictly in the future (``new_expires_at > now()``)
     and bounded by the rolling 90-day ceiling (``new_expires_at - now() <= MAX_CONVERSATION_TTL``).
 
     Resurrection: extending an ``expired`` conversation (or an ``active`` one
