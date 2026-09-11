@@ -404,22 +404,27 @@ docker compose up --build
 > - `PROPOSAL_JUDGE` must point at a real implementation (provisioned via SSM at
 >   `/reclaw-comms/{env}/proposal-judge`, e.g. `rh_comms_plugins.proposal_judge:get_proposal_judge`).
 >   Unset or empty, the board safely defaults to `escalate_all_proposals`, which never
->   auto-approves or applies any proposal. `plugins.resolve_plugin` resolves empty strings
->   and missing variables identically via `os.environ.get(key) or default`.
+>   auto-approves or applies any proposal. For `PROPOSAL_JUDGE` specifically, an empty string
+>   falls back to the default. Other seams treat an empty env var as an unknown plugin name
+>   and crash at boot -- this is intentional.
 >   `docker-compose.yml` passes `PROPOSAL_JUDGE: ${PROPOSAL_JUDGE:-}` through from the local
 >   environment so developers can set `PROPOSAL_JUDGE` in `.env` (or pass `-e PROPOSAL_JUDGE=...`)
 >   for local testing with a custom judge implementation without affecting the safe default
 >   when unset.
 > - For Redesign Health, `agent-comms-approvals` (PR #62) must be deployed with the
 >   concrete judge implementation before this service's release runs with `PROPOSAL_JUDGE`
->   configured, or the import will fail at boot.
+>   configured, or the import will fail at boot. Switch ECS task definition to the derived
+>   image AND set `PROPOSAL_JUDGE` in SSM in the same Terraform apply. Do not set `PROPOSAL_JUDGE`
+>   while the task definition still references the base image.
 > - **Behavioral regression window**: until the Terraform provisioning and deployment chain
 >   completes, proposals running under `escalate_all_proposals` will never auto-approve,
 >   and any human approval will resolve to `apply_failed` because the default judge does
->   not perform external writes.
+>   not perform external writes. Note that `apply_failed` returns HTTP 200 -- a verification pass
+>   that checks only the status code will incorrectly conclude the apply succeeded. Check the
+>   response body's `status` field.
 > - **SSM parameter removal ordering hazard (TECH-6155)**: when cleaning up legacy
->   env vars/SSM parameters (e.g. `LINEAR_API_TOKEN`, `GITHUB_TOKEN`), always update
->   the ECS task definition to remove the SSM parameter reference FIRST, deploy that revision,
+>   env vars/SSM parameters (e.g. `LINEAR_API_TOKEN`, `GITHUB_TOKEN`, `PROPOSAL_OPEN_TICKET_TEAM_ALLOWLIST`),
+>   always update the ECS task definition to remove the SSM parameter reference FIRST, deploy that revision,
 >   and only THEN delete the parameter from SSM. ECS resolves SSM parameter ARNs at task-launch
 >   time; deleting a parameter while a task definition still references it causes every
 >   subsequent task launch to crash with a parameter-resolution failure.

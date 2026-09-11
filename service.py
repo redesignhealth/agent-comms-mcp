@@ -161,6 +161,7 @@ import asyncio
 import itertools
 import json
 import logging
+import re
 import uuid
 from collections.abc import Callable, Sequence
 from collections.abc import Set as AbstractSet
@@ -5967,7 +5968,32 @@ def _classify_proposal(judge: ProposalJudge, kind: str, action: dict[str, Any]) 
 _FINGERPRINT_CONTRACT_VIOLATION_DETAIL = "unable to verify target status"
 _ALLOWED_PROPOSAL_TARGET_ERROR_STATUS_CODES: frozenset[int] = frozenset({422, 500, 503})
 _MAX_PROPOSAL_ERROR_DETAIL_LENGTH = 500
+_MAX_PROPOSAL_ERROR_CODE_LENGTH = 64
 _PROPOSAL_TRUNCATED_SUFFIX = "... [truncated]"
+
+# URL query-string scrub: strips query strings from http(s) URLs and absolute paths
+# (e.g. "https://api.linear.app/graphql?token=secret" -> "https://api.linear.app/graphql"),
+# preserving the base URL/path and enclosing delimiters.
+_URL_QUERY_STRING_RE = re.compile(r"((?:https?://|/)[^\s?#'\"<>()]+)\?[^\s'\"<>()]+")
+
+# Credential KV scrub: matches KEY=VALUE tokens where KEY is a recognized credential/token name.
+# Case-insensitive on the key name; bounded to word boundaries so legitimate prose
+# containing '=' (e.g. 'status=open', 'priority=high', 'x = 5') is not mangled.
+_CREDENTIAL_KV_RE = re.compile(
+    r"(?i)\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|"
+    r"client[_-]?secret|secret[_-]?key|private[_-]?key|password|passwd|token|secret)"
+    r"\s*=\s*(?:'[^']*'|\"[^\"]*\"|[^\s,;'\"()]+)(?:,\s*|;\s*)?"
+)
+
+
+def _scrub_proposal_error_string(text: str) -> str:
+    """Scrub obviously-credential-shaped or URL-query-shaped content from
+    caller-facing proposal error strings before truncation (Argus round 5
+    suggestion 1).
+    """
+    scrubbed = _URL_QUERY_STRING_RE.sub(r"\1", text)
+    scrubbed = _CREDENTIAL_KV_RE.sub("", scrubbed)
+    return re.sub(r" +", " ", scrubbed).strip()
 
 
 def _truncate_proposal_string(text: str, max_length: int) -> str:
@@ -5994,7 +6020,8 @@ def _truncate_proposal_string(text: str, max_length: int) -> str:
 
 def _is_well_formed_target_error(err: Any) -> bool:
     """True if ``err`` is a well-formed ``ProposalTargetError`` with valid
-    field types and an allowed status code (TECH-5872/TECH-5877 seam defensive check).
+    field types, an allowed status code, and bounded field lengths
+    (TECH-5872/TECH-5877 seam defensive check).
     """
     return (
         isinstance(err, ProposalTargetError)
@@ -6003,6 +6030,7 @@ def _is_well_formed_target_error(err: Any) -> bool:
         and err.status_code in _ALLOWED_PROPOSAL_TARGET_ERROR_STATUS_CODES
         and isinstance(err.error_code, str)
         and bool(err.error_code)
+        and len(err.error_code) <= _MAX_PROPOSAL_ERROR_CODE_LENGTH
         and isinstance(err.detail, str)
         and bool(err.detail)
         and (err.log_detail is None or isinstance(err.log_detail, str))
@@ -6036,8 +6064,11 @@ async def _safe_fingerprint(judge: ProposalJudge, ctx: ProposalContext) -> Propo
                 result.error
             ):
                 assert result.error is not None
+                scrubbed_detail = _scrub_proposal_error_string(result.error.detail)
+                if not scrubbed_detail:
+                    scrubbed_detail = _FINGERPRINT_CONTRACT_VIOLATION_DETAIL
                 truncated_detail = _truncate_proposal_string(
-                    result.error.detail, _MAX_PROPOSAL_ERROR_DETAIL_LENGTH
+                    scrubbed_detail, _MAX_PROPOSAL_ERROR_DETAIL_LENGTH
                 )
                 if truncated_detail != result.error.detail:
                     return ProposalFingerprint(
@@ -7391,8 +7422,11 @@ async def _safe_apply(judge: ProposalJudge, ctx: ProposalContext) -> ProposalApp
                     else "apply() returned applied=False with no caller_error"
                 ),
             )
+        scrubbed_caller_error = _scrub_proposal_error_string(outcome.caller_error)
+        if not scrubbed_caller_error:
+            scrubbed_caller_error = _APPLY_ERROR_PLUGIN_CONTRACT_VIOLATION_MESSAGE
         truncated_caller_error = _truncate_proposal_string(
-            outcome.caller_error, _MAX_PROPOSAL_ERROR_DETAIL_LENGTH
+            scrubbed_caller_error, _MAX_PROPOSAL_ERROR_DETAIL_LENGTH
         )
         if truncated_caller_error != outcome.caller_error:
             return ProposalApplyOutcome(

@@ -1301,19 +1301,27 @@ class ProposalJudge(Protocol):
     - ``classify()``: ``ValueError`` is wrapped into a board-controlled
       message and mapped to 422.
     - ``fingerprint()``: ``error.detail`` is capped at 500 chars (truncated
-      with ``"... [truncated]"``), and ``error.status_code`` MUST be one of
-      ``{422, 500, 503}`` -- any other value (e.g. 404, 409, 429, all
-      reasonable-seeming choices) is silently replaced with a synthesized
-      500/``server_configuration_error`` rather than reaching the caller,
-      with no signal to the plugin that this happened. Map LLM-API or
-      upstream rate-limit errors to `503` (service temporarily unavailable),
-      not `429`, to preserve the retryable signal within the
+      with ``"... [truncated]"``), ``error.error_code`` is capped at 64 chars,
+      and ``error.status_code`` MUST be one of ``{422, 500, 503}`` -- any other
+      value (e.g. 404, 409, 429, all reasonable-seeming choices) is silently
+      replaced with a synthesized 500/``server_configuration_error`` rather
+      than reaching the caller, with no signal to the plugin that this happened.
+      Map LLM-API or upstream rate-limit errors to `503` (service temporarily
+      unavailable), not `429`, to preserve the retryable signal within the
       `{422, 500, 503}` allowlist.
     - ``judge()``: ``decision_note`` is capped at 2000 chars (truncated
       with ``"... [truncated]"``).
     - ``apply()``: ``caller_error`` is capped at 500 chars (truncated
       with ``"... [truncated]"``), and ``result`` must be a JSON-serializable
       dict (or ``None``).
+
+    Security note: ``log_detail``, ``caller_error``, and ``detail`` MUST NOT
+    contain raw upstream payloads, credential-shaped strings (e.g. tokens, API
+    keys, or passwords), or URL query parameters. The board enforces a
+    defense-in-depth content scrub on caller-facing strings before truncation,
+    stripping obviously-credential-shaped token patterns and URL query strings,
+    but plugin authors must not rely on this as a replacement for plugin-side
+    error sanitization discipline.
     """
 
     def classify(self, kind: str, action: dict[str, Any]) -> ProposalClassification:

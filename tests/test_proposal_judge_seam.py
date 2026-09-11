@@ -36,6 +36,7 @@ from service import (
     _classify_proposal,
     _safe_apply,
     _safe_fingerprint,
+    _scrub_proposal_error_string,
     create_proposal,
 )
 from tests.proposal_judge_fakes import FakeProposalJudge
@@ -223,6 +224,9 @@ class TestSafeFingerprintSeam:
             ProposalTargetError(status_code=200, error_code="err", detail="msg", log_detail=None),
             ProposalTargetError(status_code=400, error_code="err", detail="msg", log_detail=None),
             ProposalTargetError(status_code=600, error_code="err", detail="msg", log_detail=None),
+            ProposalTargetError(
+                status_code=500, error_code="x" * 65, detail="msg", log_detail=None
+            ),
         ],
     )
     async def test_unavailable_status_with_malformed_error_synthesizes_generic_error(
@@ -241,6 +245,49 @@ class TestSafeFingerprintSeam:
         assert result.error.status_code == 500
         assert result.error.error_code == "server_configuration_error"
         assert result.error.detail == "unable to verify target status"
+
+    async def test_target_error_detail_scrubs_credentials_and_query_strings(self) -> None:
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(
+                status=FINGERPRINT_UNAVAILABLE,
+                error=ProposalTargetError(
+                    status_code=503,
+                    error_code="service_unavailable",
+                    detail=(
+                        "upstream error: api_key=secret12345 in call to "
+                        "https://api.linear.app/graphql?token=abc456"
+                    ),
+                    log_detail="raw log detail with api_key=secret12345",
+                ),
+            )
+        )
+        result = await _safe_fingerprint(judge, _ctx())
+        assert result.status == FINGERPRINT_UNAVAILABLE
+        assert result.error is not None
+        assert result.error.detail == "upstream error: in call to https://api.linear.app/graphql"
+        assert "secret12345" not in result.error.detail
+        assert "abc456" not in result.error.detail
+        assert "token=" not in result.error.detail
+        # log_detail is untouched
+        assert result.error.log_detail == "raw log detail with api_key=secret12345"
+
+    async def test_target_error_detail_only_credential_falls_back_to_generic_detail(self) -> None:
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(
+                status=FINGERPRINT_UNAVAILABLE,
+                error=ProposalTargetError(
+                    status_code=503,
+                    error_code="service_unavailable",
+                    detail="token=secret12345",
+                    log_detail="raw log",
+                ),
+            )
+        )
+        result = await _safe_fingerprint(judge, _ctx())
+        assert result.status == FINGERPRINT_UNAVAILABLE
+        assert result.error is not None
+        assert result.error.detail == "unable to verify target status"
+        assert result.error.log_detail == "raw log"
 
     async def test_target_error_detail_overlong_is_truncated(self) -> None:
         overlong_detail = "x" * 600
@@ -428,6 +475,85 @@ class TestSafeApplySeam:
         assert (result.caller_error or "").endswith("... [truncated]")
         assert (result.caller_error or "").startswith("e" * 100)
         assert result.log_detail == "raw detail"
+
+    async def test_apply_caller_error_scrubs_credentials_and_query_strings(self) -> None:
+        judge = FakeProposalJudge(
+            apply_result=ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error=(
+                    "upstream error: token=secret12345 in call to "
+                    "https://api.linear.app/graphql?api_key=abc456"
+                ),
+                log_detail="raw log detail with token=secret12345",
+            )
+        )
+        result = await _safe_apply(judge, _ctx())
+        assert result.applied is False
+        assert result.caller_error == "upstream error: in call to https://api.linear.app/graphql"
+        assert "secret12345" not in (result.caller_error or "")
+        assert "abc456" not in (result.caller_error or "")
+        assert "api_key=" not in (result.caller_error or "")
+        # log_detail is untouched
+        assert result.log_detail == "raw log detail with token=secret12345"
+
+    async def test_apply_caller_error_only_credential_falls_back_to_generic_error(self) -> None:
+        judge = FakeProposalJudge(
+            apply_result=ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error="token=secret12345",
+                log_detail="raw log",
+            )
+        )
+        result = await _safe_apply(judge, _ctx())
+        assert result.applied is False
+        assert result.caller_error == "unable to apply this proposal"
+        assert result.log_detail == "raw log"
+
+    async def test_apply_caller_error_preserves_legitimate_prose_with_equals(self) -> None:
+        judge = FakeProposalJudge(
+            apply_result=ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error=(
+                    "cannot transition ticket when status=closed and priority=high (count = 0)"
+                ),
+                log_detail=None,
+            )
+        )
+        result = await _safe_apply(judge, _ctx())
+        assert result.applied is False
+        assert (
+            result.caller_error
+            == "cannot transition ticket when status=closed and priority=high (count = 0)"
+        )
+
+
+class TestScrubProposalErrorString:
+    def test_preserves_clean_prose(self) -> None:
+        text = "ticket TECH-1234 was not found in team TECH"
+        assert _scrub_proposal_error_string(text) == text
+
+    def test_preserves_prose_with_equals(self) -> None:
+        text = "filter status=closed returned count = 0 results (target_id=TECH-1)"
+        assert _scrub_proposal_error_string(text) == text
+
+    def test_preserves_prose_with_question_mark(self) -> None:
+        text = "Did the target ticket exist? Please verify."
+        assert _scrub_proposal_error_string(text) == text
+
+    def test_strips_url_query_strings(self) -> None:
+        text = (
+            "failed: https://api.linear.app/graphql?token=secret123&foo=bar and /v1/issue?auth=xyz"
+        )
+        expected = "failed: https://api.linear.app/graphql and /v1/issue"
+        assert _scrub_proposal_error_string(text) == expected
+
+    def test_strips_credential_key_value_tokens(self) -> None:
+        text = "auth error: api_key=secret_123, token='abc', password=\"pwd\", client_secret=cs"
+        expected = "auth error:"
+        assert _scrub_proposal_error_string(text) == expected
 
 
 @pytest.mark.usefixtures("_migrated_schema")

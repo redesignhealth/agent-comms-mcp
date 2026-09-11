@@ -4,23 +4,18 @@ Revision ID: d88cc7e6e21b
 Revises: d885dda2ffda
 Create Date: 2026-09-09 00:00:00.000000
 
-TECH-5873 follow-up: ``open_ticket`` (``kind="linear_progress_update"``)
-is redefined in place to actually create a Linear issue (via
-``linear_client.create_ticket``/``apply_open_ticket``) instead of posting
-a comment on an already-existing target -- the only way a caller learns
-the new issue's ``TECH-####`` identifier afterward is through the apply
-response, so that metadata needs somewhere to live once the request that
-triggered it has returned.
+TECH-5873 follow-up: stores the serialized outcome returned by the
+configured ``ProposalJudge.apply()`` implementation -- e.g. identifiers or
+URLs for externally created resources, so callers can retrieve metadata once
+the request that triggered the apply has returned.
 
 Adds a single nullable JSONB column, ``apply_result``, capturing whatever
-a kind-scoped applier returns on a successful apply (e.g.
-``apply_open_ticket``'s ``{"id", "identifier", "url"}`` for the created
-issue) -- see ``service._apply_or_finalize_proposal_hold``. Set only when
-the applier actually returns something non-``None``; the pre-existing
-``apply_progress_update`` (comment-posting) applier always returns
-``None``, so this stays unset (``NULL``) for every ``close_ticket``/other
-``linear_progress_update`` row, exactly as it always has been before this
-column existed.
+a kind-scoped applier returns on a successful apply (e.g. metadata for an
+externally created resource) -- see ``service._apply_or_finalize_proposal_hold``.
+Set only when the applier actually returns something non-``None``; appliers
+that do not emit structured results return ``None``, so this stays unset
+(``NULL``) for rows where no result metadata was produced, exactly as it
+always has been before this column existed.
 
 Pure additive column, no CHECK constraint, no backfill, no index -- unlike
 its two predecessors (``e2f7a91c5b34``/``f3c9a7e2b1d4``, which each widened
@@ -32,8 +27,8 @@ no ``NOT NULL``/CHECK constraint accepts every existing row's implicit
 either direction.
 
 ``downgrade()`` just drops the column -- discards any apply results
-recorded since this migration's ``upgrade()`` ran (in particular, every
-``open_ticket`` row's Linear issue identifier/URL), same "downgrading
+recorded since this migration's ``upgrade()`` ran (in particular, any
+recorded apply metadata), same "downgrading
 discards recently-recorded data" tone as ``e2f7a91c5b34``'s own
 ``downgrade()`` discarding an in-flight ``'applying'`` row's eventual
 outcome by force-resolving it to ``'apply_failed'``.
