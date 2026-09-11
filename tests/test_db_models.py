@@ -454,10 +454,11 @@ class TestSchema:
         # query, which has no conversation_id predicate and so can't use
         # the (conversation_id, sender_id, created_at) index above.
         assert "idx_messages_sender_id_created_at" in message_indexes
-        # Backs service.get_conversation's TECH-6197 in-window/context-band
-        # queries, which filter on (conversation_id, created_at) with no
-        # sender_id predicate and so can't use the index above either
-        # (Argus round-1 BLOCKING, migration 44da57c6d9b9).
+        # Backs service.get_conversation's TECH-6197 context-band query,
+        # which filters on (conversation_id, created_at) with no sender_id
+        # predicate and no seq predicate (unlike the in-window query,
+        # which can use uq_messages_conversation_id_seq), avoiding a full
+        # scan + filter (Argus round-1 BLOCKING, migration 44da57c6d9b9).
         assert "idx_messages_conversation_id_created_at" in message_indexes
 
     async def test_messages_seq_unique_per_conversation(self, engine: AsyncEngine) -> None:

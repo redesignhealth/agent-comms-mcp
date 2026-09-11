@@ -5,17 +5,18 @@ Revises: 572b2b9a96d6
 Create Date: 2026-09-11 00:00:00.000000
 
 TECH-6197 (Argus round-1 BLOCKING): ``service.get_conversation``'s new
-in-window query (``WHERE conversation_id = ? AND seq > ? AND
-created_at >= ?``) and context-band query (``WHERE conversation_id = ? AND
-created_at >= ? AND created_at < ?``) both filter on
-``(conversation_id, created_at)`` with no ``sender_id`` predicate. Neither
-existing index supports that: ``uq_messages_conversation_id_seq`` is on
-``(conversation_id, seq)``, and ``idx_messages_conversation_id_sender_id_
-created_at`` has ``sender_id`` between ``conversation_id`` and
-``created_at``, so Postgres can't use it for a range scan on ``created_at``
-alone. Without this index, the new 72h-default "faster" read path would
-actually be SLOWER than the old full-history path on a long-lived
-conversation -- a full scan + filter instead of an index range scan.
+context-band query (``WHERE conversation_id = ? AND created_at >= ? AND
+created_at < ? ORDER BY seq DESC LIMIT 501``) filters on
+``(conversation_id, created_at)`` with no ``sender_id`` or leading ``seq``
+predicate. Neither existing index supports that: ``uq_messages_conversation_id_seq``
+is on ``(conversation_id, seq)`` (which already serves the in-window query's
+``seq > ?`` predicate, but has no ``seq`` filter here to range-scan on),
+and ``idx_messages_conversation_id_sender_id_created_at`` has ``sender_id``
+between ``conversation_id`` and ``created_at``, so Postgres can't use it for
+a range scan on ``created_at`` alone. Without this index, the context-band
+query on a long-lived conversation would fall back to a full scan + filter
+instead of an index range scan -- making the new 72h-default read path
+slower than the old full-history path.
 
 Purely additive (no column/constraint change) -- an old container that
 doesn't know about this index simply never uses it and is unaffected by
@@ -57,4 +58,12 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index("idx_messages_conversation_id_created_at", table_name="messages", if_exists=True)
+    # Schema-qualified per this migration chain's established convention
+    # (see da3e1646c44d, bb1ea7d2a0cf) -- unqualified DROP INDEX under a
+    # wrong search_path would silently no-op with if_exists=True.
+    op.drop_index(
+        "idx_messages_conversation_id_created_at",
+        table_name="messages",
+        schema="public",
+        if_exists=True,
+    )

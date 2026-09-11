@@ -1601,8 +1601,8 @@ async def get_conversation(
     An ``invited`` (not yet accepted) caller gets metadata only -- no
     message content, ``since_seq``/``since``/``context_hours`` are all
     ignored, and ``has_more`` is always ``False``. An ``active`` caller
-    gets up to 500 messages (``MAX_MESSAGES_PER_GET_CONVERSATION``) per
-    the ``since_seq``/``since`` resolution below, and their read cursor
+    gets up to 500 in-window messages (``MAX_MESSAGES_PER_GET_CONVERSATION``)
+    per the ``since_seq``/``since`` resolution below, and their read cursor
     advances. ``since_seq``, if passed, must be non-negative -- a negative
     value would silently widen the result window in an unintended way.
 
@@ -2306,8 +2306,9 @@ async def conversation_resource(conversation_id: str) -> dict[str, Any]:
     membership-is-visibility rule): an ``invited`` (not yet accepted) caller
     gets metadata only, a non-member gets the uniform ``access_denied``
     error, and an ``active`` caller gets up to the same
-    ``MAX_MESSAGES_PER_GET_CONVERSATION`` (500) message cap as the tool —
-    a conversation longer than that cap is permanently truncated from this
+    ``MAX_MESSAGES_PER_GET_CONVERSATION`` (500) in-window cap the tool
+    applies -- a conversation longer than that cap is permanently truncated
+    from this
     resource's perspective (no ``since_seq``/pagination parameter exists on
     the URI template to page further; the tool remains the way to read
     past this cap). Because this is a *template*, ``resources/list`` never

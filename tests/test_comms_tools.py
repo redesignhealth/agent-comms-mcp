@@ -4729,8 +4729,8 @@ class TestGetConversationSinceWindowTool:
     async def test_invalid_since_string_rejected(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
-        """`_parse_since`'s invalid-ISO-8601 branch (as opposed to the
-        timezone-naive branch covered by `test_naive_since_rejected`)."""
+        """`_parse_since`'s invalid-ISO-8601 and overlength branches (as opposed to
+        the timezone-naive branch covered by `test_naive_since_rejected`)."""
         conversation_id, token_target = await self._start_and_accept(
             main, test_session_factory, "gcwt-owner-12", "gcwt-target-12"
         )
@@ -4741,6 +4741,14 @@ class TestGetConversationSinceWindowTool:
                 token_target,
                 "comms_get_conversation",
                 {"conversation_id": conversation_id, "since": "not-a-date"},
+            )
+        with pytest.raises(ToolError, match="since exceeds 100 characters"):
+            await _call(
+                main,
+                test_session_factory,
+                token_target,
+                "comms_get_conversation",
+                {"conversation_id": conversation_id, "since": "x" * 101},
             )
 
     async def test_negative_context_hours_rejected(
