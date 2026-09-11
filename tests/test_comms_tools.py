@@ -4298,6 +4298,7 @@ class TestScopesUnaffected:
             "comms_archive_conversation",
             "comms_get_hold_status",
             "comms_admin_register",
+            "comms_extend_conversation",
         }
         assert expected <= mounted
         assert expected <= set(TOOL_SCOPES)

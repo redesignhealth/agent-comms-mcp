@@ -673,20 +673,20 @@ Design notes:
  with its own authorization gate, if a real need for one arises.
 
 - `conversations.name` (TECH-6120) is an optional human-readable label, settable at
-  `comms_start_conversation` time and renameable afterward via
-  `comms_rename_conversation` (see §4). Nullable with **no synthesized
-  default**: an omitted name stays `NULL` rather than being derived from the
-  participant set, which would go stale the moment `comms_invite`/`comms_leave`
-  changes membership. `_conversation_dict` (the shared projection behind
-  `comms_get_conversation`, `comms_list_conversations`, and both halves of
-  `comms_inbox`) always emits the `"name"` key, `null` when unset -- never
-  omits it. Capped at 120 characters (`schemas.MAX_CONVERSATION_NAME_LENGTH`,
-  deliberately tighter than `MAX_DISPLAY_NAME_LENGTH`) and validated by the
-  single shared `service.validate_conversation_name` (stripped, non-empty,
-  no ASCII control characters) -- called from both the tool layer and
-  `start_conversation`/`rename_conversation` themselves, so tightening the
-  rule in one place tightens it everywhere. This is a new free-text field;
-  see §8 invariant 3 for the carve-out it required.
+ `comms_start_conversation` time and renameable afterward via
+ `comms_rename_conversation` (see §4). Nullable with **no synthesized
+ default**: an omitted name stays `NULL` rather than being derived from the
+ participant set, which would go stale the moment `comms_invite`/`comms_leave`
+ changes membership. `_conversation_dict` (the shared projection behind
+ `comms_get_conversation`, `comms_list_conversations`, and both halves of
+ `comms_inbox`) always emits the `"name"` key, `null` when unset -- never
+ omits it. Capped at 120 characters (`schemas.MAX_CONVERSATION_NAME_LENGTH`,
+ deliberately tighter than `MAX_DISPLAY_NAME_LENGTH`) and validated by the
+ single shared `service.validate_conversation_name` (stripped, non-empty,
+ no ASCII control characters) -- called from both the tool layer and
+ `start_conversation`/`rename_conversation` themselves, so tightening the
+ rule in one place tightens it everywhere. This is a new free-text field;
+ see §8 invariant 3 for the carve-out it required.
 
 - **Extending a conversation (`comms_extend_conversation`, TECH-6195)**: updates
   `conversations.expires_at`, a whole-conversation action symmetric across
