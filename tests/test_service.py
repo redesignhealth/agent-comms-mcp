@@ -8294,6 +8294,81 @@ class TestListAgents:
         page = await list_agents(session, active_checker=_RaisingActiveChecker())
         assert {a["sub"] for a in page["agents"]} == {"la-checker-raises"}
 
+    async def test_suspended_agent_excluded_by_default(self, session: AsyncSession) -> None:
+        """TECH-6196: suspended agents are excluded at SQL level by default,
+        and omitted from total_count."""
+        await _register(session, "la-active-agent")
+        agent_suspended = await _register(session, "la-suspended-agent")
+        await deregister_agent(
+            session, actor_sub="admin-sub", agent_id=agent_suspended.id, deregister_authorized=True
+        )
+
+        page = await list_agents(session)
+        subs = {a["sub"] for a in page["agents"]}
+        assert "la-active-agent" in subs
+        assert "la-suspended-agent" not in subs
+        assert page["total_count"] == 1
+
+    async def test_include_suspended_true_surfaces_suspended_agent(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-6196: include_suspended=True surfaces suspended agents and
+        includes them in total_count."""
+        await _register(session, "la-active-agent-2")
+        agent_suspended = await _register(session, "la-suspended-agent-2")
+        await deregister_agent(
+            session, actor_sub="admin-sub", agent_id=agent_suspended.id, deregister_authorized=True
+        )
+
+        page = await list_agents(session, include_suspended=True)
+        subs = {a["sub"] for a in page["agents"]}
+        assert "la-active-agent-2" in subs
+        assert "la-suspended-agent-2" in subs
+        assert page["total_count"] == 2
+
+    async def test_suspension_orthogonal_to_registry_retirement(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-6196: suspension filtering in SQL is fully orthogonal to
+        external active_checker retirement filtering. include_suspended=True
+        must NOT bypass active_checker."""
+        await _register(session, "la-ortho-active")
+        await _register(session, "la-ortho-retired")
+        agent_both = await _register(session, "la-ortho-both")
+        await deregister_agent(
+            session, actor_sub="admin-sub", agent_id=agent_both.id, deregister_authorized=True
+        )
+
+        checker = _FakeActiveChecker(inactive_subs={"la-ortho-retired", "la-ortho-both"})
+        page = await list_agents(session, include_suspended=True, active_checker=checker)
+        subs = {a["sub"] for a in page["agents"]}
+        assert "la-ortho-active" in subs
+        assert "la-ortho-retired" not in subs
+        assert "la-ortho-both" not in subs
+        assert page["total_count"] == 3
+
+    async def test_pagination_with_suspended_agents(self, session: AsyncSession) -> None:
+        """TECH-6196: keyset pagination and has_more/next_cursor remain coherent
+        when suspended agents are filtered out at the SQL query level."""
+        for i in range(5):
+            agent = await _register(session, f"la-page-agent-{i:02d}")
+            if i in (1, 3):
+                await deregister_agent(
+                    session, actor_sub="admin-sub", agent_id=agent.id, deregister_authorized=True
+                )
+
+        first_page = await list_agents(session, limit=2)
+        assert [a["sub"] for a in first_page["agents"]] == ["la-page-agent-00", "la-page-agent-02"]
+        assert first_page["has_more"] is True
+        assert first_page["next_cursor"] == "la-page-agent-02"
+        assert first_page["total_count"] == 3
+
+        second_page = await list_agents(session, limit=2, cursor=first_page["next_cursor"])
+        assert [a["sub"] for a in second_page["agents"]] == ["la-page-agent-04"]
+        assert second_page["has_more"] is False
+        assert second_page["next_cursor"] is None
+        assert second_page["total_count"] == 3
+
 
 class TestLookupAgentByEmail:
     async def test_found(self, session: AsyncSession) -> None:
@@ -9233,6 +9308,214 @@ class TestListConversations:
 
         all_ids = {c["conversation_id"] for c in page1["conversations"] + page2["conversations"]}
         assert len(all_ids) == 3
+
+    async def test_archived_conversations_excluded_by_default(self, session: AsyncSession) -> None:
+        """TECH-6196: archived conversations are excluded by default,
+        and included when include_archived=True."""
+        creator = await _register(session, "listconv-arch-creator")
+        target = await _register(session, "listconv-arch-target")
+        conv = await start_conversation(
+            session,
+            actor_sub=creator.sub,
+            initiator_agent_id=creator.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+        )
+        await archive_conversation(
+            session,
+            actor_sub=creator.sub,
+            agent_id=creator.id,
+            conversation_id=conv.id,
+        )
+
+        default_result = await list_conversations(session, caller_agent_id=creator.id)
+        default_ids = {c["conversation_id"] for c in default_result["conversations"]}
+        assert str(conv.id) not in default_ids
+
+        archived_result = await list_conversations(
+            session, caller_agent_id=creator.id, include_archived=True
+        )
+        archived_ids = {c["conversation_id"] for c in archived_result["conversations"]}
+        assert str(conv.id) in archived_ids
+
+    async def test_expired_conversations_excluded_by_default(self, session: AsyncSession) -> None:
+        """TECH-6196: expired conversations are excluded by default,
+        and included when include_expired=True."""
+        creator = await _register(session, "listconv-exp-creator")
+        target = await _register(session, "listconv-exp-target")
+        already_expired = datetime.now(UTC) - timedelta(seconds=1)
+        conv = await start_conversation(
+            session,
+            actor_sub=creator.sub,
+            initiator_agent_id=creator.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            expires_at=already_expired,
+        )
+
+        default_result = await list_conversations(session, caller_agent_id=creator.id)
+        default_ids = {c["conversation_id"] for c in default_result["conversations"]}
+        assert str(conv.id) not in default_ids
+
+        expired_result = await list_conversations(
+            session, caller_agent_id=creator.id, include_expired=True
+        )
+        expired_ids = {c["conversation_id"] for c in expired_result["conversations"]}
+        assert str(conv.id) in expired_ids
+
+    async def test_explicit_state_expired_overrides_default(self, session: AsyncSession) -> None:
+        """TECH-6196: passing state='expired' surfaces expired conversations
+        even with default include_expired=False."""
+        creator = await _register(session, "listconv-exp-override-c")
+        target = await _register(session, "listconv-exp-override-t")
+        already_expired = datetime.now(UTC) - timedelta(seconds=1)
+        conv = await start_conversation(
+            session,
+            actor_sub=creator.sub,
+            initiator_agent_id=creator.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            expires_at=already_expired,
+        )
+
+        result = await list_conversations(session, caller_agent_id=creator.id, state="expired")
+        assert any(c["conversation_id"] == str(conv.id) for c in result["conversations"])
+
+    async def test_archived_and_expired_conversation(self, session: AsyncSession) -> None:
+        """TECH-6196: a conversation that is BOTH archived and expired requires
+        both filters to be satisfied: state='expired', include_archived=True surfaces it."""
+        creator = await _register(session, "listconv-both-c")
+        target = await _register(session, "listconv-both-t")
+        already_expired = datetime.now(UTC) - timedelta(seconds=1)
+        conv = await start_conversation(
+            session,
+            actor_sub=creator.sub,
+            initiator_agent_id=creator.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            expires_at=already_expired,
+        )
+        await archive_conversation(
+            session,
+            actor_sub=creator.sub,
+            agent_id=creator.id,
+            conversation_id=conv.id,
+        )
+
+        conv_id_str = str(conv.id)
+        # Default excludes (both archived and expired)
+        res_default = await list_conversations(session, caller_agent_id=creator.id)
+        assert not any(c["conversation_id"] == conv_id_str for c in res_default["conversations"])
+        # include_expired alone still excluded by archived check
+        res_exp = await list_conversations(
+            session, caller_agent_id=creator.id, include_expired=True
+        )
+        assert not any(c["conversation_id"] == conv_id_str for c in res_exp["conversations"])
+        # state='expired' alone still excluded by archived check
+        res_state_exp = await list_conversations(
+            session, caller_agent_id=creator.id, state="expired"
+        )
+        assert not any(c["conversation_id"] == conv_id_str for c in res_state_exp["conversations"])
+        # include_archived alone still excluded by expired check
+        res_arch = await list_conversations(
+            session, caller_agent_id=creator.id, include_archived=True
+        )
+        assert not any(c["conversation_id"] == conv_id_str for c in res_arch["conversations"])
+        # state='expired' AND include_archived=True surfaces it!
+        res_both_state = await list_conversations(
+            session, caller_agent_id=creator.id, state="expired", include_archived=True
+        )
+        assert any(c["conversation_id"] == conv_id_str for c in res_both_state["conversations"])
+        # include_expired=True AND include_archived=True surfaces it!
+        res_both_inc = await list_conversations(
+            session, caller_agent_id=creator.id, include_expired=True, include_archived=True
+        )
+        assert any(c["conversation_id"] == conv_id_str for c in res_both_inc["conversations"])
+
+    async def test_completed_and_canceled_remain_visible_by_default(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-6196: completed and canceled conversations are explicitly OUT of scope
+        for exclusion and remain visible by default."""
+        creator = await _register(session, "listconv-term-c")
+        target = await _register(session, "listconv-term-t")
+
+        conv1 = await start_conversation(
+            session,
+            actor_sub=creator.sub,
+            initiator_agent_id=creator.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+        )
+        conv1.state = "completed"
+
+        conv2 = await start_conversation(
+            session,
+            actor_sub=creator.sub,
+            initiator_agent_id=creator.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+        )
+        conv2.state = "canceled"
+        await session.commit()
+
+        result = await list_conversations(session, caller_agent_id=creator.id)
+        ids = {c["conversation_id"] for c in result["conversations"]}
+        assert str(conv1.id) in ids
+        assert str(conv2.id) in ids
+
+    async def test_paging_coherence_with_archived_and_expired_filters(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-6196: Keyset pagination remains coherent when archived and expired
+        conversations are filtered out."""
+        creator = await _register(session, "listconv-filter-page-c")
+        target = await _register(session, "listconv-filter-page-t")
+
+        convs = []
+        for _i in range(4):
+            c = await start_conversation(
+                session,
+                actor_sub=creator.sub,
+                initiator_agent_id=creator.id,
+                conversation_type="open",
+                target_agent_ids=[target.id],
+                initial_message=_request_payload(),
+            )
+            convs.append(c)
+
+        # Archive convs[1], expire convs[3]
+        await archive_conversation(
+            session,
+            actor_sub=creator.sub,
+            agent_id=creator.id,
+            conversation_id=convs[1].id,
+        )
+        convs[3].expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        convs[3].state = "expired"
+        await session.commit()
+
+        page1 = await list_conversations(session, caller_agent_id=creator.id, limit=1)
+        assert len(page1["conversations"]) == 1
+        assert page1["has_more"] is True
+        assert page1["next_cursor"] is not None
+
+        page2 = await list_conversations(
+            session, caller_agent_id=creator.id, limit=1, cursor=page1["next_cursor"]
+        )
+        assert len(page2["conversations"]) == 1
+        assert page2["has_more"] is False
+        assert page2["next_cursor"] is None
+
+        all_convs = page1["conversations"] + page2["conversations"]
+        returned_ids = {c["conversation_id"] for c in all_convs}
+        assert returned_ids == {str(convs[0].id), str(convs[2].id)}
 
 
 # --- OwnershipClient pluggable seam (TECH-5396 open question 1) -------------------

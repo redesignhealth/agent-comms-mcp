@@ -23,6 +23,7 @@ import subprocess
 import sys
 import uuid
 from collections.abc import AsyncIterator, Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -1645,6 +1646,39 @@ class TestAxiShapes:
         assert by_sub["dir-agent-plain"]["is_shared"] is False
         assert by_sub["dir-agent-shared"]["is_shared"] is True
 
+    async def test_list_agents_excludes_suspended_by_default_and_opt_in(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """TECH-6196: comms_list_agents excludes suspended agents by default,
+        and surfaces them when include_suspended=True."""
+        await _register(main, test_session_factory, "dir-agent-active")
+        agent_susp = await _register(main, test_session_factory, "dir-agent-susp")
+        admin_token = _token("admin-user", scopes=["comms:read", "comms:write", "comms:admin"])
+        await _call(
+            main,
+            test_session_factory,
+            admin_token,
+            "comms_deregister_agent",
+            {"agent_id": agent_susp["agent_id"]},
+        )
+
+        caller_token = _token("dir-agent-active")
+        default_result = await _call(main, test_session_factory, caller_token, "comms_list_agents")
+        subs_default = {a["sub"] for a in default_result["agents"]}
+        assert "dir-agent-active" in subs_default
+        assert "dir-agent-susp" not in subs_default
+
+        all_result = await _call(
+            main,
+            test_session_factory,
+            caller_token,
+            "comms_list_agents",
+            {"include_suspended": True},
+        )
+        subs_all = {a["sub"] for a in all_result["agents"]}
+        assert "dir-agent-active" in subs_all
+        assert "dir-agent-susp" in subs_all
+
     async def test_lookup_agent_by_email_finds_registered_agent(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
@@ -3034,12 +3068,12 @@ class TestArchiveConversation:
         assert result["archived"] is True
         assert result["archived_at"] is not None
 
-    async def test_archiving_does_not_hide_history_from_reads(
+    async def test_archive_conversation_does_not_hide_history_but_hides_from_default_listing(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
-        """Past messages remain fully readable via comms_get_conversation,
-        comms_inbox, and comms_list_conversations after archiving -- this is
-        not a delete or a redaction."""
+        """TECH-5887 / TECH-6196: past message content remains readable via
+        comms_get_conversation and comms_inbox after archiving, but default
+        comms_list_conversations excludes it unless include_archived=True."""
         conversation_id, _ids = await self._start_open_conversation(
             main,
             test_session_factory,
@@ -3095,13 +3129,23 @@ class TestArchiveConversation:
         assert len(after["messages"]) == 2
         assert [m["seq"] for m in after["messages"]] == [m["seq"] for m in before["messages"]]
 
-        listed = await _call(
+        listed_default = await _call(
             main, test_session_factory, token_owner, "comms_list_conversations", {}
         )
-        listed_ids = {c["conversation_id"] for c in listed["conversations"]}
-        assert conversation_id in listed_ids
+        listed_default_ids = {c["conversation_id"] for c in listed_default["conversations"]}
+        assert conversation_id not in listed_default_ids
+
+        listed_archived = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_list_conversations",
+            {"include_archived": True},
+        )
+        listed_archived_ids = {c["conversation_id"] for c in listed_archived["conversations"]}
+        assert conversation_id in listed_archived_ids
         listed_conv = next(
-            c for c in listed["conversations"] if c["conversation_id"] == conversation_id
+            c for c in listed_archived["conversations"] if c["conversation_id"] == conversation_id
         )
         assert listed_conv["archived"] is True
 
@@ -4164,6 +4208,130 @@ class TestListConversationsTool:
                 "comms_list_conversations",
                 {field: value},
             )
+
+    async def test_archived_and_expired_default_exclusion_and_opt_in(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """TECH-6196: comms_list_conversations excludes archived and expired
+        conversations by default; include_archived=True, include_expired=True,
+        and state='expired' opt in."""
+        creator_token = _token("listconv-tool-arch-c")
+        await _register(main, test_session_factory, "listconv-tool-arch-c")
+        target = await _register(main, test_session_factory, "listconv-tool-arch-t")
+
+        # Active conversation
+        active_conv = await _call(
+            main,
+            test_session_factory,
+            creator_token,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [target["agent_id"]],
+                "message_type": "availability_request",
+                "initial_message": _availability_request(),
+            },
+        )
+
+        # Archived conversation
+        arch_conv = await _call(
+            main,
+            test_session_factory,
+            creator_token,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [target["agent_id"]],
+                "message_type": "availability_request",
+                "initial_message": _availability_request(),
+            },
+        )
+        await _call(
+            main,
+            test_session_factory,
+            creator_token,
+            "comms_archive_conversation",
+            {"conversation_id": arch_conv["conversation_id"]},
+        )
+
+        # Expired conversation
+        already_expired = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
+        exp_conv = await _call(
+            main,
+            test_session_factory,
+            creator_token,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [target["agent_id"]],
+                "message_type": "availability_request",
+                "initial_message": _availability_request(),
+                "expires_at": already_expired,
+            },
+        )
+
+        # Default listing: only active_conv is returned
+        default_res = await _call(
+            main, test_session_factory, creator_token, "comms_list_conversations"
+        )
+        default_ids = {c["conversation_id"] for c in default_res["conversations"]}
+        assert active_conv["conversation_id"] in default_ids
+        assert arch_conv["conversation_id"] not in default_ids
+        assert exp_conv["conversation_id"] not in default_ids
+
+        # include_archived=True surfaces archived (not expired)
+        arch_res = await _call(
+            main,
+            test_session_factory,
+            creator_token,
+            "comms_list_conversations",
+            {"include_archived": True},
+        )
+        arch_ids = {c["conversation_id"] for c in arch_res["conversations"]}
+        assert active_conv["conversation_id"] in arch_ids
+        assert arch_conv["conversation_id"] in arch_ids
+        assert exp_conv["conversation_id"] not in arch_ids
+
+        # include_expired=True surfaces expired (not archived)
+        exp_res = await _call(
+            main,
+            test_session_factory,
+            creator_token,
+            "comms_list_conversations",
+            {"include_expired": True},
+        )
+        exp_ids = {c["conversation_id"] for c in exp_res["conversations"]}
+        assert active_conv["conversation_id"] in exp_ids
+        assert arch_conv["conversation_id"] not in exp_ids
+        assert exp_conv["conversation_id"] in exp_ids
+
+        # state='expired' surfaces expired even without include_expired=True
+        state_exp_res = await _call(
+            main,
+            test_session_factory,
+            creator_token,
+            "comms_list_conversations",
+            {"state": "expired"},
+        )
+        state_exp_ids = {c["conversation_id"] for c in state_exp_res["conversations"]}
+        assert exp_conv["conversation_id"] in state_exp_ids
+        assert active_conv["conversation_id"] not in state_exp_ids
+        assert arch_conv["conversation_id"] not in state_exp_ids
+
+        # Both include_archived=True and include_expired=True surfaces all 3
+        all_res = await _call(
+            main,
+            test_session_factory,
+            creator_token,
+            "comms_list_conversations",
+            {"include_archived": True, "include_expired": True},
+        )
+        all_ids = {c["conversation_id"] for c in all_res["conversations"]}
+        assert active_conv["conversation_id"] in all_ids
+        assert arch_conv["conversation_id"] in all_ids
+        assert exp_conv["conversation_id"] in all_ids
 
 
 # --- Approval pipeline (TECH-5389 PR2) ---------------------------------------
