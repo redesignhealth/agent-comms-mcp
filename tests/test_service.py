@@ -9517,6 +9517,98 @@ class TestListConversations:
         returned_ids = {c["conversation_id"] for c in all_convs}
         assert returned_ids == {str(convs[0].id), str(convs[2].id)}
 
+    async def test_explicit_state_takes_precedence_over_include_expired(
+        self, session: AsyncSession
+    ) -> None:
+        """Regression: an explicit state filter must be applied exactly, with
+        no expired rows OR'd in just because include_expired=True was also
+        passed. state="completed", include_expired=True must return ONLY the
+        completed conversation, never the expired one."""
+        creator = await _register(session, "listconv-state-vs-expired-c")
+        target = await _register(session, "listconv-state-vs-expired-t")
+
+        completed_conv = await start_conversation(
+            session,
+            actor_sub=creator.sub,
+            initiator_agent_id=creator.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+        )
+        completed_conv.state = "completed"
+
+        expired_conv = await start_conversation(
+            session,
+            actor_sub=creator.sub,
+            initiator_agent_id=creator.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            expires_at=datetime.now(UTC) - timedelta(seconds=1),
+        )
+        expired_conv.state = "expired"
+        await session.commit()
+
+        result = await list_conversations(
+            session, caller_agent_id=creator.id, state="completed", include_expired=True
+        )
+        ids = {c["conversation_id"] for c in result["conversations"]}
+        assert ids == {str(completed_conv.id)}
+
+    async def test_explicit_active_and_canceled_state_ignore_include_expired(
+        self, session: AsyncSession
+    ) -> None:
+        """Same regression as above for state="active" and state="canceled":
+        include_expired=True must not leak the expired conversation into
+        results filtered to a different, explicit state."""
+        creator = await _register(session, "listconv-state-vs-expired-c2")
+        target = await _register(session, "listconv-state-vs-expired-t2")
+
+        active_conv = await start_conversation(
+            session,
+            actor_sub=creator.sub,
+            initiator_agent_id=creator.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+        )
+
+        canceled_conv = await start_conversation(
+            session,
+            actor_sub=creator.sub,
+            initiator_agent_id=creator.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+        )
+        canceled_conv.state = "canceled"
+
+        expired_conv = await start_conversation(
+            session,
+            actor_sub=creator.sub,
+            initiator_agent_id=creator.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            expires_at=datetime.now(UTC) - timedelta(seconds=1),
+        )
+        expired_conv.state = "expired"
+        await session.commit()
+
+        active_result = await list_conversations(
+            session, caller_agent_id=creator.id, state="active", include_expired=True
+        )
+        assert {c["conversation_id"] for c in active_result["conversations"]} == {
+            str(active_conv.id)
+        }
+
+        canceled_result = await list_conversations(
+            session, caller_agent_id=creator.id, state="canceled", include_expired=True
+        )
+        assert {c["conversation_id"] for c in canceled_result["conversations"]} == {
+            str(canceled_conv.id)
+        }
+
 
 # --- OwnershipClient pluggable seam (TECH-5396 open question 1) -------------------
 #

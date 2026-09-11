@@ -168,7 +168,7 @@ from collections.abc import Set as AbstractSet
 from datetime import UTC, datetime, timedelta
 from typing import Any, NoReturn, Protocol
 
-from sqlalchemy import and_, func, literal, not_, or_, select, text, tuple_
+from sqlalchemy import ColumnElement, and_, func, literal, not_, or_, select, text, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -2799,13 +2799,16 @@ async def list_conversations(
     - ``role``: ``"owner"``, ``"member"``, or ``None`` for any role.
     - ``conversation_type``: one of ``CONVERSATION_TYPES`` or ``None`` for any.
     - ``state``: one of ``"active"``, ``"completed"``, ``"canceled"``,
-      ``"expired"``, or ``None`` for any. Passing an explicit state (e.g.
-      ``state="expired"``) overrides ``include_expired=False``.
+      ``"expired"``, or ``None`` for any. Passing an explicit state takes
+      exact precedence over ``include_expired`` — ``state="expired"``
+      surfaces expired conversations regardless of ``include_expired``, and
+      any other explicit state (e.g. ``"completed"``) returns exactly that
+      state with no expired rows OR'd in, regardless of ``include_expired``.
     - ``include_archived``: ``bool`` (default ``False``). When ``False``,
       conversations with ``archived_at IS NOT NULL`` are excluded.
-    - ``include_expired``: ``bool`` (default ``False``). When ``False``,
-      conversations in the ``"expired"`` state (or active past ``expires_at``)
-      are excluded unless explicitly requested via ``state="expired"``.
+    - ``include_expired``: ``bool`` (default ``False``). Only relevant when
+      ``state`` is ``None``. When ``False``, conversations in the
+      ``"expired"`` state (or active past ``expires_at``) are excluded.
 
     Keyset-paginated over ``(created_at DESC, id DESC)`` — pass back the
     ``next_cursor`` value from a prior response to get the next page.
@@ -2847,9 +2850,12 @@ async def list_conversations(
         # match almost nothing for "expired". Reconcile against
         # expires_at directly rather than eagerly expiring every row this
         # query would otherwise touch.
-        # An explicit state filter overrides the default expired-hiding:
-        # state="expired" surfaces expired conversations even if
-        # include_expired=False.
+        # An explicit state filter takes exact precedence over
+        # include_expired: state="expired" surfaces expired conversations
+        # even if include_expired=False, and state="completed" (or any
+        # other explicit state) must return ONLY that state — it must not
+        # have expired rows OR'd in just because include_expired=True.
+        state_cond: ColumnElement[bool]
         if state == "active":
             state_cond = (Conversation.state == "active") & (Conversation.expires_at > now)
         elif state == "expired":
@@ -2857,10 +2863,7 @@ async def list_conversations(
         else:
             state_cond = Conversation.state == state
 
-        if include_expired and state != "expired":
-            stmt = stmt.where(or_(state_cond, is_expired))
-        else:
-            stmt = stmt.where(state_cond)
+        stmt = stmt.where(state_cond)
     elif not include_expired:
         stmt = stmt.where(not_(is_expired))
 
