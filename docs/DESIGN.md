@@ -61,6 +61,25 @@ pattern today: `RISK_SCORER`, `AUTO_APPROVER`, `APPROVAL_NOTIFIER`, `ACTIVE_CHEC
 `service.py`, for the cycle reason documented there). An eighth seam should look exactly
 like the first seven.
 
+**Proposals must follow the identical flow shape as message risk-scoring — submit,
+score, approve, then act — never a bespoke pipeline.** A proposal is submitted
+(`create_proposal`), classified and judged by a plugin (`PROPOSAL_JUDGE.classify`/
+`.judge`), and routed through the same approve-or-escalate-to-a-human state machine
+every other risk-scored artifact here uses — §9's Axis 2 is the template both share.
+Approval, automatic or human, is a state transition this repo owns, claims, and
+audits; it is never itself a judgment about whether the underlying action is a good
+idea. Only after a hold reaches an approved state does this repo invoke
+`PROPOSAL_JUDGE.apply()` to perform the actual external write, exactly once, under
+the same claim/idempotency guarantees as every other terminal transition here.
+
+A board-owned scorer is not itself a violation of the principle above —
+`RISK_SCORER`'s production default, `BoundaryCrossingScorer` (`boundary_v1`), lives
+in this repo's own `plugins.py` because its logic (conversation type, message type,
+ownership-boundary topology) is genuinely generic. What must never live here is an
+org-specific scorer or judge: one that knows a Linear team key, a GitHub PR
+convention, or which bot may auto-approve what. Any future proposal `kind`, or any
+future proposal-adjacent pipeline, must reuse this exact shape.
+
 **Every built-in default must be safe in a bare deployment, and safe means inert, not
 permissive.** `escalate_all` never clears a hold. `reject_all` denies every `docs`
 message. `escalate_all_proposals` never auto-approves and never claims to have applied
