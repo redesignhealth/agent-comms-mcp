@@ -41,25 +41,49 @@ Three things must never live in this repo:
    elsewhere.
 3. **Write-actions against external services.** No API client for Linear, GitHub, Slack,
    Jira, Google, Salesforce, an internal registry, or anything else that this service
-   mutates on a caller's behalf. The board persists a decision and hands it to a
-   plugin; the plugin performs the write and reports a structured outcome back. The only
-   outbound HTTP this repo may contain is transport-generic and pipeline-agnostic (e.g.
+   mutates on a caller's behalf. The board persists a decision; a SEPARATE, network-isolated
+   deployment performs the write and reports a structured outcome back over HTTP -- never an
+   in-process plugin call, unlike judgment (see the distinction below). The only outbound
+   HTTP this repo's own process may initiate is transport-generic and pipeline-agnostic (e.g.
    `WebhookNotifier`'s signed POST to an operator-configured URL, which knows nothing
-   about what is on the other end).
+   about what is on the other end) or a call to a required seam's own HTTP-backed
+   implementation (e.g. an action-performing seam's built-in HTTP client, calling
+   whatever URL that seam's own env var points at) -- never a bespoke, pipeline-specific
+   integration client living in this repo.
 
-**The mechanism is always the same, and it already exists.** §9's "Axis 2: per-message
-risk scoring (pluggable)" is the template and the precedent: a `Protocol` interface in
-`plugins.py`, a value type the caller pattern-matches on, a registry, a safe built-in
-default, and resolution through `plugins.resolve_plugin` -- which accepts either a
+   **Judgment vs. action -- the distinction that actually matters.** Not every
+   org-specific plugin call needs to leave this process. `AUTO_APPROVER`'s real
+   implementation (Arc-site lookups, an instruction registry, LLM content judges --
+   all genuinely org-specific) runs in-process, imported into this repo's own derived
+   image, exactly like `RISK_SCORER`/`ACTIVE_CHECKER`/`APPROVAL_NOTIFIER`/`DOCS_VERIFIER`.
+   That's fine, because it only ever *judges* -- it may perform a read-only external
+   lookup to inform its decision, but it never mutates anything outside this board's own
+   tables. What crosses the line is a **write**: an actual mutation in another system
+   (a Linear ticket, a GitHub comment). Any seam method that performs one MUST run in a
+   genuinely separate, network-isolated deployment -- this repo calls it over HTTP, it
+   never imports or executes that code itself, and it never holds the credential that
+   write requires. `PROPOSAL_JUDGE` is the concrete example: `classify()`/`fingerprint()`/
+   `judge()` are judgment (in-process, same as `AUTO_APPROVER`); `apply()` is action (HTTP
+   call to `agent-comms-approvals`' own deployed service, never in-process -- see the
+   historical note below for why this had to be corrected after initially shipping
+   `apply()` in-process too).
+
+**The mechanism is always the same for judgment, and it already exists.** §9's "Axis 2:
+per-message risk scoring (pluggable)" is the template and the precedent: a `Protocol`
+interface in `plugins.py`, a value type the caller pattern-matches on, a registry, a safe
+built-in default, and resolution through `plugins.resolve_plugin` -- which accepts either a
 registry name or a `"pkg.module:factory"` import path resolved via `importlib`, so a
 deployment plugs in a private implementation from its own package on `PYTHONPATH` without
 forking this repo. Every seam is validated at process start
 (`plugins.validate_configuration()`, called from `main._cli()`), so a misconfiguration is
 loud at boot rather than lazy on the first request that needs it. Seven seams follow this
-pattern today: `RISK_SCORER`, `AUTO_APPROVER`, `APPROVAL_NOTIFIER`, `ACTIVE_CHECKER`,
-`DOCS_VERIFIER`, `PROPOSAL_JUDGE` (all in `plugins.py`), plus `OWNERSHIP_CLIENT` (in
-`service.py`, for the cycle reason documented there). An eighth seam should look exactly
-like the first seven.
+in-process pattern today for their judgment methods: `RISK_SCORER`, `AUTO_APPROVER`,
+`APPROVAL_NOTIFIER`, `ACTIVE_CHECKER`, `DOCS_VERIFIER`, `PROPOSAL_JUDGE`'s `classify`/
+`fingerprint`/`judge` (all in `plugins.py`), plus `OWNERSHIP_CLIENT` (in `service.py`, for
+the cycle reason documented there). A future judgment-only seam should look exactly like
+these. A seam whose job is to perform a genuine external write -- like `PROPOSAL_JUDGE.
+apply()` -- must NOT follow this in-process pattern; see the judgment-vs-action
+distinction immediately below.
 
 **Proposals must follow the identical flow shape as message risk-scoring -- submit,
 score, approve, then act -- never a bespoke pipeline.** A proposal is submitted
@@ -68,9 +92,11 @@ score, approve, then act -- never a bespoke pipeline.** A proposal is submitted
 every other risk-scored artifact here uses -- §9's Axis 2 is the template both share.
 Approval, automatic or human, is a state transition this repo owns, claims, and
 audits; it is never itself a judgment about whether the underlying action is a good
-idea. Only after a hold reaches an approved state does this repo invoke
-`PROPOSAL_JUDGE.apply()` to perform the actual external write, exactly once, under
-the same claim/idempotency guarantees as every other terminal transition here.
+idea. Only after a hold reaches an approved state does this repo call
+`PROPOSAL_JUDGE.apply()` -- an HTTP call to `agent-comms-approvals`' own separately
+deployed service, never an in-process plugin invocation -- to perform the actual
+external write, exactly once, under the same claim/idempotency guarantees as every
+other terminal transition here.
 
 A board-owned scorer is not itself a violation of the principle above --
 `RISK_SCORER`'s production default, `BoundaryCrossingScorer` (`boundary_v1`), lives
@@ -90,17 +116,28 @@ auto-approves because the payload "looks fine," or that writes somewhere because
 credential happened to be present -- is a bug in this repo regardless of how convenient it
 is for the deployment that wrote it.
 
-**Where the org-specific half lives.** For Redesign Health, all of it is
+**Where the org-specific half lives.** For Redesign Health, judgment-only seams
+(`RISK_SCORER`/`AUTO_APPROVER`/`APPROVAL_NOTIFIER`/`ACTIVE_CHECKER`/`DOCS_VERIFIER`, plus
+`PROPOSAL_JUDGE`'s `classify`/`fingerprint`/`judge`) are all
 `redesignhealth/agent-comms-approvals`' `rh_comms_plugins` package, layered onto this
 repo's published image by that repo's `Dockerfile.board-derived` and pointed at by env
 vars set in `rh-data-platform`'s Terraform. That package deliberately does **not** import
 `agent-comms-mcp` -- it implements each seam structurally (duck-typed), producing and
 consuming value types by shape rather than by class identity, because a dependency edge
 in that direction would be circular with the derived-image build chain. Preserve that:
-when adding a seam, do not design an interface that can only be implemented by importing
-this package. Value types crossing a seam should be plain `NamedTuple`s of primitives,
-dicts, and UUIDs; expected failures should be *returned* as typed outcomes rather than
-*raised* as exceptions the other side cannot name.
+when adding a judgment-only seam, do not design an interface that can only be implemented
+by importing this package. Value types crossing a seam should be plain `NamedTuple`s of
+primitives, dicts, and UUIDs; expected failures should be *returned* as typed outcomes
+rather than *raised* as exceptions the other side cannot name.
+
+`PROPOSAL_JUDGE.apply()` is the one exception, and deliberately does NOT follow the
+pattern above: it is never imported into this repo's derived image, and its real
+implementation is not resolved via `plugins.resolve_plugin` at all. It runs as an HTTP
+endpoint inside `agent-comms-approvals`' own separately deployed service (the same one
+`decision_page`/`ownership_api` already run in, reachable only over the tailnet), and
+this repo's own `PROPOSAL_JUDGE` seam calls it as an HTTP client. Only that separate
+deployment ever holds `GITHUB_TOKEN`/`LINEAR_API_TOKEN` or whatever other write-capable
+credential a given `apply()` implementation needs.
 
 **The test for a proposed change is mechanical, not a matter of taste.** Ask: *would a
 different company, deploying this board for a completely different purpose, want this
@@ -116,7 +153,13 @@ generic rather than generic-looking.
 `service.py` carried a `_PROPOSAL_RULES` registry of Linear/GitHub-specific auto-approval
 rules, and this repo carried `linear_client.py`, `github_client.py`, `team_allowlist.py`,
 `workflow_order.py`, and `citation_urls.py` outright. That was migrated behind the
-`PROPOSAL_JUDGE` seam. This section exists so the same drift is caught in review next
+`PROPOSAL_JUDGE` seam -- but the first attempt at that migration still shipped `apply()`
+as an in-process plugin call (imported into this repo's own derived image, holding a live
+`GITHUB_TOKEN`/`LINEAR_API_TOKEN` inside this repo's own container), which is the SAME
+violation restated: a package-boundary fix (different git repo) without a runtime-boundary
+fix (same process, same credential). Corrected by moving `apply()` specifically to run as
+an HTTP endpoint inside `agent-comms-approvals`' own separately deployed service -- see the
+judgment-vs-action distinction above. This section exists so the same drift is caught in review next
 time rather than after the fact.
 
 ## 2. Why this shape (research summary)
