@@ -404,7 +404,16 @@ docker compose up --build
 > - `PROPOSAL_JUDGE` must point at a real implementation (provisioned via SSM at
 >   `/reclaw-comms/{env}/proposal-judge`, e.g. `rh_comms_plugins.proposal_judge:get_proposal_judge`).
 >   Unset, the board safely defaults to `escalate_all_proposals`, which never
->   auto-approves or applies any proposal.
+>   auto-approves or applies any proposal. This safe-default behavior depends
+>   on the variable being genuinely ABSENT from the process environment, not
+>   set to an empty string -- `plugins.resolve_plugin`'s `os.environ.get(key,
+>   default)` only applies its Python-side default when the key is missing
+>   entirely; an empty-string value bypasses it and crashes at boot instead.
+>   ECS's task definition simply omits the variable when unconfigured, and
+>   `docker-compose.yml` (this repo's local dev stack) likewise never lists
+>   `PROPOSAL_JUDGE` in its `environment:` block -- the same treatment every
+>   other optional seam var (e.g. `OWNERSHIP_CLIENT`) already gets there -- so
+>   neither deployment path can produce the empty-string passthrough.
 > - For Redesign Health, `agent-comms-approvals` (PR #62) must be deployed with the
 >   concrete judge implementation before this service's release runs with `PROPOSAL_JUDGE`
 >   configured, or the import will fail at boot.

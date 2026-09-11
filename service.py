@@ -5973,10 +5973,20 @@ _PROPOSAL_TRUNCATED_SUFFIX = "... [truncated]"
 def _truncate_proposal_string(text: str, max_length: int) -> str:
     """Truncate ``text`` to at most ``max_length`` characters, appending
     ``"... [truncated]"`` if truncated.
+
+    Argus review round-9 suggestion: without the ``max(0, ...)`` clamp
+    below, ``prefix_len`` would go negative for a ``max_length`` shorter
+    than ``_PROPOSAL_TRUNCATED_SUFFIX`` itself (15 chars) -- a negative
+    slice index returns most of ``text`` rather than a short prefix, so
+    the result would silently balloon back up to roughly ``len(text)``.
+    Every current caller passes 500 or 2000, both safely above 15, but
+    clamp to 0 anyway so a future small-``max_length`` caller gets a
+    bounded (at most ``len(_PROPOSAL_TRUNCATED_SUFFIX)``-character) result
+    instead of that unbounded blowup.
     """
     if len(text) <= max_length:
         return text
-    prefix_len = max_length - len(_PROPOSAL_TRUNCATED_SUFFIX)
+    prefix_len = max(0, max_length - len(_PROPOSAL_TRUNCATED_SUFFIX))
     return text[:prefix_len] + _PROPOSAL_TRUNCATED_SUFFIX
 
 
@@ -7272,6 +7282,16 @@ def _cancellation_apply_error(exc: asyncio.CancelledError) -> str:
 
 _APPLY_ERROR_PLUGIN_CONTRACT_VIOLATION_MESSAGE = "unable to apply this proposal"
 
+# Argus review round-9 S1: distinct from the plugin-contract-violation
+# message above -- this is a fault entirely on the board's own side (a
+# terminal-commit failure, e.g. a database error or serialization issue),
+# nothing to do with the configured judge plugin. Used only by the
+# terminal-commit recovery path in `_apply_or_finalize_proposal_hold`, and
+# only as a fallback when that branch's own computed terminal state had no
+# more specific `apply_error` of its own to preserve (see that function's
+# recovery block).
+_APPLY_ERROR_BOARD_COMMIT_FAILURE_MESSAGE = "apply failed due to a board infrastructure error"
+
 
 async def _safe_apply(judge: ProposalJudge, ctx: ProposalContext) -> ProposalApplyOutcome:
     """Call the injected ``plugins.ProposalJudge.apply()`` defensively.
@@ -7644,6 +7664,18 @@ async def _apply_or_finalize_proposal_hold(
             action="proposal.applied",
             detail={"hold_id": str(hold_id), "target_id": target_id},
         )
+    # Argus review round-9 B1: capture the terminal state this branch just
+    # computed into local variables BEFORE the commit below, so the
+    # recovery block on a commit failure can re-apply the SAME intended
+    # values instead of discarding them and unconditionally overwriting
+    # with "apply_failed" (see that block's own comment for why that was
+    # wrong).
+    terminal_status = hold.status
+    terminal_apply_result = hold.apply_result
+    terminal_apply_error = hold.apply_error
+    terminal_applied_at = hold.applied_at
+    terminal_decision_note = hold.decision_note
+    terminal_decided_at = hold.decided_at
     # Argus review round-6 suggestion: a SECOND cancellation delivered while
     # this terminal write (re-fetch through commit/refresh above and below)
     # is in flight could still strand the row at `expected_status`, the
@@ -7667,31 +7699,57 @@ async def _apply_or_finalize_proposal_hold(
     except asyncio.CancelledError:
         raise
     except Exception as commit_exc:
-        # If the terminal commit fails (e.g. database error or serialization issue),
-        # roll back and attempt to resolve the row to apply_failed rather than
-        # leaving it permanently stranded at `expected_status` ("applying").
+        # If the terminal commit fails (e.g. database error or serialization
+        # issue), roll back and attempt to re-apply the SAME terminal state
+        # captured above rather than discarding it (Argus review round-9
+        # B1): unconditionally overwriting with "apply_failed" here would
+        # silently downgrade a genuine "applied" outcome whose external
+        # write already succeeded -- a caller seeing that false failure
+        # would retry and duplicate the write -- and would re-stamp the
+        # ORIGINAL (pre-staleness-check) `decision_note` onto a "stale" row
+        # instead of the honest `_stale_decision_note` text.
         logger.warning(
             "proposal terminal commit failed for hold_id=%s target_id=%s: %s; "
-            "attempting recovery to apply_failed to avoid stranding row",
+            "attempting recovery to %s to avoid stranding row",
             hold_id,
             target_id,
             commit_exc,
+            terminal_status,
             exc_info=True,
         )
         await session.rollback()
         try:
             recovery_hold = await _find_proposal_hold(session, hold_id, for_update=True)
             if recovery_hold is not None and recovery_hold.status == expected_status:
-                recovery_hold.status = "apply_failed"
-                recovery_hold.apply_error = _APPLY_ERROR_PLUGIN_CONTRACT_VIOLATION_MESSAGE
+                recovery_hold.status = terminal_status
+                # Argus review round-9 S1: preserve a genuine, already-
+                # computed `apply_error` (a real plugin `caller_error` or
+                # `_APPLY_ERROR_CANCELLED_MESSAGE`) rather than replacing
+                # it -- only fall back to the board-owned commit-failure
+                # message when this branch never set one (i.e. it isn't
+                # actually reachable today, since "apply_failed" always
+                # sets one, but guards against misattributing a future
+                # apply_failed-without-apply_error branch to the plugin).
+                recovery_hold.apply_error = terminal_apply_error or (
+                    _APPLY_ERROR_BOARD_COMMIT_FAILURE_MESSAGE
+                    if terminal_status == "apply_failed"
+                    else None
+                )
+                if terminal_apply_result is not None:
+                    recovery_hold.apply_result = terminal_apply_result
+                recovery_hold.applied_at = terminal_applied_at
                 recovery_hold.decision_source = decision_source
                 recovery_hold.decided_by_actor_id = decided_by_actor_id
-                recovery_hold.decided_at = _now()
-                recovery_hold.decision_note = decision_note
+                recovery_hold.decided_at = terminal_decided_at
+                recovery_hold.decision_note = terminal_decision_note
+                audit_action = {
+                    "applied": "proposal.applied",
+                    "stale": "proposal.stale",
+                }.get(terminal_status, "proposal.apply_failed")
                 _audit(
                     session,
                     actor_sub=decided_by_actor_id,
-                    action="proposal.apply_failed",
+                    action=audit_action,
                     detail={
                         "hold_id": str(hold_id),
                         "target_id": target_id,
@@ -7700,10 +7758,32 @@ async def _apply_or_finalize_proposal_hold(
                 )
                 await session.commit()
                 await session.refresh(recovery_hold)
-                return _proposal_dict(recovery_hold)
-        except Exception:
+                result = _proposal_dict(recovery_hold)
+                # Argus review round-9 B2: every OTHER return path in this
+                # function re-raises a cancellation caught earlier before
+                # returning (see the early-return above and the normal
+                # return below) -- a caller cancelled mid-apply is owed a
+                # cancelled task regardless of which return path fires;
+                # this recovery path must honor the same invariant instead
+                # of silently swallowing it.
+                if cancelled_exc is not None:
+                    raise cancelled_exc
+                return result
+        except Exception as recovery_exc:
+            logger.warning(
+                "proposal recovery commit also failed for hold_id=%s target_id=%s: %s",
+                hold_id,
+                target_id,
+                recovery_exc,
+                exc_info=True,
+            )
             await session.rollback()
-            raise commit_exc from None
+            # Argus review round-9 S2: chain `recovery_exc` explicitly
+            # (ruff B904) rather than suppressing it with `from None` --
+            # if this SECOND commit raised a DIFFERENT error, that error
+            # must stay visible in logs/tracebacks instead of vanishing
+            # silently.
+            raise commit_exc from recovery_exc
         raise commit_exc
     # `updated_at`'s onupdate=text("now()") (models.py) leaves the ORM
     # attribute expired after this UPDATE's commit -- `_proposal_dict`

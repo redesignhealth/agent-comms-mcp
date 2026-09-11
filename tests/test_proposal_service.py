@@ -28,7 +28,7 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 from sqlalchemy import select, text, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from exceptions import (
@@ -49,6 +49,7 @@ from plugins import (
     ProposalVerdict,
 )
 from service import (
+    _APPLY_ERROR_BOARD_COMMIT_FAILURE_MESSAGE,
     _APPLY_ERROR_CANCELLED_MESSAGE,
     MAX_PROPOSALS_PER_BOT_PER_WINDOW,
     PROPOSAL_SUBMITTER_SURFACES,
@@ -1406,6 +1407,209 @@ class TestDecideProposal:
             await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
         assert exc_info.value.status == "applying"
         assert judge.apply_calls == []
+
+
+class TestTerminalCommitFailureRecovery:
+    """Argus review round-9 B1/B2/S1/S2: the terminal-commit failure
+    recovery block in ``_apply_or_finalize_proposal_hold`` had zero test
+    coverage despite claims elsewhere that the stranded-row scenario
+    couldn't happen. Simulates a DB-level failure on exactly the terminal
+    commit (the 3rd ``session.commit()`` of a normal approve call -- see
+    ``_fail_nth_commit`` below for the exact count) via a monkeypatched
+    ``session.commit``, never by faking anything about the judge/plugin
+    seam itself."""
+
+    @staticmethod
+    def _fail_nth_commit(session: AsyncSession, fail_at: int, *exceptions: Exception) -> AsyncMock:
+        """Build a ``session.commit`` replacement that raises
+        ``exceptions[0]`` on the ``fail_at``-th call, ``exceptions[1]`` on
+        the ``(fail_at + 1)``-th call (if provided), and so on past the
+        end of ``exceptions`` -- every other call delegates to the real
+        ``session.commit``."""
+        real_commit = session.commit
+        call_count = {"n": 0}
+
+        async def _commit() -> None:
+            call_count["n"] += 1
+            index = call_count["n"] - fail_at
+            if 0 <= index < len(exceptions):
+                raise exceptions[index]
+            await real_commit()
+
+        return AsyncMock(side_effect=_commit)
+
+    async def test_recovery_after_commit_failure_recovers_to_applied_with_result_intact(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A post-apply terminal commit failure must recover to
+        ``"applied"`` with ``apply_result`` intact, NOT ``"apply_failed"``
+        (fix (a)) -- the external write already happened; discarding that
+        and reporting failure would cause a retrying caller to duplicate
+        it."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result={"ticket": "TECH-1"}, caller_error=None, log_detail=None
+            ),
+        )
+        submitted = await _submit(session, judge=judge)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        monkeypatch.setattr(
+            session,
+            "commit",
+            self._fail_nth_commit(session, 3, OperationalError("boom", {}, Exception("db down"))),
+        )
+
+        decided = await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
+
+        assert decided["status"] == "applied"
+        assert decided["apply_result"] == {"ticket": "TECH-1"}
+        assert "apply_error" not in decided
+        assert len(judge.apply_calls) == 1
+        audit_row = (
+            (
+                await session.execute(
+                    select(AuditLog).where(
+                        AuditLog.action == "proposal.applied",
+                        AuditLog.detail["hold_id"].astext == str(hold_id),
+                    )
+                )
+            )
+            .scalars()
+            .one()
+        )
+        assert "boom" in audit_row.detail["error"] or "db down" in audit_row.detail["error"]
+
+    async def test_recovery_after_commit_failure_recovers_to_stale(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A post-stale terminal commit failure must recover to
+        ``"stale"`` with the honest ``_stale_decision_note`` text, not
+        ``"apply_failed"`` (fix (a))."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-original"),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result=None, caller_error=None, log_detail=None
+            ),
+        )
+        submitted = await _submit(session, judge=judge)
+        judge.fingerprint_result = ProposalFingerprint(
+            status=FINGERPRINT_DIGEST, digest="fp-drifted"
+        )
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        monkeypatch.setattr(
+            session,
+            "commit",
+            self._fail_nth_commit(session, 3, OperationalError("boom", {}, Exception("db down"))),
+        )
+
+        decided = await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
+
+        assert decided["status"] == "stale"
+        assert decided["decision_note"] == (
+            "not applied: target changed after approval; no Linear write was performed"
+        )
+        assert "apply_error" not in decided
+        assert judge.apply_calls == []
+        audit_row = (
+            (
+                await session.execute(
+                    select(AuditLog).where(
+                        AuditLog.action == "proposal.stale",
+                        AuditLog.detail["hold_id"].astext == str(hold_id),
+                    )
+                )
+            )
+            .scalars()
+            .one()
+        )
+        assert audit_row is not None
+
+    async def test_recovery_after_commit_failure_recovers_to_apply_failed(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A post-apply_failed terminal commit failure must recover to
+        ``"apply_failed"`` with the GENUINE plugin ``caller_error``
+        preserved, not the board-owned commit-failure message (fix (a) +
+        the "preserve existing apply_error" half of fix S1)."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_result=ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error="Linear API returned an error",
+                log_detail="linear is down",
+            ),
+        )
+        submitted = await _submit(session, judge=judge)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        monkeypatch.setattr(
+            session,
+            "commit",
+            self._fail_nth_commit(session, 3, OperationalError("boom", {}, Exception("db down"))),
+        )
+
+        decided = await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
+
+        assert decided["status"] == "apply_failed"
+        assert decided["apply_error"] == "Linear API returned an error"
+        assert decided["apply_error"] != _APPLY_ERROR_BOARD_COMMIT_FAILURE_MESSAGE
+
+    async def test_recovery_reraises_cancellation_instead_of_returning_normally(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Fix (b): every OTHER return path in this function re-raises a
+        ``cancelled_exc`` caught earlier before returning -- this recovery
+        path must too, instead of silently swallowing it and returning a
+        normal result as if nothing happened."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_raises=asyncio.CancelledError(),
+        )
+        submitted = await _submit(session, judge=judge)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        monkeypatch.setattr(
+            session,
+            "commit",
+            self._fail_nth_commit(session, 3, OperationalError("boom", {}, Exception("db down"))),
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
+
+        row = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        assert row.status == "apply_failed"
+        assert row.apply_error == _APPLY_ERROR_CANCELLED_MESSAGE
+
+    async def test_recovery_commit_also_failing_preserves_original_exception_context(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Fix S2: if the RECOVERY commit itself also fails, the original
+        (terminal) commit exception must propagate with the secondary
+        exception preserved as ``__context__`` -- ``raise commit_exc from
+        None`` would silently drop the secondary failure from logs/
+        tracebacks."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result=None, caller_error=None, log_detail=None
+            ),
+        )
+        submitted = await _submit(session, judge=judge)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        first_exc = OperationalError("first", {}, Exception("terminal commit failed"))
+        second_exc = OperationalError("second", {}, Exception("recovery commit also failed"))
+        monkeypatch.setattr(
+            session, "commit", self._fail_nth_commit(session, 3, first_exc, second_exc)
+        )
+
+        with pytest.raises(OperationalError) as exc_info:
+            await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
+
+        assert exc_info.value is first_exc
+        assert first_exc.__context__ is second_exc
 
 
 class TestProposalJudgeSeamValidation:

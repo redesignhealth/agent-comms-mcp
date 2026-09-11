@@ -538,9 +538,11 @@ def notifier_name(notifier: ApprovalNotifier) -> str:
 
 
 def validate_configuration() -> None:
-    """Fail fast at process start if any of the six seams in THIS MODULE
-    don't resolve. ``OWNERSHIP_CLIENT`` is the sixth board-wide seam (the
-    only one living in ``service.py``) and is validated separately, by
+    """Fail fast at process start if any of the six seams resolved by this
+    module don't resolve, five of which crash at boot on misconfiguration
+    (see below for the sixth's, ``PROPOSAL_JUDGE``'s, exception).
+    ``OWNERSHIP_CLIENT`` is the sixth board-wide seam (the only one living
+    in ``service.py``) and is validated separately, by
     ``service.validate_ownership_client_configuration()``; ``PROPOSAL_JUDGE``
     is the seventh board-wide seam (added by TECH-5872/TECH-5877).
 
@@ -1281,7 +1283,11 @@ class ProposalJudge(Protocol):
     - ``classify()``: ``ValueError`` is wrapped into a board-controlled
       message and mapped to 422.
     - ``fingerprint()``: ``error.detail`` is capped at 500 chars (truncated
-      with ``"... [truncated]"``).
+      with ``"... [truncated]"``), and ``error.status_code`` MUST be one of
+      ``{422, 500, 503}`` -- any other value (e.g. 404, 409, 429, all
+      reasonable-seeming choices) is silently replaced with a synthesized
+      500/``server_configuration_error`` rather than reaching the caller,
+      with no signal to the plugin that this happened.
     - ``judge()``: ``decision_note`` is capped at 2000 chars (truncated
       with ``"... [truncated]"``).
     - ``apply()``: ``caller_error`` is capped at 500 chars (truncated
@@ -1294,9 +1300,17 @@ class ProposalJudge(Protocol):
         Synchronous and side-effect-free by contract -- called before the
         rate-limit attempt marker is committed, so it must not perform I/O.
 
-        Raise ``ValueError`` for an unsupported ``kind``; the board wraps
-        that into a board-controlled message and maps it to 422, preserving
-        the original exception as ``__cause__`` for logging.
+        Raise ``ValueError`` for an unsupported ``kind``, and ONLY for an
+        unsupported ``kind`` -- never for any other reason (a malformed
+        ``action`` shape on an otherwise-supported ``kind``, for instance).
+        The board wraps that exception into a board-controlled
+        "unsupported proposal kind" message and maps it to 422, preserving
+        the original exception as ``__cause__`` for logging -- so a
+        ``ValueError`` raised for a different reason would surface to the
+        caller as a misleading "unsupported kind" error instead of
+        whatever the real problem was. Signal any other rejection some
+        other way (e.g. treat a malformed ``action`` as still classifiable,
+        deferring the real validation to ``fingerprint()``/``apply()``).
         """
         ...
 

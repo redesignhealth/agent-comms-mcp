@@ -1669,9 +1669,9 @@ this repo. All six are validated at process start
 existing `DATABASE_URL` fail-fast check): an unknown name, a bad import path,
 or (for `APPROVAL_NOTIFIER=webhook`) a missing `APPROVAL_WEBHOOK_URL`/
 `APPROVAL_WEBHOOK_SECRET` pair crashes at boot, never lazily on the first
-high-risk message (with the sole exception of `PROPOSAL_JUDGE`, which logs a
-startup WARNING when unset rather than crashing, since its default is safe but
-silently inert).
+high-risk message. Five of the six seams crash at boot on misconfiguration;
+`PROPOSAL_JUDGE` logs a startup WARNING instead, since its safe default
+(`escalate_all_proposals`) is inert.
 
 **Trust model for `pkg.module:factory` import paths (deliberate, not a
 vulnerability):** every current call site into `resolve_plugin_name` (both
@@ -1806,9 +1806,15 @@ wrapped defensively by the board (`service._classify_proposal`/`_safe_fingerprin
 `_safe_apply`, and the inline `judge.judge()` dispatch in `create_proposal`): a raising
 plugin, or one returning a contract-violating value (a `priority` outside
 `PROPOSAL_HOLD_LEVELS`, a non-boolean `approved` verdict, an unrecognized
-`fingerprint().status`, or an `applied=True` outcome with a non-`dict` result), is
+`fingerprint().status`, an `applied=True` outcome with a non-`dict` result, or a
+`ProposalTargetError.status_code` outside the allowlisted `{422, 500, 503}`), is
 rejected via 422 at submission time or normalized to a safe outcome (pending status or
-`apply_failed`) rather than reaching an unhandled 500 or a DB CHECK violation. For Redesign Health, the concrete implementation
+`apply_failed`) rather than reaching an unhandled 500 or a DB CHECK violation. Every
+caller-facing error/detail string surfaced through this seam (`ProposalTargetError.detail`,
+`ProposalApplyOutcome.caller_error`) is additionally capped at 500 characters, truncated
+with `"... [truncated]"` if exceeded, so a misbehaving or overly verbose plugin can't blow
+out a TEXT column or leak an unbounded upstream payload through the API. For Redesign
+Health, the concrete implementation
 (Linear/GitHub-backed deterministic rules) lives in `agent-comms-approvals`'
 `rh_comms_plugins.proposal_judge` -- see "The proposal submission pipeline" below.
 
