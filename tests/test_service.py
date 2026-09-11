@@ -48,6 +48,7 @@ from exceptions import (
     HoldAwaitingAutoReviewError,
     HoldExpiredError,
     InvalidConversationStateError,
+    InvalidExtendError,
     RateLimitExceededError,
     SchemaVersionMismatchError,
     SiblingIdentityExistsError,
@@ -81,10 +82,12 @@ from service import (
     archive_conversation,
     decline_invite,
     deregister_agent,
+    extend_conversation,
     get_conversation,
     inbox,
     leave,
     list_conversations,
+    may_extend,
     reconcile_agent_ownership,
     register_agent,
     rename_conversation,
@@ -482,7 +485,9 @@ async def _audit_actions(session: AsyncSession, conversation_id: uuid.UUID) -> l
     rows = (
         (
             await session.execute(
-                select(AuditLog.action).where(AuditLog.conversation_id == conversation_id)
+                select(AuditLog.action)
+                .where(AuditLog.conversation_id == conversation_id)
+                .order_by(AuditLog.id)
             )
         )
         .scalars()
@@ -4795,6 +4800,478 @@ class TestRenameConversation:
         ).scalar_one()
         assert row.detail is not None
         assert row.detail["name"] == "My Conversation"
+
+
+class TestMayExtend:
+    """TECH-6195: pure predicate tests for may_extend."""
+
+    def test_active_may_extend(self) -> None:
+        assert may_extend("active") is True
+
+    def test_other_statuses_cannot_extend(self) -> None:
+        for status in ("invited", "left", "declined", "suspended", "unknown"):
+            assert may_extend(status) is False
+
+
+class TestExtendConversation:
+    """TECH-6195: service-layer coverage for extend_conversation."""
+
+    async def _start(
+        self,
+        session: AsyncSession,
+        owner_sub: str,
+        target_sub: str,
+        expires_at: datetime | None = None,
+    ) -> Any:
+        owner = await _register(session, owner_sub)
+        target = await _register(session, target_sub)
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            expires_at=expires_at,
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        return owner, target, conversation
+
+    async def test_extending_active_conversation_pushes_expires_at_forward(
+        self, session: AsyncSession
+    ) -> None:
+        owner, _target, conversation = await self._start(
+            session, "ext-svc-owner-1", "ext-svc-target-1"
+        )
+        orig_expires_at = conversation.expires_at
+        extended = await extend_conversation(
+            session,
+            actor_sub=owner.sub,
+            agent_id=owner.id,
+            conversation_id=conversation.id,
+            extend_by_days=10,
+        )
+        assert extended.conversation.state == "active"
+        assert extended.resurrected is False
+        assert extended.previous_expires_at == orig_expires_at
+        expected_dt = orig_expires_at + timedelta(days=10)
+        assert abs((extended.conversation.expires_at - expected_dt).total_seconds()) < 2
+
+    async def test_extend_by_days_computes_relative_to_max_current_now(
+        self, session: AsyncSession
+    ) -> None:
+        # Case A: Future deadline -> relative to current expires_at
+        now = datetime.now(UTC)
+        future_dt = now + timedelta(days=10)
+        owner_a, _target_a, conv_a = await self._start(
+            session, "ext-svc-owner-2a", "ext-svc-target-2a", expires_at=future_dt
+        )
+        extended_a = await extend_conversation(
+            session,
+            actor_sub=owner_a.sub,
+            agent_id=owner_a.id,
+            conversation_id=conv_a.id,
+            extend_by_days=5,
+        )
+        # Should be future_dt + 5 days
+        assert (
+            abs(
+                (
+                    extended_a.conversation.expires_at - (future_dt + timedelta(days=5))
+                ).total_seconds()
+            )
+            < 2
+        )
+
+        # Case B: Lapsed deadline -> relative to now()
+        past_dt = now - timedelta(days=5)
+        owner_b, _target_b, conv_b = await self._start(
+            session, "ext-svc-owner-2b", "ext-svc-target-2b", expires_at=past_dt
+        )
+        extended_b = await extend_conversation(
+            session,
+            actor_sub=owner_b.sub,
+            agent_id=owner_b.id,
+            conversation_id=conv_b.id,
+            extend_by_days=5,
+        )
+        # Should be approximately now() + 5 days (NOT past_dt + 5 days which would be now)
+        expected_b = datetime.now(UTC) + timedelta(days=5)
+        assert abs((extended_b.conversation.expires_at - expected_b).total_seconds()) < 2
+
+    async def test_rejected_ttl_ceiling(self, session: AsyncSession) -> None:
+        owner, _target, conversation = await self._start(
+            session, "ext-svc-owner-3", "ext-svc-target-3"
+        )
+        now = datetime.now(UTC)
+        too_far = now + MAX_CONVERSATION_TTL + timedelta(seconds=10)
+        with pytest.raises(InvalidExtendError, match="expires_at"):
+            await extend_conversation(
+                session,
+                actor_sub=owner.sub,
+                agent_id=owner.id,
+                conversation_id=conversation.id,
+                expires_at=too_far,
+            )
+
+        # Also via extend_by_days when current expires_at is already in future
+        future_dt = now + timedelta(days=10)
+        owner_2, _target_2, conv_2 = await self._start(
+            session, "ext-svc-owner-3b", "ext-svc-target-3b", expires_at=future_dt
+        )
+        with pytest.raises(InvalidExtendError, match="expires_at"):
+            await extend_conversation(
+                session,
+                actor_sub=owner_2.sub,
+                agent_id=owner_2.id,
+                conversation_id=conv_2.id,
+                extend_by_days=85,  # 10 + 85 = 95 > 90
+            )
+
+    async def test_extend_by_days_exact_ceiling_boundary_on_lapsed_conversation_succeeds(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-6195: on a LAPSED (already-expired) conversation,
+        ``base_dt = max(expires_at, now()) == now()``, so
+        ``extend_by_days=90`` computes ``computed == now() + 90 days ==
+        MAX_CONVERSATION_TTL`` exactly. The ceiling check is
+        strictly-greater-than (``computed - now() > MAX_CONVERSATION_TTL``),
+        so this exact-boundary case must succeed, not raise -- previously
+        unverified."""
+        past_dt = datetime.now(UTC) - timedelta(days=1)
+        owner, _target, conversation = await self._start(
+            session, "ext-svc-owner-3c", "ext-svc-target-3c", expires_at=past_dt
+        )
+        before = datetime.now(UTC)
+        extended = await extend_conversation(
+            session,
+            actor_sub=owner.sub,
+            agent_id=owner.id,
+            conversation_id=conversation.id,
+            extend_by_days=90,
+        )
+        after = datetime.now(UTC)
+        assert extended.resurrected is True
+        assert extended.conversation.state == "active"
+        assert before + MAX_CONVERSATION_TTL <= extended.conversation.expires_at
+        assert extended.conversation.expires_at <= after + MAX_CONVERSATION_TTL
+
+    async def test_rejected_shortening_and_past(self, session: AsyncSession) -> None:
+        now = datetime.now(UTC)
+        future_dt = now + timedelta(days=10)
+        owner, _target, conversation = await self._start(
+            session, "ext-svc-owner-4", "ext-svc-target-4", expires_at=future_dt
+        )
+        # Attempt to shorten
+        with pytest.raises(InvalidExtendError, match="greater than"):
+            await extend_conversation(
+                session,
+                actor_sub=owner.sub,
+                agent_id=owner.id,
+                conversation_id=conversation.id,
+                expires_at=now + timedelta(days=5),
+            )
+
+        # Attempt to keep unchanged (not idempotent)
+        with pytest.raises(InvalidExtendError, match="greater than"):
+            await extend_conversation(
+                session,
+                actor_sub=owner.sub,
+                agent_id=owner.id,
+                conversation_id=conversation.id,
+                expires_at=conversation.expires_at,
+            )
+
+        # Attempt past deadline on lapsed conversation
+        past_dt = now - timedelta(days=10)
+        owner_past, _target_past, conv_past = await self._start(
+            session, "ext-svc-owner-4b", "ext-svc-target-4b", expires_at=past_dt
+        )
+        with pytest.raises(InvalidExtendError, match="future"):
+            await extend_conversation(
+                session,
+                actor_sub=owner_past.sub,
+                agent_id=owner_past.id,
+                conversation_id=conv_past.id,
+                expires_at=now - timedelta(days=5),
+            )
+
+    async def test_rejected_parameters(self, session: AsyncSession) -> None:
+        owner, _target, conversation = await self._start(
+            session, "ext-svc-owner-5", "ext-svc-target-5"
+        )
+        # Both provided
+        with pytest.raises(InvalidExtendError, match="provide exactly one"):
+            await extend_conversation(
+                session,
+                actor_sub=owner.sub,
+                agent_id=owner.id,
+                conversation_id=conversation.id,
+                expires_at=datetime.now(UTC) + timedelta(days=15),
+                extend_by_days=5,
+            )
+
+        # Neither provided
+        with pytest.raises(InvalidExtendError, match="provide exactly one"):
+            await extend_conversation(
+                session,
+                actor_sub=owner.sub,
+                agent_id=owner.id,
+                conversation_id=conversation.id,
+            )
+
+        # extend_by_days out of bounds
+        with pytest.raises(InvalidExtendError, match="extend_by_days"):
+            await extend_conversation(
+                session,
+                actor_sub=owner.sub,
+                agent_id=owner.id,
+                conversation_id=conversation.id,
+                extend_by_days=0,
+            )
+
+        with pytest.raises(InvalidExtendError, match="extend_by_days"):
+            await extend_conversation(
+                session,
+                actor_sub=owner.sub,
+                agent_id=owner.id,
+                conversation_id=conversation.id,
+                extend_by_days=91,
+            )
+
+        # Naive datetime
+        with pytest.raises(InvalidExtendError, match="timezone-aware"):
+            await extend_conversation(
+                session,
+                actor_sub=owner.sub,
+                agent_id=owner.id,
+                conversation_id=conversation.id,
+                expires_at=datetime(2030, 1, 1),
+            )
+
+    async def test_expired_conversation_resurrects_and_becomes_postable(
+        self, session: AsyncSession
+    ) -> None:
+        past_dt = datetime.now(UTC) - timedelta(seconds=1)
+        owner, _target, conversation = await self._start(
+            session, "ext-svc-owner-6", "ext-svc-target-6", expires_at=past_dt
+        )
+        # Attempt to post before extend fails due to expired state
+        with pytest.raises(InvalidConversationStateError):
+            await post_message(
+                session,
+                actor_sub=owner.sub,
+                sender_agent_id=owner.id,
+                conversation_id=conversation.id,
+                message_type="counter_proposal",
+                payload=_counter_proposal_payload(),
+            )
+
+        # Extend and resurrect
+        extended = await extend_conversation(
+            session,
+            actor_sub=owner.sub,
+            agent_id=owner.id,
+            conversation_id=conversation.id,
+            extend_by_days=7,
+        )
+        assert extended.conversation.state == "active"
+        assert extended.resurrected is True
+
+        # Now post_message succeeds!
+        msg = await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="counter_proposal",
+            payload=_counter_proposal_payload(),
+        )
+        assert msg.seq == 2
+
+    async def test_completed_and_canceled_conversations_rejected(
+        self, session: AsyncSession
+    ) -> None:
+        # Completed
+        owner, _target, conversation = await self._start(
+            session, "ext-svc-owner-7a", "ext-svc-target-7a"
+        )
+        await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="confirm",
+            payload=_confirm_payload(),
+        )
+        await session.refresh(conversation)
+        assert conversation.state == "completed"
+
+        with pytest.raises(InvalidConversationStateError):
+            await extend_conversation(
+                session,
+                actor_sub=owner.sub,
+                agent_id=owner.id,
+                conversation_id=conversation.id,
+                extend_by_days=5,
+            )
+        actions = await _audit_actions(session, conversation.id)
+        assert "denied.bad_state" in actions
+
+        # Canceled
+        owner_c, target_c, conv_c = await self._start(
+            session, "ext-svc-owner-7b", "ext-svc-target-7b"
+        )
+        await post_message(
+            session,
+            actor_sub=target_c.sub,
+            sender_agent_id=target_c.id,
+            conversation_id=conv_c.id,
+            message_type="decline",
+            payload={"reason": "owner_declined"},
+        )
+        await session.refresh(conv_c)
+        assert conv_c.state == "canceled"
+
+        with pytest.raises(InvalidConversationStateError):
+            await extend_conversation(
+                session,
+                actor_sub=owner_c.sub,
+                agent_id=owner_c.id,
+                conversation_id=conv_c.id,
+                extend_by_days=5,
+            )
+        actions_c = await _audit_actions(session, conv_c.id)
+        assert "denied.bad_state" in actions_c
+
+    async def test_archived_conversation_rejected(self, session: AsyncSession) -> None:
+        owner, _target, conversation = await self._start(
+            session, "ext-svc-owner-8", "ext-svc-target-8"
+        )
+        await archive_conversation(
+            session,
+            actor_sub=owner.sub,
+            agent_id=owner.id,
+            conversation_id=conversation.id,
+        )
+        with pytest.raises(ConversationArchivedError):
+            await extend_conversation(
+                session,
+                actor_sub=owner.sub,
+                agent_id=owner.id,
+                conversation_id=conversation.id,
+                extend_by_days=5,
+            )
+        actions = await _audit_actions(session, conversation.id)
+        assert "denied.archived.extend" in actions
+
+    async def test_non_member_invited_left_rejected_with_uniform_access_denied(
+        self, session: AsyncSession
+    ) -> None:
+        owner = await _register(session, "ext-svc-owner-9")
+        target = await _register(session, "ext-svc-target-9")
+        outsider = await _register(session, "ext-svc-outsider-9")
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+        )
+
+        # 1. Non-member (outsider) -> AccessDeniedError
+        with pytest.raises(AccessDeniedError):
+            await extend_conversation(
+                session,
+                actor_sub=outsider.sub,
+                agent_id=outsider.id,
+                conversation_id=conversation.id,
+                extend_by_days=5,
+            )
+
+        # 2. Target is still only invited (not accepted) -> AccessDeniedError
+        with pytest.raises(AccessDeniedError):
+            await extend_conversation(
+                session,
+                actor_sub=target.sub,
+                agent_id=target.id,
+                conversation_id=conversation.id,
+                extend_by_days=5,
+            )
+
+        # 3. Target accepts, then leaves -> AccessDeniedError
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        await leave(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        with pytest.raises(AccessDeniedError):
+            await extend_conversation(
+                session,
+                actor_sub=target.sub,
+                agent_id=target.id,
+                conversation_id=conversation.id,
+                extend_by_days=5,
+            )
+
+    async def test_audit_row_shape_and_actions(self, session: AsyncSession) -> None:
+        # Test normal extend audit detail
+        owner, _target, conv = await self._start(session, "ext-svc-owner-10", "ext-svc-target-10")
+        orig_expires_at = conv.expires_at
+        extended = await extend_conversation(
+            session,
+            actor_sub=owner.sub,
+            agent_id=owner.id,
+            conversation_id=conv.id,
+            extend_by_days=5,
+        )
+        stmt = (
+            select(AuditLog)
+            .where(
+                AuditLog.conversation_id == conv.id,
+                AuditLog.action == "conversation.extend",
+            )
+            .order_by(AuditLog.id.desc())
+        )
+        log = (await session.execute(stmt)).scalars().first()
+        assert log is not None
+        assert log.detail is not None
+        assert log.detail["previous_expires_at"] == orig_expires_at.isoformat()
+        assert log.detail["new_expires_at"] == extended.conversation.expires_at.isoformat()
+        assert log.detail["previous_state"] == "active"
+        assert log.detail["resurrected"] is False
+
+        # Test resurrecting a conversation that only crosses its deadline
+        # AFTER setup (not before, like _start(expires_at=past_dt) above --
+        # that would flip it to expired during accept_invite's own lazy
+        # expiry check, well before extend_conversation ever runs, so the
+        # two audit rows wouldn't actually be adjacent). Instead, start/accept
+        # with a still-future deadline, then push it into the past directly
+        # so extend_conversation's own call is the first thing to observe
+        # the lapsed deadline and lazily expire it.
+        owner_r, _target_r, conv_r = await self._start(
+            session, "ext-svc-owner-10r", "ext-svc-target-10r"
+        )
+        # Safe to mutate post-commit: this module's session fixture is built
+        # with expire_on_commit=False.
+        conv_r.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+        await extend_conversation(
+            session,
+            actor_sub=owner_r.sub,
+            agent_id=owner_r.id,
+            conversation_id=conv_r.id,
+            extend_by_days=5,
+        )
+        actions = await _audit_actions(session, conv_r.id)
+        # Lazy expiry emits conversation.expire, immediately followed by
+        # extend's own conversation.extend -- assert strict adjacency, not
+        # just relative ordering.
+        assert actions[-2:] == ["conversation.expire", "conversation.extend"]
 
 
 # --- get_conversation ----------------------------------------------------------

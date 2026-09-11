@@ -95,6 +95,12 @@ class TestToolScopesRegistry:
         as comms_leave), same scope as every other write."""
         assert TOOL_SCOPES["comms_archive_conversation"] == "comms:write"
 
+    def test_extend_conversation_uses_comms_write(self) -> None:
+        """TECH-6195: comms_extend_conversation is a mutating, symmetric-
+        permission action (no elevated scope, no owner-only gate -- mirroring
+        comms_archive_conversation), same scope as every other write."""
+        assert TOOL_SCOPES["comms_extend_conversation"] == "comms:write"
+
 
 class TestRequiredScopeFor:
     def test_known_tool(self) -> None:
