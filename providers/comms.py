@@ -1695,8 +1695,11 @@ async def list_conversations(
     - ``type``: conversation type — ``"open"``, ``"internal"``, or
       ``"asymmetric"`` (default: any type).
     - ``state``: ``"active"``, ``"completed"``, ``"canceled"``, or
-      ``"expired"`` (default: any state). Explicit state overrides
-      ``include_expired=False``.
+      ``"expired"`` (default: any state). An explicit ``state`` filter
+      takes exact precedence over ``include_expired`` in both directions —
+      expired rows are never OR'd in when a specific state is requested,
+      and expired rows are never excluded when ``state="expired"`` is
+      explicitly passed.
     - ``include_archived``: ``bool`` (default ``False``). When ``False``,
       conversations with ``archived_at IS NOT NULL`` are excluded.
     - ``include_expired``: ``bool`` (default ``False``). When ``False``,

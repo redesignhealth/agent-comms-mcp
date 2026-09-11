@@ -2637,13 +2637,15 @@ async def list_agents(
     computation, which are still based on the raw DB rows, so a retired
     agent's ``sub`` still occupies its position in keyset order and paging
     never skips the row immediately after it. ``total_count`` deliberately
-    still counts every row regardless of retirement (it reflects the table,
-    not this listing's visibility -- the agent row itself is never deleted,
-    per this ticket's audit-trail requirement). This asymmetry between
-    suspension and retirement is intentional: suspension is an in-DB status
-    filtered in SQL and reflected in ``total_count``; retirement is an external
-    async seam that cannot be expressed in SQL and is not reflected in
-    ``total_count``. Callers MUST page until ``has_more`` is false, not until
+    still counts every non-suspended board-registered agent (when
+    include_suspended=False), regardless of retirement status (it reflects
+    the table, not this listing's visibility -- the agent row itself is
+    never deleted, per this ticket's audit-trail requirement). This
+    asymmetry between suspension and retirement is intentional: suspension
+    is an in-DB status filtered in SQL and reflected in ``total_count``;
+    retirement is an external async seam that cannot be expressed in SQL
+    and is not reflected in ``total_count``. Callers MUST page until
+    ``has_more`` is false, not until
     ``agents`` is empty -- a page can return fewer than ``limit`` agents
     (including zero) while ``has_more`` is still true, when every row on that
     page happens to be retired. ``active_checker.is_active`` failures fail open
@@ -4162,10 +4164,11 @@ async def archive_conversation(
     is purely about hiding a conversation from active use, not describing
     how it ended.
 
-    Read paths (``comms_get_conversation``, ``comms_inbox``,
-    ``comms_list_conversations``) are completely unaffected by this call --
-    archiving is not a delete or a redaction, every past message remains
-    exactly as readable as before.
+    Archiving removes the conversation from the default
+    ``comms_list_conversations`` browse listing (recoverable via
+    ``include_archived=True``); ``comms_get_conversation`` and
+    ``comms_inbox`` remain unaffected -- archiving is not a delete or a
+    redaction, every past message remains exactly as readable as before.
     """
     conversation, _participant = await _load_participant_for_transition(
         session,

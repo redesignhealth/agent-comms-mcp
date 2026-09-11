@@ -8347,6 +8347,37 @@ class TestListAgents:
         assert "la-ortho-both" not in subs
         assert page["total_count"] == 3
 
+    async def test_suspension_orthogonal_to_registry_retirement_default(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-6196: under the DEFAULT include_suspended=False, SQL-level
+        suspension filtering and external active_checker retirement
+        filtering are independently applied. A suspended (but not retired)
+        agent is excluded at the SQL level and thus omitted from
+        total_count; a retired-but-NOT-suspended agent still occupies a
+        total_count slot (retirement is not reflected in total_count) but
+        is filtered out of the agents list by active_checker."""
+        await _register(session, "la-ortho-default-active")
+        await _register(session, "la-ortho-default-retired")
+        agent_suspended = await _register(session, "la-ortho-default-suspended")
+        await deregister_agent(
+            session,
+            actor_sub="admin-sub",
+            agent_id=agent_suspended.id,
+            deregister_authorized=True,
+        )
+
+        checker = _FakeActiveChecker(inactive_subs={"la-ortho-default-retired"})
+        page = await list_agents(session, active_checker=checker)
+        subs = {a["sub"] for a in page["agents"]}
+        assert "la-ortho-default-active" in subs
+        assert "la-ortho-default-retired" not in subs
+        assert "la-ortho-default-suspended" not in subs
+        # total_count excludes the suspended agent (SQL-level filter) but
+        # still counts the retired-but-not-suspended agent (retirement is
+        # an external seam, not reflected in total_count).
+        assert page["total_count"] == 2
+
     async def test_pagination_with_suspended_agents(self, session: AsyncSession) -> None:
         """TECH-6196: keyset pagination and has_more/next_cursor remain coherent
         when suspended agents are filtered out at the SQL query level."""
@@ -9435,6 +9466,68 @@ class TestListConversations:
             session, caller_agent_id=creator.id, include_expired=True, include_archived=True
         )
         assert any(c["conversation_id"] == conv_id_str for c in res_both_inc["conversations"])
+
+    async def test_archived_and_completed_conversation_excluded_by_default(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-6196: include_archived=False applies the archived_at filter
+        unconditionally, before any state filter -- an archived conversation
+        in state='completed' must still be excluded from the default
+        listing, even though completed conversations are otherwise never
+        excluded (see test_completed_and_canceled_remain_visible_by_default)."""
+        creator = await _register(session, "listconv-arch-completed-c")
+        target = await _register(session, "listconv-arch-completed-t")
+        conv = await start_conversation(
+            session,
+            actor_sub=creator.sub,
+            initiator_agent_id=creator.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+        )
+        conv.state = "completed"
+        await session.commit()
+        await archive_conversation(
+            session,
+            actor_sub=creator.sub,
+            agent_id=creator.id,
+            conversation_id=conv.id,
+        )
+
+        result = await list_conversations(session, caller_agent_id=creator.id)
+        ids = {c["conversation_id"] for c in result["conversations"]}
+        assert str(conv.id) not in ids
+
+    async def test_archived_and_completed_conversation_surfaced_with_include_archived(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-6196: the same archived+completed conversation IS surfaced
+        when include_archived=True is combined with an explicit
+        state='completed' filter."""
+        creator = await _register(session, "listconv-arch-completed-c2")
+        target = await _register(session, "listconv-arch-completed-t2")
+        conv = await start_conversation(
+            session,
+            actor_sub=creator.sub,
+            initiator_agent_id=creator.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+        )
+        conv.state = "completed"
+        await session.commit()
+        await archive_conversation(
+            session,
+            actor_sub=creator.sub,
+            agent_id=creator.id,
+            conversation_id=conv.id,
+        )
+
+        result = await list_conversations(
+            session, caller_agent_id=creator.id, state="completed", include_archived=True
+        )
+        ids = {c["conversation_id"] for c in result["conversations"]}
+        assert str(conv.id) in ids
 
     async def test_completed_and_canceled_remain_visible_by_default(
         self, session: AsyncSession
