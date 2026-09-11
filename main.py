@@ -26,7 +26,6 @@ from pydantic import AnyUrl
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 
-import linear_client
 import plugins
 import service
 import subscriptions
@@ -40,6 +39,7 @@ from exceptions import (
     HoldAwaitingAutoReviewError,
     HoldExpiredError,
     InvalidConversationStateError,
+    ProposalTargetUnavailableError,
     RateLimitExceededError,
 )
 from identity import AGENT_JWT_ISSUER, try_resolve_email
@@ -994,6 +994,7 @@ async def submit_proposal(request: Request) -> Response:
                 confidence=confidence,
                 importance=importance,
                 impact=impact,
+                judge=plugins.get_proposal_judge(),
                 target_fingerprint=target_fingerprint,
             )
         except RateLimitExceededError as exc:
@@ -1003,15 +1004,16 @@ async def submit_proposal(request: Request) -> Response:
             return JSONResponse({"error": "rate_limited", "detail": str(exc)}, status_code=429)
         except ValueError as exc:
             return JSONResponse({"error": "invalid_request", "detail": str(exc)}, status_code=422)
-        except linear_client.LinearAPIError as exc:
+        except ProposalTargetUnavailableError as exc:
             # Argus review round-3 B1: service.create_proposal's server-side
-            # target-fingerprint fetch can fail for an unconfigured token,
-            # transport failure, or Linear-side error -- sanitized via
-            # service.sanitize_linear_submit_error so internal token env-var
-            # names, transport internals, and GraphQL error payloads are
-            # never leaked.
-            status_code, error_code, detail = service.sanitize_linear_submit_error(exc)
-            return JSONResponse({"error": error_code, "detail": detail}, status_code=status_code)
+            # target-fingerprint fetch can fail for an unconfigured
+            # credential, a transport failure, or a target-side error --
+            # already sanitized by the configured plugins.ProposalJudge
+            # (internal token env-var names, transport internals, and raw
+            # upstream error payloads are never leaked).
+            return JSONResponse(
+                {"error": exc.error_code, "detail": exc.detail}, status_code=exc.status_code
+            )
 
     return JSONResponse(result, status_code=200)
 
@@ -1265,6 +1267,7 @@ async def decide_proposal_route(request: Request) -> Response:
                 hold_id=hold_id,
                 decision=decision,
                 decision_note=decision_note,
+                judge=plugins.get_proposal_judge(),
             )
         except AccessDeniedError:
             return JSONResponse(_UNIFORM_HOLD_NOT_FOUND, status_code=404)

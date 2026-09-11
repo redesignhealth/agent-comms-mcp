@@ -3,12 +3,17 @@ Postgres only, same idiom as ``tests/test_service.py``: never mocks the
 database, runs the full Alembic migration chain once per module, and skips
 the whole module (with a clear reason) if Postgres is unreachable.
 
-Covers: create-time dedup vs. insert branching, server-derived priority,
-the TECH-5875 per-bot rate limit, and the owner_sub-scoped visibility of
-``list_pending_proposal_holds``. The judge's own four decision paths are
-covered independently (no DB needed) in ``tests/test_proposal_judge.py``;
-this file additionally checks that ``create_proposal`` actually applies the
-judge's verdict end-to-end.
+Covers: create-time dedup vs. insert branching, the TECH-5875 per-bot rate
+limit, the owner_sub-scoped visibility of ``list_pending_proposal_holds``,
+and the board-mechanics side of the judge/apply/staleness state machine
+(claim, staleness comparison, apply_failed/applied terminal writes,
+concurrent-resubmission abandonment) -- exercised against a scriptable
+``FakeProposalJudge`` (``tests/proposal_judge_fakes.py``), never a real
+Linear/GitHub-backed judge. Which citation shapes a REAL judge
+auto-approves is entirely out of scope here -- that lives in
+``agent-comms-approvals``' own test suite, against its own
+``RHProposalJudge`` (see ``docs/DESIGN.md``'s "Core and immutable
+principle" section for why).
 """
 
 from __future__ import annotations
@@ -18,25 +23,40 @@ import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
 from sqlalchemy import select, text, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 import service
-from exceptions import AccessDeniedError, HoldAlreadyDecidedError, RateLimitExceededError
-from linear_client import LinearAPIError, LinearTokenMissingError, LinearTransportError
+from exceptions import (
+    AccessDeniedError,
+    HoldAlreadyDecidedError,
+    ProposalTargetUnavailableError,
+    RateLimitExceededError,
+)
 from models import AuditLog, ProposalHold
+from plugins import (
+    FINGERPRINT_DIGEST,
+    FINGERPRINT_UNAVAILABLE,
+    ProposalApplyOutcome,
+    ProposalClassification,
+    ProposalFingerprint,
+    ProposalJudge,
+    ProposalTargetError,
+    ProposalVerdict,
+)
 from service import (
+    _APPLY_ERROR_BOARD_COMMIT_FAILURE_MESSAGE,
     _APPLY_ERROR_CANCELLED_MESSAGE,
     MAX_PROPOSALS_PER_BOT_PER_WINDOW,
     PROPOSAL_SUBMITTER_SURFACES,
     PROPOSAL_TERMINAL_STATUSES,
+    _proposal_resubmission_snapshot,
     _redact_bot_facing_dict,
-    _sanitize_apply_error,
     audit_denied_proposal_submission,
     create_proposal,
     decide_proposal,
@@ -44,9 +64,9 @@ from service import (
     list_pending_proposal_holds,
     list_proposal_history_for_owner,
     list_proposals_for_bot,
-    sanitize_linear_submit_error,
     withdraw_proposal,
 )
+from tests.proposal_judge_fakes import FakeProposalJudge
 
 # Real-Postgres fixtures (database_url, _migrated_schema, engine) are shared
 # via tests/conftest.py (Argus review S15) -- this module opts in explicitly
@@ -68,57 +88,25 @@ def session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
     return async_sessionmaker(engine, expire_on_commit=False)
 
 
-_DEFAULT_SUBMIT_TIME_FINGERPRINT = "fp-submit-time-default"
-
-
-@pytest_asyncio.fixture(autouse=True)
-async def _default_fetch_current_fingerprint() -> AsyncIterator[AsyncMock]:
-    """Bug fix: ``create_proposal`` now fetches the target's CURRENT
-    fingerprint at submission time too (server-computed, no longer
-    trusting the caller-supplied ``target_fingerprint`` -- see
-    ``service.create_proposal``'s own docstring), not just at apply/decide
-    time. Most tests in this file don't care what that submission-time
-    fingerprint actually is -- this gives them a stable default so
-    submission never attempts a real network call. Tests that DO care
-    about a specific match/mismatch between the submitted and later
-    re-fetched fingerprint override this via their own nested
-    ``patch(...)``, which layers over (and is restored back to this
-    default by) the ``with`` block below on exit."""
-    with patch(
-        "service.linear_client.fetch_current_fingerprint",
-        AsyncMock(return_value=_DEFAULT_SUBMIT_TIME_FINGERPRINT),
-    ) as mock:
-        yield mock
-
-
-@pytest.fixture(autouse=True)
-def _allow_tech_team(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Problem 2 fix: ``open_ticket`` auto-approval now additionally
-    requires ``action.team`` to be on a server-side allowlist
-    (``team_allowlist.OPEN_TICKET_TEAM_ALLOWLIST``), which defaults to
-    empty. Every ``open_ticket`` test in this module uses ``team="TECH"``
-    -- populate the allowlist with exactly that so those tests keep
-    driving the judge to ``"approved"``/``"applied"`` as before. Harmless
-    for every other test in this module (``start_ticket``/
-    ``review_ticket``/``label_ticket``/etc. are unaffected by this
-    allowlist -- only ``_rule_open_ticket`` consults it)."""
-    monkeypatch.setattr(service.team_allowlist, "OPEN_TICKET_TEAM_ALLOWLIST", frozenset({"TECH"}))
+def _default_judge() -> ProposalJudge:
+    """A ``FakeProposalJudge`` with harmless defaults (never fingerprints a
+    real target, never auto-approves) -- used by ``_submit``/``_decide``
+    whenever a test doesn't care what the injected judge actually does,
+    same role ``EscalateAllProposalJudge`` plays in production."""
+    return FakeProposalJudge()
 
 
 def _action(
     action_type: str = "close_ticket", target_id: str = "TECH-1234", **extra: Any
 ) -> dict[str, Any]:
-    """Default ``action_type`` is ``close_ticket``, not ``open_ticket``
-    (TECH-5873 redefinition): most tests using this helper's default are
-    exercising GENERIC proposal mechanics (dedup, rate limiting, the
-    fingerprint-check-then-apply-or-stale flow) via the pre-existing
-    comment-posting applier, not anything ``open_ticket``-specific --
-    ``open_ticket`` is now exempt from ALL of that (see
-    ``service._PROPOSAL_FINGERPRINT_EXEMPT``) and creates a real Linear
-    issue instead of commenting on ``target_id``, so it would silently
-    change what these tests are actually exercising. Tests that ARE about
-    ``open_ticket`` specifically pass ``action_type="open_ticket"``
-    explicitly (see ``TestJudgeIntegration``)."""
+    """Default ``action_type`` is ``close_ticket`` -- kept for continuity
+    with the pre-seam default body shape. Every test using this helper's
+    default is exercising GENERIC proposal mechanics (dedup, rate
+    limiting, the fingerprint-check-then-apply-or-stale flow) against an
+    injected ``FakeProposalJudge``, not any real judge's rule content --
+    what a given ``action_type`` means (whether it's ``FINGERPRINT_NO_TARGET``-
+    exempt, what artifact it requires, etc.) is entirely up to whichever
+    judge is injected at each call site."""
     return {"action_type": action_type, "target_id": target_id, **extra}
 
 
@@ -134,6 +122,7 @@ async def _submit(
     importance: str = "medium",
     impact: str = "medium",
     target_fingerprint: str = "deadbeef",
+    judge: ProposalJudge | None = None,
 ) -> dict[str, Any]:
     return await create_proposal(
         session,
@@ -145,7 +134,27 @@ async def _submit(
         confidence=confidence,
         importance=importance,
         impact=impact,
+        judge=judge if judge is not None else _default_judge(),
         target_fingerprint=target_fingerprint,
+    )
+
+
+async def _decide(
+    session: AsyncSession,
+    *,
+    approver_sub: str = "owner-a@example.com",
+    hold_id: uuid.UUID,
+    decision: str = "approve",
+    decision_note: str | None = None,
+    judge: ProposalJudge | None = None,
+) -> dict[str, Any]:
+    return await decide_proposal(
+        session,
+        approver_sub=approver_sub,
+        hold_id=hold_id,
+        decision=decision,
+        decision_note=decision_note,
+        judge=judge if judge is not None else _default_judge(),
     )
 
 
@@ -183,22 +192,26 @@ class TestDedup:
     async def test_matching_pending_row_updates_in_place_not_insert(
         self, session: AsyncSession
     ) -> None:
-        """``target_fingerprint`` is now server-computed at submission time
-        (bug fix) -- each submission's stored value comes from whatever
-        the (mocked) Linear fetch returns for THAT call, not a
+        """``target_fingerprint`` is server-computed at submission time via
+        the injected judge's ``fingerprint()`` -- each submission's stored
+        value comes from whatever THAT call's judge reports, not a
         caller-supplied literal, so the two submissions below use two
-        independent mock return values to prove the SECOND submission's
+        independently-configured fakes to prove the SECOND submission's
         freshly re-fetched fingerprint is what ends up persisted."""
-        with patch(
-            "service.linear_client.fetch_current_fingerprint",
-            AsyncMock(return_value="fp1"),
-        ):
-            first = await _submit(session, rationale="first rationale")
-        with patch(
-            "service.linear_client.fetch_current_fingerprint",
-            AsyncMock(return_value="fp2"),
-        ):
-            second = await _submit(session, rationale="second rationale")
+        first = await _submit(
+            session,
+            rationale="first rationale",
+            judge=FakeProposalJudge(
+                fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp1")
+            ),
+        )
+        second = await _submit(
+            session,
+            rationale="second rationale",
+            judge=FakeProposalJudge(
+                fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp2")
+            ),
+        )
 
         rows = (await session.execute(select(ProposalHold))).scalars().all()
         assert len(rows) == 1
@@ -227,11 +240,13 @@ class TestDedup:
         ``kind="arc_board_change"`` as this test used pre-Argus-review-S7:
         ``models.ProposalHold``'s own docstring documents ``"arc_board_change"``
         as a legitimate OPEN-vocabulary ``kind`` value at the DB layer, but
-        ``_derive_proposal_priority`` only has a branch for
-        ``"linear_progress_update"`` today and now raises fast for anything
-        else (S7) rather than silently defaulting -- so a second literal
-        ``kind`` can no longer flow through the public service function in
-        this test without tripping that guard. Constructing the rows
+        whether a ``kind`` is admitted at all is now entirely up to the
+        injected judge's ``classify()`` (``FakeProposalJudge`` here has no
+        opinion on ``"arc_board_change"`` one way or the other, but a real
+        judge could raise for it) -- so a second literal ``kind`` can no
+        longer flow through the public service function in this test
+        without depending on judge behavior this test isn't about.
+        Constructing the rows
         directly is the correct level for this assertion anyway: it is the
         index's scoping, not the service's kind support, being tested."""
         action = _action()
@@ -299,19 +314,13 @@ class TestDedup:
         """A previously auto-approved (now auto-applied) row (same
         kind/target_id/action_type) must not be updated in place -- dedup
         only ever matches a currently ``pending`` row."""
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(return_value="deadbeef"),
+        auto_approve_judge = FakeProposalJudge(
+            judge_result=ProposalVerdict(approved=True, decision_note="auto-approved"),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result=None, caller_error=None, log_detail=None
             ),
-            patch("service.linear_client.apply_progress_update", AsyncMock(return_value=None)),
-        ):
-            first = await _submit(
-                session,
-                action=_action(
-                    source_message_url="https://redesignhealth.slack.com/archives/C1/p1"
-                ),
-            )
+        )
+        first = await _submit(session, judge=auto_approve_judge)
         assert first["status"] == "applied"
 
         second = await _submit(session, target_fingerprint="fp-new")
@@ -402,6 +411,7 @@ class TestDedup:
                     confidence="medium",
                     importance="medium",
                     impact="medium",
+                    judge=_default_judge(),
                     target_fingerprint="fp-winner",
                 )
                 return winner
@@ -436,1052 +446,239 @@ class TestDedup:
         assert len(rows) == 1
 
 
-class TestServerDerivedPriority:
+class TestClassifyDispatch:
+    """Board-side coverage of the ``judge.classify()`` call site in
+    ``create_proposal`` (via the defensive ``_classify_proposal`` wrapper):
+    ``priority`` is always whatever the injected judge reports, never a
+    caller-supplied value, and a contract-violating priority is rejected
+    rather than trusted. Which ``kind``/``action_type`` combinations a REAL
+    judge admits, and at what priority, is entirely that judge's own
+    concern -- see ``agent-comms-approvals``' test suite for RH's rules."""
+
     async def test_priority_is_never_caller_supplied(self, session: AsyncSession) -> None:
-        result = await create_proposal(
+        result = await _submit(
             session,
+            action={**_action(), "priority": "low"},
+            judge=FakeProposalJudge(classify_result=ProposalClassification(priority="high")),
+        )
+        # The judge derives "high" -- the caller's attempted "low" override
+        # embedded in the action payload is ignored.
+        assert result["priority"] == "high"
+
+    async def test_classify_receives_kind_and_action(self, session: AsyncSession) -> None:
+        judge = FakeProposalJudge()
+        action = _action(action_type="open_ticket")
+        await _submit(session, action=action, judge=judge)
+        assert judge.classify_calls == [("linear_progress_update", action)]
+
+    async def test_unsupported_kind_raises_value_error(self, session: AsyncSession) -> None:
+        judge = FakeProposalJudge(classify_raises=ValueError("unsupported kind: 'nonsense'"))
+        pattern = "unsupported proposal kind: 'linear_progress_update'"
+        with pytest.raises(ValueError, match=pattern) as exc_info:
+            await _submit(session, judge=judge)
+        assert "unsupported kind: 'nonsense'" in str(exc_info.value.__cause__)
+
+
+class TestJudgeApplyBoardMechanics:
+    """Board-mechanics coverage of the create_proposal -> claim ->
+    judge.apply() synchronous auto-apply pipeline (TECH-5877/5873), against
+    a scriptable ``FakeProposalJudge`` -- never a real Linear/GitHub-backed
+    judge. What artifact justifies a REAL judge auto-approving a given
+    proposal is out of scope here entirely (see this module's own
+    docstring); this class only asserts what the BOARD does once a verdict
+    says "approved": claim the row, compare fingerprints, call apply() (or
+    not), and write the correct terminal status."""
+
+    async def test_approved_verdict_claims_and_applies(self, session: AsyncSession) -> None:
+        judge = FakeProposalJudge(
+            judge_result=ProposalVerdict(approved=True, decision_note="auto-approved: reasons"),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result={"id": "abc"}, caller_error=None, log_detail=None
+            ),
+        )
+        result = await _submit(session, judge=judge)
+        assert result["status"] == "applied"
+        assert result["apply_result"] == {"id": "abc"}
+        assert len(judge.judge_calls) == 1
+        assert len(judge.apply_calls) == 1
+        assert judge.apply_calls[0].action == result["action"]
+        assert judge.apply_calls[0].rationale == "because reasons"
+
+    async def test_approved_verdict_with_drifted_fingerprint_goes_stale_without_apply(
+        self, session: AsyncSession
+    ) -> None:
+        """``create_proposal`` calls ``judge.fingerprint()`` twice within
+        one request: once at submission time (stored as
+        ``target_fingerprint``) and again, synchronously, inside
+        ``_apply_or_finalize_proposal_hold`` right after claiming the
+        auto-approved verdict. A judge whose target genuinely drifted
+        between those two calls (simulated here by returning two different
+        digests in sequence) must resolve the hold to ``"stale"`` without
+        ever calling ``apply()``."""
+
+        class _DriftingFingerprintJudge(FakeProposalJudge):
+            def __init__(self) -> None:
+                super().__init__(
+                    judge_result=ProposalVerdict(approved=True, decision_note="auto-approved")
+                )
+                self._digests = iter(["fp-at-submit", "fp-drifted-before-apply"])
+
+            async def fingerprint(self, ctx: Any) -> ProposalFingerprint:
+                self.fingerprint_calls.append(ctx)
+                return ProposalFingerprint(status=FINGERPRINT_DIGEST, digest=next(self._digests))
+
+        judge = _DriftingFingerprintJudge()
+        result = await _submit(session, judge=judge)
+        assert result["status"] == "stale"
+        assert judge.apply_calls == []
+        # Finding 12: the judge's own "auto-approved" verdict note is a
+        # non-empty `original_decision_note` here, exercising the `if`
+        # branch of `_stale_decision_note` (wrapping it for context) --
+        # the sibling human-decide test below exercises the other branch
+        # (no original note to wrap).
+        assert result["decision_note"] == (
+            "not applied: target changed after approval; no write to the target was "
+            "performed (approval reason was: auto-approved)"
+        )
+
+    async def test_apply_returning_applied_false_sets_apply_failed(
+        self, session: AsyncSession
+    ) -> None:
+        judge = FakeProposalJudge(
+            judge_result=ProposalVerdict(approved=True, decision_note="auto-approved"),
+            apply_result=ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error="target system unavailable",
+                log_detail="raw upstream detail, never returned to the caller",
+            ),
+        )
+        result = await _submit(session, judge=judge)
+        assert result["status"] == "apply_failed"
+        assert result["apply_error"] == "target system unavailable"
+        # log_detail is never surfaced over the API -- only the sanitized
+        # caller_error is.
+        assert "raw upstream detail" not in str(result)
+
+    async def test_pending_verdict_never_calls_apply(self, session: AsyncSession) -> None:
+        judge = FakeProposalJudge(judge_result=ProposalVerdict(approved=False, decision_note=None))
+        result = await _submit(session, judge=judge)
+        assert result["status"] == "pending"
+        assert judge.apply_calls == []
+
+    async def test_judge_raising_resolves_to_pending_with_judge_error_note(
+        self, session: AsyncSession
+    ) -> None:
+        """Fail closed: an exception from ``judge.judge()`` (a plugin bug,
+        or a future lane's real I/O failing) must never be mistaken for an
+        "approved" verdict, and must never crash ``create_proposal``
+        outright -- same ``except Exception`` shape this module has always
+        used for the rule/judge call. The isolated, no-DB coverage of
+        every OTHER plugin call raising (``classify``/``fingerprint``/
+        ``apply``) lives in ``tests/test_proposal_judge_seam.py``; this one
+        needs the DB because the fail-closed handling is inline in
+        ``create_proposal`` itself, not a separately-testable helper."""
+        judge = FakeProposalJudge(judge_raises=RuntimeError("boom"))
+        result = await _submit(session, judge=judge)
+        assert result["status"] == "pending"
+        assert result["decision_note"] == "judge error: RuntimeError"
+        assert judge.apply_calls == []
+
+    async def test_concurrent_resubmission_supersedes_judged_payload(
+        self, session: AsyncSession, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """The CAS guard in ``_claim_proposal_hold_for_applying``: if a
+        concurrent resubmission updates the pending row's payload while
+        this judge's verdict is still in flight, the stale verdict is
+        abandoned (never applied) rather than misapplied to the new
+        payload -- exercised here by mutating the row from inside the
+        judge's own ``judge()`` call, simulating that race deterministically
+        rather than relying on real concurrency timing."""
+        target_id = "TECH-race-payload"
+
+        class _MutatingJudge(FakeProposalJudge):
+            def __init__(self, other_session: AsyncSession) -> None:
+                super().__init__(
+                    judge_result=ProposalVerdict(approved=True, decision_note="auto-approved")
+                )
+                self._other_session = other_session
+
+            async def judge(self, ctx: Any) -> ProposalVerdict:
+                self.judge_calls.append(ctx)
+                async with self._other_session() as other:
+                    await _submit(
+                        other,
+                        action=_action(target_id=target_id),
+                        rationale="superseding resubmission",
+                        judge=FakeProposalJudge(),
+                    )
+                return self.judge_result
+
+        judge = _MutatingJudge(session_factory)
+        result = await _submit(session, action=_action(target_id=target_id), judge=judge)
+        # The stale verdict never reached apply() -- the concurrent
+        # resubmission's own (pending) judgment is what's left standing.
+        assert judge.apply_calls == []
+        assert result["status"] == "pending"
+        assert result["rationale"] == "superseding resubmission"
+
+    async def test_resubmit_with_updated_payload_auto_approves_pending_row(
+        self, session: AsyncSession
+    ) -> None:
+        """A bot progressively refining its own still-pending proposal (not
+        a new escalation path): resubmitting against the same dedup key
+        with a judge that now approves must auto-apply on this pass. Kept
+        by this exact name -- referenced from ``create_proposal``'s own
+        docstring (nee ``TestJudgeIntegration::
+        test_resubmit_with_citation_auto_approves_pending_row``, before the
+        artifact-citation-specific verdict content moved to
+        ``agent-comms-approvals``)."""
+        target_id = "TECH-resubmit-approve"
+        pending_judge = FakeProposalJudge(
+            judge_result=ProposalVerdict(approved=False, decision_note=None)
+        )
+        first = await _submit(session, action=_action(target_id=target_id), judge=pending_judge)
+        assert first["status"] == "pending"
+
+        approving_judge = FakeProposalJudge(
+            judge_result=ProposalVerdict(approved=True, decision_note="auto-approved: refined"),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result=None, caller_error=None, log_detail=None
+            ),
+        )
+        second = await _submit(session, action=_action(target_id=target_id), judge=approving_judge)
+        assert second["proposal_id"] == first["proposal_id"]
+        assert second["status"] == "applied"
+
+
+class TestProposalResubmissionSnapshot:
+    """Pins the JSON-normalization behavior of
+    ``_proposal_resubmission_snapshot`` (Problem 1 fix) -- no DB needed,
+    a plain in-memory ``ProposalHold`` is enough. Guards against
+    ``copy.deepcopy`` silently creeping back in: a raw deepcopy would
+    preserve a nested ``tuple`` in ``action`` as-is, which would then
+    fail to compare equal against the SAME logical value once it has
+    round-tripped through a real JSONB column (asyncpg always decodes a
+    JSON array as a ``list``, never a ``tuple``) -- exactly the kind of
+    false CAS mismatch this normalization exists to prevent."""
+
+    def test_nested_tuple_in_action_is_normalized_to_a_list(self) -> None:
+        hold = ProposalHold(
             kind="linear_progress_update",
             proposed_by_bot_id="bot-1",
             owner_sub="owner-a@example.com",
-            action={**_action(action_type="close_ticket"), "priority": "low"},
-            rationale="r",
-            confidence="low",
-            importance="low",
-            impact="low",
-            target_fingerprint="fp",
+            action={"nested": ("a", "b")},
+            rationale="because reasons",
+            confidence="medium",
+            importance="medium",
+            impact="medium",
+            priority="medium",
+            target_fingerprint="deadbeef",
         )
-        # close_ticket derives "high" server-side, ignoring the caller's
-        # attempted "low" override embedded in the action payload.
-        assert result["priority"] == "high"
-
-    async def test_open_ticket_derives_medium(self, session: AsyncSession) -> None:
-        result = await _submit(session, action=_action(action_type="open_ticket"))
-        assert result["priority"] == "medium"
-
-    async def test_unknown_action_type_derives_low(self, session: AsyncSession) -> None:
-        result = await _submit(session, action=_action(action_type="reassign_project"))
-        assert result["priority"] == "low"
-
-
-class TestJudgeIntegration:
-    async def test_open_ticket_with_citation_creates_issue_and_returns_apply_result(
-        self, session: AsyncSession, _default_fetch_current_fingerprint: AsyncMock
-    ) -> None:
-        """TECH-5873 redefinition: open_ticket's apply step now creates a
-        real Linear issue via ``linear_client.apply_open_ticket`` (never
-        ``apply_progress_update``, the comment-posting applier every OTHER
-        ``linear_progress_update`` action_type still uses), and is exempt
-        from the fingerprint/staleness check entirely -- its ``target_id``
-        is the PR URL that originated the proposal, not a pre-existing
-        Linear issue id, so there is nothing to fingerprint (see
-        ``service._PROPOSAL_FINGERPRINT_EXEMPT``). The judge's "approved"
-        verdict is never itself persisted (Argus review B1, pre-existing)
-        -- it resolves synchronously to "applied" here.
-
-        ``target_id`` is itself the citation the judge validates (see
-        ``service._rule_open_ticket``'s docstring) -- there is no separate
-        ``source_message_url``/similar field for open_ticket to carry."""
-        created = {
-            "id": "issue-uuid-1",
-            "identifier": "TECH-999",
-            "url": "https://linear.app/redesignhealth/issue/TECH-999",
-        }
-        with (
-            patch(
-                "service.linear_client.apply_open_ticket", AsyncMock(return_value=created)
-            ) as mock_apply_open_ticket,
-            patch(
-                "service.linear_client.apply_progress_update", AsyncMock(return_value=None)
-            ) as mock_apply_progress,
-            patch(
-                "service.github_client.fetch_pull_request",
-                AsyncMock(return_value={"state": "open"}),
-            ),
-        ):
-            result = await _submit(
-                session,
-                action=_action(
-                    action_type="open_ticket",
-                    target_id="https://github.com/org/repo/pull/1",
-                    title="Fix the thing",
-                    team="TECH",
-                ),
-            )
-        assert result["status"] == "applied"
-        assert result["decision_source"] == "auto"
-        assert result["decided_by_actor_id"] == "system:judge"
-        assert result["apply_result"] == created
-        mock_apply_open_ticket.assert_awaited_once()
-        # Dispatch correctness: open_ticket must never reach the
-        # comment-posting applier every OTHER linear_progress_update
-        # action_type still uses.
-        mock_apply_progress.assert_not_awaited()
-        # Regression coverage for the fix (TECH-5873): the fingerprinter
-        # must never be called for open_ticket -- neither at submission
-        # time nor at apply time -- since its target_id was never a
-        # fingerprintable Linear issue id to begin with.
-        _default_fetch_current_fingerprint.assert_not_called()
-
-    async def test_open_ticket_without_citation_stays_pending(
-        self, session: AsyncSession, _default_fetch_current_fingerprint: AsyncMock
-    ) -> None:
-        """A ``target_id`` that isn't itself a valid citation URL (e.g. a
-        Linear-issue-id-shaped placeholder, not a PR URL) must not
-        auto-approve -- see ``service._rule_open_ticket``'s docstring:
-        ``target_id`` is now the ONLY field the rule reads."""
-        result = await _submit(
-            session,
-            action=_action(action_type="open_ticket", target_id="TECH-1234"),
-        )
-        assert result["status"] == "pending"
-        assert "decision_source" not in result
-        _default_fetch_current_fingerprint.assert_not_called()
-
-    async def test_open_ticket_bogus_target_id_never_auto_approves_via_other_citation_field(
-        self, session: AsyncSession, _default_fetch_current_fingerprint: AsyncMock
-    ) -> None:
-        """Regression test for the exact exploit this fix closes
-        (bug found in review): before it, the rule validated a SEPARATE
-        ``source_message_url`` field, so a bot could cite a real PR there
-        while submitting an arbitrary, non-citation ``target_id`` --
-        dedup (keyed on ``target_id``) could not catch this, and each
-        submission independently auto-approved and created its own
-        Linear issue for the same underlying PR. Since the rule now reads
-        ONLY ``target_id``, a bogus ``target_id`` never auto-approves no
-        matter what real citation sits in ``source_message_url``."""
-        with patch(
-            "service.linear_client.apply_open_ticket", AsyncMock()
-        ) as mock_apply_open_ticket:
-            result = await _submit(
-                session,
-                action=_action(
-                    action_type="open_ticket",
-                    target_id="not-a-citation-url",
-                    title="Fix the thing",
-                    team="TECH",
-                    source_message_url="https://github.com/org/repo/pull/99",
-                ),
-            )
-        assert result["status"] == "pending"
-        assert "decision_source" not in result
-        mock_apply_open_ticket.assert_not_awaited()
-        _default_fetch_current_fingerprint.assert_not_called()
-
-    async def test_open_ticket_varying_bogus_target_id_with_same_citation_elsewhere_stays_pending(
-        self, session: AsyncSession, _default_fetch_current_fingerprint: AsyncMock
-    ) -> None:
-        """Companion to the test above, at the level the original bug was
-        actually exploitable: varying ``target_id`` across submissions
-        while reusing the SAME real citation in ``source_message_url``
-        used to dedup-bypass into multiple auto-created Linear issues for
-        the same PR. Post-fix, neither submission auto-approves, so no
-        issue is created for either -- the exploit's payoff (multiple
-        auto-created issues for one PR) is gone, even though each
-        submission still lands in its own row (different ``target_id``
-        values are, correctly, not the same dedup key)."""
-        real_pr_url = "https://github.com/org/repo/pull/99"
-        with patch(
-            "service.linear_client.apply_open_ticket", AsyncMock()
-        ) as mock_apply_open_ticket:
-            first = await _submit(
-                session,
-                action=_action(
-                    action_type="open_ticket",
-                    target_id="bogus-dedup-key-1",
-                    title="Fix the thing",
-                    team="TECH",
-                    source_message_url=real_pr_url,
-                ),
-            )
-            second = await _submit(
-                session,
-                action=_action(
-                    action_type="open_ticket",
-                    target_id="bogus-dedup-key-2",
-                    title="Fix the thing",
-                    team="TECH",
-                    source_message_url=real_pr_url,
-                ),
-            )
-        assert first["status"] == "pending"
-        assert second["status"] == "pending"
-        mock_apply_open_ticket.assert_not_awaited()
-
-        rows = (await session.execute(select(ProposalHold))).scalars().all()
-        assert len(rows) == 2
-        assert {row.status for row in rows} == {"pending"}
-        _default_fetch_current_fingerprint.assert_not_called()
-
-    async def test_rule_exception_fails_closed_to_pending(self, session: AsyncSession) -> None:
-        """Registry refactor (fail-closed on rule errors): any exception a
-        rule raises (a future lane's real I/O failing, e.g. a transport
-        timeout) must never be mistaken for an "approved" verdict and must
-        never crash ``create_proposal`` outright -- it resolves to
-        "pending" instead, exactly like a rule that legitimately declined
-        to approve, and never reaches the Linear applier.
-
-        Bug fix: the judge-error decision_note (``"judge error:
-        RuntimeError"``) must be PERSISTED onto the row, not just logged --
-        otherwise this failure mode is indistinguishable from a
-        legitimately-held proposal via ``proposals_get``/the API-facing
-        dict, e.g. whenever GITHUB_TOKEN is unset for the three
-        GitHub-backed lanes."""
-        raising_rule = AsyncMock(side_effect=RuntimeError("boom"))
-        with (
-            patch.dict(
-                "service._PROPOSAL_RULES",
-                {("linear_progress_update", "open_ticket"): raising_rule},
-            ),
-            patch(
-                "service.linear_client.apply_progress_update", AsyncMock(return_value=None)
-            ) as mock_apply,
-        ):
-            result = await _submit(
-                session,
-                action=_action(
-                    action_type="open_ticket",
-                    source_message_url="https://redesignhealth.slack.com/archives/C1/p1",
-                ),
-            )
-        assert result["status"] == "pending"
-        assert "decision_source" not in result
-        assert result["decision_note"] == "judge error: RuntimeError"
-        raising_rule.assert_awaited_once()
-        mock_apply.assert_not_awaited()
-
-        rows = (await session.execute(select(ProposalHold))).scalars().all()
-        assert len(rows) == 1
-        assert rows[0].status == "pending"
-        assert rows[0].decision_note == "judge error: RuntimeError"
-
-    async def test_unregistered_kind_raises(self, session: AsyncSession) -> None:
-        """Argus review S7: an unrecognized ``kind`` now fails fast in
-        ``_derive_proposal_priority`` (raising ``ValueError``, well before
-        the rule dispatch this class otherwise covers) rather than silently
-        defaulting to a generic ``"medium"`` priority and staying pending
-        with no rule -- this replaces the pre-S7 version of this test,
-        which asserted that stays-pending-with-no-judge fallback."""
-        with pytest.raises(ValueError, match="unsupported kind"):
-            await _submit(
-                session,
-                kind="arc_board_change",
-                action=_action(
-                    source_message_url="https://redesignhealth.slack.com/archives/C1/p1"
-                ),
-            )
-
-    async def test_submit_time_fingerprinter_failure_propagates_and_creates_no_row(
-        self, session: AsyncSession
-    ) -> None:
-        """Bug fix regression test: ``create_proposal`` now fetches the
-        target's current fingerprint server-side BEFORE creating or dedup'ing
-        the hold row. A ``LinearAPIError`` there (target missing, transport
-        failure) must propagate out of ``create_proposal`` uncaught, must not
-        create or update a ``ProposalHold`` row, and must never reach the
-        judge (rule) or the Linear applier. Uses the default action_type
-        (``close_ticket``, not exempt from fingerprinting -- see
-        ``_action``'s own docstring); the exempted case (``open_ticket``)
-        has its OWN regression coverage in ``TestJudgeIntegration``,
-        proving the opposite: that it does NOT hit the fingerprinter at
-        all, let alone fail here."""
-        mock_judge = AsyncMock(return_value=("approved", None))
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(side_effect=LinearAPIError("target issue does not exist")),
-            ) as mock_fingerprinter,
-            patch.dict(
-                "service._PROPOSAL_RULES",
-                {("linear_progress_update", "close_ticket"): mock_judge},
-            ),
-            patch(
-                "service.linear_client.apply_progress_update", AsyncMock(return_value=None)
-            ) as mock_apply,
-        ):
-            with pytest.raises(LinearAPIError, match="target issue does not exist"):
-                await _submit(session)
-
-        mock_fingerprinter.assert_awaited_once_with("TECH-1234")
-        mock_judge.assert_not_called()
-        mock_apply.assert_not_awaited()
-
-        rows = (await session.execute(select(ProposalHold))).scalars().all()
-        assert len(rows) == 0
-
-    async def test_resubmit_with_citation_auto_approves_pending_row(
-        self, session: AsyncSession
-    ) -> None:
-        """TECH-5872 decision #2 (Argus review B5): once the dedup fix (B1)
-        scopes the dedup match to the SAME submitting bot, a bot
-        progressively refining its own proposal by adding a citation on
-        resubmission is expected to auto-approve the existing pending row
-        in place -- this is not a new escalation path, so no additional
-        guard is added for it; this test is the explicit regression
-        coverage the review asked for instead. Uses the default
-        action_type (``close_ticket``) -- ``open_ticket``'s own version of
-        this same resubmit-dedups-then-applies scenario is covered
-        separately by ``TestJudgeIntegration::
-        test_open_ticket_resubmit_same_pr_url_dedups_then_creates_issue``,
-        since it exercises the create-issue applier and the
-        fingerprint-exemption path instead of this one's comment-posting
-        applier and normal fingerprint-match path."""
-        first = await _submit(session, action=_action(target_id="TECH-99"))
-        assert first["status"] == "pending"
-
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(return_value="deadbeef"),
-            ),
-            patch("service.linear_client.apply_progress_update", AsyncMock(return_value=None)),
-        ):
-            second = await _submit(
-                session,
-                action=_action(
-                    target_id="TECH-99",
-                    source_message_url="https://redesignhealth.slack.com/archives/C1/p1",
-                ),
-            )
-        assert second["proposal_id"] == first["proposal_id"]
-        assert second["status"] == "applied"
-        assert second["decision_source"] == "auto"
-
-        rows = (await session.execute(select(ProposalHold))).scalars().all()
-        assert len(rows) == 1
-
-    async def test_resubmission_during_judging_abandons_stale_verdict(
-        self, session: AsyncSession, session_factory: async_sessionmaker[AsyncSession]
-    ) -> None:
-        """Regression test for the judged-payload vs. applied-payload race.
-
-        While a rule is judging a proposal's payload (which can take up to ~20s
-        of external I/O with no lock held), a concurrent same-bot resubmission
-        can mutate the pending row in place via ``_apply_proposal_resubmission``.
-        The compare-and-swap guard in ``_claim_proposal_hold_for_applying``
-        detects that the payload changed between judging and claim, abandoning
-        the stale verdict rather than applying it to the new payload.
-        """
-        initial_action = _action(target_id="TECH-CAS-1", note="initial")
-        stub_pending = AsyncMock(return_value=("pending", None))
-        with patch.dict(
-            "service._PROPOSAL_RULES",
-            {("linear_progress_update", "close_ticket"): stub_pending},
-        ):
-            first = await _submit(session, action=initial_action)
-        assert first["status"] == "pending"
-        hold_id = uuid.UUID(first["proposal_id"])
-
-        resubmitted_action = _action(
-            target_id="TECH-CAS-1",
-            note="judged_by_rule",
-            source_message_url="https://redesignhealth.slack.com/archives/C1/p1",
-        )
-        concurrent_action = _action(
-            target_id="TECH-CAS-1",
-            note="concurrent_resubmission_payload",
-            source_message_url="https://redesignhealth.slack.com/archives/C1/p2",
-        )
-
-        async def _rule_mutating_concurrently(action: dict[str, Any]) -> tuple[str, str | None]:
-            # Simulate a concurrent resubmission that overwrites the row's action
-            # in place during the judging window.
-            async with session_factory() as other_session:
-                await other_session.execute(
-                    update(ProposalHold)
-                    .where(ProposalHold.id == hold_id)
-                    .values(action=concurrent_action)
-                )
-                await other_session.commit()
-            return "approved", "auto-approved: stubbed"
-
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(return_value="deadbeef"),
-            ),
-            patch(
-                "service.linear_client.apply_progress_update",
-                AsyncMock(return_value=None),
-            ) as mock_apply,
-            patch.dict(
-                "service._PROPOSAL_RULES",
-                {("linear_progress_update", "close_ticket"): _rule_mutating_concurrently},
-            ),
-        ):
-            second = await _submit(session, action=resubmitted_action)
-
-        mock_apply.assert_not_awaited()
-        assert second["proposal_id"] == str(hold_id)
-        assert second["status"] == "pending"
-
-        row = (
-            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
-        ).scalar_one()
-        assert row.status == "pending"
-        assert row.action == concurrent_action
-
-    async def test_resubmission_mutating_fingerprint_during_judging_abandons_stale_verdict(
-        self, session: AsyncSession, session_factory: async_sessionmaker[AsyncSession]
-    ) -> None:
-        """Variant proving the CAS guard covers target_fingerprint mutation
-        as well as action mutation."""
-        initial_action = _action(target_id="TECH-CAS-2")
-        stub_pending = AsyncMock(return_value=("pending", None))
-        with patch.dict(
-            "service._PROPOSAL_RULES",
-            {("linear_progress_update", "close_ticket"): stub_pending},
-        ):
-            first = await _submit(session, action=initial_action)
-        assert first["status"] == "pending"
-        hold_id = uuid.UUID(first["proposal_id"])
-
-        resubmitted_action = _action(
-            target_id="TECH-CAS-2",
-            source_message_url="https://redesignhealth.slack.com/archives/C1/p1",
-        )
-
-        async def _rule_mutating_fingerprint(action: dict[str, Any]) -> tuple[str, str | None]:
-            async with session_factory() as other_session:
-                await other_session.execute(
-                    update(ProposalHold)
-                    .where(ProposalHold.id == hold_id)
-                    .values(target_fingerprint="fp-concurrent-updated")
-                )
-                await other_session.commit()
-            return "approved", "auto-approved: stubbed"
-
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(return_value="deadbeef"),
-            ),
-            patch(
-                "service.linear_client.apply_progress_update",
-                AsyncMock(return_value=None),
-            ) as mock_apply,
-            patch.dict(
-                "service._PROPOSAL_RULES",
-                {("linear_progress_update", "close_ticket"): _rule_mutating_fingerprint},
-            ),
-        ):
-            second = await _submit(session, action=resubmitted_action)
-
-        mock_apply.assert_not_awaited()
-        assert second["proposal_id"] == str(hold_id)
-        assert second["status"] == "pending"
-
-        row = (
-            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
-        ).scalar_one()
-        assert row.status == "pending"
-        assert row.target_fingerprint == "fp-concurrent-updated"
-
-    async def test_open_ticket_same_real_pr_citation_dedups_into_one_row(
-        self, session: AsyncSession, _default_fetch_current_fingerprint: AsyncMock
-    ) -> None:
-        """``open_ticket``-specific companion to
-        ``test_resubmit_with_citation_auto_approves_pending_row`` above,
-        adapted for the target_id/citation-unification fix (bug found in
-        review): a same-bot resubmission for the SAME real PR citation
-        (now ``target_id`` itself -- see ``service._rule_open_ticket``'s
-        docstring) dedups into the existing row -- the dedup
-        key/mechanism is unchanged (see
-        ``service._extract_proposal_target``'s docstring) -- and resolves
-        to ``"applied"`` via ``apply_open_ticket`` creating a real issue,
-        never via a fingerprint match (there is none to match against).
-
-        The first submission's rule is stubbed to stay pending (standing
-        in for a decision not yet made) purely so this test can exercise
-        the dedup-then-apply path against a real, UNCHANGING
-        ``target_id`` throughout -- since ``target_id`` is now the sole
-        judged field, a genuinely valid citation there approves on the
-        very first pass, so there is no honest way to keep the SAME real
-        citation pending across two submissions without stubbing the
-        rule for one of them."""
-        pr_url = "https://github.com/org/repo/pull/42"
-        stub_pending = AsyncMock(return_value=("pending", None))
-        with patch.dict(
-            "service._PROPOSAL_RULES",
-            {("linear_progress_update", "open_ticket"): stub_pending},
-        ):
-            first = await _submit(
-                session,
-                action=_action(
-                    action_type="open_ticket", target_id=pr_url, title="Fix the thing", team="TECH"
-                ),
-            )
-        assert first["status"] == "pending"
-        # Regression coverage (TECH-5873): submitting a genuinely NEW
-        # open_ticket proposal must never even attempt to fetch a
-        # fingerprint -- there is no pre-existing Linear issue to fetch
-        # one for.
-        _default_fetch_current_fingerprint.assert_not_called()
-
-        created = {
-            "id": "issue-uuid-2",
-            "identifier": "TECH-1000",
-            "url": "https://linear.app/redesignhealth/issue/TECH-1000",
-        }
-        with (
-            patch("service.linear_client.apply_open_ticket", AsyncMock(return_value=created)),
-            patch(
-                "service.github_client.fetch_pull_request",
-                AsyncMock(return_value={"state": "open"}),
-            ),
-        ):
-            second = await _submit(
-                session,
-                action=_action(
-                    action_type="open_ticket",
-                    target_id=pr_url,
-                    title="Fix the thing",
-                    team="TECH",
-                ),
-            )
-        assert second["proposal_id"] == first["proposal_id"]
-        assert second["status"] == "applied"
-        assert second["decision_source"] == "auto"
-        assert second["apply_result"] == created
-
-        rows = (await session.execute(select(ProposalHold))).scalars().all()
-        assert len(rows) == 1
-        _default_fetch_current_fingerprint.assert_not_called()
-
-    async def test_auto_apply_fingerprinter_failure_sets_apply_failed(
-        self, session: AsyncSession
-    ) -> None:
-        """Argus review round-2 B2: a ``LinearAPIError`` from the
-        fingerprinter (not just the applier) during the auto-judge's
-        synchronous apply must resolve to ``apply_failed``, not propagate
-        past ``create_proposal`` into a generic 500 -- the auto-apply
-        path shares the same fingerprinter-wrapping bug the human-decide
-        path had. Uses the default action_type (``close_ticket``): this is
-        a generic fingerprinter-wrapping mechanic, not anything
-        ``open_ticket``-specific -- ``open_ticket`` is exempt from the
-        fingerprinter entirely post-redefinition, so it can no longer
-        exercise this failure mode at all.
-
-        Two independent calls to the mocked fetch happen within this ONE
-        ``create_proposal`` call now (bug fix): the SUBMIT-time call that
-        computes the stored ``target_fingerprint`` (must succeed, or
-        ``create_proposal`` never even creates the row -- see its own
-        docstring), and the APPLY-time re-fetch this test is actually
-        about -- ``side_effect`` as a list lets the two disagree."""
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(
-                    side_effect=[
-                        "fp-at-submit",
-                        LinearTokenMissingError("LINEAR_API_TOKEN is not configured"),
-                    ]
-                ),
-            ),
-            patch(
-                "service.linear_client.apply_progress_update", AsyncMock(return_value=None)
-            ) as mock_apply,
-        ):
-            result = await _submit(
-                session,
-                action=_action(
-                    source_message_url="https://redesignhealth.slack.com/archives/C1/p1"
-                ),
-            )
-        assert result["status"] == "apply_failed"
-        # Argus review round-5 S4: the raw LinearAPIError message is no
-        # longer returned verbatim to API callers -- it's mapped to one of
-        # a small allowlisted set (see `_sanitize_apply_error`).
-        assert result["apply_error"] == "Linear API token not configured"
-        mock_apply.assert_not_awaited()
-
-    async def test_auto_apply_target_drift_sets_honest_stale_decision_note(
-        self, session: AsyncSession
-    ) -> None:
-        """Bug fix regression test: a hold resolving to ``stale`` must
-        never carry a ``decision_note`` that reads as if a Linear write
-        happened. Pre-fix, the terminal write re-stamped the SAME
-        ``decision_note`` the auto-judge wrote at approval time verbatim
-        (e.g. ``"auto-approved: ..."``) onto a row where NO write ever
-        occurred. Drives that scenario directly: a target that drifted
-        between the submit-time fingerprint fetch and the immediately
-        following apply-time re-fetch, both within this one
-        ``create_proposal`` call (auto-judge synchronous apply). Uses the
-        default action_type (``close_ticket``): ``"stale"`` is
-        unreachable for ``open_ticket`` post-redefinition -- it is exempt
-        from the fingerprint/staleness check entirely (see
-        ``service._PROPOSAL_FINGERPRINT_EXEMPT``)."""
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(side_effect=["fp-at-submit", "fp-drifted-before-apply"]),
-            ),
-            patch(
-                "service.linear_client.apply_progress_update", AsyncMock(return_value=None)
-            ) as mock_apply,
-        ):
-            result = await _submit(
-                session,
-                action=_action(
-                    source_message_url="https://redesignhealth.slack.com/archives/C1/p1"
-                ),
-            )
-        assert result["status"] == "stale"
-        mock_apply.assert_not_awaited()
-        decision_note = result["decision_note"]
-        assert "no Linear write" in decision_note
-        # The original judge verdict is preserved for context, but must no
-        # longer be the WHOLE note -- that's what made the pre-fix row
-        # read as if the write succeeded.
-        assert "auto-approved: close-ticket proposal cites a valid citation" in decision_note
-        assert not decision_note.startswith("auto-approved")
-
-    async def test_no_pool_connection_is_held_while_the_rule_runs(
-        self, session: AsyncSession
-    ) -> None:
-        """Problem 1 fix (session.refresh(hold) previously held a DB pool
-        connection across the rule's external I/O): ``create_proposal``
-        must commit and release its connection BEFORE awaiting the rule,
-        not check one back out again via a refresh just to sit idle
-        across that call. Sampled from inside a stubbed rule -- the only
-        place that can observe the pool's state DURING the rule call
-        itself, rather than merely before/after it.
-
-        Exercised on both branches of ``_dedup_or_insert_proposal``: a
-        fresh INSERT, then a dedup-UPDATE resubmission against the same
-        pending row. The UPDATE path is the one that previously needed
-        the (now-removed) pre-rule refresh to populate ``updated_at``,
-        making it the branch most likely to regress if
-        ``session.refresh(hold)`` before the rule call is ever
-        re-added."""
-        checked_out_during_rule: list[int] = []
-
-        async def _rule_sampling_pool_checkout(action: dict[str, Any]) -> tuple[str, str | None]:
-            checked_out_during_rule.append(session.get_bind().pool.checkedout())
-            return "pending", None
-
-        with patch.dict(
-            "service._PROPOSAL_RULES",
-            {("linear_progress_update", "close_ticket"): _rule_sampling_pool_checkout},
-        ):
-            # Fresh INSERT.
-            first = await _submit(session, action=_action(target_id="TECH-POOL-CHECKOUT"))
-            # Dedup UPDATE: same (bot, target_id, action_type) resubmitted
-            # against the still-pending row from the INSERT above.
-            second = await _submit(session, action=_action(target_id="TECH-POOL-CHECKOUT"))
-
-        assert first["status"] == "pending"
-        assert second["status"] == "pending"
-        assert checked_out_during_rule == [0, 0]
-
-    async def test_dedup_resubmission_response_carries_a_fresh_updated_at(
-        self, session: AsyncSession
-    ) -> None:
-        """Change 1.4 regression guard: the single post-rule
-        ``session.refresh(hold)`` must run even on the dedup-UPDATE path.
-        SQLAlchemy leaves ``updated_at`` unloaded after an ORM UPDATE
-        (its ``onupdate`` is a SQL expression, and ``eager_defaults`` only
-        covers INSERT via RETURNING) -- without the refresh,
-        ``_proposal_dict``'s read of ``hold.updated_at`` would raise
-        ``MissingGreenlet`` on this exact path, an acceptable/expected
-        failure mode for this regression."""
-        stub_pending = AsyncMock(return_value=("pending", None))
-        with patch.dict(
-            "service._PROPOSAL_RULES",
-            {("linear_progress_update", "close_ticket"): stub_pending},
-        ):
-            first = await _submit(
-                session,
-                rationale="first rationale",
-                action=_action(target_id="TECH-FRESH-UPDATED-AT"),
-            )
-            # A DIFFERENT rationale than the first call's, so the dedup
-            # UPDATE actually changes a column value -- SQLAlchemy skips
-            # emitting an UPDATE at all (and therefore never fires
-            # `onupdate`) when every column it would set is `==` the
-            # currently-loaded value, which the resubmission above would
-            # otherwise be if it resubmitted byte-identical field values.
-            second = await _submit(
-                session,
-                rationale="second rationale",
-                action=_action(target_id="TECH-FRESH-UPDATED-AT"),
-            )
-
-        assert "updated_at" in first
-        assert "updated_at" in second
-        first_updated_at = datetime.fromisoformat(first["updated_at"])
-        second_updated_at = datetime.fromisoformat(second["updated_at"])
-        assert second_updated_at > first_updated_at
-
-
-class TestFourNewLanesIntegration:
-    """TECH-5877 four new auto-approve lanes (``start_ticket``/
-    ``review_ticket``/``assign_ticket``/``label_ticket``) exercised
-    end-to-end through ``create_proposal``: submit -> judge -> (for these
-    four, unlike ``open_ticket``) apply-time fingerprint re-check -> real
-    Linear applier. Each rule's own approve/pending BEHAVIOR is already
-    exhaustively covered DB-free in ``tests/test_proposal_judge.py``; this
-    class only proves the full pipeline wiring (dispatch to the right
-    applier, priority, ``apply_result``) for one happy path and one
-    pending path per lane. The generic "a rule's exception fails closed to
-    pending" mechanism is covered once, kind-agnostically, by
-    ``test_rule_exception_fails_closed_to_pending`` above -- it patches
-    ``_PROPOSAL_RULES`` itself, so that coverage already extends to these
-    four lanes without needing a per-lane duplicate here."""
-
-    async def test_start_ticket_with_open_pr_and_backward_state_applies(
-        self, session: AsyncSession
-    ) -> None:
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(return_value="fp-stable"),
-            ),
-            patch(
-                "service.github_client.fetch_pull_request",
-                AsyncMock(return_value={"state": "open", "title": "Fix TECH-1234"}),
-            ),
-            patch(
-                "service.linear_client.fetch_issue",
-                AsyncMock(
-                    return_value={"state": {"id": "s0", "name": "Backlog", "type": "backlog"}}
-                ),
-            ),
-            patch(
-                "service.linear_client.apply_start_ticket", AsyncMock(return_value=None)
-            ) as mock_apply,
-        ):
-            result = await _submit(
-                session,
-                action=_action(
-                    action_type="start_ticket",
-                    target_id="TECH-1234",
-                    team="TECH",
-                    starting_pr_url="https://github.com/org/repo/pull/1",
-                ),
-            )
-        assert result["status"] == "applied"
-        assert result["decision_source"] == "auto"
-        assert result["priority"] == "low"
-        mock_apply.assert_awaited_once()
-
-    async def test_start_ticket_with_pr_not_referencing_ticket_stays_pending(
-        self, session: AsyncSession
-    ) -> None:
-        with (
-            patch(
-                "service.github_client.fetch_pull_request",
-                AsyncMock(return_value={"state": "open", "title": "Unrelated PR title"}),
-            ),
-            patch(
-                "service.linear_client.fetch_issue",
-                AsyncMock(
-                    return_value={"state": {"id": "s0", "name": "Backlog", "type": "backlog"}}
-                ),
-            ) as mock_fetch_issue,
-        ):
-            result = await _submit(
-                session,
-                action=_action(
-                    action_type="start_ticket",
-                    target_id="TECH-1234",
-                    team="TECH",
-                    starting_pr_url="https://github.com/org/repo/pull/1",
-                ),
-            )
-        assert result["status"] == "pending"
-        assert "decision_source" not in result
-        mock_fetch_issue.assert_not_awaited()
-
-    async def test_start_ticket_without_citation_stays_pending(
-        self, session: AsyncSession, _default_fetch_current_fingerprint: AsyncMock
-    ) -> None:
-        result = await _submit(
-            session, action=_action(action_type="start_ticket", target_id="TECH-1234")
-        )
-        assert result["status"] == "pending"
-        assert "decision_source" not in result
-
-    async def test_review_ticket_with_review_requested_applies(self, session: AsyncSession) -> None:
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(return_value="fp-stable"),
-            ),
-            patch(
-                "service.github_client.fetch_pull_request",
-                AsyncMock(
-                    return_value={
-                        "state": "open",
-                        "title": "Fix TECH-1234",
-                        "requested_reviewers": [{"login": "reviewer1"}],
-                        "requested_teams": [],
-                    }
-                ),
-            ),
-            patch(
-                "service.linear_client.fetch_issue",
-                AsyncMock(
-                    return_value={"state": {"id": "s1", "name": "In Progress", "type": "started"}}
-                ),
-            ),
-            patch(
-                "service.linear_client.apply_review_ticket", AsyncMock(return_value=None)
-            ) as mock_apply,
-        ):
-            result = await _submit(
-                session,
-                action=_action(
-                    action_type="review_ticket",
-                    target_id="TECH-1234",
-                    team="TECH",
-                    review_pr_url="https://github.com/org/repo/pull/1",
-                ),
-            )
-        assert result["status"] == "applied"
-        assert result["decision_source"] == "auto"
-        assert result["priority"] == "medium"
-        mock_apply.assert_awaited_once()
-
-    async def test_review_ticket_with_pr_not_referencing_ticket_stays_pending(
-        self, session: AsyncSession
-    ) -> None:
-        with (
-            patch(
-                "service.github_client.fetch_pull_request",
-                AsyncMock(
-                    return_value={
-                        "state": "open",
-                        "title": "Unrelated PR title",
-                        "requested_reviewers": [{"login": "reviewer1"}],
-                        "requested_teams": [],
-                    }
-                ),
-            ),
-            patch(
-                "service.linear_client.fetch_issue",
-                AsyncMock(
-                    return_value={"state": {"id": "s1", "name": "In Progress", "type": "started"}}
-                ),
-            ) as mock_fetch_issue,
-        ):
-            result = await _submit(
-                session,
-                action=_action(
-                    action_type="review_ticket",
-                    target_id="TECH-1234",
-                    team="TECH",
-                    review_pr_url="https://github.com/org/repo/pull/1",
-                ),
-            )
-        assert result["status"] == "pending"
-        assert "decision_source" not in result
-        mock_fetch_issue.assert_not_awaited()
-
-    async def test_review_ticket_without_review_requested_stays_pending(
-        self, session: AsyncSession, _default_fetch_current_fingerprint: AsyncMock
-    ) -> None:
-        mock_fetch_pr = AsyncMock(
-            return_value={"state": "open", "requested_reviewers": [], "requested_teams": []}
-        )
-        with patch("service.github_client.fetch_pull_request", mock_fetch_pr):
-            result = await _submit(
-                session,
-                action=_action(
-                    action_type="review_ticket",
-                    target_id="TECH-1234",
-                    review_pr_url="https://github.com/org/repo/pull/1",
-                    team="TECH",
-                ),
-            )
-        assert result["status"] == "pending"
-        assert "decision_source" not in result
-        mock_fetch_pr.assert_awaited_once_with("org", "repo", 1)
-
-    async def test_assign_ticket_with_valid_pr_and_assignee_applies(
-        self, session: AsyncSession
-    ) -> None:
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(return_value="fp-stable"),
-            ),
-            patch(
-                "service.github_client.fetch_pull_request",
-                AsyncMock(return_value={"user": {"login": "octocat"}, "title": "Fix TECH-1234"}),
-            ),
-            patch(
-                "service.linear_client.apply_assign_ticket", AsyncMock(return_value=None)
-            ) as mock_apply,
-        ):
-            result = await _submit(
-                session,
-                action=_action(
-                    action_type="assign_ticket",
-                    target_id="TECH-1234",
-                    assignee_pr_url="https://github.com/org/repo/pull/1",
-                    assignee_id="11111111-1111-1111-1111-111111111111",
-                ),
-            )
-        assert result["status"] == "applied"
-        assert result["decision_source"] == "auto"
-        assert result["priority"] == "low"
-        mock_apply.assert_awaited_once()
-
-    async def test_assign_ticket_with_assignee_different_from_pr_author_applies(
-        self, session: AsyncSession
-    ) -> None:
-        """Design decision, not a regression: this lane no longer verifies
-        that ``assignee_id`` corresponds to the cited PR's actual author
-        (see ``service._rule_assign_ticket``'s docstring) -- a PR authored
-        by "octocat" can back an assignment to an entirely unrelated
-        Linear user id, as long as it references the target ticket."""
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(return_value="fp-stable"),
-            ),
-            patch(
-                "service.github_client.fetch_pull_request",
-                AsyncMock(return_value={"user": {"login": "octocat"}, "title": "Fix TECH-1234"}),
-            ),
-            patch(
-                "service.linear_client.apply_assign_ticket", AsyncMock(return_value=None)
-            ) as mock_apply,
-        ):
-            result = await _submit(
-                session,
-                action=_action(
-                    action_type="assign_ticket",
-                    target_id="TECH-1234",
-                    assignee_pr_url="https://github.com/org/repo/pull/1",
-                    assignee_id="22222222-2222-2222-2222-222222222222",
-                ),
-            )
-        assert result["status"] == "applied"
-        assert result["decision_source"] == "auto"
-        mock_apply.assert_awaited_once()
-
-    async def test_assign_ticket_with_pr_missing_user_field_applies(
-        self, session: AsyncSession
-    ) -> None:
-        """Behavioral contract at integration level: a PR with no 'user'
-        field at all auto-approves and applies cleanly."""
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(return_value="fp-stable"),
-            ),
-            patch(
-                "service.github_client.fetch_pull_request",
-                AsyncMock(return_value={"title": "Fix TECH-1234"}),
-            ),
-            patch(
-                "service.linear_client.apply_assign_ticket", AsyncMock(return_value=None)
-            ) as mock_apply,
-        ):
-            result = await _submit(
-                session,
-                action=_action(
-                    action_type="assign_ticket",
-                    target_id="TECH-1234",
-                    assignee_pr_url="https://github.com/org/repo/pull/1",
-                    assignee_id="11111111-1111-1111-1111-111111111111",
-                ),
-            )
-        assert result["status"] == "applied"
-        assert result["decision_source"] == "auto"
-        mock_apply.assert_awaited_once()
-
-    async def test_assign_ticket_with_pr_not_referencing_target_stays_pending(
-        self, session: AsyncSession, _default_fetch_current_fingerprint: AsyncMock
-    ) -> None:
-        """The real-artifact bar that stays: a real PR existing is NOT
-        enough -- it must actually reference ``target_id``."""
-        with patch(
-            "service.github_client.fetch_pull_request",
-            AsyncMock(return_value={"user": {"login": "octocat"}, "title": "Unrelated fix"}),
-        ):
-            result = await _submit(
-                session,
-                action=_action(
-                    action_type="assign_ticket",
-                    target_id="TECH-1234",
-                    assignee_pr_url="https://github.com/org/repo/pull/1",
-                    assignee_id="11111111-1111-1111-1111-111111111111",
-                ),
-            )
-        assert result["status"] == "pending"
-        assert "decision_source" not in result
-
-    async def test_label_ticket_with_matching_label_applies(self, session: AsyncSession) -> None:
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(return_value="fp-stable"),
-            ),
-            patch(
-                "service.linear_client.apply_label_ticket", AsyncMock(return_value=None)
-            ) as mock_apply,
-            patch(
-                "service.github_client.fetch_pull_request",
-                AsyncMock(return_value={"state": "open", "title": "Fix TECH-1234"}),
-            ),
-        ):
-            result = await _submit(
-                session,
-                action=_action(
-                    action_type="label_ticket",
-                    target_id="TECH-1234",
-                    team="TECH",
-                    labeling_pr_url="https://github.com/org/my-repo/pull/5",
-                    label_name="target:my-repo",
-                ),
-            )
-        assert result["status"] == "applied"
-        assert result["decision_source"] == "auto"
-        assert result["priority"] == "low"
-        mock_apply.assert_awaited_once()
-
-    async def test_label_ticket_with_pr_not_referencing_ticket_stays_pending(
-        self, session: AsyncSession
-    ) -> None:
-        with (
-            patch(
-                "service.linear_client.apply_label_ticket", AsyncMock(return_value=None)
-            ) as mock_apply,
-            patch(
-                "service.github_client.fetch_pull_request",
-                AsyncMock(return_value={"state": "open", "title": "Unrelated PR title"}),
-            ),
-        ):
-            result = await _submit(
-                session,
-                action=_action(
-                    action_type="label_ticket",
-                    target_id="TECH-1234",
-                    team="TECH",
-                    labeling_pr_url="https://github.com/org/my-repo/pull/5",
-                    label_name="target:my-repo",
-                ),
-            )
-        assert result["status"] == "pending"
-        assert "decision_source" not in result
-        mock_apply.assert_not_awaited()
-
-    async def test_label_ticket_with_label_for_a_different_repo_stays_pending(
-        self, session: AsyncSession, _default_fetch_current_fingerprint: AsyncMock
-    ) -> None:
-        result = await _submit(
-            session,
-            action=_action(
-                action_type="label_ticket",
-                target_id="TECH-1234",
-                labeling_pr_url="https://github.com/org/my-repo/pull/5",
-                label_name="target:other-repo",
-            ),
-        )
-        assert result["status"] == "pending"
-        assert "decision_source" not in result
+        snapshot = _proposal_resubmission_snapshot(hold)
+        action_snapshot = snapshot[0]
+        assert action_snapshot == {"nested": ["a", "b"]}
+        assert isinstance(action_snapshot["nested"], list)
 
 
 class TestRateLimit:
@@ -1506,17 +703,27 @@ class TestRateLimit:
         self, session: AsyncSession
     ) -> None:
         """Argus review: the target-fingerprint fetch now runs BEFORE the
-        rate-limit attempt marker is committed, so a Linear failure there
-        must not consume the bot's rate-limit budget for a proposal that
-        was never created -- a normal submission right after a full
-        window's worth of failed fetches must still succeed."""
-        with patch(
-            "service.linear_client.fetch_current_fingerprint",
-            AsyncMock(side_effect=LinearAPIError("boom")),
-        ):
-            for i in range(MAX_PROPOSALS_PER_BOT_PER_WINDOW + 1):
-                with pytest.raises(LinearAPIError):
-                    await _submit(session, action=_action(target_id=f"TECH-fail-{i}"))
+        rate-limit attempt marker is committed, so a judge reporting
+        FINGERPRINT_UNAVAILABLE there must not consume the bot's rate-limit
+        budget for a proposal that was never created -- a normal submission
+        right after a full window's worth of failed fetches must still
+        succeed."""
+        failing_judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(
+                status=FINGERPRINT_UNAVAILABLE,
+                error=ProposalTargetError(
+                    status_code=503,
+                    error_code="service_unavailable",
+                    detail="target system unavailable",
+                    log_detail="boom",
+                ),
+            )
+        )
+        for i in range(MAX_PROPOSALS_PER_BOT_PER_WINDOW + 1):
+            with pytest.raises(ProposalTargetUnavailableError):
+                await _submit(
+                    session, action=_action(target_id=f"TECH-fail-{i}"), judge=failing_judge
+                )
 
         result = await _submit(session, action=_action(target_id="TECH-ok"))
         assert result["proposed_by_bot_id"] == "bot-1"
@@ -1536,23 +743,16 @@ class TestOwnerSubVisibility:
     async def test_approved_proposals_are_excluded_from_pending_listing(
         self, session: AsyncSession
     ) -> None:
-        """Name predates TECH-5873 B1: a well-cited proposal now resolves
+        """Name predates TECH-5873 B1: an auto-approved proposal now resolves
         past "approved" straight to "applied", but the assertion under
         test -- it's gone from the pending listing -- still holds."""
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(return_value="deadbeef"),
+        auto_approve_judge = FakeProposalJudge(
+            judge_result=ProposalVerdict(approved=True, decision_note="auto-approved"),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result=None, caller_error=None, log_detail=None
             ),
-            patch("service.linear_client.apply_progress_update", AsyncMock(return_value=None)),
-        ):
-            await _submit(
-                session,
-                owner_sub="owner-a@example.com",
-                action=_action(
-                    source_message_url="https://redesignhealth.slack.com/archives/C1/p1"
-                ),
-            )
+        )
+        await _submit(session, owner_sub="owner-a@example.com", judge=auto_approve_judge)
         result = await list_pending_proposal_holds(session, owner_sub="owner-a@example.com")
         assert result["proposals"] == []
 
@@ -1576,14 +776,14 @@ class TestListProposalHistoryForOwner:
         submitted_b = await _submit(
             session, owner_sub="owner-b@example.com", action=_action(target_id="T2")
         )
-        await decide_proposal(
+        await _decide(
             session,
             approver_sub="owner-a@example.com",
             hold_id=uuid.UUID(submitted_a["proposal_id"]),
             decision="reject",
             decision_note="not needed",
         )
-        await decide_proposal(
+        await _decide(
             session,
             approver_sub="owner-b@example.com",
             hold_id=uuid.UUID(submitted_b["proposal_id"]),
@@ -1618,7 +818,7 @@ class TestListProposalHistoryForOwner:
 
     async def test_no_matching_owner_sub_returns_empty(self, session: AsyncSession) -> None:
         submitted = await _submit(session, owner_sub="owner-a@example.com")
-        await decide_proposal(
+        await _decide(
             session,
             approver_sub="owner-a@example.com",
             hold_id=uuid.UUID(submitted["proposal_id"]),
@@ -1636,7 +836,7 @@ class TestListProposalHistoryForOwner:
             submitted = await _submit(
                 session, owner_sub="owner-a@example.com", action=_action(target_id=f"T{i}")
             )
-            await decide_proposal(
+            await _decide(
                 session,
                 approver_sub="owner-a@example.com",
                 hold_id=uuid.UUID(submitted["proposal_id"]),
@@ -1660,7 +860,7 @@ class TestListProposalHistoryForOwner:
             submitted = await _submit(
                 session, owner_sub="owner-a@example.com", action=_action(target_id=f"T{i}")
             )
-            await decide_proposal(
+            await _decide(
                 session,
                 approver_sub="owner-a@example.com",
                 hold_id=uuid.UUID(submitted["proposal_id"]),
@@ -1685,7 +885,7 @@ class TestListProposalHistoryForOwner:
         submitted_first = await _submit(
             session, owner_sub="owner-a@example.com", action=_action(target_id="FIRST")
         )
-        await decide_proposal(
+        await _decide(
             session,
             approver_sub="owner-a@example.com",
             hold_id=uuid.UUID(submitted_first["proposal_id"]),
@@ -1695,7 +895,7 @@ class TestListProposalHistoryForOwner:
         submitted_second = await _submit(
             session, owner_sub="owner-a@example.com", action=_action(target_id="SECOND")
         )
-        await decide_proposal(
+        await _decide(
             session,
             approver_sub="owner-a@example.com",
             hold_id=uuid.UUID(submitted_second["proposal_id"]),
@@ -1716,82 +916,81 @@ class TestListProposalHistoryForOwner:
         remaining three terminal statuses via the same paths
         ``TestDecideProposal`` uses below.
 
-        ``target_fingerprint`` is server-computed at submission time now
-        (bug fix), so each submission below is wrapped in its own
-        ``fetch_current_fingerprint`` patch -- an independent mock call
-        site from the one the later ``decide_proposal`` call patches --
+        ``target_fingerprint`` is server-computed at submission time via
+        the injected judge, so each submission below uses its own
+        independently-configured ``FakeProposalJudge`` -- an independent
+        call site from the one the later ``decide`` call configures --
         rather than trusting a caller-supplied literal. The APPLIED/
-        APPLY_FAILED cases use the SAME value at both call sites (a
-        genuinely unchanged target); STALE deliberately uses two
-        DIFFERENT values, to prove a real mismatch, not a shared
+        APPLY_FAILED cases use the SAME digest at both submit and decide
+        time (a genuinely unchanged target); STALE deliberately uses two
+        DIFFERENT digests, to prove a real mismatch, not a shared
         hardcoded string."""
-        with patch(
-            "service.linear_client.fetch_current_fingerprint",
-            AsyncMock(return_value="fp-applied-match"),
-        ):
-            applied_submitted = await _submit(
-                session, owner_sub="owner-a@example.com", action=_action(target_id="APPLIED")
-            )
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(return_value="fp-applied-match"),
+        applied_judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(
+                status=FINGERPRINT_DIGEST, digest="fp-applied-match"
             ),
-            patch("service.linear_client.apply_progress_update", AsyncMock(return_value=None)),
-        ):
-            await decide_proposal(
-                session,
-                approver_sub="owner-a@example.com",
-                hold_id=uuid.UUID(applied_submitted["proposal_id"]),
-                decision="approve",
-                decision_note=None,
-            )
+            apply_result=ProposalApplyOutcome(
+                applied=True, result=None, caller_error=None, log_detail=None
+            ),
+        )
+        applied_submitted = await _submit(
+            session,
+            owner_sub="owner-a@example.com",
+            action=_action(target_id="APPLIED"),
+            judge=applied_judge,
+        )
+        await _decide(
+            session,
+            approver_sub="owner-a@example.com",
+            hold_id=uuid.UUID(applied_submitted["proposal_id"]),
+            decision="approve",
+            judge=applied_judge,
+        )
 
-        with patch(
-            "service.linear_client.fetch_current_fingerprint",
-            AsyncMock(return_value="fp-apply-failed-match"),
-        ):
-            apply_failed_submitted = await _submit(
-                session,
-                owner_sub="owner-a@example.com",
-                action=_action(target_id="APPLY_FAILED"),
-            )
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(return_value="fp-apply-failed-match"),
+        apply_failed_judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(
+                status=FINGERPRINT_DIGEST, digest="fp-apply-failed-match"
             ),
-            patch(
-                "service.linear_client.apply_progress_update",
-                AsyncMock(side_effect=LinearAPIError("linear is down")),
+            apply_result=ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error="Linear API returned an error",
+                log_detail="linear is down",
             ),
-        ):
-            await decide_proposal(
-                session,
-                approver_sub="owner-a@example.com",
-                hold_id=uuid.UUID(apply_failed_submitted["proposal_id"]),
-                decision="approve",
-                decision_note=None,
-            )
+        )
+        apply_failed_submitted = await _submit(
+            session,
+            owner_sub="owner-a@example.com",
+            action=_action(target_id="APPLY_FAILED"),
+            judge=apply_failed_judge,
+        )
+        await _decide(
+            session,
+            approver_sub="owner-a@example.com",
+            hold_id=uuid.UUID(apply_failed_submitted["proposal_id"]),
+            decision="approve",
+            judge=apply_failed_judge,
+        )
 
-        with patch(
-            "service.linear_client.fetch_current_fingerprint",
-            AsyncMock(return_value="fp-original"),
-        ):
-            stale_submitted = await _submit(
-                session, owner_sub="owner-a@example.com", action=_action(target_id="STALE")
-            )
-        with patch(
-            "service.linear_client.fetch_current_fingerprint",
-            AsyncMock(return_value="fp-drifted"),
-        ):
-            await decide_proposal(
-                session,
-                approver_sub="owner-a@example.com",
-                hold_id=uuid.UUID(stale_submitted["proposal_id"]),
-                decision="approve",
-                decision_note=None,
-            )
+        stale_judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-original")
+        )
+        stale_submitted = await _submit(
+            session,
+            owner_sub="owner-a@example.com",
+            action=_action(target_id="STALE"),
+            judge=stale_judge,
+        )
+        stale_judge.fingerprint_result = ProposalFingerprint(
+            status=FINGERPRINT_DIGEST, digest="fp-drifted"
+        )
+        await _decide(
+            session,
+            approver_sub="owner-a@example.com",
+            hold_id=uuid.UUID(stale_submitted["proposal_id"]),
+            decision="approve",
+            judge=stale_judge,
+        )
 
         result = await list_proposal_history_for_owner(session, owner_sub="owner-a@example.com")
         statuses_by_target = {p["action"]["target_id"]: p["status"] for p in result["proposals"]}
@@ -1805,29 +1004,24 @@ class TestListProposalHistoryForOwner:
 class TestDecideProposal:
     """Service-layer coverage for ``decide_proposal`` (TECH-5873):
     approve/reject, ownership/anti-enumeration, staleness, apply failure,
-    and applied-hold idempotency. Linear is mocked at the module-qualified
-    ``service.linear_client`` names -- this file never touches the network.
+    and applied-hold idempotency. The injected ``FakeProposalJudge``
+    stands in for whatever real judge is configured -- this class asserts
+    only board mechanics (claim, staleness comparison, terminal-status
+    writes, cancellation handling), never a real judge's own rule content.
     """
 
     async def test_unknown_hold_raises_access_denied(self, session: AsyncSession) -> None:
         with pytest.raises(AccessDeniedError):
-            await decide_proposal(
-                session,
-                approver_sub="owner-a@example.com",
-                hold_id=uuid.uuid4(),
-                decision="approve",
-                decision_note=None,
-            )
+            await _decide(session, hold_id=uuid.uuid4(), decision="approve")
 
     async def test_not_owner_raises_access_denied(self, session: AsyncSession) -> None:
         submitted = await _submit(session, owner_sub="owner-a@example.com")
         with pytest.raises(AccessDeniedError):
-            await decide_proposal(
+            await _decide(
                 session,
                 approver_sub="owner-b@example.com",
                 hold_id=uuid.UUID(submitted["proposal_id"]),
                 decision="approve",
-                decision_note=None,
             )
 
     async def test_reject_without_decision_note_raises_value_error(
@@ -1835,19 +1029,12 @@ class TestDecideProposal:
     ) -> None:
         submitted = await _submit(session)
         with pytest.raises(ValueError):
-            await decide_proposal(
-                session,
-                approver_sub="owner-a@example.com",
-                hold_id=uuid.UUID(submitted["proposal_id"]),
-                decision="reject",
-                decision_note=None,
-            )
+            await _decide(session, hold_id=uuid.UUID(submitted["proposal_id"]), decision="reject")
 
     async def test_reject_with_note_sets_rejected(self, session: AsyncSession) -> None:
         submitted = await _submit(session)
-        decided = await decide_proposal(
+        decided = await _decide(
             session,
-            approver_sub="owner-a@example.com",
             hold_id=uuid.UUID(submitted["proposal_id"]),
             decision="reject",
             decision_note="not appropriate",
@@ -1857,187 +1044,132 @@ class TestDecideProposal:
         assert decided["decision_source"] == "human"
         assert decided["decided_by_actor_id"] == "owner-a@example.com"
 
-    async def test_approve_matching_fingerprint_applies_and_calls_linear_once(
+    async def test_approve_matching_fingerprint_applies_and_calls_apply_once(
         self, session: AsyncSession
     ) -> None:
-        """``target_fingerprint`` is server-computed at submission time now
-        (bug fix): the SUBMIT-time fetch and the later APPLY-time re-fetch
-        are two independent mock call sites here, not one hardcoded
-        literal shared between them -- both happen to return the same
-        value, representing a target that genuinely hasn't changed."""
-        with patch(
-            "service.linear_client.fetch_current_fingerprint",
-            AsyncMock(return_value="fp-match"),
-        ):
-            submitted = await _submit(session)
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(return_value="fp-match"),
+        """The submit-time fingerprint and the later apply-time re-fetch
+        are two independent calls to the SAME judge instance here, not one
+        hardcoded literal shared between them -- both happen to return the
+        same digest, representing a target that genuinely hasn't
+        changed."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result=None, caller_error=None, log_detail=None
             ),
-            patch(
-                "service.linear_client.apply_progress_update", AsyncMock(return_value=None)
-            ) as mock_apply,
-        ):
-            decided = await decide_proposal(
-                session,
-                approver_sub="owner-a@example.com",
-                hold_id=uuid.UUID(submitted["proposal_id"]),
-                decision="approve",
-                decision_note=None,
-            )
+        )
+        submitted = await _submit(session, judge=judge)
+        decided = await _decide(
+            session, hold_id=uuid.UUID(submitted["proposal_id"]), decision="approve", judge=judge
+        )
         assert decided["status"] == "applied"
         assert "applied_at" in decided
-        # rationale is threaded as an explicit second argument, not part of
-        # the action dict (Argus review round-5 B2).
-        mock_apply.assert_awaited_once_with(submitted["action"], "because reasons")
+        assert len(judge.apply_calls) == 1
+        # rationale is threaded as its own ProposalContext field, not part
+        # of the action dict.
+        assert judge.apply_calls[0].action == submitted["action"]
+        assert judge.apply_calls[0].rationale == "because reasons"
 
     async def test_approve_stale_fingerprint_skips_apply(self, session: AsyncSession) -> None:
-        """The SUBMIT-time fetch and the APPLY-time re-fetch below are two
-        independent mock call sites returning two DIFFERENT values -- a
-        genuine mismatch, not a caller-supplied literal the test controls
-        on both ends."""
-        with patch(
-            "service.linear_client.fetch_current_fingerprint",
-            AsyncMock(return_value="fp-original"),
-        ):
-            submitted = await _submit(session)
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(return_value="fp-drifted"),
+        """The submit-time fingerprint and the apply-time re-fetch below
+        are two DIFFERENT digests -- a genuine mismatch, not a
+        caller-supplied literal the test controls on both ends."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-original"),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result=None, caller_error=None, log_detail=None
             ),
-            patch(
-                "service.linear_client.apply_progress_update", AsyncMock(return_value=None)
-            ) as mock_apply,
-        ):
-            decided = await decide_proposal(
-                session,
-                approver_sub="owner-a@example.com",
-                hold_id=uuid.UUID(submitted["proposal_id"]),
-                decision="approve",
-                decision_note=None,
-            )
+        )
+        submitted = await _submit(session, judge=judge)
+        judge.fingerprint_result = ProposalFingerprint(
+            status=FINGERPRINT_DIGEST, digest="fp-drifted"
+        )
+        decided = await _decide(
+            session, hold_id=uuid.UUID(submitted["proposal_id"]), decision="approve", judge=judge
+        )
         assert decided["status"] == "stale"
-        mock_apply.assert_not_awaited()
-        # Sibling assertion to
-        # test_auto_apply_target_drift_sets_honest_stale_decision_note
-        # above, for the human-decide path: the same honest-stale note
-        # applies here too -- no Linear write happened, and this path
-        # passed no original decision_note to wrap for context.
+        assert judge.apply_calls == []
+        # Sibling assertion to the auto-apply staleness test above, for the
+        # human-decide path: the same honest-stale note applies here too --
+        # no write happened, and this path passed no original decision_note
+        # to wrap for context.
         assert decided["decision_note"] == (
-            "not applied: target changed after approval; no Linear write was performed"
+            "not applied: target changed after approval; no write to the target was performed"
         )
 
-    async def test_approve_linear_failure_sets_apply_failed(self, session: AsyncSession) -> None:
-        with patch(
-            "service.linear_client.fetch_current_fingerprint",
-            AsyncMock(return_value="fp-match"),
-        ):
-            submitted = await _submit(session)
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(return_value="fp-match"),
+    async def test_approve_apply_failure_sets_apply_failed(self, session: AsyncSession) -> None:
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_result=ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error="Linear API returned an error",
+                log_detail="linear is down",
             ),
-            patch(
-                "service.linear_client.apply_progress_update",
-                AsyncMock(side_effect=LinearAPIError("linear is down")),
-            ),
-        ):
-            decided = await decide_proposal(
-                session,
-                approver_sub="owner-a@example.com",
-                hold_id=uuid.UUID(submitted["proposal_id"]),
-                decision="approve",
-                decision_note=None,
-            )
+        )
+        submitted = await _submit(session, judge=judge)
+        decided = await _decide(
+            session, hold_id=uuid.UUID(submitted["proposal_id"]), decision="approve", judge=judge
+        )
         assert decided["status"] == "apply_failed"
-        # Argus review round-5 S4: unrecognized LinearAPIError messages map
-        # to the generic allowlisted message, not the raw exception text.
         assert decided["apply_error"] == "Linear API returned an error"
         assert "applied_at" not in decided
 
     async def test_retrying_applied_hold_is_idempotent_no_op(self, session: AsyncSession) -> None:
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(return_value="fp-match"),
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result=None, caller_error=None, log_detail=None
             ),
-            patch(
-                "service.linear_client.apply_progress_update", AsyncMock(return_value=None)
-            ) as mock_apply,
-        ):
-            submitted = await _submit(session)
-            first = await decide_proposal(
-                session,
-                approver_sub="owner-a@example.com",
-                hold_id=uuid.UUID(submitted["proposal_id"]),
-                decision="approve",
-                decision_note=None,
-            )
-            second = await decide_proposal(
-                session,
-                approver_sub="owner-a@example.com",
-                hold_id=uuid.UUID(submitted["proposal_id"]),
-                decision="approve",
-                decision_note=None,
-            )
+        )
+        submitted = await _submit(session, judge=judge)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        first = await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
+        second = await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
         assert first["status"] == "applied"
         assert second["status"] == "applied"
         assert second["applied_at"] == first["applied_at"]
-        mock_apply.assert_awaited_once()
+        assert len(judge.apply_calls) == 1
 
     async def test_deciding_already_rejected_hold_raises_already_decided(
         self, session: AsyncSession
     ) -> None:
         submitted = await _submit(session)
-        await decide_proposal(
-            session,
-            approver_sub="owner-a@example.com",
-            hold_id=uuid.UUID(submitted["proposal_id"]),
-            decision="reject",
-            decision_note="no thanks",
-        )
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        await _decide(session, hold_id=hold_id, decision="reject", decision_note="no thanks")
         with pytest.raises(HoldAlreadyDecidedError):
-            await decide_proposal(
-                session,
-                approver_sub="owner-a@example.com",
-                hold_id=uuid.UUID(submitted["proposal_id"]),
-                decision="approve",
-                decision_note=None,
-            )
+            await _decide(session, hold_id=hold_id, decision="approve")
 
-    async def test_approve_fingerprinter_failure_sets_apply_failed(
+    async def test_approve_fingerprint_unavailable_sets_apply_failed(
         self, session: AsyncSession
     ) -> None:
-        """Argus review round-2 B2: a ``LinearAPIError`` from the
-        fingerprinter must resolve the hold to ``apply_failed`` the same
-        way an applier failure does -- previously only the applier call
-        was wrapped, so this propagated past ``decide_proposal`` into a
-        generic 500 instead of the documented graceful degradation."""
-        submitted = await _submit(session, target_fingerprint="fp-match")
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(side_effect=LinearAPIError("linear is down")),
+        """A judge reporting FINGERPRINT_UNAVAILABLE at apply time must
+        resolve the hold to ``apply_failed`` the same way an ``apply()``
+        failure does -- symmetrical to ``create_proposal``'s own submit-time
+        handling of the same status."""
+        submitted = await _submit(
+            session,
+            judge=FakeProposalJudge(
+                fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match")
             ),
-            patch(
-                "service.linear_client.apply_progress_update", AsyncMock(return_value=None)
-            ) as mock_apply,
-        ):
-            decided = await decide_proposal(
-                session,
-                approver_sub="owner-a@example.com",
-                hold_id=uuid.UUID(submitted["proposal_id"]),
-                decision="approve",
-                decision_note=None,
+        )
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(
+                status=FINGERPRINT_UNAVAILABLE,
+                error=ProposalTargetError(
+                    status_code=422,
+                    error_code="invalid_request",
+                    detail="Linear API returned an error",
+                    log_detail="linear is down",
+                ),
             )
+        )
+        decided = await _decide(
+            session, hold_id=uuid.UUID(submitted["proposal_id"]), decision="approve", judge=judge
+        )
         assert decided["status"] == "apply_failed"
-        # Argus review round-5 S4: unrecognized LinearAPIError messages map
-        # to the generic allowlisted message, not the raw exception text.
         assert decided["apply_error"] == "Linear API returned an error"
-        mock_apply.assert_not_awaited()
+        assert judge.apply_calls == []
 
     async def test_cancellation_during_fingerprinting_resolves_to_apply_failed(
         self, session: AsyncSession
@@ -2048,26 +1180,17 @@ class TestDecideProposal:
         covers the fingerprinter-cancelled branch: the hold must reach
         ``apply_failed`` (NOT be left stranded at ``applying``), and the
         cancellation must still propagate out of ``decide_proposal``."""
-        submitted = await _submit(session, target_fingerprint="fp-match")
-        hold_id = uuid.UUID(submitted["proposal_id"])
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(side_effect=asyncio.CancelledError()),
+        submitted = await _submit(
+            session,
+            judge=FakeProposalJudge(
+                fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match")
             ),
-            patch(
-                "service.linear_client.apply_progress_update", AsyncMock(return_value=None)
-            ) as mock_apply,
-        ):
-            with pytest.raises(asyncio.CancelledError):
-                await decide_proposal(
-                    session,
-                    approver_sub="owner-a@example.com",
-                    hold_id=hold_id,
-                    decision="approve",
-                    decision_note=None,
-                )
-        mock_apply.assert_not_awaited()
+        )
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        judge = FakeProposalJudge(fingerprint_raises=asyncio.CancelledError())
+        with pytest.raises(asyncio.CancelledError):
+            await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
+        assert judge.apply_calls == []
         row = (
             await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
         ).scalar_one()
@@ -2077,16 +1200,6 @@ class TestDecideProposal:
         # BLOCKING fix: `apply_error` must never carry cancellation detail
         # that could leak internal information via the API response).
         assert row.apply_error == _APPLY_ERROR_CANCELLED_MESSAGE
-        # Argus review round-9 suggestion: the bare-CancelledError fallback
-        # text (the other branch of `_cancellation_apply_error`, exercised
-        # by `test_cancellation_with_message_uses_message_in_raw_error_only`
-        # for the WITH-message case) should also land in the audit log.
-        # Argus review round-10 suggestion: filter by `hold_id` (a JSONB
-        # field on `detail`), not `order_by(at.desc()).first()` -- the
-        # timestamp-ordering approach only happened to work because this
-        # test's own hold is the only row this action type could produce
-        # in an otherwise-truncated table; filtering directly is correct
-        # regardless of ordering or what else might run in this table.
         audit_row = (
             (
                 await session.execute(
@@ -2105,50 +1218,27 @@ class TestDecideProposal:
         self, session: AsyncSession
     ) -> None:
         """Same as above, for the applier-cancelled branch specifically --
-        cancellation during the fingerprinter vs. during the applier are
-        two distinct ``except asyncio.CancelledError`` sites in
-        ``_apply_or_finalize_proposal_hold``."""
-        with patch(
-            "service.linear_client.fetch_current_fingerprint",
-            AsyncMock(return_value="fp-match"),
-        ):
-            submitted = await _submit(session)
+        cancellation during the fingerprint check vs. during apply() are
+        two distinct code paths in ``_apply_or_finalize_proposal_hold``."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_raises=asyncio.CancelledError(),
+        )
+        submitted = await _submit(session, judge=judge)
         hold_id = uuid.UUID(submitted["proposal_id"])
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(return_value="fp-match"),
-            ),
-            patch(
-                "service.linear_client.apply_progress_update",
-                AsyncMock(side_effect=asyncio.CancelledError()),
-            ) as mock_apply,
-        ):
-            with pytest.raises(asyncio.CancelledError):
-                await decide_proposal(
-                    session,
-                    approver_sub="owner-a@example.com",
-                    hold_id=hold_id,
-                    decision="approve",
-                    decision_note=None,
-                )
+        with pytest.raises(asyncio.CancelledError):
+            await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
         # Argus review round-7 suggestion: without this, a regression that
-        # took the fingerprinter-cancelled path (which never calls the
-        # applier at all) instead of the applier-cancelled path this test
-        # is meant to cover would still pass on the status/apply_error
-        # assertions alone.
-        mock_apply.assert_awaited_once()
+        # took the fingerprinter-cancelled path (which never calls apply()
+        # at all) instead of the apply-cancelled path this test is meant to
+        # cover would still pass on the status/apply_error assertions
+        # alone.
+        assert len(judge.apply_calls) == 1
         row = (
             await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
         ).scalar_one()
         assert row.status == "apply_failed"
         assert row.apply_error == _APPLY_ERROR_CANCELLED_MESSAGE
-        # Argus review round-10 suggestion: mirror the fingerprinter-
-        # cancelled test's audit-log assertion here, for the applier-
-        # cancelled branch specifically -- these are two distinct
-        # `except asyncio.CancelledError` call sites in
-        # `_apply_or_finalize_proposal_hold`, both of which write to the
-        # audit log independently.
         audit_row = (
             (
                 await session.execute(
@@ -2174,23 +1264,18 @@ class TestDecideProposal:
         (internal-only), but `apply_error` (the API-response field) stays
         the fixed constant regardless of what the cancellation message
         says."""
-        submitted = await _submit(session, target_fingerprint="fp-match")
-        hold_id = uuid.UUID(submitted["proposal_id"])
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(side_effect=asyncio.CancelledError("watchdog: 30s timeout")),
+        submitted = await _submit(
+            session,
+            judge=FakeProposalJudge(
+                fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match")
             ),
-            patch("service.linear_client.apply_progress_update", AsyncMock(return_value=None)),
-        ):
-            with pytest.raises(asyncio.CancelledError):
-                await decide_proposal(
-                    session,
-                    approver_sub="owner-a@example.com",
-                    hold_id=hold_id,
-                    decision="approve",
-                    decision_note=None,
-                )
+        )
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        judge = FakeProposalJudge(
+            fingerprint_raises=asyncio.CancelledError("watchdog: 30s timeout")
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
         row = (
             await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
         ).scalar_one()
@@ -2222,41 +1307,34 @@ class TestDecideProposal:
         return this function takes. No terminal write happens on this
         path: the row keeps whatever status the concurrent mutation left
         it at."""
-        submitted = await _submit(session, target_fingerprint="fp-match")
+        submitted = await _submit(
+            session,
+            judge=FakeProposalJudge(
+                fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match")
+            ),
+        )
         hold_id = uuid.UUID(submitted["proposal_id"])
 
-        async def _mutate_then_cancel(_target_id: str) -> str:
-            await session.execute(
-                update(ProposalHold)
-                .where(ProposalHold.id == hold_id)
-                .values(
-                    status="rejected",
-                    decision_source="human",
-                    decided_by_actor_id="someone-else@example.com",
-                    decided_at=text("now()"),
+        class _MutateThenCancelJudge(FakeProposalJudge):
+            async def fingerprint(self, ctx: Any) -> ProposalFingerprint:
+                self.fingerprint_calls.append(ctx)
+                await session.execute(
+                    update(ProposalHold)
+                    .where(ProposalHold.id == hold_id)
+                    .values(
+                        status="rejected",
+                        decision_source="human",
+                        decided_by_actor_id="someone-else@example.com",
+                        decided_at=text("now()"),
+                    )
                 )
-            )
-            await session.commit()
-            raise asyncio.CancelledError()
+                await session.commit()
+                raise asyncio.CancelledError()
 
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(side_effect=_mutate_then_cancel),
-            ),
-            patch(
-                "service.linear_client.apply_progress_update", AsyncMock(return_value=None)
-            ) as mock_apply,
-        ):
-            with pytest.raises(asyncio.CancelledError):
-                await decide_proposal(
-                    session,
-                    approver_sub="owner-a@example.com",
-                    hold_id=hold_id,
-                    decision="approve",
-                    decision_note=None,
-                )
-        mock_apply.assert_not_awaited()
+        judge = _MutateThenCancelJudge()
+        with pytest.raises(asyncio.CancelledError):
+            await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
+        assert judge.apply_calls == []
         row = (
             await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
         ).scalar_one()
@@ -2269,52 +1347,45 @@ class TestDecideProposal:
     ) -> None:
         """Argus review round-2 B1/S4: this decide call CLAIMS the hold
         (status="applying") before releasing the row lock, so a second
-        caller can no longer reach the applier for the SAME hold -- but if
+        caller can no longer reach apply() for the SAME hold -- but if
         something outside this call's own claim still manages to change
         the hold's status during the ~10s external round-trip (simulated
-        here via the fingerprinter mock's side effect), this call must
+        here via the fingerprint call's side effect), this call must
         raise 409, not silently return the concurrent state as its own
         200 (S4): this call never got to decide anything."""
-        with patch(
-            "service.linear_client.fetch_current_fingerprint",
-            AsyncMock(return_value="fp-match"),
-        ):
-            submitted = await _submit(session)
+        submitted = await _submit(
+            session,
+            judge=FakeProposalJudge(
+                fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match")
+            ),
+        )
         hold_id = uuid.UUID(submitted["proposal_id"])
 
-        async def _mutate_then_fingerprint(_target_id: str) -> str:
-            await session.execute(
-                update(ProposalHold)
-                .where(ProposalHold.id == hold_id)
-                .values(
-                    status="rejected",
-                    decision_source="human",
-                    decided_by_actor_id="someone-else@example.com",
-                    decided_at=text("now()"),
+        class _MutateThenFingerprintJudge(FakeProposalJudge):
+            async def fingerprint(self, ctx: Any) -> ProposalFingerprint:
+                self.fingerprint_calls.append(ctx)
+                await session.execute(
+                    update(ProposalHold)
+                    .where(ProposalHold.id == hold_id)
+                    .values(
+                        status="rejected",
+                        decision_source="human",
+                        decided_by_actor_id="someone-else@example.com",
+                        decided_at=text("now()"),
+                    )
                 )
-            )
-            await session.commit()
-            return "fp-match"
+                await session.commit()
+                return ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match")
 
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(side_effect=_mutate_then_fingerprint),
-            ),
-            patch(
-                "service.linear_client.apply_progress_update", AsyncMock(return_value=None)
-            ) as mock_apply,
-        ):
-            with pytest.raises(HoldAlreadyDecidedError) as exc_info:
-                await decide_proposal(
-                    session,
-                    approver_sub="owner-a@example.com",
-                    hold_id=hold_id,
-                    decision="approve",
-                    decision_note=None,
-                )
+        judge = _MutateThenFingerprintJudge(
+            apply_result=ProposalApplyOutcome(
+                applied=True, result=None, caller_error=None, log_detail=None
+            )
+        )
+        with pytest.raises(HoldAlreadyDecidedError) as exc_info:
+            await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
         assert exc_info.value.status == "rejected"
-        mock_apply.assert_awaited_once()
+        assert len(judge.apply_calls) == 1
 
     async def test_decide_on_already_applying_hold_raises_already_decided(
         self, session: AsyncSession
@@ -2327,7 +1398,7 @@ class TestDecideProposal:
         mid-flight; this covers the simpler, more common case of a
         decide call landing on a hold that was ALREADY ``"applying"``
         before this call ever acquired its lock."""
-        submitted = await _submit(session, target_fingerprint="fp-match")
+        submitted = await _submit(session)
         hold_id = uuid.UUID(submitted["proposal_id"])
         await session.execute(
             update(ProposalHold)
@@ -2341,143 +1412,630 @@ class TestDecideProposal:
         )
         await session.commit()
 
-        with patch(
-            "service.linear_client.apply_progress_update", AsyncMock(return_value=None)
-        ) as mock_apply:
-            with pytest.raises(HoldAlreadyDecidedError) as exc_info:
-                await decide_proposal(
-                    session,
-                    approver_sub="owner-a@example.com",
-                    hold_id=hold_id,
-                    decision="approve",
-                    decision_note=None,
-                )
+        judge = FakeProposalJudge()
+        with pytest.raises(HoldAlreadyDecidedError) as exc_info:
+            await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
         assert exc_info.value.status == "applying"
-        mock_apply.assert_not_awaited()
+        assert judge.apply_calls == []
 
-    async def test_approve_assign_ticket_with_non_canonical_uuid_normalizes_and_applies(
-        self, session: AsyncSession
+
+class TestTerminalCommitFailureRecovery:
+    """Argus review round-9 B1/B2/S1/S2: the terminal-commit failure
+    recovery block in ``_apply_or_finalize_proposal_hold`` had zero test
+    coverage despite claims elsewhere that the stranded-row scenario
+    couldn't happen. Simulates a DB-level failure on exactly the terminal
+    commit (the 3rd ``session.commit()`` of a normal approve call -- see
+    the commit sequence below) via a monkeypatched ``session.commit``,
+    never by faking anything about the judge/plugin seam itself.
+
+    Commit sequence in ``decide_proposal`` -> ``_apply_or_finalize_proposal_hold``:
+    - Call 1: ``_claim_proposal_hold_for_applying`` (service.py ~line 7162) --
+      claims ``status="applying"`` under row lock and commits.
+    - Call 2: ``_apply_or_finalize_proposal_hold`` (service.py ~line 7491) --
+      releases read connection before external fingerprint/apply I/O.
+    - Call 3: ``_apply_or_finalize_proposal_hold`` (service.py ~line 7658) --
+      terminal commit attempting to persist final status (injected failure point).
+    - Call 4: ``_apply_or_finalize_proposal_hold`` (service.py ~line 7718) --
+      recovery commit attempting to persist genuine terminal state after rollback.
+    - Call 5: ``_apply_or_finalize_proposal_hold`` (service.py ~line 7742) --
+      last-ditch commit retrying the SAME genuine terminal state again (or a
+      minimal ``apply_failed`` write, if that state was already ``apply_failed``)
+      if the recovery commit also fails.
+    """
+
+    @staticmethod
+    def _fail_nth_commit(session: AsyncSession, fail_at: int, *exceptions: Exception) -> AsyncMock:
+        """Build a ``session.commit`` replacement that raises
+        ``exceptions[0]`` on the ``fail_at``-th call, ``exceptions[1]`` on
+        the ``(fail_at + 1)``-th call (if provided), and so on past the
+        end of ``exceptions`` -- every other call delegates to the real
+        ``session.commit``."""
+        real_commit = session.commit
+        call_count = {"n": 0}
+
+        async def _commit() -> None:
+            call_count["n"] += 1
+            index = call_count["n"] - fail_at
+            if 0 <= index < len(exceptions):
+                raise exceptions[index]
+            await real_commit()
+
+        return AsyncMock(side_effect=_commit)
+
+    async def test_recovery_after_commit_failure_recovers_to_applied_with_result_intact(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A human-approved ``assign_ticket`` proposal bypasses the judge
-        rule's format check entirely (dispatching straight to the
-        applier) -- ``linear_client.apply_assign_ticket`` normalizes non-canonical
-        UUID spellings (e.g. braced form) to canonical lowercase-dashed form
-        before making the Linear API call."""
-        with patch(
-            "service.linear_client.update_issue_assignee", AsyncMock(return_value=None)
-        ) as mock_update_assignee:
-            submitted = await _submit(
-                session,
-                action=_action(
-                    action_type="assign_ticket",
-                    target_id="TECH-1234",
-                    assignee_id="{11111111-1111-1111-1111-111111111111}",
-                ),
-            )
-            assert submitted["status"] == "pending"
+        """A post-apply terminal commit failure must recover to
+        ``"applied"`` with ``apply_result`` intact, NOT ``"apply_failed"``
+        (fix (a)) -- the external write already happened; discarding that
+        and reporting failure would cause a retrying caller to duplicate
+        it."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result={"ticket": "TECH-1"}, caller_error=None, log_detail=None
+            ),
+        )
+        submitted = await _submit(session, judge=judge)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        commit_mock = self._fail_nth_commit(
+            session, 3, OperationalError("boom", {}, Exception("db down"))
+        )
+        monkeypatch.setattr(session, "commit", commit_mock)
 
-            decided = await decide_proposal(
-                session,
-                approver_sub="owner-a@example.com",
-                hold_id=uuid.UUID(submitted["proposal_id"]),
-                decision="approve",
-                decision_note=None,
-            )
+        decided = await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
+
+        assert commit_mock.call_count == 4
         assert decided["status"] == "applied"
-        assert "applied_at" in decided
-        mock_update_assignee.assert_awaited_once_with(
-            "TECH-1234", "11111111-1111-1111-1111-111111111111"
+        assert decided["apply_result"] == {"ticket": "TECH-1"}
+        assert "apply_error" not in decided
+        assert len(judge.apply_calls) == 1
+        audit_row = (
+            (
+                await session.execute(
+                    select(AuditLog).where(
+                        AuditLog.action == "proposal.applied",
+                        AuditLog.detail["hold_id"].astext == str(hold_id),
+                    )
+                )
+            )
+            .scalars()
+            .one()
         )
+        assert audit_row is not None
+        assert "error" not in audit_row.detail
 
-    async def test_approve_assign_ticket_with_invalid_uuid_sets_apply_failed(
+    async def test_recovery_after_commit_failure_recovers_to_stale(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A post-stale terminal commit failure must recover to
+        ``"stale"`` with the honest ``_stale_decision_note`` text, not
+        ``"apply_failed"`` (fix (a))."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-original"),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result=None, caller_error=None, log_detail=None
+            ),
+        )
+        submitted = await _submit(session, judge=judge)
+        judge.fingerprint_result = ProposalFingerprint(
+            status=FINGERPRINT_DIGEST, digest="fp-drifted"
+        )
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        commit_mock = self._fail_nth_commit(
+            session, 3, OperationalError("boom", {}, Exception("db down"))
+        )
+        monkeypatch.setattr(session, "commit", commit_mock)
+
+        decided = await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
+
+        assert commit_mock.call_count == 4
+        assert decided["status"] == "stale"
+        assert decided["decision_note"] == (
+            "not applied: target changed after approval; no write to the target was performed"
+        )
+        assert "apply_error" not in decided
+        assert judge.apply_calls == []
+        audit_row = (
+            (
+                await session.execute(
+                    select(AuditLog).where(
+                        AuditLog.action == "proposal.stale",
+                        AuditLog.detail["hold_id"].astext == str(hold_id),
+                    )
+                )
+            )
+            .scalars()
+            .one()
+        )
+        assert audit_row is not None
+        assert "error" not in audit_row.detail
+
+    async def test_recovery_after_commit_failure_recovers_to_apply_failed(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A post-apply_failed terminal commit failure must recover to
+        ``"apply_failed"`` with the GENUINE plugin ``caller_error``
+        preserved, not the board-owned commit-failure message (fix (a) +
+        the "preserve existing apply_error" half of fix S1)."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_result=ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error="Linear API returned an error",
+                log_detail="linear is down",
+            ),
+        )
+        submitted = await _submit(session, judge=judge)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        commit_mock = self._fail_nth_commit(
+            session, 3, OperationalError("boom", {}, Exception("db down"))
+        )
+        monkeypatch.setattr(session, "commit", commit_mock)
+
+        decided = await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
+
+        assert commit_mock.call_count == 4
+        assert decided["status"] == "apply_failed"
+        assert decided["apply_error"] == "Linear API returned an error"
+        assert decided["apply_error"] != _APPLY_ERROR_BOARD_COMMIT_FAILURE_MESSAGE
+        audit_row = (
+            (
+                await session.execute(
+                    select(AuditLog).where(
+                        AuditLog.action == "proposal.apply_failed",
+                        AuditLog.detail["hold_id"].astext == str(hold_id),
+                    )
+                )
+            )
+            .scalars()
+            .one()
+        )
+        assert audit_row is not None
+        assert audit_row.detail.get("error") == "linear is down"
+
+    async def test_recovery_reraises_cancellation_instead_of_returning_normally(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Fix (b): every OTHER return path in this function re-raises a
+        ``cancelled_exc`` caught earlier before returning -- this recovery
+        path must too, instead of silently swallowing it and returning a
+        normal result as if nothing happened."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_raises=asyncio.CancelledError(),
+        )
+        submitted = await _submit(session, judge=judge)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        commit_mock = self._fail_nth_commit(
+            session, 3, OperationalError("boom", {}, Exception("db down"))
+        )
+        monkeypatch.setattr(session, "commit", commit_mock)
+
+        with pytest.raises(asyncio.CancelledError):
+            await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
+
+        assert commit_mock.call_count == 4
+        row = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        assert row.status == "apply_failed"
+        assert row.apply_error == _APPLY_ERROR_CANCELLED_MESSAGE
+
+    async def test_last_ditch_reraises_cancellation_after_two_commit_failures(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Finding 5: cancellation during apply, COMBINED with both the
+        terminal commit AND the recovery commit failing (reaching the
+        last-ditch write), must still re-raise the cancellation -- not
+        just when the recovery commit alone fails (the sibling test
+        above)."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_raises=asyncio.CancelledError(),
+        )
+        submitted = await _submit(session, judge=judge)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        commit_mock = self._fail_nth_commit(
+            session,
+            3,
+            OperationalError("first", {}, Exception("terminal commit failed")),
+            OperationalError("second", {}, Exception("recovery commit also failed")),
+        )
+        monkeypatch.setattr(session, "commit", commit_mock)
+
+        with pytest.raises(asyncio.CancelledError):
+            await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
+
+        assert commit_mock.call_count == 5
+        row = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        # A cancellation sets apply_error/terminal_status="apply_failed"
+        # BEFORE any commit is even attempted -- so the last-ditch write
+        # here takes the minimal-fallback branch (fix 2's other case),
+        # same as the non-cancelled apply_failed scenario above.
+        assert row.status == "apply_failed"
+        assert row.apply_error == _APPLY_ERROR_BOARD_COMMIT_FAILURE_MESSAGE
+
+    async def test_recovery_fallthrough_on_concurrent_resolution_reraises_cancellation(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Finding 1: if apply was cancelled, terminal commit fails, AND
+        recovery_hold is concurrently resolved (recovery_hold.status != expected_status),
+        the fallthrough must re-raise cancelled_exc instead of commit_exc."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_raises=asyncio.CancelledError(),
+        )
+        submitted = await _submit(session, judge=judge)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+
+        commit_mock = self._fail_nth_commit(
+            session, 3, OperationalError("boom", {}, Exception("terminal commit failed"))
+        )
+        monkeypatch.setattr(session, "commit", commit_mock)
+
+        real_find = service._find_proposal_hold
+        find_for_update_calls = 0
+
+        async def _find_hook(sess: Any, hid: Any, for_update: bool = False) -> Any:
+            nonlocal find_for_update_calls
+            h = await real_find(sess, hid, for_update=for_update)
+            if for_update and h is not None:
+                find_for_update_calls += 1
+                if find_for_update_calls == 3:
+                    # 3rd for_update find is the recovery find; simulate concurrent resolution
+                    h.status = "rejected"
+            return h
+
+        monkeypatch.setattr(service, "_find_proposal_hold", _find_hook)
+
+        with pytest.raises(asyncio.CancelledError):
+            await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
+
+        assert commit_mock.call_count == 3
+        assert find_for_update_calls == 3
+
+    async def test_recovery_fallthrough_on_concurrent_resolution_raises_commit_exc(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When not cancelled, recovery fallthrough on concurrent resolution raises commit_exc."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result=None, caller_error=None, log_detail=None
+            ),
+        )
+        submitted = await _submit(session, judge=judge)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+
+        first_exc = OperationalError("boom", {}, Exception("terminal commit failed"))
+        commit_mock = self._fail_nth_commit(session, 3, first_exc)
+        monkeypatch.setattr(session, "commit", commit_mock)
+
+        real_find = service._find_proposal_hold
+        find_for_update_calls = 0
+
+        async def _find_hook(sess: Any, hid: Any, for_update: bool = False) -> Any:
+            nonlocal find_for_update_calls
+            h = await real_find(sess, hid, for_update=for_update)
+            if for_update and h is not None:
+                find_for_update_calls += 1
+                if find_for_update_calls == 3:
+                    h.status = "rejected"
+            return h
+
+        monkeypatch.setattr(service, "_find_proposal_hold", _find_hook)
+
+        with pytest.raises(OperationalError) as exc_info:
+            await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
+
+        assert exc_info.value is first_exc
+        assert commit_mock.call_count == 3
+        assert find_for_update_calls == 3
+
+    async def test_recovery_commit_also_failing_preserves_original_exception_context(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Fix S2 / Finding 2 / Finding 12 / Argus review round-4 B2: if the
+        RECOVERY commit itself also fails, the last-ditch commit must retry
+        the SAME genuine terminal state ("applied" here, with apply_result
+        intact) rather than downgrading it to a false apply_failed --
+        silently discarding a real successful external write and reporting
+        failure would let a retrying caller duplicate that write (the
+        dedup check does not block resubmission against an apply_failed
+        row). The original (terminal) commit exception still propagates,
+        with the secondary exception explicitly chained via __cause__ and
+        __context__."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result={"ticket": "TECH-1"}, caller_error=None, log_detail=None
+            ),
+        )
+        submitted = await _submit(session, judge=judge)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        first_exc = OperationalError("first", {}, Exception("terminal commit failed"))
+        second_exc = OperationalError("second", {}, Exception("recovery commit also failed"))
+        commit_mock = self._fail_nth_commit(session, 3, first_exc, second_exc)
+        monkeypatch.setattr(session, "commit", commit_mock)
+
+        with pytest.raises(OperationalError) as exc_info:
+            await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
+
+        assert commit_mock.call_count == 5
+        assert exc_info.value is first_exc
+        assert first_exc.__cause__ is second_exc
+        assert first_exc.__context__ is second_exc
+        row = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        assert row.status == "applied"
+        assert row.apply_result == {"ticket": "TECH-1"}
+        assert row.apply_error is None
+        assert row.applied_at is not None
+        audit_row = (
+            (
+                await session.execute(
+                    select(AuditLog).where(
+                        AuditLog.action == "proposal.applied",
+                        AuditLog.detail["hold_id"].astext == str(hold_id),
+                    )
+                )
+            )
+            .scalars()
+            .one()
+        )
+        assert "error" not in audit_row.detail
+
+    async def test_last_ditch_write_preserves_stale(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Fix 2 (BLOCKING): the last-ditch write must retry "stale" (with
+        the honest ``_stale_decision_note`` text) too, not just "applied"
+        -- a "stale" outcome is just as much a real, already-computed
+        terminal state as "applied" is, and downgrading it to a false
+        apply_failed would be equally misleading."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-original"),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result=None, caller_error=None, log_detail=None
+            ),
+        )
+        submitted = await _submit(session, judge=judge)
+        judge.fingerprint_result = ProposalFingerprint(
+            status=FINGERPRINT_DIGEST, digest="fp-drifted"
+        )
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        first_exc = OperationalError("first", {}, Exception("terminal commit failed"))
+        second_exc = OperationalError("second", {}, Exception("recovery commit also failed"))
+        commit_mock = self._fail_nth_commit(session, 3, first_exc, second_exc)
+        monkeypatch.setattr(session, "commit", commit_mock)
+
+        with pytest.raises(OperationalError) as exc_info:
+            await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
+
+        assert commit_mock.call_count == 5
+        assert exc_info.value is first_exc
+        row = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        assert row.status == "stale"
+        assert row.decision_note == (
+            "not applied: target changed after approval; no write to the target was performed"
+        )
+        assert judge.apply_calls == []
+        audit_row = (
+            (
+                await session.execute(
+                    select(AuditLog).where(
+                        AuditLog.action == "proposal.stale",
+                        AuditLog.detail["hold_id"].astext == str(hold_id),
+                    )
+                )
+            )
+            .scalars()
+            .one()
+        )
+        assert "error" not in audit_row.detail
+
+    async def test_last_ditch_write_uses_minimal_fallback_only_for_apply_failed(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Fix 2 (BLOCKING): when the ALREADY-computed terminal state was
+        itself ``apply_failed`` (no successful external write to
+        protect), the last-ditch write correctly falls back to the
+        minimal board-owned ``_APPLY_ERROR_BOARD_COMMIT_FAILURE_MESSAGE``
+        -- this is the one case where that minimal write remains
+        correct."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_result=ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error="Linear API returned an error",
+                log_detail="linear is down",
+            ),
+        )
+        submitted = await _submit(session, judge=judge)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        first_exc = OperationalError("first", {}, Exception("terminal commit failed"))
+        second_exc = OperationalError("second", {}, Exception("recovery commit also failed"))
+        commit_mock = self._fail_nth_commit(session, 3, first_exc, second_exc)
+        monkeypatch.setattr(session, "commit", commit_mock)
+
+        with pytest.raises(OperationalError) as exc_info:
+            await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
+
+        assert commit_mock.call_count == 5
+        assert exc_info.value is first_exc
+        row = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        assert row.status == "apply_failed"
+        assert row.apply_error == _APPLY_ERROR_BOARD_COMMIT_FAILURE_MESSAGE
+
+    async def test_recovery_commit_and_last_ditch_both_failing_strands_row(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Finding 2 option (a) residual gap: if terminal commit, recovery commit,
+        AND last-ditch commit all fail (3 consecutive DB failures), the row remains
+        stranded at applying and commit_exc from recovery_exc is raised."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result=None, caller_error=None, log_detail=None
+            ),
+        )
+        submitted = await _submit(session, judge=judge)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        first_exc = OperationalError("first", {}, Exception("terminal commit failed"))
+        second_exc = OperationalError("second", {}, Exception("recovery commit also failed"))
+        third_exc = OperationalError("third", {}, Exception("last-ditch commit also failed"))
+        commit_mock = self._fail_nth_commit(session, 3, first_exc, second_exc, third_exc)
+        monkeypatch.setattr(session, "commit", commit_mock)
+
+        with pytest.raises(OperationalError) as exc_info:
+            await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
+
+        assert commit_mock.call_count == 5
+        assert exc_info.value is first_exc
+        assert first_exc.__cause__ is second_exc
+        row = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        assert row.status == "applying"
+
+
+class TestProposalJudgeSeamValidation:
+    """Board-side seam validation this module is well-placed to exercise
+    end-to-end against a real Postgres row (the seam's own isolated
+    fail-closed/contract-violation coverage, with no DB at all, lives in
+    ``tests/test_proposal_judge_seam.py``): a plugin-returned ``priority``
+    outside ``PROPOSAL_HOLD_LEVELS`` is rejected at the seam
+    rather than reaching the ``ck_proposal_holds_priority`` CHECK; a
+    plugin-supplied ``caller_error`` is exactly what surfaces over the API;
+    and a plugin's ``log_detail`` never surfaces over the API but does land
+    in the audit row."""
+
+    async def test_priority_outside_hold_levels_raises_value_error(
         self, session: AsyncSession
     ) -> None:
-        """A human-approved ``assign_ticket`` proposal with a genuinely
-        malformed (non-UUID) ``assignee_id`` fails in the applier with
-        ``LinearAPIError``, which resolves the hold to ``apply_failed``
-        gracefully rather than crashing or silently applying."""
-        with patch(
-            "service.linear_client.update_issue_assignee", AsyncMock(return_value=None)
-        ) as mock_update_assignee:
-            submitted = await _submit(
-                session,
-                action=_action(
-                    action_type="assign_ticket",
-                    target_id="TECH-1234",
-                    assignee_id="not-a-uuid",
-                ),
+        judge = FakeProposalJudge(classify_result=ProposalClassification(priority="urgent!!"))
+        with pytest.raises(ValueError, match="invalid priority"):
+            await _submit(session, judge=judge)
+
+    async def test_caller_error_is_what_surfaces_over_the_api(self, session: AsyncSession) -> None:
+        judge = FakeProposalJudge(
+            judge_result=ProposalVerdict(approved=True, decision_note="auto-approved"),
+            apply_result=ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error="a small, allowlisted, caller-safe message",
+                log_detail="the raw upstream detail, credentials and all",
+            ),
+        )
+        result = await _submit(session, judge=judge)
+        assert result["apply_error"] == "a small, allowlisted, caller-safe message"
+        assert "log_detail" not in result
+        assert "raw upstream detail" not in str(result)
+
+    async def test_log_detail_lands_in_the_audit_row_only(self, session: AsyncSession) -> None:
+        judge = FakeProposalJudge(
+            judge_result=ProposalVerdict(approved=True, decision_note="auto-approved"),
+            apply_result=ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error="a small, allowlisted, caller-safe message",
+                log_detail="the raw upstream detail, credentials and all",
+            ),
+        )
+        result = await _submit(session, judge=judge)
+        audit_row = (
+            (
+                await session.execute(
+                    select(AuditLog).where(
+                        AuditLog.action == "proposal.apply_failed",
+                        AuditLog.detail["hold_id"].astext == result["proposal_id"],
+                    )
+                )
             )
-            assert submitted["status"] == "pending"
+            .scalars()
+            .one()
+        )
+        assert audit_row.detail["error"] == "the raw upstream detail, credentials and all"
 
-            decided = await decide_proposal(
-                session,
-                approver_sub="owner-a@example.com",
-                hold_id=uuid.UUID(submitted["proposal_id"]),
-                decision="approve",
-                decision_note=None,
+    async def test_non_json_serializable_apply_result_resolves_cleanly_to_apply_failed(
+        self, session: AsyncSession
+    ) -> None:
+        judge = FakeProposalJudge(
+            judge_result=ProposalVerdict(approved=True, decision_note="auto-approved"),
+            apply_result=ProposalApplyOutcome(
+                applied=True,
+                result={"invalid_set": {1, 2, 3}},
+                caller_error=None,
+                log_detail=None,
+            ),
+        )
+        result = await _submit(session, judge=judge)
+        assert result["status"] == "apply_failed"
+        assert result["apply_error"] == "unable to apply this proposal"
+
+        # Verify hold in DB is not stranded at 'applying'
+        hold = await session.get(ProposalHold, uuid.UUID(result["proposal_id"]))
+        assert hold is not None
+        assert hold.status == "apply_failed"
+        assert hold.apply_error == "unable to apply this proposal"
+
+    async def test_overlong_decision_note_is_truncated(self, session: AsyncSession) -> None:
+        overlong_note = "n" * 2500
+        judge = FakeProposalJudge(
+            judge_result=ProposalVerdict(approved=True, decision_note=overlong_note),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result={"ok": True}, caller_error=None, log_detail=None
+            ),
+        )
+        result = await _submit(session, judge=judge)
+        assert len(result["decision_note"]) == 2000
+        assert result["decision_note"].endswith("... [truncated]")
+        assert result["decision_note"].startswith("n" * 100)
+
+    async def test_overlong_caller_error_is_truncated(self, session: AsyncSession) -> None:
+        overlong_error = "e" * 600
+        judge = FakeProposalJudge(
+            judge_result=ProposalVerdict(approved=True, decision_note="auto-approved"),
+            apply_result=ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error=overlong_error,
+                log_detail="raw",
+            ),
+        )
+        result = await _submit(session, judge=judge)
+        assert result["status"] == "apply_failed"
+        assert len(result["apply_error"]) == 500
+        assert result["apply_error"].endswith("... [truncated]")
+        assert result["apply_error"].startswith("e" * 100)
+
+    async def test_legitimate_decision_note_starting_with_judge_error_does_not_trigger_error_branch(
+        self, session: AsyncSession
+    ) -> None:
+        judge = FakeProposalJudge(
+            judge_result=ProposalVerdict(
+                approved=False,
+                decision_note="judge error: legitimate business reason to hold for human",
             )
-        assert decided["status"] == "apply_failed"
-        assert "applied_at" not in decided
-        assert decided["apply_error"] == "Linear API returned an error"
-        mock_update_assignee.assert_not_awaited()
-
-
-class TestSanitizeApplyError:
-    """Pure-function tests for ``_sanitize_apply_error`` -- no DB needed,
-    but this module is the only place that imports ``service``'s proposal
-    internals, so it lives here rather than a new file for three cases."""
-
-    def test_token_missing_maps_to_token_message(self) -> None:
-        exc = LinearTokenMissingError("LINEAR_API_TOKEN is not configured")
-        assert _sanitize_apply_error(exc) == "Linear API token not configured"
-
-    def test_transport_error_maps_to_unavailable_message(self) -> None:
-        """Argus review round-6 suggestion: this branch (triggered by
-        ``LinearTransportError``, raised by ``linear_client._post_graphql``
-        on an ``httpx``/JSON-decode failure) previously had no test --
-        both existing apply-failure tests used a plain ``LinearAPIError``,
-        which never exercises this case."""
-        exc = LinearTransportError("Linear API request failed: connection refused")
-        assert _sanitize_apply_error(exc) == "Linear API unavailable"
-
-    def test_generic_linear_api_error_maps_to_generic_message(self) -> None:
-        """A message that merely happens to contain "is not configured" --
-        e.g. echoed back from Linear's own GraphQL error payload -- must
-        NOT be misclassified as a local token-configuration problem now
-        that dispatch is by exception TYPE, not substring match (Argus
-        review round-6 suggestion, the whole point of
-        ``LinearTokenMissingError``/``LinearTransportError`` as distinct
-        types)."""
-        exc = LinearAPIError("Linear API returned errors: field X is not configured on this team")
-        assert _sanitize_apply_error(exc) == "Linear API returned an error"
-
-
-class TestSanitizeLinearSubmitError:
-    """Pure-function tests for ``sanitize_linear_submit_error`` (Argus review round-3 B1)."""
-
-    def test_token_missing_maps_to_500_and_server_configuration_error(self) -> None:
-        exc = LinearTokenMissingError("LINEAR_API_TOKEN is not configured")
-        assert sanitize_linear_submit_error(exc) == (
-            500,
-            "server_configuration_error",
-            "server configuration error",
         )
-
-    def test_transport_error_maps_to_503_and_unavailable_message(self) -> None:
-        exc = LinearTransportError("Linear API request failed: connection refused")
-        assert sanitize_linear_submit_error(exc) == (
-            503,
-            "service_unavailable",
-            "Linear API unavailable",
-        )
-
-    def test_generic_linear_api_error_maps_to_422_and_generic_message(self) -> None:
-        exc = LinearAPIError("Linear API returned errors: field X is not configured on this team")
-        assert sanitize_linear_submit_error(exc) == (
-            422,
-            "invalid_request",
-            "Linear returned an error",
-        )
+        result = await _submit(session, judge=judge)
+        assert result["status"] == "pending"
+        # Since this was a normal plugin-supplied verdict and not an internal judge error,
+        # the error-branch pre-return commit did not fire and no error note was persisted.
+        assert "decision_note" not in result
+        hold = await session.get(ProposalHold, uuid.UUID(result["proposal_id"]))
+        assert hold is not None
+        assert hold.decision_note is None
 
 
 class TestGetProposalForBot:
@@ -2516,7 +2074,7 @@ class TestGetProposalForBot:
         stays readable by the submitting bot after the fact, not just in
         the synchronous response to whatever call decided it."""
         submitted = await _submit(session, proposed_by_bot_id="bot-1")
-        await decide_proposal(
+        await _decide(
             session,
             approver_sub="owner-a@example.com",
             hold_id=uuid.UUID(submitted["proposal_id"]),
@@ -2634,7 +2192,7 @@ class TestWithdrawProposal:
         self, session: AsyncSession
     ) -> None:
         submitted = await _submit(session, proposed_by_bot_id="bot-1")
-        await decide_proposal(
+        await _decide(
             session,
             approver_sub="owner-a@example.com",
             hold_id=uuid.UUID(submitted["proposal_id"]),

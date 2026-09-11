@@ -77,11 +77,11 @@ APPROVAL_HOLD_KINDS = ("message", "invite")
 #     (service.decide_proposal) -- both paths funnel through the same
 #     service._apply_or_finalize_proposal_hold helper, and both first
 #     claim the row by writing `applying` (below) under the initial
-#     `FOR UPDATE` before releasing that lock for the ~10s external
-#     Linear call.
+#     `FOR UPDATE` before releasing that lock for the external
+#     apply call.
 #   - `rejected`, via a human's `reject` decision only (decide_proposal) --
 #     the auto-judge never rejects on a bot's behalf (see
-#     evaluate_linear_progress_update_judge's docstring).
+#     plugins.ProposalJudge.judge's / plugins.ProposalVerdict's docstrings).
 # `applying` is a transient, PERSISTED sentinel (unlike `approved`, see
 # below): the claiming caller writes it (plus decided_at/
 # decided_by_actor_id/decision_source, to satisfy
@@ -90,7 +90,7 @@ APPROVAL_HOLD_KINDS = ("message", "invite")
 # second concurrent caller that acquires the lock while this is in flight
 # reads `applying` (not `pending`), takes the already-decided branch, and
 # never reaches the applier a second time -- this is what actually closes
-# the double-Linear-write race; the DB-level dedup on the terminal write
+# the double-apply race; the DB-level dedup on the terminal write
 # alone was not enough; see `_apply_or_finalize_proposal_hold`'s docstring.
 # `approved` is a value this CHECK still accepts (see the "frozen
 # migration" note below) but is NEVER actually persisted: it is the
@@ -725,12 +725,12 @@ class ProposalHold(Base):
     bot/action kind is a code change, not a migration.
 
     That DB-level openness is broader than what the *service* currently
-    accepts, though: ``service._derive_proposal_priority`` raises for any
-    ``kind`` other than ``"linear_progress_update"`` -- e.g. a proposal
-    with ``kind="arc_board_change"`` will 422 at submission time even
-    though the column would happily store it. Adding a new kind requires
-    both a new ``_derive_proposal_priority`` branch and a registered rule
-    in ``_PROPOSAL_KIND_DEFAULT_RULE``, not just writing the row.
+    accepts, though: which ``kind``s are admitted at all is determined by
+    the configured ``plugins.ProposalJudge``'s ``classify()`` method, which
+    raises ``ValueError`` (mapped to 422 at submission time) for any
+    unsupported ``kind``. Adding support for a new kind requires updating
+    the configured judge to classify, fingerprint, judge, and apply it,
+    not just writing the row.
 
     ``owner_sub`` is snapshotted at creation time from the proposing bot's
     verified owner claim (falling back to the agent-owner registry, same
@@ -812,7 +812,7 @@ class ProposalHold(Base):
         # terminal hold is not "pending" anymore, but it is very much
         # still a live in-flight duplicate a resubmission must be blocked
         # against -- `pending`-only left a ~10s window, for the duration
-        # of the external Linear round-trip, where a resubmission with the
+        # of the external apply round-trip, where a resubmission with the
         # same dedup key found no `pending` row and inserted a fresh one,
         # silently bypassing dedup.
         Index(
@@ -860,14 +860,13 @@ class ProposalHold(Base):
     target_fingerprint: Mapped[str] = mapped_column(Text, nullable=False)
     applied_at: Mapped[datetime | None] = mapped_column(nullable=True)
     apply_error: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # Metadata a kind-scoped applier returns on a successful apply -- e.g.
-    # `linear_client.apply_open_ticket`'s `{"id", "identifier", "url"}` for
-    # the Linear issue it just created (TECH-5873 redefinition). Nullable
-    # and set only when the applier actually returns something non-None;
-    # `apply_progress_update` (the comment-posting applier) always returns
-    # `None`, so this stays unset for every `close_ticket`/other
-    # `linear_progress_update` row -- see `service._apply_or_finalize_
-    # proposal_hold`.
+    # Metadata the configured plugins.ProposalJudge's apply() returns on a
+    # successful apply -- e.g. an external ticket-creation plugin might return
+    # `{"id", "identifier", "url"}` for an issue it just created
+    # (TECH-5873 redefinition). Nullable and set only when apply() actually
+    # returns a non-None result; an applier with nothing
+    # structured to report returns `None`, so this stays unset for those
+    # rows -- see `service._apply_or_finalize_proposal_hold`.
     apply_result: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _updated_at()

@@ -20,22 +20,7 @@ services:
       OKTA_CLIENT_SECRET: ${OKTA_CLIENT_SECRET}
       MCP_JWT_SECRET: ${MCP_JWT_SECRET}
       AGENT_JWT_SECRET: ${AGENT_JWT_SECRET}
-      # Argus review round-5 S10 suggested dropping this `:-` default for
-      # consistency with the other vars in this block; round-6 flagged that
-      # doing so makes Docker Compose v2 print a "variable is not set"
-      # warning on every `docker compose up` for anyone following
-      # .env.example (where this is commented out under "Optional"),
-      # contradicting README's documented "server runs without it".
-      # Restored: LINEAR_API_TOKEN is genuinely optional, unlike every
-      # other var in this block, so it's the one that should keep the
-      # explicit empty-string default.
-      LINEAR_API_TOKEN: ${LINEAR_API_TOKEN:-}
-      # Same "genuinely optional" reasoning as LINEAR_API_TOKEN above:
-      # unset, the `open_ticket`/`start_ticket`/`review_ticket`/
-      # `assign_ticket`/`label_ticket` auto-approve lanes (GITHUB_TOKEN)
-      # fail closed rather than crash the server -- see README.md's
-      # environment-variable table.
-      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      PROPOSAL_JUDGE: ${PROPOSAL_JUDGE:-}
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/agent_comms
     volumes:
       - token-storage:/data

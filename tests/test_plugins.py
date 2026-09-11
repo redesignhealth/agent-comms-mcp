@@ -49,6 +49,18 @@ class TestResolvePluginRegistryLookup:
         scorer = resolve_plugin("SOME_ENV_VAR", _REGISTRY, "boundary_v1")
         assert isinstance(scorer, BoundaryCrossingScorer)
 
+    def test_empty_env_var_is_not_treated_as_absent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Argus review round-4 B1: an empty-string env var must resolve
+        as an unknown plugin name (same as a typo), not silently fall
+        back to ``default`` -- two seams resolved through this shared
+        function (``APPROVAL_NOTIFIER``/``ACTIVE_CHECKER``) rely on that
+        crash as a safety net for an operator who left the var blank by
+        accident. ``PROPOSAL_JUDGE``'s own empty-string tolerance lives in
+        ``get_proposal_judge`` instead, not here."""
+        monkeypatch.setenv("SOME_ENV_VAR", "")
+        with pytest.raises(RuntimeError, match="unknown plugin"):
+            resolve_plugin("SOME_ENV_VAR", _REGISTRY, "boundary_v1")
+
     def test_env_var_overrides_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SOME_ENV_VAR", "fake")
         scorer = resolve_plugin(
@@ -97,14 +109,16 @@ class TestRiskScorerRegistry:
 class TestGetRiskScorerAndValidateConfiguration:
     def setup_method(self) -> None:
         # get_risk_scorer/get_auto_approver/get_approval_notifier/
-        # get_active_checker each cache a process-wide singleton -- reset
-        # all four so each test starts from a clean slate regardless of run
-        # order (validate_configuration now resolves all four).
+        # get_active_checker/get_docs_verifier/get_proposal_judge each cache
+        # a process-wide singleton -- reset all six so each test starts from
+        # a clean slate regardless of run order (validate_configuration now
+        # resolves all six).
         plugins._risk_scorer = None
         plugins._auto_approver = None
         plugins._approval_notifier = None
         plugins._active_checker = None
         plugins._docs_verifier = None
+        plugins._proposal_judge = None
 
     def teardown_method(self) -> None:
         plugins._risk_scorer = None
@@ -112,6 +126,7 @@ class TestGetRiskScorerAndValidateConfiguration:
         plugins._approval_notifier = None
         plugins._active_checker = None
         plugins._docs_verifier = None
+        plugins._proposal_judge = None
 
     def test_get_risk_scorer_defaults_to_boundary_v1(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(plugins.RISK_SCORER_ENV_VAR, raising=False)
@@ -313,6 +328,18 @@ class TestGetApprovalNotifier:
         monkeypatch.delenv(plugins.APPROVAL_NOTIFIER_ENV_VAR, raising=False)
         assert isinstance(plugins.get_approval_notifier(), LogOnlyNotifier)
 
+    def test_empty_string_is_not_treated_as_absent_and_crashes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Argus review round-4 B1: unlike ``PROPOSAL_JUDGE``, this seam's
+        fail-open default (``log_only``) must NOT be silently reached by
+        an empty-string env var -- that crash is the safety net for an
+        operator who left the var blank by accident (e.g. a blank line in
+        a ``.env`` file)."""
+        monkeypatch.setenv(plugins.APPROVAL_NOTIFIER_ENV_VAR, "")
+        with pytest.raises(RuntimeError, match="unknown plugin"):
+            plugins.get_approval_notifier()
+
 
 # --- Seam 4: the active checker (TECH-5703) -----------------------------------
 
@@ -340,6 +367,7 @@ class TestGetActiveCheckerAndValidateConfiguration:
         plugins._approval_notifier = None
         plugins._active_checker = None
         plugins._docs_verifier = None
+        plugins._proposal_judge = None
 
     def teardown_method(self) -> None:
         plugins._risk_scorer = None
@@ -347,12 +375,25 @@ class TestGetActiveCheckerAndValidateConfiguration:
         plugins._approval_notifier = None
         plugins._active_checker = None
         plugins._docs_verifier = None
+        plugins._proposal_judge = None
 
     def test_get_active_checker_defaults_to_always_active(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.delenv(plugins.ACTIVE_CHECKER_ENV_VAR, raising=False)
         assert isinstance(plugins.get_active_checker(), plugins.AlwaysActiveChecker)
+
+    def test_empty_string_is_not_treated_as_absent_and_crashes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Argus review round-4 B1: unlike ``PROPOSAL_JUDGE``, this seam's
+        fail-open default (``always_active``, itself documented as
+        fail-open) must NOT be silently reached by an empty-string env
+        var -- that crash is the safety net for an operator who left the
+        var blank by accident (e.g. a blank line in a ``.env`` file)."""
+        monkeypatch.setenv(plugins.ACTIVE_CHECKER_ENV_VAR, "")
+        with pytest.raises(RuntimeError, match="unknown plugin"):
+            plugins.get_active_checker()
 
     def test_get_active_checker_caches_the_instance(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(plugins.ACTIVE_CHECKER_ENV_VAR, raising=False)
@@ -447,6 +488,7 @@ class TestGetDocsVerifierAndValidateConfiguration:
         plugins._approval_notifier = None
         plugins._active_checker = None
         plugins._docs_verifier = None
+        plugins._proposal_judge = None
 
     def teardown_method(self) -> None:
         plugins._risk_scorer = None
@@ -454,6 +496,7 @@ class TestGetDocsVerifierAndValidateConfiguration:
         plugins._approval_notifier = None
         plugins._active_checker = None
         plugins._docs_verifier = None
+        plugins._proposal_judge = None
 
     def test_get_docs_verifier_defaults_to_reject_all(
         self, monkeypatch: pytest.MonkeyPatch
@@ -503,6 +546,194 @@ class TestGetDocsVerifierAndValidateConfiguration:
             plugins.validate_configuration()
 
 
+# --- Seam 6 of this module (seventh board-wide seam) -- the proposal judge --
+
+
+class _FakeJudge:
+    def classify(self, kind: str, action: dict[str, object]) -> None:  # pragma: no cover
+        raise NotImplementedError
+
+    async def fingerprint(self, ctx: object) -> None:  # pragma: no cover -- never called
+        raise NotImplementedError
+
+    async def judge(self, ctx: object) -> None:  # pragma: no cover -- never called
+        raise NotImplementedError
+
+    async def apply(self, ctx: object) -> None:  # pragma: no cover -- never called
+        raise NotImplementedError
+
+
+class TestProposalJudgeRegistry:
+    def test_default_registry_contains_escalate_all_proposals(self) -> None:
+        assert (
+            plugins.PROPOSAL_JUDGES[plugins.DEFAULT_PROPOSAL_JUDGE]
+            is plugins.EscalateAllProposalJudge
+        )
+
+    def test_escalate_all_proposal_judge_satisfies_protocol(self) -> None:
+        judge: plugins.ProposalJudge = plugins.EscalateAllProposalJudge()
+        assert hasattr(judge, "classify")
+        assert hasattr(judge, "fingerprint")
+        assert hasattr(judge, "judge")
+        assert hasattr(judge, "apply")
+
+    def test_classify_accepts_any_kind_at_low_priority(self) -> None:
+        judge = plugins.EscalateAllProposalJudge()
+        result = judge.classify("anything", {})
+        assert result.priority == "low"
+
+    async def test_fingerprint_reports_no_target(self) -> None:
+        judge = plugins.EscalateAllProposalJudge()
+        ctx = plugins.ProposalContext(
+            kind="anything",
+            action={},
+            target_id="t-1",
+            action_type="a",
+            rationale="because",
+            proposed_by_bot_id="bot-1",
+            owner_sub="owner-a",
+            hold_id=None,
+        )
+        result = await judge.fingerprint(ctx)
+        assert result.status == plugins.FINGERPRINT_NO_TARGET
+
+    async def test_judge_never_auto_approves(self) -> None:
+        judge = plugins.EscalateAllProposalJudge()
+        ctx = plugins.ProposalContext(
+            kind="anything",
+            action={},
+            target_id="t-1",
+            action_type="a",
+            rationale="because",
+            proposed_by_bot_id="bot-1",
+            owner_sub="owner-a",
+            hold_id=uuid.uuid4(),
+        )
+        verdict = await judge.judge(ctx)
+        assert verdict.approved is False
+
+    async def test_apply_never_writes_anything(self) -> None:
+        judge = plugins.EscalateAllProposalJudge()
+        ctx = plugins.ProposalContext(
+            kind="anything",
+            action={},
+            target_id="t-1",
+            action_type="a",
+            rationale="because",
+            proposed_by_bot_id="bot-1",
+            owner_sub="owner-a",
+            hold_id=uuid.uuid4(),
+        )
+        outcome = await judge.apply(ctx)
+        assert outcome.applied is False
+        assert outcome.result is None
+        assert outcome.caller_error == "no proposal judge is configured for this deployment"
+
+
+class TestGetProposalJudgeAndValidateConfiguration:
+    def setup_method(self) -> None:
+        plugins._risk_scorer = None
+        plugins._auto_approver = None
+        plugins._approval_notifier = None
+        plugins._active_checker = None
+        plugins._docs_verifier = None
+        plugins._proposal_judge = None
+
+    def teardown_method(self) -> None:
+        plugins._risk_scorer = None
+        plugins._auto_approver = None
+        plugins._approval_notifier = None
+        plugins._active_checker = None
+        plugins._docs_verifier = None
+        plugins._proposal_judge = None
+
+    def test_get_proposal_judge_defaults_to_escalate_all_proposals(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(plugins.PROPOSAL_JUDGE_ENV_VAR, raising=False)
+        assert isinstance(plugins.get_proposal_judge(), plugins.EscalateAllProposalJudge)
+
+    def test_get_proposal_judge_caches_the_instance(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv(plugins.PROPOSAL_JUDGE_ENV_VAR, raising=False)
+        first = plugins.get_proposal_judge()
+        second = plugins.get_proposal_judge()
+        assert first is second
+
+    def test_env_var_overrides_default_by_registry_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setitem(plugins.PROPOSAL_JUDGES, "fake", _FakeJudge)
+        monkeypatch.setenv(plugins.PROPOSAL_JUDGE_ENV_VAR, "fake")
+        assert isinstance(plugins.get_proposal_judge(), _FakeJudge)
+
+    def test_env_var_overrides_default_by_import_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(plugins.PROPOSAL_JUDGE_ENV_VAR, "tests.test_plugins:_FakeJudge")
+        assert isinstance(plugins.get_proposal_judge(), _FakeJudge)
+
+    def test_unknown_registry_name_raises_runtime_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(plugins.PROPOSAL_JUDGE_ENV_VAR, "not_a_real_judge")
+        with pytest.raises(RuntimeError, match="unknown plugin"):
+            plugins.get_proposal_judge()
+
+    def test_validate_configuration_passes_for_the_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(plugins.PROPOSAL_JUDGE_ENV_VAR, raising=False)
+        plugins.validate_configuration()  # must not raise
+
+    def test_validate_configuration_logs_a_warning_when_unset(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.delenv(plugins.PROPOSAL_JUDGE_ENV_VAR, raising=False)
+        with caplog.at_level("WARNING", logger="plugins"):
+            plugins.validate_configuration()
+        assert any(plugins.PROPOSAL_JUDGE_ENV_VAR in record.message for record in caplog.records)
+
+    def test_validate_configuration_logs_a_warning_and_uses_default_when_empty(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv(plugins.PROPOSAL_JUDGE_ENV_VAR, "")
+        with caplog.at_level("WARNING", logger="plugins"):
+            plugins.validate_configuration()
+        assert any(plugins.PROPOSAL_JUDGE_ENV_VAR in record.message for record in caplog.records)
+        assert isinstance(plugins.get_proposal_judge(), plugins.EscalateAllProposalJudge)
+
+    def test_validate_configuration_does_not_warn_when_set(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv(plugins.PROPOSAL_JUDGE_ENV_VAR, plugins.DEFAULT_PROPOSAL_JUDGE)
+        with caplog.at_level("WARNING", logger="plugins"):
+            plugins.validate_configuration()
+        assert not any(
+            plugins.PROPOSAL_JUDGE_ENV_VAR in record.message for record in caplog.records
+        )
+
+    def test_validate_configuration_fails_fast_on_unknown_judge(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(plugins.PROPOSAL_JUDGE_ENV_VAR, "not_a_real_judge")
+        with pytest.raises(RuntimeError, match="unknown plugin"):
+            plugins.validate_configuration()
+
+    def test_validate_configuration_fails_fast_on_bad_import_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Isolate the earlier seams, same rationale as
+        # TestGetActiveCheckerAndValidateConfiguration's identical guard.
+        monkeypatch.delenv(plugins.RISK_SCORER_ENV_VAR, raising=False)
+        monkeypatch.delenv(plugins.AUTO_APPROVER_ENV_VAR, raising=False)
+        monkeypatch.delenv(plugins.APPROVAL_NOTIFIER_ENV_VAR, raising=False)
+        monkeypatch.delenv(plugins.ACTIVE_CHECKER_ENV_VAR, raising=False)
+        monkeypatch.delenv(plugins.DOCS_VERIFIER_ENV_VAR, raising=False)
+        monkeypatch.setenv(plugins.PROPOSAL_JUDGE_ENV_VAR, "not_a_real_module:Whatever")
+        with pytest.raises(RuntimeError, match="failed to import plugin"):
+            plugins.validate_configuration()
+
+
 # --- Plugin name resolution (audit-readable names) ---------------------------
 
 
@@ -518,6 +749,12 @@ class TestPluginDisplayNames:
 
     def test_docs_verifier_name_for_registry_instance(self) -> None:
         assert plugins.docs_verifier_name(RejectAllDocsVerifier()) == "reject_all"
+
+    def test_proposal_judge_name_for_registry_instance(self) -> None:
+        assert (
+            plugins.proposal_judge_name(plugins.EscalateAllProposalJudge())
+            == "escalate_all_proposals"
+        )
 
     def test_falls_back_to_module_qualname_for_unregistered_instance(self) -> None:
         class _AdHocScorer:

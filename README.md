@@ -150,18 +150,17 @@ still-pending ones; likewise a DIFFERENT, human-scoped listing than
 human decide-and-synchronously-apply side: `approve`/`reject` on a
 `"pending"` proposal, same interactive-only + owner_sub-scoped gate as
 `/approvals/{id}/decide`. Approving re-checks the target hasn't drifted
-since submission (`"stale"` if it has) before calling out to Linear
-directly (`linear_client.py`, credential via `LINEAR_API_TOKEN`); a Linear
-failure resolves to `"apply_failed"` rather than an error response.
-Retrying an already-`"applied"` hold is a no-op (returns the existing
-applied state, no second Linear write) -- but retrying while the hold is
-still `"applying"` (another decide call, or the auto-judge, currently has
-it claimed and is mid-flight on its own Linear round-trip) returns 409,
-not a no-op: this call never got a chance to decide anything. See
-docs/DESIGN.md's "The proposal submission pipeline" section for the
-create-time dedup key, per-bot rate limit, deterministic auto-approval
-judge, and the full decide/apply status-transition and
-fingerprint-contract details.
+since submission (`"stale"` if it has) before calling the configured
+`PROPOSAL_JUDGE` plugin's `apply()`; a failed apply resolves to
+`"apply_failed"` rather than an error response. Retrying an
+already-`"applied"` hold is a no-op (returns the existing applied state,
+no second write) -- but retrying while the hold is still `"applying"`
+(another decide call, or the auto-judge, currently has it claimed and is
+mid-flight on its own external round-trip) returns 409, not a no-op: this
+call never got a chance to decide anything. See docs/DESIGN.md's "The
+proposal submission pipeline" section for the create-time dedup key,
+per-bot rate limit, pluggable auto-approval judge, and the full
+decide/apply status-transition and fingerprint-contract details.
 
 ## Auth model
 
@@ -393,49 +392,42 @@ docker compose up --build
 | Variable | Purpose |
 |---|---|
 | `DECISION_PAGE_BASE_URL` | Base URL of the separate `agent-comms-approvals-decision-page` service. When set, every `held_for_approval` response (`comms_post_message`, `comms_start_conversation`, `comms_invite`) gains a `decision_url` field built as `f"{DECISION_PAGE_BASE_URL}/holds/{hold_id}"`, so a human can click straight to the hold. Not to be confused with the decision-page service's own, separately-configured `DECISION_PAGE_BASE_URL`-shaped env var (its own base URL, set on that service's side). Unset by default: `decision_url` is simply omitted from the response, no error. |
-| `LINEAR_API_TOKEN` | A Linear **personal API token** (not an OAuth workspace token -- see `.env.example`; the client sends it unprefixed, without a `Bearer` prefix) for `linear_client.py`'s direct Linear API calls, used when a `POST /proposals/{id}/decide` approval or an auto-approved submission applies a `linear_progress_update` proposal. The server runs without it, but any such apply resolves to `apply_failed` if it's unset. |
-| `GITHUB_TOKEN` | A GitHub personal access token (fine-grained, read-only `pull_requests` + `contents`) for `github_client.py`'s direct GitHub API calls, used by the `open_ticket`/`start_ticket`/`review_ticket`/`assign_ticket`/`label_ticket` auto-approve judge lanes (`service.py`) to verify a cited PR before approving. Sent as `Authorization: Bearer <token>` (unlike `LINEAR_API_TOKEN` above, which is sent raw). If unset, those lanes fail closed -- they silently stay `"pending"` rather than crashing or auto-approving; see `service.py`'s judge error-handling docstring. |
-| `PROPOSAL_OPEN_TICKET_TEAM_ALLOWLIST` | A JSON array of Linear team KEYS (e.g. `["TECH"]`) the `open_ticket` auto-approve judge lane (`service._rule_open_ticket`) is allowed to auto-create an issue into, for `team_allowlist.py`'s server-side allowlist -- `open_ticket` creates a brand-new issue with no existing ticket to anchor to at all (whereas the other auto-approve lanes at least require a real PR referencing an existing target ticket), so an allowlist is required to bound which team receives newly-created issues. A malformed value logs a warning and falls back to an empty set; an unset or empty env var falls back silently to an empty set (neither is fatal) -- an empty set is always safe, but it leaves `open_ticket` permanently inert (never auto-approves) until populated with real data. |
+| `PROPOSAL_JUDGE` | Which `ProposalJudge` implementation judges/applies a submitted `proposal_holds` proposal (`POST /proposals`) -- a name from `plugins.PROPOSAL_JUDGES`, or a `"pkg.module:factory"` import path to plug in your own without forking this repo (see `docs/DESIGN.md`'s "Configuration: pluggable seams" section). Default: `escalate_all_proposals` -- accepts any kind at low priority, never fingerprints a real target, never auto-approves, and never writes anywhere. Redesign Health's Linear/GitHub-backed rules live in `agent-comms-approvals`' `rh_comms_plugins.proposal_judge` instead of this repo. |
 
 > [!WARNING]
-> **Deployment prerequisites for the approve/apply and auto-approve paths (TECH-5874).** In ECS
-> environments, credentials and configs are provisioned via SSM by
-> `rh-data-platform`'s Terraform -- a SEPARATE repo/deploy from this one.
-> **Landing this repo's code does not itself provision these variables.**
+> **Deployment prerequisites for the `PROPOSAL_JUDGE` seam.** In deployed ECS
+> environments, environment variables and credentials are provisioned via SSM
+> by `rh-data-platform`'s Terraform -- a separate repo and deploy process from
+> this one. Landing this repo's code does not itself activate an organization's
+> real judge:
 >
-> - `LINEAR_API_TOKEN` (`/reclaw-comms/{env}/linear-api-token`): until
->   provisioned, every approve/auto-apply of a `linear_progress_update`
->   proposal resolves to `"apply_failed"` with a normal HTTP 200 (not an
->   error response -- see the decide/apply section above), which is easy to
->   misread as "it worked" during a deploy verification pass that only checks
->   the status code.
-> - `GITHUB_TOKEN` (`/reclaw-comms/{env}/github-token`): until provisioned,
->   all five GitHub-backed lanes (`open_ticket`, `start_ticket`,
->   `review_ticket`, `assign_ticket`, `label_ticket`) fail closed silently --
->   proposals stay `"pending"` with an HTTP 200 response and NO `apply_error`.
->   Confirming only that `apply_error` is absent will deceptively pass in
->   this broken state.
-> - `PROPOSAL_OPEN_TICKET_TEAM_ALLOWLIST`
->   (`/reclaw-comms/{env}/proposal-open-ticket-team-allowlist`): if absent or
->   empty, `open_ticket` auto-approval is silently disabled forever with no
->   observable error.
->
-> **Pre-deploy checklist:**
-> - Confirm `LINEAR_API_TOKEN`, `GITHUB_TOKEN`, and
->   `PROPOSAL_OPEN_TICKET_TEAM_ALLOWLIST` are actually set in the running
->   container's environment (or in SSM).
-> - On a real approve/auto-apply test, confirm `apply_error` is absent and the
->   proposal transitions to `"applied"`, not silently remaining `"pending"`.
-> - Note: `/reclaw-comms/{env}/github-login-to-linear-user-id-json` (and its ECS
->   task-definition env-var wiring) in `rh-data-platform`'s Terraform is now
->   orphaned following the removal of assignee identity verification (design
->   decision record: TECH-6153) -- tracked for removal in **TECH-6155**. When
->   removing it, the ECS task-definition wiring must go FIRST: (1) remove the
->   SSM parameter reference from the task definition and deploy the updated
->   revision, THEN (2) delete the SSM parameter itself. ECS resolves SSM
->   parameter ARNs at task-launch time, so deleting the parameter before the
->   task definition stops referencing it makes every subsequent task launch
->   hard-fail with a parameter-resolution error.
+> - `PROPOSAL_JUDGE` must point at a real implementation (provisioned via SSM at
+>   `/reclaw-comms/{env}/proposal-judge`, e.g. `rh_comms_plugins.proposal_judge:get_proposal_judge`).
+>   Unset or empty, the board safely defaults to `escalate_all_proposals`, which never
+>   auto-approves or applies any proposal. For `PROPOSAL_JUDGE` specifically, an empty string
+>   falls back to the default. Other seams treat an empty env var as an unknown plugin name
+>   and crash at boot -- this is intentional.
+>   `docker-compose.yml` passes `PROPOSAL_JUDGE: ${PROPOSAL_JUDGE:-}` through from the local
+>   environment so developers can set `PROPOSAL_JUDGE` in `.env` (or pass `-e PROPOSAL_JUDGE=...`)
+>   for local testing with a custom judge implementation without affecting the safe default
+>   when unset.
+> - For Redesign Health, `agent-comms-approvals` (PR #62) must be deployed with the
+>   concrete judge implementation before this service's release runs with `PROPOSAL_JUDGE`
+>   configured, or the import will fail at boot. Switch ECS task definition to the derived
+>   image AND set `PROPOSAL_JUDGE` in SSM in the same Terraform apply. Do not set `PROPOSAL_JUDGE`
+>   while the task definition still references the base image.
+> - **Behavioral regression window**: until the Terraform provisioning and deployment chain
+>   completes, proposals running under `escalate_all_proposals` will never auto-approve,
+>   and any human approval will resolve to `apply_failed` because the default judge does
+>   not perform external writes. Note that `apply_failed` returns HTTP 200 -- a verification pass
+>   that checks only the status code will incorrectly conclude the apply succeeded. Check the
+>   response body's `status` field.
+> - **SSM parameter removal ordering hazard (TECH-6155)**: when cleaning up legacy
+>   env vars/SSM parameters (e.g. `LINEAR_API_TOKEN`, `GITHUB_TOKEN`, `PROPOSAL_OPEN_TICKET_TEAM_ALLOWLIST`),
+>   always update the ECS task definition to remove the SSM parameter reference FIRST, deploy that revision,
+>   and only THEN delete the parameter from SSM. ECS resolves SSM parameter ARNs at task-launch
+>   time; deleting a parameter while a task definition still references it causes every
+>   subsequent task launch to crash with a parameter-resolution failure.
 
 `entrypoint.sh` runs `alembic upgrade head` automatically on every container
 start, so migrations apply before the server accepts traffic.

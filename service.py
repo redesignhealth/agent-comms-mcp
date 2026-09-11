@@ -163,7 +163,7 @@ import json
 import logging
 import re
 import uuid
-from collections.abc import Callable, Coroutine, Sequence
+from collections.abc import Callable, Sequence
 from collections.abc import Set as AbstractSet
 from datetime import UTC, datetime, timedelta
 from typing import Any, NoReturn, Protocol
@@ -172,11 +172,6 @@ from sqlalchemy import ColumnElement, and_, func, literal, not_, or_, select, te
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-import citation_urls
-import github_client
-import linear_client
-import team_allowlist
-import workflow_order
 from exceptions import (
     AccessDeniedError,
     AgentAlreadyRegisteredError,
@@ -189,6 +184,7 @@ from exceptions import (
     HoldAwaitingAutoReviewError,
     HoldExpiredError,
     InvalidConversationStateError,
+    ProposalTargetUnavailableError,
     RateLimitExceededError,
     SchemaVersionMismatchError,
     SiblingIdentityExistsError,
@@ -207,6 +203,9 @@ from models import (
 )
 from plugins import (
     BARRIER_SENSITIVE_TYPES,
+    FINGERPRINT_DIGEST,
+    FINGERPRINT_NO_TARGET,
+    FINGERPRINT_UNAVAILABLE,
     ActiveChecker,
     ApprovalNotification,
     ApprovalNotifier,
@@ -218,6 +217,13 @@ from plugins import (
     HoldContext,
     MessageRiskContext,
     ParticipantInfo,
+    ProposalApplyOutcome,
+    ProposalClassification,
+    ProposalContext,
+    ProposalFingerprint,
+    ProposalJudge,
+    ProposalTargetError,
+    ProposalVerdict,
     RiskScorer,
     RiskScoringInfraError,
     resolve_plugin,
@@ -5869,16 +5875,17 @@ def _extract_proposal_target(action: dict[str, Any]) -> tuple[str, str]:
     string fields -- ``target_id`` (what real-world thing this action
     targets, e.g. a Linear issue id) and ``action_type`` (what kind of
     mutation, e.g. ``"open_ticket"``/``"close_ticket"``) -- so dedup and the
-    kind/action_type-scoped rule (see ``_PROPOSAL_RULES`` below) have a
-    stable key without needing to understand every kind's full shape.
+    injected ``plugins.ProposalJudge`` (which dispatches internally on
+    ``(kind, action_type)``) have a stable key without the board needing to
+    understand every kind's full shape.
 
     ``open_ticket`` is the one exception to "``target_id`` is a Linear
     issue id" (TECH-5873 redefinition): it CREATES a new issue, so there
     is no pre-existing Linear id to target yet. Its ``target_id`` is
     instead the PR URL (or similar) that originated the proposal -- still
     a stable, caller-supplied string, so dedup keeps working unmodified
-    (see ``_PROPOSAL_FINGERPRINT_EXEMPT`` below for the corresponding
-    fingerprint-side exemption)."""
+    (the judge reports ``plugins.FINGERPRINT_NO_TARGET`` for this pair
+    instead of fetching a fingerprint for it -- see ``create_proposal``)."""
     target_id = action.get("target_id")
     action_type = action.get("action_type")
     if not isinstance(target_id, str) or not target_id:
@@ -5888,619 +5895,218 @@ def _extract_proposal_target(action: dict[str, Any]) -> tuple[str, str]:
     return target_id, action_type
 
 
-# TECH-5873 redefinition: (kind, action_type) pairs whose target has no
-# PRE-EXISTING state to fingerprint at all -- today, just open_ticket,
-# which creates a brand-new Linear issue rather than acting on one that
-# already exists. For these, create_proposal skips the submit-time
-# fingerprint fetch entirely (there is nothing to fetch: fetching a
-# fingerprint FOR the target_id, a PR URL, would be a category error, not
-# just a wasted call) and _apply_or_finalize_proposal_hold skips the
-# apply-time re-fetch/staleness comparison the same way -- a hold for an
-# exempted pair can never be "stale"; its applier always runs once
-# approved. See _NO_PRE_EXISTING_TARGET_FINGERPRINT for the fixed sentinel
-# stored in target_fingerprint for these rows instead of a real digest.
-_PROPOSAL_FINGERPRINT_EXEMPT: frozenset[tuple[str, str]] = frozenset(
-    {("linear_progress_update", "open_ticket")}
-)
-
 # Fixed, self-documenting sentinel stored as target_fingerprint for any
-# (kind, action_type) in _PROPOSAL_FINGERPRINT_EXEMPT -- never compared
-# against a real fetched digest (see _PROPOSAL_FINGERPRINT_EXEMPT above),
+# proposal whose configured plugins.ProposalJudge reports
+# plugins.FINGERPRINT_NO_TARGET (TECH-5873 redefinition -- today, just
+# open_ticket, which creates a brand-new Linear issue rather than acting on
+# one that already exists) -- never compared against a real fetched digest,
 # so its exact value only matters for a human reading the row directly.
 _NO_PRE_EXISTING_TARGET_FINGERPRINT = "n/a:no-pre-existing-target"
 
 
-def _derive_proposal_priority(kind: str, action: dict[str, Any]) -> str:
-    """Server-derive ``priority`` from ``kind``/``action`` -- NEVER trust a
-    caller-supplied value (TECH-5872). Deliberately simple for the one
-    ``kind`` this repo currently understands; a future kind needing a
-    richer derivation adds its own branch here rather than a generic
-    fallback silently misclassifying it.
+def _classify_proposal(judge: ProposalJudge, kind: str, action: dict[str, Any]) -> str:
+    """Call the injected ``plugins.ProposalJudge.classify()`` defensively
+    and return its ``priority`` -- NEVER a caller-supplied value
+    (TECH-5872).
 
-    Kind-admission is checked directly against ``_PROPOSAL_KIND_DEFAULT_RULE``
-    (defined below -- one entry per supported kind, same single-source-of-
-    truth role ``_PROPOSAL_JUDGES`` used to play pre-refactor) rather than a
-    parallel enumeration here, so the two cannot drift apart -- a ``kind``
-    with no registered default rule can never reach the priority branches
-    below and instead raises immediately. This matters because a ``kind``
-    that passed this function but had no rule entry would otherwise hit an
-    unhandled lookup failure at rule dispatch time in ``create_proposal``,
-    which only catches ``ValueError``/``RateLimitExceededError`` and would
-    surface as an unhandled 500. An unrecognized ``kind`` instead raises
-    ``ValueError`` (422) here, and per the call-site ordering in
-    ``create_proposal`` (validation runs before the rate-limit attempt
-    marker is audited + committed), this failing loudly doesn't waste a
-    rate-limit slot either (Argus review S7)."""
-    if kind not in _PROPOSAL_KIND_DEFAULT_RULE:
-        logger.warning("_derive_proposal_priority: no branch for kind=%r", kind)
-        raise ValueError(f"unsupported kind: {kind!r}")
-    if kind == "linear_progress_update":
-        action_type = action.get("action_type")
-        if action_type == "close_ticket":
-            return "high"
-        # TECH-5877: review_ticket joins open_ticket at "medium" --
-        # start_ticket/assign_ticket/label_ticket fall through to the
-        # "low" default below, same as any other action_type with no
-        # explicit branch.
-        if action_type in ("open_ticket", "review_ticket"):
-            return "medium"
-        return "low"
-    # Unreachable: every kind registered in _PROPOSAL_KIND_DEFAULT_RULE must
-    # have a matching priority branch above. If this fires, a new kind was
-    # registered without a corresponding priority derivation.
-    raise AssertionError(
-        f"kind {kind!r} is registered in _PROPOSAL_KIND_DEFAULT_RULE but has no priority "
-        "branch in _derive_proposal_priority"
-    )
+    ``classify()`` is contractually synchronous, side-effect-free, and
+    allowed exactly one exception type: ``ValueError``, for an unsupported
+    ``kind`` -- wrapped into a board-controlled message and mapped to 422 by
+    both ``main.py`` and ``providers.proposals`` (preserving the original
+    exception as ``__cause__`` for logging). Any OTHER exception is a plugin bug,
+    not a caller-input problem -- but this runs before
+    ``_dedup_or_insert_proposal``, so there is no hold yet to fail closed
+    onto; it is converted into the same ``ValueError`` -> 422 path instead
+    of propagating as an unhandled 500 (Argus hardening: widen fail-closed
+    coverage to every plugin call, not just ``judge()``).
 
-
-# TECH-5877: six auto-approval rules, scoped to
-# kind="linear_progress_update" only -- a deterministic rules engine, not an
-# LLM judge, because write intent must be judged outside the proposing
-# agent (a bot must never self-approve its own proposal). A future kind
-# needs its OWN rule functions registered in ``_PROPOSAL_RULES``/
-# ``_PROPOSAL_KIND_DEFAULT_RULE`` below -- deliberately not a shared/generic
-# judge across kinds.
-
-# Argus review B4: presence of a non-empty string was NOT sufficient to
-# treat a citation as real -- a bot could self-approve by writing ANY
-# string (including whitespace-shaped junk, or a URL to a host it fully
-# controls) into ``source_message_url``/``resolving_pr_url``. A citation
-# must now be an http(s) URL whose host is one of two allowlisted families
-# (Slack message permalinks, GitHub PR/commit links) -- see
-# ``citation_urls`` (extracted there in Argus review round-2 S2 so
-# ``linear_client.py`` can re-validate at apply time without a circular
-# import back into this module).
-_is_valid_citation_url = citation_urls.is_valid_citation_url
-
-# Registry refactor (pure restructuring, no behavior change): each rule is
-# now scoped to a single ``(kind, action_type)`` pair rather than one
-# monolithic per-``kind`` function branching internally on ``action_type``,
-# so a future lane (e.g. a new action_type) can be added as its own
-# independent rule instead of growing an ever-larger if/elif chain. Rules
-# are ``async def`` -- ``_rule_start_ticket``/``_rule_review_ticket``/
-# ``_rule_assign_ticket`` below genuinely ``await`` real I/O (GitHub/Linear
-# API calls) to verify a cited artifact before auto-approving. Typed as
-# returning a ``Coroutine`` (not the broader ``Awaitable``) since every
-# rule registered here genuinely is one (an ``async def`` call always
-# returns a coroutine object) -- callers ``await`` it directly.
-ProposalRule = Callable[[dict[str, Any]], Coroutine[Any, Any, tuple[str, str | None]]]
-
-
-async def _rule_open_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
-    """``(kind="linear_progress_update", action_type="open_ticket")`` rule
-    (TECH-5877): auto-approve ONLY if ALL of the following hold:
-
-    1. ``action["target_id"]`` -- itself, not a separate citation field --
-       is specifically a ``github.com`` PR URL, validated via
-       ``github_client.parse_github_pull_request_url`` (Argus review:
-       host-confusion hole -- this single helper both checks the general
-       citation-URL allowlist AND that the host is specifically
-       ``github.com``, not merely PR-*shaped*; chaining
-       ``_is_valid_citation_url``/``parse_pull_request_url`` directly, as
-       an earlier version of this rule did, let a Slack URL shaped like
-       ``https://xyz.slack.com/owner/repo/pull/123`` pass both checks and
-       be treated as a real GitHub PR reference). ``target_id`` IS the
-       citation for ``open_ticket`` (see ``_extract_proposal_target``'s
-       docstring: it is the PR URL that originated the proposal, since
-       there is no pre-existing Linear issue to target yet) and is also
-       this action_type's create-time dedup key. Validating a SEPARATE
-       field here (as an earlier version of this rule did, against
-       ``action["source_message_url"]``) let a bot cite a real PR there
-       while submitting arbitrarily many different ``target_id`` values,
-       which dedup has no way to catch -- each one auto-approves
-       independently and creates its own Linear issue for the same
-       underlying PR. Tying the judged field and the dedup key together
-       structurally closes that: a bot can no longer vary the dedup key
-       while keeping the judged citation fixed, because they are now the
-       same value.
-    2. ``action["title"]`` AND ``action["team"]`` (both applier-required
-       fields -- ``linear_client.apply_open_ticket`` raises
-       ``LinearAPIError`` on a missing/empty one of either) are present
-       and non-empty (Argus review: rule/applier precondition mismatch --
-       without this check, a proposal missing either could be
-       auto-approved here and then deterministically fail at apply
-       time), AND ``action["team"]`` is additionally a member of
-       ``team_allowlist.OPEN_TICKET_TEAM_ALLOWLIST`` (case-sensitive exact
-       match, same convention as ``linear_client.resolve_team_id``'s own
-       team-key filter). ``team`` here is entirely bot-asserted, and
-       unlike the state-transition rules below (``_rule_start_ticket``/
-       ``_rule_review_ticket``/``_rule_label_ticket``, which mutate a
-       pre-existing ``target_id`` whose real team already bounds where
-       the write can land -- see ``docs/DESIGN.md``'s deferred-scope note
-       for those three), ``open_ticket`` creates a brand-new issue with
-       no pre-existing artifact to cross-check a team against at all: an
-       unconstrained ``team`` would let a bot get an issue auto-created
-       on ANY Linear team just by naming it in the action payload. This
-       check runs BEFORE the PR-existence fetch below, so a team not on
-       the allowlist never burns that network round-trip either.
-    3. The cited PR actually EXISTS -- verified via
-       ``github_client.fetch_pull_request`` (Argus review: this rule
-       previously approved on URL shape alone, never confirming the
-       cited PR was real; a fabricated but well-formed PR URL for a
-       nonexistent PR number would still trigger real Linear issue
-       creation). Deliberately does NOT gate on the PR's ``state``
-       (unlike ``_rule_start_ticket``/``_rule_review_ticket``, which
-       specifically need a PR still ``open``): ``open_ticket``'s purpose
-       is to document a SHIPPED PR, so by the time someone documents it
-       as a ticket the PR has very plausibly already been merged/closed
-       -- requiring ``state == "open"`` here would reject the expected
-       case, not just fabrications. Existence alone is the bar. A
-       ``github_client.GitHubAPIError`` (a genuine 404/not-found, a
-       transport failure, etc.) propagates uncaught -- this rule adds no
-       local try/except for that, same "fail closed via
-       ``create_proposal``'s wrapper" contract as
-       ``_rule_start_ticket``'s own docstring documents.
-    4. ``action`` does NOT specify a ``target_state`` (i.e.
-       ``action.get("target_state") is None``) -- target workflow state
-       is deliberately not bot-controllable via the action payload in
-       auto-approval (closing the invariant gap noted in DESIGN.md).
-       Auto-approved issues always land in the team's default initial
-       workflow state (Linear omits stateId). If a proposal specifies a
-       ``target_state``, it is held for human review (``pending``)
-       instead of auto-approved, leaving it to a human reviewer to
-       approve issue creation into non-default states.
-    5. ``action`` does NOT specify a ``project`` (i.e.
-       ``action.get("project") is None``) -- project placement is
-       deliberately not bot-controllable via the action payload in
-       auto-approval (same class of placement/routing field as
-       ``target_state``; ``linear_client.apply_open_ticket`` accepts
-       ``project`` as-is with no name resolution). Auto-approved issues
-       are created without a project assignment. If a proposal specifies a
-       ``project``, it is held for human review (``pending``) instead of
-       auto-approved, leaving it to a human reviewer to approve issue
-       creation into specific projects.
-
-    A Slack permalink -- otherwise a valid citation URL under
-    ``_is_valid_citation_url``'s general allowlist -- is deliberately NOT
-    sufficient here (Argus review): ``open_ticket``'s whole intent is to
-    document a SHIPPED PR, and a bare Slack link proves no such artifact
-    exists. Every other unproven case (a bare confidence score, free-text
-    rationale, or an unlisted-host/non-http(s) URL; self-reported
-    ``confidence``/``importance``/``impact`` are advisory only and are NOT
-    inputs here -- see models.ProposalHold's docstring) is likewise never
-    sufficient. Never returns ``"rejected"`` -- this rule only ever clears
-    a proposal for auto-apply or leaves it for a human, it does not reject
-    on a bot's behalf."""
-    target_id = action.get("target_id")
-    if not isinstance(target_id, str):
-        return "pending", None
-    parsed = github_client.parse_github_pull_request_url(target_id)
-    if parsed is None:
-        return "pending", None
-    title = action.get("title")
-    if not isinstance(title, str) or not title:
-        return "pending", None
-    team = action.get("team")
-    if not isinstance(team, str) or not team:
-        return "pending", None
-    if team not in team_allowlist.OPEN_TICKET_TEAM_ALLOWLIST:
-        return "pending", None
-    if action.get("target_state") is not None:
-        return "pending", None
-    if action.get("project") is not None:
-        return "pending", None
-    owner, repo, number = parsed
-    await github_client.fetch_pull_request(owner, repo, number)
-    return (
-        "approved",
-        "auto-approved: open-ticket proposal's target_id cites a github.com PR URL",
-    )
-
-
-async def _rule_close_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
-    """``(kind="linear_progress_update", action_type="close_ticket")`` rule
-    (TECH-5877): auto-approve if EITHER ``action["source_message_url"]`` (a
-    human confirming completion) OR ``action["resolving_pr_url"]`` (a
-    merged PR that plausibly resolves it) is a valid citation URL. Same
-    "never rejects" contract as ``_rule_open_ticket`` above."""
-    if _is_valid_citation_url(action.get("source_message_url")) or _is_valid_citation_url(
-        action.get("resolving_pr_url")
-    ):
-        return "approved", "auto-approved: close-ticket proposal cites a valid citation"
-    return "pending", None
-
-
-async def _rule_start_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
-    """``(kind="linear_progress_update", action_type="start_ticket")`` rule
-    (TECH-5877, target workflow state: "In Progress"). Auto-approve ONLY
-    if ALL hold:
-
-    1. ``action["starting_pr_url"]`` is specifically a ``github.com`` PR
-       URL, validated via ``github_client.parse_github_pull_request_url``
-       (Argus review: host-confusion hole -- this single helper checks
-       BOTH the general citation-URL allowlist AND that the host is
-       specifically ``github.com``, not merely PR-*shaped*; a bare
-       ``_is_valid_citation_url``/``parse_pull_request_url`` chain, as an
-       earlier version of this rule used, would let a Slack URL shaped
-       like ``https://xyz.slack.com/owner/repo/pull/123`` pass both
-       checks and be treated as a real GitHub PR reference). ``action[
-       "target_id"]`` must also be present/non-empty -- checked BEFORE
-       any network call (Argus review: an earlier version checked this
-       AFTER ``fetch_pull_request``, wasting a round-trip on a proposal
-       that was always going to stay pending regardless of the PR
-       fetch's result). ``action["team"]`` (the applier's required field
-       -- ``linear_client.apply_start_ticket`` raises ``LinearAPIError``
-       on a missing/empty one) must likewise be present/non-empty before
-       any network call, so a proposal missing it never gets auto-approved
-       only to deterministically fail at apply time (Argus review:
-       rule/applier precondition mismatch).
-    2. That cited PR genuinely exists and is still open
-       (``github_client.fetch_pull_request``) -- an artifact proving work
-       has actually begun, not a bot's own say-so.
-    3. That cited PR actually REFERENCES ``target_id`` (``_pull_request_
-       references_ticket`` below) -- otherwise an open PR on ANY unrelated
-       ticket could justify advancing this ticket to In Progress, not just
-       one it actually worked on.
-    4. The ticket's CURRENT workflow state -- fetched fresh via
-       ``linear_client.fetch_issue(action["target_id"])``, never trusted
-       from the action payload itself -- is strictly BEHIND "In Progress"
-       along the workflow (``workflow_order.is_forward_transition``), the
-       universal forward-only safety rule every lane in this registry
-       depends on. Already at/past "In Progress", or an unrecognized
-       current state, is held for a human, never auto-approved.
-
-    A ``github_client.GitHubAPIError``/``linear_client.LinearAPIError``
-    (transport failure, 404, etc.) propagates uncaught -- this rule adds
-    no local try/except for that; ``create_proposal``'s existing
-    fail-closed wrapper around the rule call resolves it to ``"pending"``.
-
-    Never returns ``"rejected"`` -- same "never rejects on a bot's behalf"
-    contract as every other rule in this registry."""
-    citation = action.get("starting_pr_url")
-    if not isinstance(citation, str):
-        return "pending", None
-    parsed = github_client.parse_github_pull_request_url(citation)
-    if parsed is None:
-        return "pending", None
-    target_id = action.get("target_id")
-    if not isinstance(target_id, str) or not target_id:
-        return "pending", None
-    team = action.get("team")
-    if not isinstance(team, str) or not team:
-        return "pending", None
-
-    owner, repo, number = parsed
-    pull_request = await github_client.fetch_pull_request(owner, repo, number)
-    if pull_request.get("state") != "open":
-        return "pending", None
-    if not _pull_request_references_ticket(pull_request, target_id):
-        return "pending", None
-
-    issue = await linear_client.fetch_issue(target_id)
-    state = issue.get("state") or {}
-    if not workflow_order.is_forward_transition(
-        current_type=state.get("type", ""),
-        current_name=state.get("name", ""),
-        target_type="started",
-        target_name="In Progress",
-    ):
-        return "pending", None
-    return (
-        "approved",
-        "auto-approved: start-ticket proposal cites an open PR and In Progress is forward",
-    )
-
-
-async def _rule_review_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
-    """``(kind="linear_progress_update", action_type="review_ticket")``
-    rule (TECH-5877, target workflow state: "In Review"). Same overall
-    shape as ``_rule_start_ticket`` above, but the cited PR
-    (``action["review_pr_url"]``) must additionally show review requested
-    -- ``state == "open"`` AND (``requested_reviewers`` OR
-    ``requested_teams``) non-empty -- and must actually REFERENCE
-    ``target_id`` (``_pull_request_references_ticket`` below) -- otherwise
-    a PR with review requested could justify advancing any unrelated
-    ticket to In Review, not just one it actually worked on. The
-    forward-transition check targets "In Review" instead of "In Progress".
-    See ``_rule_start_ticket``'s docstring for the shared citation/
-    ``target_id``/``team``/forward-transition/error-propagation contract."""
-    citation = action.get("review_pr_url")
-    if not isinstance(citation, str):
-        return "pending", None
-    parsed = github_client.parse_github_pull_request_url(citation)
-    if parsed is None:
-        return "pending", None
-    target_id = action.get("target_id")
-    if not isinstance(target_id, str) or not target_id:
-        return "pending", None
-    team = action.get("team")
-    if not isinstance(team, str) or not team:
-        return "pending", None
-
-    owner, repo, number = parsed
-    pull_request = await github_client.fetch_pull_request(owner, repo, number)
-    if pull_request.get("state") != "open":
-        return "pending", None
-    if not pull_request.get("requested_reviewers") and not pull_request.get("requested_teams"):
-        return "pending", None
-    if not _pull_request_references_ticket(pull_request, target_id):
-        return "pending", None
-
-    issue = await linear_client.fetch_issue(target_id)
-    state = issue.get("state") or {}
-    if not workflow_order.is_forward_transition(
-        current_type=state.get("type", ""),
-        current_name=state.get("name", ""),
-        target_type="started",
-        target_name="In Review",
-    ):
-        return "pending", None
-    return (
-        "approved",
-        "auto-approved: review-ticket proposal cites an open PR with review requested "
-        "and In Review is forward",
-    )
-
-
-def _pull_request_references_ticket(pull_request: dict[str, Any], target_id: str) -> bool:
-    """Whether ``pull_request`` (a ``github_client.fetch_pull_request``
-    response) actually references ``target_id`` (the ticket identifier,
-    e.g. ``"TECH-1234"``) anywhere in its ``head.ref``/``title``/``body`` --
-    checked case-insensitively, since a branch name commonly lowercases the
-    ticket id (e.g. ``"tech-1234-fix-x"``).
-
-    Closes a scope gap shared by all four auto-approve rules that require a
-    cited PR to reference the target ticket (``_rule_start_ticket``,
-    ``_rule_review_ticket``, ``_rule_assign_ticket``, and
-    ``_rule_label_ticket``; Argus review): a cited PR merely EXISTING proves
-    an artifact is real, but not that the artifact has anything to do with
-    ``target_id`` -- without this check, any real PR could justify mutating
-    ANY unrelated ticket, not just the one it actually pertains to.
-
-    Matches ``target_id`` as a complete TOKEN, not a plain substring
-    (Argus review: identifier collision) -- a bare ``needle in haystack``
-    check let ``"TECH-1"`` match inside ``"TECH-10"``/``"TECH-100"``/
-    ``"TECH-123"``, letting a PR that references a completely different,
-    unrelated ticket satisfy this check for the intended ticket just
-    because its identifier happens to be a numeric prefix of the real
-    one. ``\\b`` word-boundary anchors on both sides of the (regex-escaped)
-    identifier require it not be immediately adjacent to another
-    word character (``TECH-10``'s trailing ``0`` right after ``TECH-1``'s
-    ``1`` is such a character, so no boundary exists there -- the match
-    correctly fails)."""
-    haystacks = (
-        (pull_request.get("head") or {}).get("ref"),
-        pull_request.get("title"),
-        pull_request.get("body"),
-    )
-    pattern = re.compile(rf"\b{re.escape(target_id)}\b", re.IGNORECASE)
-    return any(isinstance(haystack, str) and pattern.search(haystack) for haystack in haystacks)
-
-
-async def _rule_assign_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
-    """``(kind="linear_progress_update", action_type="assign_ticket")``
-    rule (TECH-5877). Auto-approve ONLY if ALL of the following hold:
-
-    1. ``action["assignee_pr_url"]`` is specifically a ``github.com`` PR
-       URL, validated via ``github_client.parse_github_pull_request_url``
-       (Argus review: host-confusion hole -- see ``_rule_open_ticket``'s
-       docstring for why a bare ``_is_valid_citation_url``/
-       ``parse_pull_request_url`` chain alone lets a Slack URL shaped like
-       a PR path masquerade as a real GitHub PR reference).
-    2. ``action["target_id"]`` and ``action["assignee_id"]`` are both
-       present and non-empty, and ``action["assignee_id"]`` is a valid
-       UUID string -- checked BEFORE the PR fetch (Argus review:
-       an earlier version checked ``target_id`` AFTER
-       ``fetch_pull_request``, wasting a round-trip on a proposal that was
-       always going to stay pending regardless of the PR fetch's result;
-       the UUID format check similarly avoids burning network calls or
-       an apply attempt on a syntactically malformed id). See the design
-       decision below for what this rule deliberately does NOT verify
-       about ``assignee_id``.
-    3. The cited PR actually EXISTS (``github_client.fetch_pull_request``
-       -- an artifact, not a bot's own say-so) and actually REFERENCES
-       ``target_id`` (``_pull_request_references_ticket`` above) --
-       otherwise a real PR on ANY unrelated ticket could justify assigning
-       this ticket to anyone, not just a ticket that PR actually pertains
-       to.
-
-    Design decision (TECH-6153) -- assignee attribution AND authorization
-    are intentionally NOT verified (do not read this as a newly-discovered
-    gap; it is a deliberate, confirmed, doubly-considered tradeoff, not an
-    oversight, per Linear decision record TECH-6153): an earlier version of
-    this rule additionally required ``action["assignee_id"]`` to match the
-    cited PR's ACTUAL author, cross-checked against a server-side
-    GitHub-login-to-Linear-user-id mapping module that has SINCE BEEN
-    DELETED from this codebase -- closing a self-approval hole where a
-    bot could otherwise fabricate an author-to-assignee match to justify
-    assigning itself (or an accomplice) to a ticket.
-
-    Per TECH-6153, the product owner explicitly confirmed that BOTH
-    attribution and authorization constraints are removed:
-    (a) Attribution: the assignee's identity is not verified against the
-        PR author -- this service tracks outstanding work, not a credit or
-        attribution system, so who ends up assigned is not something worth
-        cross-checking against who wrote the code.
-    (b) Authorization: there is NO authorization anchor at all on who can
-        be assigned -- no team-membership check, and no bound on which
-        Linear user UUID the bot proposes.
-    A bot can cite any real PR referencing the target ticket and assign it
-    to any Linear user it names (provided ``assignee_id`` is syntactically
-    a valid UUID). The only gate that still matters is that a real PR exists
-    and actually references the target ticket (point 3 above). This
-    absence of both attribution and authorization boundaries is an
-    intentional, accepted tradeoff.
-
-    No workflow-state/forward-transition concept applies here -- this
-    isn't a state transition -- so unlike ``_rule_start_ticket``/
-    ``_rule_review_ticket`` above, this rule does not consult
-    ``workflow_order`` or fetch the Linear issue at all."""
-    citation = action.get("assignee_pr_url")
-    if not isinstance(citation, str):
-        return "pending", None
-    parsed = github_client.parse_github_pull_request_url(citation)
-    if parsed is None:
-        return "pending", None
-    target_id = action.get("target_id")
-    if not isinstance(target_id, str) or not target_id:
-        return "pending", None
-    assignee_id = action.get("assignee_id")
-    if not isinstance(assignee_id, str) or not assignee_id:
-        return "pending", None
+    A returned ``priority`` outside ``models.PROPOSAL_HOLD_LEVELS`` is a
+    contract violation too (it would otherwise hit
+    ``ck_proposal_holds_priority`` as an unhandled 500 at insert time) --
+    logged and rejected via the same ``ValueError`` -> 422 path, rather than
+    silently proceeding or crashing at insert time.
+    """
     try:
-        uuid.UUID(assignee_id)
-    except ValueError:
-        return "pending", None
+        classification = judge.classify(kind, action)
+    except ValueError as exc:
+        raise ValueError(f"unsupported proposal kind: {kind!r}") from exc
+    except Exception as exc:
+        logger.warning(
+            "proposal judge classify() raised for kind=%r: %s",
+            kind,
+            type(exc).__name__,
+            exc_info=True,
+        )
+        raise ValueError(f"proposal classification failed for kind {kind!r}") from exc
 
-    owner, repo, number = parsed
-    pull_request = await github_client.fetch_pull_request(owner, repo, number)
-    if not _pull_request_references_ticket(pull_request, target_id):
-        return "pending", None
+    if not isinstance(classification, ProposalClassification):
+        logger.warning(
+            "proposal judge classify() returned a malformed result (%r) for kind=%r; "
+            "rejecting submission",
+            classification,
+            kind,
+        )
+        raise ValueError(
+            f"proposal classification failed for kind {kind!r}: "
+            f"expected ProposalClassification, got {type(classification).__name__}"
+        )
+    if classification.priority not in PROPOSAL_HOLD_LEVELS:
+        logger.warning(
+            "proposal judge classify() returned invalid priority %r for kind=%r; "
+            "rejecting submission",
+            classification.priority,
+            kind,
+        )
+        levels = sorted(PROPOSAL_HOLD_LEVELS)
+        raise ValueError(
+            f"proposal judge returned invalid priority {classification.priority!r} "
+            f"for kind {kind!r}; must be one of {levels}"
+        )
+    return classification.priority
+
+
+_FINGERPRINT_CONTRACT_VIOLATION_DETAIL = "unable to verify target status"
+_ALLOWED_PROPOSAL_TARGET_ERROR_STATUS_CODES: frozenset[int] = frozenset({422, 500, 503})
+_MAX_PROPOSAL_ERROR_DETAIL_LENGTH = 500
+_MAX_PROPOSAL_ERROR_CODE_LENGTH = 64
+_PROPOSAL_TRUNCATED_SUFFIX = "... [truncated]"
+
+# URL query-string scrub: strips query strings from http(s) URLs and absolute paths
+# (e.g. "https://api.linear.app/graphql?token=secret" -> "https://api.linear.app/graphql"),
+# preserving the base URL/path and enclosing delimiters.
+_URL_QUERY_STRING_RE = re.compile(r"((?:https?://|/)[^\s?#'\"<>()]+)\?[^\s'\"<>()]+")
+
+# Credential KV scrub: matches KEY=VALUE tokens where KEY is a recognized credential/token name.
+# Case-insensitive on the key name; bounded to word boundaries so legitimate prose
+# containing '=' (e.g. 'status=open', 'priority=high', 'x = 5') is not mangled.
+_CREDENTIAL_KV_RE = re.compile(
+    r"(?i)\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|"
+    r"client[_-]?secret|secret[_-]?key|private[_-]?key|password|passwd|token|secret)"
+    r"\s*=\s*(?:'[^']*'|\"[^\"]*\"|[^\s,;'\"()]+)(?:,\s*|;\s*)?"
+)
+
+
+def _scrub_proposal_error_string(text: str) -> str:
+    """Scrub obviously-credential-shaped or URL-query-shaped content from
+    caller-facing proposal error strings before truncation (Argus round 5
+    suggestion 1).
+    """
+    scrubbed = _URL_QUERY_STRING_RE.sub(r"\1", text)
+    scrubbed = _CREDENTIAL_KV_RE.sub("", scrubbed)
+    return re.sub(r" +", " ", scrubbed).strip()
+
+
+def _truncate_proposal_string(text: str, max_length: int) -> str:
+    """Truncate ``text`` to at most ``max_length`` characters (except when
+    ``max_length < len(_PROPOSAL_TRUNCATED_SUFFIX)`` (15), in which case
+    the full suffix is returned), appending ``"... [truncated]"`` if
+    truncated.
+
+    Argus review round-9 suggestion: without the ``max(0, ...)`` clamp
+    below, ``prefix_len`` would go negative for a ``max_length`` shorter
+    than ``_PROPOSAL_TRUNCATED_SUFFIX`` itself (15 chars) -- a negative
+    slice index returns most of ``text`` rather than a short prefix, so
+    the result would silently balloon back up to roughly ``len(text)``.
+    Every current caller passes 500 or 2000, both safely above 15, but
+    clamp to 0 anyway so a future small-``max_length`` caller gets a
+    bounded (at most ``len(_PROPOSAL_TRUNCATED_SUFFIX)``-character) result
+    instead of that unbounded blowup.
+    """
+    if len(text) <= max_length:
+        return text
+    prefix_len = max(0, max_length - len(_PROPOSAL_TRUNCATED_SUFFIX))
+    return text[:prefix_len] + _PROPOSAL_TRUNCATED_SUFFIX
+
+
+def _is_well_formed_target_error(err: Any) -> bool:
+    """True if ``err`` is a well-formed ``ProposalTargetError`` with valid
+    field types, an allowed status code, and bounded field lengths
+    (TECH-5872/TECH-5877 seam defensive check).
+    """
     return (
-        "approved",
-        "auto-approved: assign-ticket proposal cites a real PR that references the target ticket",
+        isinstance(err, ProposalTargetError)
+        and isinstance(err.status_code, int)
+        and not isinstance(err.status_code, bool)
+        and err.status_code in _ALLOWED_PROPOSAL_TARGET_ERROR_STATUS_CODES
+        and isinstance(err.error_code, str)
+        and bool(err.error_code)
+        and len(err.error_code) <= _MAX_PROPOSAL_ERROR_CODE_LENGTH
+        and isinstance(err.detail, str)
+        and bool(err.detail)
+        and (err.log_detail is None or isinstance(err.log_detail, str))
     )
 
 
-async def _rule_label_ticket(action: dict[str, Any]) -> tuple[str, str | None]:
-    """``(kind="linear_progress_update", action_type="label_ticket")``
-    rule (TECH-5877). Auto-approve ONLY if ALL of the following hold:
+async def _safe_fingerprint(judge: ProposalJudge, ctx: ProposalContext) -> ProposalFingerprint:
+    """Call the injected ``plugins.ProposalJudge.fingerprint()`` defensively.
 
-    1. ``action["labeling_pr_url"]`` is specifically a ``github.com`` PR
-       URL, validated via ``github_client.parse_github_pull_request_url``
-       (Argus review: host-confusion hole -- see ``_rule_open_ticket``'s
-       docstring for why a bare ``_is_valid_citation_url``/
-       ``parse_pull_request_url`` chain, as an earlier version of this
-       rule used, lets a Slack URL shaped like a PR path masquerade as a
-       real GitHub PR reference).
-    2. The requested label (``action["label_name"]``) is EXACTLY
-       ``f"target:{repo}"``, where ``repo`` is derived from the cited PR
-       URL's OWN path -- pure citation-URL-shape derivation, no GitHub
-       API call needed for THIS check (the repo name is already in the
-       URL; nothing further to dereference).
-    3. ``action["target_id"]`` is present and non-empty -- checked BEFORE
-       the PR fetch (same ordering reasoning as ``_rule_assign_ticket``).
-    4. ``action["team"]`` (the applier's required field --
-       ``linear_client.apply_label_ticket`` raises ``LinearAPIError`` on
-       a missing/empty one) is present and non-empty (Argus review:
-       rule/applier precondition mismatch).
-    5. The cited PR actually EXISTS -- verified via
-       ``github_client.fetch_pull_request`` (Argus review: since both the
-       cited URL and the requested label name are entirely bot-supplied,
-       a bot could otherwise always construct a syntactically-matching
-       pair -- a ``target:<repo>`` label plus a well-formed-but-possibly-
-       fake PR URL citing that repo -- with zero real artifact behind
-       it, defeating the "auto-approve only when a git artifact proves
-       it" principle this lane is supposed to follow). Deliberately does
-       NOT gate on the PR's ``state`` (unlike ``_rule_start_ticket``/
-       ``_rule_review_ticket``): labeling a ticket based on a PR that's
-       since been merged/closed is still a legitimate artifact-backed
-       case -- existence alone is the bar, same reasoning as
-       ``_rule_open_ticket``'s own existence-only check. A
-       ``github_client.GitHubAPIError`` propagates uncaught, same
-       fail-closed contract as every other rule in this registry.
-    6. The cited PR actually REFERENCES ``target_id`` (``_pull_request_
-       references_ticket`` above) -- otherwise a PR in a given repo could
-       justify labeling any unrelated ticket with that repo's target
-       label, not just ones touched by that PR.
-
-    No workflow-state/forward-transition concept applies here either --
-    see ``_rule_assign_ticket``'s docstring for the same reasoning."""
-    citation = action.get("labeling_pr_url")
-    if not isinstance(citation, str):
-        return "pending", None
-    parsed = github_client.parse_github_pull_request_url(citation)
-    if parsed is None:
-        return "pending", None
-    owner, repo, number = parsed
-
-    if action.get("label_name") != f"target:{repo}":
-        return "pending", None
-    target_id = action.get("target_id")
-    if not isinstance(target_id, str) or not target_id:
-        return "pending", None
-    team = action.get("team")
-    if not isinstance(team, str) or not team:
-        return "pending", None
-
-    pull_request = await github_client.fetch_pull_request(owner, repo, number)
-    if not _pull_request_references_ticket(pull_request, target_id):
-        return "pending", None
-    return (
-        "approved",
-        "auto-approved: requested label exactly matches target:<repo> derived from the cited PR",
+    ``fingerprint()`` is contractually never supposed to raise, and is
+    contractually required to return one of ``FINGERPRINT_DIGEST`` (with a
+    string ``digest``), ``FINGERPRINT_NO_TARGET``, or
+    ``FINGERPRINT_UNAVAILABLE`` (with a well-formed ``ProposalTargetError``) --
+    but this board cannot trust a duck-typed plugin to honor either promise.
+    A raise, or a malformed result (including an invalid status, None, or a
+    malformed error), is logged and normalized to ``FINGERPRINT_UNAVAILABLE``
+    with a generic, caller-safe message -- fail closed rather than reach a
+    500 or an inconsistent write. Callers treat the returned
+    ``FINGERPRINT_UNAVAILABLE`` exactly like a plugin-reported one: raised
+    as ``ProposalTargetUnavailableError`` at submit time, resolved to
+    ``apply_failed`` at apply time.
+    """
+    try:
+        result = await judge.fingerprint(ctx)
+        if isinstance(result, ProposalFingerprint):
+            if result.status == FINGERPRINT_DIGEST and isinstance(result.digest, str):
+                return result
+            if result.status == FINGERPRINT_NO_TARGET:
+                return result
+            if result.status == FINGERPRINT_UNAVAILABLE and _is_well_formed_target_error(
+                result.error
+            ):
+                assert result.error is not None
+                scrubbed_detail = _scrub_proposal_error_string(result.error.detail)
+                if not scrubbed_detail:
+                    scrubbed_detail = _FINGERPRINT_CONTRACT_VIOLATION_DETAIL
+                truncated_detail = _truncate_proposal_string(
+                    scrubbed_detail, _MAX_PROPOSAL_ERROR_DETAIL_LENGTH
+                )
+                if truncated_detail != result.error.detail:
+                    return ProposalFingerprint(
+                        status=FINGERPRINT_UNAVAILABLE,
+                        error=ProposalTargetError(
+                            status_code=result.error.status_code,
+                            error_code=result.error.error_code,
+                            detail=truncated_detail,
+                            log_detail=result.error.log_detail,
+                        ),
+                    )
+                return result
+        logger.warning(
+            "proposal judge fingerprint() returned a malformed result (%r) for "
+            "kind=%r action_type=%r; treating as unavailable",
+            result,
+            ctx.kind,
+            ctx.action_type,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "proposal judge fingerprint() raised for kind=%r action_type=%r: %s",
+            ctx.kind,
+            ctx.action_type,
+            type(exc).__name__,
+            exc_info=True,
+        )
+    return ProposalFingerprint(
+        status=FINGERPRINT_UNAVAILABLE,
+        error=ProposalTargetError(
+            status_code=500,
+            error_code="server_configuration_error",
+            detail=_FINGERPRINT_CONTRACT_VIOLATION_DETAIL,
+            log_detail="proposal judge fingerprint() violated its contract; see WARNING log above",
+        ),
     )
-
-
-async def _rule_always_pending(action: dict[str, Any]) -> tuple[str, str | None]:
-    """Per-kind fallback for any ``action_type`` with no specific rule
-    registered in ``_PROPOSAL_RULES`` -- e.g. status changes short of
-    closing, project reassignment, or priority changes on a
-    ``linear_progress_update`` proposal. Preserves the pre-refactor
-    monolithic judge's "everything else stays pending" behavior."""
-    return "pending", None
-
-
-# Registry keyed by ``(kind, action_type)`` -- deliberately not a shared/
-# generic judge across kinds or action_types (see ``_rule_open_ticket``'s
-# docstring). ``_PROPOSAL_KIND_DEFAULT_RULE`` below (one entry per
-# supported kind) is the single source of truth for which kinds are
-# supported: ``_derive_proposal_priority`` checks membership there directly
-# and raises ``ValueError`` (-> 422) for any kind not present, before rule
-# dispatch ever runs. A kind reaching rule dispatch in ``create_proposal``
-# is therefore guaranteed to have a default-rule entry -- there is no
-# "kind with no registered rule at all" path reachable in practice.
-_PROPOSAL_RULES: dict[tuple[str, str], ProposalRule] = {
-    ("linear_progress_update", "open_ticket"): _rule_open_ticket,
-    ("linear_progress_update", "close_ticket"): _rule_close_ticket,
-    ("linear_progress_update", "start_ticket"): _rule_start_ticket,
-    ("linear_progress_update", "review_ticket"): _rule_review_ticket,
-    ("linear_progress_update", "assign_ticket"): _rule_assign_ticket,
-    ("linear_progress_update", "label_ticket"): _rule_label_ticket,
-}
-
-_PROPOSAL_KIND_DEFAULT_RULE: dict[str, ProposalRule] = {
-    "linear_progress_update": _rule_always_pending,
-}
-
-
-async def evaluate_linear_progress_update_judge(action: dict[str, Any]) -> tuple[str, str | None]:
-    """Thin async wrapper over ``_PROPOSAL_RULES``/``_PROPOSAL_KIND_DEFAULT_RULE``
-    for ``kind="linear_progress_update"``, kept for backward compatibility
-    with existing test code (``tests/test_proposal_judge.py``).
-    ``create_proposal`` itself no longer calls this function; it looks up
-    and ``await``s the registry directly.
-
-    Returns ``(status, decision_note)`` where ``status`` is either
-    ``"approved"`` or ``"pending"`` -- never anything else. Dispatches on
-    ``action["action_type"]``: ``"open_ticket"`` (``_rule_open_ticket``),
-    ``"close_ticket"`` (``_rule_close_ticket``), ``"start_ticket"``
-    (``_rule_start_ticket``), ``"review_ticket"`` (``_rule_review_ticket``),
-    ``"assign_ticket"`` (``_rule_assign_ticket``), and ``"label_ticket"``
-    (``_rule_label_ticket``) each have their own rule registered in
-    ``_PROPOSAL_RULES`` (Argus review: docstring update -- this list was
-    stale, predating the TECH-5877 lanes added after ``open_ticket``/
-    ``close_ticket``); anything else (including a missing or non-string
-    ``action_type``) falls back to ``_rule_always_pending``. All of the
-    above make live GitHub and/or Linear API calls during judging EXCEPT
-    ``close_ticket``, which is pure/offline (citation-URL-shape validation
-    only, no network I/O)."""
-    action_type = action.get("action_type")
-    rule = _PROPOSAL_KIND_DEFAULT_RULE["linear_progress_update"]
-    if isinstance(action_type, str):
-        rule = _PROPOSAL_RULES.get(("linear_progress_update", action_type), rule)
-    return await rule(action)
 
 
 _PROPOSAL_JUDGE_DECIDED_BY = "system:judge"
@@ -6867,42 +6473,55 @@ async def create_proposal(
     confidence: str,
     importance: str,
     impact: str,
+    judge: ProposalJudge,
     target_fingerprint: str,
 ) -> dict[str, Any]:
     """``POST /proposals`` (main.py, non-MCP, bot-submission-gated).
 
+    ``judge`` is the caller-injected ``plugins.ProposalJudge`` (resolved by
+    the caller via ``plugins.get_proposal_judge()``, same injection style
+    ``post_message``'s ``risk_scorer``/``auto_approver``/``notifier``/
+    ``docs_verifier`` already use) that owns every RH-specific (or
+    deployment-specific) piece of this pipeline: admission + priority
+    (``classify``), the target's current-state digest (``fingerprint``),
+    the auto-approval verdict (``judge``), and the external write
+    (``apply``). This board owns only the generic bus mechanics around it --
+    dedup, rate-limiting, the claim/apply state machine, staleness
+    comparison, and audit.
+
     ``target_fingerprint`` (the parameter) is DEPRECATED and ignored (bug
     fix): it used to be trusted verbatim from the caller, but it's an
-    opaque, caller-supplied string that can never equal the sha256 digest
-    ``linear_client.compute_target_fingerprint`` later compares it
-    against at apply time -- every proposal was landing in ``"stale"``
-    deterministically, not from an actual race. The value actually
-    stored is instead computed HERE, server-side, by fetching the
-    target's CURRENT fingerprint via the same kind-scoped fingerprinter
-    (``_PROPOSAL_FINGERPRINTER_NAMES``) that ``_apply_or_finalize_proposal_hold``
-    later re-fetches at apply time, so the stored value and the value
-    compared against it come from the exact same function. A
-    ``linear_client.LinearAPIError`` raised while fetching it (e.g. the
-    target doesn't exist, or Linear is unreachable) propagates out of
-    this function uncaught -- a proposal against a target we can't even
-    fetch is never created as if it were valid. Kept as an accepted
-    parameter only for backward compatibility with existing callers.
+    opaque, caller-supplied string that can never equal the digest the
+    judge's ``fingerprint()`` later compares it against at apply time --
+    every proposal was landing in ``"stale"`` deterministically, not from
+    an actual race. The value actually stored is instead computed HERE,
+    server-side, by calling ``judge.fingerprint()`` (via the defensive
+    ``_safe_fingerprint`` wrapper), the exact same call
+    ``_apply_or_finalize_proposal_hold`` makes again at apply time, so the
+    stored value and the value compared against it come from the exact
+    same function. A ``FINGERPRINT_UNAVAILABLE`` result raises
+    ``ProposalTargetUnavailableError`` (carrying the judge's already-
+    sanitized ``status_code``/``error_code``/``detail``) -- a proposal
+    against a target we can't even fetch is never created as if it were
+    valid. Kept as an accepted parameter only for backward compatibility
+    with existing callers.
 
-    A ``(kind, action_type)`` in ``_PROPOSAL_FINGERPRINT_EXEMPT`` (TECH-5873
-    redefinition -- today, just open_ticket) skips this fetch entirely and
-    stores the fixed ``_NO_PRE_EXISTING_TARGET_FINGERPRINT`` sentinel
-    instead: its ``target_id`` is not a Linear issue id at all (see
-    ``_extract_proposal_target``'s docstring), so there is nothing to
-    fetch a fingerprint FOR.
+    A ``FINGERPRINT_NO_TARGET`` result (e.g. an ``open_ticket``-style
+    action whose ``target_id`` is a PR URL, not a pre-existing ticket)
+    skips storing a real digest entirely and stores the fixed
+    ``_NO_PRE_EXISTING_TARGET_FINGERPRINT`` sentinel instead -- see
+    ``_extract_proposal_target``'s docstring.
 
     This fingerprint fetch runs BEFORE the TECH-5875 per-bot rate-limit
     attempt marker is committed (Argus review: rate-limit slot burned on
-    an unrelated Linear failure) -- it is itself an external I/O call
+    an unrelated target-side failure) -- it is itself an external I/O call
     that can fail for reasons that have nothing to do with the
-    submitting bot's actual submission rate (Linear down, a bad
+    submitting bot's actual submission rate (the target system down, a bad
     ``target_id``); charging it against the bot's rate-limit budget for
     a proposal that was never even created would let a string of
-    Linear-side failures alone exhaust that budget.
+    target-side failures alone exhaust that budget. ``classify()`` runs
+    even earlier, before that too, for the same reason (Argus review S7)
+    -- a bad ``kind`` shouldn't burn a slot either.
 
     Enforces the TECH-5875 per-bot rate limit (recording this attempt in
     ``audit_log`` and committing immediately -- see
@@ -6914,45 +6533,39 @@ async def create_proposal(
     ``target_id``/``action_type`` derived from ``action`` via
     ``_extract_proposal_target``; scoped to the submitting bot, Argus
     review B1) or INSERTs a new one. ``priority`` is always server-derived
-    (``_derive_proposal_priority``) -- a caller-supplied value in ``action``
-    or elsewhere is never trusted or persisted as ``priority``.
+    (``judge.classify()``, via the defensive ``_classify_proposal``
+    wrapper) -- a caller-supplied value in ``action`` or elsewhere is never
+    trusted or persisted as ``priority``.
 
     Immediately after the row is inserted/updated, this function commits
     it -- releasing the DB connection, same commit-before-external-I/O
     pattern as ``_apply_or_finalize_proposal_hold``, see that function's
     docstring -- WITHOUT refreshing it (bug fix: a pool connection must
-    not be held across the upcoming rule call, and a refresh here would
+    not be held across the upcoming judge call, and a refresh here would
     require checking one back out just to hand it right back). It then
     snapshots the still-unrefreshed in-memory row (``_proposal_resubmission_
-    snapshot``) and looks up and ``await``s the TECH-5877 ``(kind,
-    action_type)``-scoped rule (``_PROPOSAL_RULES``, falling back to
-    ``_PROPOSAL_KIND_DEFAULT_RULE`` for any action_type with no specific
-    rule registered) exactly once, with no DB connection held for the
-    duration. Only after the rule (and, on an "approved" verdict, the
-    apply path it triggers) has returned does this function refresh the
-    row once, so later reads of DB-server-populated columns (notably
-    ``updated_at``) see current values. Every ``kind`` that reaches this point
-    is guaranteed to be ``"linear_progress_update"`` -- ``_derive_proposal_
-    priority`` above already raised (422) for any other kind, so the
-    default-rule lookup here can never miss; there is no live "kind with
-    no registered rule at all" path today. Any exception the rule itself
-    raises (e.g. a future lane's real I/O failing) is caught and treated
-    as ``"pending"`` -- fail closed, never mistaken for an "approved"
-    verdict, and never left to crash this function with the hold in a bad
-    state. A verdict is only applied if the payload is unchanged at
-    claim time; abandoning a stale verdict when a concurrent
-    resubmission has superseded it is safe because that resubmitting
-    call independently judges and drives the new payload.
+    snapshot``) and ``await``s ``judge.judge(ctx)`` exactly once, with no
+    DB connection held for the duration. Only after that call (and, on an
+    "approved" verdict, the apply path it triggers) has returned does this
+    function refresh the row once, so later reads of DB-server-populated
+    columns (notably ``updated_at``) see current values. Any exception
+    ``judge.judge()`` itself raises (a future lane's real I/O failing, or a
+    plugin bug) is caught and treated as ``"pending"`` -- fail closed,
+    never mistaken for an "approved" verdict, and never left to crash this
+    function with the hold in a bad state. A verdict is only applied if the
+    payload is unchanged at claim time; abandoning a stale verdict when a
+    concurrent resubmission has superseded it is safe because that
+    resubmitting call independently judges and drives the new payload.
 
-    A rule verdict of ``"approved"`` is never itself persisted (Argus
-    review B1): a hold left sitting at rest with ``status="approved"``
-    would be invisible to ``list_pending_proposal_holds`` (``status=
-    'pending'`` only) AND unreachable via ``decide_proposal`` (which
-    treats any non-``"pending"`` status as already-decided) -- permanently
-    stranded, never applied. Instead, the row is committed as ``pending``
-    first (see above), then ``_apply_or_finalize_proposal_hold`` -- the
-    same helper ``decide_proposal``'s human-approve path uses -- resolves
-    it synchronously to ``"applied"``/``"apply_failed"``/``"stale"``
+    A verdict of ``approved=True`` is never itself persisted as a hold
+    status (Argus review B1): a hold left sitting at rest with
+    ``status="approved"`` would be invisible to ``list_pending_proposal_holds``
+    (``status='pending'`` only) AND unreachable via ``decide_proposal``
+    (which treats any non-``"pending"`` status as already-decided) --
+    permanently stranded, never applied. Instead, the row is committed as
+    ``pending`` first (see above), then ``_apply_or_finalize_proposal_hold``
+    -- the same helper ``decide_proposal``'s human-approve path uses --
+    resolves it synchronously to ``"applied"``/``"apply_failed"``/``"stale"``
     before this function returns. Note: a SAME-bot resubmission that adds
     a valid citation to an already-pending row is expected to auto-apply
     on this pass -- a bot progressively refining its own proposal, not a
@@ -6968,39 +6581,54 @@ async def create_proposal(
     # (but authenticated) request that fails here still burns a rate-limit
     # slot before ever reaching a 422.
     target_id, action_type = _extract_proposal_target(action)
-    priority = _derive_proposal_priority(kind, action)
+    priority = _classify_proposal(judge, kind, action)
 
     # Bug fix: server-compute target_fingerprint here instead of trusting
     # the caller-supplied parameter of the same name (see this function's
-    # docstring) -- reuses the SAME kind-scoped fingerprinter
-    # (_PROPOSAL_FINGERPRINTER_NAMES) _apply_or_finalize_proposal_hold
-    # re-fetches from at apply time, so a genuine target change between
-    # submission and apply/decide is the only thing that can ever make
-    # the two disagree. Deliberately NOT wrapped in a try/except -- a
-    # LinearAPIError here (target doesn't exist, Linear unreachable)
-    # propagates out of create_proposal uncaught.
+    # docstring) -- calls the SAME judge.fingerprint()
+    # (_apply_or_finalize_proposal_hold re-calls it at apply time), so a
+    # genuine target change between submission and apply/decide is the
+    # only thing that can ever make the two disagree. A
+    # FINGERPRINT_UNAVAILABLE result raises ProposalTargetUnavailableError
+    # below -- a proposal against a target we can't even fetch is never
+    # created as if it were valid.
     #
     # Argus review: this fetch runs BEFORE the rate-limit attempt marker
     # below is audited + committed -- same "don't burn a rate-limit slot
     # on a proposal that was never created" reasoning as the pure-
     # validation ordering above, extended to this external I/O call: a
-    # LinearAPIError here (Linear down, a bad target_id) has nothing to
-    # do with the submitting bot's actual submission rate, so it must not
-    # consume that bot's rate-limit budget either.
-    #
-    # Critical fix (TECH-5873 redefinition): an exempted (kind,
-    # action_type) pair -- open_ticket -- has no pre-existing target to
-    # fetch a fingerprint FOR at all (its target_id is a PR URL, not a
-    # Linear issue id). Fetching one anyway is exactly the regression this
-    # branch closes: without it, every open_ticket submission raised a
-    # LinearAPIError trying to fetch a "current fingerprint" for a target
-    # that doesn't exist, so open_ticket could never even be SUBMITTED.
-    # See _PROPOSAL_FINGERPRINT_EXEMPT's own docstring.
-    if (kind, action_type) in _PROPOSAL_FINGERPRINT_EXEMPT:
+    # target-side failure here (the target system down, a bad target_id)
+    # has nothing to do with the submitting bot's actual submission rate,
+    # so it must not consume that bot's rate-limit budget either.
+    submit_ctx = ProposalContext(
+        kind=kind,
+        action=action,
+        target_id=target_id,
+        action_type=action_type,
+        rationale=rationale,
+        proposed_by_bot_id=proposed_by_bot_id,
+        owner_sub=owner_sub,
+        hold_id=None,
+    )
+    fingerprint_result = await _safe_fingerprint(judge, submit_ctx)
+    if fingerprint_result.status == FINGERPRINT_NO_TARGET:
         target_fingerprint = _NO_PRE_EXISTING_TARGET_FINGERPRINT
+    elif fingerprint_result.status == FINGERPRINT_DIGEST:
+        assert fingerprint_result.digest is not None  # guaranteed by _safe_fingerprint
+        target_fingerprint = fingerprint_result.digest
     else:
-        fingerprinter = getattr(linear_client, _PROPOSAL_FINGERPRINTER_NAMES[kind])
-        target_fingerprint = await fingerprinter(target_id)
+        assert fingerprint_result.error is not None  # guaranteed by _safe_fingerprint
+        error = fingerprint_result.error
+        logger.warning(
+            "proposal target unavailable for kind=%r action_type=%r target_id=%r: %s",
+            kind,
+            action_type,
+            target_id,
+            error.log_detail or error.detail,
+        )
+        raise ProposalTargetUnavailableError(
+            status_code=error.status_code, error_code=error.error_code, detail=error.detail
+        )
 
     await _deny_rate_limited_proposals(session, proposed_by_bot_id=proposed_by_bot_id)
     _audit(session, actor_sub=proposed_by_bot_id, action=_PROPOSAL_SUBMISSION_ATTEMPT_ACTION)
@@ -7051,16 +6679,73 @@ async def create_proposal(
     # comparison.
     judged_payload = _proposal_resubmission_snapshot(hold)
 
-    # Reaching this point guarantees kind == "linear_progress_update":
-    # _derive_proposal_priority above already raised for every other kind,
-    # so the default-rule lookup below is guaranteed to hit (no "kind with
-    # no registered rule at all" path is actually reachable -- see this
-    # function's docstring).
-    rule = _PROPOSAL_RULES.get((kind, action_type)) or _PROPOSAL_KIND_DEFAULT_RULE.get(kind)
-    if rule is None:
-        raise AssertionError(f"kind {kind!r} reached rule dispatch with no registered rule")
+    judge_ctx = ProposalContext(
+        kind=kind,
+        action=hold.action,
+        target_id=target_id,
+        action_type=action_type,
+        rationale=hold.rationale,
+        proposed_by_bot_id=proposed_by_bot_id,
+        owner_sub=owner_sub,
+        hold_id=hold.id,
+    )
+    is_judge_error = False
     try:
-        judged_status, decision_note = await rule(hold.action)
+        verdict = await judge.judge(judge_ctx)
+        if not isinstance(verdict, ProposalVerdict):
+            logger.warning(
+                "proposal judge for (kind=%r, action_type=%r) returned a malformed verdict "
+                "(%r) for hold %s",
+                kind,
+                action_type,
+                verdict,
+                hold.id,
+            )
+            verdict_type = type(verdict).__name__
+            judged_status, decision_note = (
+                "pending",
+                f"judge error: expected ProposalVerdict, got {verdict_type}",
+            )
+            is_judge_error = True
+        elif not isinstance(verdict.approved, bool):
+            # Fix 2: approved must be an actual boolean, never plain truthiness.
+            # In Python, strings like "false" or numbers like 1 are truthy;
+            # treating them as approved would trigger an unauthorized external write.
+            logger.warning(
+                "proposal judge for (kind=%r, action_type=%r) returned non-bool approved "
+                "(%r) for hold %s",
+                kind,
+                action_type,
+                verdict.approved,
+                hold.id,
+            )
+            app_type = type(verdict.approved).__name__
+            judged_status, decision_note = (
+                "pending",
+                f"judge error: ProposalVerdict.approved must be a bool, got {app_type}",
+            )
+            is_judge_error = True
+        elif verdict.decision_note is not None and not isinstance(verdict.decision_note, str):
+            logger.warning(
+                "proposal judge for (kind=%r, action_type=%r) returned non-str decision_note "
+                "(%r) for hold %s",
+                kind,
+                action_type,
+                verdict.decision_note,
+                hold.id,
+            )
+            note_type = type(verdict.decision_note).__name__
+            judged_status, decision_note = (
+                "pending",
+                f"judge error: ProposalVerdict.decision_note must be None or str, got {note_type}",
+            )
+            is_judge_error = True
+        else:
+            judged_status = "approved" if verdict.approved else "pending"
+            note = verdict.decision_note
+            if note is not None:
+                note = _truncate_proposal_string(note, MAX_DECISION_REASON_LENGTH)
+            decision_note = note
     except asyncio.CancelledError:
         # BaseException, not Exception -- already excluded from the guard
         # below under Python's actual exception hierarchy, but re-raised
@@ -7074,14 +6759,15 @@ async def create_proposal(
         # decidable, resubmittable resting state with no stranding risk.
         raise
     except Exception as exc:
-        # Fail closed: any exception from the rule (a future lane's real
-        # I/O -- a transport failure, timeout, etc.) must never be
-        # mistaken for an "approved" verdict, and must never crash this
-        # function outright with the hold left in a bad state. Same
-        # `except Exception` + `logger.warning(..., exc_info=True)` shape
-        # as `_fire_approval_notifier`'s own defensive catch.
+        # Fail closed: any exception from judge.judge() (a future lane's
+        # real I/O -- a transport failure, timeout, etc. -- or a plugin
+        # bug) must never be mistaken for an "approved" verdict, and must
+        # never crash this function outright with the hold left in a bad
+        # state. Same `except Exception` + `logger.warning(...,
+        # exc_info=True)` shape as `_fire_approval_notifier`'s own
+        # defensive catch.
         logger.warning(
-            "proposal rule for (kind=%r, action_type=%r) raised for hold %s: %s",
+            "proposal judge for (kind=%r, action_type=%r) raised for hold %s: %s",
             kind,
             action_type,
             hold.id,
@@ -7089,24 +6775,27 @@ async def create_proposal(
             exc_info=True,
         )
         judged_status, decision_note = "pending", f"judge error: {type(exc).__name__}"
+        is_judge_error = True
+
+    if is_judge_error:
         # Bug fix: unlike a legitimately-pending judge verdict (always
-        # decision_note=None by convention -- see e.g. _rule_always_
-        # pending), THIS decision_note describes a real failure -- but
-        # nothing below persists it, so this row would otherwise fall
-        # through the `if not auto_approved` branch just below as an
-        # ordinary-looking status="pending" row, indistinguishable from a
-        # legitimately-held proposal. Write it onto the row now:
-        # decision_note is NOT part of `ck_proposal_holds_decision_
-        # consistency` (unlike decided_at/decided_by_actor_id/
-        # decision_source), so it can be set independent of status --
-        # making this failure visible via `proposals_get`/the API-facing
-        # dict for an operator to find.
+        # decision_note=None by convention -- see e.g.
+        # EscalateAllProposalJudge.judge), THIS decision_note describes a
+        # real failure -- but nothing below persists it, so this row would
+        # otherwise fall through the `if not auto_approved` branch just
+        # below as an ordinary-looking status="pending" row,
+        # indistinguishable from a legitimately-held proposal. Write it
+        # onto the row now: decision_note is NOT part of
+        # `ck_proposal_holds_decision_consistency` (unlike decided_at/
+        # decided_by_actor_id/decision_source), so it can be set
+        # independent of status -- making this failure visible via
+        # `proposals_get`/the API-facing dict for an operator to find.
         hold.decision_note = decision_note
         await session.commit()
     # The single refresh for this function -- deliberately placed here,
-    # AFTER the rule call has returned (whichever branch above ran) and
+    # AFTER the judge call has returned (whichever branch above ran) and
     # its own commit (if any) has landed, rather than before it, so no DB
-    # pool connection is held across the rule's external I/O (see the
+    # pool connection is held across the judge's external I/O (see the
     # comment above `judged_payload`'s assignment). It exists because
     # SQLAlchemy leaves `updated_at` unloaded after an ORM UPDATE: that
     # column's `onupdate` is a SQL-expression (`text("now()")`), and
@@ -7174,6 +6863,7 @@ async def create_proposal(
         decided_by_actor_id=_PROPOSAL_JUDGE_DECIDED_BY,
         decision_source="auto",
         decision_note=decision_note,
+        judge=judge,
     )
     if result is not None:
         # `_apply_or_finalize_proposal_hold` returns a dict, not a
@@ -7509,45 +7199,6 @@ async def _find_proposal_hold(
     return (await session.execute(stmt)).scalar_one_or_none()
 
 
-# Kind-scoped appliers for a decided ``linear_progress_update`` proposal
-# (TECH-5873) -- same registry shape (keyed by ``kind``) as
-# ``_PROPOSAL_KIND_DEFAULT_RULE``, and for the same reason: a kind
-# reaching ``decide_proposal``'s approve path is
-# guaranteed (by ``_derive_proposal_priority`` at submission time) to be
-# ``"linear_progress_update"`` today, but a future kind adds its own entry
-# here rather than a generic dispatcher silently no-op'ing on it.
-#
-# Stores attribute NAMES on the ``linear_client`` module, not the function
-# objects themselves -- tests patch ``service.linear_client.<name>``
-# (``service.linear_client`` IS the ``linear_client`` module, so this is
-# the same object `main.py` would import), and binding the function object
-# into this dict at module-import time would freeze the ORIGINAL,
-# unpatched function in here forever.
-_PROPOSAL_APPLIER_NAMES: dict[str, str] = {
-    "linear_progress_update": "apply_progress_update",
-}
-_PROPOSAL_FINGERPRINTER_NAMES: dict[str, str] = {
-    "linear_progress_update": "fetch_current_fingerprint",
-}
-
-# Action-scoped override, consulted BEFORE the per-kind default above
-# (TECH-5873 redefinition): open_ticket's applier creates a brand-new
-# Linear issue (``apply_open_ticket``), not a comment on an existing one
-# (``apply_progress_update``, still correct for every OTHER
-# linear_progress_update action_type, including close_ticket) -- a single
-# per-kind entry can no longer describe every action_type under
-# "linear_progress_update". A future action_type needing its own applier
-# gets its own entry here too; anything absent still falls back to
-# ``_PROPOSAL_APPLIER_NAMES[kind]``.
-_PROPOSAL_ACTION_APPLIER_NAMES: dict[tuple[str, str], str] = {
-    ("linear_progress_update", "open_ticket"): "apply_open_ticket",
-    ("linear_progress_update", "start_ticket"): "apply_start_ticket",
-    ("linear_progress_update", "review_ticket"): "apply_review_ticket",
-    ("linear_progress_update", "assign_ticket"): "apply_assign_ticket",
-    ("linear_progress_update", "label_ticket"): "apply_label_ticket",
-}
-
-
 async def _claim_proposal_hold_for_applying(
     session: AsyncSession,
     *,
@@ -7613,28 +7264,12 @@ async def _claim_proposal_hold_for_applying(
     return True
 
 
-# Argus review round-5 S4: `apply_error` was previously returned to any
-# authenticated caller of `POST /proposals/{id}/decide`
-# via `_proposal_dict` -- any authenticated actor, not just an operator with
-# Linear/infra access. A raw `httpx` transport exception's `str()` can
-# contain request internals (a full URL including query params, redirect
-# targets, TLS/connection details) that are meant for an operator reading
-# logs, not for every caller of this endpoint. Rather than pass through an
-# unbounded set of possible messages (merely truncated), classify into a
-# small allowlisted set of caller-safe messages and log the real `str(exc)`
-# server-side at WARNING for whoever's debugging `apply_failed` -- the exact
-# same disposition `_apply_or_finalize_proposal_hold`'s `elif apply_error is
-# not None:` branch already logs, so nothing observable to an operator is
-# lost, only what's returned over the API is narrowed.
-_APPLY_ERROR_TOKEN_MESSAGE = "Linear API token not configured"
-_APPLY_ERROR_UNAVAILABLE_MESSAGE = "Linear API unavailable"
-_APPLY_ERROR_GENERIC_MESSAGE = "Linear API returned an error"
-# Argus review round-9 suggestions: grouped alongside its LinearAPIError
-# siblings (was previously declared next to `_cancellation_apply_error`,
-# separately from the rest of the allowlisted `apply_error` set -- less
-# discoverable as "one of four fixed public values"), and given
-# human-readable prose matching the sibling constants' style instead of a
-# `status:reason` machine-token shape.
+# Fixed, caller-safe message for a proposal apply cancelled mid-flight
+# (Argus review round-7/8/9). Unlike a plugin-supplied `caller_error`
+# (`plugins.ProposalApplyOutcome.caller_error`), this one is entirely the
+# board's own: a cancellation is bus mechanics (a client disconnect, a task
+# cancellation) that can happen regardless of which ProposalJudge is
+# configured, so the board -- not the plugin -- owns this message.
 #
 # Backward compatibility (Argus review round-10 suggestion): this value
 # changed from the machine-token `"apply_failed:cancelled"` (introduced
@@ -7644,67 +7279,10 @@ _APPLY_ERROR_GENERIC_MESSAGE = "Linear API returned an error"
 # migration `e2f7a91c5b34`'s own DEPLOYMENT note) -- so there is no
 # persisted row anywhere carrying the old value and no migration is
 # needed. This string is NOT meant to be machine-matched by any consumer
-# going forward either -- like its three `LinearAPIError` siblings, it is
-# prose for a human reading the API response, not a stable enum value;
-# don't build string-equality logic against it in a future caller.
+# going forward either -- it is prose for a human reading the API
+# response, not a stable enum value; don't build string-equality logic
+# against it in a future caller.
 _APPLY_ERROR_CANCELLED_MESSAGE = "Apply cancelled before completion"
-
-
-def _sanitize_apply_error(exc: Exception) -> str:
-    """Map a ``LinearAPIError`` to one of a small allowlisted, caller-safe
-    message set before it's persisted to ``hold.apply_error`` and returned
-    to API callers via ``_proposal_dict`` (Argus review round-4 suggestion,
-    round-5 S4 hardening). The full, unredacted ``str(exc)`` is NOT logged
-    by this function -- the caller (``_apply_or_finalize_proposal_hold``)
-    captures it into its own ``raw_apply_error`` local BEFORE calling this
-    function, and logs that at WARNING on the ``apply_failed`` path
-    (Argus review round-6 B1 -- an earlier version of this docstring
-    claimed the caller logged it, without that call site actually doing
-    so). This function only bounds what leaves the process via the API
-    response.
-
-    Dispatches on the exception's TYPE, not a substring match against its
-    message text (Argus review round-6 suggestion): a earlier version
-    checked ``"is not configured" in str(exc)``, which would also match a
-    ``LinearAPIError`` whose message happened to contain that phrase for
-    an unrelated reason (e.g. echoed back verbatim from Linear's own
-    GraphQL error payload), misclassifying a real Linear-side error as a
-    local configuration problem. ``linear_client.LinearTokenMissingError``/
-    ``LinearTransportError`` are typed subclasses of ``LinearAPIError``
-    that exist specifically so this dispatch is exact."""
-    if isinstance(exc, linear_client.LinearTokenMissingError):
-        return _APPLY_ERROR_TOKEN_MESSAGE
-    if isinstance(exc, linear_client.LinearTransportError):
-        return _APPLY_ERROR_UNAVAILABLE_MESSAGE
-    return _APPLY_ERROR_GENERIC_MESSAGE
-
-
-_SUBMIT_ERROR_TOKEN_MESSAGE = "server configuration error"
-_SUBMIT_ERROR_UNAVAILABLE_MESSAGE = "Linear API unavailable"
-_SUBMIT_ERROR_GENERIC_MESSAGE = "Linear returned an error"
-
-
-def sanitize_linear_submit_error(exc: Exception) -> tuple[int, str, str]:
-    """Map a submit-time ``LinearAPIError`` to a safe (status_code, error_code, detail)
-    tuple before returning it to callers at either entry point (HTTP
-    ``POST /proposals`` or FastMCP ``submit``) (Argus review round-3 B1).
-
-    Prevents leaking internal environment variable names (e.g. from
-    ``LinearTokenMissingError``), httpx transport internals (from
-    ``LinearTransportError``), or raw GraphQL error payloads (from
-    ``LinearAPIError``) to callers during the submission-time fingerprint
-    fetch.
-
-    Dispatches on exception TYPE, mirroring ``_sanitize_apply_error``:
-    - ``LinearTokenMissingError``: 500, "server_configuration_error", "server configuration error"
-    - ``LinearTransportError``: 503, "service_unavailable", "Linear API unavailable"
-    - other ``LinearAPIError``: 422, "invalid_request", "Linear returned an error"
-    """
-    if isinstance(exc, linear_client.LinearTokenMissingError):
-        return 500, "server_configuration_error", _SUBMIT_ERROR_TOKEN_MESSAGE
-    if isinstance(exc, linear_client.LinearTransportError):
-        return 503, "service_unavailable", _SUBMIT_ERROR_UNAVAILABLE_MESSAGE
-    return 422, "invalid_request", _SUBMIT_ERROR_GENERIC_MESSAGE
 
 
 def _cancellation_apply_error(exc: asyncio.CancelledError) -> str:
@@ -7727,11 +7305,154 @@ def _cancellation_apply_error(exc: asyncio.CancelledError) -> str:
     authenticated caller of this endpoint). ``apply_error`` on a
     cancellation is always the fixed ``_APPLY_ERROR_CANCELLED_MESSAGE``
     constant, set directly at each call site -- never derived from this
-    function -- the same "small allowlisted set" treatment
-    ``_sanitize_apply_error`` gives a ``LinearAPIError``."""
+    function -- the same allowlisted-message treatment a
+    ``plugins.ProposalApplyOutcome.caller_error`` already gets from the
+    injected judge."""
     detail = str(exc)
     base = "apply cancelled before completion (request disconnected or task cancelled)"
     return f"{base}: {detail}" if detail else base
+
+
+_APPLY_ERROR_PLUGIN_CONTRACT_VIOLATION_MESSAGE = "unable to apply this proposal"
+
+# Argus review round-9 S1: distinct from the plugin-contract-violation
+# message above -- this is a fault entirely on the board's own side (a
+# terminal-commit failure, e.g. a database error or serialization issue),
+# nothing to do with the configured judge plugin. Used only by the
+# last-ditch commit recovery path in `_apply_or_finalize_proposal_hold`
+# when the recovery commit itself fails, to avoid stranding the row at
+# status="applying".
+_APPLY_ERROR_BOARD_COMMIT_FAILURE_MESSAGE = "apply failed due to a board infrastructure error"
+
+
+async def _safe_apply(judge: ProposalJudge, ctx: ProposalContext) -> ProposalApplyOutcome:
+    """Call the injected ``plugins.ProposalJudge.apply()`` defensively.
+
+    ``apply()`` is contractually allowed to return ``applied=False`` as a
+    NORMAL, queryable outcome (not an error) -- but a raise, or a malformed
+    result (``outcome is None``; ``applied`` not a bool; ``applied=True``
+    with a non-``None``, non-``dict`` ``result``; ``applied=False`` with no
+    ``caller_error``), is a plugin bug this board cannot trust a duck-typed
+    plugin to avoid. Normalized to a safe ``applied=False`` outcome with a
+    generic, caller-safe message -- fail closed rather than reach a 500,
+    strand a claimed row at ``status="applying"``, or persist a malformed
+    ``apply_result``."""
+    try:
+        outcome = await judge.apply(ctx)
+        if not isinstance(outcome, ProposalApplyOutcome):
+            logger.warning(
+                "proposal judge apply() returned a malformed result (%r) for hold %s "
+                "(kind=%r action_type=%r)",
+                outcome,
+                ctx.hold_id,
+                ctx.kind,
+                ctx.action_type,
+            )
+            return ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error=_APPLY_ERROR_PLUGIN_CONTRACT_VIOLATION_MESSAGE,
+                log_detail=f"apply() returned a malformed result: {outcome!r}",
+            )
+        if not isinstance(outcome.applied, bool):
+            logger.warning(
+                "proposal judge apply() returned non-bool applied (%r) for hold %s "
+                "(kind=%r action_type=%r)",
+                outcome.applied,
+                ctx.hold_id,
+                ctx.kind,
+                ctx.action_type,
+            )
+            return ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error=_APPLY_ERROR_PLUGIN_CONTRACT_VIOLATION_MESSAGE,
+                log_detail=f"apply() returned non-bool applied: {outcome.applied!r}",
+            )
+        if outcome.applied:
+            if outcome.result is None:
+                return outcome
+            if isinstance(outcome.result, dict):
+                try:
+                    json.dumps(outcome.result)
+                except (TypeError, ValueError) as exc:
+                    logger.warning(
+                        "proposal judge apply() returned applied=True with non-JSON-serializable "
+                        "result (%s) for hold %s; treating as apply_failed",
+                        type(exc).__name__,
+                        ctx.hold_id,
+                    )
+                    return ProposalApplyOutcome(
+                        applied=False,
+                        result=None,
+                        caller_error=_APPLY_ERROR_PLUGIN_CONTRACT_VIOLATION_MESSAGE,
+                        log_detail=(
+                            "apply() returned applied=True with a non-JSON-serializable "
+                            f"result: {exc}"
+                        ),
+                    )
+                return outcome
+            logger.warning(
+                "proposal judge apply() returned applied=True with a non-dict result (%s) "
+                "for hold %s; treating as apply_failed",
+                type(outcome.result).__name__,
+                ctx.hold_id,
+            )
+            return ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error=_APPLY_ERROR_PLUGIN_CONTRACT_VIOLATION_MESSAGE,
+                log_detail=(
+                    f"apply() returned applied=True with a non-dict result: {outcome.result!r}"
+                ),
+            )
+        if not isinstance(outcome.caller_error, str) or not outcome.caller_error:
+            logger.warning(
+                "proposal judge apply() returned applied=False with no caller_error for hold "
+                "%s; using a generic message",
+                ctx.hold_id,
+            )
+            return ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error=_APPLY_ERROR_PLUGIN_CONTRACT_VIOLATION_MESSAGE,
+                log_detail=(
+                    outcome.log_detail
+                    if isinstance(outcome.log_detail, str) and outcome.log_detail
+                    else "apply() returned applied=False with no caller_error"
+                ),
+            )
+        scrubbed_caller_error = _scrub_proposal_error_string(outcome.caller_error)
+        if not scrubbed_caller_error:
+            scrubbed_caller_error = _APPLY_ERROR_PLUGIN_CONTRACT_VIOLATION_MESSAGE
+        truncated_caller_error = _truncate_proposal_string(
+            scrubbed_caller_error, _MAX_PROPOSAL_ERROR_DETAIL_LENGTH
+        )
+        if truncated_caller_error != outcome.caller_error:
+            return ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error=truncated_caller_error,
+                log_detail=outcome.log_detail,
+            )
+        return outcome
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "proposal judge apply() raised for hold %s (kind=%r action_type=%r): %s",
+            ctx.hold_id,
+            ctx.kind,
+            ctx.action_type,
+            type(exc).__name__,
+            exc_info=True,
+        )
+        return ProposalApplyOutcome(
+            applied=False,
+            result=None,
+            caller_error=_APPLY_ERROR_PLUGIN_CONTRACT_VIOLATION_MESSAGE,
+            log_detail=f"apply() raised {type(exc).__name__}: {exc}",
+        )
 
 
 def _stale_decision_note(original_decision_note: str | None) -> str:
@@ -7739,17 +7460,17 @@ def _stale_decision_note(original_decision_note: str | None) -> str:
     ``"stale"``. The pre-fix code simply re-stamped the SAME
     ``decision_note`` the judge/human wrote at approval time (e.g.
     ``"auto-approved: close-ticket proposal cites a valid citation"``)
-    onto the terminal ``"stale"`` row -- misleading, since NO Linear
-    write ever happens on this path. This wraps that original note
+    onto the terminal ``"stale"`` row -- misleading, since NO write to
+    the target ever happens on this path. This wraps that original note
     (still worth keeping around, for context on why it was approved in
     the first place) inside a message that makes unambiguously clear no
     write occurred."""
     if original_decision_note:
         return (
-            "not applied: target changed after approval; no Linear write was "
+            "not applied: target changed after approval; no write to the target was "
             f"performed (approval reason was: {original_decision_note})"
         )
-    return "not applied: target changed after approval; no Linear write was performed"
+    return "not applied: target changed after approval; no write to the target was performed"
 
 
 async def _apply_or_finalize_proposal_hold(
@@ -7760,6 +7481,7 @@ async def _apply_or_finalize_proposal_hold(
     decided_by_actor_id: str,
     decision_source: str,
     decision_note: str | None,
+    judge: ProposalJudge,
 ) -> dict[str, Any] | None:
     """Shared fingerprint-check-then-apply-or-stale logic for a hold
     leaving ``pending`` via approval -- reused by both ``decide_proposal``
@@ -7768,65 +7490,53 @@ async def _apply_or_finalize_proposal_hold(
     of being left sitting at rest in a persisted ``"approved"`` state that
     nothing ever revisits (Argus review B1).
 
-    Re-fetches the target's current fingerprint via the kind-scoped
-    fingerprinter and compares it against ``hold.target_fingerprint`` (the
-    fingerprint ``create_proposal`` computed server-side at submission
-    time -- see that function's docstring) BEFORE writing anything. A
-    mismatch means the target drifted since submission -- sets
-    ``status="stale"`` and never calls the kind-scoped applier, and
-    writes an honest ``decision_note`` making clear no Linear write
-    occurred (bug fix: the pre-fix code re-stamped the SAME
-    ``decision_note`` the judge/human wrote at approval time verbatim,
-    even on a ``"stale"`` row where nothing was ever written -- see
-    ``_stale_decision_note``). A match proceeds to the actual write;
-    success sets ``status="applied"`` (and ``applied_at``); a raised
-    ``linear_client.LinearAPIError`` sets ``status="apply_failed"`` with
+    Re-fetches the target's current fingerprint via ``judge.fingerprint()``
+    (through the defensive ``_safe_fingerprint`` wrapper) and compares it
+    against ``hold.target_fingerprint`` (the fingerprint ``create_proposal``
+    computed server-side at submission time -- see that function's
+    docstring) BEFORE writing anything. A digest mismatch means the target
+    drifted since submission -- sets ``status="stale"`` and never calls
+    ``judge.apply()``, and writes an honest ``decision_note`` making clear
+    no write occurred (bug fix: the pre-fix code re-stamped the SAME
+    ``decision_note`` the judge/human wrote at approval time verbatim, even
+    on a ``"stale"`` row where nothing was ever written -- see
+    ``_stale_decision_note``). ``FINGERPRINT_UNAVAILABLE`` short-circuits
+    the same way a stale digest does, skipping ``judge.apply()`` entirely,
+    but resolves to ``"apply_failed"`` instead. Otherwise (a digest match,
+    or ``FINGERPRINT_NO_TARGET``) proceeds to the actual write via
+    ``judge.apply()`` (through the defensive ``_safe_apply`` wrapper);
+    success sets ``status="applied"`` (and ``applied_at``); an
+    ``applied=False`` outcome sets ``status="apply_failed"`` with
     ``apply_error`` populated instead of propagating -- both are normal,
     queryable outcomes of this function, not exceptions raised to the
-    caller.
+    caller. Neither ``_safe_fingerprint`` nor ``_safe_apply`` ever raises
+    an ``Exception`` (a raising plugin is itself normalized to a safe
+    outcome by those wrappers -- see their own docstrings); the ``try``
+    block below exists only to catch ``asyncio.CancelledError``, a
+    ``BaseException`` neither wrapper catches.
 
     Deliberately re-fetches ``hold_id`` from scratch rather than taking a
-    caller-held ORM object: the fingerprinter/applier calls above are
-    ~10s external HTTP round-trips, and the row lock this function itself
-    takes is scoped ONLY to the final write below, not held across those
-    calls (Argus review S1). ``expected_status`` is ``"applying"`` from
-    both call sites (Argus review round-2 B1): the caller must have
-    already claimed the row by writing ``status="applying"`` under its
-    OWN initial ``FOR UPDATE`` and committed BEFORE calling this function
-    -- that claiming write is what makes a second concurrent caller
-    observe a non-``"pending"`` status and bail out via
-    ``HoldAlreadyDecidedError`` instead of ever reaching the fingerprinter/
-    applier a second time for the same hold. Returns ``None`` if the row
-    is no longer ``expected_status`` by the time this re-acquires it with
-    ``FOR UPDATE`` -- something else (in practice, only a hand-authored
-    test faking a race, since the claiming write above should make this
-    unreachable in production) resolved it while the HTTP round-trip
-    above was in flight -- and the caller is responsible for reloading
-    and returning the now-current state instead of this function
+    caller-held ORM object: the fingerprint/apply calls above are ~10s
+    external HTTP round-trips, and the row lock this function itself takes
+    is scoped ONLY to the final write below, not held across those calls
+    (Argus review S1). ``expected_status`` is ``"applying"`` from both call
+    sites (Argus review round-2 B1): the caller must have already claimed
+    the row by writing ``status="applying"`` under its OWN initial ``FOR
+    UPDATE`` and committed BEFORE calling this function -- that claiming
+    write is what makes a second concurrent caller observe a
+    non-``"pending"`` status and bail out via ``HoldAlreadyDecidedError``
+    instead of ever reaching ``judge.fingerprint()``/``judge.apply()`` a
+    second time for the same hold. Returns ``None`` if the row is no
+    longer ``expected_status`` by the time this re-acquires it with ``FOR
+    UPDATE`` -- something else (in practice, only a hand-authored test
+    faking a race, since the claiming write above should make this
+    unreachable in production) resolved it while the HTTP round-trip above
+    was in flight -- and the caller is responsible for reloading and
+    returning the now-current state instead of this function
     double-writing over it.
 
-    The fingerprinter call is wrapped in the SAME ``LinearAPIError``
-    handling as the applier call (Argus review round-2 B2): a transport
-    failure, missing ``LINEAR_API_TOKEN``, or Linear-side error while
-    fetching the current fingerprint must resolve the hold to
-    ``"apply_failed"`` like any other Linear failure, not propagate past
-    this function to main.py's generic 500 handler.
-
-    A ``(kind, action_type)`` in ``_PROPOSAL_FINGERPRINT_EXEMPT`` (TECH-5873
-    redefinition -- today, just open_ticket) skips the re-fetch/staleness
-    comparison entirely: ``is_stale`` is simply treated as ``False``, and
-    the applier always runs once a hold reaches this function -- there is
-    no pre-existing target state that could have drifted. The applier
-    itself is looked up via ``_PROPOSAL_ACTION_APPLIER_NAMES`` first (an
-    action_type-scoped override), falling back to the per-kind
-    ``_PROPOSAL_APPLIER_NAMES`` -- same two-tier lookup ``create_proposal``'s
-    rule dispatch already uses for ``_PROPOSAL_RULES``/
-    ``_PROPOSAL_KIND_DEFAULT_RULE``. Whatever the applier returns
-    (``dict[str, Any] | None``) is captured and, when non-``None``, stored
-    on ``hold.apply_result`` -- see ``models.ProposalHold.apply_result``.
-
     Releases the DB connection this function's own initial read checks
-    out, via a bare ``session.commit()``, BEFORE the fingerprinter/applier
+    out, via a bare ``session.commit()``, BEFORE the fingerprint/apply
     calls (Argus review round-4 B2): committing (even with no pending
     changes) ends the implicit read transaction that read opened and
     returns the connection to the pool -- ``db.py``'s pool is capped at
@@ -7852,75 +7562,68 @@ async def _apply_or_finalize_proposal_hold(
     kind = hold.kind
     action = hold.action
     rationale = hold.rationale
+    proposed_by_bot_id = hold.proposed_by_bot_id
+    owner_sub = hold.owner_sub
     stored_fingerprint = hold.target_fingerprint
-    fingerprint_exempt = (kind, action_type) in _PROPOSAL_FINGERPRINT_EXEMPT
     await session.commit()
 
     is_stale = False
     apply_error: str | None = None
     raw_apply_error: str | None = None
     apply_result: dict[str, Any] | None = None
+    apply_ctx = ProposalContext(
+        kind=kind,
+        action=action,
+        target_id=target_id,
+        action_type=action_type,
+        rationale=rationale,
+        proposed_by_bot_id=proposed_by_bot_id,
+        owner_sub=owner_sub,
+        hold_id=hold_id,
+    )
     # Argus review round-5 B1: `asyncio.CancelledError` (a `BaseException`,
-    # not caught by the `except linear_client.LinearAPIError` clauses
-    # below) previously propagated straight out of this function on
-    # cancellation -- an ASGI client disconnect mid-apply, or any other
-    # task cancellation during the fingerprinter/applier await -- leaving
-    # the hold permanently stuck at `"applying"` with no automated
-    # recovery (see the "Stuck applying rows" note in docs/DESIGN.md).
-    # Catch it, record a distinguishable apply_error, fall through to the
-    # SAME terminal write every other path below takes (so the hold still
-    # resolves to a real terminal status), and re-raise at the very end --
-    # this cooperative-cancellation shape (catch, clean up, re-raise) is
-    # the same one this module already uses at `_fire_approval_notifier`
-    # (see its own `except asyncio.CancelledError: raise` comment); the
-    # caller still observes its task as cancelled, this function just
-    # doesn't leave a stranded row behind while it happens.
+    # not caught by `except Exception`) previously propagated straight out
+    # of this function on cancellation -- an ASGI client disconnect
+    # mid-apply, or any other task cancellation during the
+    # fingerprint/apply await -- leaving the hold permanently stuck at
+    # `"applying"` with no automated recovery (see the "Stuck applying
+    # rows" note in docs/DESIGN.md). Catch it, record a distinguishable
+    # apply_error, fall through to the SAME terminal write every other
+    # path below takes (so the hold still resolves to a real terminal
+    # status), and re-raise at the very end -- this cooperative-
+    # cancellation shape (catch, clean up, re-raise) is the same one this
+    # module already uses at `_fire_approval_notifier` (see its own
+    # `except asyncio.CancelledError: raise` comment); the caller still
+    # observes its task as cancelled, this function just doesn't leave a
+    # stranded row behind while it happens. Neither `_safe_fingerprint`
+    # nor `_safe_apply` ever raises an `Exception` (both normalize a
+    # raising or contract-violating plugin into a safe outcome object
+    # internally -- see their own docstrings), so this `try` exists only
+    # to catch this one `BaseException`.
     cancelled_exc: asyncio.CancelledError | None = None
     try:
-        # TECH-5873 redefinition: an exempted pair (see
-        # _PROPOSAL_FINGERPRINT_EXEMPT) has no pre-existing target to
-        # fetch a fingerprint FOR -- skip the fetch entirely rather than
-        # call a fingerprinter against a target_id that was never a
-        # fingerprintable Linear issue id in the first place. `is_stale`
-        # stays `False` (its initial value): there is nothing that could
-        # have drifted since submission.
-        if not fingerprint_exempt:
-            fingerprinter = getattr(linear_client, _PROPOSAL_FINGERPRINTER_NAMES[kind])
-            current_fingerprint = await fingerprinter(target_id)
-            is_stale = current_fingerprint != stored_fingerprint
-    except linear_client.LinearAPIError as exc:
-        # Argus review round-6 B1: `_sanitize_apply_error`'s own docstring
-        # promises the caller always logs the full, unredacted `str(exc)`
-        # server-side -- that promise is only true if this call site
-        # actually does it. Capture the raw text into a local BEFORE
-        # sanitizing, and log it (not the sanitized constant, which is
-        # exactly what the "sanitized" value already is) below.
-        raw_apply_error = str(exc)
-        apply_error = _sanitize_apply_error(exc)
+        fingerprint_result = await _safe_fingerprint(judge, apply_ctx)
+        if fingerprint_result.status == FINGERPRINT_DIGEST:
+            is_stale = fingerprint_result.digest != stored_fingerprint
+        elif fingerprint_result.status == FINGERPRINT_UNAVAILABLE:
+            assert fingerprint_result.error is not None  # guaranteed by _safe_fingerprint
+            apply_error = fingerprint_result.error.detail
+            raw_apply_error = fingerprint_result.error.log_detail or fingerprint_result.error.detail
+        # FINGERPRINT_NO_TARGET: `is_stale` stays `False` (its initial
+        # value) -- there is no pre-existing target state that could have
+        # drifted since submission.
+
+        if not is_stale and apply_error is None:
+            outcome = await _safe_apply(judge, apply_ctx)
+            if outcome.applied:
+                apply_result = outcome.result
+            else:
+                apply_error = outcome.caller_error
+                raw_apply_error = outcome.log_detail or outcome.caller_error
     except asyncio.CancelledError as exc:
         raw_apply_error = _cancellation_apply_error(exc)
         apply_error = _APPLY_ERROR_CANCELLED_MESSAGE
         cancelled_exc = exc
-    else:
-        if not is_stale:
-            # Action-scoped override first (TECH-5873 redefinition -- see
-            # _PROPOSAL_ACTION_APPLIER_NAMES's own comment), falling back
-            # to the per-kind default -- same two-tier lookup
-            # create_proposal's rule dispatch already uses.
-            applier_name = (
-                _PROPOSAL_ACTION_APPLIER_NAMES.get((kind, action_type))
-                or _PROPOSAL_APPLIER_NAMES[kind]
-            )
-            applier = getattr(linear_client, applier_name)
-            try:
-                apply_result = await applier(action, rationale)
-            except linear_client.LinearAPIError as exc:
-                raw_apply_error = str(exc)
-                apply_error = _sanitize_apply_error(exc)
-            except asyncio.CancelledError as exc:
-                raw_apply_error = _cancellation_apply_error(exc)
-                apply_error = _APPLY_ERROR_CANCELLED_MESSAGE
-                cancelled_exc = exc
 
     hold = await _find_proposal_hold(session, hold_id, for_update=True)
     if hold is None:
@@ -7954,14 +7657,12 @@ async def _apply_or_finalize_proposal_hold(
     elif apply_error is not None:
         hold.status = "apply_failed"
         hold.apply_error = apply_error
-        # Argus review round-6 B1: log the RAW (unsanitized) exception text
-        # here, not `apply_error` -- `apply_error` is already one of the
-        # four fixed allowlisted strings (Argus review round-9 fix to this
-        # comment: three `LinearAPIError` messages via `_sanitize_apply_error`,
-        # plus `_APPLY_ERROR_CANCELLED_MESSAGE` assigned directly at the
-        # `CancelledError` call sites, not through that function), so
-        # logging it would collapse every distinct failure to one of only
-        # four strings, defeating the whole point of keeping full detail
+        # Argus review round-6 B1: log the RAW (unsanitized) detail here,
+        # not `apply_error` -- `apply_error` is already the caller-safe
+        # message (a plugin-supplied `caller_error`/`ProposalTargetError.
+        # detail`, or `_APPLY_ERROR_CANCELLED_MESSAGE` on a cancellation),
+        # so logging it again would lose exactly the extra detail
+        # (`log_detail`) the judge/fingerprint seam exists to keep
         # server-side while narrowing what the API returns.
         logger.warning(
             "proposal apply_failed for hold_id=%s target_id=%s: %s",
@@ -7984,11 +7685,12 @@ async def _apply_or_finalize_proposal_hold(
         hold.status = "applied"
         hold.applied_at = _now()
         hold.apply_error = None
-        # Only set when the applier actually returned something -- never
-        # overwrite with `None` (`apply_progress_update`'s comment-posting
-        # applier always returns `None`, and that must leave apply_result
-        # unset, not explicitly nulled, same "only include if not None"
-        # convention _proposal_dict already uses for applied_at/apply_error).
+        # Only set when judge.apply() actually returned a result -- never
+        # overwrite with `None` (an applier with nothing structured to
+        # report, e.g. one that only posts a comment, returns `result=None`,
+        # and that must leave apply_result unset, not explicitly nulled,
+        # same "only include if not None" convention _proposal_dict already
+        # uses for applied_at/apply_error).
         if apply_result is not None:
             hold.apply_result = apply_result
         _audit(
@@ -7997,6 +7699,19 @@ async def _apply_or_finalize_proposal_hold(
             action="proposal.applied",
             detail={"hold_id": str(hold_id), "target_id": target_id},
         )
+    # Argus review round-9 B1: capture the terminal state this branch just
+    # computed into local variables BEFORE the commit below, so the
+    # recovery block on a commit failure can re-apply the SAME intended
+    # values instead of discarding them and unconditionally overwriting
+    # with "apply_failed" (see that block's own comment for why that was
+    # wrong).
+    terminal_status = hold.status
+    terminal_apply_result = hold.apply_result
+    terminal_apply_error = hold.apply_error
+    terminal_raw_apply_error = raw_apply_error
+    terminal_applied_at = hold.applied_at
+    terminal_decision_note = hold.decision_note
+    terminal_decided_at = hold.decided_at
     # Argus review round-6 suggestion: a SECOND cancellation delivered while
     # this terminal write (re-fetch through commit/refresh above and below)
     # is in flight could still strand the row at `expected_status`, the
@@ -8015,7 +7730,173 @@ async def _apply_or_finalize_proposal_hold(
     # client disconnect) that this documents the residual gap rather than
     # trading it for a session-safety hazard that would apply on every
     # single decide.
-    await session.commit()
+    try:
+        await session.commit()
+    except asyncio.CancelledError:
+        raise
+    except Exception as commit_exc:
+        # If the terminal commit fails (e.g. database error or serialization
+        # issue), roll back and attempt to re-apply the SAME terminal state
+        # captured above rather than discarding it (Argus review round-9
+        # B1): unconditionally overwriting with "apply_failed" here would
+        # silently downgrade a genuine "applied" outcome whose external
+        # write already succeeded -- a caller seeing that false failure
+        # would retry and duplicate the write -- and would re-stamp the
+        # ORIGINAL (pre-staleness-check) `decision_note` onto a "stale" row
+        # instead of the honest `_stale_decision_note` text.
+        logger.warning(
+            "proposal terminal commit failed for hold_id=%s target_id=%s: %s; "
+            "attempting recovery to %s to avoid stranding row",
+            hold_id,
+            target_id,
+            commit_exc,
+            terminal_status,
+            exc_info=True,
+        )
+        await session.rollback()
+        try:
+            recovery_hold = await _find_proposal_hold(session, hold_id, for_update=True)
+            if recovery_hold is not None and recovery_hold.status == expected_status:
+                recovery_hold.status = terminal_status
+                # Argus review round-9 S1: preserve a genuine, already-
+                # computed `apply_error` (a real plugin `caller_error` or
+                # `_APPLY_ERROR_CANCELLED_MESSAGE`) rather than replacing it.
+                recovery_hold.apply_error = terminal_apply_error
+                if terminal_apply_result is not None:
+                    recovery_hold.apply_result = terminal_apply_result
+                recovery_hold.applied_at = terminal_applied_at
+                recovery_hold.decision_source = decision_source
+                recovery_hold.decided_by_actor_id = decided_by_actor_id
+                recovery_hold.decided_at = terminal_decided_at
+                recovery_hold.decision_note = terminal_decision_note
+                audit_action = {
+                    "applied": "proposal.applied",
+                    "stale": "proposal.stale",
+                }.get(terminal_status, "proposal.apply_failed")
+                audit_detail: dict[str, Any] = {
+                    "hold_id": str(hold_id),
+                    "target_id": target_id,
+                }
+                if terminal_status == "apply_failed":
+                    audit_detail["error"] = terminal_raw_apply_error
+                _audit(
+                    session,
+                    actor_sub=decided_by_actor_id,
+                    action=audit_action,
+                    detail=audit_detail,
+                )
+                await session.commit()
+                await session.refresh(recovery_hold)
+                result = _proposal_dict(recovery_hold)
+                # Argus review round-9 B2: every OTHER return path in this
+                # function re-raises a cancellation caught earlier before
+                # returning (see the early-return above and the normal
+                # return below) -- a caller cancelled mid-apply is owed a
+                # cancelled task regardless of which return path fires;
+                # this recovery path must honor the same invariant instead
+                # of silently swallowing it.
+                if cancelled_exc is not None:
+                    raise cancelled_exc
+                return result
+        except Exception as recovery_exc:
+            logger.warning(
+                "proposal recovery commit also failed for hold_id=%s target_id=%s: %s; "
+                "attempting last-ditch %s write to avoid stranding row",
+                hold_id,
+                target_id,
+                recovery_exc,
+                terminal_status,
+                exc_info=True,
+            )
+            await session.rollback()
+            try:
+                last_ditch_hold = await _find_proposal_hold(session, hold_id, for_update=True)
+                if last_ditch_hold is not None and last_ditch_hold.status == expected_status:
+                    last_ditch_audit_action: str
+                    last_ditch_audit_detail: dict[str, Any]
+                    if terminal_status == "apply_failed":
+                        # No successful external write to protect here --
+                        # the minimal board-owned failure write (Argus
+                        # review round-9 S1's original shape) is correct
+                        # as-is.
+                        last_ditch_hold.status = "apply_failed"
+                        last_ditch_hold.apply_error = _APPLY_ERROR_BOARD_COMMIT_FAILURE_MESSAGE
+                        last_ditch_hold.applied_at = None
+                        last_ditch_hold.apply_result = None
+                        last_ditch_audit_action = "proposal.apply_failed"
+                        last_ditch_audit_detail = {
+                            "hold_id": str(hold_id),
+                            "target_id": target_id,
+                            "error": _APPLY_ERROR_BOARD_COMMIT_FAILURE_MESSAGE,
+                        }
+                    else:
+                        # Argus review round-4 B2: `terminal_status` is
+                        # "applied" or "stale" here -- judge.apply() (or
+                        # the fingerprint check) already produced a REAL
+                        # outcome, and the recovery commit above just
+                        # tried, and failed, to persist that same outcome.
+                        # Retry that SAME write here (identical to the
+                        # recovery block above) rather than downgrading it
+                        # to a false "apply_failed": the dedup check only
+                        # blocks resubmission for pending/applying status,
+                        # so a caller retrying after seeing a false
+                        # apply_failed could trigger a genuine duplicate
+                        # external write.
+                        last_ditch_hold.status = terminal_status
+                        last_ditch_hold.apply_error = terminal_apply_error
+                        if terminal_apply_result is not None:
+                            last_ditch_hold.apply_result = terminal_apply_result
+                        last_ditch_hold.applied_at = terminal_applied_at
+                        last_ditch_hold.decision_source = decision_source
+                        last_ditch_hold.decided_by_actor_id = decided_by_actor_id
+                        last_ditch_hold.decided_at = terminal_decided_at
+                        last_ditch_hold.decision_note = terminal_decision_note
+                        last_ditch_audit_action = {
+                            "applied": "proposal.applied",
+                            "stale": "proposal.stale",
+                        }.get(terminal_status, "proposal.apply_failed")
+                        last_ditch_audit_detail = {"hold_id": str(hold_id), "target_id": target_id}
+                    _audit(
+                        session,
+                        actor_sub=decided_by_actor_id,
+                        action=last_ditch_audit_action,
+                        detail=last_ditch_audit_detail,
+                    )
+                    await session.commit()
+            except asyncio.CancelledError:
+                raise
+            except Exception as last_ditch_exc:
+                logger.error(
+                    "proposal last-ditch commit also failed for hold_id=%s target_id=%s: %s; "
+                    "row %s stranded at applying",
+                    hold_id,
+                    target_id,
+                    last_ditch_exc,
+                    hold_id,
+                    exc_info=True,
+                )
+                await session.rollback()
+            # Argus review round-9 S2: chain `recovery_exc` explicitly
+            # (ruff B904) rather than suppressing it with `from None` --
+            # if this SECOND commit raised a DIFFERENT error, that error
+            # must stay visible in logs/tracebacks instead of vanishing
+            # silently.
+            if cancelled_exc is not None:
+                raise cancelled_exc from recovery_exc
+            raise commit_exc from recovery_exc
+        # Argus review round-4 suggestion: this fallthrough is only
+        # reached when `recovery_hold` was concurrently resolved by
+        # another writer (or vanished) -- nothing was mutated on this
+        # iteration, but the `FOR UPDATE` re-fetch above still opened a
+        # fresh transaction (the `session.rollback()` before that `try`
+        # ended the terminal commit's own transaction). Roll that back
+        # explicitly too, matching every other exit path in this function,
+        # rather than relying on the caller's `async with` session context
+        # manager to close (and implicitly roll back) it later.
+        await session.rollback()
+        if cancelled_exc is not None:
+            raise cancelled_exc from commit_exc
+        raise commit_exc
     # `updated_at`'s onupdate=text("now()") (models.py) leaves the ORM
     # attribute expired after this UPDATE's commit -- `_proposal_dict`
     # reads it, so this refresh (consolidated here for every caller of
@@ -8040,6 +7921,7 @@ async def decide_proposal(
     hold_id: uuid.UUID,
     decision: str,
     decision_note: str | None,
+    judge: ProposalJudge,
 ) -> dict[str, Any]:
     """``POST /proposals/{hold_id}/decide`` (main.py, non-MCP,
     interactive+owner-gated -- TECH-5873). ``decision`` is ``"approve"`` or
@@ -8090,22 +7972,21 @@ async def decide_proposal(
 
     ``approve`` first CLAIMS the row by writing ``status="applying"``
     (plus decision fields) and committing -- releasing the `FOR UPDATE`
-    lock acquired above BEFORE the ~10s external Linear calls (Argus
-    review S1), while also closing a double-Linear-write race a second
-    concurrent decide call could otherwise hit (Argus review round-2 B1):
-    once claimed, a second caller sees ``"applying"``, not ``"pending"``,
-    and raises ``HoldAlreadyDecidedError`` itself without ever reaching
-    the applier. It then delegates to ``_apply_or_finalize_proposal_hold``,
-    which re-fetches the target's current state via the kind-scoped
-    fingerprinter (``_PROPOSAL_FINGERPRINTER_NAMES``) and compares it against
+    lock acquired above BEFORE the ~10s external calls (Argus review S1),
+    while also closing a double-write race a second concurrent decide call
+    could otherwise hit (Argus review round-2 B1): once claimed, a second
+    caller sees ``"applying"``, not ``"pending"``, and raises
+    ``HoldAlreadyDecidedError`` itself without ever reaching
+    ``judge.apply()``. It then delegates to
+    ``_apply_or_finalize_proposal_hold``, which re-fetches the target's
+    current state via ``judge.fingerprint()`` and compares it against
     ``hold.target_fingerprint`` (the fingerprint ``create_proposal``
     computed server-side at submission time) BEFORE writing anything. A
     mismatch means the target drifted since submission -- sets
-    ``status="stale"`` and returns without ever calling the kind-scoped
-    applier (``_PROPOSAL_APPLIER_NAMES``).
+    ``status="stale"`` and returns without ever calling ``judge.apply()``.
     A match proceeds to the actual write; success sets ``status="applied"``
-    (and ``applied_at``), a raised ``linear_client.LinearAPIError`` from
-    EITHER the fingerprinter or the applier (Argus review round-2 B2) sets
+    (and ``applied_at``); an ``applied=False``/``FINGERPRINT_UNAVAILABLE``
+    outcome from EITHER call (Argus review round-2 B2) sets
     ``status="apply_failed"`` with ``apply_error`` populated instead of
     propagating -- both are normal, queryable outcomes of this endpoint,
     not exceptions raised to the caller. In the vanishingly unlikely event
@@ -8179,22 +8060,16 @@ async def decide_proposal(
     hold.decided_at = _now()
     hold.decision_note = decision_note
     await session.commit()
-    # By design: this dispatches straight to the applier and never re-runs
-    # the kind/action_type-scoped rule (``_PROPOSAL_RULES``) that would
-    # otherwise gate an auto-approval -- e.g. an approved ``assign_ticket``
-    # applies whatever ``assignee_id`` the bot proposed with NO PR-exists/
-    # PR-references-ticket re-verification (and even in auto-approval, per
-    # TECH-6153, neither attribution against the PR author nor any
-    # authorization anchor/team-membership bound is enforced -- a bot can
-    # cite any real PR referencing the target ticket and assign it to any
-    # Linear user UUID it names, a confirmed deliberate tradeoff since
-    # this service tracks outstanding work rather than credit/attribution),
-    # and an approved ``start_ticket``/``review_ticket`` applies with no
-    # forward-transition check. A human approving here IS
-    # the final authority this whole human-in-the-loop escape hatch
-    # exists for; it deliberately bypasses every rule-level check, not
-    # just the fingerprint/staleness one below (see docs/DESIGN.md's
-    # decide/apply section).
+    # By design: this dispatches straight to ``judge.apply()`` and never
+    # re-runs ``judge.judge()`` -- the plugin-owned auto-approval
+    # verdict/rule -- that would otherwise gate an auto-approval. See
+    # DESIGN.md's decide/apply section, and the RH plugin's own rule
+    # docstrings, for the concrete lanes this bypasses (e.g. an approved
+    # ``assign_ticket`` applying with no re-verification, per TECH-6153's
+    # confirmed deliberate tradeoff). A human approving here IS the final
+    # authority this whole human-in-the-loop escape hatch exists for; it
+    # deliberately bypasses every judge-level check, not just the
+    # fingerprint/staleness one below.
     result = await _apply_or_finalize_proposal_hold(
         session,
         hold_id=hold_id,
@@ -8202,6 +8077,7 @@ async def decide_proposal(
         decided_by_actor_id=approver_sub,
         decision_source="human",
         decision_note=decision_note,
+        judge=judge,
     )
     if result is not None:
         return result
@@ -9511,7 +9387,6 @@ __all__ = [
     "decline_invite",
     "deny_resource_subscribe",
     "deregister_agent",
-    "evaluate_linear_progress_update_judge",
     "get_active_participant_agent_ids",
     "get_agent_by_sub",
     "get_conversation",

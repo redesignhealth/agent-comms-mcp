@@ -481,7 +481,18 @@ def resolve_plugin(env_var: str, registry: dict[str, Callable[[], Any]], default
     plugin instance.
 
     See ``resolve_plugin_name`` for the actual name-to-instance resolution
-    rule (registry lookup or ``pkg.module:factory`` import path).
+    rule (registry lookup or ``pkg.module:factory`` import path). An env
+    var set to the empty string is NOT treated as absent -- it resolves as
+    an unknown plugin name (same as a typo), which crashes/errors exactly
+    like it always has. Two of this module's seams
+    (``APPROVAL_NOTIFIER``/``ACTIVE_CHECKER``) have deliberately fail-open
+    defaults and rely on that crash as a safety net for an operator who
+    left an env var blank by accident (Argus review round-4 B1) --
+    treating an empty string as absent here would silently and uniformly
+    replace that crash with a fail-open default for every seam this
+    function resolves, not just the one (``PROPOSAL_JUDGE``) that
+    actually wants it; see ``get_proposal_judge`` for that seam's own,
+    narrowly-scoped empty-string tolerance instead.
     """
     name = os.environ.get(env_var, default)
     return resolve_plugin_name(env_var, registry, name)
@@ -538,21 +549,47 @@ def notifier_name(notifier: ApprovalNotifier) -> str:
 
 
 def validate_configuration() -> None:
-    """Fail fast at process start if any of the five seams in THIS MODULE
-    don't resolve. ``OWNERSHIP_CLIENT`` is a sixth, board-wide seam that
-    lives in ``service.py`` and is validated separately, by
-    ``service.validate_ownership_client_configuration()``.
+    """Fail fast at process start if any of the six seams resolved by this
+    module don't resolve, five of which crash at boot on misconfiguration
+    (see below for the sixth's, ``PROPOSAL_JUDGE``'s, exception).
+    ``OWNERSHIP_CLIENT`` is the sixth board-wide seam (the only one living
+    in ``service.py``) and is validated separately, by
+    ``service.validate_ownership_client_configuration()``; ``PROPOSAL_JUDGE``
+    is the seventh board-wide seam (added by TECH-5872/TECH-5877).
 
     Called from ``main._cli()`` beside the existing ``db.database_url()``
     fail-fast call — an unknown registry name, a bad import path, or (for
     ``APPROVAL_NOTIFIER=webhook``) a missing webhook env var must crash at
     boot, not lazily on the first high-risk message.
+
+    Unlike every other seam here, an unset (or empty-string) ``PROPOSAL_JUDGE``
+    is not itself a misconfiguration worth crashing over -- ``escalate_all_proposals``
+    is a safe, inert default for a bare/OSS deployment (see that class's own
+    docstring) -- but silently falling back to it is exactly the kind of
+    "silently inert" failure mode this repo's own docs already criticize
+    other unset-by-default knobs for. Emit a startup WARNING instead, so an
+    operator who meant to configure a real judge finds out at boot, not
+    after every proposal quietly stops auto-applying. The empty-string
+    case matters in practice: a deployment's env-var passthrough (e.g.
+    ``docker-compose.yml``'s ``PROPOSAL_JUDGE: ${PROPOSAL_JUDGE:-}``) sets
+    this var to an empty string, not absent, whenever the operator hasn't
+    configured a real judge on the host -- see ``get_proposal_judge``'s
+    own empty-string handling, which this check's ``not os.environ.get(...)``
+    already matches (``not ""`` is ``True``, same as ``not None``).
     """
     get_risk_scorer()
     get_auto_approver()
     get_approval_notifier()
     get_active_checker()
     get_docs_verifier()
+    if not os.environ.get(PROPOSAL_JUDGE_ENV_VAR):
+        logger.warning(
+            "%s is not set (or is set to an empty string); falling back to %r, "
+            "which never auto-approves or applies any proposal",
+            PROPOSAL_JUDGE_ENV_VAR,
+            DEFAULT_PROPOSAL_JUDGE,
+        )
+    get_proposal_judge()
 
 
 # --- Seam 2: the auto-approver (TECH-5389 PR2) -------------------------------
@@ -1094,6 +1131,311 @@ def docs_verifier_name(verifier: DocsVerifier) -> str:
     return _plugin_display_name(verifier, DOCS_VERIFIERS)
 
 
+# --- Seam 6 of this module (seventh board-wide seam) -- the proposal judge
+# (TECH-5877/proposal-judge-arch migration) --------------------------------
+#
+# Answers all four questions in the ``proposal_holds`` pipeline (DESIGN.md's
+# "proposal submission pipeline" section) that require RH-specific policy or
+# an RH-external write: whether a submitted ``(kind, action)`` is admissible
+# and how urgent it is (``classify``), what the target's current state digest
+# is for staleness comparison (``fingerprint``), whether it should auto-apply
+# or wait for a human (``judge``), and how to actually perform the write
+# (``apply``). One seam, not two, because the auto-approval judgment and the
+# write it triggers are deliberately coupled -- see the migration plan's
+# rationale for why a judge/applier precondition mismatch is exactly the bug
+# class this avoids.
+#
+# ``classify``/``fingerprint``/``judge``/``apply`` are called from
+# different, carefully-ordered points in ``service.create_proposal``/
+# ``service.decide_proposal``/``service._apply_or_finalize_proposal_hold`` --
+# see those functions' own docstrings for the exact ordering contract (e.g.
+# ``classify`` runs before the per-bot rate-limit attempt marker is
+# committed, so a bad ``kind`` doesn't burn a slot). Every board call site
+# wraps each of these four calls defensively: an implementation is
+# contractually expected to never raise except where its own docstring
+# says otherwise (``classify``'s ``ValueError``), but this board cannot
+# trust a duck-typed plugin to honor that, so a raise -- or a
+# contract-violating return value, like a ``priority`` outside
+# ``models.PROPOSAL_HOLD_LEVELS`` or an unrecognized ``fingerprint().status``
+# -- is always treated as a safe fail-closed outcome (a 422 for
+# ``classify``, ``FINGERPRINT_UNAVAILABLE`` for ``fingerprint``, ``pending``
+# for ``judge``, ``apply_failed`` for ``apply``) rather than propagating as
+# an unhandled 500.
+#
+# Like every other seam in this module, this repo does not attempt an org-
+# specific implementation: the default, ``escalate_all_proposals``, accepts
+# any ``kind`` at ``low`` priority, never fingerprints a real target, never
+# auto-approves, and never writes anywhere -- see
+# ``EscalateAllProposalJudge``'s own docstring for why this is NOT a
+# ``RejectAllDocsVerifier``-style submit-time rejection.
+
+PROPOSAL_JUDGE_ENV_VAR = "PROPOSAL_JUDGE"
+DEFAULT_PROPOSAL_JUDGE = "escalate_all_proposals"
+
+# Discriminator values for ProposalFingerprint.status.
+FINGERPRINT_DIGEST = "digest"
+FINGERPRINT_NO_TARGET = "no_target"
+FINGERPRINT_UNAVAILABLE = "unavailable"
+
+
+class ProposalContext(NamedTuple):
+    """Everything a ProposalJudge needs for one proposal, at any stage.
+
+    ``hold_id`` is None at submit-time ``classify``/``fingerprint`` (the row
+    is not inserted yet) and set for ``judge``/``apply``. ``target_id``/
+    ``action_type`` are already extracted by the board
+    (``service._extract_proposal_target``) -- those two fields are the ONE
+    structural requirement the board imposes on an otherwise free-form
+    ``action`` payload, because dedup and the DB-level partial unique index
+    key on them. Everything else in ``action`` is opaque to the board.
+    """
+
+    kind: str
+    action: dict[str, Any]
+    target_id: str
+    action_type: str
+    rationale: str
+    proposed_by_bot_id: str
+    owner_sub: str
+    hold_id: uuid.UUID | None
+
+
+class ProposalClassification(NamedTuple):
+    """Submit-time admission + server-derived priority.
+
+    ``priority`` MUST be one of ``models.PROPOSAL_HOLD_LEVELS``; the board
+    re-validates (a plugin returning anything else is a contract violation
+    that would otherwise hit the ``ck_proposal_holds_priority`` CHECK as a
+    500).
+    """
+
+    priority: str
+
+
+class ProposalTargetError(NamedTuple):
+    """A submit-time target-unavailability outcome, already caller-safe.
+
+    Authored by the plugin -- which alone knows whether a failure was a
+    missing credential, a transport error, or a target-side rejection.
+    ``detail`` is returned to the caller verbatim (truncated to 500 chars
+    with ``"... [truncated]"`` by the board if exceeded) -- the plugin is
+    responsible for it containing no credential names, URLs with query
+    params, or upstream error payloads. ``log_detail`` is NEVER returned
+    over the API; it lands in the board's WARNING log and audit row only,
+    preserving the split between what an operator sees and what a caller
+    sees.
+    """
+
+    status_code: int  # 422 | 500 | 503
+    error_code: str  # "invalid_request" | "server_configuration_error" | ...
+    detail: str
+    log_detail: str | None
+
+
+class ProposalFingerprint(NamedTuple):
+    """Result of fetching the target's current state digest.
+
+    ``status == FINGERPRINT_DIGEST``  -> ``digest`` is a stable string; the
+        board stores it at submit time and compares it at apply time.
+    ``status == FINGERPRINT_NO_TARGET`` -> there is no pre-existing target to
+        fingerprint (e.g. an ``open_ticket``-style action whose ``target_id``
+        is a PR URL, not a pre-existing ticket id). The board treats this
+        status as "never stale" -- there is no exemption table on the board
+        side for this anymore, the plugin simply reports it per-proposal.
+    ``status == FINGERPRINT_UNAVAILABLE`` -> ``error`` explains why. At
+        submit time the board raises ``exceptions.ProposalTargetUnavailableError``;
+        at apply time it resolves the hold to ``apply_failed``.
+
+    Never raises for any of these three -- an implementation raising is
+    caught by the board's defensive wrapper and treated as UNAVAILABLE with
+    a generic message.
+    """
+
+    status: str
+    digest: str | None = None
+    error: ProposalTargetError | None = None
+
+
+class ProposalVerdict(NamedTuple):
+    """A judge's verdict for one proposal.
+
+    ``approved=True`` means "auto-apply now, no human needed"; ``False``
+    means "hold for a human." There is deliberately NO ``rejected`` value: a
+    judge never rejects on a bot's behalf. ``decision_note`` is persisted
+    to ``proposal_holds.decision_note`` (truncated to ``MAX_DECISION_REASON_LENGTH``
+    (2000 chars) with ``"... [truncated]"`` by the board if exceeded) and IS
+    visible to the submitting bot, so it must be caller-safe.
+    """
+
+    approved: bool
+    decision_note: str | None
+
+
+class ProposalApplyOutcome(NamedTuple):
+    """The result of actually performing the external write.
+
+    ``applied=True`` -> ``status="applied"``, ``applied_at`` stamped,
+        ``result`` (when non-``None``) stored on
+        ``proposal_holds.apply_result``.
+    ``applied=False`` -> ``status="apply_failed"``, ``caller_error`` stored
+        on ``proposal_holds.apply_error`` and returned over the API
+        (truncated to 500 chars with ``"... [truncated]"`` by the board if
+        exceeded). ``log_detail`` goes to the board's WARNING log + audit row
+        only, never the API -- same split as ``ProposalTargetError`` above.
+
+    Returning ``applied=False`` is a NORMAL, queryable outcome, not an
+    error condition. An implementation must not raise for it.
+    """
+
+    applied: bool
+    result: dict[str, Any] | None
+    caller_error: str | None
+    log_detail: str | None
+
+
+class ProposalJudge(Protocol):
+    """Pluggable proposal judging and applying seam (TECH-5872/TECH-5877).
+
+    The board defensively validates all return values and exceptions at
+    the seam boundary:
+    - ``classify()``: ``ValueError`` is wrapped into a board-controlled
+      message and mapped to 422.
+    - ``fingerprint()``: ``error.detail`` is capped at 500 chars (truncated
+      with ``"... [truncated]"``), ``error.error_code`` is capped at 64 chars,
+      and ``error.status_code`` MUST be one of ``{422, 500, 503}`` -- any other
+      value (e.g. 404, 409, 429, all reasonable-seeming choices) is silently
+      replaced with a synthesized 500/``server_configuration_error`` rather
+      than reaching the caller, with no signal to the plugin that this happened.
+      Map LLM-API or upstream rate-limit errors to `503` (service temporarily
+      unavailable), not `429`, to preserve the retryable signal within the
+      `{422, 500, 503}` allowlist.
+    - ``judge()``: ``decision_note`` is capped at 2000 chars (truncated
+      with ``"... [truncated]"``).
+    - ``apply()``: ``caller_error`` is capped at 500 chars (truncated
+      with ``"... [truncated]"``), and ``result`` must be a JSON-serializable
+      dict (or ``None``).
+
+    Security note: ``log_detail``, ``caller_error``, and ``detail`` MUST NOT
+    contain raw upstream payloads, credential-shaped strings (e.g. tokens, API
+    keys, or passwords), or URL query parameters. The board enforces a
+    defense-in-depth content scrub on caller-facing strings before truncation,
+    stripping obviously-credential-shaped token patterns and URL query strings,
+    but plugin authors must not rely on this as a replacement for plugin-side
+    error sanitization discipline.
+    """
+
+    def classify(self, kind: str, action: dict[str, Any]) -> ProposalClassification:
+        """Admit (or refuse) this ``kind`` and derive its priority.
+        Synchronous and side-effect-free by contract -- called before the
+        rate-limit attempt marker is committed, so it must not perform I/O.
+
+        Raise ``ValueError`` for an unsupported ``kind``, and ONLY for an
+        unsupported ``kind`` -- never for any other reason (a malformed
+        ``action`` shape on an otherwise-supported ``kind``, for instance).
+        The board wraps that exception into a board-controlled
+        "unsupported proposal kind" message and maps it to 422, preserving
+        the original exception as ``__cause__`` for logging -- so a
+        ``ValueError`` raised for a different reason would surface to the
+        caller as a misleading "unsupported kind" error instead of
+        whatever the real problem was. LLM response parsing failures --
+        e.g. a `classify()` implementation synchronously parsing
+        already-fetched LLM output embedded in `action`, NOT making a
+        live LLM call itself (that would violate the "must not perform
+        I/O" contract above) -- that raise `ValueError` must still be
+        caught and re-raised as `RuntimeError` or a custom exception
+        type, so they reach the broader `except Exception` handler with
+        an accurate error message instead of being mistaken for an
+        unsupported-kind rejection. Signal any other
+        rejection some other way (e.g. treat a malformed ``action`` as still
+        classifiable, deferring the real validation to
+        ``fingerprint()``/``apply()``). Prefer deferring to `fingerprint()`
+        over `apply()` -- `fingerprint()` runs before the rate-limit slot is
+        committed and the hold row is created.
+        """
+        ...
+
+    async def fingerprint(self, ctx: ProposalContext) -> ProposalFingerprint: ...
+
+    async def judge(self, ctx: ProposalContext) -> ProposalVerdict: ...
+
+    async def apply(self, ctx: ProposalContext) -> ProposalApplyOutcome: ...
+
+
+class EscalateAllProposalJudge:
+    """``escalate_all_proposals`` -- the v1 default. Accepts any kind at
+    ``low`` priority, never fingerprints, never auto-approves, and never
+    writes anything anywhere.
+
+    Deliberately NOT a submit-time rejection of every kind (the shape
+    ``RejectAllDocsVerifier`` uses for its own seam): a bare/OSS deployment
+    of this board should still be able to accept, store, list, and
+    human-decide proposals as a generic queue -- the storage/dedup/rate-
+    limit/audit half of this pipeline is real, working, org-agnostic
+    infrastructure. What it must NOT do without a configured judge is
+    auto-approve anything or claim to have applied anything; ``apply()``
+    therefore resolves the hold honestly to ``apply_failed`` with an
+    explicit "no proposal judge is configured" message rather than
+    silently succeeding.
+    """
+
+    def classify(self, kind: str, action: dict[str, Any]) -> ProposalClassification:
+        return ProposalClassification(priority="low")
+
+    async def fingerprint(self, ctx: ProposalContext) -> ProposalFingerprint:
+        return ProposalFingerprint(status=FINGERPRINT_NO_TARGET)
+
+    async def judge(self, ctx: ProposalContext) -> ProposalVerdict:
+        return ProposalVerdict(approved=False, decision_note=None)
+
+    async def apply(self, ctx: ProposalContext) -> ProposalApplyOutcome:
+        return ProposalApplyOutcome(
+            applied=False,
+            result=None,
+            caller_error="no proposal judge is configured for this deployment",
+            log_detail=(
+                f"PROPOSAL_JUDGE is unset; refusing to apply kind={ctx.kind!r} "
+                f"action_type={ctx.action_type!r}"
+            ),
+        )
+
+
+PROPOSAL_JUDGES: dict[str, Callable[[], ProposalJudge]] = {
+    DEFAULT_PROPOSAL_JUDGE: EscalateAllProposalJudge,
+}
+
+_proposal_judge: ProposalJudge | None = None
+
+
+def get_proposal_judge() -> ProposalJudge:
+    """Return the process-wide configured ``ProposalJudge`` (lazy
+    singleton, mirrors ``get_risk_scorer``).
+
+    Unlike every other seam here (which goes through ``resolve_plugin``
+    uniformly, and treats an empty-string env var as an unknown plugin
+    name -- see that function's own docstring), a ``PROPOSAL_JUDGE`` set
+    to the empty string is treated the SAME as truly unset: both fall
+    back to ``DEFAULT_PROPOSAL_JUDGE`` (with ``validate_configuration``
+    emitting a WARNING for either case). This is deliberately handled
+    HERE, not inside ``resolve_plugin`` itself (Argus review round-4 B1):
+    doing it there would silently extend the same fail-open, empty-
+    string-tolerant behavior to ``APPROVAL_NOTIFIER``/``ACTIVE_CHECKER``
+    too, both of which have their own deliberately fail-open defaults and
+    rely on an empty string crashing at boot exactly like a typo would.
+    """
+    global _proposal_judge
+    if _proposal_judge is None:
+        name = os.environ.get(PROPOSAL_JUDGE_ENV_VAR) or DEFAULT_PROPOSAL_JUDGE
+        _proposal_judge = resolve_plugin_name(PROPOSAL_JUDGE_ENV_VAR, PROPOSAL_JUDGES, name)
+    return _proposal_judge
+
+
+def proposal_judge_name(judge: ProposalJudge) -> str:
+    """Audit-readable name for a resolved ``ProposalJudge`` instance --
+    mirrors ``risk_scorer_name``/``auto_approver_name``/``notifier_name``/
+    ``docs_verifier_name``."""
+    return _plugin_display_name(judge, PROPOSAL_JUDGES)
+
+
 __all__ = [
     "ACTIVE_CHECKERS",
     "ACTIVE_CHECKER_ENV_VAR",
@@ -1108,11 +1450,17 @@ __all__ = [
     "DEFAULT_APPROVAL_NOTIFIER",
     "DEFAULT_AUTO_APPROVER",
     "DEFAULT_DOCS_VERIFIER",
+    "DEFAULT_PROPOSAL_JUDGE",
     "DEFAULT_RISK_SCORER",
     "DOCS_VERIFIERS",
     "DOCS_VERIFIER_ENV_VAR",
+    "FINGERPRINT_DIGEST",
+    "FINGERPRINT_NO_TARGET",
+    "FINGERPRINT_UNAVAILABLE",
     "INSTRUCTION_REGISTRY_PATH",
     "INSTRUCTION_TEXT_HASHES",
+    "PROPOSAL_JUDGES",
+    "PROPOSAL_JUDGE_ENV_VAR",
     "RISK_SCORERS",
     "RISK_SCORER_ENV_VAR",
     "ActiveChecker",
@@ -1127,10 +1475,18 @@ __all__ = [
     "DocsVerificationResult",
     "DocsVerifier",
     "EscalateAllAutoApprover",
+    "EscalateAllProposalJudge",
     "HoldContext",
     "LogOnlyNotifier",
     "MessageRiskContext",
     "ParticipantInfo",
+    "ProposalApplyOutcome",
+    "ProposalClassification",
+    "ProposalContext",
+    "ProposalFingerprint",
+    "ProposalJudge",
+    "ProposalTargetError",
+    "ProposalVerdict",
     "RejectAllDocsVerifier",
     "RiskScorer",
     "RiskScoringInfraError",
@@ -1142,9 +1498,11 @@ __all__ = [
     "get_approval_notifier",
     "get_auto_approver",
     "get_docs_verifier",
+    "get_proposal_judge",
     "get_risk_scorer",
     "normalize_instruction_text",
     "notifier_name",
+    "proposal_judge_name",
     "resolve_plugin",
     "resolve_plugin_name",
     "risk_scorer_name",

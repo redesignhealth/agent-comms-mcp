@@ -17,6 +17,108 @@ This repo is only the comms layer. Out of scope, by explicit decision:
  The board neither knows nor cares that a counterparty is being represented over
  email. It only ever sees typed messages from a registered agent.
 
+### Core and immutable principle: generic infrastructure, never organization-specific policy
+
+This repository is **bus, transport, and storage infrastructure only.** That is not a
+stylistic preference or a current-state description; it is a permanent constraint on what
+may ever be merged here, and it binds every pipeline this service grows -- the comms
+pipeline, the proposal pipeline, and whatever comes next.
+
+Three things must never live in this repo:
+
+1. **Organization-specific business logic.** No knowledge of a particular company's
+   teams, workflow state names, ticket identifier formats, bot fleet, tool inventory,
+   escalation ladder, or naming conventions. `"TECH"`, `"In Progress"`, `"target:<repo>"`,
+   `"linear_progress_update"` are examples of the kind of vocabulary that belongs behind a
+   seam, not in `service.py`.
+2. **Approve/deny judgment for any pipeline.** This repo decides *who may reach a
+   decision point* (token scope, conversation membership, interactive-vs-agent gate,
+   `owner_sub` match -- §4, §8) and *what happens to the row afterwards* (claim, state
+   transition, audit, staleness comparison, idempotency). It never decides *whether a
+   given payload is a good idea.* "Is this message safe to send across an ownership
+   boundary," "is this summary grounded in its cited document," "is this proposed ticket
+   mutation justified by the artifact it cites" are all judgments, and all belong
+   elsewhere.
+3. **Write-actions against external services.** No API client for Linear, GitHub, Slack,
+   Jira, Google, Salesforce, an internal registry, or anything else that this service
+   mutates on a caller's behalf. The board persists a decision and hands it to a
+   plugin; the plugin performs the write and reports a structured outcome back. The only
+   outbound HTTP this repo may contain is transport-generic and pipeline-agnostic (e.g.
+   `WebhookNotifier`'s signed POST to an operator-configured URL, which knows nothing
+   about what is on the other end).
+
+**The mechanism is always the same, and it already exists.** §9's "Axis 2: per-message
+risk scoring (pluggable)" is the template and the precedent: a `Protocol` interface in
+`plugins.py`, a value type the caller pattern-matches on, a registry, a safe built-in
+default, and resolution through `plugins.resolve_plugin` -- which accepts either a
+registry name or a `"pkg.module:factory"` import path resolved via `importlib`, so a
+deployment plugs in a private implementation from its own package on `PYTHONPATH` without
+forking this repo. Every seam is validated at process start
+(`plugins.validate_configuration()`, called from `main._cli()`), so a misconfiguration is
+loud at boot rather than lazy on the first request that needs it. Seven seams follow this
+pattern today: `RISK_SCORER`, `AUTO_APPROVER`, `APPROVAL_NOTIFIER`, `ACTIVE_CHECKER`,
+`DOCS_VERIFIER`, `PROPOSAL_JUDGE` (all in `plugins.py`), plus `OWNERSHIP_CLIENT` (in
+`service.py`, for the cycle reason documented there). An eighth seam should look exactly
+like the first seven.
+
+**Proposals must follow the identical flow shape as message risk-scoring -- submit,
+score, approve, then act -- never a bespoke pipeline.** A proposal is submitted
+(`create_proposal`), classified and judged by a plugin (`PROPOSAL_JUDGE.classify`/
+`.judge`), and routed through the same approve-or-escalate-to-a-human state machine
+every other risk-scored artifact here uses -- §9's Axis 2 is the template both share.
+Approval, automatic or human, is a state transition this repo owns, claims, and
+audits; it is never itself a judgment about whether the underlying action is a good
+idea. Only after a hold reaches an approved state does this repo invoke
+`PROPOSAL_JUDGE.apply()` to perform the actual external write, exactly once, under
+the same claim/idempotency guarantees as every other terminal transition here.
+
+A board-owned scorer is not itself a violation of the principle above --
+`RISK_SCORER`'s production default, `BoundaryCrossingScorer` (`boundary_v1`), lives
+in this repo's own `plugins.py` because its logic (conversation type, message type,
+ownership-boundary topology) is genuinely generic. What must never live here is an
+org-specific scorer or judge: one that knows a Linear team key, a GitHub PR
+convention, or which bot may auto-approve what. Any future proposal `kind`, or any
+future proposal-adjacent pipeline, must reuse this exact shape.
+
+**Every built-in default must be safe in a bare deployment, and safe means inert, not
+permissive.** `escalate_all` never clears a hold. `reject_all` denies every `docs`
+message. `escalate_all_proposals` never auto-approves and never claims to have applied
+anything. `always_active` and `log_only` are the two exceptions, and only because
+"no retirement registry configured" and "no notification transport configured" have
+genuinely non-restrictive correct answers. A default that guesses at policy -- that
+auto-approves because the payload "looks fine," or that writes somewhere because a
+credential happened to be present -- is a bug in this repo regardless of how convenient it
+is for the deployment that wrote it.
+
+**Where the org-specific half lives.** For Redesign Health, all of it is
+`redesignhealth/agent-comms-approvals`' `rh_comms_plugins` package, layered onto this
+repo's published image by that repo's `Dockerfile.board-derived` and pointed at by env
+vars set in `rh-data-platform`'s Terraform. That package deliberately does **not** import
+`agent-comms-mcp` -- it implements each seam structurally (duck-typed), producing and
+consuming value types by shape rather than by class identity, because a dependency edge
+in that direction would be circular with the derived-image build chain. Preserve that:
+when adding a seam, do not design an interface that can only be implemented by importing
+this package. Value types crossing a seam should be plain `NamedTuple`s of primitives,
+dicts, and UUIDs; expected failures should be *returned* as typed outcomes rather than
+*raised* as exceptions the other side cannot name.
+
+**The test for a proposed change is mechanical, not a matter of taste.** Ask: *would a
+different company, deploying this board for a completely different purpose, want this
+code?* If the honest answer is no -- if the code encodes what *our* tickets look like,
+what *our* bots are called, which of *our* systems is authoritative, or what *we* consider
+an acceptable risk -- it belongs behind a seam. If the answer is yes -- schema validation,
+membership, dedup, rate limiting, audit, state machines, idempotency, race prevention,
+anti-enumeration, redaction -- it belongs here, and it should be built to be genuinely
+generic rather than generic-looking.
+
+**Historical note, kept deliberately.** The proposal pipeline
+(TECH-5872/5875/5877/5873/6018/6030) originally shipped in violation of this principle:
+`service.py` carried a `_PROPOSAL_RULES` registry of Linear/GitHub-specific auto-approval
+rules, and this repo carried `linear_client.py`, `github_client.py`, `team_allowlist.py`,
+`workflow_order.py`, and `citation_urls.py` outright. That was migrated behind the
+`PROPOSAL_JUDGE` seam. This section exists so the same drift is caught in review next
+time rather than after the fact.
+
 ## 2. Why this shape (research summary)
 
 Reviewed Aug 2026: shipping EA products (Lindy, Skej, Clara, historically
@@ -297,11 +399,10 @@ approval_holds id, conversation_id, sender_agent_id, target_agent_id (nullable
  invite-approval rule and models.ApprovalHold's class docstring)
 proposal_holds id, kind (at the DB level an open TEXT column -- NOT
 CHECK-constrained, same convention as conversations.type/messages.type --
-but narrower in practice: the service currently only admits
-kind="linear_progress_update"; `service._derive_proposal_priority` raises
-422 for any other kind, so adding a new kind requires both a new
-`_derive_proposal_priority` branch and at least one registered rule in
-`_PROPOSAL_RULES`/`_PROPOSAL_KIND_DEFAULT_RULE`, not just a row insert), proposed_by_bot_id (opaque, NOT an FK
+but narrower in practice: which `kind`s are admitted at all is entirely up
+to the configured `PROPOSAL_JUDGE` plugin's `classify()`, which raises
+`ValueError` (-> 422) for any `kind` it doesn't recognize; this repo itself
+has no kind vocabulary of its own), proposed_by_bot_id (opaque, NOT an FK
 to agents -- proposers need not be board-registered), owner_sub
 (snapshotted at creation, same convention as approval_holds.owner_sub),
 action jsonb, rationale, confidence/importance/impact(low|medium|high,
@@ -344,56 +445,71 @@ never reach `decide_proposal` at all),
  detected at apply/decide time, by which point decision fields are already
  stamped at the `applying` claim (see models.ProposalHold's class
  docstring and the `ck_proposal_holds_decision_consistency` CHECK).
- **Stuck `applying` rows** (the process dies, OR the request is cancelled,
- between the claim commit and the terminal write) have two distinct
- recovery stories depending on the cause (updated, Argus review round-6
- suggestion -- a prior version of this note said the ONLY recovery was
- manual DB intervention, which stopped being true once round-5 B1 added
- cooperative cancellation handling):
- - **Cancellation landing during the fingerprinter or applier await IS
-   auto-recovered** (narrowed, Argus review round-7 suggestion -- a prior
-   version of this bullet implied ALL cancellations during this function
-   are covered, which overstates it): `service._apply_or_finalize_proposal_hold`
-   catches `asyncio.CancelledError` specifically around the fingerprinter
-   and applier awaits, still performs the SAME terminal write every other
-   path takes (setting `"apply_failed"` with a distinguishable
-   `apply_error`), and only re-raises the cancellation afterward -- for
-   THAT window, the row reaches a real terminal status, it is not left
-   stuck. Two windows outside that coverage remain, both undocumented
-   gaps rather than closed:
-   - **Pre-`try:` awaits** -- the initial `_find_proposal_hold` re-fetch
-     and its `session.commit()`, which run BEFORE the try/except block, are
-     not wrapped at all; a cancellation landing there propagates
-     immediately with no terminal write, functionally identical to the
-     hard-process-death case below (the row was already `"applying"`
-     before this function was ever called, so nothing new is stranded,
-     but nothing recovers it either).
-   - **A second cancellation during the terminal write itself** (the
-     re-fetch through commit/refresh AFTER the try/except block) -- that
-     narrower window is a residual gap, documented at that code's own
-     comment rather than closed via `asyncio.shield` (sharing a single
-     `AsyncSession` across a shielded Task is its own hazard -- see that
-     comment for why the trade-off wasn't taken).
-   - **The concurrent-resolution early-return path** (`hold.status !=
-     expected_status` on re-fetch) deliberately does NOT attempt a
-     terminal write of its own -- something else already resolved the row,
-     so there is nothing for this call to strand; a cancellation observed
-     there just re-raises after the (already-resolved) row's own no-op
-     commit.
- - **A hard process death** (the container itself dies mid-apply, not a
-   cooperative cancellation) still has no background reaper AND no in-app
-   recovery path -- an earlier version of this note claimed a fresh
-   `POST /proposals` resubmission could recover one; it cannot, precisely
-   BECAUSE the round-3 B1 dedup fix now also matches `applying` rows: a
-   resubmission for the same target finds the stuck row via dedup and is
-   folded into it as a no-op, per `_dedup_or_insert_proposal`'s "don't
-   mutate an in-flight applying row" guard -- it can never re-arm it). The
-   row is also invisible to `list_pending_proposal_holds`
-   (`status='pending'` only) and a decide call on it raises
-   `HoldAlreadyDecidedError`. The only recovery for THIS case is manual DB
-   intervention: an operator running `UPDATE proposal_holds SET status =
-   'apply_failed', apply_error = '<note>' WHERE id = '<hold_id>'` (the
-   same terminal status a genuine Linear failure would have produced),
+  **Stuck `applying` rows** (the process dies, the request is cancelled,
+  OR a terminal commit fails between the claim commit and completion) have
+  distinct recovery stories depending on the cause (updated, Argus review round-6/round-9
+  suggestions):
+  - **Cancellation landing during the fingerprinter or applier await IS
+    auto-recovered** (narrowed, Argus review round-7 suggestion -- a prior
+    version of this bullet implied ALL cancellations during this function
+    are covered, which overstates it): `service._apply_or_finalize_proposal_hold`
+    catches `asyncio.CancelledError` specifically around the fingerprinter
+    and applier awaits, still performs the SAME terminal write every other
+    path takes (setting `"apply_failed"` with a distinguishable
+    `apply_error`), and only re-raises the cancellation afterward -- for
+    THAT window, the row reaches a real terminal status, it is not left
+    stuck. Two windows outside that coverage remain, both undocumented
+    gaps rather than closed:
+    - **Pre-`try:` awaits** -- the initial `_find_proposal_hold` re-fetch
+      and its `session.commit()`, which run BEFORE the try/except block, are
+      not wrapped at all; a cancellation landing there propagates
+      immediately with no terminal write, functionally identical to the
+      hard-process-death case below (the row was already `"applying"`
+      before this function was ever called, so nothing new is stranded,
+      but nothing recovers it either).
+    - **A second cancellation during the terminal write itself** (the
+      re-fetch through commit/refresh AFTER the try/except block) -- that
+      narrower window is a residual gap, documented at that code's own
+      comment rather than closed via `asyncio.shield` (sharing a single
+      `AsyncSession` across a shielded Task is its own hazard -- see that
+      comment for why the trade-off wasn't taken).
+    - **The concurrent-resolution early-return and recovery-fallthrough paths**
+      (`hold.status != expected_status` on re-fetch, or `recovery_hold`
+      status mismatch on recovery re-fetch) deliberately do NOT attempt a
+      terminal write of their own -- something else already resolved the row,
+      so there is nothing for this call to strand; a cancellation observed
+      there re-raises cleanly after commit rollback without stranding.
+  - **Terminal commit failure IS auto-recovered to its genuine terminal status**:
+    if the terminal commit fails (e.g. DB serialization failure or transient
+    error), the function catches the failure, rolls back, and attempts recovery
+    by re-applying the *exact same* computed terminal state (`applied` with
+    `apply_result`/`applied_at`, `stale` with `_stale_decision_note`, or
+    `apply_failed` with the original `apply_error`). Crucially, it does not
+    blindly overwrite successful external writes with `apply_failed`, preventing
+    duplicate external writes on caller retries. If that recovery commit itself
+    also fails, a last-ditch commit retries that SAME computed terminal state
+    again -- unless it was already `apply_failed`, in which case a minimal write
+    marks the row `apply_failed` with `_APPLY_ERROR_BOARD_COMMIT_FAILURE_MESSAGE`
+    (clearing `applied_at` and `apply_result`) instead, since there is no
+    successful external write to protect in that case. Either way this last-ditch
+    write is audited too, same as the recovery attempt. If even that last-ditch
+    commit fails (three consecutive DB failures), the row remains stranded at
+    `applying` with an error logged -- this is the documented residual gap for
+    commit failures.
+  - **A hard process death** (the container itself dies mid-apply, not a
+    cooperative cancellation) still has no background reaper AND no in-app
+    recovery path -- an earlier version of this note claimed a fresh
+    `POST /proposals` resubmission could recover one; it cannot, precisely
+    BECAUSE the round-3 B1 dedup fix now also matches `applying` rows: a
+    resubmission for the same target finds the stuck row via dedup and is
+    folded into it as a no-op, per `_dedup_or_insert_proposal`'s "don't
+    mutate an in-flight applying row" guard -- it can never re-arm it). The
+    row is also invisible to `list_pending_proposal_holds`
+    (`status='pending'` only) and a decide call on it raises
+    `HoldAlreadyDecidedError`. The only recovery for THIS case is manual DB
+    intervention: an operator running `UPDATE proposal_holds SET status =
+    'apply_failed', apply_error = '<note>' WHERE id = '<hold_id>'` (the
+    same terminal status a genuine target-write failure would have produced),
    after which a fresh `POST /proposals` resubmission for the same target
    works normally again. Automating this (a background reaper that
    transitions `applying` rows older than some threshold to
@@ -1423,7 +1539,7 @@ silent overwrite of (and potential auto-approval under) another bot's
 identity. The app-level SELECT (`service._proposal_dedup_where`) and a
 DB-level partial UNIQUE index, `idx_proposal_holds_pending_dedup` (`(kind,
 proposed_by_bot_id, action->>'target_id', action->>'action_type') WHERE
-status = 'pending'`), share this exact key so the two cannot drift apart.
+status IN ('pending', 'applying')`), share this exact key so the two cannot drift apart.
 The index is also the race-closing backstop for two concurrent submissions
 that both miss the SELECT and both attempt an INSERT: the loser's INSERT
 raises `IntegrityError`, which `service._dedup_or_insert_proposal` catches
@@ -1438,181 +1554,56 @@ at unlimited frequency. The attempt marker is written and committed
 immediately, before the dedup lookup, so it survives a later
 rollback-and-retry on the unique-index race above.
 
-**The proposal rule registry** (TECH-5877) is deterministic and async, not
-LLM-based. `create_proposal` inserts or updates the hold, then looks up and
-awaits exactly one `(kind, action_type)` rule in `_PROPOSAL_RULES`, falling
-back to `_PROPOSAL_KIND_DEFAULT_RULE[kind]` when no action-specific rule is
-registered. Any exception from a rule fails closed to `pending`.
+**Judge/apply dispatch is deterministic and async, not LLM-based, and lives
+entirely behind the `PROPOSAL_JUDGE` seam** (TECH-5877; migrated behind the
+seam per this document's "Core and immutable principle" section in §1).
+`create_proposal` inserts or updates the hold, then `await`s exactly one
+call, `judge.judge(ctx) -> ProposalVerdict`, on the configured
+`plugins.ProposalJudge`. Any exception the call raises fails closed to
+`pending` (`decision_note="judge error: <ExceptionType>"`); a
+contract-violating return value is likewise normalized rather than trusted
+(see the `PROPOSAL_JUDGE` seam description above). This repo has no
+per-`kind`/`action_type` rule vocabulary of its own -- what a given `kind`
+even means, which `action_type`s it supports, and what artifact (if any)
+justifies auto-approving one is entirely the plugin's concern.
 
-`kind="linear_progress_update"` currently has these rules:
-
-- `open_ticket`: artifact-backed. `action.target_id` itself must be a valid
-  `github.com` PR URL (validated via `github_client.
-  parse_github_pull_request_url`, not merely PR-*shaped* -- see the
-  host-confusion note below) -- it is both the cited PR URL and the
-  create-time dedup key, deliberately unified so dedup can never be
-  bypassed by varying `target_id` while citing the same PR elsewhere. The
-  cited PR must actually exist (a live `fetch_pull_request` call), but its
-  `state` is NOT gated -- a merged/closed PR is the expected case for
-  documenting a shipped PR, not just an open one. `action.title`/
-  `action.team` (the applier's required fields) must also be present, AND
-  `action.team` must additionally be on the server-side allowlist
-  (`team_allowlist.py`, `PROPOSAL_OPEN_TICKET_TEAM_ALLOWLIST`) -- inert
-  (never auto-approves) when that allowlist is unset/empty. The apply step
-  is redefined in place to create a new Linear issue, not comment on an
-  existing one, and this pair is exempt from the normal fingerprint/
-  staleness check.
-- `close_ticket`: citation-backed. Either `source_message_url` or
-  `resolving_pr_url` must be a valid citation URL.
-- `start_ticket`: artifact-backed. The cited GitHub PR must exist and be
-  open, `action.team` must be present, and the issue's current workflow
-  state must be strictly before `In Progress`.
-- `review_ticket`: artifact-backed. The cited PR must exist, be open, and
-  have review requested, `action.team` must be present, and the current
-  workflow state must be strictly before `In Review`.
-- `assign_ticket`: artifact-backed. The cited PR must exist and actually
-  reference `target_id`, and `action.assignee_id` must be present and a
-  valid UUID string.
-  **Design decision (TECH-6153), not an oversight:** this lane deliberately
-  enforces NEITHER attribution NOR authorization on the proposed assignee.
-  An earlier version required the proposed assignee to match the cited PR's
-  actual author via a server-side GitHub-login-to-Linear-user-id map (closing
-  a self-approval hole where a bot could fabricate an author-to-assignee match
-  to justify assigning itself/an accomplice). Per Linear decision record
-  **TECH-6153**, the product owner explicitly confirmed that BOTH attribution
-  and authorization constraints are removed: (a) attribution: who gets
-  assigned is not cross-checked against who authored the PR, because this
-  service tracks outstanding work rather than acting as a credit/attribution
-  system; and (b) authorization: there is NO authorization anchor at all on
-  who can be assigned -- no team-membership check and no bound on which
-  Linear user UUID the bot proposes. A bot can cite any real PR referencing
-  the target ticket and assign it to any Linear user it names. A future review
-  should read this as a confirmed, deliberate, doubly-considered tradeoff
-  (per TECH-6153), not a newly-discovered gap.
-- `label_ticket`: artifact-backed. The requested label must be exactly
-  `target:<repo>` derived from the cited PR URL's repo, `action.team` must
-  be present, and the cited PR must actually exist (a live
-  `fetch_pull_request` call, state not gated -- same "existence, not
-  openness" reasoning as `open_ticket` above) and actually reference
-  `target_id`.
-- Any other `action_type` stays pending via `_PROPOSAL_KIND_DEFAULT_RULE`.
-
-Unsupported changes stay human-only: priority changes, ticket cancellation,
-description edits, project assignment, and any workflow transition that is
-not strictly forward (or is a no-op) are held rather than auto-approved.
-
-Every lane above that treats a citation as a GitHub PR reference validates
-it through the single shared `github_client.parse_github_pull_request_url`
-helper -- which checks BOTH the general citation-URL allowlist AND that the
-host is specifically `github.com`, not merely PR-*shaped* -- rather than
-each rule chaining `citation_urls.is_valid_citation_url`/
-`parse_pull_request_url` itself; the latter, used alone, lets a
-`*.slack.com` URL shaped like a PR path (a valid citation host under the
-general allowlist) masquerade as a real GitHub PR reference.
-
-Rules that resolve a Linear workflow state by name (`start_ticket`'s
-`"In Progress"`, `review_ticket`'s `"In Review"`) match that name
-CASE-SENSITIVELY against the target team's real Linear workflow states
-(`resolve_workflow_state_id`) -- the target team's states must be named
-EXACTLY that, or the apply step fails cleanly with `LinearNotFoundError`
-(-> `apply_failed`), never a silent no-op. Target workflow state is
-deliberately not bot-controllable via the action payload in auto-approval,
-to avoid letting a bot influence its own approval target:
-`start_ticket` and `review_ticket` hardcode their target states, while
-`open_ticket` auto-approval never honors a bot-specified `target_state`
-at all (auto-created issues always land in the team's default initial
-workflow state; if a proposal specifies a `target_state`, it is held for
-human review instead of auto-approved).
-
-**`action.team` scope is DEFERRED for `start_ticket`/`review_ticket`/
-`label_ticket` (unlike `open_ticket`, closed above via
-`team_allowlist.py`).** These three rules never cross-check the
-bot-asserted `action.team` against the target ticket's ACTUAL team --
-`team` is only ever used to scope a NAME lookup (`resolve_workflow_
-state_id` for the hardcoded `"In Progress"`/`"In Review"` state name in
-`start_ticket`/`review_ticket`, or `resolve_label_id` for the label name in
-`label_ticket`), never to choose which ticket gets mutated (always
-`target_id`, fetched fresh via `fetch_issue`/`update_issue_state`/
-`add_issue_label`) or the destination state/label name (both
-server-derived: hardcoded for the state names, a separate `label_name`
-field for labels). Linear's workflow states are strictly per-team
-(`WorkflowState.team: Team!` in Linear's own public GraphQL schema), so a
-false `team` naming a team with no matching state/label name fails cleanly
-with `LinearNotFoundError` -> `apply_failed`; a team that DOES happen to
-have a same-named state/label would at worst apply that OTHER team's
-object -- Linear's API is expected (not confirmed with a live call) to
-reject this on `issueUpdate`/`issueAddLabel` as a cross-team mismatch
-anyway, since `target_id` and the resolved `stateId`/`labelId` would then
-belong to different teams. `open_ticket` is NOT deferred the same way
-because it has no pre-existing artifact bounding the destination team at
-all -- it CREATES a brand-new issue, so an unconstrained `team` there picks
-the team outright, not merely a name to look up within one. Closing this
-remaining gap for the other three (cross-checking `action.team` against
-`target_id`'s real team) is tracked as follow-up work (TECH-6150), deferred because it
-requires extending `linear_client._ISSUE_QUERY` with `team { key }`, which
-touches `compute_target_fingerprint`'s hashed field set and needs its own
-fingerprint-stability test coverage.
-
-The artifact-backed lanes use `github_client.py` (raw GitHub REST client,
-`GITHUB_TOKEN`) for PR lookup and URL parsing, and `workflow_order.py` for
-the forward-only workflow check. `open_ticket`, `start_ticket`,
-`review_ticket`, `assign_ticket`, and `label_ticket` all make live GitHub
-API calls.
+For Redesign Health, the concrete rules -- today, six lanes under
+`kind="linear_progress_update"` (`open_ticket`, `close_ticket`,
+`start_ticket`, `review_ticket`, `assign_ticket`, `label_ticket`), each
+requiring a specific GitHub/Slack artifact before auto-approving, plus the
+TECH-6153 assignee-attribution/authorization tradeoff on `assign_ticket` --
+live in `agent-comms-approvals`' `rh_comms_plugins.proposal_judge`
+(`RHProposalJudge`), not here. See that module's own rule docstrings for the
+exact artifact/citation requirements per lane; this document no longer
+duplicates them.
 
 **An auto-approved verdict is applied synchronously, at submission time, by
 `create_proposal` itself**. `"approved"` is a value the DB CHECK constraint
 still accepts but is never persisted at rest: `create_proposal` immediately
 claims the row (writes `status="applying"` under a fresh row lock and
 commits, releasing the lock before any external call) and then runs the same
-fingerprint-check-then-apply-or-stale helper that `POST /proposals/{id}/decide`
-uses for human approval, resolving the hold to `"applied"`/
-`"apply_failed"`/`"stale"` before `POST /proposals` returns. The
-`"applying"` claim exists specifically to prevent a double Linear write:
-without it, a human decide call racing the auto-rule for the same
-just-inserted hold could reach the applier a second time before either
-terminal write landed.
+fingerprint-check-then-apply-or-stale helper
+(`_apply_or_finalize_proposal_hold`) that `POST /proposals/{id}/decide` uses
+for human approval, resolving the hold to `"applied"`/`"apply_failed"`/
+`"stale"` before `POST /proposals` returns. The `"applying"` claim exists
+specifically to prevent a double external write: without it, a human decide
+call racing the auto-judge for the same just-inserted hold could reach
+`judge.apply()` a second time before either terminal write landed.
 
-**Latency (Argus review round-4 suggestion, updated for the TECH-5877
-artifact-backed lanes):** `POST /proposals` was DB-only latency before
-TECH-5873 landed the auto-apply behavior above. For `close_ticket`, it
-can make up to two sequential Linear HTTP calls (submission-time fingerprint
-fetch, then the comment-posting write) inline before responding.
-
-`open_ticket` is fingerprint-exempt (`_PROPOSAL_FINGERPRINT_EXEMPT`, zero
-fingerprint fetches at submission or apply time), but makes up to four
-sequential round-trips across GitHub and Linear before responding: (1) rule-time
-GitHub `fetch_pull_request` (existence check), (2) apply-time `resolve_team_id`,
-(3) optionally apply-time `resolve_workflow_state_id`, and (4) the
-`create_ticket` (`issueCreate`) mutation itself.
-
-The `start_ticket`/`review_ticket` auto-approve path is worse: it can now make up
-to SEVEN sequential round-trips across two providers before responding --
-(1) the submission-time fingerprint fetch (`create_proposal`), (2) the
-GitHub PR fetch inside the rule, (3) the Linear `fetch_issue` call inside the
-rule (both to check the forward-transition condition), (4) the apply-time
-fingerprint re-fetch (staleness check), (5) `resolve_team_id`, (6)
-`resolve_workflow_state_id`, and (7) the `issueUpdate` state-change mutation
-itself. Each Linear call is bounded by
-`linear_client._LINEAR_REQUEST_TIMEOUT_SECONDS` and each GitHub call by
-`github_client._GITHUB_REQUEST_TIMEOUT_SECONDS` (both 10 seconds as of this
-writing) -- worst case, over a minute of sequential latency, not the
-sub-second DB-only latency this endpoint had before TECH-5873. `assign_ticket`
-is shorter -- only FOUR round-trips ((1) submission-time fingerprint fetch,
-(2) the GitHub PR fetch, (3) the apply-time fingerprint re-fetch, (4) the
-`assigneeId` `issueUpdate` mutation) -- since this rule has no workflow-state
-concept and, unlike `start_ticket`/`review_ticket`, never fetches the Linear
-issue in the rule itself, and its applier never needs `resolve_team_id`/
-`resolve_workflow_state_id`. `label_ticket` makes SIX round-trips (Argus
-review: this rule now also verifies the cited PR exists, per the same
-artifact-backed reasoning as `start_ticket`/`review_ticket`) -- (1) the
-submission-time fingerprint fetch, (2) the GitHub PR fetch inside the rule
-(existence check only, no forward-transition concept so no Linear
-`fetch_issue` call in the rule itself), (3) the apply-time fingerprint
-re-fetch, (4) `resolve_team_id`, (5) `resolve_label_id`, and (6) the
-`issueAddLabel` mutation. A client or load balancer with a short timeout
-tuned to the pre-TECH-5873 behavior can time out mid-apply; the apply itself
-still completes server-side and the hold still resolves to a terminal
-status, but the caller's HTTP request may not see the response.
+**Latency is entirely a function of the configured judge**, not something
+this repo bounds or predicts. `POST /proposals` was DB-only latency before
+TECH-5873 landed the auto-apply behavior above; today it additionally awaits
+`judge.fingerprint()` (submission-time) and, on an auto-approved verdict,
+`judge.judge()` and `judge.apply()` inline, all before responding. This
+repo's only latency-relevant commitment is architectural: it always commits
+and releases its DB connection back to the pool BEFORE calling into any of
+the four `PROPOSAL_JUDGE` methods (see `_apply_or_finalize_proposal_hold`'s
+own docstring for why), so an arbitrarily slow judge never pins a pool slot
+across its own external I/O, no matter how many sequential round-trips it
+makes. For Redesign Health's concrete plugin's own latency profile (which
+lanes make how many sequential GitHub/Linear round-trips, and their
+timeouts), see `rh_comms_plugins.proposal_judge`'s own documentation in
+`agent-comms-approvals` -- this repo does not track it.
 
 **`POST /proposals/{id}/decide`** (TECH-5873, `service.decide_proposal`) is
 the human decide-and-synchronously-apply endpoint for a still-`"pending"`
@@ -1624,75 +1615,78 @@ bot self-approving its own proposal structurally impossible here too.
 Status transitions from `"pending"`: `"rejected"` (requires a non-empty
 `decision_note`, 400/`ValueError` otherwise, never touches the target
 system), or on `"approve"` the shared helper re-fetches the current target
-state, compares it to `hold.target_fingerprint`, and either marks the hold
-`"stale"` or runs the kind/action_type-specific applier. `apply_open_ticket`
-creates the issue via `issueCreate` and returns `{"id", "identifier",
-"url"}`; `apply_start_ticket`/`apply_review_ticket` move an existing issue
-with `issueUpdate(stateId)`; `apply_assign_ticket` updates `assigneeId`; and
-`apply_label_ticket` uses the dedicated `issueAddLabel` mutation so it never
-clobbers existing labels. `apply_progress_update` remains the comment-posting
-fallback for `close_ticket` and any other lane that still writes a note
-instead of mutating workflow state.
+state via `judge.fingerprint()`, compares it to `hold.target_fingerprint`,
+and either marks the hold `"stale"` or calls `judge.apply()`. What
+`apply()` actually does -- which mutation, against which system -- is
+entirely up to the configured judge; this repo only interprets its
+`ProposalApplyOutcome` (`applied=True` -> `"applied"`, with `result` stored
+on `proposal_holds.apply_result` when non-`None`; `applied=False` ->
+`"apply_failed"`, with `caller_error` stored on `proposal_holds.apply_error`
+and returned over the API, while `log_detail` lands in the WARNING log and
+audit row only).
 
-`open_ticket` is the only action_type whose apply result is retained:
-`apply_open_ticket` stores the created issue's `{id, identifier, url}` in
-`proposal_holds.apply_result`, so the bot learns the new `TECH-####`
-identifier from the proposal response rather than from a comment body.
+**Human approval bypasses all judge-level checks, by design.** `"approve"`
+here dispatches straight to `judge.apply()` and never re-runs
+`judge.judge()` -- the plugin-owned auto-approval verdict -- so whatever
+preconditions the configured judge's rules would otherwise enforce (e.g.
+Redesign Health's artifact-citation requirements) do not apply on this path.
+Only the fingerprint/staleness check still runs. This is intentional -- a
+human approving IS the final authority this whole human-in-the-loop escape
+hatch exists for -- not an oversight or a gap to close later.
 
-**Human approval bypasses all rule-level checks, by design.** `"approve"`
-here dispatches straight to the applier and never re-runs the
-kind/action_type-scoped rule (`_PROPOSAL_RULES`) that gates auto-approval --
-e.g. a human-approved `assign_ticket` applies whatever `assignee_id` the bot
-proposed with no re-verification that a cited PR exists or references the
-target ticket, and a human-approved `start_ticket`/`review_ticket` applies
-with no forward-transition check. Only the fingerprint/staleness check
-still runs on this path. This is intentional -- a human approving IS the
-final authority this whole human-in-the-loop escape hatch exists for -- not
-an oversight or a gap to close later.
+**Fingerprint scheme is an internal contract of the configured judge, not
+this repo.** `judge.fingerprint(ctx) -> ProposalFingerprint` reports one of
+three statuses: `FINGERPRINT_DIGEST` (a stable string this repo stores at
+submission time and compares byte-for-byte at apply time -- what fields
+feed that digest, and how they're serialized, is entirely the judge's
+concern), `FINGERPRINT_NO_TARGET` (no pre-existing target to fingerprint at
+all, e.g. an action that creates a new artifact rather than mutating an
+existing one -- this repo treats it as "never stale"), or
+`FINGERPRINT_UNAVAILABLE` (with a caller-safe error this repo surfaces as
+`ProposalTargetUnavailableError` at submission time, or `"apply_failed"` at
+apply time). `service.create_proposal` calls it and stores
+`target_fingerprint` server-side at submission time; `_apply_or_finalize_proposal_hold`
+calls it again at apply time to check for drift. The value is purely
+internal (any caller-supplied `target_fingerprint` in the request body is
+ignored). For Redesign Health's exact byte-level digest scheme (a sha256
+hex digest over a fixed, sorted set of Linear issue fields, deliberately
+excluding `updatedAt`), see `rh_comms_plugins.proposal_judge`'s/
+`rh_comms_plugins.linear_client`'s own docstrings and pinned-digest test in
+`agent-comms-approvals` -- this repo no longer contains that scheme or that
+test.
 
-**Fingerprint scheme is an internal contract**
-(`linear_client.compute_target_fingerprint`): a sha256 hex digest over a
-fixed, sorted set of Linear issue fields (state id/name, priority, assignee
-id). `updatedAt` is deliberately EXCLUDED (bug fix: Linear bumps it on
-any touch, which made staleness fire on unrelated activity). Staleness now
-means "the ticket's state/priority/assignee changed since the proposal was
-submitted," not "anything touched this ticket." `service.create_proposal`
-computes and stores `target_fingerprint` server-side at submission time,
-and `_apply_or_finalize_proposal_hold` reuses the same function at
-apply time to check for drift. The value is purely internal and server-computed
-(any caller-supplied `target_fingerprint` in the request body is ignored).
-This function's own docstring is the single source of truth for the EXACT
-byte-level scheme (field set AND serialization: `json.dumps` args), not
-duplicated here (Argus review round-7 suggestion). See
-`test_pinned_digest_for_fixed_input` in `tests/test_linear_client.py` for
-the exact digest this scheme produces for a fixed input.
-
-**One-time transitional cost of the fingerprint fix:** because the
-fingerprint computation changed (server-computed now, `updated_at` dropped
-from the hash -- see the bug-fix note above), every `status='pending'` row
-that existed BEFORE this fix deploys will deterministically resolve to
-`"stale"` the first time it's decided post-deploy -- a human clicking
-Approve on an old hold gets a 200 with no Linear write. This is an accepted,
-one-time cost, not a bug needing a data migration: the proposing bot simply
-resubmits (dedup lands it back on the same row, now with a fresh,
-correctly-computed fingerprint), and the new logic handles that fresh row
-correctly from then on.
+**One-time transitional cost of a fingerprint scheme change.** Whenever the
+configured judge's fingerprint scheme changes in a way that alters the
+digest it computes for otherwise-unchanged state (this happened once,
+historically, when the scheme moved from caller-supplied to
+server-computed and dropped `updated_at` from the hash), every
+`status='pending'` row that existed BEFORE the new scheme deploys will
+deterministically resolve to `"stale"` the first time it's decided
+post-deploy -- a human clicking Approve on an old hold gets a 200 with no
+external write. This is an accepted, one-time cost of any such change, not
+a bug needing a data migration: the proposing bot simply resubmits (dedup
+lands it back on the same row, now with a fresh, correctly-computed
+fingerprint), and the new scheme handles that fresh row correctly from then
+on.
 
 ### Configuration: pluggable seams
 
 `RISK_SCORER` (default `boundary_v1`), `AUTO_APPROVER` (default
 `escalate_all`), `APPROVAL_NOTIFIER` (default `log_only`), `ACTIVE_CHECKER`
-(default `always_active`, TECH-5703 — see "A fifth seam" below), and
-`DOCS_VERIFIER` (default `reject_all`, TECH-5998 — see "A sixth seam" below)
+(default `always_active`, TECH-5703 -- see "A fifth seam" below),
+`DOCS_VERIFIER` (default `reject_all`, TECH-5998 -- see "A sixth seam" below), and
+`PROPOSAL_JUDGE` (default `escalate_all_proposals` -- see "A seventh seam" below)
 each resolve a registry name or, if the value contains a `:`, an import path
-(`"pkg.module:factory"`) via `importlib` — letting a deployment plug in a
+(`"pkg.module:factory"`) via `importlib` -- letting a deployment plug in a
 private implementation from its own package on `PYTHONPATH` without forking
-this repo. All five are validated at process start
+this repo. All six are validated at process start
 (`plugins.validate_configuration()`, called from `main._cli()` beside the
 existing `DATABASE_URL` fail-fast check): an unknown name, a bad import path,
 or (for `APPROVAL_NOTIFIER=webhook`) a missing `APPROVAL_WEBHOOK_URL`/
 `APPROVAL_WEBHOOK_SECRET` pair crashes at boot, never lazily on the first
-high-risk message.
+high-risk message. Five of the six seams crash at boot on misconfiguration;
+`PROPOSAL_JUDGE` logs a startup WARNING instead, since its safe default
+(`escalate_all_proposals`) is inert.
 
 **Trust model for `pkg.module:factory` import paths (deliberate, not a
 vulnerability):** every current call site into `resolve_plugin_name` (both
@@ -1802,6 +1796,42 @@ unreachable, say) must raise `DocsVerificationInfraError` rather than returning
 (`denied.docs_verification_unscored`) instead of the caller-visible
 `DocsVerificationFailedError`, so a transient infra outage is never misreported to the
 sender as "your summary failed grounding review."
+
+**A seventh seam, `PROPOSAL_JUDGE`** (default `escalate_all_proposals`), resolves the
+same way as the other stateless, process-wide-singleton seams
+(`plugins.resolve_plugin`/`plugins.validate_configuration`, which now also emits a
+startup WARNING -- not a crash -- when this one specifically is left unset, since its
+default is safe but silent). Unlike the other six, it owns FOUR responsibilities for one
+pipeline (the proposal submission pipeline below) rather than one question for the
+comms pipeline: `classify(kind, action) -> ProposalClassification` (submit-time
+admission + server-derived priority -- synchronous, side-effect-free, may raise
+`ValueError` for an unsupported `kind`), `fingerprint(ctx) -> ProposalFingerprint`
+(the target's current state digest, or `FINGERPRINT_NO_TARGET`/`FINGERPRINT_UNAVAILABLE`),
+`judge(ctx) -> ProposalVerdict` (auto-apply now, or hold for a human -- never rejects on a
+bot's behalf), and `apply(ctx) -> ProposalApplyOutcome` (perform the actual external
+write). One seam, not four, because a judge's auto-approval preconditions are
+deliberately coupled to its own applier's requirements -- splitting them across
+independently-configurable knobs would let a mismatched pair become reachable
+configuration rather than a code bug. The default, `EscalateAllProposalJudge`, accepts
+any `kind` at `low` priority, never fingerprints a real target, never auto-approves, and
+never writes anywhere -- safe-by-inertness, not a `RejectAllDocsVerifier`-style submit-time
+rejection, since the generic dedup/rate-limit/audit/state-machine half of this pipeline is
+real infrastructure a bare deployment should still get. Every call into this seam is
+wrapped defensively by the board (`service._classify_proposal`/`_safe_fingerprint`/
+`_safe_apply`, and the inline `judge.judge()` dispatch in `create_proposal`): a raising
+plugin, or one returning a contract-violating value (a `priority` outside
+`PROPOSAL_HOLD_LEVELS`, a non-boolean `approved` verdict, an unrecognized
+`fingerprint().status`, an `applied=True` outcome with a non-`dict` result, or a
+`ProposalTargetError.status_code` outside the allowlisted `{422, 500, 503}`), is
+rejected via 422 at submission time or normalized to a safe outcome (pending status or
+`apply_failed`) rather than reaching an unhandled 500 or a DB CHECK violation. Every
+caller-facing error/detail string surfaced through this seam (`ProposalTargetError.detail`,
+`ProposalApplyOutcome.caller_error`) is additionally capped at 500 characters, truncated
+with `"... [truncated]"` if exceeded, so a misbehaving or overly verbose plugin can't blow
+out a TEXT column or leak an unbounded upstream payload through the API. For Redesign
+Health, the concrete implementation
+(Linear/GitHub-backed deterministic rules) lives in `agent-comms-approvals`'
+`rh_comms_plugins.proposal_judge` -- see "The proposal submission pipeline" below.
 
 **`owner_sub` provenance — accepted risk, partially resolved by the
 snapshot design.** Every high-risk post now depends on the decide

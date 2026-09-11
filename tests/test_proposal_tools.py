@@ -25,7 +25,7 @@ import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import pytest_asyncio
@@ -39,7 +39,16 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+import plugins
+from plugins import (
+    FINGERPRINT_DIGEST,
+    FINGERPRINT_UNAVAILABLE,
+    ProposalApplyOutcome,
+    ProposalFingerprint,
+    ProposalTargetError,
+)
 from service import decide_proposal
+from tests.proposal_judge_fakes import FakeProposalJudge
 
 SERVICE_ROOT = Path(__file__).parent.parent
 _DEFAULT_TEST_DATABASE_URL = "postgresql://postgres:postgres@localhost:55432/agent_comms"
@@ -136,22 +145,23 @@ async def _clean_tables(engine: AsyncEngine) -> AsyncIterator[None]:
 _DEFAULT_SUBMIT_TIME_FINGERPRINT = "fp-submit-time-default"
 
 
-@pytest_asyncio.fixture(autouse=True)
-async def _default_fetch_current_fingerprint() -> AsyncIterator[AsyncMock]:
-    """Bug fix: ``proposals_submit`` -> ``service.create_proposal`` now
-    fetches the target's CURRENT fingerprint at submission time too
-    (server-computed, no longer trusting the caller-supplied
-    ``target_fingerprint`` tool argument -- see that function's own
-    docstring), not just at apply/decide time. None of the tests in this
-    file exercise the auto-judge/apply path (see this module's own
-    docstring -- that's ``tests/test_proposal_service.py``'s job), so a
-    single stable default here is all any test needs; it just keeps
-    submission from attempting a real network call."""
-    with patch(
-        "service.linear_client.fetch_current_fingerprint",
-        AsyncMock(return_value=_DEFAULT_SUBMIT_TIME_FINGERPRINT),
-    ) as mock:
-        yield mock
+@pytest.fixture(autouse=True)
+def _default_proposal_judge(monkeypatch: pytest.MonkeyPatch) -> FakeProposalJudge:
+    """``proposals_submit`` -> ``service.create_proposal`` resolves
+    ``plugins.get_proposal_judge()`` fresh per call -- monkeypatch it to
+    always return the SAME ``FakeProposalJudge`` instance for the duration
+    of one test. None of the tests in this file exercise the auto-judge/
+    apply path (see this module's own docstring -- that's
+    ``tests/test_proposal_service.py``'s job), so a single stable digest
+    default here is all any test needs; it just keeps submission from
+    reaching a FINGERPRINT_UNAVAILABLE outcome."""
+    fake = FakeProposalJudge(
+        fingerprint_result=ProposalFingerprint(
+            status=FINGERPRINT_DIGEST, digest=_DEFAULT_SUBMIT_TIME_FINGERPRINT
+        )
+    )
+    monkeypatch.setattr(plugins, "get_proposal_judge", lambda: fake)
+    return fake
 
 
 @pytest.fixture
@@ -506,93 +516,109 @@ class TestSubmitGetWithdraw:
         main: Any,
         test_session_factory: async_sessionmaker[AsyncSession],
         session: AsyncSession,
+        _default_proposal_judge: FakeProposalJudge,
     ) -> None:
         """Mirrors ``tests/test_proposal_endpoint.py::TestSubmitProposal::
         test_target_fingerprint_in_body_is_ignored`` for the MCP tool
         path: a caller-supplied ``target_fingerprint`` is DEPRECATED and
         ignored -- the value actually stored (and later compared against
         at decide time) is always computed server-side. Submit with a
-        tool argument value that could never match the mocked
+        tool argument value that could never match the judge's
         server-computed fingerprint, then decide (via
         ``service.decide_proposal`` directly -- there is no MCP tool for
-        deciding, see this module's own docstring) with that SAME
-        server-computed value re-fetched -- reaching ``"applied"`` (not
-        ``"stale"``) proves the server-computed value, not the tool
-        argument, was stored and matched."""
-        with patch(
-            "service.linear_client.fetch_current_fingerprint",
-            AsyncMock(return_value="server-value"),
-        ):
-            submitted = await _submit(
-                main,
-                test_session_factory,
-                bot_sub="bot-fp-ignored",
-                owner_sub="owner-fp-ignored@example.com",
-                action=_action(target_id="TECH-FINGERPRINT-IGNORED"),
-                target_fingerprint="tool-argument-value",
-            )
+        deciding, see this module's own docstring) against that SAME
+        shared fixture judge -- reaching ``"applied"`` (not ``"stale"``)
+        proves the server-computed value, not the tool argument, was
+        stored and matched."""
+        _default_proposal_judge.fingerprint_result = ProposalFingerprint(
+            status=FINGERPRINT_DIGEST, digest="server-value"
+        )
+        submitted = await _submit(
+            main,
+            test_session_factory,
+            bot_sub="bot-fp-ignored",
+            owner_sub="owner-fp-ignored@example.com",
+            action=_action(target_id="TECH-FINGERPRINT-IGNORED"),
+            target_fingerprint="tool-argument-value",
+        )
         assert submitted["status"] == "pending"
 
-        with (
-            patch(
-                "service.linear_client.fetch_current_fingerprint",
-                AsyncMock(return_value="server-value"),
-            ),
-            patch("service.linear_client.apply_progress_update", AsyncMock(return_value=None)),
-        ):
-            decided = await decide_proposal(
-                session,
-                approver_sub="owner-fp-ignored@example.com",
-                hold_id=uuid.UUID(submitted["proposal_id"]),
-                decision="approve",
-                decision_note=None,
-            )
+        _default_proposal_judge.apply_result = ProposalApplyOutcome(
+            applied=True, result=None, caller_error=None, log_detail=None
+        )
+        decided = await decide_proposal(
+            session,
+            approver_sub="owner-fp-ignored@example.com",
+            hold_id=uuid.UUID(submitted["proposal_id"]),
+            decision="approve",
+            decision_note=None,
+            judge=_default_proposal_judge,
+        )
         assert decided["status"] == "applied"
 
-    async def test_linear_api_error_during_submission_raises_tool_error(
-        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    async def test_fingerprint_unavailable_during_submission_raises_tool_error(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        _default_proposal_judge: FakeProposalJudge,
     ) -> None:
         """Argus review round-3 B1: service.create_proposal's server-side
-        target-fingerprint fetch can fail (target doesn't exist, Linear
-        error) -- must surface as a ToolError with a sanitized message."""
-        from linear_client import LinearAPIError
-
-        with patch(
-            "service.linear_client.fetch_current_fingerprint",
-            AsyncMock(side_effect=LinearAPIError("target issue does not exist")),
-        ):
-            with pytest.raises(ToolError, match=r"^Linear returned an error$"):
-                await _submit(main, test_session_factory, bot_sub="bot-linear-error")
-
-    async def test_linear_token_missing_during_submission_raises_sanitized_tool_error(
-        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
-    ) -> None:
-        """Argus review round-3 B1: LinearTokenMissingError must raise ToolError
-        without leaking the internal env-var name."""
-        from linear_client import LinearTokenMissingError
-
-        with patch(
-            "service.linear_client.fetch_current_fingerprint",
-            AsyncMock(side_effect=LinearTokenMissingError("LINEAR_API_TOKEN is not configured")),
-        ):
-            with pytest.raises(ToolError, match=r"^server configuration error$"):
-                await _submit(main, test_session_factory, bot_sub="bot-token-error")
-
-    async def test_linear_transport_error_during_submission_raises_sanitized_tool_error(
-        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
-    ) -> None:
-        """Argus review round-3 B1: LinearTransportError must raise ToolError
-        without leaking transport internals."""
-        from linear_client import LinearTransportError
-
-        with patch(
-            "service.linear_client.fetch_current_fingerprint",
-            AsyncMock(
-                side_effect=LinearTransportError("Linear API request failed: connection refused")
+        target-fingerprint fetch can fail (target doesn't exist, target
+        system error) -- must surface as a ToolError with the judge's own
+        sanitized message."""
+        _default_proposal_judge.fingerprint_result = ProposalFingerprint(
+            status=FINGERPRINT_UNAVAILABLE,
+            error=ProposalTargetError(
+                status_code=422,
+                error_code="invalid_request",
+                detail="Linear returned an error",
+                log_detail="target issue does not exist",
             ),
-        ):
-            with pytest.raises(ToolError, match=r"^Linear API unavailable$"):
-                await _submit(main, test_session_factory, bot_sub="bot-transport-error")
+        )
+        with pytest.raises(ToolError, match=r"^Linear returned an error$"):
+            await _submit(main, test_session_factory, bot_sub="bot-linear-error")
+
+    async def test_fingerprint_unavailable_missing_credential_raises_sanitized_tool_error(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        _default_proposal_judge: FakeProposalJudge,
+    ) -> None:
+        """Argus review round-3 B1: a missing-credential-shaped judge
+        failure must raise ToolError without leaking the internal env-var
+        name."""
+        _default_proposal_judge.fingerprint_result = ProposalFingerprint(
+            status=FINGERPRINT_UNAVAILABLE,
+            error=ProposalTargetError(
+                status_code=500,
+                error_code="server_configuration_error",
+                detail="server configuration error",
+                log_detail="LINEAR_API_TOKEN is not configured",
+            ),
+        )
+        with pytest.raises(ToolError, match=r"^server configuration error$"):
+            await _submit(main, test_session_factory, bot_sub="bot-token-error")
+
+    async def test_fingerprint_unavailable_transport_failure_raises_sanitized_tool_error(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        _default_proposal_judge: FakeProposalJudge,
+    ) -> None:
+        """Argus review round-3 B1: a transport-failure-shaped judge
+        failure must raise ToolError without leaking transport
+        internals."""
+        _default_proposal_judge.fingerprint_result = ProposalFingerprint(
+            status=FINGERPRINT_UNAVAILABLE,
+            error=ProposalTargetError(
+                status_code=503,
+                error_code="service_unavailable",
+                detail="Linear API unavailable",
+                log_detail="Linear API request failed: connection refused",
+            ),
+        )
+        with pytest.raises(ToolError, match=r"^Linear API unavailable$"):
+            await _submit(main, test_session_factory, bot_sub="bot-transport-error")
 
 
 # --- list_pending / list_history -------------------------------------------------
@@ -655,6 +681,7 @@ class TestListPendingAndHistory:
             hold_id=uuid.UUID(rejected["proposal_id"]),
             decision="reject",
             decision_note="not appropriate",
+            judge=FakeProposalJudge(),
         )
         token = _token(bot_sub)
         await _call(
@@ -691,6 +718,7 @@ class TestListPendingAndHistory:
             hold_id=uuid.UUID(submitted["proposal_id"]),
             decision="reject",
             decision_note="not appropriate",
+            judge=FakeProposalJudge(),
         )
 
         token = _token(bot_sub)
