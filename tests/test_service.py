@@ -484,7 +484,9 @@ async def _audit_actions(session: AsyncSession, conversation_id: uuid.UUID) -> l
     rows = (
         (
             await session.execute(
-                select(AuditLog.action).where(AuditLog.conversation_id == conversation_id)
+                select(AuditLog.action)
+                .where(AuditLog.conversation_id == conversation_id)
+                .order_by(AuditLog.id)
             )
         )
         .scalars()
@@ -4903,7 +4905,7 @@ class TestExtendConversation:
                 actor_sub=owner.sub,
                 agent_id=owner.id,
                 conversation_id=conversation.id,
-                new_expires_at=too_far,
+                expires_at=too_far,
             )
 
         # Also via extend_by_days when current expires_at is already in future
@@ -4933,7 +4935,7 @@ class TestExtendConversation:
                 actor_sub=owner.sub,
                 agent_id=owner.id,
                 conversation_id=conversation.id,
-                new_expires_at=now + timedelta(days=5),
+                expires_at=now + timedelta(days=5),
             )
 
         # Attempt to keep unchanged (not idempotent)
@@ -4943,7 +4945,7 @@ class TestExtendConversation:
                 actor_sub=owner.sub,
                 agent_id=owner.id,
                 conversation_id=conversation.id,
-                new_expires_at=conversation.expires_at,
+                expires_at=conversation.expires_at,
             )
 
         # Attempt past deadline on lapsed conversation
@@ -4957,7 +4959,7 @@ class TestExtendConversation:
                 actor_sub=owner_past.sub,
                 agent_id=owner_past.id,
                 conversation_id=conv_past.id,
-                new_expires_at=now - timedelta(days=5),
+                expires_at=now - timedelta(days=5),
             )
 
     async def test_rejected_parameters(self, session: AsyncSession) -> None:
@@ -5207,11 +5209,21 @@ class TestExtendConversation:
         assert log.detail["previous_state"] == "active"
         assert log.detail["resurrected"] is False
 
-        # Test resurrecting past-deadline conversation: conversation.expire then conversation.extend
-        past_dt = datetime.now(UTC) - timedelta(seconds=1)
+        # Test resurrecting a conversation that only crosses its deadline
+        # AFTER setup (not before, like _start(expires_at=past_dt) above --
+        # that would flip it to expired during accept_invite's own lazy
+        # expiry check, well before extend_conversation ever runs, so the
+        # two audit rows wouldn't actually be adjacent). Instead, start/accept
+        # with a still-future deadline, then push it into the past directly
+        # so extend_conversation's own call is the first thing to observe
+        # the lapsed deadline and lazily expire it.
         owner_r, _target_r, conv_r = await self._start(
-            session, "ext-svc-owner-10r", "ext-svc-target-10r", expires_at=past_dt
+            session, "ext-svc-owner-10r", "ext-svc-target-10r"
         )
+        # Safe to mutate post-commit: this module's session fixture is built
+        # with expire_on_commit=False.
+        conv_r.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
         await extend_conversation(
             session,
             actor_sub=owner_r.sub,
@@ -5220,12 +5232,10 @@ class TestExtendConversation:
             extend_by_days=5,
         )
         actions = await _audit_actions(session, conv_r.id)
-        # Lazy expiry emits conversation.expire, then extend emits conversation.extend
-        assert "conversation.expire" in actions
-        assert "conversation.extend" in actions
-        expire_idx = actions.index("conversation.expire")
-        extend_idx = actions.index("conversation.extend")
-        assert expire_idx < extend_idx
+        # Lazy expiry emits conversation.expire, immediately followed by
+        # extend's own conversation.extend -- assert strict adjacency, not
+        # just relative ordering.
+        assert actions[-2:] == ["conversation.expire", "conversation.extend"]
 
 
 # --- get_conversation ----------------------------------------------------------

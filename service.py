@@ -4284,7 +4284,6 @@ async def extend_conversation(
     actor_sub: str,
     agent_id: uuid.UUID,
     conversation_id: uuid.UUID,
-    new_expires_at: datetime | None = None,
     expires_at: datetime | None = None,
     extend_by_days: int | None = None,
 ) -> Conversation:
@@ -4317,9 +4316,8 @@ async def extend_conversation(
     unchanged ``expires_at`` correctly fails the "reject shortening/same value"
     check.
     """
-    target_expires_at = new_expires_at if new_expires_at is not None else expires_at
-    if (target_expires_at is None and extend_by_days is None) or (
-        target_expires_at is not None and extend_by_days is not None
+    if (expires_at is None and extend_by_days is None) or (
+        expires_at is not None and extend_by_days is not None
     ):
         raise ValueError("provide exactly one of expires_at or extend_by_days")
 
@@ -4330,7 +4328,7 @@ async def extend_conversation(
     ):
         raise ValueError("extend_by_days must be an integer between 1 and 90")
 
-    if target_expires_at is not None and target_expires_at.tzinfo is None:
+    if expires_at is not None and expires_at.tzinfo is None:
         raise ValueError("expires_at must be timezone-aware")
 
     conversation, participant = await _load_participant_for_transition(
@@ -4374,8 +4372,8 @@ async def extend_conversation(
         base_dt = max(conversation.expires_at, now)
         computed_new_expires_at = base_dt + timedelta(days=extend_by_days)
     else:
-        assert target_expires_at is not None
-        computed_new_expires_at = target_expires_at
+        assert expires_at is not None
+        computed_new_expires_at = expires_at
 
     if computed_new_expires_at <= now:
         raise ValueError("new expires_at must be in the future")
