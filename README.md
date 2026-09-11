@@ -394,6 +394,31 @@ docker compose up --build
 | `DECISION_PAGE_BASE_URL` | Base URL of the separate `agent-comms-approvals-decision-page` service. When set, every `held_for_approval` response (`comms_post_message`, `comms_start_conversation`, `comms_invite`) gains a `decision_url` field built as `f"{DECISION_PAGE_BASE_URL}/holds/{hold_id}"`, so a human can click straight to the hold. Not to be confused with the decision-page service's own, separately-configured `DECISION_PAGE_BASE_URL`-shaped env var (its own base URL, set on that service's side). Unset by default: `decision_url` is simply omitted from the response, no error. |
 | `PROPOSAL_JUDGE` | Which `ProposalJudge` implementation judges/applies a submitted `proposal_holds` proposal (`POST /proposals`) -- a name from `plugins.PROPOSAL_JUDGES`, or a `"pkg.module:factory"` import path to plug in your own without forking this repo (see `docs/DESIGN.md`'s "Configuration: pluggable seams" section). Default: `escalate_all_proposals` -- accepts any kind at low priority, never fingerprints a real target, never auto-approves, and never writes anywhere. Redesign Health's Linear/GitHub-backed rules live in `agent-comms-approvals`' `rh_comms_plugins.proposal_judge` instead of this repo. |
 
+> [!WARNING]
+> **Deployment prerequisites for the `PROPOSAL_JUDGE` seam.** In deployed ECS
+> environments, environment variables and credentials are provisioned via SSM
+> by `rh-data-platform`'s Terraform -- a separate repo and deploy process from
+> this one. Landing this repo's code does not itself activate an organization's
+> real judge:
+>
+> - `PROPOSAL_JUDGE` must point at a real implementation (provisioned via SSM at
+>   `/reclaw-comms/{env}/proposal-judge`, e.g. `rh_comms_plugins.proposal_judge:get_proposal_judge`).
+>   Unset, the board safely defaults to `escalate_all_proposals`, which never
+>   auto-approves or applies any proposal.
+> - For Redesign Health, `agent-comms-approvals` (PR #62) must be deployed with the
+>   concrete judge implementation before this service's release runs with `PROPOSAL_JUDGE`
+>   configured, or the import will fail at boot.
+> - **Behavioral regression window**: until the Terraform provisioning and deployment chain
+>   completes, proposals running under `escalate_all_proposals` will never auto-approve,
+>   and any human approval will resolve to `apply_failed` because the default judge does
+>   not perform external writes.
+> - **SSM parameter removal ordering hazard (TECH-6155)**: when cleaning up legacy
+>   env vars/SSM parameters (e.g. `LINEAR_API_TOKEN`, `GITHUB_TOKEN`), always update
+>   the ECS task definition to remove the SSM parameter reference FIRST, deploy that revision,
+>   and only THEN delete the parameter from SSM. ECS resolves SSM parameter ARNs at task-launch
+>   time; deleting a parameter while a task definition still references it causes every
+>   subsequent task launch to crash with a parameter-resolution failure.
+
 `entrypoint.sh` runs `alembic upgrade head` automatically on every container
 start, so migrations apply before the server accepts traffic.
 

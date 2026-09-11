@@ -471,8 +471,10 @@ class TestClassifyDispatch:
 
     async def test_unsupported_kind_raises_value_error(self, session: AsyncSession) -> None:
         judge = FakeProposalJudge(classify_raises=ValueError("unsupported kind: 'nonsense'"))
-        with pytest.raises(ValueError, match="unsupported kind"):
+        pattern = "unsupported proposal kind: 'linear_progress_update'"
+        with pytest.raises(ValueError, match=pattern) as exc_info:
             await _submit(session, judge=judge)
+        assert "unsupported kind: 'nonsense'" in str(exc_info.value.__cause__)
 
 
 class TestJudgeApplyBoardMechanics:
@@ -1463,6 +1465,76 @@ class TestProposalJudgeSeamValidation:
             .one()
         )
         assert audit_row.detail["error"] == "the raw upstream detail, credentials and all"
+
+    async def test_non_json_serializable_apply_result_resolves_cleanly_to_apply_failed(
+        self, session: AsyncSession
+    ) -> None:
+        judge = FakeProposalJudge(
+            judge_result=ProposalVerdict(approved=True, decision_note="auto-approved"),
+            apply_result=ProposalApplyOutcome(
+                applied=True,
+                result={"invalid_set": {1, 2, 3}},
+                caller_error=None,
+                log_detail=None,
+            ),
+        )
+        result = await _submit(session, judge=judge)
+        assert result["status"] == "apply_failed"
+        assert result["apply_error"] == "unable to apply this proposal"
+
+        # Verify hold in DB is not stranded at 'applying'
+        hold = await session.get(ProposalHold, uuid.UUID(result["proposal_id"]))
+        assert hold is not None
+        assert hold.status == "apply_failed"
+        assert hold.apply_error == "unable to apply this proposal"
+
+    async def test_overlong_decision_note_is_truncated(self, session: AsyncSession) -> None:
+        overlong_note = "n" * 2500
+        judge = FakeProposalJudge(
+            judge_result=ProposalVerdict(approved=True, decision_note=overlong_note),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result={"ok": True}, caller_error=None, log_detail=None
+            ),
+        )
+        result = await _submit(session, judge=judge)
+        assert len(result["decision_note"]) == 2000
+        assert result["decision_note"].endswith("... [truncated]")
+        assert result["decision_note"].startswith("n" * 100)
+
+    async def test_overlong_caller_error_is_truncated(self, session: AsyncSession) -> None:
+        overlong_error = "e" * 600
+        judge = FakeProposalJudge(
+            judge_result=ProposalVerdict(approved=True, decision_note="auto-approved"),
+            apply_result=ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error=overlong_error,
+                log_detail="raw",
+            ),
+        )
+        result = await _submit(session, judge=judge)
+        assert result["status"] == "apply_failed"
+        assert len(result["apply_error"]) == 500
+        assert result["apply_error"].endswith("... [truncated]")
+        assert result["apply_error"].startswith("e" * 100)
+
+    async def test_legitimate_decision_note_starting_with_judge_error_does_not_trigger_error_branch(
+        self, session: AsyncSession
+    ) -> None:
+        judge = FakeProposalJudge(
+            judge_result=ProposalVerdict(
+                approved=False,
+                decision_note="judge error: legitimate business reason to hold for human",
+            )
+        )
+        result = await _submit(session, judge=judge)
+        assert result["status"] == "pending"
+        # Since this was a normal plugin-supplied verdict and not an internal judge error,
+        # the error-branch pre-return commit did not fire and no error note was persisted.
+        assert "decision_note" not in result
+        hold = await session.get(ProposalHold, uuid.UUID(result["proposal_id"]))
+        assert hold is not None
+        assert hold.decision_note is None
 
 
 class TestGetProposalForBot:

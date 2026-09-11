@@ -21,7 +21,7 @@ This repo is only the comms layer. Out of scope, by explicit decision:
 
 This repository is **bus, transport, and storage infrastructure only.** That is not a
 stylistic preference or a current-state description; it is a permanent constraint on what
-may ever be merged here, and it binds every pipeline this service grows — the comms
+may ever be merged here, and it binds every pipeline this service grows -- the comms
 pipeline, the proposal pipeline, and whatever comes next.
 
 Three things must never live in this repo:
@@ -33,7 +33,7 @@ Three things must never live in this repo:
    seam, not in `service.py`.
 2. **Approve/deny judgment for any pipeline.** This repo decides *who may reach a
    decision point* (token scope, conversation membership, interactive-vs-agent gate,
-   `owner_sub` match — §4, §8) and *what happens to the row afterwards* (claim, state
+   `owner_sub` match -- §4, §8) and *what happens to the row afterwards* (claim, state
    transition, audit, staleness comparison, idempotency). It never decides *whether a
    given payload is a good idea.* "Is this message safe to send across an ownership
    boundary," "is this summary grounded in its cited document," "is this proposed ticket
@@ -50,7 +50,7 @@ Three things must never live in this repo:
 **The mechanism is always the same, and it already exists.** §9's "Axis 2: per-message
 risk scoring (pluggable)" is the template and the precedent: a `Protocol` interface in
 `plugins.py`, a value type the caller pattern-matches on, a registry, a safe built-in
-default, and resolution through `plugins.resolve_plugin` — which accepts either a
+default, and resolution through `plugins.resolve_plugin` -- which accepts either a
 registry name or a `"pkg.module:factory"` import path resolved via `importlib`, so a
 deployment plugs in a private implementation from its own package on `PYTHONPATH` without
 forking this repo. Every seam is validated at process start
@@ -61,18 +61,18 @@ pattern today: `RISK_SCORER`, `AUTO_APPROVER`, `APPROVAL_NOTIFIER`, `ACTIVE_CHEC
 `service.py`, for the cycle reason documented there). An eighth seam should look exactly
 like the first seven.
 
-**Proposals must follow the identical flow shape as message risk-scoring — submit,
-score, approve, then act — never a bespoke pipeline.** A proposal is submitted
+**Proposals must follow the identical flow shape as message risk-scoring -- submit,
+score, approve, then act -- never a bespoke pipeline.** A proposal is submitted
 (`create_proposal`), classified and judged by a plugin (`PROPOSAL_JUDGE.classify`/
 `.judge`), and routed through the same approve-or-escalate-to-a-human state machine
-every other risk-scored artifact here uses — §9's Axis 2 is the template both share.
+every other risk-scored artifact here uses -- §9's Axis 2 is the template both share.
 Approval, automatic or human, is a state transition this repo owns, claims, and
 audits; it is never itself a judgment about whether the underlying action is a good
 idea. Only after a hold reaches an approved state does this repo invoke
 `PROPOSAL_JUDGE.apply()` to perform the actual external write, exactly once, under
 the same claim/idempotency guarantees as every other terminal transition here.
 
-A board-owned scorer is not itself a violation of the principle above —
+A board-owned scorer is not itself a violation of the principle above --
 `RISK_SCORER`'s production default, `BoundaryCrossingScorer` (`boundary_v1`), lives
 in this repo's own `plugins.py` because its logic (conversation type, message type,
 ownership-boundary topology) is genuinely generic. What must never live here is an
@@ -85,16 +85,16 @@ permissive.** `escalate_all` never clears a hold. `reject_all` denies every `doc
 message. `escalate_all_proposals` never auto-approves and never claims to have applied
 anything. `always_active` and `log_only` are the two exceptions, and only because
 "no retirement registry configured" and "no notification transport configured" have
-genuinely non-restrictive correct answers. A default that guesses at policy — that
+genuinely non-restrictive correct answers. A default that guesses at policy -- that
 auto-approves because the payload "looks fine," or that writes somewhere because a
-credential happened to be present — is a bug in this repo regardless of how convenient it
+credential happened to be present -- is a bug in this repo regardless of how convenient it
 is for the deployment that wrote it.
 
 **Where the org-specific half lives.** For Redesign Health, all of it is
 `redesignhealth/agent-comms-approvals`' `rh_comms_plugins` package, layered onto this
 repo's published image by that repo's `Dockerfile.board-derived` and pointed at by env
 vars set in `rh-data-platform`'s Terraform. That package deliberately does **not** import
-`agent-comms-mcp` — it implements each seam structurally (duck-typed), producing and
+`agent-comms-mcp` -- it implements each seam structurally (duck-typed), producing and
 consuming value types by shape rather than by class identity, because a dependency edge
 in that direction would be circular with the derived-image build chain. Preserve that:
 when adding a seam, do not design an interface that can only be implemented by importing
@@ -104,11 +104,11 @@ dicts, and UUIDs; expected failures should be *returned* as typed outcomes rathe
 
 **The test for a proposed change is mechanical, not a matter of taste.** Ask: *would a
 different company, deploying this board for a completely different purpose, want this
-code?* If the honest answer is no — if the code encodes what *our* tickets look like,
+code?* If the honest answer is no -- if the code encodes what *our* tickets look like,
 what *our* bots are called, which of *our* systems is authoritative, or what *we* consider
-an acceptable risk — it belongs behind a seam. If the answer is yes — schema validation,
+an acceptable risk -- it belongs behind a seam. If the answer is yes -- schema validation,
 membership, dedup, rate limiting, audit, state machines, idempotency, race prevention,
-anti-enumeration, redaction — it belongs here, and it should be built to be genuinely
+anti-enumeration, redaction -- it belongs here, and it should be built to be genuinely
 generic rather than generic-looking.
 
 **Historical note, kept deliberately.** The proposal pipeline
@@ -1658,17 +1658,20 @@ on.
 
 `RISK_SCORER` (default `boundary_v1`), `AUTO_APPROVER` (default
 `escalate_all`), `APPROVAL_NOTIFIER` (default `log_only`), `ACTIVE_CHECKER`
-(default `always_active`, TECH-5703 — see "A fifth seam" below), and
-`DOCS_VERIFIER` (default `reject_all`, TECH-5998 — see "A sixth seam" below)
+(default `always_active`, TECH-5703 -- see "A fifth seam" below),
+`DOCS_VERIFIER` (default `reject_all`, TECH-5998 -- see "A sixth seam" below), and
+`PROPOSAL_JUDGE` (default `escalate_all_proposals` -- see "A seventh seam" below)
 each resolve a registry name or, if the value contains a `:`, an import path
-(`"pkg.module:factory"`) via `importlib` — letting a deployment plug in a
+(`"pkg.module:factory"`) via `importlib` -- letting a deployment plug in a
 private implementation from its own package on `PYTHONPATH` without forking
-this repo. All five are validated at process start
+this repo. All six are validated at process start
 (`plugins.validate_configuration()`, called from `main._cli()` beside the
 existing `DATABASE_URL` fail-fast check): an unknown name, a bad import path,
 or (for `APPROVAL_NOTIFIER=webhook`) a missing `APPROVAL_WEBHOOK_URL`/
 `APPROVAL_WEBHOOK_SECRET` pair crashes at boot, never lazily on the first
-high-risk message.
+high-risk message (with the sole exception of `PROPOSAL_JUDGE`, which logs a
+startup WARNING when unset rather than crashing, since its default is safe but
+silently inert).
 
 **Trust model for `pkg.module:factory` import paths (deliberate, not a
 vulnerability):** every current call site into `resolve_plugin_name` (both
@@ -1782,21 +1785,21 @@ sender as "your summary failed grounding review."
 **A seventh seam, `PROPOSAL_JUDGE`** (default `escalate_all_proposals`), resolves the
 same way as the other stateless, process-wide-singleton seams
 (`plugins.resolve_plugin`/`plugins.validate_configuration`, which now also emits a
-startup WARNING — not a crash — when this one specifically is left unset, since its
+startup WARNING -- not a crash -- when this one specifically is left unset, since its
 default is safe but silent). Unlike the other six, it owns FOUR responsibilities for one
 pipeline (the proposal submission pipeline below) rather than one question for the
 comms pipeline: `classify(kind, action) -> ProposalClassification` (submit-time
-admission + server-derived priority — synchronous, side-effect-free, may raise
+admission + server-derived priority -- synchronous, side-effect-free, may raise
 `ValueError` for an unsupported `kind`), `fingerprint(ctx) -> ProposalFingerprint`
 (the target's current state digest, or `FINGERPRINT_NO_TARGET`/`FINGERPRINT_UNAVAILABLE`),
-`judge(ctx) -> ProposalVerdict` (auto-apply now, or hold for a human — never rejects on a
+`judge(ctx) -> ProposalVerdict` (auto-apply now, or hold for a human -- never rejects on a
 bot's behalf), and `apply(ctx) -> ProposalApplyOutcome` (perform the actual external
 write). One seam, not four, because a judge's auto-approval preconditions are
-deliberately coupled to its own applier's requirements — splitting them across
+deliberately coupled to its own applier's requirements -- splitting them across
 independently-configurable knobs would let a mismatched pair become reachable
 configuration rather than a code bug. The default, `EscalateAllProposalJudge`, accepts
 any `kind` at `low` priority, never fingerprints a real target, never auto-approves, and
-never writes anywhere — safe-by-inertness, not a `RejectAllDocsVerifier`-style submit-time
+never writes anywhere -- safe-by-inertness, not a `RejectAllDocsVerifier`-style submit-time
 rejection, since the generic dedup/rate-limit/audit/state-machine half of this pipeline is
 real infrastructure a bare deployment should still get. Every call into this seam is
 wrapped defensively by the board (`service._classify_proposal`/`_safe_fingerprint`/
@@ -1807,7 +1810,7 @@ plugin, or one returning a contract-violating value (a `priority` outside
 rejected via 422 at submission time or normalized to a safe outcome (pending status or
 `apply_failed`) rather than reaching an unhandled 500 or a DB CHECK violation. For Redesign Health, the concrete implementation
 (Linear/GitHub-backed deterministic rules) lives in `agent-comms-approvals`'
-`rh_comms_plugins.proposal_judge` — see "The proposal submission pipeline" below.
+`rh_comms_plugins.proposal_judge` -- see "The proposal submission pipeline" below.
 
 **`owner_sub` provenance — accepted risk, partially resolved by the
 snapshot design.** Every high-risk post now depends on the decide

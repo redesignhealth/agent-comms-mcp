@@ -5910,9 +5910,9 @@ def _classify_proposal(judge: ProposalJudge, kind: str, action: dict[str, Any]) 
 
     ``classify()`` is contractually synchronous, side-effect-free, and
     allowed exactly one exception type: ``ValueError``, for an unsupported
-    ``kind`` -- propagated here unchanged, mapped to 422 by both
-    ``main.py`` and ``providers.proposals`` exactly as the pre-seam
-    ``_derive_proposal_priority`` was. Any OTHER exception is a plugin bug,
+    ``kind`` -- wrapped into a board-controlled message and mapped to 422 by
+    both ``main.py`` and ``providers.proposals`` (preserving the original
+    exception as ``__cause__`` for logging). Any OTHER exception is a plugin bug,
     not a caller-input problem -- but this runs before
     ``_dedup_or_insert_proposal``, so there is no hold yet to fail closed
     onto; it is converted into the same ``ValueError`` -> 422 path instead
@@ -5927,32 +5927,8 @@ def _classify_proposal(judge: ProposalJudge, kind: str, action: dict[str, Any]) 
     """
     try:
         classification = judge.classify(kind, action)
-        if not isinstance(classification, ProposalClassification):
-            logger.warning(
-                "proposal judge classify() returned a malformed result (%r) for kind=%r; "
-                "rejecting submission",
-                classification,
-                kind,
-            )
-            raise ValueError(
-                f"proposal classification failed for kind {kind!r}: "
-                f"expected ProposalClassification, got {type(classification).__name__}"
-            )
-        if classification.priority not in PROPOSAL_HOLD_LEVELS:
-            logger.warning(
-                "proposal judge classify() returned invalid priority %r for kind=%r; "
-                "rejecting submission",
-                classification.priority,
-                kind,
-            )
-            levels = sorted(PROPOSAL_HOLD_LEVELS)
-            raise ValueError(
-                f"proposal judge returned invalid priority {classification.priority!r} "
-                f"for kind {kind!r}; must be one of {levels}"
-            )
-        return classification.priority
-    except ValueError:
-        raise
+    except ValueError as exc:
+        raise ValueError(f"unsupported proposal kind: {kind!r}") from exc
     except Exception as exc:
         logger.warning(
             "proposal judge classify() raised for kind=%r: %s",
@@ -5962,18 +5938,57 @@ def _classify_proposal(judge: ProposalJudge, kind: str, action: dict[str, Any]) 
         )
         raise ValueError(f"proposal classification failed for kind {kind!r}") from exc
 
+    if not isinstance(classification, ProposalClassification):
+        logger.warning(
+            "proposal judge classify() returned a malformed result (%r) for kind=%r; "
+            "rejecting submission",
+            classification,
+            kind,
+        )
+        raise ValueError(
+            f"proposal classification failed for kind {kind!r}: "
+            f"expected ProposalClassification, got {type(classification).__name__}"
+        )
+    if classification.priority not in PROPOSAL_HOLD_LEVELS:
+        logger.warning(
+            "proposal judge classify() returned invalid priority %r for kind=%r; "
+            "rejecting submission",
+            classification.priority,
+            kind,
+        )
+        levels = sorted(PROPOSAL_HOLD_LEVELS)
+        raise ValueError(
+            f"proposal judge returned invalid priority {classification.priority!r} "
+            f"for kind {kind!r}; must be one of {levels}"
+        )
+    return classification.priority
+
 
 _FINGERPRINT_CONTRACT_VIOLATION_DETAIL = "unable to verify target status"
+_ALLOWED_PROPOSAL_TARGET_ERROR_STATUS_CODES: frozenset[int] = frozenset({422, 500, 503})
+_MAX_PROPOSAL_ERROR_DETAIL_LENGTH = 500
+_PROPOSAL_TRUNCATED_SUFFIX = "... [truncated]"
+
+
+def _truncate_proposal_string(text: str, max_length: int) -> str:
+    """Truncate ``text`` to at most ``max_length`` characters, appending
+    ``"... [truncated]"`` if truncated.
+    """
+    if len(text) <= max_length:
+        return text
+    prefix_len = max_length - len(_PROPOSAL_TRUNCATED_SUFFIX)
+    return text[:prefix_len] + _PROPOSAL_TRUNCATED_SUFFIX
 
 
 def _is_well_formed_target_error(err: Any) -> bool:
     """True if ``err`` is a well-formed ``ProposalTargetError`` with valid
-    field types (TECH-5872/TECH-5877 seam defensive check).
+    field types and an allowed status code (TECH-5872/TECH-5877 seam defensive check).
     """
     return (
         isinstance(err, ProposalTargetError)
         and isinstance(err.status_code, int)
         and not isinstance(err.status_code, bool)
+        and err.status_code in _ALLOWED_PROPOSAL_TARGET_ERROR_STATUS_CODES
         and isinstance(err.error_code, str)
         and bool(err.error_code)
         and isinstance(err.detail, str)
@@ -6008,6 +6023,20 @@ async def _safe_fingerprint(judge: ProposalJudge, ctx: ProposalContext) -> Propo
             if result.status == FINGERPRINT_UNAVAILABLE and _is_well_formed_target_error(
                 result.error
             ):
+                assert result.error is not None
+                truncated_detail = _truncate_proposal_string(
+                    result.error.detail, _MAX_PROPOSAL_ERROR_DETAIL_LENGTH
+                )
+                if truncated_detail != result.error.detail:
+                    return ProposalFingerprint(
+                        status=FINGERPRINT_UNAVAILABLE,
+                        error=ProposalTargetError(
+                            status_code=result.error.status_code,
+                            error_code=result.error.error_code,
+                            detail=truncated_detail,
+                            log_detail=result.error.log_detail,
+                        ),
+                    )
                 return result
         logger.warning(
             "proposal judge fingerprint() returned a malformed result (%r) for "
@@ -6552,7 +6581,7 @@ async def create_proposal(
             kind,
             action_type,
             target_id,
-            error.log_detail,
+            error.log_detail or error.detail,
         )
         raise ProposalTargetUnavailableError(
             status_code=error.status_code, error_code=error.error_code, detail=error.detail
@@ -6617,6 +6646,7 @@ async def create_proposal(
         owner_sub=owner_sub,
         hold_id=hold.id,
     )
+    is_judge_error = False
     try:
         verdict = await judge.judge(judge_ctx)
         if not isinstance(verdict, ProposalVerdict):
@@ -6633,6 +6663,7 @@ async def create_proposal(
                 "pending",
                 f"judge error: expected ProposalVerdict, got {verdict_type}",
             )
+            is_judge_error = True
         elif not isinstance(verdict.approved, bool):
             # Fix 2: approved must be an actual boolean, never plain truthiness.
             # In Python, strings like "false" or numbers like 1 are truthy;
@@ -6650,6 +6681,7 @@ async def create_proposal(
                 "pending",
                 f"judge error: ProposalVerdict.approved must be a bool, got {app_type}",
             )
+            is_judge_error = True
         elif verdict.decision_note is not None and not isinstance(verdict.decision_note, str):
             logger.warning(
                 "proposal judge for (kind=%r, action_type=%r) returned non-str decision_note "
@@ -6664,9 +6696,13 @@ async def create_proposal(
                 "pending",
                 f"judge error: ProposalVerdict.decision_note must be None or str, got {note_type}",
             )
+            is_judge_error = True
         else:
             judged_status = "approved" if verdict.approved else "pending"
-            decision_note = verdict.decision_note
+            note = verdict.decision_note
+            if note is not None:
+                note = _truncate_proposal_string(note, MAX_DECISION_REASON_LENGTH)
+            decision_note = note
     except asyncio.CancelledError:
         # BaseException, not Exception -- already excluded from the guard
         # below under Python's actual exception hierarchy, but re-raised
@@ -6696,8 +6732,9 @@ async def create_proposal(
             exc_info=True,
         )
         judged_status, decision_note = "pending", f"judge error: {type(exc).__name__}"
+        is_judge_error = True
 
-    if decision_note is not None and decision_note.startswith("judge error: "):
+    if is_judge_error:
         # Bug fix: unlike a legitimately-pending judge verdict (always
         # decision_note=None by convention -- see e.g.
         # EscalateAllProposalJudge.judge), THIS decision_note describes a
@@ -7281,7 +7318,27 @@ async def _safe_apply(judge: ProposalJudge, ctx: ProposalContext) -> ProposalApp
                 log_detail=f"apply() returned non-bool applied: {outcome.applied!r}",
             )
         if outcome.applied:
-            if outcome.result is None or isinstance(outcome.result, dict):
+            if outcome.result is None:
+                return outcome
+            if isinstance(outcome.result, dict):
+                try:
+                    json.dumps(outcome.result)
+                except (TypeError, ValueError) as exc:
+                    logger.warning(
+                        "proposal judge apply() returned applied=True with non-JSON-serializable "
+                        "result (%s) for hold %s; treating as apply_failed",
+                        type(exc).__name__,
+                        ctx.hold_id,
+                    )
+                    return ProposalApplyOutcome(
+                        applied=False,
+                        result=None,
+                        caller_error=_APPLY_ERROR_PLUGIN_CONTRACT_VIOLATION_MESSAGE,
+                        log_detail=(
+                            "apply() returned applied=True with a non-JSON-serializable "
+                            f"result: {exc}"
+                        ),
+                    )
                 return outcome
             logger.warning(
                 "proposal judge apply() returned applied=True with a non-dict result (%s) "
@@ -7312,6 +7369,16 @@ async def _safe_apply(judge: ProposalJudge, ctx: ProposalContext) -> ProposalApp
                     if isinstance(outcome.log_detail, str) and outcome.log_detail
                     else "apply() returned applied=False with no caller_error"
                 ),
+            )
+        truncated_caller_error = _truncate_proposal_string(
+            outcome.caller_error, _MAX_PROPOSAL_ERROR_DETAIL_LENGTH
+        )
+        if truncated_caller_error != outcome.caller_error:
+            return ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error=truncated_caller_error,
+                log_detail=outcome.log_detail,
             )
         return outcome
     except asyncio.CancelledError:
@@ -7595,7 +7662,49 @@ async def _apply_or_finalize_proposal_hold(
     # client disconnect) that this documents the residual gap rather than
     # trading it for a session-safety hazard that would apply on every
     # single decide.
-    await session.commit()
+    try:
+        await session.commit()
+    except asyncio.CancelledError:
+        raise
+    except Exception as commit_exc:
+        # If the terminal commit fails (e.g. database error or serialization issue),
+        # roll back and attempt to resolve the row to apply_failed rather than
+        # leaving it permanently stranded at `expected_status` ("applying").
+        logger.warning(
+            "proposal terminal commit failed for hold_id=%s target_id=%s: %s; "
+            "attempting recovery to apply_failed to avoid stranding row",
+            hold_id,
+            target_id,
+            commit_exc,
+            exc_info=True,
+        )
+        await session.rollback()
+        try:
+            recovery_hold = await _find_proposal_hold(session, hold_id, for_update=True)
+            if recovery_hold is not None and recovery_hold.status == expected_status:
+                recovery_hold.status = "apply_failed"
+                recovery_hold.apply_error = _APPLY_ERROR_PLUGIN_CONTRACT_VIOLATION_MESSAGE
+                recovery_hold.decision_source = decision_source
+                recovery_hold.decided_by_actor_id = decided_by_actor_id
+                recovery_hold.decided_at = _now()
+                recovery_hold.decision_note = decision_note
+                _audit(
+                    session,
+                    actor_sub=decided_by_actor_id,
+                    action="proposal.apply_failed",
+                    detail={
+                        "hold_id": str(hold_id),
+                        "target_id": target_id,
+                        "error": str(commit_exc),
+                    },
+                )
+                await session.commit()
+                await session.refresh(recovery_hold)
+                return _proposal_dict(recovery_hold)
+        except Exception:
+            await session.rollback()
+            raise commit_exc from None
+        raise commit_exc
     # `updated_at`'s onupdate=text("now()") (models.py) leaves the ORM
     # attribute expired after this UPDATE's commit -- `_proposal_dict`
     # reads it, so this refresh (consolidated here for every caller of

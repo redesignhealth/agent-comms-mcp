@@ -539,9 +539,10 @@ def notifier_name(notifier: ApprovalNotifier) -> str:
 
 def validate_configuration() -> None:
     """Fail fast at process start if any of the six seams in THIS MODULE
-    don't resolve. ``OWNERSHIP_CLIENT`` is a seventh, board-wide seam that
-    lives in ``service.py`` and is validated separately, by
-    ``service.validate_ownership_client_configuration()``.
+    don't resolve. ``OWNERSHIP_CLIENT`` is the sixth board-wide seam (the
+    only one living in ``service.py``) and is validated separately, by
+    ``service.validate_ownership_client_configuration()``; ``PROPOSAL_JUDGE``
+    is the seventh board-wide seam (added by TECH-5872/TECH-5877).
 
     Called from ``main._cli()`` beside the existing ``db.database_url()``
     fail-fast call — an unknown registry name, a bad import path, or (for
@@ -1196,7 +1197,8 @@ class ProposalTargetError(NamedTuple):
 
     Authored by the plugin -- which alone knows whether a failure was a
     missing credential, a transport error, or a target-side rejection.
-    ``detail`` is returned to the caller verbatim -- the plugin is
+    ``detail`` is returned to the caller verbatim (truncated to 500 chars
+    with ``"... [truncated]"`` by the board if exceeded) -- the plugin is
     responsible for it containing no credential names, URLs with query
     params, or upstream error payloads. ``log_detail`` is NEVER returned
     over the API; it lands in the board's WARNING log and audit row only,
@@ -1240,8 +1242,9 @@ class ProposalVerdict(NamedTuple):
     ``approved=True`` means "auto-apply now, no human needed"; ``False``
     means "hold for a human." There is deliberately NO ``rejected`` value: a
     judge never rejects on a bot's behalf. ``decision_note`` is persisted
-    verbatim to ``proposal_holds.decision_note`` and IS visible to the
-    submitting bot, so it must be caller-safe.
+    to ``proposal_holds.decision_note`` (truncated to ``MAX_DECISION_REASON_LENGTH``
+    (2000 chars) with ``"... [truncated]"`` by the board if exceeded) and IS
+    visible to the submitting bot, so it must be caller-safe.
     """
 
     approved: bool
@@ -1255,9 +1258,10 @@ class ProposalApplyOutcome(NamedTuple):
         ``result`` (when non-``None``) stored on
         ``proposal_holds.apply_result``.
     ``applied=False`` -> ``status="apply_failed"``, ``caller_error`` stored
-        on ``proposal_holds.apply_error`` and returned over the API.
-        ``log_detail`` goes to the board's WARNING log + audit row only,
-        never the API -- same split as ``ProposalTargetError`` above.
+        on ``proposal_holds.apply_error`` and returned over the API
+        (truncated to 500 chars with ``"... [truncated]"`` by the board if
+        exceeded). ``log_detail`` goes to the board's WARNING log + audit row
+        only, never the API -- same split as ``ProposalTargetError`` above.
 
     Returning ``applied=False`` is a NORMAL, queryable outcome, not an
     error condition. An implementation must not raise for it.
@@ -1270,18 +1274,29 @@ class ProposalApplyOutcome(NamedTuple):
 
 
 class ProposalJudge(Protocol):
+    """Pluggable proposal judging and applying seam (TECH-5872/TECH-5877).
+
+    The board defensively validates all return values and exceptions at
+    the seam boundary:
+    - ``classify()``: ``ValueError`` is wrapped into a board-controlled
+      message and mapped to 422.
+    - ``fingerprint()``: ``error.detail`` is capped at 500 chars (truncated
+      with ``"... [truncated]"``).
+    - ``judge()``: ``decision_note`` is capped at 2000 chars (truncated
+      with ``"... [truncated]"``).
+    - ``apply()``: ``caller_error`` is capped at 500 chars (truncated
+      with ``"... [truncated]"``), and ``result`` must be a JSON-serializable
+      dict (or ``None``).
+    """
+
     def classify(self, kind: str, action: dict[str, Any]) -> ProposalClassification:
         """Admit (or refuse) this ``kind`` and derive its priority.
         Synchronous and side-effect-free by contract -- called before the
         rate-limit attempt marker is committed, so it must not perform I/O.
 
-        Raise ``ValueError`` for an unsupported ``kind``; the board maps
-        that to 422 with the message verbatim, exactly as the pre-seam
-        ``_derive_proposal_priority`` did. This is the one place the seam
-        uses an exception rather than an outcome object, because
-        ``ValueError`` is a stdlib type both sides already share and
-        ``service.py``/``main.py`` already have a ``ValueError -> 422``
-        mapping for every other proposal-input problem.
+        Raise ``ValueError`` for an unsupported ``kind``; the board wraps
+        that into a board-controlled message and maps it to 422, preserving
+        the original exception as ``__cause__`` for logging.
         """
         ...
 

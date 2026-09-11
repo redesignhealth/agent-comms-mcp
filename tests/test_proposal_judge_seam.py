@@ -95,10 +95,12 @@ class TestClassifyProposalSeam:
         judge = FakeProposalJudge(classify_result=ProposalClassification(priority="high"))
         assert _classify_proposal(judge, "linear_progress_update", {}) == "high"
 
-    def test_value_error_propagates_unchanged(self) -> None:
-        judge = FakeProposalJudge(classify_raises=ValueError("unsupported kind: 'nonsense'"))
-        with pytest.raises(ValueError, match="unsupported kind"):
+    def test_value_error_wrapped_into_board_controlled_message(self) -> None:
+        judge = FakeProposalJudge(classify_raises=ValueError("secret internal config key: 12345"))
+        with pytest.raises(ValueError, match="unsupported proposal kind: 'nonsense'") as exc_info:
             _classify_proposal(judge, "nonsense", {})
+        assert "secret internal config key: 12345" not in str(exc_info.value)
+        assert "secret internal config key: 12345" in str(exc_info.value.__cause__)
 
     def test_non_value_error_is_converted_to_value_error(self) -> None:
         """Fail closed: classify() runs before any hold exists, so there is
@@ -217,6 +219,10 @@ class TestSafeFingerprintSeam:
             ProposalTargetError(status_code=500, error_code="", detail="msg", log_detail=None),
             ProposalTargetError(status_code=500, error_code="err", detail="", log_detail=None),
             ProposalTargetError(status_code=500, error_code="err", detail="msg", log_detail=123),  # type: ignore[arg-type]
+            ProposalTargetError(status_code=0, error_code="err", detail="msg", log_detail=None),
+            ProposalTargetError(status_code=200, error_code="err", detail="msg", log_detail=None),
+            ProposalTargetError(status_code=400, error_code="err", detail="msg", log_detail=None),
+            ProposalTargetError(status_code=600, error_code="err", detail="msg", log_detail=None),
         ],
     )
     async def test_unavailable_status_with_malformed_error_synthesizes_generic_error(
@@ -235,6 +241,29 @@ class TestSafeFingerprintSeam:
         assert result.error.status_code == 500
         assert result.error.error_code == "server_configuration_error"
         assert result.error.detail == "unable to verify target status"
+
+    async def test_target_error_detail_overlong_is_truncated(self) -> None:
+        overlong_detail = "x" * 600
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(
+                status=FINGERPRINT_UNAVAILABLE,
+                error=ProposalTargetError(
+                    status_code=503,
+                    error_code="service_unavailable",
+                    detail=overlong_detail,
+                    log_detail="raw error detail",
+                ),
+            )
+        )
+        result = await _safe_fingerprint(judge, _ctx())
+        assert result.status == FINGERPRINT_UNAVAILABLE
+        assert result.error is not None
+        assert len(result.error.detail) == 500
+        assert result.error.detail.endswith("... [truncated]")
+        assert result.error.detail.startswith("x" * 100)
+        assert result.error.status_code == 503
+        assert result.error.error_code == "service_unavailable"
+        assert result.error.log_detail == "raw error detail"
 
     async def test_unrecognized_status_is_a_contract_violation(self) -> None:
         judge = FakeProposalJudge(
@@ -360,6 +389,45 @@ class TestSafeApplySeam:
         assert result.result is None
         assert result.caller_error == "unable to apply this proposal"
         assert "non-bool applied" in (result.log_detail or "")
+
+    async def test_apply_returning_non_json_serializable_result_treated_as_apply_failed(
+        self,
+    ) -> None:
+        """A plugin returning applied=True with a dict containing non-JSON-serializable
+        values (e.g. set, datetime) must be caught by _safe_apply and normalized to
+        applied=False, rather than failing at commit time and stranding the row.
+        """
+        judge = FakeProposalJudge(
+            apply_result=ProposalApplyOutcome(
+                applied=True,
+                result={"invalid_set": {1, 2, 3}},
+                caller_error=None,
+                log_detail=None,
+            )
+        )
+        result = await _safe_apply(judge, _ctx())
+        assert result.applied is False
+        assert result.result is None
+        assert result.caller_error == "unable to apply this proposal"
+        assert "non-JSON-serializable" in (result.log_detail or "")
+
+    async def test_apply_caller_error_overlong_is_truncated(self) -> None:
+        overlong_error = "e" * 600
+        judge = FakeProposalJudge(
+            apply_result=ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error=overlong_error,
+                log_detail="raw detail",
+            )
+        )
+        result = await _safe_apply(judge, _ctx())
+        assert result.applied is False
+        assert result.result is None
+        assert len(result.caller_error or "") == 500
+        assert (result.caller_error or "").endswith("... [truncated]")
+        assert (result.caller_error or "").startswith("e" * 100)
+        assert result.log_detail == "raw detail"
 
 
 @pytest.mark.usefixtures("_migrated_schema")
