@@ -445,56 +445,68 @@ never reach `decide_proposal` at all),
  detected at apply/decide time, by which point decision fields are already
  stamped at the `applying` claim (see models.ProposalHold's class
  docstring and the `ck_proposal_holds_decision_consistency` CHECK).
- **Stuck `applying` rows** (the process dies, OR the request is cancelled,
- between the claim commit and the terminal write) have two distinct
- recovery stories depending on the cause (updated, Argus review round-6
- suggestion -- a prior version of this note said the ONLY recovery was
- manual DB intervention, which stopped being true once round-5 B1 added
- cooperative cancellation handling):
- - **Cancellation landing during the fingerprinter or applier await IS
-   auto-recovered** (narrowed, Argus review round-7 suggestion -- a prior
-   version of this bullet implied ALL cancellations during this function
-   are covered, which overstates it): `service._apply_or_finalize_proposal_hold`
-   catches `asyncio.CancelledError` specifically around the fingerprinter
-   and applier awaits, still performs the SAME terminal write every other
-   path takes (setting `"apply_failed"` with a distinguishable
-   `apply_error`), and only re-raises the cancellation afterward -- for
-   THAT window, the row reaches a real terminal status, it is not left
-   stuck. Two windows outside that coverage remain, both undocumented
-   gaps rather than closed:
-   - **Pre-`try:` awaits** -- the initial `_find_proposal_hold` re-fetch
-     and its `session.commit()`, which run BEFORE the try/except block, are
-     not wrapped at all; a cancellation landing there propagates
-     immediately with no terminal write, functionally identical to the
-     hard-process-death case below (the row was already `"applying"`
-     before this function was ever called, so nothing new is stranded,
-     but nothing recovers it either).
-   - **A second cancellation during the terminal write itself** (the
-     re-fetch through commit/refresh AFTER the try/except block) -- that
-     narrower window is a residual gap, documented at that code's own
-     comment rather than closed via `asyncio.shield` (sharing a single
-     `AsyncSession` across a shielded Task is its own hazard -- see that
-     comment for why the trade-off wasn't taken).
-   - **The concurrent-resolution early-return path** (`hold.status !=
-     expected_status` on re-fetch) deliberately does NOT attempt a
-     terminal write of its own -- something else already resolved the row,
-     so there is nothing for this call to strand; a cancellation observed
-     there just re-raises after the (already-resolved) row's own no-op
-     commit.
- - **A hard process death** (the container itself dies mid-apply, not a
-   cooperative cancellation) still has no background reaper AND no in-app
-   recovery path -- an earlier version of this note claimed a fresh
-   `POST /proposals` resubmission could recover one; it cannot, precisely
-   BECAUSE the round-3 B1 dedup fix now also matches `applying` rows: a
-   resubmission for the same target finds the stuck row via dedup and is
-   folded into it as a no-op, per `_dedup_or_insert_proposal`'s "don't
-   mutate an in-flight applying row" guard -- it can never re-arm it). The
-   row is also invisible to `list_pending_proposal_holds`
-   (`status='pending'` only) and a decide call on it raises
-   `HoldAlreadyDecidedError`. The only recovery for THIS case is manual DB
-   intervention: an operator running `UPDATE proposal_holds SET status =
-   'apply_failed', apply_error = '<note>' WHERE id = '<hold_id>'` (the
-   same terminal status a genuine Linear failure would have produced),
+  **Stuck `applying` rows** (the process dies, the request is cancelled,
+  OR a terminal commit fails between the claim commit and completion) have
+  distinct recovery stories depending on the cause (updated, Argus review round-6/round-9
+  suggestions):
+  - **Cancellation landing during the fingerprinter or applier await IS
+    auto-recovered** (narrowed, Argus review round-7 suggestion -- a prior
+    version of this bullet implied ALL cancellations during this function
+    are covered, which overstates it): `service._apply_or_finalize_proposal_hold`
+    catches `asyncio.CancelledError` specifically around the fingerprinter
+    and applier awaits, still performs the SAME terminal write every other
+    path takes (setting `"apply_failed"` with a distinguishable
+    `apply_error`), and only re-raises the cancellation afterward -- for
+    THAT window, the row reaches a real terminal status, it is not left
+    stuck. Two windows outside that coverage remain, both undocumented
+    gaps rather than closed:
+    - **Pre-`try:` awaits** -- the initial `_find_proposal_hold` re-fetch
+      and its `session.commit()`, which run BEFORE the try/except block, are
+      not wrapped at all; a cancellation landing there propagates
+      immediately with no terminal write, functionally identical to the
+      hard-process-death case below (the row was already `"applying"`
+      before this function was ever called, so nothing new is stranded,
+      but nothing recovers it either).
+    - **A second cancellation during the terminal write itself** (the
+      re-fetch through commit/refresh AFTER the try/except block) -- that
+      narrower window is a residual gap, documented at that code's own
+      comment rather than closed via `asyncio.shield` (sharing a single
+      `AsyncSession` across a shielded Task is its own hazard -- see that
+      comment for why the trade-off wasn't taken).
+    - **The concurrent-resolution early-return and recovery-fallthrough paths**
+      (`hold.status != expected_status` on re-fetch, or `recovery_hold`
+      status mismatch on recovery re-fetch) deliberately do NOT attempt a
+      terminal write of their own -- something else already resolved the row,
+      so there is nothing for this call to strand; a cancellation observed
+      there re-raises cleanly after commit rollback without stranding.
+  - **Terminal commit failure IS auto-recovered to its genuine terminal status**:
+    if the terminal commit fails (e.g. DB serialization failure or transient
+    error), the function catches the failure, rolls back, and attempts recovery
+    by re-applying the *exact same* computed terminal state (`applied` with
+    `apply_result`/`applied_at`, `stale` with `_stale_decision_note`, or
+    `apply_failed` with the original `apply_error`). Crucially, it does not
+    blindly overwrite successful external writes with `apply_failed`, preventing
+    duplicate external writes on caller retries. If that recovery commit itself
+    also fails, a last-ditch minimal write attempts to mark the row `apply_failed`
+    with `_APPLY_ERROR_BOARD_COMMIT_FAILURE_MESSAGE` (clearing `applied_at` and
+    `apply_result`, skipping audit writes) to avoid stranding. If even that
+    last-ditch commit fails (three consecutive DB failures), the row remains
+    stranded at `applying` with an error logged -- this is the documented residual
+    gap for commit failures.
+  - **A hard process death** (the container itself dies mid-apply, not a
+    cooperative cancellation) still has no background reaper AND no in-app
+    recovery path -- an earlier version of this note claimed a fresh
+    `POST /proposals` resubmission could recover one; it cannot, precisely
+    BECAUSE the round-3 B1 dedup fix now also matches `applying` rows: a
+    resubmission for the same target finds the stuck row via dedup and is
+    folded into it as a no-op, per `_dedup_or_insert_proposal`'s "don't
+    mutate an in-flight applying row" guard -- it can never re-arm it). The
+    row is also invisible to `list_pending_proposal_holds`
+    (`status='pending'` only) and a decide call on it raises
+    `HoldAlreadyDecidedError`. The only recovery for THIS case is manual DB
+    intervention: an operator running `UPDATE proposal_holds SET status =
+    'apply_failed', apply_error = '<note>' WHERE id = '<hold_id>'` (the
+    same terminal status a genuine target-write failure would have produced),
    after which a fresh `POST /proposals` resubmission for the same target
    works normally again. Automating this (a background reaper that
    transitions `applying` rows older than some threshold to

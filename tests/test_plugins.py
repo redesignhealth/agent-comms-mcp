@@ -49,6 +49,11 @@ class TestResolvePluginRegistryLookup:
         scorer = resolve_plugin("SOME_ENV_VAR", _REGISTRY, "boundary_v1")
         assert isinstance(scorer, BoundaryCrossingScorer)
 
+    def test_empty_env_var_falls_back_to_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SOME_ENV_VAR", "")
+        scorer = resolve_plugin("SOME_ENV_VAR", _REGISTRY, "boundary_v1")
+        assert isinstance(scorer, BoundaryCrossingScorer)
+
     def test_env_var_overrides_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SOME_ENV_VAR", "fake")
         scorer = resolve_plugin(
@@ -656,6 +661,15 @@ class TestGetProposalJudgeAndValidateConfiguration:
         with caplog.at_level("WARNING", logger="plugins"):
             plugins.validate_configuration()
         assert any(plugins.PROPOSAL_JUDGE_ENV_VAR in record.message for record in caplog.records)
+
+    def test_validate_configuration_logs_a_warning_and_uses_default_when_empty(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv(plugins.PROPOSAL_JUDGE_ENV_VAR, "")
+        with caplog.at_level("WARNING", logger="plugins"):
+            plugins.validate_configuration()
+        assert any(plugins.PROPOSAL_JUDGE_ENV_VAR in record.message for record in caplog.records)
+        assert isinstance(plugins.get_proposal_judge(), plugins.EscalateAllProposalJudge)
 
     def test_validate_configuration_does_not_warn_when_set(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture

@@ -483,7 +483,7 @@ def resolve_plugin(env_var: str, registry: dict[str, Callable[[], Any]], default
     See ``resolve_plugin_name`` for the actual name-to-instance resolution
     rule (registry lookup or ``pkg.module:factory`` import path).
     """
-    name = os.environ.get(env_var, default)
+    name = os.environ.get(env_var) or default
     return resolve_plugin_name(env_var, registry, name)
 
 
@@ -1287,7 +1287,10 @@ class ProposalJudge(Protocol):
       ``{422, 500, 503}`` -- any other value (e.g. 404, 409, 429, all
       reasonable-seeming choices) is silently replaced with a synthesized
       500/``server_configuration_error`` rather than reaching the caller,
-      with no signal to the plugin that this happened.
+      with no signal to the plugin that this happened. Map LLM-API or
+      upstream rate-limit errors to `503` (service temporarily unavailable),
+      not `429`, to preserve the retryable signal within the
+      `{422, 500, 503}` allowlist.
     - ``judge()``: ``decision_note`` is capped at 2000 chars (truncated
       with ``"... [truncated]"``).
     - ``apply()``: ``caller_error`` is capped at 500 chars (truncated
@@ -1308,9 +1311,16 @@ class ProposalJudge(Protocol):
         the original exception as ``__cause__`` for logging -- so a
         ``ValueError`` raised for a different reason would surface to the
         caller as a misleading "unsupported kind" error instead of
-        whatever the real problem was. Signal any other rejection some
-        other way (e.g. treat a malformed ``action`` as still classifiable,
-        deferring the real validation to ``fingerprint()``/``apply()``).
+        whatever the real problem was. LLM response parsing failures that
+        raise `ValueError` must be caught inside `classify()` and re-raised
+        as `RuntimeError` or a custom exception type, so they reach the broader
+        `except Exception` handler with an accurate error message instead of
+        being mistaken for an unsupported-kind rejection. Signal any other
+        rejection some other way (e.g. treat a malformed ``action`` as still
+        classifiable, deferring the real validation to
+        ``fingerprint()``/``apply()``). Prefer deferring to `fingerprint()`
+        over `apply()` -- `fingerprint()` runs before the rate-limit slot is
+        committed and the hold row is created.
         """
         ...
 

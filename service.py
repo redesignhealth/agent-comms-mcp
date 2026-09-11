@@ -5971,8 +5971,10 @@ _PROPOSAL_TRUNCATED_SUFFIX = "... [truncated]"
 
 
 def _truncate_proposal_string(text: str, max_length: int) -> str:
-    """Truncate ``text`` to at most ``max_length`` characters, appending
-    ``"... [truncated]"`` if truncated.
+    """Truncate ``text`` to at most ``max_length`` characters (except when
+    ``max_length < len(_PROPOSAL_TRUNCATED_SUFFIX)`` (15), in which case
+    the full suffix is returned), appending ``"... [truncated]"`` if
+    truncated.
 
     Argus review round-9 suggestion: without the ``max(0, ...)`` clamp
     below, ``prefix_len`` would go negative for a ``max_length`` shorter
@@ -7286,10 +7288,9 @@ _APPLY_ERROR_PLUGIN_CONTRACT_VIOLATION_MESSAGE = "unable to apply this proposal"
 # message above -- this is a fault entirely on the board's own side (a
 # terminal-commit failure, e.g. a database error or serialization issue),
 # nothing to do with the configured judge plugin. Used only by the
-# terminal-commit recovery path in `_apply_or_finalize_proposal_hold`, and
-# only as a fallback when that branch's own computed terminal state had no
-# more specific `apply_error` of its own to preserve (see that function's
-# recovery block).
+# last-ditch commit recovery path in `_apply_or_finalize_proposal_hold`
+# when the recovery commit itself fails, to avoid stranding the row at
+# status="applying".
 _APPLY_ERROR_BOARD_COMMIT_FAILURE_MESSAGE = "apply failed due to a board infrastructure error"
 
 
@@ -7425,17 +7426,17 @@ def _stale_decision_note(original_decision_note: str | None) -> str:
     ``"stale"``. The pre-fix code simply re-stamped the SAME
     ``decision_note`` the judge/human wrote at approval time (e.g.
     ``"auto-approved: close-ticket proposal cites a valid citation"``)
-    onto the terminal ``"stale"`` row -- misleading, since NO Linear
-    write ever happens on this path. This wraps that original note
+    onto the terminal ``"stale"`` row -- misleading, since NO write to
+    the target ever happens on this path. This wraps that original note
     (still worth keeping around, for context on why it was approved in
     the first place) inside a message that makes unambiguously clear no
     write occurred."""
     if original_decision_note:
         return (
-            "not applied: target changed after approval; no Linear write was "
+            "not applied: target changed after approval; no write to the target was "
             f"performed (approval reason was: {original_decision_note})"
         )
-    return "not applied: target changed after approval; no Linear write was performed"
+    return "not applied: target changed after approval; no write to the target was performed"
 
 
 async def _apply_or_finalize_proposal_hold(
@@ -7673,6 +7674,7 @@ async def _apply_or_finalize_proposal_hold(
     terminal_status = hold.status
     terminal_apply_result = hold.apply_result
     terminal_apply_error = hold.apply_error
+    terminal_raw_apply_error = raw_apply_error
     terminal_applied_at = hold.applied_at
     terminal_decision_note = hold.decision_note
     terminal_decided_at = hold.decided_at
@@ -7724,17 +7726,8 @@ async def _apply_or_finalize_proposal_hold(
                 recovery_hold.status = terminal_status
                 # Argus review round-9 S1: preserve a genuine, already-
                 # computed `apply_error` (a real plugin `caller_error` or
-                # `_APPLY_ERROR_CANCELLED_MESSAGE`) rather than replacing
-                # it -- only fall back to the board-owned commit-failure
-                # message when this branch never set one (i.e. it isn't
-                # actually reachable today, since "apply_failed" always
-                # sets one, but guards against misattributing a future
-                # apply_failed-without-apply_error branch to the plugin).
-                recovery_hold.apply_error = terminal_apply_error or (
-                    _APPLY_ERROR_BOARD_COMMIT_FAILURE_MESSAGE
-                    if terminal_status == "apply_failed"
-                    else None
-                )
+                # `_APPLY_ERROR_CANCELLED_MESSAGE`) rather than replacing it.
+                recovery_hold.apply_error = terminal_apply_error
                 if terminal_apply_result is not None:
                     recovery_hold.apply_result = terminal_apply_result
                 recovery_hold.applied_at = terminal_applied_at
@@ -7746,15 +7739,17 @@ async def _apply_or_finalize_proposal_hold(
                     "applied": "proposal.applied",
                     "stale": "proposal.stale",
                 }.get(terminal_status, "proposal.apply_failed")
+                audit_detail: dict[str, Any] = {
+                    "hold_id": str(hold_id),
+                    "target_id": target_id,
+                }
+                if terminal_status == "apply_failed":
+                    audit_detail["error"] = terminal_raw_apply_error
                 _audit(
                     session,
                     actor_sub=decided_by_actor_id,
                     action=audit_action,
-                    detail={
-                        "hold_id": str(hold_id),
-                        "target_id": target_id,
-                        "error": str(commit_exc),
-                    },
+                    detail=audit_detail,
                 )
                 await session.commit()
                 await session.refresh(recovery_hold)
@@ -7771,19 +7766,43 @@ async def _apply_or_finalize_proposal_hold(
                 return result
         except Exception as recovery_exc:
             logger.warning(
-                "proposal recovery commit also failed for hold_id=%s target_id=%s: %s",
+                "proposal recovery commit also failed for hold_id=%s target_id=%s: %s; "
+                "attempting last-ditch apply_failed write to avoid stranding row",
                 hold_id,
                 target_id,
                 recovery_exc,
                 exc_info=True,
             )
             await session.rollback()
+            try:
+                last_ditch_hold = await _find_proposal_hold(session, hold_id, for_update=True)
+                if last_ditch_hold is not None and last_ditch_hold.status == expected_status:
+                    last_ditch_hold.status = "apply_failed"
+                    last_ditch_hold.apply_error = _APPLY_ERROR_BOARD_COMMIT_FAILURE_MESSAGE
+                    last_ditch_hold.applied_at = None
+                    last_ditch_hold.apply_result = None
+                    await session.commit()
+            except Exception as last_ditch_exc:
+                logger.error(
+                    "proposal last-ditch commit also failed for hold_id=%s target_id=%s: %s; "
+                    "row %s stranded at applying",
+                    hold_id,
+                    target_id,
+                    last_ditch_exc,
+                    hold_id,
+                    exc_info=True,
+                )
+                await session.rollback()
             # Argus review round-9 S2: chain `recovery_exc` explicitly
             # (ruff B904) rather than suppressing it with `from None` --
             # if this SECOND commit raised a DIFFERENT error, that error
             # must stay visible in logs/tracebacks instead of vanishing
             # silently.
+            if cancelled_exc is not None:
+                raise cancelled_exc from recovery_exc
             raise commit_exc from recovery_exc
+        if cancelled_exc is not None:
+            raise cancelled_exc from commit_exc
         raise commit_exc
     # `updated_at`'s onupdate=text("now()") (models.py) leaves the ORM
     # attribute expired after this UPDATE's commit -- `_proposal_dict`
