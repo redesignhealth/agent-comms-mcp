@@ -48,6 +48,7 @@ from exceptions import (
     HoldAwaitingAutoReviewError,
     HoldExpiredError,
     InvalidConversationStateError,
+    InvalidExtendError,
     RateLimitExceededError,
     SchemaVersionMismatchError,
     SiblingIdentityExistsError,
@@ -4852,11 +4853,11 @@ class TestExtendConversation:
             conversation_id=conversation.id,
             extend_by_days=10,
         )
-        assert extended.state == "active"
+        assert extended.conversation.state == "active"
         assert extended.resurrected is False
         assert extended.previous_expires_at == orig_expires_at
         expected_dt = orig_expires_at + timedelta(days=10)
-        assert abs((extended.expires_at - expected_dt).total_seconds()) < 2
+        assert abs((extended.conversation.expires_at - expected_dt).total_seconds()) < 2
 
     async def test_extend_by_days_computes_relative_to_max_current_now(
         self, session: AsyncSession
@@ -4875,7 +4876,14 @@ class TestExtendConversation:
             extend_by_days=5,
         )
         # Should be future_dt + 5 days
-        assert abs((extended_a.expires_at - (future_dt + timedelta(days=5))).total_seconds()) < 2
+        assert (
+            abs(
+                (
+                    extended_a.conversation.expires_at - (future_dt + timedelta(days=5))
+                ).total_seconds()
+            )
+            < 2
+        )
 
         # Case B: Lapsed deadline -> relative to now()
         past_dt = now - timedelta(days=5)
@@ -4891,7 +4899,7 @@ class TestExtendConversation:
         )
         # Should be approximately now() + 5 days (NOT past_dt + 5 days which would be now)
         expected_b = datetime.now(UTC) + timedelta(days=5)
-        assert abs((extended_b.expires_at - expected_b).total_seconds()) < 2
+        assert abs((extended_b.conversation.expires_at - expected_b).total_seconds()) < 2
 
     async def test_rejected_ttl_ceiling(self, session: AsyncSession) -> None:
         owner, _target, conversation = await self._start(
@@ -4899,7 +4907,7 @@ class TestExtendConversation:
         )
         now = datetime.now(UTC)
         too_far = now + MAX_CONVERSATION_TTL + timedelta(seconds=10)
-        with pytest.raises(ValueError, match="expires_at"):
+        with pytest.raises(InvalidExtendError, match="expires_at"):
             await extend_conversation(
                 session,
                 actor_sub=owner.sub,
@@ -4913,7 +4921,7 @@ class TestExtendConversation:
         owner_2, _target_2, conv_2 = await self._start(
             session, "ext-svc-owner-3b", "ext-svc-target-3b", expires_at=future_dt
         )
-        with pytest.raises(ValueError, match="expires_at"):
+        with pytest.raises(InvalidExtendError, match="expires_at"):
             await extend_conversation(
                 session,
                 actor_sub=owner_2.sub,
@@ -4922,6 +4930,34 @@ class TestExtendConversation:
                 extend_by_days=85,  # 10 + 85 = 95 > 90
             )
 
+    async def test_extend_by_days_exact_ceiling_boundary_on_lapsed_conversation_succeeds(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-6195: on a LAPSED (already-expired) conversation,
+        ``base_dt = max(expires_at, now()) == now()``, so
+        ``extend_by_days=90`` computes ``computed == now() + 90 days ==
+        MAX_CONVERSATION_TTL`` exactly. The ceiling check is
+        strictly-greater-than (``computed - now() > MAX_CONVERSATION_TTL``),
+        so this exact-boundary case must succeed, not raise -- previously
+        unverified."""
+        past_dt = datetime.now(UTC) - timedelta(days=1)
+        owner, _target, conversation = await self._start(
+            session, "ext-svc-owner-3c", "ext-svc-target-3c", expires_at=past_dt
+        )
+        before = datetime.now(UTC)
+        extended = await extend_conversation(
+            session,
+            actor_sub=owner.sub,
+            agent_id=owner.id,
+            conversation_id=conversation.id,
+            extend_by_days=90,
+        )
+        after = datetime.now(UTC)
+        assert extended.resurrected is True
+        assert extended.conversation.state == "active"
+        assert before + MAX_CONVERSATION_TTL <= extended.conversation.expires_at
+        assert extended.conversation.expires_at <= after + MAX_CONVERSATION_TTL
+
     async def test_rejected_shortening_and_past(self, session: AsyncSession) -> None:
         now = datetime.now(UTC)
         future_dt = now + timedelta(days=10)
@@ -4929,7 +4965,7 @@ class TestExtendConversation:
             session, "ext-svc-owner-4", "ext-svc-target-4", expires_at=future_dt
         )
         # Attempt to shorten
-        with pytest.raises(ValueError, match="greater than"):
+        with pytest.raises(InvalidExtendError, match="greater than"):
             await extend_conversation(
                 session,
                 actor_sub=owner.sub,
@@ -4939,7 +4975,7 @@ class TestExtendConversation:
             )
 
         # Attempt to keep unchanged (not idempotent)
-        with pytest.raises(ValueError, match="greater than"):
+        with pytest.raises(InvalidExtendError, match="greater than"):
             await extend_conversation(
                 session,
                 actor_sub=owner.sub,
@@ -4953,7 +4989,7 @@ class TestExtendConversation:
         owner_past, _target_past, conv_past = await self._start(
             session, "ext-svc-owner-4b", "ext-svc-target-4b", expires_at=past_dt
         )
-        with pytest.raises(ValueError, match="future"):
+        with pytest.raises(InvalidExtendError, match="future"):
             await extend_conversation(
                 session,
                 actor_sub=owner_past.sub,
@@ -4967,7 +5003,7 @@ class TestExtendConversation:
             session, "ext-svc-owner-5", "ext-svc-target-5"
         )
         # Both provided
-        with pytest.raises(ValueError, match="provide exactly one"):
+        with pytest.raises(InvalidExtendError, match="provide exactly one"):
             await extend_conversation(
                 session,
                 actor_sub=owner.sub,
@@ -4978,7 +5014,7 @@ class TestExtendConversation:
             )
 
         # Neither provided
-        with pytest.raises(ValueError, match="provide exactly one"):
+        with pytest.raises(InvalidExtendError, match="provide exactly one"):
             await extend_conversation(
                 session,
                 actor_sub=owner.sub,
@@ -4987,7 +5023,7 @@ class TestExtendConversation:
             )
 
         # extend_by_days out of bounds
-        with pytest.raises(ValueError, match="extend_by_days"):
+        with pytest.raises(InvalidExtendError, match="extend_by_days"):
             await extend_conversation(
                 session,
                 actor_sub=owner.sub,
@@ -4996,7 +5032,7 @@ class TestExtendConversation:
                 extend_by_days=0,
             )
 
-        with pytest.raises(ValueError, match="extend_by_days"):
+        with pytest.raises(InvalidExtendError, match="extend_by_days"):
             await extend_conversation(
                 session,
                 actor_sub=owner.sub,
@@ -5006,7 +5042,7 @@ class TestExtendConversation:
             )
 
         # Naive datetime
-        with pytest.raises(ValueError, match="timezone-aware"):
+        with pytest.raises(InvalidExtendError, match="timezone-aware"):
             await extend_conversation(
                 session,
                 actor_sub=owner.sub,
@@ -5041,7 +5077,7 @@ class TestExtendConversation:
             conversation_id=conversation.id,
             extend_by_days=7,
         )
-        assert extended.state == "active"
+        assert extended.conversation.state == "active"
         assert extended.resurrected is True
 
         # Now post_message succeeds!
@@ -5205,7 +5241,7 @@ class TestExtendConversation:
         assert log is not None
         assert log.detail is not None
         assert log.detail["previous_expires_at"] == orig_expires_at.isoformat()
-        assert log.detail["new_expires_at"] == extended.expires_at.isoformat()
+        assert log.detail["new_expires_at"] == extended.conversation.expires_at.isoformat()
         assert log.detail["previous_state"] == "active"
         assert log.detail["resurrected"] is False
 

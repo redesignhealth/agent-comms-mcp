@@ -166,7 +166,7 @@ import uuid
 from collections.abc import Callable, Sequence
 from collections.abc import Set as AbstractSet
 from datetime import UTC, datetime, timedelta
-from typing import Any, NoReturn, Protocol
+from typing import Any, NamedTuple, NoReturn, Protocol
 
 from sqlalchemy import ColumnElement, and_, func, literal, not_, or_, select, text, tuple_
 from sqlalchemy.exc import IntegrityError
@@ -184,6 +184,7 @@ from exceptions import (
     HoldAwaitingAutoReviewError,
     HoldExpiredError,
     InvalidConversationStateError,
+    InvalidExtendError,
     ProposalTargetUnavailableError,
     RateLimitExceededError,
     SchemaVersionMismatchError,
@@ -4278,6 +4279,24 @@ async def rename_conversation(
     return conversation
 
 
+class ExtendConversationResult(NamedTuple):
+    """Result of a successful ``extend_conversation`` call (TECH-6195).
+
+    A typed result rather than stapling ``previous_expires_at``/
+    ``resurrected`` onto the returned ``Conversation`` ORM instance as
+    dynamic (non-mapped) attributes -- that approach worked only because
+    this module's session is built with ``expire_on_commit=False``; a
+    future ``session.refresh()``/``session.expire()`` on ``conversation``
+    before a caller reads those attributes would silently drop them
+    instead of raising. ``conversation`` is the same (already-committed)
+    ORM instance ``extend_conversation`` mutated in place.
+    """
+
+    conversation: Conversation
+    previous_expires_at: datetime
+    resurrected: bool
+
+
 async def extend_conversation(
     session: AsyncSession,
     *,
@@ -4286,7 +4305,7 @@ async def extend_conversation(
     conversation_id: uuid.UUID,
     expires_at: datetime | None = None,
     extend_by_days: int | None = None,
-) -> Conversation:
+) -> ExtendConversationResult:
     """Extend conversation expiry (TECH-6195): updates ``expires_at``, a
     whole-conversation, symmetric-permission action mirroring
     ``archive_conversation``.
@@ -4319,17 +4338,17 @@ async def extend_conversation(
     if (expires_at is None and extend_by_days is None) or (
         expires_at is not None and extend_by_days is not None
     ):
-        raise ValueError("provide exactly one of expires_at or extend_by_days")
+        raise InvalidExtendError("provide exactly one of expires_at or extend_by_days")
 
     if extend_by_days is not None and (
         isinstance(extend_by_days, bool)
         or not isinstance(extend_by_days, int)
         or not (1 <= extend_by_days <= 90)
     ):
-        raise ValueError("extend_by_days must be an integer between 1 and 90")
+        raise InvalidExtendError("extend_by_days must be an integer between 1 and 90")
 
     if expires_at is not None and expires_at.tzinfo is None:
-        raise ValueError("expires_at must be timezone-aware")
+        raise InvalidExtendError("expires_at must be timezone-aware")
 
     conversation, participant = await _load_participant_for_transition(
         session,
@@ -4376,11 +4395,11 @@ async def extend_conversation(
         computed_new_expires_at = expires_at
 
     if computed_new_expires_at <= now:
-        raise ValueError("new expires_at must be in the future")
+        raise InvalidExtendError("new expires_at must be in the future")
     if computed_new_expires_at <= conversation.expires_at:
-        raise ValueError("new expires_at must be greater than current expires_at")
+        raise InvalidExtendError("new expires_at must be greater than current expires_at")
     if computed_new_expires_at - now > MAX_CONVERSATION_TTL:
-        raise ValueError(f"expires_at may not be more than {MAX_CONVERSATION_TTL} from now")
+        raise InvalidExtendError(f"expires_at may not be more than {MAX_CONVERSATION_TTL} from now")
 
     previous_expires_at = conversation.expires_at
     previous_state = conversation.state
@@ -4403,10 +4422,12 @@ async def extend_conversation(
             "resurrected": resurrected,
         },
     )
-    conversation.previous_expires_at = previous_expires_at  # type: ignore[attr-defined]
-    conversation.resurrected = resurrected  # type: ignore[attr-defined]
     await session.commit()
-    return conversation
+    return ExtendConversationResult(
+        conversation=conversation,
+        previous_expires_at=previous_expires_at,
+        resurrected=resurrected,
+    )
 
 
 async def _enforce_message_rate_limit(
@@ -9516,6 +9537,7 @@ __all__ = [
     "PROPOSAL_SUBMITTER_SURFACES",
     "PROPOSAL_TERMINAL_STATUSES",
     "AgentTableOwnershipClient",
+    "ExtendConversationResult",
     "OwnershipClient",
     "OwnershipClientFactory",
     "accept_invite",

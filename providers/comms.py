@@ -65,6 +65,7 @@ from exceptions import (
     DisplayNameCollisionError,
     DocsVerificationFailedError,
     InvalidConversationStateError,
+    InvalidExtendError,
     RateLimitExceededError,
     SchemaVersionMismatchError,
     SiblingIdentityExistsError,
@@ -376,7 +377,9 @@ async def _map_service_errors(error_cls: type[Exception] = ToolError) -> AsyncIt
     ``ConversationArchivedError`` (TECH-5887, ``comms_archive_conversation``)
     is the same story as ``InvalidConversationStateError``: the caller
     already has legitimate read access to the conversation's archived
-    status.
+    status. ``InvalidExtendError`` (TECH-6195, ``comms_extend_conversation``)
+    is likewise specific and client-safe by design -- see its own
+    docstring in exceptions.py.
 
     A bare ``ValueError`` is different: the service layer raises it for
     internal parameter-shape problems (e.g. an empty ``display_name`` or
@@ -393,6 +396,7 @@ async def _map_service_errors(error_cls: type[Exception] = ToolError) -> AsyncIt
         raise error_cls(str(exc)) from None
     except (
         InvalidConversationStateError,
+        InvalidExtendError,
         RateLimitExceededError,
         PayloadValidationError,
         UnknownConversationTypeError,
@@ -2144,27 +2148,24 @@ async def extend_conversation(
     async with get_session_factory()() as session:
         caller = await _resolve_caller_agent(session, sub, token)
         async with _map_service_errors():
-            try:
-                conversation = await service.extend_conversation(
-                    session,
-                    actor_sub=sub,
-                    agent_id=caller.id,
-                    conversation_id=conv_id,
-                    expires_at=expires_dt,
-                    extend_by_days=extend_by_days,
-                )
-            except ValueError as exc:
-                raise ToolError(f"invalid_request: {exc}") from None
+            result = await service.extend_conversation(
+                session,
+                actor_sub=sub,
+                agent_id=caller.id,
+                conversation_id=conv_id,
+                expires_at=expires_dt,
+                extend_by_days=extend_by_days,
+            )
         active_ids = await _get_active_participant_agent_ids_or_empty(session, conv_id)
 
     await subscriptions.notify_conversation_event(conv_id, active_agent_ids=active_ids)
     return {
         "conversation_id": conversation_id,
         "agent_id": str(caller.id),
-        "expires_at": _iso(conversation.expires_at),
-        "previous_expires_at": _iso(getattr(conversation, "previous_expires_at", None)),
-        "state": conversation.state,
-        "resurrected": getattr(conversation, "resurrected", False),
+        "expires_at": _iso(result.conversation.expires_at),
+        "previous_expires_at": _iso(result.previous_expires_at),
+        "state": result.conversation.state,
+        "resurrected": result.resurrected,
     }
 
 

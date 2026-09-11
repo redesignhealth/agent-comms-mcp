@@ -38,6 +38,13 @@ service/tools boundary:
   is already an authorized member with legitimate access to the current
   state via ``get_conversation``, so there is nothing to enumerate here.
 
+- ``InvalidExtendError`` (TECH-6195): ``comms_extend_conversation`` request-
+  shape/business-rule validation failure (bad parameter combination,
+  out-of-range ``extend_by_days``, shortening/ceiling rejection). Kept
+  distinct and specific, same reasoning as ``InvalidConversationStateError``
+  — every case describes only the caller's own request or a conversation it
+  is already an authorized active participant of.
+
 - ``ConversationArchivedError`` (TECH-5887): ``comms_invite``/
   ``comms_post_message``/``comms_accept`` targeted a conversation that has
   been archived (``comms_archive_conversation``). Also raised by the HTTP
@@ -151,6 +158,27 @@ class ConversationArchivedError(Exception):
     is unaffected, since declining only ever narrows access, never grants
     it) -- see ``service.archive_conversation``'s docstring for the full
     reasoning and the alternatives considered.
+    """
+
+
+class InvalidExtendError(Exception):
+    """``extend_conversation`` (TECH-6195) request-shape/business-rule
+    validation failure: neither or both of ``expires_at``/``extend_by_days``
+    supplied, an out-of-range ``extend_by_days``, a non-timezone-aware
+    ``expires_at``, a resulting expiry not strictly in the future, a
+    shortening/no-op expiry (``new_expires_at <= current expires_at``), or a
+    ceiling violation (``new_expires_at - now() > MAX_CONVERSATION_TTL``).
+
+    Specific and client-actionable by design, unlike the generic bare-
+    ``ValueError`` mapping ``_map_service_errors`` otherwise applies: every
+    one of these describes only the CALLER's own supplied parameters (or,
+    for the ceiling/shortening cases, a conversation the caller is already
+    an authorized active participant of and can already read the current
+    ``expires_at`` for via ``comms_get_conversation``), never another
+    agent/conversation's secret state -- so there is nothing to enumerate
+    by naming the real cause here, and the caller needs the specific
+    message (not a generic "could not be processed") to know which
+    parameter to fix and retry.
     """
 
 
@@ -421,6 +449,7 @@ __all__ = [
     "HoldAwaitingAutoReviewError",
     "HoldExpiredError",
     "InvalidConversationStateError",
+    "InvalidExtendError",
     "ProposalTargetUnavailableError",
     "RateLimitExceededError",
     "SchemaVersionMismatchError",

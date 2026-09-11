@@ -3698,10 +3698,14 @@ class TestExtendConversation:
                 },
             )
 
-        # Shortening
+        # Shortening -- this validation lives in service.extend_conversation
+        # (it needs the DB-loaded current expires_at), raised as
+        # InvalidExtendError and passed through _map_service_errors
+        # verbatim (no "invalid_request:" prefix, unlike the tool-layer's
+        # own pre-checks above).
         with pytest.raises(
             ToolError,
-            match="invalid_request: new expires_at must be greater than current expires_at",
+            match="new expires_at must be greater than current expires_at",
         ):
             await _call(
                 main,
@@ -3786,6 +3790,183 @@ class TestExtendConversation:
             c for c in listing_after["conversations"] if c["conversation_id"] == conversation_id
         )
         assert matching["state"] == "active"
+
+    async def test_extend_requires_active_membership(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """A caller who was never a participant gets the uniform denial,
+        same precondition every other conversation-scoped write shares."""
+        conversation_id, _ids = await self._start_open_conversation(
+            main,
+            test_session_factory,
+            owner_sub="ext-tool-owner-6",
+            member_sub="ext-tool-member-6",
+        )
+        await _register(main, test_session_factory, "ext-tool-outsider-6")
+        token_outsider = _token("ext-tool-outsider-6")
+
+        with pytest.raises(
+            ToolError, match=re.escape("access_denied: not authorized for this resource")
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                token_outsider,
+                "comms_extend_conversation",
+                {"conversation_id": conversation_id, "extend_by_days": 10},
+            )
+
+    async def test_extend_denied_for_invited_not_yet_accepted_participant(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """An `invited` participant (hasn't called comms_accept yet) is not
+        `active` and gets the same uniform denial as a non-participant --
+        extend_conversation's `required_status="active"` check applies just
+        as strictly to a pending invite as to a total stranger."""
+        conversation_id, _ids = await self._start_open_conversation(
+            main,
+            test_session_factory,
+            owner_sub="ext-tool-owner-7",
+            member_sub="ext-tool-member-7",
+        )
+        token_member = _token("ext-tool-member-7")
+        with pytest.raises(
+            ToolError, match=re.escape("access_denied: not authorized for this resource")
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                token_member,
+                "comms_extend_conversation",
+                {"conversation_id": conversation_id, "extend_by_days": 10},
+            )
+
+    async def test_extend_denied_for_left_participant(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """A participant who accepted and then left is no longer `active`
+        and gets the same uniform denial -- leaving revokes extend
+        eligibility just like every other write path."""
+        conversation_id, _ids = await self._start_open_conversation(
+            main,
+            test_session_factory,
+            owner_sub="ext-tool-owner-8",
+            member_sub="ext-tool-member-8",
+        )
+        token_member = _token("ext-tool-member-8")
+        await _call(
+            main,
+            test_session_factory,
+            token_member,
+            "comms_accept",
+            {"conversation_id": conversation_id},
+        )
+        await _call(
+            main,
+            test_session_factory,
+            token_member,
+            "comms_leave",
+            {"conversation_id": conversation_id},
+        )
+        with pytest.raises(
+            ToolError, match=re.escape("access_denied: not authorized for this resource")
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                token_member,
+                "comms_extend_conversation",
+                {"conversation_id": conversation_id, "extend_by_days": 10},
+            )
+
+    async def test_extend_rejects_archived_conversation(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        conversation_id, _ids = await self._start_open_conversation(
+            main,
+            test_session_factory,
+            owner_sub="ext-tool-owner-9",
+            member_sub="ext-tool-member-9",
+        )
+        token_owner = _token("ext-tool-owner-9")
+        await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_archive_conversation",
+            {"conversation_id": conversation_id},
+        )
+
+        with pytest.raises(ToolError, match="conversation_archived"):
+            await _call(
+                main,
+                test_session_factory,
+                token_owner,
+                "comms_extend_conversation",
+                {"conversation_id": conversation_id, "extend_by_days": 10},
+            )
+
+    async def test_extend_rejects_completed_conversation(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        conversation_id, _ids = await self._start_open_conversation(
+            main,
+            test_session_factory,
+            owner_sub="ext-tool-owner-10",
+            member_sub="ext-tool-member-10",
+        )
+        token_owner = _token("ext-tool-owner-10")
+        async with test_session_factory() as session:
+            await session.execute(
+                text("UPDATE conversations SET state = 'completed' WHERE id = :cid"),
+                {"cid": conversation_id},
+            )
+            await session.commit()
+
+        with pytest.raises(
+            ToolError,
+            match=re.escape(
+                "message type 'extend' is not legal while the conversation is 'completed'"
+            ),
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                token_owner,
+                "comms_extend_conversation",
+                {"conversation_id": conversation_id, "extend_by_days": 10},
+            )
+
+    async def test_extend_rejects_canceled_conversation(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        conversation_id, _ids = await self._start_open_conversation(
+            main,
+            test_session_factory,
+            owner_sub="ext-tool-owner-11",
+            member_sub="ext-tool-member-11",
+        )
+        token_owner = _token("ext-tool-owner-11")
+        async with test_session_factory() as session:
+            await session.execute(
+                text("UPDATE conversations SET state = 'canceled' WHERE id = :cid"),
+                {"cid": conversation_id},
+            )
+            await session.commit()
+
+        with pytest.raises(
+            ToolError,
+            match=re.escape(
+                "message type 'extend' is not legal while the conversation is 'canceled'"
+            ),
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                token_owner,
+                "comms_extend_conversation",
+                {"conversation_id": conversation_id, "extend_by_days": 10},
+            )
 
 
 class TestTaskLifecycleToolLayer:
