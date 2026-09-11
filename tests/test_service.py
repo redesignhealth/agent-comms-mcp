@@ -5747,6 +5747,36 @@ class TestGetConversationSinceWindow:
         assert result["since_was_defaulted"] is False
         assert "context" not in result["messages"][0]
 
+    async def test_explicit_since_and_since_seq_zero_suppresses_context(
+        self, session: AsyncSession
+    ) -> None:
+        """Regression guard for the Argus round-1 BLOCKING documentation
+        drift: `since_seq=0` is just as "explicit" as any other value --
+        passing it alongside an explicit `since` (what looks like a first,
+        fresh call) must still suppress the context band entirely, exactly
+        like any other explicit `since_seq` continuation call."""
+        owner = await _register(session, "gcw-owner-16")
+        target = await _register(session, "gcw-target-16")
+        now = datetime.now(UTC)
+        since_ts = now - timedelta(hours=_service.GET_CONVERSATION_DEFAULT_LOOKBACK_HOURS)
+        in_window = since_ts + timedelta(hours=1)
+        context_band = since_ts - timedelta(hours=1)
+        conversation = await self._seed(
+            session, owner=owner, target=target, message_times=[context_band, in_window]
+        )
+
+        result = await get_conversation(
+            session,
+            actor_sub=target.sub,
+            caller_agent_id=target.id,
+            conversation_id=conversation.id,
+            since=since_ts,
+            since_seq=0,
+        )
+        assert result["since_was_defaulted"] is False
+        assert [m["seq"] for m in result["messages"]] == [2]
+        assert "context" not in result["messages"][0]
+
     async def test_fresh_call_applies_72h_default(self, session: AsyncSession) -> None:
         owner = await _register(session, "gcw-owner-2")
         target = await _register(session, "gcw-target-2")
@@ -5818,6 +5848,31 @@ class TestGetConversationSinceWindow:
         assert result["since_was_defaulted"] is True
         assert result["messages"] == []
 
+    async def test_since_inclusive_boundary_message_at_since_is_in_window(
+        self, session: AsyncSession
+    ) -> None:
+        """The in-window lower bound is `created_at >= since` -- a message
+        whose `created_at` lands EXACTLY on `since` must be included, not
+        excluded by an off-by-one on the boundary."""
+        owner = await _register(session, "gcw-owner-18")
+        target = await _register(session, "gcw-target-18")
+        now = datetime.now(UTC)
+        since_ts = now - timedelta(hours=1)
+        conversation = await self._seed(
+            session, owner=owner, target=target, message_times=[since_ts]
+        )
+
+        result = await get_conversation(
+            session,
+            actor_sub=target.sub,
+            caller_agent_id=target.id,
+            conversation_id=conversation.id,
+            since=since_ts,
+        )
+        assert result["since_was_defaulted"] is False
+        assert [m["seq"] for m in result["messages"]] == [1]
+        assert "context" not in result["messages"][0]
+
     async def test_context_hours_zero_never_includes_context(self, session: AsyncSession) -> None:
         owner = await _register(session, "gcw-owner-5")
         target = await _register(session, "gcw-target-5")
@@ -5841,6 +5896,7 @@ class TestGetConversationSinceWindow:
         # Only the in-window (70h-ago) message -- the would-be context
         # message (74h-ago) is never pulled in.
         assert [m["seq"] for m in result["messages"]] == [2]
+        assert all("context" not in m for m in result["messages"])
 
     async def test_larger_context_hours_pulls_further_back(self, session: AsyncSession) -> None:
         owner = await _register(session, "gcw-owner-6")
@@ -5958,6 +6014,7 @@ class TestGetConversationSinceWindow:
         assert result["invited"] is True
         assert result["messages"] == []
         assert result["has_more"] is False
+        assert "since_was_defaulted" not in result
 
     async def test_naive_since_rejected(self, session: AsyncSession) -> None:
         owner = await _register(session, "gcw-owner-11")
@@ -6077,6 +6134,51 @@ class TestGetConversationSinceWindow:
         row = await session.get(Participant, (conversation.id, target.id))
         assert row is not None
         assert row.last_read_seq == MAX_MESSAGES_PER_GET_CONVERSATION + 1
+
+    async def test_context_band_truncated_to_closest_messages(self, session: AsyncSession) -> None:
+        """The context band is independently capped at
+        ``MAX_MESSAGES_PER_GET_CONVERSATION`` -- seeding one more than that
+        many context-band messages must truncate to exactly that many, and
+        must keep the ones CLOSEST to ``since`` (highest seq / most recent),
+        since the underlying query is `ORDER BY seq DESC LIMIT 500` then
+        reversed back to ascending order."""
+        owner = await _register(session, "gcw-owner-17")
+        target = await _register(session, "gcw-target-17")
+        now = datetime.now(UTC)
+        since_ts = now - timedelta(hours=_service.GET_CONVERSATION_DEFAULT_LOOKBACK_HOURS)
+        context_count = MAX_MESSAGES_PER_GET_CONVERSATION + 1
+        # Ascending timestamps within [since - 24h, since) -- seq order
+        # matches recency order (later seq == later/closer to `since`).
+        context_times = [
+            since_ts
+            - timedelta(hours=_service.GET_CONVERSATION_DEFAULT_CONTEXT_HOURS)
+            + timedelta(seconds=i)
+            for i in range(context_count)
+        ]
+        in_window_time = since_ts + timedelta(hours=1)
+        message_times = [*context_times, in_window_time]
+        conversation = await self._seed(
+            session, owner=owner, target=target, message_times=message_times
+        )
+
+        result = await get_conversation(
+            session,
+            actor_sub=target.sub,
+            caller_agent_id=target.id,
+            conversation_id=conversation.id,
+            since=since_ts,
+        )
+
+        context_messages = [m for m in result["messages"] if m.get("context")]
+        assert len(context_messages) == MAX_MESSAGES_PER_GET_CONVERSATION
+        # Dropped the single oldest context message (seq 1, furthest from
+        # `since`); kept the 500 closest to it (seq 2..501), in ascending
+        # seq order.
+        assert [m["seq"] for m in context_messages] == list(
+            range(2, MAX_MESSAGES_PER_GET_CONVERSATION + 2)
+        )
+        in_window_messages = [m for m in result["messages"] if not m.get("context")]
+        assert [m["seq"] for m in in_window_messages] == [context_count + 1]
 
     async def test_explicit_since_and_since_seq_continuation_drops_context_band(
         self, session: AsyncSession

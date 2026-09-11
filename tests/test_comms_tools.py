@@ -4709,6 +4709,7 @@ class TestGetConversationSinceWindowTool:
             {"conversation_id": conversation_id, "context_hours": 0},
         )
         assert [m["seq"] for m in result["messages"]] == [2]
+        assert all("context" not in m for m in result["messages"])
 
     async def test_naive_since_rejected(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
@@ -4723,6 +4724,23 @@ class TestGetConversationSinceWindowTool:
                 token_target,
                 "comms_get_conversation",
                 {"conversation_id": conversation_id, "since": "2020-01-01T00:00:00"},
+            )
+
+    async def test_invalid_since_string_rejected(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """`_parse_since`'s invalid-ISO-8601 branch (as opposed to the
+        timezone-naive branch covered by `test_naive_since_rejected`)."""
+        conversation_id, token_target = await self._start_and_accept(
+            main, test_session_factory, "gcwt-owner-12", "gcwt-target-12"
+        )
+        with pytest.raises(ToolError, match="not a valid ISO 8601 datetime"):
+            await _call(
+                main,
+                test_session_factory,
+                token_target,
+                "comms_get_conversation",
+                {"conversation_id": conversation_id, "since": "not-a-date"},
             )
 
     async def test_negative_context_hours_rejected(
@@ -4789,6 +4807,7 @@ class TestGetConversationSinceWindowTool:
         assert result["invited"] is True
         assert result["messages"] == []
         assert result["has_more"] is False
+        assert "since_was_defaulted" not in result
 
     async def test_explicit_since_and_since_seq_continuation_drops_context_band(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]

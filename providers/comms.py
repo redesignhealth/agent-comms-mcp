@@ -97,6 +97,14 @@ comms_server: FastMCP[Any] = FastMCP("comms")
 # audit_log write amplification. Matches decision_reason's own cap.
 MAX_REVIEW_REASON_LENGTH = 2000
 
+# TECH-6197 (Argus round-1 SECURITY-INFORMATIONAL): _parse_since reflects the
+# caller-supplied `since` string verbatim (via `{value!r}`) into a ToolError
+# on parse failure -- same MAX_AGENT_KEY_LENGTH-style generous-margin cap as
+# _validate_agent_key, applied before attempting to parse, so an oversized
+# string can't be echoed back unbounded. Every real ISO 8601 datetime string
+# is well under 100 characters.
+MAX_SINCE_LENGTH = 100
+
 # Base URL of the separate agent-comms-approvals-decision-page service, used
 # to build a `decision_url` on every `held_for_approval` response so a human
 # has something to click straight to the hold. Optional and unrelated to
@@ -452,6 +460,8 @@ def _parse_since(value: str | None) -> datetime | None:
     """Parse an optional ISO 8601 ``since`` lower bound (TECH-6197), rejecting naive datetimes."""
     if value is None:
         return None
+    if len(value) > MAX_SINCE_LENGTH:
+        raise ToolError(f"invalid_request: since exceeds {MAX_SINCE_LENGTH} characters")
     try:
         dt = datetime.fromisoformat(value)
     except ValueError as exc:
@@ -1588,16 +1598,16 @@ async def get_conversation(
     caller) or ``messages_returned``, ``page_max_seq``, ``last_read_seq``,
     ``since_was_defaulted`` (only for a non-``invited`` caller).
 
-    An ``invited`` (not yet accepted) caller gets metadata only — no
+    An ``invited`` (not yet accepted) caller gets metadata only -- no
     message content, ``since_seq``/``since``/``context_hours`` are all
     ignored, and ``has_more`` is always ``False``. An ``active`` caller
     gets up to 500 messages (``MAX_MESSAGES_PER_GET_CONVERSATION``) per
     the ``since_seq``/``since`` resolution below, and their read cursor
-    advances. ``since_seq``, if passed, must be non-negative — a negative
+    advances. ``since_seq``, if passed, must be non-negative -- a negative
     value would silently widen the result window in an unintended way.
 
     **Pagination**: when ``has_more`` is ``True``, re-call with
-    ``since_seq=page_max_seq`` from THIS response — NOT
+    ``since_seq=page_max_seq`` from THIS response -- NOT
     ``since_seq=last_read_seq``. ``last_read_seq`` is your persisted read
     cursor across all calls, which can already be ahead of a page you're
     re-reading (e.g. you deliberately pass a low ``since_seq`` to revisit
@@ -1608,8 +1618,12 @@ async def get_conversation(
 
     The returned ``messages_returned`` count is the size of the returned
     (post-filter, capped, context-inclusive) slice, NOT the conversation's
-    total message count — deliberately not named ``total_count`` to avoid
-    implying otherwise.
+    total message count -- deliberately not named ``total_count`` to avoid
+    implying otherwise. The in-window band and the context band are each
+    INDEPENDENTLY capped at ``MAX_MESSAGES_PER_GET_CONVERSATION`` (500),
+    so ``messages_returned`` can be up to ~2x that cap on a call that
+    pulls in both a full in-window page and a full context band, not a
+    single combined 500 ceiling.
 
     **TECH-6197 -- ``since``/``context_hours`` default behavior (breaking
     change)**: a plain, argument-free call used to return the ENTIRE
@@ -1621,31 +1635,37 @@ async def get_conversation(
       (AND'd), exactly as before.
     - Pass ``since_seq`` (e.g. for pagination continuation, including
       ``since_seq=0``) but omit ``since``: NO timestamp bound is applied
-      at all — this is the existing continuation behavior, unchanged
+      at all -- this is the existing continuation behavior, unchanged
       (full history from that seq onward).
     - Pass NEITHER (a plain ``comms_get_conversation(conversation_id)``
-      call): a new default is applied automatically — only the last 72
+      call): a new default is applied automatically -- only the last 72
       hours of history (plus context, see below) is returned, instead of
       full history from the beginning. ``since_was_defaulted: true`` in
       the response flags this case. **To get true full history on a
       fresh call, explicitly pass an old ``since`` (e.g. the Unix epoch,
-      ``"1970-01-01T00:00:00Z"``)** — this is the escape hatch.
+      ``"1970-01-01T00:00:00Z"``)** -- this is the escape hatch.
 
-    **Anchor-triggered context window**: whenever a timestamp bound is in
-    effect (explicit ``since`` OR the 72h default — never on the plain
-    ``since_seq``-continuation path above), messages with
-    ``created_at >= since`` are the "in-window" set. If that set is
-    non-empty, messages in the ``context_hours``-wide band immediately
-    before ``since`` (``since - context_hours <= created_at < since``)
-    are ADDITIONALLY included and flagged ``"context": true`` in the
-    response (in-window messages carry no ``"context"`` key at all). If
-    the in-window set is EMPTY, no context band is pulled and no messages
-    are returned at all — an in-window message is required to "anchor"
-    the context pull. Worked example with the 72h/24h defaults: messages
-    at 70h-ago and 74h-ago — BOTH returned (70h-ago is in-window; 74h-ago
-    falls in the resulting `[72h, 96h)` context band), with 74h-ago
-    flagged ``"context": true``. Messages at 74h-ago and 76h-ago —
-    NEITHER returned (nothing is in-window to anchor a context pull).
+    **Anchor-triggered context window**: context is suppressed whenever
+    ``since_seq`` is explicitly provided by the caller, even when ``since``
+    is ALSO explicitly provided -- explicit ``since_seq`` (any value,
+    including ``0``) is the sole signal that this is a continuation/
+    pagination call, and no context band is ever pulled on that path.
+    Context only applies when ``since_seq`` is entirely omitted (whether
+    ``since`` is explicit or defaulted). Whenever a timestamp bound is in
+    effect (explicit ``since`` OR the 72h default) AND ``since_seq`` was
+    omitted, messages with ``created_at >= since`` are the "in-window"
+    set. If that set is non-empty, messages in the ``context_hours``-wide
+    band immediately before ``since``
+    (``since - context_hours <= created_at < since``) are ADDITIONALLY
+    included and flagged ``"context": true`` in the response (in-window
+    messages carry no ``"context"`` key at all). If the in-window set is
+    EMPTY, no context band is pulled and no messages are returned at all
+    -- an in-window message is required to "anchor" the context pull.
+    Worked example with the 72h/24h defaults: messages at 70h-ago and
+    74h-ago -- BOTH returned (70h-ago is in-window; 74h-ago falls in the
+    resulting `[72h, 96h)` context band), with 74h-ago flagged
+    ``"context": true``. Messages at 74h-ago and 76h-ago -- NEITHER
+    returned (nothing is in-window to anchor a context pull).
     ``context_hours`` defaults to 24, must be ``>= 0``
     (``context_hours=0`` means "never include context") and
     ``<= 168`` (7 days).

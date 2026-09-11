@@ -493,6 +493,21 @@ class Message(Base):
             "sender_id",
             "created_at",
         ),
+        # Backs service.get_conversation's TECH-6197 in-window
+        # (`created_at >= since_ts`) and context-band
+        # (`lower <= created_at < since_ts`) queries, both filtered on
+        # `(conversation_id, created_at)` with no `sender_id` predicate --
+        # the composite index above has `sender_id` between
+        # `conversation_id` and `created_at`, so Postgres can't use it for
+        # a range scan on `created_at` alone, and would fall back to a
+        # full scan + filter on a long-lived conversation (Argus round-1
+        # BLOCKING: this made the new 72h-default "faster" path slower
+        # than the old full-history path). Migration 44da57c6d9b9.
+        Index(
+            "idx_messages_conversation_id_created_at",
+            "conversation_id",
+            "created_at",
+        ),
         # Backs service._enforce_sender_global_rate_limit's
         # WHERE sender_id = ... AND created_at > ... query (no
         # conversation_id predicate) -- the index above has conversation_id

@@ -8714,12 +8714,17 @@ async def get_conversation(
       case from an explicit ``since``. To get true full history on a
       fresh call, pass an explicitly old ``since`` (e.g. the epoch).
 
-    **Anchor-triggered context window**: whenever a timestamp bound is in
-    effect (explicit ``since`` OR the 72h default -- never on the pure
-    ``since_seq``-continuation path above), the "in-window" set is
-    ``created_at >= since`` (further bounded by ``seq > since_seq`` if
-    that was also explicit). If the in-window set is non-empty, messages
-    with ``since - context_hours <= created_at < since`` are ADDITIONALLY
+    **Anchor-triggered context window**: context is suppressed whenever
+    ``since_seq`` is explicitly provided by the caller, even when ``since``
+    is ALSO explicitly provided -- explicit ``since_seq`` (any value,
+    including ``0``) is the sole signal that this is a continuation/
+    pagination call, and no context band is ever pulled on that path.
+    Context only applies when ``since_seq`` is entirely omitted (whether
+    ``since`` is explicit or defaulted). Whenever a timestamp bound is in
+    effect (explicit ``since`` OR the 72h default) AND ``since_seq`` was
+    omitted, the "in-window" set is ``created_at >= since``. If the
+    in-window set is non-empty, messages with
+    ``since - context_hours <= created_at < since`` are ADDITIONALLY
     included and flagged ``"context": true`` (in-window messages carry no
     ``"context"`` key at all). If the in-window set is EMPTY, no context
     band is pulled and no messages are returned -- an anchor is required
@@ -8890,11 +8895,14 @@ async def get_conversation(
         "participants": participants_view,
         "messages": combined_messages,
         "invited": False,
-        # Page-scoped, capped at MAX_MESSAGES_PER_GET_CONVERSATION -- NOT
-        # the conversation's true total message count (Argus round-1
-        # SUGGESTION: the prior name was misleading for direct service
-        # callers even though the tools layer already renamed it to
-        # `messages_returned`). Includes any context messages (TECH-6197).
+        # Page-scoped -- NOT the conversation's true total message count
+        # (Argus round-1 SUGGESTION: the prior name was misleading for
+        # direct service callers even though the tools layer already
+        # renamed it to `messages_returned`). Includes any context
+        # messages (TECH-6197): the in-window band and the context band
+        # are each independently capped at MAX_MESSAGES_PER_GET_CONVERSATION,
+        # so this combined count can be up to ~2x that cap, not a single
+        # 500 ceiling.
         "messages_in_page": len(combined_messages),
         "has_more": has_more,
         "page_max_seq": page_max_seq,
