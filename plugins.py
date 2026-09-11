@@ -481,9 +481,20 @@ def resolve_plugin(env_var: str, registry: dict[str, Callable[[], Any]], default
     plugin instance.
 
     See ``resolve_plugin_name`` for the actual name-to-instance resolution
-    rule (registry lookup or ``pkg.module:factory`` import path).
+    rule (registry lookup or ``pkg.module:factory`` import path). An env
+    var set to the empty string is NOT treated as absent -- it resolves as
+    an unknown plugin name (same as a typo), which crashes/errors exactly
+    like it always has. Two of this module's seams
+    (``APPROVAL_NOTIFIER``/``ACTIVE_CHECKER``) have deliberately fail-open
+    defaults and rely on that crash as a safety net for an operator who
+    left an env var blank by accident (Argus review round-4 B1) --
+    treating an empty string as absent here would silently and uniformly
+    replace that crash with a fail-open default for every seam this
+    function resolves, not just the one (``PROPOSAL_JUDGE``) that
+    actually wants it; see ``get_proposal_judge`` for that seam's own,
+    narrowly-scoped empty-string tolerance instead.
     """
-    name = os.environ.get(env_var) or default
+    name = os.environ.get(env_var, default)
     return resolve_plugin_name(env_var, registry, name)
 
 
@@ -551,14 +562,20 @@ def validate_configuration() -> None:
     ``APPROVAL_NOTIFIER=webhook``) a missing webhook env var must crash at
     boot, not lazily on the first high-risk message.
 
-    Unlike every other seam here, an unset ``PROPOSAL_JUDGE`` is not itself
-    a misconfiguration worth crashing over -- ``escalate_all_proposals`` is
-    a safe, inert default for a bare/OSS deployment (see that class's own
+    Unlike every other seam here, an unset (or empty-string) ``PROPOSAL_JUDGE``
+    is not itself a misconfiguration worth crashing over -- ``escalate_all_proposals``
+    is a safe, inert default for a bare/OSS deployment (see that class's own
     docstring) -- but silently falling back to it is exactly the kind of
     "silently inert" failure mode this repo's own docs already criticize
     other unset-by-default knobs for. Emit a startup WARNING instead, so an
     operator who meant to configure a real judge finds out at boot, not
-    after every proposal quietly stops auto-applying.
+    after every proposal quietly stops auto-applying. The empty-string
+    case matters in practice: a deployment's env-var passthrough (e.g.
+    ``docker-compose.yml``'s ``PROPOSAL_JUDGE: ${PROPOSAL_JUDGE:-}``) sets
+    this var to an empty string, not absent, whenever the operator hasn't
+    configured a real judge on the host -- see ``get_proposal_judge``'s
+    own empty-string handling, which this check's ``not os.environ.get(...)``
+    already matches (``not ""`` is ``True``, same as ``not None``).
     """
     get_risk_scorer()
     get_auto_approver()
@@ -567,7 +584,8 @@ def validate_configuration() -> None:
     get_docs_verifier()
     if not os.environ.get(PROPOSAL_JUDGE_ENV_VAR):
         logger.warning(
-            "%s is unset; falling back to %r, which never auto-approves or applies any proposal",
+            "%s is not set (or is set to an empty string); falling back to %r, "
+            "which never auto-approves or applies any proposal",
             PROPOSAL_JUDGE_ENV_VAR,
             DEFAULT_PROPOSAL_JUDGE,
         )
@@ -1311,11 +1329,15 @@ class ProposalJudge(Protocol):
         the original exception as ``__cause__`` for logging -- so a
         ``ValueError`` raised for a different reason would surface to the
         caller as a misleading "unsupported kind" error instead of
-        whatever the real problem was. LLM response parsing failures that
-        raise `ValueError` must be caught inside `classify()` and re-raised
-        as `RuntimeError` or a custom exception type, so they reach the broader
-        `except Exception` handler with an accurate error message instead of
-        being mistaken for an unsupported-kind rejection. Signal any other
+        whatever the real problem was. LLM response parsing failures --
+        e.g. a `classify()` implementation synchronously parsing
+        already-fetched LLM output embedded in `action`, NOT making a
+        live LLM call itself (that would violate the "must not perform
+        I/O" contract above) -- that raise `ValueError` must still be
+        caught and re-raised as `RuntimeError` or a custom exception
+        type, so they reach the broader `except Exception` handler with
+        an accurate error message instead of being mistaken for an
+        unsupported-kind rejection. Signal any other
         rejection some other way (e.g. treat a malformed ``action`` as still
         classifiable, deferring the real validation to
         ``fingerprint()``/``apply()``). Prefer deferring to `fingerprint()`
@@ -1378,12 +1400,24 @@ _proposal_judge: ProposalJudge | None = None
 
 def get_proposal_judge() -> ProposalJudge:
     """Return the process-wide configured ``ProposalJudge`` (lazy
-    singleton, mirrors ``get_risk_scorer``)."""
+    singleton, mirrors ``get_risk_scorer``).
+
+    Unlike every other seam here (which goes through ``resolve_plugin``
+    uniformly, and treats an empty-string env var as an unknown plugin
+    name -- see that function's own docstring), a ``PROPOSAL_JUDGE`` set
+    to the empty string is treated the SAME as truly unset: both fall
+    back to ``DEFAULT_PROPOSAL_JUDGE`` (with ``validate_configuration``
+    emitting a WARNING for either case). This is deliberately handled
+    HERE, not inside ``resolve_plugin`` itself (Argus review round-4 B1):
+    doing it there would silently extend the same fail-open, empty-
+    string-tolerant behavior to ``APPROVAL_NOTIFIER``/``ACTIVE_CHECKER``
+    too, both of which have their own deliberately fail-open defaults and
+    rely on an empty string crashing at boot exactly like a typo would.
+    """
     global _proposal_judge
     if _proposal_judge is None:
-        _proposal_judge = resolve_plugin(
-            PROPOSAL_JUDGE_ENV_VAR, PROPOSAL_JUDGES, DEFAULT_PROPOSAL_JUDGE
-        )
+        name = os.environ.get(PROPOSAL_JUDGE_ENV_VAR) or DEFAULT_PROPOSAL_JUDGE
+        _proposal_judge = resolve_plugin_name(PROPOSAL_JUDGE_ENV_VAR, PROPOSAL_JUDGES, name)
     return _proposal_judge
 
 

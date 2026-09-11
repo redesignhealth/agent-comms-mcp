@@ -7767,21 +7767,70 @@ async def _apply_or_finalize_proposal_hold(
         except Exception as recovery_exc:
             logger.warning(
                 "proposal recovery commit also failed for hold_id=%s target_id=%s: %s; "
-                "attempting last-ditch apply_failed write to avoid stranding row",
+                "attempting last-ditch %s write to avoid stranding row",
                 hold_id,
                 target_id,
                 recovery_exc,
+                terminal_status,
                 exc_info=True,
             )
             await session.rollback()
             try:
                 last_ditch_hold = await _find_proposal_hold(session, hold_id, for_update=True)
                 if last_ditch_hold is not None and last_ditch_hold.status == expected_status:
-                    last_ditch_hold.status = "apply_failed"
-                    last_ditch_hold.apply_error = _APPLY_ERROR_BOARD_COMMIT_FAILURE_MESSAGE
-                    last_ditch_hold.applied_at = None
-                    last_ditch_hold.apply_result = None
+                    last_ditch_audit_action: str
+                    last_ditch_audit_detail: dict[str, Any]
+                    if terminal_status == "apply_failed":
+                        # No successful external write to protect here --
+                        # the minimal board-owned failure write (Argus
+                        # review round-9 S1's original shape) is correct
+                        # as-is.
+                        last_ditch_hold.status = "apply_failed"
+                        last_ditch_hold.apply_error = _APPLY_ERROR_BOARD_COMMIT_FAILURE_MESSAGE
+                        last_ditch_hold.applied_at = None
+                        last_ditch_hold.apply_result = None
+                        last_ditch_audit_action = "proposal.apply_failed"
+                        last_ditch_audit_detail = {
+                            "hold_id": str(hold_id),
+                            "target_id": target_id,
+                            "error": _APPLY_ERROR_BOARD_COMMIT_FAILURE_MESSAGE,
+                        }
+                    else:
+                        # Argus review round-4 B2: `terminal_status` is
+                        # "applied" or "stale" here -- judge.apply() (or
+                        # the fingerprint check) already produced a REAL
+                        # outcome, and the recovery commit above just
+                        # tried, and failed, to persist that same outcome.
+                        # Retry that SAME write here (identical to the
+                        # recovery block above) rather than downgrading it
+                        # to a false "apply_failed": the dedup check only
+                        # blocks resubmission for pending/applying status,
+                        # so a caller retrying after seeing a false
+                        # apply_failed could trigger a genuine duplicate
+                        # external write.
+                        last_ditch_hold.status = terminal_status
+                        last_ditch_hold.apply_error = terminal_apply_error
+                        if terminal_apply_result is not None:
+                            last_ditch_hold.apply_result = terminal_apply_result
+                        last_ditch_hold.applied_at = terminal_applied_at
+                        last_ditch_hold.decision_source = decision_source
+                        last_ditch_hold.decided_by_actor_id = decided_by_actor_id
+                        last_ditch_hold.decided_at = terminal_decided_at
+                        last_ditch_hold.decision_note = terminal_decision_note
+                        last_ditch_audit_action = {
+                            "applied": "proposal.applied",
+                            "stale": "proposal.stale",
+                        }.get(terminal_status, "proposal.apply_failed")
+                        last_ditch_audit_detail = {"hold_id": str(hold_id), "target_id": target_id}
+                    _audit(
+                        session,
+                        actor_sub=decided_by_actor_id,
+                        action=last_ditch_audit_action,
+                        detail=last_ditch_audit_detail,
+                    )
                     await session.commit()
+            except asyncio.CancelledError:
+                raise
             except Exception as last_ditch_exc:
                 logger.error(
                     "proposal last-ditch commit also failed for hold_id=%s target_id=%s: %s; "
@@ -7801,6 +7850,16 @@ async def _apply_or_finalize_proposal_hold(
             if cancelled_exc is not None:
                 raise cancelled_exc from recovery_exc
             raise commit_exc from recovery_exc
+        # Argus review round-4 suggestion: this fallthrough is only
+        # reached when `recovery_hold` was concurrently resolved by
+        # another writer (or vanished) -- nothing was mutated on this
+        # iteration, but the `FOR UPDATE` re-fetch above still opened a
+        # fresh transaction (the `session.rollback()` before that `try`
+        # ended the terminal commit's own transaction). Roll that back
+        # explicitly too, matching every other exit path in this function,
+        # rather than relying on the caller's `async with` session context
+        # manager to close (and implicitly roll back) it later.
+        await session.rollback()
         if cancelled_exc is not None:
             raise cancelled_exc from commit_exc
         raise commit_exc

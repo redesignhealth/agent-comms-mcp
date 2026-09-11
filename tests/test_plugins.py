@@ -49,10 +49,17 @@ class TestResolvePluginRegistryLookup:
         scorer = resolve_plugin("SOME_ENV_VAR", _REGISTRY, "boundary_v1")
         assert isinstance(scorer, BoundaryCrossingScorer)
 
-    def test_empty_env_var_falls_back_to_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_empty_env_var_is_not_treated_as_absent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Argus review round-4 B1: an empty-string env var must resolve
+        as an unknown plugin name (same as a typo), not silently fall
+        back to ``default`` -- two seams resolved through this shared
+        function (``APPROVAL_NOTIFIER``/``ACTIVE_CHECKER``) rely on that
+        crash as a safety net for an operator who left the var blank by
+        accident. ``PROPOSAL_JUDGE``'s own empty-string tolerance lives in
+        ``get_proposal_judge`` instead, not here."""
         monkeypatch.setenv("SOME_ENV_VAR", "")
-        scorer = resolve_plugin("SOME_ENV_VAR", _REGISTRY, "boundary_v1")
-        assert isinstance(scorer, BoundaryCrossingScorer)
+        with pytest.raises(RuntimeError, match="unknown plugin"):
+            resolve_plugin("SOME_ENV_VAR", _REGISTRY, "boundary_v1")
 
     def test_env_var_overrides_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SOME_ENV_VAR", "fake")
@@ -321,6 +328,18 @@ class TestGetApprovalNotifier:
         monkeypatch.delenv(plugins.APPROVAL_NOTIFIER_ENV_VAR, raising=False)
         assert isinstance(plugins.get_approval_notifier(), LogOnlyNotifier)
 
+    def test_empty_string_is_not_treated_as_absent_and_crashes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Argus review round-4 B1: unlike ``PROPOSAL_JUDGE``, this seam's
+        fail-open default (``log_only``) must NOT be silently reached by
+        an empty-string env var -- that crash is the safety net for an
+        operator who left the var blank by accident (e.g. a blank line in
+        a ``.env`` file)."""
+        monkeypatch.setenv(plugins.APPROVAL_NOTIFIER_ENV_VAR, "")
+        with pytest.raises(RuntimeError, match="unknown plugin"):
+            plugins.get_approval_notifier()
+
 
 # --- Seam 4: the active checker (TECH-5703) -----------------------------------
 
@@ -363,6 +382,18 @@ class TestGetActiveCheckerAndValidateConfiguration:
     ) -> None:
         monkeypatch.delenv(plugins.ACTIVE_CHECKER_ENV_VAR, raising=False)
         assert isinstance(plugins.get_active_checker(), plugins.AlwaysActiveChecker)
+
+    def test_empty_string_is_not_treated_as_absent_and_crashes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Argus review round-4 B1: unlike ``PROPOSAL_JUDGE``, this seam's
+        fail-open default (``always_active``, itself documented as
+        fail-open) must NOT be silently reached by an empty-string env
+        var -- that crash is the safety net for an operator who left the
+        var blank by accident (e.g. a blank line in a ``.env`` file)."""
+        monkeypatch.setenv(plugins.ACTIVE_CHECKER_ENV_VAR, "")
+        with pytest.raises(RuntimeError, match="unknown plugin"):
+            plugins.get_active_checker()
 
     def test_get_active_checker_caches_the_instance(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(plugins.ACTIVE_CHECKER_ENV_VAR, raising=False)

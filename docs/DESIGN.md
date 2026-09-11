@@ -487,12 +487,15 @@ never reach `decide_proposal` at all),
     `apply_failed` with the original `apply_error`). Crucially, it does not
     blindly overwrite successful external writes with `apply_failed`, preventing
     duplicate external writes on caller retries. If that recovery commit itself
-    also fails, a last-ditch minimal write attempts to mark the row `apply_failed`
-    with `_APPLY_ERROR_BOARD_COMMIT_FAILURE_MESSAGE` (clearing `applied_at` and
-    `apply_result`, skipping audit writes) to avoid stranding. If even that
-    last-ditch commit fails (three consecutive DB failures), the row remains
-    stranded at `applying` with an error logged -- this is the documented residual
-    gap for commit failures.
+    also fails, a last-ditch commit retries that SAME computed terminal state
+    again -- unless it was already `apply_failed`, in which case a minimal write
+    marks the row `apply_failed` with `_APPLY_ERROR_BOARD_COMMIT_FAILURE_MESSAGE`
+    (clearing `applied_at` and `apply_result`) instead, since there is no
+    successful external write to protect in that case. Either way this last-ditch
+    write is audited too, same as the recovery attempt. If even that last-ditch
+    commit fails (three consecutive DB failures), the row remains stranded at
+    `applying` with an error logged -- this is the documented residual gap for
+    commit failures.
   - **A hard process death** (the container itself dies mid-apply, not a
     cooperative cancellation) still has no background reaper AND no in-app
     recovery path -- an earlier version of this note claimed a fresh

@@ -531,6 +531,15 @@ class TestJudgeApplyBoardMechanics:
         result = await _submit(session, judge=judge)
         assert result["status"] == "stale"
         assert judge.apply_calls == []
+        # Finding 12: the judge's own "auto-approved" verdict note is a
+        # non-empty `original_decision_note` here, exercising the `if`
+        # branch of `_stale_decision_note` (wrapping it for context) --
+        # the sibling human-decide test below exercises the other branch
+        # (no original note to wrap).
+        assert result["decision_note"] == (
+            "not applied: target changed after approval; no write to the target was "
+            "performed (approval reason was: auto-approved)"
+        )
 
     async def test_apply_returning_applied_false_sets_apply_failed(
         self, session: AsyncSession
@@ -1420,7 +1429,7 @@ class TestTerminalCommitFailureRecovery:
     never by faking anything about the judge/plugin seam itself.
 
     Commit sequence in ``decide_proposal`` -> ``_apply_or_finalize_proposal_hold``:
-    - Call 1: ``_claim_proposal_hold_for_apply`` (service.py ~line 7162) --
+    - Call 1: ``_claim_proposal_hold_for_applying`` (service.py ~line 7162) --
       claims ``status="applying"`` under row lock and commits.
     - Call 2: ``_apply_or_finalize_proposal_hold`` (service.py ~line 7491) --
       releases read connection before external fingerprint/apply I/O.
@@ -1429,7 +1438,9 @@ class TestTerminalCommitFailureRecovery:
     - Call 4: ``_apply_or_finalize_proposal_hold`` (service.py ~line 7718) --
       recovery commit attempting to persist genuine terminal state after rollback.
     - Call 5: ``_apply_or_finalize_proposal_hold`` (service.py ~line 7742) --
-      last-ditch commit attempting minimal ``apply_failed`` write if recovery commit fails.
+      last-ditch commit retrying the SAME genuine terminal state again (or a
+      minimal ``apply_failed`` write, if that state was already ``apply_failed``)
+      if the recovery commit also fails.
     """
 
     @staticmethod
@@ -1612,6 +1623,42 @@ class TestTerminalCommitFailureRecovery:
         assert row.status == "apply_failed"
         assert row.apply_error == _APPLY_ERROR_CANCELLED_MESSAGE
 
+    async def test_last_ditch_reraises_cancellation_after_two_commit_failures(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Finding 5: cancellation during apply, COMBINED with both the
+        terminal commit AND the recovery commit failing (reaching the
+        last-ditch write), must still re-raise the cancellation -- not
+        just when the recovery commit alone fails (the sibling test
+        above)."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_raises=asyncio.CancelledError(),
+        )
+        submitted = await _submit(session, judge=judge)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        commit_mock = self._fail_nth_commit(
+            session,
+            3,
+            OperationalError("first", {}, Exception("terminal commit failed")),
+            OperationalError("second", {}, Exception("recovery commit also failed")),
+        )
+        monkeypatch.setattr(session, "commit", commit_mock)
+
+        with pytest.raises(asyncio.CancelledError):
+            await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
+
+        assert commit_mock.call_count == 5
+        row = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        # A cancellation sets apply_error/terminal_status="apply_failed"
+        # BEFORE any commit is even attempted -- so the last-ditch write
+        # here takes the minimal-fallback branch (fix 2's other case),
+        # same as the non-cancelled apply_failed scenario above.
+        assert row.status == "apply_failed"
+        assert row.apply_error == _APPLY_ERROR_BOARD_COMMIT_FAILURE_MESSAGE
+
     async def test_recovery_fallthrough_on_concurrent_resolution_reraises_cancellation(
         self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1692,15 +1739,20 @@ class TestTerminalCommitFailureRecovery:
     async def test_recovery_commit_also_failing_preserves_original_exception_context(
         self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Fix S2 / Finding 2 / Finding 12: if the RECOVERY commit itself
-        also fails, last-ditch commit attempts to recover the row to
-        apply_failed with _APPLY_ERROR_BOARD_COMMIT_FAILURE_MESSAGE. The
-        original (terminal) commit exception propagates with the secondary
-        exception explicitly chained via __cause__ and __context__."""
+        """Fix S2 / Finding 2 / Finding 12 / Argus review round-4 B2: if the
+        RECOVERY commit itself also fails, the last-ditch commit must retry
+        the SAME genuine terminal state ("applied" here, with apply_result
+        intact) rather than downgrading it to a false apply_failed --
+        silently discarding a real successful external write and reporting
+        failure would let a retrying caller duplicate that write (the
+        dedup check does not block resubmission against an apply_failed
+        row). The original (terminal) commit exception still propagates,
+        with the secondary exception explicitly chained via __cause__ and
+        __context__."""
         judge = FakeProposalJudge(
             fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
             apply_result=ProposalApplyOutcome(
-                applied=True, result=None, caller_error=None, log_detail=None
+                applied=True, result={"ticket": "TECH-1"}, caller_error=None, log_detail=None
             ),
         )
         submitted = await _submit(session, judge=judge)
@@ -1717,6 +1769,108 @@ class TestTerminalCommitFailureRecovery:
         assert exc_info.value is first_exc
         assert first_exc.__cause__ is second_exc
         assert first_exc.__context__ is second_exc
+        row = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        assert row.status == "applied"
+        assert row.apply_result == {"ticket": "TECH-1"}
+        assert row.apply_error is None
+        assert row.applied_at is not None
+        audit_row = (
+            (
+                await session.execute(
+                    select(AuditLog).where(
+                        AuditLog.action == "proposal.applied",
+                        AuditLog.detail["hold_id"].astext == str(hold_id),
+                    )
+                )
+            )
+            .scalars()
+            .one()
+        )
+        assert "error" not in audit_row.detail
+
+    async def test_last_ditch_write_preserves_stale(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Fix 2 (BLOCKING): the last-ditch write must retry "stale" (with
+        the honest ``_stale_decision_note`` text) too, not just "applied"
+        -- a "stale" outcome is just as much a real, already-computed
+        terminal state as "applied" is, and downgrading it to a false
+        apply_failed would be equally misleading."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-original"),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result=None, caller_error=None, log_detail=None
+            ),
+        )
+        submitted = await _submit(session, judge=judge)
+        judge.fingerprint_result = ProposalFingerprint(
+            status=FINGERPRINT_DIGEST, digest="fp-drifted"
+        )
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        first_exc = OperationalError("first", {}, Exception("terminal commit failed"))
+        second_exc = OperationalError("second", {}, Exception("recovery commit also failed"))
+        commit_mock = self._fail_nth_commit(session, 3, first_exc, second_exc)
+        monkeypatch.setattr(session, "commit", commit_mock)
+
+        with pytest.raises(OperationalError) as exc_info:
+            await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
+
+        assert commit_mock.call_count == 5
+        assert exc_info.value is first_exc
+        row = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        assert row.status == "stale"
+        assert row.decision_note == (
+            "not applied: target changed after approval; no write to the target was performed"
+        )
+        assert judge.apply_calls == []
+        audit_row = (
+            (
+                await session.execute(
+                    select(AuditLog).where(
+                        AuditLog.action == "proposal.stale",
+                        AuditLog.detail["hold_id"].astext == str(hold_id),
+                    )
+                )
+            )
+            .scalars()
+            .one()
+        )
+        assert "error" not in audit_row.detail
+
+    async def test_last_ditch_write_uses_minimal_fallback_only_for_apply_failed(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Fix 2 (BLOCKING): when the ALREADY-computed terminal state was
+        itself ``apply_failed`` (no successful external write to
+        protect), the last-ditch write correctly falls back to the
+        minimal board-owned ``_APPLY_ERROR_BOARD_COMMIT_FAILURE_MESSAGE``
+        -- this is the one case where that minimal write remains
+        correct."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_result=ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error="Linear API returned an error",
+                log_detail="linear is down",
+            ),
+        )
+        submitted = await _submit(session, judge=judge)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        first_exc = OperationalError("first", {}, Exception("terminal commit failed"))
+        second_exc = OperationalError("second", {}, Exception("recovery commit also failed"))
+        commit_mock = self._fail_nth_commit(session, 3, first_exc, second_exc)
+        monkeypatch.setattr(session, "commit", commit_mock)
+
+        with pytest.raises(OperationalError) as exc_info:
+            await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
+
+        assert commit_mock.call_count == 5
+        assert exc_info.value is first_exc
         row = (
             await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
         ).scalar_one()
