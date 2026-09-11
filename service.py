@@ -8832,13 +8832,15 @@ async def get_conversation(
     page_max_seq = max((m.seq for m, _ in msg_rows), default=resolved_since_seq)
 
     # TECH-6197 anchor-triggered context band: only pulled in when a
-    # timestamp bound is actually in effect AND at least one message
-    # anchors it (landed in-window) -- an empty in-window set pulls in NO
-    # context at all (see docstring point 3). `context_hours=0` naturally
+    # timestamp bound is actually in effect AND this is a "fresh" read
+    # (no explicit `since_seq` continuation cursor) AND at least one
+    # message anchors it (landed in-window). An empty in-window set pulls
+    # in NO context at all (see docstring point 3), and continuation
+    # pages must not repeat the context band. `context_hours=0` naturally
     # yields an empty (lower-bound == upper-bound) band with no special
     # case needed.
     context_rows: list[Any] = []
-    if since_ts is not None and msg_rows and context_hours > 0:
+    if since_ts is not None and not since_seq_explicit and msg_rows and context_hours > 0:
         context_lower_bound = since_ts - timedelta(hours=context_hours)
         context_rows = list(
             (

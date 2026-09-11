@@ -4790,6 +4790,48 @@ class TestGetConversationSinceWindowTool:
         assert result["messages"] == []
         assert result["has_more"] is False
 
+    async def test_explicit_since_and_since_seq_continuation_drops_context_band(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """End-to-end regression: a continuation call that passes both an
+        explicit ``since`` and ``since_seq=page_max_seq`` must not re-include
+        the context band, and the ``since`` bound must still apply."""
+        conversation_id, token_target = await self._start_and_accept(
+            main, test_session_factory, "gcwt-owner-10", "gcwt-target-10"
+        )
+        await self._post_second_message(main, test_session_factory, token_target, conversation_id)
+        now = datetime.now(UTC)
+        await self._backdate(test_session_factory, conversation_id, 1, now - timedelta(hours=74))
+        await self._backdate(test_session_factory, conversation_id, 2, now - timedelta(hours=70))
+        since = (now - timedelta(hours=72)).isoformat()
+
+        first = await _call(
+            main,
+            test_session_factory,
+            token_target,
+            "comms_get_conversation",
+            {"conversation_id": conversation_id, "since": since},
+        )
+        assert first["since_was_defaulted"] is False
+        assert [m["seq"] for m in first["messages"]] == [1, 2]
+        assert first["messages"][0]["context"] is True
+        assert "context" not in first["messages"][1]
+        assert first["page_max_seq"] == 2
+
+        second = await _call(
+            main,
+            test_session_factory,
+            token_target,
+            "comms_get_conversation",
+            {
+                "conversation_id": conversation_id,
+                "since": since,
+                "since_seq": first["page_max_seq"],
+            },
+        )
+        assert second["messages"] == []
+        assert second["has_more"] is False
+
 
 # --- concurrent seq assignment, exercised through the full tool stack ------------
 

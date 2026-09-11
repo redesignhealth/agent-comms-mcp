@@ -6032,6 +6032,111 @@ class TestGetConversationSinceWindow:
                 context_hours=_service.GET_CONVERSATION_MAX_CONTEXT_HOURS + 1,
             )
 
+    async def test_context_messages_are_purely_additive_for_pagination_state(
+        self, session: AsyncSession
+    ) -> None:
+        """Context messages are included in the response but must not influence
+        ``has_more``, ``page_max_seq``, or the read cursor. Only the in-window
+        page participates in pagination and cursor advancement."""
+        owner = await _register(session, "gcw-owner-14")
+        target = await _register(session, "gcw-target-14")
+        now = datetime.now(UTC)
+        since_ts = now - timedelta(hours=_service.GET_CONVERSATION_DEFAULT_LOOKBACK_HOURS)
+        context_time = since_ts - timedelta(hours=12)
+        # One context-band message plus enough in-window messages to overflow
+        # one page by exactly one row.
+        in_window_count = MAX_MESSAGES_PER_GET_CONVERSATION + 1
+        message_times = [context_time] + [
+            now - timedelta(minutes=i) for i in range(in_window_count)
+        ]
+        conversation = await self._seed(
+            session, owner=owner, target=target, message_times=message_times
+        )
+
+        result = await get_conversation(
+            session,
+            actor_sub=target.sub,
+            caller_agent_id=target.id,
+            conversation_id=conversation.id,
+        )
+
+        # Context (seq 1) plus the first MAX in-window messages (seq 2..MAX+1).
+        assert len(result["messages"]) == MAX_MESSAGES_PER_GET_CONVERSATION + 1
+        assert result["messages"][0]["seq"] == 1
+        assert result["messages"][0]["context"] is True
+        assert result["messages"][1]["seq"] == 2
+        assert result["messages"][-1]["seq"] == MAX_MESSAGES_PER_GET_CONVERSATION + 1
+        assert "context" not in result["messages"][-1]
+
+        # Pagination state reflects the in-window page only.
+        assert result["has_more"] is True
+        assert result["page_max_seq"] == MAX_MESSAGES_PER_GET_CONVERSATION + 1
+        assert result["last_read_seq"] == MAX_MESSAGES_PER_GET_CONVERSATION + 1
+        assert result["page_max_seq"] > result["messages"][0]["seq"]
+
+        row = await session.get(Participant, (conversation.id, target.id))
+        assert row is not None
+        assert row.last_read_seq == MAX_MESSAGES_PER_GET_CONVERSATION + 1
+
+    async def test_explicit_since_and_since_seq_continuation_drops_context_band(
+        self, session: AsyncSession
+    ) -> None:
+        """A continuation call that passes both an explicit ``since`` timestamp
+        AND ``since_seq=page_max_seq`` must AND the two bounds. The context
+        band must not be repeated on continuation pages; it is only included
+        on the first fresh page."""
+        owner = await _register(session, "gcw-owner-15")
+        target = await _register(session, "gcw-target-15")
+        now = datetime.now(UTC)
+        since_ts = now - timedelta(hours=_service.GET_CONVERSATION_DEFAULT_LOOKBACK_HOURS)
+        context_time = since_ts - timedelta(hours=2)
+        # Context + enough in-window messages to span two pages.
+        extra_in_window = 5
+        in_window_count = MAX_MESSAGES_PER_GET_CONVERSATION + extra_in_window
+        message_times = [context_time] + [
+            now - timedelta(minutes=i) for i in range(in_window_count)
+        ]
+        conversation = await self._seed(
+            session, owner=owner, target=target, message_times=message_times
+        )
+
+        first = await get_conversation(
+            session,
+            actor_sub=target.sub,
+            caller_agent_id=target.id,
+            conversation_id=conversation.id,
+            since=since_ts,
+        )
+        assert first["since_was_defaulted"] is False
+        assert first["has_more"] is True
+        assert [m["seq"] for m in first["messages"]] == [
+            1,
+            *range(2, MAX_MESSAGES_PER_GET_CONVERSATION + 2),
+        ]
+        assert first["messages"][0]["context"] is True
+        assert first["page_max_seq"] == MAX_MESSAGES_PER_GET_CONVERSATION + 1
+
+        second = await get_conversation(
+            session,
+            actor_sub=target.sub,
+            caller_agent_id=target.id,
+            conversation_id=conversation.id,
+            since=since_ts,
+            since_seq=first["page_max_seq"],
+        )
+        # Only the remaining in-window messages; the context band must not
+        # reappear, and every returned message must still respect ``since``.
+        assert [m["seq"] for m in second["messages"]] == list(
+            range(
+                MAX_MESSAGES_PER_GET_CONVERSATION + 2,
+                MAX_MESSAGES_PER_GET_CONVERSATION + 2 + extra_in_window,
+            )
+        )
+        for m in second["messages"]:
+            assert "context" not in m
+            assert datetime.fromisoformat(m["created_at"]) >= since_ts
+        assert second["has_more"] is False
+
 
 # --- resolve_inbox_target -------------------------------------------------------
 
