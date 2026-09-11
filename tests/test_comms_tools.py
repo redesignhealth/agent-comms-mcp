@@ -4526,6 +4526,271 @@ class TestLazyExpiryEndToEnd:
         assert view["conversation"]["state"] == "expired"
 
 
+# --- TECH-6197: since/context_hours default window, end-to-end ------------------
+
+
+class TestGetConversationSinceWindowTool:
+    """End-to-end coverage of TECH-6197's ``since``/``context_hours``
+    behavior through the full ``comms_get_conversation`` tool stack.
+
+    Backdates a message's ``created_at`` via a raw SQL ``UPDATE`` after
+    posting it through the normal tools -- there is no tool parameter to
+    control this directly, and the tool stack's ``comms_start_conversation``
+    always stamps its own seq-1 message with the real ``now()`` -- same
+    established direct-session pattern this file already uses elsewhere
+    (e.g. ``TestArchiveConversationTool``'s state-forcing ``UPDATE``)."""
+
+    async def _backdate(
+        self,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        conversation_id: str,
+        seq: int,
+        created_at: datetime,
+    ) -> None:
+        async with test_session_factory() as session:
+            await session.execute(
+                text(
+                    "UPDATE messages SET created_at = :created_at "
+                    "WHERE conversation_id = :cid AND seq = :seq"
+                ),
+                {"created_at": created_at, "cid": conversation_id, "seq": seq},
+            )
+            await session.commit()
+
+    async def _start_and_accept(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        owner_sub: str,
+        target_sub: str,
+    ) -> tuple[str, MagicMock]:
+        await _register(main, test_session_factory, owner_sub)
+        await _register(main, test_session_factory, target_sub)
+        token_owner = _token(owner_sub)
+        token_target = _token(target_sub)
+        list_result = await _call(main, test_session_factory, token_owner, "comms_list_agents")
+        target_id = next(a["agent_id"] for a in list_result["agents"] if a["sub"] == target_sub)
+        started = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [target_id],
+                "initial_message": _availability_request(),
+            },
+        )
+        conversation_id = started["conversation_id"]
+        await _call(
+            main,
+            test_session_factory,
+            token_target,
+            "comms_accept",
+            {"conversation_id": conversation_id},
+        )
+        return conversation_id, token_target
+
+    async def _post_second_message(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        token_target: MagicMock,
+        conversation_id: str,
+    ) -> None:
+        await _call(
+            main,
+            test_session_factory,
+            token_target,
+            "comms_post_message",
+            {
+                "conversation_id": conversation_id,
+                "message_type": "availability_response",
+                "payload": _availability_response(),
+            },
+        )
+
+    async def test_fresh_call_applies_72h_default(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        conversation_id, token_target = await self._start_and_accept(
+            main, test_session_factory, "gcwt-owner-1", "gcwt-target-1"
+        )
+        result = await _call(
+            main,
+            test_session_factory,
+            token_target,
+            "comms_get_conversation",
+            {"conversation_id": conversation_id},
+        )
+        assert result["since_was_defaulted"] is True
+        assert [m["seq"] for m in result["messages"]] == [1]
+
+    async def test_explicit_since_seq_no_since_behaves_like_full_history(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        conversation_id, token_target = await self._start_and_accept(
+            main, test_session_factory, "gcwt-owner-2", "gcwt-target-2"
+        )
+        far_past = datetime.now(UTC) - timedelta(hours=200)
+        await self._backdate(test_session_factory, conversation_id, 1, far_past)
+
+        result = await _call(
+            main,
+            test_session_factory,
+            token_target,
+            "comms_get_conversation",
+            {"conversation_id": conversation_id, "since_seq": 0},
+        )
+        assert result["since_was_defaulted"] is False
+        assert [m["seq"] for m in result["messages"]] == [1]
+        assert "context" not in result["messages"][0]
+
+    async def test_boundary_70h_and_74h_both_returned_74h_flagged_context(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        conversation_id, token_target = await self._start_and_accept(
+            main, test_session_factory, "gcwt-owner-3", "gcwt-target-3"
+        )
+        await self._post_second_message(main, test_session_factory, token_target, conversation_id)
+        now = datetime.now(UTC)
+        await self._backdate(test_session_factory, conversation_id, 1, now - timedelta(hours=74))
+        await self._backdate(test_session_factory, conversation_id, 2, now - timedelta(hours=70))
+
+        result = await _call(
+            main,
+            test_session_factory,
+            token_target,
+            "comms_get_conversation",
+            {"conversation_id": conversation_id},
+        )
+        assert result["since_was_defaulted"] is True
+        assert [m["seq"] for m in result["messages"]] == [1, 2]
+        assert result["messages"][0]["context"] is True
+        assert "context" not in result["messages"][1]
+
+    async def test_boundary_74h_and_76h_neither_returned(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        conversation_id, token_target = await self._start_and_accept(
+            main, test_session_factory, "gcwt-owner-4", "gcwt-target-4"
+        )
+        await self._post_second_message(main, test_session_factory, token_target, conversation_id)
+        now = datetime.now(UTC)
+        await self._backdate(test_session_factory, conversation_id, 1, now - timedelta(hours=76))
+        await self._backdate(test_session_factory, conversation_id, 2, now - timedelta(hours=74))
+
+        result = await _call(
+            main,
+            test_session_factory,
+            token_target,
+            "comms_get_conversation",
+            {"conversation_id": conversation_id},
+        )
+        assert result["since_was_defaulted"] is True
+        assert result["messages"] == []
+
+    async def test_context_hours_zero_never_includes_context(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        conversation_id, token_target = await self._start_and_accept(
+            main, test_session_factory, "gcwt-owner-5", "gcwt-target-5"
+        )
+        await self._post_second_message(main, test_session_factory, token_target, conversation_id)
+        now = datetime.now(UTC)
+        await self._backdate(test_session_factory, conversation_id, 1, now - timedelta(hours=74))
+        await self._backdate(test_session_factory, conversation_id, 2, now - timedelta(hours=70))
+
+        result = await _call(
+            main,
+            test_session_factory,
+            token_target,
+            "comms_get_conversation",
+            {"conversation_id": conversation_id, "context_hours": 0},
+        )
+        assert [m["seq"] for m in result["messages"]] == [2]
+
+    async def test_naive_since_rejected(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        conversation_id, token_target = await self._start_and_accept(
+            main, test_session_factory, "gcwt-owner-6", "gcwt-target-6"
+        )
+        with pytest.raises(ToolError, match="timezone-aware"):
+            await _call(
+                main,
+                test_session_factory,
+                token_target,
+                "comms_get_conversation",
+                {"conversation_id": conversation_id, "since": "2020-01-01T00:00:00"},
+            )
+
+    async def test_negative_context_hours_rejected(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        conversation_id, token_target = await self._start_and_accept(
+            main, test_session_factory, "gcwt-owner-7", "gcwt-target-7"
+        )
+        with pytest.raises(ToolError, match="invalid_request"):
+            await _call(
+                main,
+                test_session_factory,
+                token_target,
+                "comms_get_conversation",
+                {"conversation_id": conversation_id, "context_hours": -1},
+            )
+
+    async def test_context_hours_over_cap_rejected(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        conversation_id, token_target = await self._start_and_accept(
+            main, test_session_factory, "gcwt-owner-8", "gcwt-target-8"
+        )
+        with pytest.raises(ToolError, match="may not exceed"):
+            await _call(
+                main,
+                test_session_factory,
+                token_target,
+                "comms_get_conversation",
+                {"conversation_id": conversation_id, "context_hours": 200},
+            )
+
+    async def test_invited_caller_unaffected_by_new_params(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        await _register(main, test_session_factory, "gcwt-owner-9")
+        await _register(main, test_session_factory, "gcwt-target-9")
+        token_owner = _token("gcwt-owner-9")
+        token_target = _token("gcwt-target-9")
+        list_result = await _call(main, test_session_factory, token_owner, "comms_list_agents")
+        target_id = next(
+            a["agent_id"] for a in list_result["agents"] if a["sub"] == "gcwt-target-9"
+        )
+        started = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [target_id],
+                "initial_message": _availability_request(),
+            },
+        )
+        conversation_id = started["conversation_id"]
+
+        result = await _call(
+            main,
+            test_session_factory,
+            token_target,
+            "comms_get_conversation",
+            {"conversation_id": conversation_id, "context_hours": 48},
+        )
+        assert result["invited"] is True
+        assert result["messages"] == []
+        assert result["has_more"] is False
+
+
 # --- concurrent seq assignment, exercised through the full tool stack ------------
 
 

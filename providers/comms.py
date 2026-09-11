@@ -448,6 +448,21 @@ def _parse_expires_at(value: str | None) -> datetime | None:
     return dt
 
 
+def _parse_since(value: str | None) -> datetime | None:
+    """Parse an optional ISO 8601 ``since`` lower bound (TECH-6197), rejecting naive datetimes."""
+    if value is None:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ToolError(
+            f"invalid_request: since is not a valid ISO 8601 datetime: {value!r}"
+        ) from exc
+    if dt.tzinfo is None:
+        raise ToolError("invalid_request: since must be timezone-aware (include a UTC offset)")
+    return dt
+
+
 def _iso(dt: datetime | None) -> str | None:
     return dt.isoformat() if dt is not None else None
 
@@ -1560,22 +1575,26 @@ async def get_hold_status(hold_id: str, agent_key: str | None = None) -> dict[st
 
 @comms_server.tool
 async def get_conversation(
-    conversation_id: str, since_seq: int = 0, agent_key: str | None = None
+    conversation_id: str,
+    since_seq: int | None = None,
+    since: str | None = None,
+    context_hours: int = service.GET_CONVERSATION_DEFAULT_CONTEXT_HOURS,
+    agent_key: str | None = None,
 ) -> dict[str, Any]:
-    """Combined read: conversation + participants + messages since ``since_seq``.
+    """Combined read: conversation + participants + messages since ``since_seq``/``since``.
 
     Returns ``conversation``, ``participants``, ``messages``, ``invited``,
     ``has_more``, and either ``invited_by`` (only for an ``invited``
-    caller) or ``messages_returned``, ``page_max_seq``, ``last_read_seq``
-    (only for a non-``invited`` caller).
+    caller) or ``messages_returned``, ``page_max_seq``, ``last_read_seq``,
+    ``since_was_defaulted`` (only for a non-``invited`` caller).
 
     An ``invited`` (not yet accepted) caller gets metadata only — no
-    message content, ``since_seq`` is ignored, and ``has_more`` is always
-    ``False``. An ``active`` caller gets up to 500 messages
-    (``MAX_MESSAGES_PER_GET_CONVERSATION``) from ``since_seq`` onward, and
-    their read cursor advances. ``since_seq`` must be non-negative — a
-    negative value would silently widen the result window in an
-    unintended way.
+    message content, ``since_seq``/``since``/``context_hours`` are all
+    ignored, and ``has_more`` is always ``False``. An ``active`` caller
+    gets up to 500 messages (``MAX_MESSAGES_PER_GET_CONVERSATION``) per
+    the ``since_seq``/``since`` resolution below, and their read cursor
+    advances. ``since_seq``, if passed, must be non-negative — a negative
+    value would silently widen the result window in an unintended way.
 
     **Pagination**: when ``has_more`` is ``True``, re-call with
     ``since_seq=page_max_seq`` from THIS response — NOT
@@ -1584,19 +1603,68 @@ async def get_conversation(
     re-reading (e.g. you deliberately pass a low ``since_seq`` to revisit
     older history); re-calling with it instead of ``page_max_seq`` can
     silently skip messages between this page's end and that cursor.
+    ``page_max_seq``/``has_more`` reflect only the in-window page below,
+    never any additional context messages.
 
     The returned ``messages_returned`` count is the size of the returned
-    (post-``since_seq``-filter, capped) slice, NOT the conversation's total
-    message count — deliberately not named ``total_count`` to avoid
+    (post-filter, capped, context-inclusive) slice, NOT the conversation's
+    total message count — deliberately not named ``total_count`` to avoid
     implying otherwise.
+
+    **TECH-6197 -- ``since``/``context_hours`` default behavior (breaking
+    change)**: a plain, argument-free call used to return the ENTIRE
+    message history from the beginning. It no longer does. Resolution:
+
+    - Pass ``since`` (a timezone-aware ISO 8601 string, e.g.
+      ``"2026-01-01T00:00:00Z"``): used as the timestamp lower bound on
+      ``created_at``. An also-explicit ``since_seq`` still applies too
+      (AND'd), exactly as before.
+    - Pass ``since_seq`` (e.g. for pagination continuation, including
+      ``since_seq=0``) but omit ``since``: NO timestamp bound is applied
+      at all — this is the existing continuation behavior, unchanged
+      (full history from that seq onward).
+    - Pass NEITHER (a plain ``comms_get_conversation(conversation_id)``
+      call): a new default is applied automatically — only the last 72
+      hours of history (plus context, see below) is returned, instead of
+      full history from the beginning. ``since_was_defaulted: true`` in
+      the response flags this case. **To get true full history on a
+      fresh call, explicitly pass an old ``since`` (e.g. the Unix epoch,
+      ``"1970-01-01T00:00:00Z"``)** — this is the escape hatch.
+
+    **Anchor-triggered context window**: whenever a timestamp bound is in
+    effect (explicit ``since`` OR the 72h default — never on the plain
+    ``since_seq``-continuation path above), messages with
+    ``created_at >= since`` are the "in-window" set. If that set is
+    non-empty, messages in the ``context_hours``-wide band immediately
+    before ``since`` (``since - context_hours <= created_at < since``)
+    are ADDITIONALLY included and flagged ``"context": true`` in the
+    response (in-window messages carry no ``"context"`` key at all). If
+    the in-window set is EMPTY, no context band is pulled and no messages
+    are returned at all — an in-window message is required to "anchor"
+    the context pull. Worked example with the 72h/24h defaults: messages
+    at 70h-ago and 74h-ago — BOTH returned (70h-ago is in-window; 74h-ago
+    falls in the resulting `[72h, 96h)` context band), with 74h-ago
+    flagged ``"context": true``. Messages at 74h-ago and 76h-ago —
+    NEITHER returned (nothing is in-window to anchor a context pull).
+    ``context_hours`` defaults to 24, must be ``>= 0``
+    (``context_hours=0`` means "never include context") and
+    ``<= 168`` (7 days).
     """
     token = _require_token()
     base_sub = _require_identity(token)
     agent_key = _validate_agent_key(agent_key)
     sub = _compose_sub(base_sub, agent_key)
     conv_id = _parse_uuid("conversation_id", conversation_id)
-    if since_seq < 0:
+    if since_seq is not None and since_seq < 0:
         raise ToolError("invalid_request: since_seq must be >= 0")
+    since_dt = _parse_since(since)
+    if context_hours < 0:
+        raise ToolError("invalid_request: context_hours must be >= 0")
+    if context_hours > service.GET_CONVERSATION_MAX_CONTEXT_HOURS:
+        raise ToolError(
+            "invalid_request: context_hours may not exceed "
+            f"{service.GET_CONVERSATION_MAX_CONTEXT_HOURS}"
+        )
 
     async with get_session_factory()() as session:
         caller = await _resolve_caller_agent(session, sub, token)
@@ -1607,6 +1675,8 @@ async def get_conversation(
                 caller_agent_id=caller.id,
                 conversation_id=conv_id,
                 since_seq=since_seq,
+                since=since_dt,
+                context_hours=context_hours,
             )
 
     if "messages_in_page" in result:
