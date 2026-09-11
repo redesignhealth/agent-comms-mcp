@@ -168,7 +168,7 @@ from collections.abc import Set as AbstractSet
 from datetime import UTC, datetime, timedelta
 from typing import Any, NoReturn, Protocol
 
-from sqlalchemy import and_, func, literal, or_, select, text, tuple_
+from sqlalchemy import ColumnElement, and_, func, literal, not_, or_, select, text, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -2617,6 +2617,7 @@ async def list_agents(
     active_checker: ActiveChecker,
     limit: int = DEFAULT_LIST_AGENTS_LIMIT,
     cursor: str | None = None,
+    include_suspended: bool = False,
 ) -> dict[str, Any]:
     """Paginated board directory, ordered by ``sub`` (keyset pagination).
 
@@ -2626,29 +2627,44 @@ async def list_agents(
     as acceptable today and as the seam that tightens once external
     counterparties exist) — no denial paths, so no audit rows.
 
+    ``include_suspended`` (default ``False``): when ``False``, agents with
+    ``status == "suspended"`` are excluded at the SQL query level from both
+    the paginated results and ``total_count``. Pass ``True`` to include
+    suspended agents.
+
     TECH-5703: a registry-retired agent (``active_checker.is_active`` false)
     is dropped from ``agents`` -- filtered AFTER pagination/cursor
     computation, which are still based on the raw DB rows, so a retired
     agent's ``sub`` still occupies its position in keyset order and paging
     never skips the row immediately after it. ``total_count`` deliberately
-    still counts every row regardless of retirement (it reflects the table,
-    not this listing's visibility -- the agent row itself is never deleted,
-    per this ticket's audit-trail requirement). Callers MUST page until
-    ``has_more`` is false, not until ``agents`` is empty -- a page can
-    return fewer than ``limit`` agents (including zero) while ``has_more``
-    is still true, when every row on that page happens to be retired.
-    ``active_checker.is_active`` failures fail open (see
-    ``_is_active_safe``): worst case a retired agent stays briefly visible,
+    still counts every non-suspended board-registered agent (when
+    include_suspended=False), regardless of retirement status (it reflects
+    the table, not this listing's visibility -- the agent row itself is
+    never deleted, per this ticket's audit-trail requirement). This
+    asymmetry between suspension and retirement is intentional: suspension
+    is an in-DB status filtered in SQL and reflected in ``total_count``;
+    retirement is an external async seam that cannot be expressed in SQL
+    and is not reflected in ``total_count``. Callers MUST page until
+    ``has_more`` is false, not until
+    ``agents`` is empty -- a page can return fewer than ``limit`` agents
+    (including zero) while ``has_more`` is still true, when every row on that
+    page happens to be retired. ``active_checker.is_active`` failures fail open
+    (see ``_is_active_safe``): worst case a retired agent stays briefly visible,
     never a directory outage.
     """
     limit = max(1, min(limit, 200))
     stmt = select(Agent).order_by(Agent.sub).limit(limit + 1)
+    if not include_suspended:
+        stmt = stmt.where(Agent.status != "suspended")
     if cursor:
         stmt = stmt.where(Agent.sub > cursor)
     rows = list((await session.execute(stmt)).scalars().all())
     has_more = len(rows) > limit
     rows = rows[:limit]
-    total_count = (await session.execute(select(func.count()).select_from(Agent))).scalar_one()
+    count_stmt = select(func.count()).select_from(Agent)
+    if not include_suspended:
+        count_stmt = count_stmt.where(Agent.status != "suspended")
+    total_count = (await session.execute(count_stmt)).scalar_one()
     active_flags = await asyncio.gather(*(_is_active_safe(active_checker, a.sub) for a in rows))
     visible_agents = [
         _agent_public(a) for a, is_active in zip(rows, active_flags, strict=True) if is_active
@@ -2776,6 +2792,8 @@ async def list_conversations(
     state: str | None = None,
     limit: int = 50,
     cursor: str | None = None,
+    include_archived: bool = False,
+    include_expired: bool = False,
 ) -> dict[str, Any]:
     """Paginated list of conversations the caller participates in.
 
@@ -2783,7 +2801,16 @@ async def list_conversations(
     - ``role``: ``"owner"``, ``"member"``, or ``None`` for any role.
     - ``conversation_type``: one of ``CONVERSATION_TYPES`` or ``None`` for any.
     - ``state``: one of ``"active"``, ``"completed"``, ``"canceled"``,
-      ``"expired"``, or ``None`` for any.
+      ``"expired"``, or ``None`` for any. Passing an explicit state takes
+      exact precedence over ``include_expired`` — ``state="expired"``
+      surfaces expired conversations regardless of ``include_expired``, and
+      any other explicit state (e.g. ``"completed"``) returns exactly that
+      state with no expired rows OR'd in, regardless of ``include_expired``.
+    - ``include_archived``: ``bool`` (default ``False``). When ``False``,
+      conversations with ``archived_at IS NOT NULL`` are excluded.
+    - ``include_expired``: ``bool`` (default ``False``). Only relevant when
+      ``state`` is ``None``. When ``False``, conversations in the
+      ``"expired"`` state (or active past ``expires_at``) are excluded.
 
     Keyset-paginated over ``(created_at DESC, id DESC)`` — pass back the
     ``next_cursor`` value from a prior response to get the next page.
@@ -2805,6 +2832,15 @@ async def list_conversations(
         .limit(limit + 1)
     )
 
+    now = _now()
+    is_expired = or_(
+        Conversation.state == "expired",
+        (Conversation.state == "active") & (Conversation.expires_at <= now),
+    )
+
+    if not include_archived:
+        stmt = stmt.where(Conversation.archived_at.is_(None))
+
     if role is not None:
         stmt = stmt.where(Participant.role == role)
     if conversation_type is not None:
@@ -2816,17 +2852,22 @@ async def list_conversations(
         # match almost nothing for "expired". Reconcile against
         # expires_at directly rather than eagerly expiring every row this
         # query would otherwise touch.
+        # An explicit state filter takes exact precedence over
+        # include_expired: state="expired" surfaces expired conversations
+        # even if include_expired=False, and state="completed" (or any
+        # other explicit state) must return ONLY that state — it must not
+        # have expired rows OR'd in just because include_expired=True.
+        state_cond: ColumnElement[bool]
         if state == "active":
-            stmt = stmt.where(Conversation.state == "active", Conversation.expires_at > _now())
+            state_cond = (Conversation.state == "active") & (Conversation.expires_at > now)
         elif state == "expired":
-            stmt = stmt.where(
-                or_(
-                    Conversation.state == "expired",
-                    (Conversation.state == "active") & (Conversation.expires_at <= _now()),
-                )
-            )
+            state_cond = is_expired
         else:
-            stmt = stmt.where(Conversation.state == state)
+            state_cond = Conversation.state == state
+
+        stmt = stmt.where(state_cond)
+    elif not include_expired:
+        stmt = stmt.where(not_(is_expired))
 
     if cursor:
         # cursor = "<created_at_iso>|<id>"
@@ -4123,10 +4164,11 @@ async def archive_conversation(
     is purely about hiding a conversation from active use, not describing
     how it ended.
 
-    Read paths (``comms_get_conversation``, ``comms_inbox``,
-    ``comms_list_conversations``) are completely unaffected by this call --
-    archiving is not a delete or a redaction, every past message remains
-    exactly as readable as before.
+    Archiving removes the conversation from the default
+    ``comms_list_conversations`` browse listing (recoverable via
+    ``include_archived=True``); ``comms_get_conversation`` and
+    ``comms_inbox`` remain unaffected -- archiving is not a delete or a
+    redaction, every past message remains exactly as readable as before.
     """
     conversation, _participant = await _load_participant_for_transition(
         session,

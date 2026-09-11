@@ -599,6 +599,15 @@ class TestAgentsDirectoryResource:
     ) -> None:
         await _register(main, test_session_factory, "dir-res-a")
         await _register(main, test_session_factory, "dir-res-b")
+        res_c = await _register(main, test_session_factory, "dir-res-c-suspended")
+        admin_token = _token("dir-res-admin", scopes=["comms:read", "comms:write", "comms:admin"])
+        await _call(
+            main,
+            test_session_factory,
+            admin_token,
+            "comms_deregister_agent",
+            {"agent_id": res_c["agent_id"]},
+        )
         token = _token("dir-res-a")
 
         tool_result = await _call(main, test_session_factory, token, "comms_list_agents")
@@ -607,3 +616,7 @@ class TestAgentsDirectoryResource:
         )
         assert resource_result == tool_result
         assert resource_result["total_count"] >= 2
+        subs = [a["sub"] for a in resource_result["agents"]]
+        assert "dir-res-c-suspended" not in subs
+        assert "dir-res-a" in subs
+        assert "dir-res-b" in subs

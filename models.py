@@ -414,10 +414,13 @@ class Conversation(Base):
     # column: ``service.invite``/``service.post_message`` (and
     # ``service.accept_invite`` -- see that function's own docstring for why
     # accept is treated the same as a new invite here) deny with the
-    # specific ``ConversationArchivedError`` when it is set; every read path
-    # (``get_conversation``, ``inbox``, ``list_conversations``) is
-    # completely unaffected -- past messages remain fully readable forever,
-    # archiving is not a delete or a redaction. Archiving has no undo path
+    # specific ``ConversationArchivedError`` when it is set; read paths
+    # preserving history and per-conversation access (``get_conversation``,
+    # ``inbox``, ``get_hold_status``) are completely unaffected -- past
+    # messages remain fully readable forever. Archiving removes the
+    # conversation from the default ``list_conversations`` browse listing,
+    # recoverable via ``include_archived=True``. Archiving is not a delete
+    # or a redaction. Archiving has no undo path
     # (no "unarchive" tool) -- see ``service.archive_conversation``'s
     # docstring.
     archived_at: Mapped[datetime | None] = mapped_column(nullable=True)

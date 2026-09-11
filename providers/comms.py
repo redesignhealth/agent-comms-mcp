@@ -1027,17 +1027,25 @@ async def admin_register(
 
 @comms_server.tool
 async def list_agents(
-    limit: int = service.DEFAULT_LIST_AGENTS_LIMIT, cursor: str | None = None
+    limit: int = service.DEFAULT_LIST_AGENTS_LIMIT,
+    cursor: str | None = None,
+    include_suspended: bool = False,
 ) -> dict[str, Any]:
     """List the board directory (paginated, keyset on ``sub``).
 
     Internal domain — enumeration is acceptable per DESIGN.md §10. Pass the
     returned ``next_cursor`` back as ``cursor`` to page forward.
 
+    ``include_suspended`` (default ``False``): when ``False``, agents with
+    ``status == "suspended"`` are excluded from the directory listing and from
+    ``total_count``. Pass ``True`` to include suspended agents.
+
     TECH-5703: a registry-retired agent is dropped from ``agents`` (its row
     still exists -- retirement never deletes conversation history -- it's
     just excluded from this listing). ``total_count`` still reflects every
-    board-registered agent regardless of retirement status. Retirement is
+    board-registered agent matching the query regardless of retirement status.
+    This asymmetry is intentional: suspension is an in-DB status filtered in SQL,
+    while retirement is an external seam filtered post-pagination. Retirement is
     filtered AFTER pagination is computed from the raw rows, so a page can
     return fewer than ``limit`` agents (including zero) while ``has_more``
     is still ``true`` -- page until ``has_more`` is ``false``, not until
@@ -1049,6 +1057,7 @@ async def list_agents(
             session,
             limit=limit,
             cursor=cursor,
+            include_suspended=include_suspended,
             active_checker=plugins.get_active_checker(),
         )
 
@@ -1676,6 +1685,8 @@ async def list_conversations(
     limit: int = 50,
     cursor: str | None = None,
     agent_key: str | None = None,
+    include_archived: bool = False,
+    include_expired: bool = False,
 ) -> dict[str, Any]:
     """Return a paginated list of conversations the caller participates in.
 
@@ -1684,7 +1695,16 @@ async def list_conversations(
     - ``type``: conversation type — ``"open"``, ``"internal"``, or
       ``"asymmetric"`` (default: any type).
     - ``state``: ``"active"``, ``"completed"``, ``"canceled"``, or
-      ``"expired"`` (default: any state).
+      ``"expired"`` (default: any state). An explicit ``state`` filter
+      takes exact precedence over ``include_expired`` in both directions —
+      expired rows are never OR'd in when a specific state is requested,
+      and expired rows are never excluded when ``state="expired"`` is
+      explicitly passed.
+    - ``include_archived``: ``bool`` (default ``False``). When ``False``,
+      conversations with ``archived_at IS NOT NULL`` are excluded.
+    - ``include_expired``: ``bool`` (default ``False``). When ``False``,
+      conversations in the ``"expired"`` state (or active past ``expires_at``)
+      are excluded unless explicitly requested via ``state="expired"``.
 
     Results are ordered newest-first. Pass ``next_cursor`` from a prior
     response to get the next page. Both ``invited`` and ``active``
@@ -1713,6 +1733,8 @@ async def list_conversations(
                 state=state,
                 limit=limit,
                 cursor=cursor,
+                include_archived=include_archived,
+                include_expired=include_expired,
             )
 
 
@@ -2005,10 +2027,12 @@ async def archive_conversation(
       retroactive history read, the same outcome archiving is meant to
       close off. ``comms_decline_invite`` is unaffected (declining only
       narrows access).
-    - Every read path is completely unaffected: ``comms_get_conversation``,
-      ``comms_inbox``, and ``comms_list_conversations`` keep returning this
-      conversation and every one of its past messages exactly as before.
-      Archiving is not a delete or a redaction.
+    - Archiving never hides history or per-conversation access
+      (``comms_get_conversation``, ``comms_inbox``,
+      ``comms_get_hold_status``) — it does remove the conversation from
+      the default ``comms_list_conversations`` browse listing, recoverable
+      via ``include_archived=true``. Archiving is not a delete or a
+      redaction; past messages remain fully readable.
 
     Idempotent: archiving an already-archived conversation succeeds
     silently and returns the SAME ``archived_at`` timestamp from the first
@@ -2202,6 +2226,8 @@ async def agent_inbox_resource(agent_id: str) -> dict[str, Any]:
 @comms_server.resource("comms://agents")
 async def agents_directory_resource() -> dict[str, Any]:
     """Read the board directory: identical shape to ``comms_list_agents``' first page.
+
+    Shows the default (suspended-excluded) view.
 
     Static resource, no parameters — always the first page
     (``service.DEFAULT_LIST_AGENTS_LIMIT``, matching that tool's own

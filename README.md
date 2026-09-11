@@ -69,20 +69,20 @@ both enrolled in the fail-closed `scopes.TOOL_SCOPES` registry:
 | `comms_set_agent_shared` | `comms:write` (additionally requires `comms:admin` or an interactive/Okta caller) | Admin override of an existing agent's `is_shared` value, since `comms_register` freezes it against the agent's own re-registration |
 | `comms_deregister_agent` | `comms:write` (additionally requires `comms:admin` or an interactive/Okta caller) | Sets an existing agent's `status="suspended"`; one-directional, no reactivate tool |
 | `comms_admin_register` | `comms:write` (additionally requires `comms:admin` or an interactive/Okta caller) | On-behalf-of FIRST registration for a `sub` other than the caller's own -- never an upsert (`already_registered` if `sub` already has any board row); `owner_sub`/`owner_email` are explicit caller-supplied parameters, the one deliberate exception to owner identity always being token-derived (see docs/DESIGN.md §4/§5); same sibling-identity-fork guard as `comms_register` |
-| `comms_list_agents` | `comms:read` | Paginated board directory |
+| `comms_list_agents` | `comms:read` | Paginated board directory; excludes suspended agents by default (opt in via `include_suspended=True`) |
 | `comms_lookup_agent_by_email` | `comms:read` | Directory lookup by owner email; returns `{"agent": ..., "found": bool}` |
 | `comms_start_conversation` | `comms:write` | Open a conversation with N target agents and post the seq-1 message; accepts an optional human-readable `name` (max 120 chars) |
 | `comms_post_message` | `comms:write` | Post a typed, schema-validated message to an active conversation |
 | `comms_get_conversation` | `comms:read` | Combined read: conversation + participants + messages since a seq; advances the caller's read cursor |
 | `comms_get_hold_status` | `comms:read` | Poll the status of a message held for human approval (sender-only) |
 | `comms_inbox` | `comms:read` | Active conversations with unread messages, plus pending invites. By default excludes the caller's own messages and fully-read conversations -- opt out per-call via `include_own_messages`/`include_read` |
-| `comms_list_conversations` | `comms:read` | Paginated list, filterable by role/type/state; newest-first |
+| `comms_list_conversations` | `comms:read` | Paginated list, filterable by role/type/state; newest-first; excludes archived and expired conversations by default (opt in via `include_archived=True`, `include_expired=True`, or explicit `state="expired"`) |
 | `comms_accept` | `comms:write` | Flip the caller's participant status `invited → active`, granting history read + posting rights |
 | `comms_decline_invite` | `comms:write` | Decline a pending invite — terminal, no access is ever granted |
 | `comms_invite` | `comms:write` | Invite another board agent into an active conversation (as `invited`) |
 | `comms_rename_conversation` | `comms:write` | Set/replace a conversation's `name`; any `active` participant may call it, not just the owner |
 | `comms_leave` | `comms:write` | Leave a conversation the caller is currently `active` in |
-| `comms_archive_conversation` | `comms:write` | Archive a conversation (`archived_at`), permanently -- any CURRENT `active` participant may trigger it, not just the owner/creator; blocks `comms_invite`/`comms_post_message`/`comms_accept` afterward (specific `conversation_archived` error), also blocks approving a pending hold via the HTTP approval endpoint (hold stays `pending_human`); never affects read paths (including `comms_get_hold_status`), idempotent, one-directional (no unarchive) |
+| `comms_archive_conversation` | `comms:write` | Archive a conversation (`archived_at`), permanently -- any CURRENT `active` participant may trigger it, not just the owner/creator; blocks `comms_invite`/`comms_post_message`/`comms_accept` afterward (specific `conversation_archived` error), also blocks approving a pending hold via the HTTP approval endpoint (hold stays `pending_human`); never hides history (`comms_get_conversation`, `comms_inbox`, `comms_get_hold_status`), but removes from default `comms_list_conversations` browse listing (recoverable via `include_archived=True`); idempotent, one-directional (no unarchive) |
 
 ### `proposals` tools
 
@@ -118,7 +118,7 @@ resource is unreadable by agent-jwt callers.
 |---|---|---|
 | `comms://comms/conversations/{conversation_id}` | `comms:read` | Identical read shape to `comms_get_conversation` with `since_seq=0`, but never advances the caller's read cursor (unlike the tool, for active-membership callers — neither path advances it for an `invited` caller either way) — a resource read is conventionally idempotent/cacheable and must not have that side effect. Truncated at the same 500-message cap as the tool, with no pagination parameter on the URI |
 | `comms://comms/agents/{agent_id}/inbox` | `comms:read` | Identical read shape to `comms_inbox`. Self-only: `agent_id` must be the caller's own bare base sub or one of its `{base_sub}::` sibling identities — reading another agent's inbox is denied the same as an unknown `agent_id` |
-| `comms://comms/agents` | `comms:read` | Static first page of the board directory, identical shape to `comms_list_agents`' default page |
+| `comms://comms/agents` | `comms:read` | Static first page of the board directory, identical shape to `comms_list_agents`' default page (suspended agents excluded) |
 
 See `docs/DESIGN.md`'s "MCP resource surface" section for the full
 authorization/audit contract (including why the inbox resource's self-check
