@@ -52,6 +52,7 @@ from plugins import (
 from service import (
     _APPLY_ERROR_BOARD_COMMIT_FAILURE_MESSAGE,
     _APPLY_ERROR_CANCELLED_MESSAGE,
+    _APPLY_ERROR_INDETERMINATE_MESSAGE,
     MAX_PROPOSALS_PER_BOT_PER_WINDOW,
     PROPOSAL_SUBMITTER_SURFACES,
     PROPOSAL_TERMINAL_STATUSES,
@@ -1234,7 +1235,7 @@ class TestDecideProposal:
             await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
         ).scalar_one()
         assert row.status == "applying"
-        assert row.apply_error == _APPLY_ERROR_CANCELLED_MESSAGE
+        assert row.apply_error == _APPLY_ERROR_INDETERMINATE_MESSAGE
         audit_row = (
             (
                 await session.execute(
@@ -1269,15 +1270,13 @@ class TestDecideProposal:
         hold_id = uuid.UUID(submitted["proposal_id"])
         decided = await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
         assert decided["status"] == "applying"
-        assert (
-            decided["apply_error"]
-            == "apply outcome could not be confirmed; awaiting manual reconciliation"
-        )
+        assert decided["apply_error"] == _APPLY_ERROR_INDETERMINATE_MESSAGE
 
         row = (
             await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
         ).scalar_one()
         assert row.status == "applying"
+        assert row.apply_error == _APPLY_ERROR_INDETERMINATE_MESSAGE
         assert row.applied_at is None
         assert row.apply_result is None
 

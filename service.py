@@ -7865,7 +7865,11 @@ async def _apply_or_finalize_proposal_hold(
         # Deliberately do NOT transition hold.status to a terminal status!
         # It remains at "applying" so create-time dedup blocks resubmissions with
         # a fresh hold_id, preventing duplicate external writes.
-        hold.apply_error = apply_error or _APPLY_ERROR_INDETERMINATE_MESSAGE
+        # apply_error is ALWAYS set to the fixed _APPLY_ERROR_INDETERMINATE_MESSAGE constant
+        # across all indeterminate cases (HTTP retry exhaustion and mid-apply cancellation alike)
+        # for a stable, predictable API contract, while detailed diagnostics are preserved in
+        # the audit log.
+        hold.apply_error = _APPLY_ERROR_INDETERMINATE_MESSAGE
         logger.warning(
             "proposal apply indeterminate for hold_id=%s target_id=%s: %s; "
             "row remains at status='applying' awaiting manual reconciliation",

@@ -584,24 +584,35 @@ async def apply_proposal(ctx: ProposalContext) -> ProposalApplyOutcome:
     try:
         async with client:
             for attempt in range(1, max_attempts + 1):
-                attempts_made = attempt
                 now = time.monotonic()
                 remaining_budget = deadline - now
-                if attempt > 1 and remaining_budget < MIN_REMAINING_BUDGET_FOR_RETRY_SECONDS:
+                if remaining_budget <= 0 or (
+                    attempt > 1 and remaining_budget < MIN_REMAINING_BUDGET_FOR_RETRY_SECONDS
+                ):
                     logger.warning(
                         "proposal apply retry budget exhausted (remaining=%.2fs) for hold_id=%s",
                         remaining_budget,
                         ctx.hold_id,
                     )
                     break
+                attempts_made = attempt
 
-                attempt_timeout = min(timeout_seconds, max(0.1, remaining_budget))
+                # Enforce true wall-clock ceiling via asyncio.timeout(remaining_budget)
+                # and clamp attempt_timeout to remaining_budget without overshooting.
+                attempt_timeout = min(timeout_seconds, remaining_budget)
 
                 try:
-                    response = await client.post(
-                        url, json=payload, headers=headers, timeout=attempt_timeout
-                    )
+                    async with asyncio.timeout(remaining_budget):
+                        response = await client.post(
+                            url, json=payload, headers=headers, timeout=attempt_timeout
+                        )
                     disposition, outcome = _classify_response(response, url, ctx.hold_id)
+                except TimeoutError as exc:
+                    disposition, outcome = _classify_exception(
+                        httpx.ReadTimeout(f"wall-clock retry budget expired: {exc}"),
+                        url,
+                        ctx.hold_id,
+                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -673,7 +684,9 @@ async def apply_proposal(ctx: ProposalContext) -> ProposalApplyOutcome:
             ),
             log_detail=(
                 f"retry loop exhausted after {attempts_made} attempts (saw_ambiguous=True); "
-                f"last error: {last_outcome.caller_error if last_outcome else 'unknown'}"
+                f"last error: {last_outcome.caller_error} ({last_outcome.log_detail})"
+                if last_outcome
+                else "retry loop exhausted after 0 attempts"
             ),
             indeterminate=True,
         )

@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -562,6 +564,57 @@ class TestFailureTaxonomyAndRetries:
         with pytest.raises(asyncio.CancelledError):
             await _run_and_cancel()
 
+    async def test_attempt_not_started_when_budget_already_expired(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _set_required_env(monkeypatch)
+        monkeypatch.setenv(PROPOSAL_APPLY_RETRY_BUDGET_SECONDS_ENV_VAR, "10.0")
+        calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            return httpx.Response(200, json={"applied": True})
+
+        _patch_transport(monkeypatch, handler)
+        t0 = time.monotonic()
+        # Mock time.monotonic so deadline is t0 + 10.0, but when loop checks, time has passed
+        times = [t0, t0 + 15.0, t0 + 15.0]
+        monkeypatch.setattr(time, "monotonic", lambda: times.pop(0) if times else t0 + 15.0)
+
+        outcome = await apply_proposal(_ctx())
+        assert calls == 0
+        assert outcome.applied is False
+        assert outcome.indeterminate is False
+
+    async def test_wall_clock_timeout_enforced_via_asyncio_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _set_required_env(monkeypatch)
+        monkeypatch.setenv(PROPOSAL_APPLY_MAX_ATTEMPTS_ENV_VAR, "1")
+        monkeypatch.setenv(PROPOSAL_APPLY_RETRY_BUDGET_SECONDS_ENV_VAR, "0.05")
+
+        async def slow_handler(request: httpx.Request) -> httpx.Response:
+            await asyncio.sleep(0.2)
+            return httpx.Response(200, json={"applied": True})
+
+        def fake_build_apply_client(
+            timeout_seconds: float, tls_sni_host: str | None
+        ) -> httpx.AsyncClient:
+            return httpx.AsyncClient(
+                timeout=httpx.Timeout(timeout_seconds),
+                transport=httpx.MockTransport(slow_handler),
+            )
+
+        monkeypatch.setattr(
+            proposal_apply_http_client, "_build_apply_client", fake_build_apply_client
+        )
+
+        outcome = await apply_proposal(_ctx())
+        assert outcome.applied is False
+        assert outcome.indeterminate is True
+        assert "wall-clock retry budget expired" in (outcome.log_detail or "")
+
 
 class TestTlsSniOverride:
     async def test_sni_hook_sets_headers_and_extension(self) -> None:
@@ -773,8 +826,18 @@ class TestSubclassBypassAndRealPackageReachability:
                 break
 
         try:
-            from rh_comms_plugins.proposal_judge import RHProposalJudge
+            from rh_comms_plugins.proposal_judge import (  # type: ignore[import-not-found]
+                RHProposalJudge,
+            )
         except ImportError:
+            if os.environ.get("CI") == "true":
+                pytest.fail(
+                    "TECH-6213: Real agent-comms-approvals package is missing in CI! "
+                    "Cannot verify zero-Linear-reachability against real RHProposalJudge. "
+                    "agent-comms-approvals is a private downstream package installed only "
+                    "into Dockerfile.board-derived, not available in base public CI without "
+                    "cross-repo provisioning (tracked in TECH-6243)."
+                )
             pytest.skip("rh_comms_plugins is not installed in this environment")
 
         _set_required_env(monkeypatch)

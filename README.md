@@ -413,7 +413,7 @@ docker compose up --build
 > real judge:
 >
 > - `PROPOSAL_JUDGE` must point at a real implementation (provisioned via SSM at
->   `/reclaw-comms/{env}/proposal-judge`, e.g. `rh_comms_plugins.proposal_judge:get_proposal_judge`).
+>   `/reclaw-comms/{env}/proposal-judge`, e.g. `rh_comms_plugins.proposal_judge:build_rh_proposal_judge`).
 >   Unset or empty, the board safely defaults to `escalate_all_proposals`, which never
 >   auto-approves or applies any proposal. For `PROPOSAL_JUDGE` specifically, an empty string
 >   falls back to the default. Other seams treat an empty env var as an unknown plugin name
