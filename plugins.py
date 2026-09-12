@@ -582,14 +582,22 @@ def validate_configuration() -> None:
     get_approval_notifier()
     get_active_checker()
     get_docs_verifier()
-    if not os.environ.get(PROPOSAL_JUDGE_ENV_VAR):
+    proposal_judge_env = os.environ.get(PROPOSAL_JUDGE_ENV_VAR)
+    if not proposal_judge_env:
         logger.warning(
             "%s is not set (or is set to an empty string); falling back to %r, "
             "which never auto-approves or applies any proposal",
             PROPOSAL_JUDGE_ENV_VAR,
             DEFAULT_PROPOSAL_JUDGE,
         )
-    get_proposal_judge()
+    judge = get_proposal_judge()
+    from proposal_apply_http_client import (
+        HttpApplyProposalJudge,
+        validate_proposal_apply_configuration,
+    )
+
+    if isinstance(judge, HttpApplyProposalJudge):
+        validate_proposal_apply_configuration()
 
 
 # --- Seam 2: the auto-approver (TECH-5389 PR2) -------------------------------
@@ -1172,6 +1180,14 @@ def docs_verifier_name(verifier: DocsVerifier) -> str:
 PROPOSAL_JUDGE_ENV_VAR = "PROPOSAL_JUDGE"
 DEFAULT_PROPOSAL_JUDGE = "escalate_all_proposals"
 
+PROPOSAL_APPLY_URL_ENV_VAR = "PROPOSAL_APPLY_URL"
+PROPOSAL_APPLY_TOKEN_ENV_VAR = "PROPOSAL_APPLY_TOKEN"
+PROPOSAL_APPLY_TLS_SNI_HOST_ENV_VAR = "PROPOSAL_APPLY_TLS_SNI_HOST"
+PROPOSAL_APPLY_TIMEOUT_SECONDS_ENV_VAR = "PROPOSAL_APPLY_TIMEOUT_SECONDS"
+PROPOSAL_APPLY_MAX_ATTEMPTS_ENV_VAR = "PROPOSAL_APPLY_MAX_ATTEMPTS"
+PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS_ENV_VAR = "PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS"
+PROPOSAL_APPLY_RETRY_BUDGET_SECONDS_ENV_VAR = "PROPOSAL_APPLY_RETRY_BUDGET_SECONDS"
+
 # Discriminator values for ProposalFingerprint.status.
 FINGERPRINT_DIGEST = "digest"
 FINGERPRINT_NO_TARGET = "no_target"
@@ -1277,11 +1293,18 @@ class ProposalApplyOutcome(NamedTuple):
     ``applied=True`` -> ``status="applied"``, ``applied_at`` stamped,
         ``result`` (when non-``None``) stored on
         ``proposal_holds.apply_result``.
-    ``applied=False`` -> ``status="apply_failed"``, ``caller_error`` stored
-        on ``proposal_holds.apply_error`` and returned over the API
+    ``applied=False`` -> ``status="apply_failed"`` (unless ``indeterminate=True``,
+        in which case the hold remains at ``status="applying"`` awaiting
+        manual reconciliation), ``caller_error`` stored on
+        ``proposal_holds.apply_error`` and returned over the API
         (truncated to 500 chars with ``"... [truncated]"`` by the board if
         exceeded). ``log_detail`` goes to the board's WARNING log + audit row
         only, never the API -- same split as ``ProposalTargetError`` above.
+    ``indeterminate=True`` -> only meaningful alongside ``applied=False``: the
+        external write may or may not have occurred (e.g. transport timeout or
+        retry exhaustion). The hold must NOT be transitioned to a terminal
+        status; it remains at ``applying`` so create-time dedup blocks
+        resubmission, avoiding duplicate external writes.
 
     Returning ``applied=False`` is a NORMAL, queryable outcome, not an
     error condition. An implementation must not raise for it.
@@ -1291,6 +1314,7 @@ class ProposalApplyOutcome(NamedTuple):
     result: dict[str, Any] | None
     caller_error: str | None
     log_detail: str | None
+    indeterminate: bool = False
 
 
 class ProposalJudge(Protocol):
@@ -1399,8 +1423,22 @@ class EscalateAllProposalJudge:
         )
 
 
+def build_rh_proposal_judge() -> ProposalJudge:
+    """Factory for the board's PROPOSAL_JUDGE seam.
+
+    Returns an HttpApplyProposalJudge wrapping Redesign Health's
+    RHProposalJudge (from rh_comms_plugins.proposal_judge) for judgment,
+    with apply() calling the approvals service over HTTP via
+    proposal_apply_http_client.
+    """
+    from proposal_apply_http_client import build_rh_proposal_judge as _build
+
+    return _build()
+
+
 PROPOSAL_JUDGES: dict[str, Callable[[], ProposalJudge]] = {
     DEFAULT_PROPOSAL_JUDGE: EscalateAllProposalJudge,
+    "rh_proposal_judge": build_rh_proposal_judge,
 }
 
 _proposal_judge: ProposalJudge | None = None
@@ -1421,11 +1459,41 @@ def get_proposal_judge() -> ProposalJudge:
     string-tolerant behavior to ``APPROVAL_NOTIFIER``/``ACTIVE_CHECKER``
     too, both of which have their own deliberately fail-open defaults and
     rely on an empty string crashing at boot exactly like a typo would.
+
+    When resolving an RHProposalJudge instance or subclass, it is automatically
+    wrapped in HttpApplyProposalJudge so that apply() always executes via the board's
+    HTTP applier client and never touches the in-process deprecated shim.
     """
     global _proposal_judge
     if _proposal_judge is None:
         name = os.environ.get(PROPOSAL_JUDGE_ENV_VAR) or DEFAULT_PROPOSAL_JUDGE
-        _proposal_judge = resolve_plugin_name(PROPOSAL_JUDGE_ENV_VAR, PROPOSAL_JUDGES, name)
+        raw_judge = resolve_plugin_name(PROPOSAL_JUDGE_ENV_VAR, PROPOSAL_JUDGES, name)
+
+        # BLOCKING #2 fix: unconditionally inspect the inheritance chain (MRO)
+        # alongside isinstance() so subclasses or judges loaded from a shadowed
+        # module object are always wrapped, never skipping wrapping.
+        is_rh = any(
+            getattr(base, "__name__", "") == "RHProposalJudge" for base in type(raw_judge).__mro__
+        )
+        if not is_rh:
+            try:
+                from rh_comms_plugins.proposal_judge import (  # type: ignore[import-not-found]
+                    RHProposalJudge,
+                )
+
+                is_rh = isinstance(raw_judge, RHProposalJudge)
+            except ImportError:
+                pass
+
+        if is_rh:
+            from proposal_apply_http_client import HttpApplyProposalJudge
+
+            if not isinstance(raw_judge, HttpApplyProposalJudge):
+                _proposal_judge = HttpApplyProposalJudge(raw_judge)
+            else:
+                _proposal_judge = raw_judge
+        else:
+            _proposal_judge = raw_judge
     return _proposal_judge
 
 
@@ -1459,6 +1527,13 @@ __all__ = [
     "FINGERPRINT_UNAVAILABLE",
     "INSTRUCTION_REGISTRY_PATH",
     "INSTRUCTION_TEXT_HASHES",
+    "PROPOSAL_APPLY_MAX_ATTEMPTS_ENV_VAR",
+    "PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS_ENV_VAR",
+    "PROPOSAL_APPLY_RETRY_BUDGET_SECONDS_ENV_VAR",
+    "PROPOSAL_APPLY_TIMEOUT_SECONDS_ENV_VAR",
+    "PROPOSAL_APPLY_TLS_SNI_HOST_ENV_VAR",
+    "PROPOSAL_APPLY_TOKEN_ENV_VAR",
+    "PROPOSAL_APPLY_URL_ENV_VAR",
     "PROPOSAL_JUDGES",
     "PROPOSAL_JUDGE_ENV_VAR",
     "RISK_SCORERS",
@@ -1493,6 +1568,7 @@ __all__ = [
     "RiskVerdict",
     "WebhookNotifier",
     "auto_approver_name",
+    "build_rh_proposal_judge",
     "docs_verifier_name",
     "get_active_checker",
     "get_approval_notifier",

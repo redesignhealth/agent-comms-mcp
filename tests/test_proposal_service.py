@@ -52,6 +52,7 @@ from plugins import (
 from service import (
     _APPLY_ERROR_BOARD_COMMIT_FAILURE_MESSAGE,
     _APPLY_ERROR_CANCELLED_MESSAGE,
+    _APPLY_ERROR_INDETERMINATE_MESSAGE,
     MAX_PROPOSALS_PER_BOT_PER_WINDOW,
     PROPOSAL_SUBMITTER_SURFACES,
     PROPOSAL_TERMINAL_STATUSES,
@@ -1214,12 +1215,13 @@ class TestDecideProposal:
         )
         assert "apply cancelled before completion" in audit_row.detail["error"]
 
-    async def test_cancellation_during_apply_resolves_to_apply_failed(
+    async def test_cancellation_during_apply_leaves_hold_at_applying(
         self, session: AsyncSession
     ) -> None:
-        """Same as above, for the applier-cancelled branch specifically --
-        cancellation during the fingerprint check vs. during apply() are
-        two distinct code paths in ``_apply_or_finalize_proposal_hold``."""
+        """TECH-6213 PR-B1 (FIX 4): cancellation during apply is indeterminate.
+        The hold must remain at 'applying' (NOT 'apply_failed') so create-time dedup
+        blocks resubmissions from minting a new hold_id, preventing duplicate
+        external writes."""
         judge = FakeProposalJudge(
             fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
             apply_raises=asyncio.CancelledError(),
@@ -1228,22 +1230,17 @@ class TestDecideProposal:
         hold_id = uuid.UUID(submitted["proposal_id"])
         with pytest.raises(asyncio.CancelledError):
             await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
-        # Argus review round-7 suggestion: without this, a regression that
-        # took the fingerprinter-cancelled path (which never calls apply()
-        # at all) instead of the apply-cancelled path this test is meant to
-        # cover would still pass on the status/apply_error assertions
-        # alone.
         assert len(judge.apply_calls) == 1
         row = (
             await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
         ).scalar_one()
-        assert row.status == "apply_failed"
-        assert row.apply_error == _APPLY_ERROR_CANCELLED_MESSAGE
+        assert row.status == "applying"
+        assert row.apply_error == _APPLY_ERROR_INDETERMINATE_MESSAGE
         audit_row = (
             (
                 await session.execute(
                     select(AuditLog).where(
-                        AuditLog.action == "proposal.apply_failed",
+                        AuditLog.action == "proposal.apply_indeterminate",
                         AuditLog.detail["hold_id"].astext == str(hold_id),
                     )
                 )
@@ -1252,6 +1249,56 @@ class TestDecideProposal:
             .one()
         )
         assert "apply cancelled before completion" in audit_row.detail["error"]
+
+    async def test_indeterminate_apply_outcome_leaves_hold_at_applying_and_blocks_resubmission(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-6213 PR-B1 (FIX 4): an indeterminate apply outcome leaves status='applying',
+        and a subsequent resubmission attempt for the same target key folds into the
+        existing row as a no-op, minting NO new hold_id."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_result=ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error="apply outcome could not be confirmed; awaiting manual reconciliation",
+                log_detail="retry budget exhausted",
+                indeterminate=True,
+            ),
+        )
+        submitted = await _submit(session, judge=judge)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        decided = await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
+        assert decided["status"] == "applying"
+        assert decided["apply_error"] == _APPLY_ERROR_INDETERMINATE_MESSAGE
+
+        row = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        assert row.status == "applying"
+        assert row.apply_error == _APPLY_ERROR_INDETERMINATE_MESSAGE
+        assert row.applied_at is None
+        assert row.apply_result is None
+
+        # Check audit log recorded proposal.apply_indeterminate
+        audit_row = (
+            (
+                await session.execute(
+                    select(AuditLog).where(
+                        AuditLog.action == "proposal.apply_indeterminate",
+                        AuditLog.detail["hold_id"].astext == str(hold_id),
+                    )
+                )
+            )
+            .scalars()
+            .one()
+        )
+        assert "retry budget exhausted" in audit_row.detail["error"]
+
+        # Resubmit with the same target key
+        resubmitted = await _submit(session, judge=judge)
+        assert resubmitted["proposal_id"] == str(hold_id)
+        assert resubmitted["status"] == "applying"
 
     async def test_cancellation_with_message_uses_message_in_raw_error_only(
         self, session: AsyncSession
@@ -1444,7 +1491,9 @@ class TestTerminalCommitFailureRecovery:
     """
 
     @staticmethod
-    def _fail_nth_commit(session: AsyncSession, fail_at: int, *exceptions: Exception) -> AsyncMock:
+    def _fail_nth_commit(
+        session: AsyncSession, fail_at: int, *exceptions: BaseException
+    ) -> AsyncMock:
         """Build a ``session.commit`` replacement that raises
         ``exceptions[0]`` on the ``fail_at``-th call, ``exceptions[1]`` on
         the ``(fail_at + 1)``-th call (if provided), and so on past the
@@ -1604,10 +1653,10 @@ class TestTerminalCommitFailureRecovery:
         normal result as if nothing happened."""
         judge = FakeProposalJudge(
             fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
-            apply_raises=asyncio.CancelledError(),
         )
         submitted = await _submit(session, judge=judge)
         hold_id = uuid.UUID(submitted["proposal_id"])
+        judge.fingerprint_raises = asyncio.CancelledError()
         commit_mock = self._fail_nth_commit(
             session, 3, OperationalError("boom", {}, Exception("db down"))
         )
@@ -1626,17 +1675,17 @@ class TestTerminalCommitFailureRecovery:
     async def test_last_ditch_reraises_cancellation_after_two_commit_failures(
         self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Finding 5: cancellation during apply, COMBINED with both the
+        """Finding 5: cancellation during fingerprint, COMBINED with both the
         terminal commit AND the recovery commit failing (reaching the
         last-ditch write), must still re-raise the cancellation -- not
         just when the recovery commit alone fails (the sibling test
         above)."""
         judge = FakeProposalJudge(
             fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
-            apply_raises=asyncio.CancelledError(),
         )
         submitted = await _submit(session, judge=judge)
         hold_id = uuid.UUID(submitted["proposal_id"])
+        judge.fingerprint_raises = asyncio.CancelledError()
         commit_mock = self._fail_nth_commit(
             session,
             3,
@@ -1662,15 +1711,15 @@ class TestTerminalCommitFailureRecovery:
     async def test_recovery_fallthrough_on_concurrent_resolution_reraises_cancellation(
         self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Finding 1: if apply was cancelled, terminal commit fails, AND
+        """Finding 1: if fingerprint was cancelled, terminal commit fails, AND
         recovery_hold is concurrently resolved (recovery_hold.status != expected_status),
         the fallthrough must re-raise cancelled_exc instead of commit_exc."""
         judge = FakeProposalJudge(
             fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
-            apply_raises=asyncio.CancelledError(),
         )
         submitted = await _submit(session, judge=judge)
         hold_id = uuid.UUID(submitted["proposal_id"])
+        judge.fingerprint_raises = asyncio.CancelledError()
 
         commit_mock = self._fail_nth_commit(
             session, 3, OperationalError("boom", {}, Exception("terminal commit failed"))
@@ -1735,6 +1784,158 @@ class TestTerminalCommitFailureRecovery:
         assert exc_info.value is first_exc
         assert commit_mock.call_count == 3
         assert find_for_update_calls == 3
+
+    async def test_indeterminate_commit_failure_with_cancellation_reraises(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """BLOCKING #3 (A): apply cancellation + commit failure must re-raise
+        cancelled_exc from commit_exc."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_raises=asyncio.CancelledError(),
+        )
+        submitted = await _submit(session, judge=judge)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        commit_mock = self._fail_nth_commit(
+            session, 3, OperationalError("boom", {}, Exception("db down"))
+        )
+        monkeypatch.setattr(session, "commit", commit_mock)
+
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
+
+        assert isinstance(exc_info.value.__cause__, OperationalError)
+        row = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        assert row.status == "applying"
+
+    async def test_indeterminate_commit_failure_without_cancellation_returns_none(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """BLOCKING #3 (B): indeterminate outcome + commit failure (no cancellation)
+        must return None and leave row at status='applying'."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_result=ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error="retry budget exhausted",
+                log_detail="detail",
+                indeterminate=True,
+            ),
+        )
+        submitted = await _submit(session, judge=judge)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        commit_mock = self._fail_nth_commit(
+            session, 3, OperationalError("boom", {}, Exception("db down"))
+        )
+        monkeypatch.setattr(session, "commit", commit_mock)
+
+        claimed = await service._claim_proposal_hold_for_applying(
+            session,
+            hold_id=hold_id,
+            decided_by_actor_id="user-1",
+            decision_source="human",
+            decision_note=None,
+            expected_payload=None,
+        )
+        assert claimed is True
+
+        result = await service._apply_or_finalize_proposal_hold(
+            session,
+            hold_id=hold_id,
+            expected_status="applying",
+            decided_by_actor_id="user-1",
+            decision_source="human",
+            decision_note=None,
+            judge=judge,
+        )
+        assert result is None
+        row = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        assert row.status == "applying"
+
+        audit_row = (
+            (
+                await session.execute(
+                    select(AuditLog).where(
+                        AuditLog.action == "proposal.apply_indeterminate_commit_failed",
+                        AuditLog.detail["hold_id"].astext == str(hold_id),
+                    )
+                )
+            )
+            .scalars()
+            .one()
+        )
+        assert audit_row is not None
+        assert "boom" in audit_row.detail["error"]
+
+    async def test_indeterminate_first_commit_cancelled_reraises(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """BLOCKING #2 (1): apply returns indeterminate=True, and the primary
+        commit itself raises CancelledError -> must re-raise CancelledError."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_result=ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error="retry budget exhausted",
+                log_detail="detail",
+                indeterminate=True,
+            ),
+        )
+        submitted = await _submit(session, judge=judge)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        commit_mock = self._fail_nth_commit(
+            session, 3, asyncio.CancelledError("cancelled during primary commit")
+        )
+        monkeypatch.setattr(session, "commit", commit_mock)
+
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
+
+        assert "cancelled during primary commit" in str(exc_info.value)
+        row = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        assert row.status == "applying"
+
+    async def test_indeterminate_audit_commit_cancelled_reraises_chained(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """BLOCKING #2 (2): primary commit fails with OperationalError, and the audit
+        commit raises CancelledError -> must re-raise CancelledError from commit_exc."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_result=ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error="retry budget exhausted",
+                log_detail="detail",
+                indeterminate=True,
+            ),
+        )
+        submitted = await _submit(session, judge=judge)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        commit_mock = self._fail_nth_commit(
+            session,
+            3,
+            OperationalError("first", {}, Exception("db error")),
+            asyncio.CancelledError("cancelled during audit commit"),
+        )
+        monkeypatch.setattr(session, "commit", commit_mock)
+
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
+
+        assert isinstance(exc_info.value.__cause__, OperationalError)
+        row = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        assert row.status == "applying"
 
     async def test_recovery_commit_also_failing_preserves_original_exception_context(
         self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch

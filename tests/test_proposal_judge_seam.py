@@ -9,6 +9,7 @@ board's defensive wrappers around every plugin call (
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
@@ -528,6 +529,107 @@ class TestSafeApplySeam:
             result.caller_error
             == "cannot transition ticket when status=closed and priority=high (count = 0)"
         )
+
+    async def test_apply_illegal_applied_true_with_indeterminate_true_is_normalized(self) -> None:
+        judge = FakeProposalJudge(
+            apply_result=ProposalApplyOutcome(
+                applied=True,
+                result={"issue_id": "LIN-1"},
+                caller_error=None,
+                log_detail=None,
+                indeterminate=True,
+            )
+        )
+        result = await _safe_apply(judge, _ctx())
+        assert result.applied is False
+        assert result.indeterminate is True
+        assert result.caller_error == "unable to apply this proposal"
+
+    async def test_apply_indeterminate_flag_preserved_on_failure(self) -> None:
+        judge = FakeProposalJudge(
+            apply_result=ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error="timeout after 3 attempts",
+                log_detail="raw timeout",
+                indeterminate=True,
+            )
+        )
+        result = await _safe_apply(judge, _ctx())
+        assert result.applied is False
+        assert result.indeterminate is True
+        assert result.caller_error == "timeout after 3 attempts"
+
+    async def test_apply_indeterminate_flag_preserved_when_caller_error_missing(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """BLOCKING #1: missing/empty caller_error must still propagate indeterminate=True."""
+        ctx = _ctx()
+        judge = FakeProposalJudge(
+            apply_result=ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error=None,
+                log_detail="retry budget exhausted",
+                indeterminate=True,
+            )
+        )
+        with caplog.at_level(logging.WARNING, logger="service"):
+            result = await _safe_apply(judge, ctx)
+        assert result.applied is False
+        assert result.indeterminate is True
+        assert result.caller_error == "unable to apply this proposal"
+        assert f"applied=False with no caller_error for hold {ctx.hold_id}" in caplog.text
+
+    async def test_apply_empty_caller_error_logs_warning_and_uses_generic_message(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Item 7: applied=False with empty caller_error logs warning and assigns
+        generic message.
+        """
+        ctx = _ctx()
+        judge = FakeProposalJudge(
+            apply_result=ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error="   ",
+                log_detail=None,
+                indeterminate=False,
+            )
+        )
+        with caplog.at_level(logging.WARNING, logger="service"):
+            result = await _safe_apply(judge, ctx)
+        assert result.applied is False
+        assert result.indeterminate is False
+        assert result.caller_error == "unable to apply this proposal"
+        assert f"applied=False with no caller_error for hold {ctx.hold_id}" in caplog.text
+
+    async def test_apply_indeterminate_flag_preserved_when_caller_error_truncated(self) -> None:
+        """BLOCKING #1: truncated caller_error must still propagate indeterminate=True."""
+        judge = FakeProposalJudge(
+            apply_result=ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error="A" * 600,
+                log_detail="log",
+                indeterminate=True,
+            )
+        )
+        result = await _safe_apply(judge, _ctx())
+        assert result.applied is False
+        assert result.indeterminate is True
+        assert result.caller_error is not None
+        assert len(result.caller_error) <= 500
+
+    async def test_apply_exception_catch_all_defaults_to_indeterminate_true(self) -> None:
+        """BLOCKING #1: unhandled exception escaping apply() defaults to indeterminate=True."""
+        judge = FakeProposalJudge(
+            apply_raises=RuntimeError("unexpected crash inside apply"),
+        )
+        result = await _safe_apply(judge, _ctx())
+        assert result.applied is False
+        assert result.indeterminate is True
+        assert result.caller_error == "unable to apply this proposal"
 
 
 class TestScrubProposalErrorString:

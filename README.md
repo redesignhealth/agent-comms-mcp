@@ -393,10 +393,17 @@ docker compose up --build
 | Variable | Purpose |
 |---|---|
 | `DECISION_PAGE_BASE_URL` | Base URL of the separate `agent-comms-approvals-decision-page` service. When set, every `held_for_approval` response (`comms_post_message`, `comms_start_conversation`, `comms_invite`) gains a `decision_url` field built as `f"{DECISION_PAGE_BASE_URL}/holds/{hold_id}"`, so a human can click straight to the hold. Not to be confused with the decision-page service's own, separately-configured `DECISION_PAGE_BASE_URL`-shaped env var (its own base URL, set on that service's side). Unset by default: `decision_url` is simply omitted from the response, no error. |
-| `PROPOSAL_JUDGE` | Which `ProposalJudge` implementation judges/applies a submitted `proposal_holds` proposal (`POST /proposals`) -- a name from `plugins.PROPOSAL_JUDGES`, or a `"pkg.module:factory"` import path to plug in your own without forking this repo (see `docs/DESIGN.md`'s "Configuration: pluggable seams" section). Default: `escalate_all_proposals` -- accepts any kind at low priority, never fingerprints a real target, never auto-approves, and never writes anywhere. Redesign Health's Linear/GitHub-backed rules live in `agent-comms-approvals`' `rh_comms_plugins.proposal_judge` instead of this repo. |
+| `PROPOSAL_JUDGE` | Which `ProposalJudge` implementation judges/applies a submitted `proposal_holds` proposal (`POST /proposals`) -- a name from `plugins.PROPOSAL_JUDGES` (e.g. `escalate_all_proposals`, `rh_proposal_judge`), or a `"pkg.module:factory"` import path to plug in your own without forking this repo (see `docs/DESIGN.md`'s "Configuration: pluggable seams" section). Default: `escalate_all_proposals` -- accepts any kind at low priority, never fingerprints a real target, never auto-approves, and never writes anywhere. Redesign Health's Linear/GitHub-backed rules live in `agent-comms-approvals`' `rh_comms_plugins.proposal_judge` for judgment, and `proposal_apply_http_client` executes `apply()` over HTTP. |
+| `PROPOSAL_APPLY_URL` | Base URL of `agent-comms-approvals`' proposal action API mount point (e.g. `https://comms-approvals.<tailnet>.ts.net/actions`). The board's HTTP applier client appends `/proposals/apply` to dispatch mutations. Required when applying proposals; must start with `https://`. |
+| `PROPOSAL_APPLY_TOKEN` | Bearer token carrying `proposals:apply` scope for calling `POST /actions/proposals/apply`. |
+| `PROPOSAL_APPLY_TLS_SNI_HOST` | Optional MagicDNS hostname (e.g. `comms-approvals.<tailnet>.ts.net`) to validate TLS against and set on the outgoing HTTP `Host` header while dialing `PROPOSAL_APPLY_URL`'s private-zone hostname (TECH-5400). |
+| `PROPOSAL_APPLY_TIMEOUT_SECONDS` | Optional per-call HTTP timeout in seconds for proposal apply operations (default: 15.0s). |
+| `PROPOSAL_APPLY_MAX_ATTEMPTS` | Optional maximum number of attempts for ambiguous apply failures (default: 3, max: 10). |
+| `PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS` | Optional initial backoff in seconds (default: 0.5s), exponential with full jitter capped at 4.0s per sleep. |
+| `PROPOSAL_APPLY_RETRY_BUDGET_SECONDS` | Optional wall-clock ceiling in seconds for the entire apply operation across retries (default: 45.0s, minimum: 2.0s). Note: ALB/ingress idle timeouts should be configured comfortably above this budget. If `PROPOSAL_APPLY_RETRY_BUDGET_SECONDS` is currently set below 2.0, update it before deploying this image or the board will fail to start. |
 
 > [!IMPORTANT]
-> **Judgment versus action for `PROPOSAL_JUDGE`.** `classify()`/`fingerprint()`/`judge()` are judgment and may use the same locally importable, in-process plugin pattern as the other seams. `apply()` is action: it performs an actual external write and MUST call a genuinely separate, network-isolated `agent-comms-approvals` service over HTTP. It must never be a locally importable Python plugin executed in this repo's process, and this process must not hold the write credential. The import-path/derived-image configuration described below is the mechanism being corrected for `apply()`; do not treat it as the final architecture.
+> **Judgment versus action for `PROPOSAL_JUDGE` (TECH-6213).** `classify()`/`fingerprint()`/`judge()` are judgment and use the locally importable, in-process plugin pattern (`RHProposalJudge`). `apply()` is action: it performs an actual external write and calls `agent-comms-approvals`' `POST /actions/proposals/apply` endpoint over HTTP via `proposal_apply_http_client`. When resolving `RHProposalJudge`, the board automatically composes it with `HttpApplyProposalJudge` so that the board process never executes external writes in-process and never loads Linear credentials or client libraries.
 
 > [!WARNING]
 > **Deployment prerequisites for the `PROPOSAL_JUDGE` seam.** In deployed ECS
@@ -406,7 +413,11 @@ docker compose up --build
 > real judge:
 >
 > - `PROPOSAL_JUDGE` must point at a real implementation (provisioned via SSM at
->   `/reclaw-comms/{env}/proposal-judge`, e.g. `rh_comms_plugins.proposal_judge:get_proposal_judge`).
+>   `/reclaw-comms/{env}/proposal-judge`, e.g. the short registry key `rh_proposal_judge` or
+>   the full import path `rh_comms_plugins.proposal_judge:build_rh_proposal_judge`).
+>   If the live SSM value still references `get_proposal_judge`, update it to either `rh_proposal_judge`
+>   or `rh_comms_plugins.proposal_judge:build_rh_proposal_judge` in the same deploy that activates
+>   this release (bare `build_rh_proposal_judge` without module prefix is not a valid registry key).
 >   Unset or empty, the board safely defaults to `escalate_all_proposals`, which never
 >   auto-approves or applies any proposal. For `PROPOSAL_JUDGE` specifically, an empty string
 >   falls back to the default. Other seams treat an empty env var as an unknown plugin name
@@ -415,6 +426,14 @@ docker compose up --build
 >   environment so developers can set `PROPOSAL_JUDGE` in `.env` (or pass `-e PROPOSAL_JUDGE=...`)
 >   for local testing with a custom judge implementation without affecting the safe default
 >   when unset.
+> - **Proposal Apply SSM Provisioning & Deployment Ordering (TECH-6213)**: In environments
+>   using `HttpApplyProposalJudge`, both `PROPOSAL_APPLY_URL` (SSM path
+>   `/reclaw-comms/{env}/proposal-apply-url`) and `PROPOSAL_APPLY_TOKEN` (SSM path
+>   `/reclaw-comms/{env}/proposal-apply-token`) must be provisioned. Required deployment
+>   ordering: deploy the approvals service release first -> provision both SSM parameters
+>   in `rh-data-platform`'s Terraform -> deploy the board image with `PROPOSAL_JUDGE`
+>   configured. Booting a board task with an `HttpApplyProposalJudge` when either parameter is
+>   missing will fail fast (crash at startup).
 > - For Redesign Health, `agent-comms-approvals` (PR #62) must be deployed with the
 >   concrete judge implementation before this service's release runs with `PROPOSAL_JUDGE`
 >   configured, or the import will fail at boot. Switch ECS task definition to the derived
