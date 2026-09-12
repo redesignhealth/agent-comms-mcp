@@ -23,6 +23,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -531,6 +532,77 @@ class TestFailureTaxonomyAndRetries:
         assert outcome.indeterminate is True
         assert "wall-clock retry budget expired" in (outcome.log_detail or "")
 
+    async def test_payload_identity_preserved_across_retries(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Verifies that the same payload dict and request body bytes are sent
+        on every retry, guaranteeing request-digest determinism.
+        """
+        _set_required_env(monkeypatch)
+        monkeypatch.setenv(PROPOSAL_APPLY_MAX_ATTEMPTS_ENV_VAR, "2")
+        monkeypatch.setenv(PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS_ENV_VAR, "0.01")
+        payloads: list[bytes] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            payloads.append(request.content)
+            if len(payloads) == 1:
+                return httpx.Response(503, text="temporarily unavailable")
+            return httpx.Response(200, json={"applied": True})
+
+        _patch_transport(monkeypatch, handler)
+        outcome = await apply_proposal(_ctx())
+        assert outcome.applied is True
+        assert len(payloads) == 2
+        assert payloads[0] == payloads[1]
+
+    async def test_cancellation_during_backoff_sleep_propagates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Verifies that asyncio.CancelledError during retry backoff sleep
+        propagates immediately.
+        """
+        _set_required_env(monkeypatch)
+        monkeypatch.setenv(PROPOSAL_APPLY_MAX_ATTEMPTS_ENV_VAR, "3")
+        monkeypatch.setenv(PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS_ENV_VAR, "5.0")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout("Timeout")
+
+        _patch_transport(monkeypatch, handler)
+
+        async def _run_and_cancel() -> None:
+            task = asyncio.create_task(apply_proposal(_ctx()))
+            await asyncio.sleep(0.05)
+            task.cancel()
+            await task
+
+        with pytest.raises(asyncio.CancelledError):
+            await _run_and_cancel()
+
+    async def test_attempt_not_started_when_budget_already_expired(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Verifies that zero HTTP requests are started when the budget is already expired,
+        and an indeterminate outcome is returned."""
+        _set_required_env(monkeypatch)
+        calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            return httpx.Response(200, json={"applied": True})
+
+        _patch_transport(monkeypatch, handler)
+        t0 = time.monotonic()
+        times = [t0, t0 + 50.0, t0 + 50.0]
+        monkeypatch.setattr(time, "monotonic", lambda: times.pop(0) if times else t0 + 50.0)
+
+        outcome = await apply_proposal(_ctx())
+        assert calls == 0
+        assert outcome.applied is False
+        assert outcome.indeterminate is True
+        assert "retry budget expired before request could be made" in (outcome.caller_error or "")
+
 
 class TestTlsSniOverride:
     async def test_sni_hook_sets_headers_and_extension(self) -> None:
@@ -542,8 +614,8 @@ class TestTlsSniOverride:
         for hook in client.event_hooks.get("request", []):
             await hook(request)
 
+        assert request.headers["host"] == sni_host
         assert request.extensions.get("sni_hostname") == sni_host
-        assert request.headers["host"] == "10.0.0.1"
 
 
 class _MockJudgeDelegate:
@@ -672,6 +744,14 @@ class TestConfigValidationHardFails:
         assert isinstance(judge, HttpApplyProposalJudge)
         assert isinstance(judge.delegate, FakeRH)
 
+    def test_fails_when_proposal_apply_budget_below_minimum(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _set_required_env(monkeypatch)
+        monkeypatch.setenv(PROPOSAL_APPLY_RETRY_BUDGET_SECONDS_ENV_VAR, "1.5")
+        with pytest.raises(RuntimeError, match=r"must be a finite number at least 2\.0"):
+            validate_proposal_apply_configuration()
+
     def test_validate_configuration_passes_for_escalate_all_without_apply_url(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -691,6 +771,37 @@ class TestSubclassBypassAndRealPackageReachability:
     - Integration test with real RHProposalJudge: verify that resolving via
       plugins.get_proposal_judge() and calling apply() never imports Linear modules.
     """
+
+    def test_direct_rh_proposal_judge_instance_triggers_mro_wrapping(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Material suggestion 2: passing an RHProposalJudge-shaped instance directly
+        to get_proposal_judge() exercises the MRO wrapping path.
+        """
+
+        class FakeDirectRHProposalJudge:
+            def classify(self, kind: str, action: dict[str, Any]) -> ProposalClassification:
+                return ProposalClassification(priority="low")
+
+            async def fingerprint(self, ctx: ProposalContext) -> ProposalFingerprint:
+                return ProposalFingerprint(status="no_target")
+
+            async def judge(self, ctx: ProposalContext) -> ProposalVerdict:
+                return ProposalVerdict(approved=False, decision_note=None)
+
+            async def apply(self, ctx: ProposalContext) -> ProposalApplyOutcome:
+                raise AssertionError("shim must not be called")
+
+        FakeDirectRHProposalJudge.__name__ = "RHProposalJudge"
+
+        direct_instance = FakeDirectRHProposalJudge()
+        plugins._proposal_judge = None
+        monkeypatch.setitem(plugins.PROPOSAL_JUDGES, "direct_rh", lambda: direct_instance)
+        monkeypatch.setenv(plugins.PROPOSAL_JUDGE_ENV_VAR, "direct_rh")
+
+        resolved = plugins.get_proposal_judge()
+        assert isinstance(resolved, HttpApplyProposalJudge)
+        assert resolved.delegate is direct_instance
 
     def test_subclass_of_rh_proposal_judge_is_wrapped(
         self, monkeypatch: pytest.MonkeyPatch

@@ -158,6 +158,7 @@ raised — logged, never fails the triggering call).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import itertools
 import json
 import logging
@@ -7512,22 +7513,66 @@ _APPLY_ERROR_INDETERMINATE_MESSAGE = (
 )
 
 
+def _normalize_outcome(
+    *,
+    applied: bool,
+    indeterminate: bool,
+    caller_error: str | None = None,
+    result: dict[str, Any] | None = None,
+    log_detail: str | None = None,
+) -> ProposalApplyOutcome:
+    """Single construction choke-point for ProposalApplyOutcome inside _safe_apply.
+
+    Guarantees consistent, fail-safe outcome normalization:
+    - If applied is True and indeterminate is True (illegal contract violation),
+      it is normalized to applied=False, indeterminate=True.
+    - If applied is True, caller_error is cleared to None.
+    - If applied is False and caller_error is empty/None, a safe generic error is assigned.
+    - Any caller_error on applied=False is scrubbed and truncated.
+    - indeterminate is strictly propagated as a boolean.
+    """
+    if applied and indeterminate:
+        applied = False
+        result = None
+        caller_error = _APPLY_ERROR_PLUGIN_CONTRACT_VIOLATION_MESSAGE
+        log_detail = log_detail or "apply() illegally returned applied=True with indeterminate=True"
+
+    if applied:
+        return ProposalApplyOutcome(
+            applied=True,
+            result=result,
+            caller_error=None,
+            log_detail=log_detail,
+            indeterminate=False,
+        )
+
+    # applied is False
+    if not isinstance(caller_error, str) or not caller_error.strip():
+        caller_error = _APPLY_ERROR_PLUGIN_CONTRACT_VIOLATION_MESSAGE
+        if not log_detail:
+            log_detail = "apply() returned applied=False with no caller_error"
+    else:
+        scrubbed = _scrub_proposal_error_string(caller_error)
+        caller_error = _truncate_proposal_string(
+            scrubbed or _APPLY_ERROR_PLUGIN_CONTRACT_VIOLATION_MESSAGE,
+            _MAX_PROPOSAL_ERROR_DETAIL_LENGTH,
+        )
+
+    return ProposalApplyOutcome(
+        applied=False,
+        result=None,
+        caller_error=caller_error,
+        log_detail=log_detail,
+        indeterminate=bool(indeterminate),
+    )
+
+
 async def _safe_apply(judge: ProposalJudge, ctx: ProposalContext) -> ProposalApplyOutcome:
     """Call the injected ``plugins.ProposalJudge.apply()`` defensively.
 
-    ``apply()`` is contractually allowed to return ``applied=False`` as a
-    NORMAL, queryable outcome (not an error) -- but a raise, or a malformed
-    result (``outcome is None``; ``applied`` not a bool; ``applied=True``
-    with a non-``None``, non-``dict`` ``result``; ``applied=False`` with no
-    ``caller_error``), is a plugin bug this board cannot trust a duck-typed
-    plugin to avoid. Normalized to a safe ``applied=False`` outcome with a
-    generic, caller-safe message -- fail closed rather than reach a 500,
-    strand a claimed row at ``status="applying"``, or persist a malformed
-    ``apply_result``.
-
-    If a plugin illegally returns ``applied=True`` alongside ``indeterminate=True``,
-    this is normalized to ``applied=False, indeterminate=True`` to fail safe
-    and preserve the indeterminate signal."""
+    All return paths route through ``_normalize_outcome`` to guarantee
+    consistent, fail-safe outcome normalization and strict ``indeterminate``
+    propagation by construction."""
     try:
         outcome = await judge.apply(ctx)
         if not isinstance(outcome, ProposalApplyOutcome):
@@ -7539,12 +7584,16 @@ async def _safe_apply(judge: ProposalJudge, ctx: ProposalContext) -> ProposalApp
                 ctx.kind,
                 ctx.action_type,
             )
-            return ProposalApplyOutcome(
+            return _normalize_outcome(
                 applied=False,
-                result=None,
+                indeterminate=False,
                 caller_error=_APPLY_ERROR_PLUGIN_CONTRACT_VIOLATION_MESSAGE,
                 log_detail=f"apply() returned a malformed result: {outcome!r}",
             )
+
+        raw_indeterminate = getattr(outcome, "indeterminate", False)
+        is_indeterminate = bool(raw_indeterminate)
+
         if not isinstance(outcome.applied, bool):
             logger.warning(
                 "proposal judge apply() returned non-bool applied (%r) for hold %s "
@@ -7554,29 +7603,43 @@ async def _safe_apply(judge: ProposalJudge, ctx: ProposalContext) -> ProposalApp
                 ctx.kind,
                 ctx.action_type,
             )
-            return ProposalApplyOutcome(
+            return _normalize_outcome(
                 applied=False,
-                result=None,
+                indeterminate=is_indeterminate,
                 caller_error=_APPLY_ERROR_PLUGIN_CONTRACT_VIOLATION_MESSAGE,
                 log_detail=f"apply() returned non-bool applied: {outcome.applied!r}",
             )
+
         if outcome.applied:
-            if outcome.indeterminate:
+            if is_indeterminate:
                 logger.warning(
                     "proposal judge apply() returned applied=True with indeterminate=True "
                     "for hold %s; normalizing to applied=False, indeterminate=True",
                     ctx.hold_id,
                 )
-                return ProposalApplyOutcome(
+                return _normalize_outcome(
                     applied=False,
-                    result=None,
+                    indeterminate=True,
                     caller_error=_APPLY_ERROR_PLUGIN_CONTRACT_VIOLATION_MESSAGE,
                     log_detail="apply() illegally returned applied=True with indeterminate=True",
-                    indeterminate=True,
                 )
-            if outcome.result is None:
-                return outcome
-            if isinstance(outcome.result, dict):
+            if outcome.result is not None:
+                if not isinstance(outcome.result, dict):
+                    logger.warning(
+                        "proposal judge apply() returned applied=True with a non-dict result (%s) "
+                        "for hold %s; treating as apply_failed",
+                        type(outcome.result).__name__,
+                        ctx.hold_id,
+                    )
+                    return _normalize_outcome(
+                        applied=False,
+                        indeterminate=False,
+                        caller_error=_APPLY_ERROR_PLUGIN_CONTRACT_VIOLATION_MESSAGE,
+                        log_detail=(
+                            "apply() returned applied=True with a non-dict result: "
+                            f"{outcome.result!r}"
+                        ),
+                    )
                 try:
                     json.dumps(outcome.result)
                 except (TypeError, ValueError) as exc:
@@ -7586,62 +7649,28 @@ async def _safe_apply(judge: ProposalJudge, ctx: ProposalContext) -> ProposalApp
                         type(exc).__name__,
                         ctx.hold_id,
                     )
-                    return ProposalApplyOutcome(
+                    return _normalize_outcome(
                         applied=False,
-                        result=None,
+                        indeterminate=False,
                         caller_error=_APPLY_ERROR_PLUGIN_CONTRACT_VIOLATION_MESSAGE,
                         log_detail=(
                             "apply() returned applied=True with a non-JSON-serializable "
                             f"result: {exc}"
                         ),
                     )
-                return outcome
-            logger.warning(
-                "proposal judge apply() returned applied=True with a non-dict result (%s) "
-                "for hold %s; treating as apply_failed",
-                type(outcome.result).__name__,
-                ctx.hold_id,
-            )
-            return ProposalApplyOutcome(
-                applied=False,
-                result=None,
-                caller_error=_APPLY_ERROR_PLUGIN_CONTRACT_VIOLATION_MESSAGE,
-                log_detail=(
-                    f"apply() returned applied=True with a non-dict result: {outcome.result!r}"
-                ),
-            )
-        if not isinstance(outcome.caller_error, str) or not outcome.caller_error:
-            logger.warning(
-                "proposal judge apply() returned applied=False with no caller_error for hold "
-                "%s; using a generic message",
-                ctx.hold_id,
-            )
-            return ProposalApplyOutcome(
-                applied=False,
-                result=None,
-                caller_error=_APPLY_ERROR_PLUGIN_CONTRACT_VIOLATION_MESSAGE,
-                log_detail=(
-                    outcome.log_detail
-                    if isinstance(outcome.log_detail, str) and outcome.log_detail
-                    else "apply() returned applied=False with no caller_error"
-                ),
-                indeterminate=outcome.indeterminate,
-            )
-        scrubbed_caller_error = _scrub_proposal_error_string(outcome.caller_error)
-        if not scrubbed_caller_error:
-            scrubbed_caller_error = _APPLY_ERROR_PLUGIN_CONTRACT_VIOLATION_MESSAGE
-        truncated_caller_error = _truncate_proposal_string(
-            scrubbed_caller_error, _MAX_PROPOSAL_ERROR_DETAIL_LENGTH
-        )
-        if truncated_caller_error != outcome.caller_error:
-            return ProposalApplyOutcome(
-                applied=False,
-                result=None,
-                caller_error=truncated_caller_error,
+            return _normalize_outcome(
+                applied=True,
+                indeterminate=False,
+                result=outcome.result,
                 log_detail=outcome.log_detail,
-                indeterminate=outcome.indeterminate,
             )
-        return outcome
+
+        return _normalize_outcome(
+            applied=False,
+            indeterminate=is_indeterminate,
+            caller_error=outcome.caller_error,
+            log_detail=outcome.log_detail,
+        )
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -7653,12 +7682,11 @@ async def _safe_apply(judge: ProposalJudge, ctx: ProposalContext) -> ProposalApp
             type(exc).__name__,
             exc_info=True,
         )
-        return ProposalApplyOutcome(
+        return _normalize_outcome(
             applied=False,
-            result=None,
+            indeterminate=True,
             caller_error=_APPLY_ERROR_PLUGIN_CONTRACT_VIOLATION_MESSAGE,
             log_detail=f"apply() raised {type(exc).__name__}: {exc}",
-            indeterminate=True,
         )
 
 
@@ -7895,8 +7923,10 @@ async def _apply_or_finalize_proposal_hold(
             if cancelled_exc is not None:
                 raise cancelled_exc
             return _proposal_dict(hold)
-        except asyncio.CancelledError:
-            raise
+        except asyncio.CancelledError as cancel_err:
+            with contextlib.suppress(Exception):
+                await session.rollback()
+            raise cancel_err
         except Exception as commit_exc:
             # If this commit itself fails, the row is ALREADY non-terminal at
             # "applying", so rollback is self-correcting: the row remains at
@@ -7908,7 +7938,8 @@ async def _apply_or_finalize_proposal_hold(
                 target_id,
                 commit_exc,
             )
-            await session.rollback()
+            with contextlib.suppress(Exception):
+                await session.rollback()
             try:
                 _audit(
                     session,
@@ -7921,12 +7952,17 @@ async def _apply_or_finalize_proposal_hold(
                     },
                 )
                 await session.commit()
+            except asyncio.CancelledError as cancel_err:
+                with contextlib.suppress(Exception):
+                    await session.rollback()
+                raise cancel_err
             except Exception:
                 # If the DB connection is dead, persisting an audit row to the DB
                 # cannot succeed. The primary durable signal is the structured server
                 # WARNING log above, captured by centralized log infrastructure. The hold
                 # row in Postgres remains safely non-terminal at status="applying".
-                await session.rollback()
+                with contextlib.suppress(Exception):
+                    await session.rollback()
 
             if cancelled_exc is not None:
                 raise cancelled_exc from commit_exc

@@ -187,10 +187,10 @@ def _read_retry_budget_seconds() -> float:
             f"{PROPOSAL_APPLY_RETRY_BUDGET_SECONDS_ENV_VAR} must be a finite, "
             f"positive number: {raw!r}"
         ) from exc
-    if not math.isfinite(val) or val <= 0:
+    if not math.isfinite(val) or val < MIN_REMAINING_BUDGET_FOR_RETRY_SECONDS:
         raise ValueError(
-            f"{PROPOSAL_APPLY_RETRY_BUDGET_SECONDS_ENV_VAR} must be a finite, "
-            f"positive number: {raw!r}"
+            f"{PROPOSAL_APPLY_RETRY_BUDGET_SECONDS_ENV_VAR} must be a finite number "
+            f"at least {MIN_REMAINING_BUDGET_FOR_RETRY_SECONDS}: {raw!r}"
         )
     return val
 
@@ -235,6 +235,10 @@ def validate_proposal_apply_configuration() -> None:
 
 def _sni_override_hook(sni_host: str) -> Callable[[httpx.Request], Awaitable[None]]:
     async def _hook(request: httpx.Request) -> None:
+        # TECH-5400 / rh_comms_plugins.tls precedent: Tailscale Serve on ECS Fargate
+        # validates the *.ts.net hostname in both SNI and Host header. Both are set
+        # here to ensure parity with ownership_client.py and decision_page/tls.py.
+        request.headers["host"] = sni_host
         request.extensions["sni_hostname"] = sni_host
 
     return _hook
@@ -584,13 +588,13 @@ async def apply_proposal(ctx: ProposalContext) -> ProposalApplyOutcome:
     last_outcome: ProposalApplyOutcome | None = None
     attempts_made = 0
 
-    # asyncio.CancelledError is a BaseException, so it naturally propagates out
-    # of this function unhandled, triggering the caller's cancellation recovery.
     async with client:
         for attempt in range(1, max_attempts + 1):
             now = time.monotonic()
             remaining_budget = deadline - now
-            if remaining_budget < MIN_REMAINING_BUDGET_FOR_RETRY_SECONDS:
+            if remaining_budget <= 0 or (
+                attempt > 1 and remaining_budget < MIN_REMAINING_BUDGET_FOR_RETRY_SECONDS
+            ):
                 logger.warning(
                     "proposal apply retry budget exhausted (remaining=%.2fs) for hold_id=%s",
                     remaining_budget,
@@ -614,6 +618,8 @@ async def apply_proposal(ctx: ProposalContext) -> ProposalApplyOutcome:
                     url,
                     ctx.hold_id,
                 )
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
                 disposition, outcome = _classify_exception(exc, url, ctx.hold_id)
             else:
@@ -669,6 +675,18 @@ async def apply_proposal(ctx: ProposalContext) -> ProposalApplyOutcome:
                         sleep_time,
                     )
                     await asyncio.sleep(sleep_time)
+
+    if attempts_made == 0:
+        return ProposalApplyOutcome(
+            applied=False,
+            result=None,
+            caller_error=(
+                "apply outcome could not be confirmed; retry budget expired before request "
+                "could be made"
+            ),
+            log_detail="retry budget expired before attempt could be started",
+            indeterminate=True,
+        )
 
     if saw_ambiguous:
         return ProposalApplyOutcome(

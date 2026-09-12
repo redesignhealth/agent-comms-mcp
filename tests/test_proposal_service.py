@@ -1855,6 +1855,21 @@ class TestTerminalCommitFailureRecovery:
         ).scalar_one()
         assert row.status == "applying"
 
+        audit_row = (
+            (
+                await session.execute(
+                    select(AuditLog).where(
+                        AuditLog.action == "proposal.apply_indeterminate_commit_failed",
+                        AuditLog.detail["hold_id"].astext == str(hold_id),
+                    )
+                )
+            )
+            .scalars()
+            .one()
+        )
+        assert audit_row is not None
+        assert "boom" in audit_row.detail["error"]
+
     async def test_recovery_commit_also_failing_preserves_original_exception_context(
         self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
     ) -> None:
