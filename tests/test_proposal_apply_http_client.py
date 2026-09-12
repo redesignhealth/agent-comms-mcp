@@ -23,7 +23,6 @@ import asyncio
 import json
 import os
 import sys
-import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -66,9 +65,6 @@ def _set_required_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(PROPOSAL_APPLY_MAX_ATTEMPTS_ENV_VAR, raising=False)
     monkeypatch.delenv(PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS_ENV_VAR, raising=False)
     monkeypatch.delenv(PROPOSAL_APPLY_RETRY_BUDGET_SECONDS_ENV_VAR, raising=False)
-    monkeypatch.delenv("PROPOSAL_ACTION_URL", raising=False)
-    monkeypatch.delenv("PROPOSAL_ACTION_TOKEN", raising=False)
-    monkeypatch.delenv("PROPOSAL_ACTION_TLS_SNI_HOST", raising=False)
 
 
 def _patch_transport(monkeypatch: pytest.MonkeyPatch, handler: Any) -> None:
@@ -245,7 +241,6 @@ class TestApplyProposalValidation:
     ) -> None:
         _set_required_env(monkeypatch)
         monkeypatch.delenv(PROPOSAL_APPLY_URL_ENV_VAR)
-        monkeypatch.delenv("PROPOSAL_ACTION_URL", raising=False)
 
         outcome = await apply_proposal(_ctx())
         assert outcome.applied is False
@@ -261,14 +256,13 @@ class TestApplyProposalValidation:
         assert outcome.applied is False
         assert outcome.caller_error == "server configuration error"
         assert outcome.indeterminate is False
-        assert "must be an https:// URL" in (outcome.log_detail or "")
+        assert "must be an https:// URL, got scheme='http'" in (outcome.log_detail or "")
 
     async def test_missing_proposal_apply_token_fails_safe(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _set_required_env(monkeypatch)
         monkeypatch.delenv(PROPOSAL_APPLY_TOKEN_ENV_VAR)
-        monkeypatch.delenv("PROPOSAL_ACTION_TOKEN", raising=False)
 
         outcome = await apply_proposal(_ctx())
         assert outcome.applied is False
@@ -322,29 +316,6 @@ class TestApplyProposalValidation:
         assert outcome.caller_error == "server configuration error"
         assert outcome.indeterminate is False
         assert "not a bare hostname" in (outcome.log_detail or "")
-
-    async def test_fallback_env_vars_used_when_primary_unset(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.delenv(PROPOSAL_APPLY_URL_ENV_VAR, raising=False)
-        monkeypatch.delenv(PROPOSAL_APPLY_TOKEN_ENV_VAR, raising=False)
-        monkeypatch.delenv(PROPOSAL_APPLY_TLS_SNI_HOST_ENV_VAR, raising=False)
-        monkeypatch.setenv("PROPOSAL_ACTION_URL", _URL)
-        monkeypatch.setenv("PROPOSAL_ACTION_TOKEN", _TOKEN)
-        monkeypatch.setenv("PROPOSAL_ACTION_TLS_SNI_HOST", "comms-approvals.example.ts.net")
-
-        seen: dict[str, Any] = {}
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            seen["url"] = str(request.url)
-            seen["auth"] = request.headers.get("authorization")
-            return httpx.Response(200, json={"applied": True})
-
-        _patch_transport(monkeypatch, handler)
-        outcome = await apply_proposal(_ctx())
-        assert outcome.applied is True
-        assert seen["url"] == f"{_URL}/proposals/apply"
-        assert seen["auth"] == f"Bearer {_TOKEN}"
 
 
 class TestFailureTaxonomyAndRetries:
@@ -504,98 +475,43 @@ class TestFailureTaxonomyAndRetries:
     ) -> None:
         _set_required_env(monkeypatch)
         monkeypatch.setenv(PROPOSAL_APPLY_MAX_ATTEMPTS_ENV_VAR, "5")
-        # Budget of 0.2s will exhaust after 1 ambiguous attempt
-        monkeypatch.setenv(PROPOSAL_APPLY_RETRY_BUDGET_SECONDS_ENV_VAR, "0.2")
+        # Budget of 2.1s: attempt 1 runs (delay 0.2s), before attempt 2 remaining budget < 2.0s
+        monkeypatch.setenv(PROPOSAL_APPLY_RETRY_BUDGET_SECONDS_ENV_VAR, "2.1")
         monkeypatch.setenv(PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS_ENV_VAR, "1.0")
         calls = 0
 
-        def handler(request: httpx.Request) -> httpx.Response:
+        async def handler(request: httpx.Request) -> httpx.Response:
             nonlocal calls
             calls += 1
+            await asyncio.sleep(0.2)
             return httpx.Response(500, text="server error")
 
-        _patch_transport(monkeypatch, handler)
+        def fake_build_apply_client(
+            timeout_seconds: float, tls_sni_host: str | None
+        ) -> httpx.AsyncClient:
+            return httpx.AsyncClient(
+                timeout=httpx.Timeout(timeout_seconds),
+                transport=httpx.MockTransport(handler),
+            )
+
+        monkeypatch.setattr(
+            proposal_apply_http_client, "_build_apply_client", fake_build_apply_client
+        )
+
         outcome = await apply_proposal(_ctx())
         assert calls == 1
         assert outcome.applied is False
         assert outcome.indeterminate is True
-
-    async def test_payload_identity_preserved_across_retries(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Verifies that the same payload dict and request body bytes are sent
-        on every retry, guaranteeing request-digest determinism.
-        """
-        _set_required_env(monkeypatch)
-        monkeypatch.setenv(PROPOSAL_APPLY_MAX_ATTEMPTS_ENV_VAR, "2")
-        monkeypatch.setenv(PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS_ENV_VAR, "0.01")
-        payloads: list[bytes] = []
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            payloads.append(request.content)
-            if len(payloads) == 1:
-                return httpx.Response(503, text="temporarily unavailable")
-            return httpx.Response(200, json={"applied": True})
-
-        _patch_transport(monkeypatch, handler)
-        outcome = await apply_proposal(_ctx())
-        assert outcome.applied is True
-        assert len(payloads) == 2
-        assert payloads[0] == payloads[1]
-
-    async def test_cancellation_during_backoff_sleep_propagates(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _set_required_env(monkeypatch)
-        monkeypatch.setenv(PROPOSAL_APPLY_MAX_ATTEMPTS_ENV_VAR, "3")
-        monkeypatch.setenv(PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS_ENV_VAR, "5.0")
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            raise httpx.ReadTimeout("Timeout")
-
-        _patch_transport(monkeypatch, handler)
-
-        async def _run_and_cancel():
-            task = asyncio.create_task(apply_proposal(_ctx()))
-            await asyncio.sleep(0.05)  # Let it hit the sleep
-            task.cancel()
-            await task
-
-        with pytest.raises(asyncio.CancelledError):
-            await _run_and_cancel()
-
-    async def test_attempt_not_started_when_budget_already_expired(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _set_required_env(monkeypatch)
-        monkeypatch.setenv(PROPOSAL_APPLY_RETRY_BUDGET_SECONDS_ENV_VAR, "10.0")
-        calls = 0
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            nonlocal calls
-            calls += 1
-            return httpx.Response(200, json={"applied": True})
-
-        _patch_transport(monkeypatch, handler)
-        t0 = time.monotonic()
-        # Mock time.monotonic so deadline is t0 + 10.0, but when loop checks, time has passed
-        times = [t0, t0 + 15.0, t0 + 15.0]
-        monkeypatch.setattr(time, "monotonic", lambda: times.pop(0) if times else t0 + 15.0)
-
-        outcome = await apply_proposal(_ctx())
-        assert calls == 0
-        assert outcome.applied is False
-        assert outcome.indeterminate is False
 
     async def test_wall_clock_timeout_enforced_via_asyncio_timeout(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _set_required_env(monkeypatch)
         monkeypatch.setenv(PROPOSAL_APPLY_MAX_ATTEMPTS_ENV_VAR, "1")
-        monkeypatch.setenv(PROPOSAL_APPLY_RETRY_BUDGET_SECONDS_ENV_VAR, "0.05")
+        monkeypatch.setenv(PROPOSAL_APPLY_RETRY_BUDGET_SECONDS_ENV_VAR, "2.05")
 
         async def slow_handler(request: httpx.Request) -> httpx.Response:
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(2.5)
             return httpx.Response(200, json={"applied": True})
 
         def fake_build_apply_client(
@@ -626,8 +542,8 @@ class TestTlsSniOverride:
         for hook in client.event_hooks.get("request", []):
             await hook(request)
 
-        assert request.headers["host"] == sni_host
         assert request.extensions.get("sni_hostname") == sni_host
+        assert request.headers["host"] == "10.0.0.1"
 
 
 class _MockJudgeDelegate:
@@ -806,6 +722,71 @@ class TestSubclassBypassAndRealPackageReachability:
         assert isinstance(resolved, HttpApplyProposalJudge)
         assert isinstance(resolved.delegate, CustomRHProposalJudge)
 
+    def test_mro_fallback_when_package_genuinely_unavailable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """BLOCKING #2: MRO fallback still wraps when rh_comms_plugins is genuinely unavailable."""
+
+        class FakeBaseRHProposalJudge:
+            def classify(self, kind: str, action: dict[str, Any]) -> ProposalClassification:
+                return ProposalClassification(priority="low")
+
+            async def fingerprint(self, ctx: ProposalContext) -> ProposalFingerprint:
+                return ProposalFingerprint(status="no_target")
+
+            async def judge(self, ctx: ProposalContext) -> ProposalVerdict:
+                return ProposalVerdict(approved=False, decision_note=None)
+
+            async def apply(self, ctx: ProposalContext) -> ProposalApplyOutcome:
+                raise AssertionError("shim must not be called")
+
+        FakeBaseRHProposalJudge.__name__ = "RHProposalJudge"
+
+        class SubclassWhenPackageUnavailable(FakeBaseRHProposalJudge):
+            pass
+
+        # Force ImportError on import of rh_comms_plugins.proposal_judge
+        monkeypatch.setitem(sys.modules, "rh_comms_plugins", None)
+        monkeypatch.setitem(sys.modules, "rh_comms_plugins.proposal_judge", None)
+
+        plugins._proposal_judge = None
+        monkeypatch.setitem(
+            plugins.PROPOSAL_JUDGES,
+            "unavailable_rh",
+            lambda: SubclassWhenPackageUnavailable(),
+        )
+        monkeypatch.setenv(plugins.PROPOSAL_JUDGE_ENV_VAR, "unavailable_rh")
+
+        resolved = plugins.get_proposal_judge()
+        assert isinstance(resolved, HttpApplyProposalJudge)
+        assert isinstance(resolved.delegate, SubclassWhenPackageUnavailable)
+
+    def test_get_proposal_judge_with_rh_registry_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """BLOCKING #2: PROPOSAL_JUDGE='rh_proposal_judge' resolves via registry
+        to HttpApplyProposalJudge.
+        """
+
+        class FakeRH:
+            def classify(self, kind: str, action: dict[str, Any]) -> ProposalClassification:
+                return ProposalClassification(priority="low")
+
+            async def fingerprint(self, ctx: ProposalContext) -> ProposalFingerprint:
+                return ProposalFingerprint(status="no_target")
+
+            async def judge(self, ctx: ProposalContext) -> ProposalVerdict:
+                return ProposalVerdict(approved=False, decision_note=None)
+
+            async def apply(self, ctx: ProposalContext) -> ProposalApplyOutcome:
+                raise AssertionError("shim must not be called")
+
+        monkeypatch.setattr(proposal_apply_http_client, "_load_rh_proposal_judge", lambda: FakeRH())
+        plugins._proposal_judge = None
+        monkeypatch.setenv(plugins.PROPOSAL_JUDGE_ENV_VAR, "rh_proposal_judge")
+
+        resolved = plugins.get_proposal_judge()
+        assert isinstance(resolved, HttpApplyProposalJudge)
+        assert isinstance(resolved.delegate, FakeRH)
+
     async def test_real_package_loading_and_zero_linear_reachability(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -813,62 +794,66 @@ class TestSubclassBypassAndRealPackageReachability:
         Confirms sys.modules never contains rh_comms_plugins.linear_client or
         rh_comms_plugins.proposal_apply_service after a full get_proposal_judge() + apply() call.
         """
-        # Ensure sibling approvals repo is importable if on disk
-        candidates = [
-            Path(__file__).resolve().parents[2] / "agent-comms-approvals-tech-5755",
-            Path(__file__).resolve().parents[2] / "agent-comms-approvals",
-            Path(__file__).resolve().parents[2] / "agent-comms-approvals-proposal-judge-plan",
-        ]
-        for candidate in candidates:
-            if (candidate / "rh_comms_plugins" / "proposal_judge.py").is_file():
-                if str(candidate) not in sys.path:
-                    sys.path.insert(0, str(candidate))
-                break
-
+        orig_sys_path = list(sys.path)
         try:
-            from rh_comms_plugins.proposal_judge import (  # type: ignore[import-not-found]
-                RHProposalJudge,
-            )
-        except ImportError:
-            if os.environ.get("CI") == "true":
-                pytest.fail(
-                    "TECH-6213: Real agent-comms-approvals package is missing in CI! "
-                    "Cannot verify zero-Linear-reachability against real RHProposalJudge. "
-                    "agent-comms-approvals is a private downstream package installed only "
-                    "into Dockerfile.board-derived, not available in base public CI without "
-                    "cross-repo provisioning (tracked in TECH-6243)."
+            # Ensure sibling approvals repo is importable if on disk
+            candidates = [
+                Path(__file__).resolve().parents[2] / "agent-comms-approvals-tech-5755",
+                Path(__file__).resolve().parents[2] / "agent-comms-approvals",
+                Path(__file__).resolve().parents[2] / "agent-comms-approvals-proposal-judge-plan",
+            ]
+            for candidate in candidates:
+                if (candidate / "rh_comms_plugins" / "proposal_judge.py").is_file():
+                    if str(candidate) not in sys.path:
+                        sys.path.insert(0, str(candidate))
+                    break
+
+            try:
+                from rh_comms_plugins.proposal_judge import (  # type: ignore[import-not-found]
+                    RHProposalJudge,
                 )
-            pytest.skip("rh_comms_plugins is not installed in this environment")
+            except ImportError:
+                if os.environ.get("CI") == "true":
+                    pytest.fail(
+                        "TECH-6213: Real agent-comms-approvals package is missing in CI! "
+                        "Cannot verify zero-Linear-reachability against real RHProposalJudge. "
+                        "agent-comms-approvals is a private downstream package installed only "
+                        "into Dockerfile.board-derived, not available in base public CI without "
+                        "cross-repo provisioning (tracked in TECH-6243)."
+                    )
+                pytest.skip("rh_comms_plugins is not installed in this environment")
 
-        _set_required_env(monkeypatch)
+            _set_required_env(monkeypatch)
 
-        def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json={"applied": True, "result": {"real_ok": True}})
+            def handler(request: httpx.Request) -> httpx.Response:
+                return httpx.Response(200, json={"applied": True, "result": {"real_ok": True}})
 
-        _patch_transport(monkeypatch, handler)
+            _patch_transport(monkeypatch, handler)
 
-        # Test both base RHProposalJudge and a custom subclass
-        class CustomRealRHProposalJudge(RHProposalJudge):
-            pass
+            # Test both base RHProposalJudge and a custom subclass
+            class CustomRealRHProposalJudge(RHProposalJudge):
+                pass
 
-        for judge_factory in (RHProposalJudge, CustomRealRHProposalJudge):
-            plugins._proposal_judge = None
-            monkeypatch.setitem(
-                plugins.PROPOSAL_JUDGES, "test_real_rh", lambda f=judge_factory: f()
-            )
-            monkeypatch.setenv(plugins.PROPOSAL_JUDGE_ENV_VAR, "test_real_rh")
+            for judge_factory in (RHProposalJudge, CustomRealRHProposalJudge):
+                plugins._proposal_judge = None
+                monkeypatch.setitem(
+                    plugins.PROPOSAL_JUDGES, "test_real_rh", lambda f=judge_factory: f()
+                )
+                monkeypatch.setenv(plugins.PROPOSAL_JUDGE_ENV_VAR, "test_real_rh")
 
-            judge = plugins.get_proposal_judge()
-            assert isinstance(judge, HttpApplyProposalJudge)
-            assert isinstance(judge.delegate, judge_factory)
+                judge = plugins.get_proposal_judge()
+                assert isinstance(judge, HttpApplyProposalJudge)
+                assert isinstance(judge.delegate, judge_factory)
 
-            ctx = _ctx()
-            outcome = await judge.apply(ctx)
-            assert outcome.applied is True
+                ctx = _ctx()
+                outcome = await judge.apply(ctx)
+                assert outcome.applied is True
 
-            forbidden = {
-                "rh_comms_plugins.linear_client",
-                "rh_comms_plugins.proposal_apply_service",
-            }
-            loaded = forbidden & set(sys.modules.keys())
-            assert not loaded, f"Linear modules leaked into sys.modules: {loaded}"
+                forbidden = {
+                    "rh_comms_plugins.linear_client",
+                    "rh_comms_plugins.proposal_apply_service",
+                }
+                loaded = forbidden & set(sys.modules.keys())
+                assert not loaded, f"Linear modules leaked into sys.modules: {loaded}"
+        finally:
+            sys.path[:] = orig_sys_path

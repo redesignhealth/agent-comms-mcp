@@ -1783,6 +1783,78 @@ class TestTerminalCommitFailureRecovery:
         assert commit_mock.call_count == 3
         assert find_for_update_calls == 3
 
+    async def test_indeterminate_commit_failure_with_cancellation_reraises(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """BLOCKING #3 (A): apply cancellation + commit failure must re-raise
+        cancelled_exc from commit_exc."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_raises=asyncio.CancelledError(),
+        )
+        submitted = await _submit(session, judge=judge)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        commit_mock = self._fail_nth_commit(
+            session, 3, OperationalError("boom", {}, Exception("db down"))
+        )
+        monkeypatch.setattr(session, "commit", commit_mock)
+
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
+
+        assert isinstance(exc_info.value.__cause__, OperationalError)
+        row = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        assert row.status == "applying"
+
+    async def test_indeterminate_commit_failure_without_cancellation_returns_none(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """BLOCKING #3 (B): indeterminate outcome + commit failure (no cancellation)
+        must return None and leave row at status='applying'."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_result=ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error="retry budget exhausted",
+                log_detail="detail",
+                indeterminate=True,
+            ),
+        )
+        submitted = await _submit(session, judge=judge)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        commit_mock = self._fail_nth_commit(
+            session, 3, OperationalError("boom", {}, Exception("db down"))
+        )
+        monkeypatch.setattr(session, "commit", commit_mock)
+
+        claimed = await service._claim_proposal_hold_for_applying(
+            session,
+            hold_id=hold_id,
+            decided_by_actor_id="user-1",
+            decision_source="human",
+            decision_note=None,
+            expected_payload=None,
+        )
+        assert claimed is True
+
+        result = await service._apply_or_finalize_proposal_hold(
+            session,
+            hold_id=hold_id,
+            expected_status="applying",
+            decided_by_actor_id="user-1",
+            decision_source="human",
+            decision_note=None,
+            judge=judge,
+        )
+        assert result is None
+        row = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        assert row.status == "applying"
+
     async def test_recovery_commit_also_failing_preserves_original_exception_context(
         self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
     ) -> None:

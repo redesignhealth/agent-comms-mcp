@@ -1460,31 +1460,38 @@ def get_proposal_judge() -> ProposalJudge:
     too, both of which have their own deliberately fail-open defaults and
     rely on an empty string crashing at boot exactly like a typo would.
 
-    When resolving an RHProposalJudge instance, it is automatically wrapped
-    in HttpApplyProposalJudge so that apply() always executes via the board's
+    When resolving an RHProposalJudge instance or subclass, it is automatically
+    wrapped in HttpApplyProposalJudge so that apply() always executes via the board's
     HTTP applier client and never touches the in-process deprecated shim.
     """
     global _proposal_judge
     if _proposal_judge is None:
         name = os.environ.get(PROPOSAL_JUDGE_ENV_VAR) or DEFAULT_PROPOSAL_JUDGE
         raw_judge = resolve_plugin_name(PROPOSAL_JUDGE_ENV_VAR, PROPOSAL_JUDGES, name)
-        from proposal_apply_http_client import HttpApplyProposalJudge
 
-        is_rh = False
-        try:
-            from rh_comms_plugins.proposal_judge import (  # type: ignore[import-not-found]
-                RHProposalJudge,
-            )
+        # BLOCKING #2 fix: unconditionally inspect the inheritance chain (MRO)
+        # alongside isinstance() so subclasses or judges loaded from a shadowed
+        # module object are always wrapped, never skipping wrapping.
+        is_rh = any(
+            getattr(base, "__name__", "") == "RHProposalJudge" for base in type(raw_judge).__mro__
+        )
+        if not is_rh:
+            try:
+                from rh_comms_plugins.proposal_judge import (  # type: ignore[import-not-found]
+                    RHProposalJudge,
+                )
 
-            is_rh = isinstance(raw_judge, RHProposalJudge)
-        except ImportError:
-            is_rh = any(
-                getattr(base, "__name__", "") == "RHProposalJudge"
-                for base in type(raw_judge).__mro__
-            )
+                is_rh = isinstance(raw_judge, RHProposalJudge)
+            except ImportError:
+                pass
 
-        if is_rh and not isinstance(raw_judge, HttpApplyProposalJudge):
-            _proposal_judge = HttpApplyProposalJudge(raw_judge)
+        if is_rh:
+            from proposal_apply_http_client import HttpApplyProposalJudge
+
+            if not isinstance(raw_judge, HttpApplyProposalJudge):
+                _proposal_judge = HttpApplyProposalJudge(raw_judge)
+            else:
+                _proposal_judge = raw_judge
         else:
             _proposal_judge = raw_judge
     return _proposal_judge

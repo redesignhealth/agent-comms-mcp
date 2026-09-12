@@ -503,11 +503,16 @@ never reach `decide_proposal` at all),
       the external write may or may not have succeeded. Rather than marking the
       row `apply_failed` (which would allow callers to resubmit and mint a fresh
       `hold_id`, triggering a duplicate external write), the hold is left at
-      `status="applying"` with `apply_error` set to an explanatory message and
-      audited as `action="proposal.apply_indeterminate"`. This deliberately trades
-      liveness (the row is non-terminal and requires manual reconciliation;
-      automated reconciliation is tracked in TECH-6244) for correctness (guaranteed
-      prevention of duplicate external writes).
+      `status="applying"` with `apply_error` set to `_APPLY_ERROR_INDETERMINATE_MESSAGE`
+      and audited as `action="proposal.apply_indeterminate"`.
+      
+      This deliberately distinguishes *deliberately stranded indeterminate* rows
+      (an intentional safety trade-off to prevent duplicate external mutations) from
+      *accidentally stuck* rows (e.g. unhandled container crashes). Because `applying`
+      rows are dedup-blocking, resubmissions are folded in as no-ops. Both cases currently
+      require manual DB intervention (`UPDATE proposal_holds SET status = 'apply_failed',
+      apply_error = '<reason>' WHERE id = '<hold_id>'` -- or `status = 'applied'` if verified
+      in Linear) until automated background reconciliation is implemented (tracked in TECH-6244).
     - **Pre-`try:` awaits** -- the initial `_find_proposal_hold` re-fetch
       and its `session.commit()`, which run BEFORE the try/except block, are
       not wrapped at all; a cancellation landing there propagates

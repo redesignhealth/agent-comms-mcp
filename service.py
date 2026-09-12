@@ -7625,6 +7625,7 @@ async def _safe_apply(judge: ProposalJudge, ctx: ProposalContext) -> ProposalApp
                     if isinstance(outcome.log_detail, str) and outcome.log_detail
                     else "apply() returned applied=False with no caller_error"
                 ),
+                indeterminate=outcome.indeterminate,
             )
         scrubbed_caller_error = _scrub_proposal_error_string(outcome.caller_error)
         if not scrubbed_caller_error:
@@ -7657,6 +7658,7 @@ async def _safe_apply(judge: ProposalJudge, ctx: ProposalContext) -> ProposalApp
             result=None,
             caller_error=_APPLY_ERROR_PLUGIN_CONTRACT_VIOLATION_MESSAGE,
             log_detail=f"apply() raised {type(exc).__name__}: {exc}",
+            indeterminate=True,
         )
 
 
@@ -7897,7 +7899,8 @@ async def _apply_or_finalize_proposal_hold(
             raise
         except Exception as commit_exc:
             # If this commit itself fails, the row is ALREADY non-terminal at
-            # "applying", so rollback is self-correcting.
+            # "applying", so rollback is self-correcting: the row remains at
+            # "applying", safely blocking create-time dedup.
             logger.warning(
                 "proposal indeterminate commit failed for hold_id=%s target_id=%s: %s; "
                 "row remains at applying",
@@ -7906,6 +7909,25 @@ async def _apply_or_finalize_proposal_hold(
                 commit_exc,
             )
             await session.rollback()
+            try:
+                _audit(
+                    session,
+                    actor_sub=decided_by_actor_id,
+                    action="proposal.apply_indeterminate_commit_failed",
+                    detail={
+                        "hold_id": str(hold_id),
+                        "target_id": target_id,
+                        "error": _truncate_proposal_string(str(commit_exc), 500),
+                    },
+                )
+                await session.commit()
+            except Exception:
+                # If the DB connection is dead, persisting an audit row to the DB
+                # cannot succeed. The primary durable signal is the structured server
+                # WARNING log above, captured by centralized log infrastructure. The hold
+                # row in Postgres remains safely non-terminal at status="applying".
+                await session.rollback()
+
             if cancelled_exc is not None:
                 raise cancelled_exc from commit_exc
             return None

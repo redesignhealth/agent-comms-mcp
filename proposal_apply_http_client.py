@@ -66,6 +66,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any, cast
+from urllib.parse import urlparse
 
 import httpx
 
@@ -117,12 +118,9 @@ def _sanitize_log_field(value: Any) -> str:
     return text[:_MAX_LOG_FIELD_LENGTH].replace("\n", " ").replace("\r", " ")
 
 
-def _read_env(name: str, fallback_name: str | None = None) -> str:
-    """Read an env var with an optional fallback name."""
-    val = os.environ.get(name, "")
-    if not val and fallback_name:
-        val = os.environ.get(fallback_name, "")
-    return val
+def _read_env(name: str) -> str:
+    """Read an env var."""
+    return os.environ.get(name, "")
 
 
 def _read_timeout_seconds() -> float:
@@ -198,7 +196,7 @@ def _read_retry_budget_seconds() -> float:
 
 
 def _read_tls_sni_host() -> str | None:
-    host = _read_env(PROPOSAL_APPLY_TLS_SNI_HOST_ENV_VAR, "PROPOSAL_ACTION_TLS_SNI_HOST") or None
+    host = _read_env(PROPOSAL_APPLY_TLS_SNI_HOST_ENV_VAR) or None
     if host is not None and not _HOSTNAME_RE.fullmatch(host):
         raise ValueError(f"{PROPOSAL_APPLY_TLS_SNI_HOST_ENV_VAR} is not a bare hostname: {host!r}")
     return host
@@ -208,17 +206,18 @@ def validate_proposal_apply_configuration() -> None:
     """Validate configuration required by HttpApplyProposalJudge. Hard-fails
     at boot (raises RuntimeError) if required configuration is missing or malformed.
     """
-    base_url = _read_env(PROPOSAL_APPLY_URL_ENV_VAR, "PROPOSAL_ACTION_URL").rstrip("/")
+    base_url = _read_env(PROPOSAL_APPLY_URL_ENV_VAR).rstrip("/")
     if not base_url:
         raise RuntimeError(
             f"{PROPOSAL_APPLY_URL_ENV_VAR} is required for HttpApplyProposalJudge but is not set"
         )
     if not base_url.startswith("https://"):
+        scheme = urlparse(base_url).scheme or "unknown"
         raise RuntimeError(
-            f"{PROPOSAL_APPLY_URL_ENV_VAR} must be an https:// URL, got {base_url!r}"
+            f"{PROPOSAL_APPLY_URL_ENV_VAR} must be an https:// URL, got scheme={scheme!r}"
         )
 
-    token = _read_env(PROPOSAL_APPLY_TOKEN_ENV_VAR, "PROPOSAL_ACTION_TOKEN")
+    token = _read_env(PROPOSAL_APPLY_TOKEN_ENV_VAR)
     if not token:
         raise RuntimeError(
             f"{PROPOSAL_APPLY_TOKEN_ENV_VAR} is required for HttpApplyProposalJudge but is not set"
@@ -236,7 +235,6 @@ def validate_proposal_apply_configuration() -> None:
 
 def _sni_override_hook(sni_host: str) -> Callable[[httpx.Request], Awaitable[None]]:
     async def _hook(request: httpx.Request) -> None:
-        request.headers["host"] = sni_host
         request.extensions["sni_hostname"] = sni_host
 
     return _hook
@@ -256,13 +254,11 @@ def _build_apply_client(timeout_seconds: float, tls_sni_host: str | None) -> htt
     else:
         event_hooks = None
 
-    client = httpx.AsyncClient(
+    return httpx.AsyncClient(
         timeout=httpx.Timeout(timeout_seconds),
         follow_redirects=False,
         event_hooks=event_hooks,
     )
-    client.follow_redirects = False
-    return client
 
 
 def _extract_detail(response: httpx.Response) -> str | None:
@@ -460,8 +456,8 @@ def _classify_response(
         )
 
     caller_error = body.get("caller_error")
-    if caller_error is not None and not isinstance(caller_error, str):
-        caller_error = str(caller_error)
+    if caller_error is not None:
+        caller_error = _sanitize_log_field(str(caller_error))
 
     if applied:
         return _DISPOSITION_DECIDED, ProposalApplyOutcome(
@@ -497,7 +493,7 @@ async def apply_proposal(ctx: ProposalContext) -> ProposalApplyOutcome:
             indeterminate=False,
         )
 
-    base_url = _read_env(PROPOSAL_APPLY_URL_ENV_VAR, "PROPOSAL_ACTION_URL").rstrip("/")
+    base_url = _read_env(PROPOSAL_APPLY_URL_ENV_VAR).rstrip("/")
     if not base_url:
         logger.error("%s environment variable is not set", PROPOSAL_APPLY_URL_ENV_VAR)
         return ProposalApplyOutcome(
@@ -508,16 +504,23 @@ async def apply_proposal(ctx: ProposalContext) -> ProposalApplyOutcome:
             indeterminate=False,
         )
     if not base_url.startswith("https://"):
-        logger.error("%s must be an https:// URL, got %r", PROPOSAL_APPLY_URL_ENV_VAR, base_url)
+        scheme = urlparse(base_url).scheme or "unknown"
+        logger.error(
+            "%s must be an https:// URL, got scheme=%r",
+            PROPOSAL_APPLY_URL_ENV_VAR,
+            scheme,
+        )
         return ProposalApplyOutcome(
             applied=False,
             result=None,
             caller_error="server configuration error",
-            log_detail=f"{PROPOSAL_APPLY_URL_ENV_VAR} must be an https:// URL, got {base_url!r}",
+            log_detail=(
+                f"{PROPOSAL_APPLY_URL_ENV_VAR} must be an https:// URL, got scheme={scheme!r}"
+            ),
             indeterminate=False,
         )
 
-    token = _read_env(PROPOSAL_APPLY_TOKEN_ENV_VAR, "PROPOSAL_ACTION_TOKEN")
+    token = _read_env(PROPOSAL_APPLY_TOKEN_ENV_VAR)
     if not token:
         logger.error("%s environment variable is not set", PROPOSAL_APPLY_TOKEN_ENV_VAR)
         return ProposalApplyOutcome(
@@ -581,98 +584,91 @@ async def apply_proposal(ctx: ProposalContext) -> ProposalApplyOutcome:
     last_outcome: ProposalApplyOutcome | None = None
     attempts_made = 0
 
-    try:
-        async with client:
-            for attempt in range(1, max_attempts + 1):
-                now = time.monotonic()
-                remaining_budget = deadline - now
-                if remaining_budget <= 0 or (
-                    attempt > 1 and remaining_budget < MIN_REMAINING_BUDGET_FOR_RETRY_SECONDS
-                ):
-                    logger.warning(
-                        "proposal apply retry budget exhausted (remaining=%.2fs) for hold_id=%s",
-                        remaining_budget,
-                        ctx.hold_id,
+    # asyncio.CancelledError is a BaseException, so it naturally propagates out
+    # of this function unhandled, triggering the caller's cancellation recovery.
+    async with client:
+        for attempt in range(1, max_attempts + 1):
+            now = time.monotonic()
+            remaining_budget = deadline - now
+            if remaining_budget < MIN_REMAINING_BUDGET_FOR_RETRY_SECONDS:
+                logger.warning(
+                    "proposal apply retry budget exhausted (remaining=%.2fs) for hold_id=%s",
+                    remaining_budget,
+                    ctx.hold_id,
+                )
+                break
+            attempts_made = attempt
+
+            # Enforce true wall-clock ceiling via asyncio.timeout(remaining_budget)
+            # and clamp attempt_timeout to remaining_budget without overshooting.
+            attempt_timeout = min(timeout_seconds, remaining_budget)
+
+            try:
+                async with asyncio.timeout(remaining_budget):
+                    response = await client.post(
+                        url, json=payload, headers=headers, timeout=attempt_timeout
                     )
-                    break
-                attempts_made = attempt
+            except TimeoutError as exc:
+                disposition, outcome = _classify_exception(
+                    httpx.ReadTimeout(f"wall-clock retry budget expired: {exc}"),
+                    url,
+                    ctx.hold_id,
+                )
+            except Exception as exc:
+                disposition, outcome = _classify_exception(exc, url, ctx.hold_id)
+            else:
+                disposition, outcome = _classify_response(response, url, ctx.hold_id)
 
-                # Enforce true wall-clock ceiling via asyncio.timeout(remaining_budget)
-                # and clamp attempt_timeout to remaining_budget without overshooting.
-                attempt_timeout = min(timeout_seconds, remaining_budget)
+            last_outcome = outcome
 
-                try:
-                    async with asyncio.timeout(remaining_budget):
-                        response = await client.post(
-                            url, json=payload, headers=headers, timeout=attempt_timeout
-                        )
-                    disposition, outcome = _classify_response(response, url, ctx.hold_id)
-                except TimeoutError as exc:
-                    disposition, outcome = _classify_exception(
-                        httpx.ReadTimeout(f"wall-clock retry budget expired: {exc}"),
-                        url,
-                        ctx.hold_id,
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    disposition, outcome = _classify_exception(exc, url, ctx.hold_id)
+            if disposition == _DISPOSITION_DECIDED:
+                return outcome
 
-                last_outcome = outcome
-
-                if disposition == _DISPOSITION_DECIDED:
+            if disposition in (_DISPOSITION_DEFINITE_TERMINAL, _DISPOSITION_DEFINITE_CLEAN):
+                if not saw_ambiguous:
                     return outcome
+                # Critical invariant: once ambiguous, always ambiguous
+                return ProposalApplyOutcome(
+                    applied=False,
+                    result=None,
+                    caller_error=(
+                        f"apply outcome could not be confirmed after {attempt} attempts; "
+                        "awaiting manual reconciliation"
+                    ),
+                    log_detail=(
+                        f"initial attempt was ambiguous; subsequent attempt failed with: "
+                        f"{outcome.caller_error} ({outcome.log_detail})"
+                    ),
+                    indeterminate=True,
+                )
 
-                if disposition in (_DISPOSITION_DEFINITE_TERMINAL, _DISPOSITION_DEFINITE_CLEAN):
-                    if not saw_ambiguous:
-                        return outcome
-                    # Critical invariant: once ambiguous, always ambiguous
-                    return ProposalApplyOutcome(
-                        applied=False,
-                        result=None,
-                        caller_error=(
-                            f"apply outcome could not be confirmed after {attempt} attempts; "
-                            "awaiting manual reconciliation"
-                        ),
-                        log_detail=(
-                            f"initial attempt was ambiguous; subsequent attempt failed with: "
-                            f"{outcome.caller_error} ({outcome.log_detail})"
-                        ),
-                        indeterminate=True,
-                    )
-
-                if disposition == _DISPOSITION_AMBIGUOUS:
-                    saw_ambiguous = True
-                    if attempt < max_attempts:
-                        now = time.monotonic()
-                        remaining_budget = deadline - now
-                        if remaining_budget < MIN_REMAINING_BUDGET_FOR_RETRY_SECONDS:
-                            logger.warning(
-                                "proposal apply retry budget exhausted before sleep "
-                                "(remaining=%.2fs) for hold_id=%s",
-                                remaining_budget,
-                                ctx.hold_id,
-                            )
-                            break
-                        base_sleep = min(
-                            backoff_base * (2 ** (attempt - 1)), MAX_BACKOFF_SLEEP_SECONDS
-                        )
-                        jittered_sleep = random.uniform(0.0, base_sleep)
-                        sleep_time = min(
-                            jittered_sleep,
-                            max(0.0, remaining_budget - MIN_REMAINING_BUDGET_FOR_RETRY_SECONDS),
-                        )
-                        logger.info(
-                            "proposal apply attempt %d was ambiguous for hold_id=%s; "
-                            "sleeping %.2fs before retry",
-                            attempt,
+            if disposition == _DISPOSITION_AMBIGUOUS:
+                saw_ambiguous = True
+                if attempt < max_attempts:
+                    now = time.monotonic()
+                    remaining_budget = deadline - now
+                    if remaining_budget < MIN_REMAINING_BUDGET_FOR_RETRY_SECONDS:
+                        logger.warning(
+                            "proposal apply retry budget exhausted before sleep "
+                            "(remaining=%.2fs) for hold_id=%s",
+                            remaining_budget,
                             ctx.hold_id,
-                            sleep_time,
                         )
-                        await asyncio.sleep(sleep_time)
-
-    except asyncio.CancelledError:
-        raise
+                        break
+                    base_sleep = min(backoff_base * (2 ** (attempt - 1)), MAX_BACKOFF_SLEEP_SECONDS)
+                    jittered_sleep = random.uniform(0.0, base_sleep)
+                    sleep_time = min(
+                        jittered_sleep,
+                        max(0.0, remaining_budget - MIN_REMAINING_BUDGET_FOR_RETRY_SECONDS),
+                    )
+                    logger.info(
+                        "proposal apply attempt %d was ambiguous for hold_id=%s; "
+                        "sleeping %.2fs before retry",
+                        attempt,
+                        ctx.hold_id,
+                        sleep_time,
+                    )
+                    await asyncio.sleep(sleep_time)
 
     if saw_ambiguous:
         return ProposalApplyOutcome(

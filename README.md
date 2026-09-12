@@ -413,7 +413,9 @@ docker compose up --build
 > real judge:
 >
 > - `PROPOSAL_JUDGE` must point at a real implementation (provisioned via SSM at
->   `/reclaw-comms/{env}/proposal-judge`, e.g. `rh_comms_plugins.proposal_judge:build_rh_proposal_judge`).
+>   `/reclaw-comms/{env}/proposal-judge`, e.g. `rh_comms_plugins.proposal_judge:build_rh_proposal_judge` or `rh_proposal_judge`).
+>   If the live SSM value still references `get_proposal_judge`, update it to `build_rh_proposal_judge`
+>   in the same deploy that activates this release.
 >   Unset or empty, the board safely defaults to `escalate_all_proposals`, which never
 >   auto-approves or applies any proposal. For `PROPOSAL_JUDGE` specifically, an empty string
 >   falls back to the default. Other seams treat an empty env var as an unknown plugin name
@@ -422,6 +424,14 @@ docker compose up --build
 >   environment so developers can set `PROPOSAL_JUDGE` in `.env` (or pass `-e PROPOSAL_JUDGE=...`)
 >   for local testing with a custom judge implementation without affecting the safe default
 >   when unset.
+> - **Proposal Apply SSM Provisioning & Deployment Ordering (TECH-6213)**: In environments
+>   using `HttpApplyProposalJudge`, both `PROPOSAL_APPLY_URL` (SSM path
+>   `/reclaw-comms/{env}/proposal-apply-url`) and `PROPOSAL_APPLY_TOKEN` (SSM path
+>   `/reclaw-comms/{env}/proposal-apply-token`) must be provisioned. Required deployment
+>   ordering: deploy the approvals service release first -> provision both SSM parameters
+>   in `rh-data-platform`'s Terraform -> deploy the board image with `PROPOSAL_JUDGE`
+>   configured. Booting a board task with an `HttpApplyProposalJudge` when either parameter is
+>   missing will fail fast (crash at startup).
 > - For Redesign Health, `agent-comms-approvals` (PR #62) must be deployed with the
 >   concrete judge implementation before this service's release runs with `PROPOSAL_JUDGE`
 >   configured, or the import will fail at boot. Switch ECS task definition to the derived

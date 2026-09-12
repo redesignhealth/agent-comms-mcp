@@ -559,6 +559,49 @@ class TestSafeApplySeam:
         assert result.indeterminate is True
         assert result.caller_error == "timeout after 3 attempts"
 
+    async def test_apply_indeterminate_flag_preserved_when_caller_error_missing(self) -> None:
+        """BLOCKING #1: missing/empty caller_error must still propagate indeterminate=True."""
+        judge = FakeProposalJudge(
+            apply_result=ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error=None,
+                log_detail="retry budget exhausted",
+                indeterminate=True,
+            )
+        )
+        result = await _safe_apply(judge, _ctx())
+        assert result.applied is False
+        assert result.indeterminate is True
+        assert result.caller_error == "unable to apply this proposal"
+
+    async def test_apply_indeterminate_flag_preserved_when_caller_error_truncated(self) -> None:
+        """BLOCKING #1: truncated caller_error must still propagate indeterminate=True."""
+        judge = FakeProposalJudge(
+            apply_result=ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error="A" * 600,
+                log_detail="log",
+                indeterminate=True,
+            )
+        )
+        result = await _safe_apply(judge, _ctx())
+        assert result.applied is False
+        assert result.indeterminate is True
+        assert result.caller_error is not None
+        assert len(result.caller_error) <= 500
+
+    async def test_apply_exception_catch_all_defaults_to_indeterminate_true(self) -> None:
+        """BLOCKING #1: unhandled exception escaping apply() defaults to indeterminate=True."""
+        judge = FakeProposalJudge(
+            apply_raises=RuntimeError("unexpected crash inside apply"),
+        )
+        result = await _safe_apply(judge, _ctx())
+        assert result.applied is False
+        assert result.indeterminate is True
+        assert result.caller_error == "unable to apply this proposal"
+
 
 class TestScrubProposalErrorString:
     def test_preserves_clean_prose(self) -> None:
