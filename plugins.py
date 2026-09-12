@@ -582,12 +582,24 @@ def validate_configuration() -> None:
     get_approval_notifier()
     get_active_checker()
     get_docs_verifier()
-    if not os.environ.get(PROPOSAL_JUDGE_ENV_VAR):
+    proposal_judge_env = os.environ.get(PROPOSAL_JUDGE_ENV_VAR)
+    if not proposal_judge_env:
         logger.warning(
             "%s is not set (or is set to an empty string); falling back to %r, "
             "which never auto-approves or applies any proposal",
             PROPOSAL_JUDGE_ENV_VAR,
             DEFAULT_PROPOSAL_JUDGE,
+        )
+    elif (
+        proposal_judge_env != DEFAULT_PROPOSAL_JUDGE
+        and not os.environ.get(PROPOSAL_APPLY_URL_ENV_VAR)
+        and not os.environ.get("PROPOSAL_ACTION_URL")
+    ):
+        logger.warning(
+            "%s is configured (%r) but %s is unset",
+            PROPOSAL_JUDGE_ENV_VAR,
+            proposal_judge_env,
+            PROPOSAL_APPLY_URL_ENV_VAR,
         )
     get_proposal_judge()
 
@@ -1172,6 +1184,11 @@ def docs_verifier_name(verifier: DocsVerifier) -> str:
 PROPOSAL_JUDGE_ENV_VAR = "PROPOSAL_JUDGE"
 DEFAULT_PROPOSAL_JUDGE = "escalate_all_proposals"
 
+PROPOSAL_APPLY_URL_ENV_VAR = "PROPOSAL_APPLY_URL"
+PROPOSAL_APPLY_TOKEN_ENV_VAR = "PROPOSAL_APPLY_TOKEN"
+PROPOSAL_APPLY_TLS_SNI_HOST_ENV_VAR = "PROPOSAL_APPLY_TLS_SNI_HOST"
+PROPOSAL_APPLY_TIMEOUT_SECONDS_ENV_VAR = "PROPOSAL_APPLY_TIMEOUT_SECONDS"
+
 # Discriminator values for ProposalFingerprint.status.
 FINGERPRINT_DIGEST = "digest"
 FINGERPRINT_NO_TARGET = "no_target"
@@ -1399,8 +1416,22 @@ class EscalateAllProposalJudge:
         )
 
 
+def build_rh_proposal_judge() -> ProposalJudge:
+    """Factory for the board's PROPOSAL_JUDGE seam.
+
+    Returns an HttpApplyProposalJudge wrapping Redesign Health's
+    RHProposalJudge (from rh_comms_plugins.proposal_judge) for judgment,
+    with apply() calling the approvals service over HTTP via
+    proposal_apply_http_client.
+    """
+    from proposal_apply_http_client import build_rh_proposal_judge as _build
+
+    return _build()
+
+
 PROPOSAL_JUDGES: dict[str, Callable[[], ProposalJudge]] = {
     DEFAULT_PROPOSAL_JUDGE: EscalateAllProposalJudge,
+    "rh_proposal_judge": build_rh_proposal_judge,
 }
 
 _proposal_judge: ProposalJudge | None = None
@@ -1421,11 +1452,24 @@ def get_proposal_judge() -> ProposalJudge:
     string-tolerant behavior to ``APPROVAL_NOTIFIER``/``ACTIVE_CHECKER``
     too, both of which have their own deliberately fail-open defaults and
     rely on an empty string crashing at boot exactly like a typo would.
+
+    When resolving an RHProposalJudge instance, it is automatically wrapped
+    in HttpApplyProposalJudge so that apply() always executes via the board's
+    HTTP applier client and never touches the in-process deprecated shim.
     """
     global _proposal_judge
     if _proposal_judge is None:
         name = os.environ.get(PROPOSAL_JUDGE_ENV_VAR) or DEFAULT_PROPOSAL_JUDGE
-        _proposal_judge = resolve_plugin_name(PROPOSAL_JUDGE_ENV_VAR, PROPOSAL_JUDGES, name)
+        raw_judge = resolve_plugin_name(PROPOSAL_JUDGE_ENV_VAR, PROPOSAL_JUDGES, name)
+        if type(raw_judge).__name__ == "RHProposalJudge":
+            from proposal_apply_http_client import HttpApplyProposalJudge
+
+            if not isinstance(raw_judge, HttpApplyProposalJudge):
+                _proposal_judge = HttpApplyProposalJudge(raw_judge)
+            else:
+                _proposal_judge = raw_judge
+        else:
+            _proposal_judge = raw_judge
     return _proposal_judge
 
 
@@ -1459,6 +1503,10 @@ __all__ = [
     "FINGERPRINT_UNAVAILABLE",
     "INSTRUCTION_REGISTRY_PATH",
     "INSTRUCTION_TEXT_HASHES",
+    "PROPOSAL_APPLY_TIMEOUT_SECONDS_ENV_VAR",
+    "PROPOSAL_APPLY_TLS_SNI_HOST_ENV_VAR",
+    "PROPOSAL_APPLY_TOKEN_ENV_VAR",
+    "PROPOSAL_APPLY_URL_ENV_VAR",
     "PROPOSAL_JUDGES",
     "PROPOSAL_JUDGE_ENV_VAR",
     "RISK_SCORERS",
@@ -1493,6 +1541,7 @@ __all__ = [
     "RiskVerdict",
     "WebhookNotifier",
     "auto_approver_name",
+    "build_rh_proposal_judge",
     "docs_verifier_name",
     "get_active_checker",
     "get_approval_notifier",
