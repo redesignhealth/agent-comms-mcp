@@ -7520,6 +7520,7 @@ def _normalize_outcome(
     caller_error: str | None = None,
     result: dict[str, Any] | None = None,
     log_detail: str | None = None,
+    hold_id: Any = None,
 ) -> ProposalApplyOutcome:
     """Single construction choke-point for ProposalApplyOutcome inside _safe_apply.
 
@@ -7548,6 +7549,11 @@ def _normalize_outcome(
 
     # applied is False
     if not isinstance(caller_error, str) or not caller_error.strip():
+        logger.warning(
+            "proposal judge apply() returned applied=False with no caller_error for hold %s; "
+            "using generic message",
+            hold_id,
+        )
         caller_error = _APPLY_ERROR_PLUGIN_CONTRACT_VIOLATION_MESSAGE
         if not log_detail:
             log_detail = "apply() returned applied=False with no caller_error"
@@ -7670,6 +7676,7 @@ async def _safe_apply(judge: ProposalJudge, ctx: ProposalContext) -> ProposalApp
             indeterminate=is_indeterminate,
             caller_error=outcome.caller_error,
             log_detail=outcome.log_detail,
+            hold_id=ctx.hold_id,
         )
     except asyncio.CancelledError:
         raise
@@ -7924,7 +7931,7 @@ async def _apply_or_finalize_proposal_hold(
                 raise cancelled_exc
             return _proposal_dict(hold)
         except asyncio.CancelledError as cancel_err:
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(BaseException):
                 await session.rollback()
             raise cancel_err
         except Exception as commit_exc:
@@ -7953,9 +7960,9 @@ async def _apply_or_finalize_proposal_hold(
                 )
                 await session.commit()
             except asyncio.CancelledError as cancel_err:
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(BaseException):
                     await session.rollback()
-                raise cancel_err
+                raise cancel_err from commit_exc
             except Exception:
                 # If the DB connection is dead, persisting an audit row to the DB
                 # cannot succeed. The primary durable signal is the structured server

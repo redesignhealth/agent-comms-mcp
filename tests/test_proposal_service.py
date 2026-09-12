@@ -1491,7 +1491,9 @@ class TestTerminalCommitFailureRecovery:
     """
 
     @staticmethod
-    def _fail_nth_commit(session: AsyncSession, fail_at: int, *exceptions: Exception) -> AsyncMock:
+    def _fail_nth_commit(
+        session: AsyncSession, fail_at: int, *exceptions: BaseException
+    ) -> AsyncMock:
         """Build a ``session.commit`` replacement that raises
         ``exceptions[0]`` on the ``fail_at``-th call, ``exceptions[1]`` on
         the ``(fail_at + 1)``-th call (if provided), and so on past the
@@ -1869,6 +1871,71 @@ class TestTerminalCommitFailureRecovery:
         )
         assert audit_row is not None
         assert "boom" in audit_row.detail["error"]
+
+    async def test_indeterminate_first_commit_cancelled_reraises(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """BLOCKING #2 (1): apply returns indeterminate=True, and the primary
+        commit itself raises CancelledError -> must re-raise CancelledError."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_result=ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error="retry budget exhausted",
+                log_detail="detail",
+                indeterminate=True,
+            ),
+        )
+        submitted = await _submit(session, judge=judge)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        commit_mock = self._fail_nth_commit(
+            session, 3, asyncio.CancelledError("cancelled during primary commit")
+        )
+        monkeypatch.setattr(session, "commit", commit_mock)
+
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
+
+        assert "cancelled during primary commit" in str(exc_info.value)
+        row = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        assert row.status == "applying"
+
+    async def test_indeterminate_audit_commit_cancelled_reraises_chained(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """BLOCKING #2 (2): primary commit fails with OperationalError, and the audit
+        commit raises CancelledError -> must re-raise CancelledError from commit_exc."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_result=ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error="retry budget exhausted",
+                log_detail="detail",
+                indeterminate=True,
+            ),
+        )
+        submitted = await _submit(session, judge=judge)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        commit_mock = self._fail_nth_commit(
+            session,
+            3,
+            OperationalError("first", {}, Exception("db error")),
+            asyncio.CancelledError("cancelled during audit commit"),
+        )
+        monkeypatch.setattr(session, "commit", commit_mock)
+
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await _decide(session, hold_id=hold_id, decision="approve", judge=judge)
+
+        assert isinstance(exc_info.value.__cause__, OperationalError)
+        row = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        assert row.status == "applying"
 
     async def test_recovery_commit_also_failing_preserves_original_exception_context(
         self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch

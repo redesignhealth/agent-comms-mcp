@@ -50,7 +50,7 @@ Env vars:
     PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS: optional initial backoff in seconds
         (default 0.5s), exponential with full jitter capped at 4.0s.
     PROPOSAL_APPLY_RETRY_BUDGET_SECONDS: optional wall-clock ceiling in seconds
-        (default 45.0s) for the entire apply operation.
+        (default 45.0s, minimum 2.0s) for the entire apply operation.
 """
 
 from __future__ import annotations
@@ -184,13 +184,13 @@ def _read_retry_budget_seconds() -> float:
         val = float(raw)
     except ValueError as exc:
         raise ValueError(
-            f"{PROPOSAL_APPLY_RETRY_BUDGET_SECONDS_ENV_VAR} must be a finite, "
-            f"positive number: {raw!r}"
+            f"{PROPOSAL_APPLY_RETRY_BUDGET_SECONDS_ENV_VAR} must be a finite number "
+            f">= {MIN_REMAINING_BUDGET_FOR_RETRY_SECONDS}: {raw!r}"
         ) from exc
     if not math.isfinite(val) or val < MIN_REMAINING_BUDGET_FOR_RETRY_SECONDS:
         raise ValueError(
             f"{PROPOSAL_APPLY_RETRY_BUDGET_SECONDS_ENV_VAR} must be a finite number "
-            f"at least {MIN_REMAINING_BUDGET_FOR_RETRY_SECONDS}: {raw!r}"
+            f">= {MIN_REMAINING_BUDGET_FOR_RETRY_SECONDS}: {raw!r}"
         )
     return val
 
@@ -235,9 +235,10 @@ def validate_proposal_apply_configuration() -> None:
 
 def _sni_override_hook(sni_host: str) -> Callable[[httpx.Request], Awaitable[None]]:
     async def _hook(request: httpx.Request) -> None:
-        # TECH-5400 / rh_comms_plugins.tls precedent: Tailscale Serve on ECS Fargate
-        # validates the *.ts.net hostname in both SNI and Host header. Both are set
-        # here to ensure parity with ownership_client.py and decision_page/tls.py.
+        # TECH-5400: Tailscale Serve on ECS Fargate receives traffic fronted by its *.ts.net
+        # MagicDNS certificate and routes internally based on the Host header. Both Host and
+        # sni_hostname are set here for parity with agent-comms-approvals'
+        # rh_comms_plugins/tls.py (create_sni_override_client).
         request.headers["host"] = sni_host
         request.extensions["sni_hostname"] = sni_host
 
@@ -685,7 +686,7 @@ async def apply_proposal(ctx: ProposalContext) -> ProposalApplyOutcome:
                 "could be made"
             ),
             log_detail="retry budget expired before attempt could be started",
-            indeterminate=True,
+            indeterminate=False,
         )
 
     if saw_ambiguous:

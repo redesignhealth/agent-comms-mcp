@@ -600,7 +600,7 @@ class TestFailureTaxonomyAndRetries:
         outcome = await apply_proposal(_ctx())
         assert calls == 0
         assert outcome.applied is False
-        assert outcome.indeterminate is True
+        assert outcome.indeterminate is False
         assert "retry budget expired before request could be made" in (outcome.caller_error or "")
 
 
@@ -749,7 +749,7 @@ class TestConfigValidationHardFails:
     ) -> None:
         _set_required_env(monkeypatch)
         monkeypatch.setenv(PROPOSAL_APPLY_RETRY_BUDGET_SECONDS_ENV_VAR, "1.5")
-        with pytest.raises(RuntimeError, match=r"must be a finite number at least 2\.0"):
+        with pytest.raises(RuntimeError, match=r"must be a finite number >= 2\.0"):
             validate_proposal_apply_configuration()
 
     def test_validate_configuration_passes_for_escalate_all_without_apply_url(
