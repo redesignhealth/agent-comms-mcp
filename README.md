@@ -398,6 +398,9 @@ docker compose up --build
 | `PROPOSAL_APPLY_TOKEN` | Bearer token carrying `proposals:apply` scope for calling `POST /actions/proposals/apply`. |
 | `PROPOSAL_APPLY_TLS_SNI_HOST` | Optional MagicDNS hostname (e.g. `comms-approvals.<tailnet>.ts.net`) to validate TLS against while dialing `PROPOSAL_APPLY_URL`'s private-zone hostname (TECH-5400). |
 | `PROPOSAL_APPLY_TIMEOUT_SECONDS` | Optional per-call HTTP timeout in seconds for proposal apply operations (default: 15.0s). |
+| `PROPOSAL_APPLY_MAX_ATTEMPTS` | Optional maximum number of attempts for ambiguous apply failures (default: 3, max: 10). |
+| `PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS` | Optional initial backoff in seconds (default: 0.5s), exponential with full jitter capped at 4.0s per sleep. |
+| `PROPOSAL_APPLY_RETRY_BUDGET_SECONDS` | Optional wall-clock ceiling in seconds for the entire apply operation across retries (default: 45.0s). Note: ALB/ingress idle timeouts should be configured comfortably above this budget. |
 
 > [!IMPORTANT]
 > **Judgment versus action for `PROPOSAL_JUDGE` (TECH-6213).** `classify()`/`fingerprint()`/`judge()` are judgment and use the locally importable, in-process plugin pattern (`RHProposalJudge`). `apply()` is action: it performs an actual external write and calls `agent-comms-approvals`' `POST /actions/proposals/apply` endpoint over HTTP via `proposal_apply_http_client`. When resolving `RHProposalJudge`, the board automatically composes it with `HttpApplyProposalJudge` so that the board process never executes external writes in-process and never loads Linear credentials or client libraries.

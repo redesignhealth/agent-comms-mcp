@@ -529,6 +529,36 @@ class TestSafeApplySeam:
             == "cannot transition ticket when status=closed and priority=high (count = 0)"
         )
 
+    async def test_apply_illegal_applied_true_with_indeterminate_true_is_normalized(self) -> None:
+        judge = FakeProposalJudge(
+            apply_result=ProposalApplyOutcome(
+                applied=True,
+                result={"issue_id": "LIN-1"},
+                caller_error=None,
+                log_detail=None,
+                indeterminate=True,
+            )
+        )
+        result = await _safe_apply(judge, _ctx())
+        assert result.applied is False
+        assert result.indeterminate is True
+        assert result.caller_error == "unable to apply this proposal"
+
+    async def test_apply_indeterminate_flag_preserved_on_failure(self) -> None:
+        judge = FakeProposalJudge(
+            apply_result=ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error="timeout after 3 attempts",
+                log_detail="raw timeout",
+                indeterminate=True,
+            )
+        )
+        result = await _safe_apply(judge, _ctx())
+        assert result.applied is False
+        assert result.indeterminate is True
+        assert result.caller_error == "timeout after 3 attempts"
+
 
 class TestScrubProposalErrorString:
     def test_preserves_clean_prose(self) -> None:

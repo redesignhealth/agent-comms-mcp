@@ -590,18 +590,14 @@ def validate_configuration() -> None:
             PROPOSAL_JUDGE_ENV_VAR,
             DEFAULT_PROPOSAL_JUDGE,
         )
-    elif (
-        proposal_judge_env != DEFAULT_PROPOSAL_JUDGE
-        and not os.environ.get(PROPOSAL_APPLY_URL_ENV_VAR)
-        and not os.environ.get("PROPOSAL_ACTION_URL")
-    ):
-        logger.warning(
-            "%s is configured (%r) but %s is unset",
-            PROPOSAL_JUDGE_ENV_VAR,
-            proposal_judge_env,
-            PROPOSAL_APPLY_URL_ENV_VAR,
-        )
-    get_proposal_judge()
+    judge = get_proposal_judge()
+    from proposal_apply_http_client import (
+        HttpApplyProposalJudge,
+        validate_proposal_apply_configuration,
+    )
+
+    if isinstance(judge, HttpApplyProposalJudge):
+        validate_proposal_apply_configuration()
 
 
 # --- Seam 2: the auto-approver (TECH-5389 PR2) -------------------------------
@@ -1188,6 +1184,9 @@ PROPOSAL_APPLY_URL_ENV_VAR = "PROPOSAL_APPLY_URL"
 PROPOSAL_APPLY_TOKEN_ENV_VAR = "PROPOSAL_APPLY_TOKEN"
 PROPOSAL_APPLY_TLS_SNI_HOST_ENV_VAR = "PROPOSAL_APPLY_TLS_SNI_HOST"
 PROPOSAL_APPLY_TIMEOUT_SECONDS_ENV_VAR = "PROPOSAL_APPLY_TIMEOUT_SECONDS"
+PROPOSAL_APPLY_MAX_ATTEMPTS_ENV_VAR = "PROPOSAL_APPLY_MAX_ATTEMPTS"
+PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS_ENV_VAR = "PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS"
+PROPOSAL_APPLY_RETRY_BUDGET_SECONDS_ENV_VAR = "PROPOSAL_APPLY_RETRY_BUDGET_SECONDS"
 
 # Discriminator values for ProposalFingerprint.status.
 FINGERPRINT_DIGEST = "digest"
@@ -1294,11 +1293,18 @@ class ProposalApplyOutcome(NamedTuple):
     ``applied=True`` -> ``status="applied"``, ``applied_at`` stamped,
         ``result`` (when non-``None``) stored on
         ``proposal_holds.apply_result``.
-    ``applied=False`` -> ``status="apply_failed"``, ``caller_error`` stored
-        on ``proposal_holds.apply_error`` and returned over the API
+    ``applied=False`` -> ``status="apply_failed"`` (unless ``indeterminate=True``,
+        in which case the hold remains at ``status="applying"`` awaiting
+        manual reconciliation), ``caller_error`` stored on
+        ``proposal_holds.apply_error`` and returned over the API
         (truncated to 500 chars with ``"... [truncated]"`` by the board if
         exceeded). ``log_detail`` goes to the board's WARNING log + audit row
         only, never the API -- same split as ``ProposalTargetError`` above.
+    ``indeterminate=True`` -> only meaningful alongside ``applied=False``: the
+        external write may or may not have occurred (e.g. transport timeout or
+        retry exhaustion). The hold must NOT be transitioned to a terminal
+        status; it remains at ``applying`` so create-time dedup blocks
+        resubmission, avoiding duplicate external writes.
 
     Returning ``applied=False`` is a NORMAL, queryable outcome, not an
     error condition. An implementation must not raise for it.
@@ -1308,6 +1314,7 @@ class ProposalApplyOutcome(NamedTuple):
     result: dict[str, Any] | None
     caller_error: str | None
     log_detail: str | None
+    indeterminate: bool = False
 
 
 class ProposalJudge(Protocol):
@@ -1461,13 +1468,23 @@ def get_proposal_judge() -> ProposalJudge:
     if _proposal_judge is None:
         name = os.environ.get(PROPOSAL_JUDGE_ENV_VAR) or DEFAULT_PROPOSAL_JUDGE
         raw_judge = resolve_plugin_name(PROPOSAL_JUDGE_ENV_VAR, PROPOSAL_JUDGES, name)
-        if type(raw_judge).__name__ == "RHProposalJudge":
-            from proposal_apply_http_client import HttpApplyProposalJudge
+        from proposal_apply_http_client import HttpApplyProposalJudge
 
-            if not isinstance(raw_judge, HttpApplyProposalJudge):
-                _proposal_judge = HttpApplyProposalJudge(raw_judge)
-            else:
-                _proposal_judge = raw_judge
+        is_rh = False
+        try:
+            from rh_comms_plugins.proposal_judge import (  # type: ignore[import-not-found]
+                RHProposalJudge,
+            )
+
+            is_rh = isinstance(raw_judge, RHProposalJudge)
+        except ImportError:
+            is_rh = any(
+                getattr(base, "__name__", "") == "RHProposalJudge"
+                for base in type(raw_judge).__mro__
+            )
+
+        if is_rh and not isinstance(raw_judge, HttpApplyProposalJudge):
+            _proposal_judge = HttpApplyProposalJudge(raw_judge)
         else:
             _proposal_judge = raw_judge
     return _proposal_judge
@@ -1503,6 +1520,9 @@ __all__ = [
     "FINGERPRINT_UNAVAILABLE",
     "INSTRUCTION_REGISTRY_PATH",
     "INSTRUCTION_TEXT_HASHES",
+    "PROPOSAL_APPLY_MAX_ATTEMPTS_ENV_VAR",
+    "PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS_ENV_VAR",
+    "PROPOSAL_APPLY_RETRY_BUDGET_SECONDS_ENV_VAR",
     "PROPOSAL_APPLY_TIMEOUT_SECONDS_ENV_VAR",
     "PROPOSAL_APPLY_TLS_SNI_HOST_ENV_VAR",
     "PROPOSAL_APPLY_TOKEN_ENV_VAR",

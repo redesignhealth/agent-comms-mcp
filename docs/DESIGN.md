@@ -492,17 +492,22 @@ never reach `decide_proposal` at all),
   OR a terminal commit fails between the claim commit and completion) have
   distinct recovery stories depending on the cause (updated, Argus review round-6/round-9
   suggestions):
-  - **Cancellation landing during the fingerprinter or applier await IS
-    auto-recovered** (narrowed, Argus review round-7 suggestion -- a prior
-    version of this bullet implied ALL cancellations during this function
-    are covered, which overstates it): `service._apply_or_finalize_proposal_hold`
-    catches `asyncio.CancelledError` specifically around the fingerprinter
-    and applier awaits, still performs the SAME terminal write every other
-    path takes (setting `"apply_failed"` with a distinguishable
-    `apply_error`), and only re-raises the cancellation afterward -- for
-    THAT window, the row reaches a real terminal status, it is not left
-    stuck. Two windows outside that coverage remain, both undocumented
-    gaps rather than closed:
+  - **Cancellation during fingerprint vs apply (TECH-6213 PR-B1)**:
+    - **Fingerprint cancellation IS auto-recovered to `apply_failed`**:
+      fingerprinting is read-only, so no external write was ever attempted.
+      Setting `apply_failed` and re-raising cancellation is safe and terminal.
+    - **Apply cancellation and ambiguous transport failures are DELIBERATELY
+      left at `applying` (indeterminate)**: if cancellation occurs while
+      `judge.apply()` is in flight, or if the HTTP client exhausts retries on
+      ambiguous failures (`httpx.ReadTimeout`, 409 conflict, 5xx server error),
+      the external write may or may not have succeeded. Rather than marking the
+      row `apply_failed` (which would allow callers to resubmit and mint a fresh
+      `hold_id`, triggering a duplicate external write), the hold is left at
+      `status="applying"` with `apply_error` set to an explanatory message and
+      audited as `action="proposal.apply_indeterminate"`. This deliberately trades
+      liveness (the row is non-terminal and requires manual reconciliation;
+      automated reconciliation is tracked in TECH-6244) for correctness (guaranteed
+      prevention of duplicate external writes).
     - **Pre-`try:` awaits** -- the initial `_find_proposal_hold` re-fetch
       and its `session.commit()`, which run BEFORE the try/except block, are
       not wrapped at all; a cancellation landing there propagates

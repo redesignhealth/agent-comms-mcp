@@ -7507,6 +7507,9 @@ _APPLY_ERROR_PLUGIN_CONTRACT_VIOLATION_MESSAGE = "unable to apply this proposal"
 # when the recovery commit itself fails, to avoid stranding the row at
 # status="applying".
 _APPLY_ERROR_BOARD_COMMIT_FAILURE_MESSAGE = "apply failed due to a board infrastructure error"
+_APPLY_ERROR_INDETERMINATE_MESSAGE = (
+    "apply outcome could not be confirmed; awaiting manual reconciliation"
+)
 
 
 async def _safe_apply(judge: ProposalJudge, ctx: ProposalContext) -> ProposalApplyOutcome:
@@ -7520,7 +7523,11 @@ async def _safe_apply(judge: ProposalJudge, ctx: ProposalContext) -> ProposalApp
     plugin to avoid. Normalized to a safe ``applied=False`` outcome with a
     generic, caller-safe message -- fail closed rather than reach a 500,
     strand a claimed row at ``status="applying"``, or persist a malformed
-    ``apply_result``."""
+    ``apply_result``.
+
+    If a plugin illegally returns ``applied=True`` alongside ``indeterminate=True``,
+    this is normalized to ``applied=False, indeterminate=True`` to fail safe
+    and preserve the indeterminate signal."""
     try:
         outcome = await judge.apply(ctx)
         if not isinstance(outcome, ProposalApplyOutcome):
@@ -7554,6 +7561,19 @@ async def _safe_apply(judge: ProposalJudge, ctx: ProposalContext) -> ProposalApp
                 log_detail=f"apply() returned non-bool applied: {outcome.applied!r}",
             )
         if outcome.applied:
+            if outcome.indeterminate:
+                logger.warning(
+                    "proposal judge apply() returned applied=True with indeterminate=True "
+                    "for hold %s; normalizing to applied=False, indeterminate=True",
+                    ctx.hold_id,
+                )
+                return ProposalApplyOutcome(
+                    applied=False,
+                    result=None,
+                    caller_error=_APPLY_ERROR_PLUGIN_CONTRACT_VIOLATION_MESSAGE,
+                    log_detail="apply() illegally returned applied=True with indeterminate=True",
+                    indeterminate=True,
+                )
             if outcome.result is None:
                 return outcome
             if isinstance(outcome.result, dict):
@@ -7618,6 +7638,7 @@ async def _safe_apply(judge: ProposalJudge, ctx: ProposalContext) -> ProposalApp
                 result=None,
                 caller_error=truncated_caller_error,
                 log_detail=outcome.log_detail,
+                indeterminate=outcome.indeterminate,
             )
         return outcome
     except asyncio.CancelledError:
@@ -7785,6 +7806,7 @@ async def _apply_or_finalize_proposal_hold(
     # internally -- see their own docstrings), so this `try` exists only
     # to catch this one `BaseException`.
     cancelled_exc: asyncio.CancelledError | None = None
+    is_indeterminate: bool = False
     try:
         fingerprint_result = await _safe_fingerprint(judge, apply_ctx)
         if fingerprint_result.status == FINGERPRINT_DIGEST:
@@ -7796,18 +7818,25 @@ async def _apply_or_finalize_proposal_hold(
         # FINGERPRINT_NO_TARGET: `is_stale` stays `False` (its initial
         # value) -- there is no pre-existing target state that could have
         # drifted since submission.
+    except asyncio.CancelledError as exc:
+        raw_apply_error = _cancellation_apply_error(exc)
+        apply_error = _APPLY_ERROR_CANCELLED_MESSAGE
+        cancelled_exc = exc
 
-        if not is_stale and apply_error is None:
+    if not is_stale and apply_error is None and cancelled_exc is None:
+        try:
             outcome = await _safe_apply(judge, apply_ctx)
             if outcome.applied:
                 apply_result = outcome.result
             else:
                 apply_error = outcome.caller_error
                 raw_apply_error = outcome.log_detail or outcome.caller_error
-    except asyncio.CancelledError as exc:
-        raw_apply_error = _cancellation_apply_error(exc)
-        apply_error = _APPLY_ERROR_CANCELLED_MESSAGE
-        cancelled_exc = exc
+                is_indeterminate = outcome.indeterminate
+        except asyncio.CancelledError as exc:
+            raw_apply_error = _cancellation_apply_error(exc)
+            apply_error = _APPLY_ERROR_CANCELLED_MESSAGE
+            is_indeterminate = True
+            cancelled_exc = exc
 
     hold = await _find_proposal_hold(session, hold_id, for_update=True)
     if hold is None:
@@ -7829,7 +7858,54 @@ async def _apply_or_finalize_proposal_hold(
     hold.decided_at = _now()
     hold.decision_note = decision_note
 
-    if is_stale:
+    if is_indeterminate:
+        # TECH-6213 PR-B1 (FIX 4): an indeterminate outcome means the external
+        # write may or may not have occurred (e.g. transport timeout, 409 conflict,
+        # 5xx server error retry exhaustion, or task cancellation mid-apply).
+        # Deliberately do NOT transition hold.status to a terminal status!
+        # It remains at "applying" so create-time dedup blocks resubmissions with
+        # a fresh hold_id, preventing duplicate external writes.
+        hold.apply_error = apply_error or _APPLY_ERROR_INDETERMINATE_MESSAGE
+        logger.warning(
+            "proposal apply indeterminate for hold_id=%s target_id=%s: %s; "
+            "row remains at status='applying' awaiting manual reconciliation",
+            hold_id,
+            target_id,
+            raw_apply_error,
+        )
+        _audit(
+            session,
+            actor_sub=decided_by_actor_id,
+            action="proposal.apply_indeterminate",
+            detail={
+                "hold_id": str(hold_id),
+                "target_id": target_id,
+                "error": raw_apply_error,
+            },
+        )
+        try:
+            await session.commit()
+            await session.refresh(hold)
+            if cancelled_exc is not None:
+                raise cancelled_exc
+            return _proposal_dict(hold)
+        except asyncio.CancelledError:
+            raise
+        except Exception as commit_exc:
+            # If this commit itself fails, the row is ALREADY non-terminal at
+            # "applying", so rollback is self-correcting.
+            logger.warning(
+                "proposal indeterminate commit failed for hold_id=%s target_id=%s: %s; "
+                "row remains at applying",
+                hold_id,
+                target_id,
+                commit_exc,
+            )
+            await session.rollback()
+            if cancelled_exc is not None:
+                raise cancelled_exc from commit_exc
+            return None
+    elif is_stale:
         hold.status = "stale"
         hold.decision_note = _stale_decision_note(decision_note)
         _audit(

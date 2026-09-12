@@ -23,6 +23,11 @@ Contract:
   recovery guards.
 - Idempotency is keyed server-side on ``hold_id`` (stored in the
   ``proposal_apply_attempts`` table).
+- Ambiguous transport failures (ReadTimeout, 409 conflict, 5xx, or disconnects)
+  are retried with exponential backoff and jitter under a wall-clock budget.
+  If retries exhaust, an ambiguous outcome returns ``indeterminate=True`` so the
+  board leaves the hold at ``status="applying"`` rather than minting a fresh
+  hold_id on resubmission, preventing duplicate external writes.
 
 Env vars:
     PROPOSAL_APPLY_URL: base URL of ``agent-comms-approvals``' proposal
@@ -40,6 +45,12 @@ Env vars:
         ``DEFAULT_TIMEOUT_SECONDS`` (15.0s) -- matching
         ``linear_read_http_client``'s timeout to provide headroom over the
         inner Linear write call.
+    PROPOSAL_APPLY_MAX_ATTEMPTS: optional integer 1..10 (default 3), maximum
+        number of attempts for ambiguous failures.
+    PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS: optional initial backoff in seconds
+        (default 0.5s), exponential with full jitter capped at 4.0s.
+    PROPOSAL_APPLY_RETRY_BUDGET_SECONDS: optional wall-clock ceiling in seconds
+        (default 45.0s) for the entire apply operation.
 """
 
 from __future__ import annotations
@@ -50,7 +61,9 @@ import json
 import logging
 import math
 import os
+import random
 import re
+import time
 from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any, cast
 
@@ -70,16 +83,30 @@ PROPOSAL_APPLY_URL_ENV_VAR = "PROPOSAL_APPLY_URL"
 PROPOSAL_APPLY_TOKEN_ENV_VAR = "PROPOSAL_APPLY_TOKEN"
 PROPOSAL_APPLY_TLS_SNI_HOST_ENV_VAR = "PROPOSAL_APPLY_TLS_SNI_HOST"
 PROPOSAL_APPLY_TIMEOUT_SECONDS_ENV_VAR = "PROPOSAL_APPLY_TIMEOUT_SECONDS"
+PROPOSAL_APPLY_MAX_ATTEMPTS_ENV_VAR = "PROPOSAL_APPLY_MAX_ATTEMPTS"
+PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS_ENV_VAR = "PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS"
+PROPOSAL_APPLY_RETRY_BUDGET_SECONDS_ENV_VAR = "PROPOSAL_APPLY_RETRY_BUDGET_SECONDS"
 
 DEFAULT_TIMEOUT_SECONDS = 15.0
-_PROPOSAL_APPLY_PATH = "/proposals/apply"
+DEFAULT_MAX_ATTEMPTS = 3
+DEFAULT_RETRY_BACKOFF_SECONDS = 0.5
+DEFAULT_RETRY_BUDGET_SECONDS = 45.0
+MAX_BACKOFF_SLEEP_SECONDS = 4.0
+MIN_REMAINING_BUDGET_FOR_RETRY_SECONDS = 2.0
 
+_PROPOSAL_APPLY_PATH = "/proposals/apply"
 _MAX_LOG_FIELD_LENGTH = 200
 
 # Hostname-shaped regex matching TECH-5400 / rh_comms_plugins.tls pattern.
 _HOSTNAME_RE = re.compile(
     r"[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*\Z"
 )
+
+# Failure disposition categories for the retry loop
+_DISPOSITION_DECIDED = "DECIDED"
+_DISPOSITION_DEFINITE_CLEAN = "DEFINITE_CLEAN"
+_DISPOSITION_DEFINITE_TERMINAL = "DEFINITE_TERMINAL"
+_DISPOSITION_AMBIGUOUS = "AMBIGUOUS"
 
 
 def _sanitize_log_field(value: Any) -> str:
@@ -113,6 +140,98 @@ def _read_timeout_seconds() -> float:
             f"{PROPOSAL_APPLY_TIMEOUT_SECONDS_ENV_VAR} must be a finite, positive number: {raw!r}"
         )
     return timeout
+
+
+def _read_max_attempts() -> int:
+    raw = os.environ.get(PROPOSAL_APPLY_MAX_ATTEMPTS_ENV_VAR)
+    if not raw:
+        return DEFAULT_MAX_ATTEMPTS
+    try:
+        val = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{PROPOSAL_APPLY_MAX_ATTEMPTS_ENV_VAR} must be an integer between 1 and 10: {raw!r}"
+        ) from exc
+    if not (1 <= val <= 10):
+        raise ValueError(
+            f"{PROPOSAL_APPLY_MAX_ATTEMPTS_ENV_VAR} must be an integer between 1 and 10: {raw!r}"
+        )
+    return val
+
+
+def _read_retry_backoff_seconds() -> float:
+    raw = os.environ.get(PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS_ENV_VAR)
+    if not raw:
+        return DEFAULT_RETRY_BACKOFF_SECONDS
+    try:
+        val = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS_ENV_VAR} must be a finite, "
+            f"positive number: {raw!r}"
+        ) from exc
+    if not math.isfinite(val) or val <= 0:
+        raise ValueError(
+            f"{PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS_ENV_VAR} must be a finite, "
+            f"positive number: {raw!r}"
+        )
+    return val
+
+
+def _read_retry_budget_seconds() -> float:
+    raw = os.environ.get(PROPOSAL_APPLY_RETRY_BUDGET_SECONDS_ENV_VAR)
+    if not raw:
+        return DEFAULT_RETRY_BUDGET_SECONDS
+    try:
+        val = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{PROPOSAL_APPLY_RETRY_BUDGET_SECONDS_ENV_VAR} must be a finite, "
+            f"positive number: {raw!r}"
+        ) from exc
+    if not math.isfinite(val) or val <= 0:
+        raise ValueError(
+            f"{PROPOSAL_APPLY_RETRY_BUDGET_SECONDS_ENV_VAR} must be a finite, "
+            f"positive number: {raw!r}"
+        )
+    return val
+
+
+def _read_tls_sni_host() -> str | None:
+    host = _read_env(PROPOSAL_APPLY_TLS_SNI_HOST_ENV_VAR, "PROPOSAL_ACTION_TLS_SNI_HOST") or None
+    if host is not None and not _HOSTNAME_RE.fullmatch(host):
+        raise ValueError(f"{PROPOSAL_APPLY_TLS_SNI_HOST_ENV_VAR} is not a bare hostname: {host!r}")
+    return host
+
+
+def validate_proposal_apply_configuration() -> None:
+    """Validate configuration required by HttpApplyProposalJudge. Hard-fails
+    at boot (raises RuntimeError) if required configuration is missing or malformed.
+    """
+    base_url = _read_env(PROPOSAL_APPLY_URL_ENV_VAR, "PROPOSAL_ACTION_URL").rstrip("/")
+    if not base_url:
+        raise RuntimeError(
+            f"{PROPOSAL_APPLY_URL_ENV_VAR} is required for HttpApplyProposalJudge but is not set"
+        )
+    if not base_url.startswith("https://"):
+        raise RuntimeError(
+            f"{PROPOSAL_APPLY_URL_ENV_VAR} must be an https:// URL, got {base_url!r}"
+        )
+
+    token = _read_env(PROPOSAL_APPLY_TOKEN_ENV_VAR, "PROPOSAL_ACTION_TOKEN")
+    if not token:
+        raise RuntimeError(
+            f"{PROPOSAL_APPLY_TOKEN_ENV_VAR} is required for HttpApplyProposalJudge but is not set"
+        )
+
+    try:
+        _read_timeout_seconds()
+        _read_max_attempts()
+        _read_retry_backoff_seconds()
+        _read_retry_budget_seconds()
+        _read_tls_sni_host()
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
 
 
 def _sni_override_hook(sni_host: str) -> Callable[[httpx.Request], Awaitable[None]]:
@@ -160,11 +279,213 @@ def _extract_detail(response: httpx.Response) -> str | None:
     return None
 
 
+def _classify_exception(exc: Exception, url: str, hold_id: Any) -> tuple[str, ProposalApplyOutcome]:
+    """Classify an HTTP transport exception into DEFINITE_CLEAN vs AMBIGUOUS."""
+    safe_exc = _sanitize_log_field(str(exc))
+
+    # DEFINITE-CLEAN: request never reached server (DNS, connect, TLS handshake, URL errors)
+    if isinstance(
+        exc,
+        (
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.PoolTimeout,
+            httpx.UnsupportedProtocol,
+            httpx.LocalProtocolError,
+            httpx.InvalidURL,
+            httpx.ProxyError,
+        ),
+    ):
+        logger.warning(
+            "proposal apply connection failed calling %s for hold_id=%s: %s",
+            url,
+            hold_id,
+            safe_exc,
+        )
+        return _DISPOSITION_DEFINITE_CLEAN, ProposalApplyOutcome(
+            applied=False,
+            result=None,
+            caller_error="proposal apply service unreachable",
+            log_detail=f"connection failed: {safe_exc}",
+            indeterminate=False,
+        )
+
+    # AMBIGUOUS: request may have been sent/processed (ReadTimeout, WriteTimeout, resets)
+    logger.warning(
+        "proposal apply transport failure (ambiguous) calling %s for hold_id=%s: %s",
+        url,
+        hold_id,
+        safe_exc,
+    )
+    return _DISPOSITION_AMBIGUOUS, ProposalApplyOutcome(
+        applied=False,
+        result=None,
+        caller_error="proposal apply service unreachable",
+        log_detail=f"transport failure (ambiguous): {safe_exc}",
+        indeterminate=True,
+    )
+
+
+def _classify_response(
+    response: httpx.Response, url: str, hold_id: Any
+) -> tuple[str, ProposalApplyOutcome]:
+    """Classify an HTTP response into DECIDED, DEFINITE_TERMINAL, or AMBIGUOUS."""
+    if response.status_code in (401, 403):
+        logger.warning(
+            "proposal apply proxy rejected our credentials (status %s) calling %s -- check %s",
+            response.status_code,
+            url,
+            PROPOSAL_APPLY_TOKEN_ENV_VAR,
+        )
+        return _DISPOSITION_DEFINITE_TERMINAL, ProposalApplyOutcome(
+            applied=False,
+            result=None,
+            caller_error="server configuration error",
+            log_detail=f"proposal apply proxy rejected credentials (status {response.status_code})",
+            indeterminate=False,
+        )
+
+    if response.status_code == 422:
+        detail = _extract_detail(response)
+        safe_detail = _sanitize_log_field(detail or "unprocessable entity")
+        logger.warning(
+            "proposal apply rejected as malformed (status 422) calling %s for hold_id=%s: %s",
+            url,
+            hold_id,
+            safe_detail,
+        )
+        return _DISPOSITION_DEFINITE_TERMINAL, ProposalApplyOutcome(
+            applied=False,
+            result=None,
+            caller_error="proposal apply request was rejected as malformed",
+            log_detail=f"proposal apply rejected (422): {safe_detail}",
+            indeterminate=False,
+        )
+
+    if response.status_code == 409:
+        detail = _extract_detail(response)
+        safe_detail = _sanitize_log_field(detail or "conflict")
+        logger.error(
+            "proposal apply conflict (status 409) calling %s for hold_id=%s: %s",
+            url,
+            hold_id,
+            safe_detail,
+        )
+        return _DISPOSITION_AMBIGUOUS, ProposalApplyOutcome(
+            applied=False,
+            result=None,
+            caller_error=f"proposal apply conflict: {safe_detail}",
+            log_detail=f"proposal apply conflict: {safe_detail}",
+            indeterminate=True,
+        )
+
+    if response.status_code >= 500:
+        logger.warning(
+            "proposal apply proxy returned server error (status %s) calling %s for hold_id=%s",
+            response.status_code,
+            url,
+            hold_id,
+        )
+        return _DISPOSITION_AMBIGUOUS, ProposalApplyOutcome(
+            applied=False,
+            result=None,
+            caller_error="proposal apply service unavailable",
+            log_detail=(
+                f"proposal apply proxy returned server error (status {response.status_code})"
+            ),
+            indeterminate=True,
+        )
+
+    if response.status_code != 200:
+        logger.warning(
+            "proposal apply proxy returned unexpected status %s calling %s for hold_id=%s",
+            response.status_code,
+            url,
+            hold_id,
+        )
+        return _DISPOSITION_DEFINITE_TERMINAL, ProposalApplyOutcome(
+            applied=False,
+            result=None,
+            caller_error="proposal apply service returned unexpected status",
+            log_detail=f"proposal apply proxy returned unexpected status {response.status_code}",
+            indeterminate=False,
+        )
+
+    # Status is 200: parse body
+    try:
+        body = response.json()
+    except Exception as exc:
+        safe_exc = _sanitize_log_field(str(exc))
+        logger.warning(
+            "proposal apply proxy returned non-JSON 200 response for hold_id=%s: %s",
+            hold_id,
+            safe_exc,
+        )
+        # 200 received but unparseable body -> write likely occurred; ambiguous
+        return _DISPOSITION_AMBIGUOUS, ProposalApplyOutcome(
+            applied=False,
+            result=None,
+            caller_error="proposal apply service returned malformed response",
+            log_detail=f"response body was not valid JSON: {safe_exc}",
+            indeterminate=True,
+        )
+
+    if not isinstance(body, dict):
+        return _DISPOSITION_AMBIGUOUS, ProposalApplyOutcome(
+            applied=False,
+            result=None,
+            caller_error="proposal apply service returned malformed response",
+            log_detail=f"response JSON was not an object: {type(body).__name__}",
+            indeterminate=True,
+        )
+
+    applied = body.get("applied")
+    if not isinstance(applied, bool):
+        return _DISPOSITION_AMBIGUOUS, ProposalApplyOutcome(
+            applied=False,
+            result=None,
+            caller_error="proposal apply service returned malformed response",
+            log_detail=f"response applied field is not a bool: {applied!r}",
+            indeterminate=True,
+        )
+
+    result = body.get("result")
+    if result is not None and not isinstance(result, dict):
+        return _DISPOSITION_AMBIGUOUS, ProposalApplyOutcome(
+            applied=False,
+            result=None,
+            caller_error="proposal apply service returned malformed response",
+            log_detail=f"response result field is not a dict: {type(result).__name__}",
+            indeterminate=True,
+        )
+
+    caller_error = body.get("caller_error")
+    if caller_error is not None and not isinstance(caller_error, str):
+        caller_error = str(caller_error)
+
+    if applied:
+        return _DISPOSITION_DECIDED, ProposalApplyOutcome(
+            applied=True,
+            result=result,
+            caller_error=None,
+            log_detail=None,
+            indeterminate=False,
+        )
+    return _DISPOSITION_DECIDED, ProposalApplyOutcome(
+        applied=False,
+        result=None,
+        caller_error=caller_error or "apply failed",
+        log_detail=f"proposal apply outcome was applied=false: {caller_error}",
+        indeterminate=False,
+    )
+
+
 async def apply_proposal(ctx: ProposalContext) -> ProposalApplyOutcome:
     """Apply an approved proposal via HTTP call to agent-comms-approvals.
 
     Satisfies ProposalJudge.apply() contract. Never raises (except on
-    cancellation).
+    cancellation). Retries ambiguous transport/server errors with backoff
+    under an overall wall-clock budget.
     """
     if ctx.hold_id is None:
         logger.warning("apply_proposal called with hold_id=None; cannot apply over HTTP")
@@ -173,6 +494,7 @@ async def apply_proposal(ctx: ProposalContext) -> ProposalApplyOutcome:
             result=None,
             caller_error="cannot apply proposal without a hold_id",
             log_detail="hold_id is None; proposal cannot be applied over HTTP",
+            indeterminate=False,
         )
 
     base_url = _read_env(PROPOSAL_APPLY_URL_ENV_VAR, "PROPOSAL_ACTION_URL").rstrip("/")
@@ -183,6 +505,7 @@ async def apply_proposal(ctx: ProposalContext) -> ProposalApplyOutcome:
             result=None,
             caller_error="server configuration error",
             log_detail=f"{PROPOSAL_APPLY_URL_ENV_VAR} environment variable is not set",
+            indeterminate=False,
         )
     if not base_url.startswith("https://"):
         logger.error("%s must be an https:// URL, got %r", PROPOSAL_APPLY_URL_ENV_VAR, base_url)
@@ -191,6 +514,7 @@ async def apply_proposal(ctx: ProposalContext) -> ProposalApplyOutcome:
             result=None,
             caller_error="server configuration error",
             log_detail=f"{PROPOSAL_APPLY_URL_ENV_VAR} must be an https:// URL, got {base_url!r}",
+            indeterminate=False,
         )
 
     token = _read_env(PROPOSAL_APPLY_TOKEN_ENV_VAR, "PROPOSAL_ACTION_TOKEN")
@@ -201,23 +525,25 @@ async def apply_proposal(ctx: ProposalContext) -> ProposalApplyOutcome:
             result=None,
             caller_error="server configuration error",
             log_detail=f"{PROPOSAL_APPLY_TOKEN_ENV_VAR} environment variable is not set",
+            indeterminate=False,
         )
 
     try:
         timeout_seconds = _read_timeout_seconds()
+        max_attempts = _read_max_attempts()
+        backoff_base = _read_retry_backoff_seconds()
+        retry_budget_seconds = _read_retry_budget_seconds()
+        tls_sni_host = _read_tls_sni_host()
     except ValueError as exc:
         safe_exc = _sanitize_log_field(str(exc))
-        logger.error("invalid proposal apply timeout: %s", safe_exc)
+        logger.error("invalid proposal apply configuration: %s", safe_exc)
         return ProposalApplyOutcome(
             applied=False,
             result=None,
             caller_error="server configuration error",
             log_detail=safe_exc,
+            indeterminate=False,
         )
-
-    tls_sni_host = (
-        _read_env(PROPOSAL_APPLY_TLS_SNI_HOST_ENV_VAR, "PROPOSAL_ACTION_TLS_SNI_HOST") or None
-    )
 
     try:
         client = _build_apply_client(timeout_seconds, tls_sni_host)
@@ -229,6 +555,7 @@ async def apply_proposal(ctx: ProposalContext) -> ProposalApplyOutcome:
             result=None,
             caller_error="server configuration error",
             log_detail=f"failed to build HTTP client: {safe_exc}",
+            indeterminate=False,
         )
 
     url = f"{base_url}{_PROPOSAL_APPLY_PATH}"
@@ -236,6 +563,7 @@ async def apply_proposal(ctx: ProposalContext) -> ProposalApplyOutcome:
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
+    # Built ONCE and reused across all retries to guarantee request-digest determinism
     payload = {
         "kind": ctx.kind,
         "action": ctx.action,
@@ -247,160 +575,115 @@ async def apply_proposal(ctx: ProposalContext) -> ProposalApplyOutcome:
         "hold_id": str(ctx.hold_id),
     }
 
+    start_time = time.monotonic()
+    deadline = start_time + retry_budget_seconds
+    saw_ambiguous = False
+    last_outcome: ProposalApplyOutcome | None = None
+    attempts_made = 0
+
     try:
         async with client:
-            response = await client.post(url, json=payload, headers=headers)
+            for attempt in range(1, max_attempts + 1):
+                attempts_made = attempt
+                now = time.monotonic()
+                remaining_budget = deadline - now
+                if attempt > 1 and remaining_budget < MIN_REMAINING_BUDGET_FOR_RETRY_SECONDS:
+                    logger.warning(
+                        "proposal apply retry budget exhausted (remaining=%.2fs) for hold_id=%s",
+                        remaining_budget,
+                        ctx.hold_id,
+                    )
+                    break
+
+                attempt_timeout = min(timeout_seconds, max(0.1, remaining_budget))
+
+                try:
+                    response = await client.post(
+                        url, json=payload, headers=headers, timeout=attempt_timeout
+                    )
+                    disposition, outcome = _classify_response(response, url, ctx.hold_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    disposition, outcome = _classify_exception(exc, url, ctx.hold_id)
+
+                last_outcome = outcome
+
+                if disposition == _DISPOSITION_DECIDED:
+                    return outcome
+
+                if disposition in (_DISPOSITION_DEFINITE_TERMINAL, _DISPOSITION_DEFINITE_CLEAN):
+                    if not saw_ambiguous:
+                        return outcome
+                    # Critical invariant: once ambiguous, always ambiguous
+                    return ProposalApplyOutcome(
+                        applied=False,
+                        result=None,
+                        caller_error=(
+                            f"apply outcome could not be confirmed after {attempt} attempts; "
+                            "awaiting manual reconciliation"
+                        ),
+                        log_detail=(
+                            f"initial attempt was ambiguous; subsequent attempt failed with: "
+                            f"{outcome.caller_error} ({outcome.log_detail})"
+                        ),
+                        indeterminate=True,
+                    )
+
+                if disposition == _DISPOSITION_AMBIGUOUS:
+                    saw_ambiguous = True
+                    if attempt < max_attempts:
+                        now = time.monotonic()
+                        remaining_budget = deadline - now
+                        if remaining_budget < MIN_REMAINING_BUDGET_FOR_RETRY_SECONDS:
+                            logger.warning(
+                                "proposal apply retry budget exhausted before sleep "
+                                "(remaining=%.2fs) for hold_id=%s",
+                                remaining_budget,
+                                ctx.hold_id,
+                            )
+                            break
+                        base_sleep = min(
+                            backoff_base * (2 ** (attempt - 1)), MAX_BACKOFF_SLEEP_SECONDS
+                        )
+                        jittered_sleep = random.uniform(0.0, base_sleep)
+                        sleep_time = min(
+                            jittered_sleep,
+                            max(0.0, remaining_budget - MIN_REMAINING_BUDGET_FOR_RETRY_SECONDS),
+                        )
+                        logger.info(
+                            "proposal apply attempt %d was ambiguous for hold_id=%s; "
+                            "sleeping %.2fs before retry",
+                            attempt,
+                            ctx.hold_id,
+                            sleep_time,
+                        )
+                        await asyncio.sleep(sleep_time)
+
     except asyncio.CancelledError:
         raise
-    except Exception as exc:
-        safe_exc = _sanitize_log_field(str(exc))
-        logger.warning(
-            "proposal apply proxy unreachable calling %s for hold_id=%s: %s",
-            url,
-            ctx.hold_id,
-            safe_exc,
-        )
-        return ProposalApplyOutcome(
-            applied=False,
-            result=None,
-            caller_error="proposal apply service unreachable",
-            log_detail=f"proposal apply proxy unreachable: {safe_exc}",
-        )
 
-    if response.status_code in (401, 403):
-        logger.warning(
-            "proposal apply proxy rejected our credentials (status %s) calling %s -- check %s",
-            response.status_code,
-            url,
-            PROPOSAL_APPLY_TOKEN_ENV_VAR,
-        )
+    if saw_ambiguous:
         return ProposalApplyOutcome(
             applied=False,
             result=None,
-            caller_error="server configuration error",
-            log_detail=f"proposal apply proxy rejected credentials (status {response.status_code})",
-        )
-
-    if response.status_code == 409:
-        detail = _extract_detail(response)
-        safe_detail = _sanitize_log_field(detail or "conflict")
-        logger.warning(
-            "proposal apply conflict (status 409) calling %s for hold_id=%s: %s",
-            url,
-            ctx.hold_id,
-            safe_detail,
-        )
-        return ProposalApplyOutcome(
-            applied=False,
-            result=None,
-            caller_error=f"proposal apply conflict: {safe_detail}",
-            log_detail=f"proposal apply conflict: {safe_detail}",
-        )
-
-    if response.status_code == 422:
-        detail = _extract_detail(response)
-        safe_detail = _sanitize_log_field(detail or "unprocessable entity")
-        logger.warning(
-            "proposal apply rejected as malformed (status 422) calling %s for hold_id=%s: %s",
-            url,
-            ctx.hold_id,
-            safe_detail,
-        )
-        return ProposalApplyOutcome(
-            applied=False,
-            result=None,
-            caller_error="proposal apply request was rejected as malformed",
-            log_detail=f"proposal apply rejected (422): {safe_detail}",
-        )
-
-    if response.status_code >= 500:
-        logger.warning(
-            "proposal apply proxy returned server error (status %s) calling %s for hold_id=%s",
-            response.status_code,
-            url,
-            ctx.hold_id,
-        )
-        return ProposalApplyOutcome(
-            applied=False,
-            result=None,
-            caller_error="proposal apply service unavailable",
-            log_detail=(
-                f"proposal apply proxy returned server error (status {response.status_code})"
+            caller_error=(
+                f"apply outcome could not be confirmed after {attempts_made} attempts; "
+                "awaiting manual reconciliation"
             ),
+            log_detail=(
+                f"retry loop exhausted after {attempts_made} attempts (saw_ambiguous=True); "
+                f"last error: {last_outcome.caller_error if last_outcome else 'unknown'}"
+            ),
+            indeterminate=True,
         )
 
-    if response.status_code != 200:
-        logger.warning(
-            "proposal apply proxy returned unexpected status %s calling %s for hold_id=%s",
-            response.status_code,
-            url,
-            ctx.hold_id,
-        )
-        return ProposalApplyOutcome(
-            applied=False,
-            result=None,
-            caller_error="proposal apply service returned unexpected status",
-            log_detail=f"proposal apply proxy returned unexpected status {response.status_code}",
-        )
-
-    try:
-        body = response.json()
-    except Exception as exc:
-        safe_exc = _sanitize_log_field(str(exc))
-        logger.warning(
-            "proposal apply proxy returned non-JSON response for hold_id=%s: %s",
-            ctx.hold_id,
-            safe_exc,
-        )
-        return ProposalApplyOutcome(
-            applied=False,
-            result=None,
-            caller_error="proposal apply service returned malformed response",
-            log_detail=f"response body was not valid JSON: {safe_exc}",
-        )
-
-    if not isinstance(body, dict):
-        return ProposalApplyOutcome(
-            applied=False,
-            result=None,
-            caller_error="proposal apply service returned malformed response",
-            log_detail=f"response JSON was not an object: {type(body).__name__}",
-        )
-
-    applied = body.get("applied")
-    if not isinstance(applied, bool):
-        return ProposalApplyOutcome(
-            applied=False,
-            result=None,
-            caller_error="proposal apply service returned malformed response",
-            log_detail=f"response applied field is not a bool: {applied!r}",
-        )
-
-    result = body.get("result")
-    if result is not None and not isinstance(result, dict):
-        return ProposalApplyOutcome(
-            applied=False,
-            result=None,
-            caller_error="proposal apply service returned malformed response",
-            log_detail=f"response result field is not a dict: {type(result).__name__}",
-        )
-
-    caller_error = body.get("caller_error")
-    if caller_error is not None and not isinstance(caller_error, str):
-        caller_error = str(caller_error)
-
-    if applied:
-        return ProposalApplyOutcome(
-            applied=True,
-            result=result,
-            caller_error=None,
-            log_detail=None,
-        )
-    return ProposalApplyOutcome(
+    return last_outcome or ProposalApplyOutcome(
         applied=False,
         result=None,
-        caller_error=caller_error or "apply failed",
-        log_detail=f"proposal apply outcome was applied=false: {caller_error}",
+        caller_error="proposal apply failed",
+        log_detail="retry loop exhausted without attempts",
+        indeterminate=False,
     )
 
 
@@ -463,7 +746,13 @@ def build_rh_proposal_judge() -> HttpApplyProposalJudge:
 
 
 __all__ = [
+    "DEFAULT_MAX_ATTEMPTS",
+    "DEFAULT_RETRY_BACKOFF_SECONDS",
+    "DEFAULT_RETRY_BUDGET_SECONDS",
     "DEFAULT_TIMEOUT_SECONDS",
+    "PROPOSAL_APPLY_MAX_ATTEMPTS_ENV_VAR",
+    "PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS_ENV_VAR",
+    "PROPOSAL_APPLY_RETRY_BUDGET_SECONDS_ENV_VAR",
     "PROPOSAL_APPLY_TIMEOUT_SECONDS_ENV_VAR",
     "PROPOSAL_APPLY_TLS_SNI_HOST_ENV_VAR",
     "PROPOSAL_APPLY_TOKEN_ENV_VAR",
@@ -471,4 +760,5 @@ __all__ = [
     "HttpApplyProposalJudge",
     "apply_proposal",
     "build_rh_proposal_judge",
+    "validate_proposal_apply_configuration",
 ]

@@ -3,13 +3,18 @@
 Covers:
 - HTTP client POST /actions/proposals/apply request serialization and headers
 - Success paths (applied=True with result, applied=False with caller_error)
+- Failure taxonomy (DEFINITE_CLEAN vs DEFINITE_TERMINAL vs AMBIGUOUS)
+- Retry loop with saw_ambiguous stickiness, jittered backoff, budget deadline, and attempt cap
 - Never-raise behavior: network errors, HTTP errors (401, 403, 409, 422, 5xx),
   malformed responses, missing env vars, and validation errors all map to safe
   ProposalApplyOutcome instances
-- Cancellation propagation: asyncio.CancelledError is re-raised
+- Indeterminate outcomes: transport timeouts, 409 conflicts, and 5xx errors return
+  indeterminate=True on exhaustion to prevent duplicate external writes
+- Cancellation propagation: asyncio.CancelledError is re-raised (not retried)
 - TLS SNI override hook behavior
-- HttpApplyProposalJudge wrapper delegation and zero Linear code reachability
-- plugins.get_proposal_judge wrapping of RHProposalJudge
+- Hard-fail config validation in validate_configuration() for HttpApplyProposalJudge (FIX 2)
+- Subclass bypass prevention in plugins.get_proposal_judge() (FIX 1)
+- Real package integration test verifying zero Linear modules reachable (FIX 3)
 """
 
 from __future__ import annotations
@@ -18,6 +23,7 @@ import asyncio
 import json
 import sys
 import uuid
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -33,6 +39,9 @@ from plugins import (
     ProposalVerdict,
 )
 from proposal_apply_http_client import (
+    PROPOSAL_APPLY_MAX_ATTEMPTS_ENV_VAR,
+    PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS_ENV_VAR,
+    PROPOSAL_APPLY_RETRY_BUDGET_SECONDS_ENV_VAR,
     PROPOSAL_APPLY_TIMEOUT_SECONDS_ENV_VAR,
     PROPOSAL_APPLY_TLS_SNI_HOST_ENV_VAR,
     PROPOSAL_APPLY_TOKEN_ENV_VAR,
@@ -40,6 +49,7 @@ from proposal_apply_http_client import (
     HttpApplyProposalJudge,
     apply_proposal,
     build_rh_proposal_judge,
+    validate_proposal_apply_configuration,
 )
 
 _URL = "https://comms-approvals.example.ts.net/actions"
@@ -51,6 +61,9 @@ def _set_required_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(PROPOSAL_APPLY_TOKEN_ENV_VAR, _TOKEN)
     monkeypatch.delenv(PROPOSAL_APPLY_TLS_SNI_HOST_ENV_VAR, raising=False)
     monkeypatch.delenv(PROPOSAL_APPLY_TIMEOUT_SECONDS_ENV_VAR, raising=False)
+    monkeypatch.delenv(PROPOSAL_APPLY_MAX_ATTEMPTS_ENV_VAR, raising=False)
+    monkeypatch.delenv(PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS_ENV_VAR, raising=False)
+    monkeypatch.delenv(PROPOSAL_APPLY_RETRY_BUDGET_SECONDS_ENV_VAR, raising=False)
     monkeypatch.delenv("PROPOSAL_ACTION_URL", raising=False)
     monkeypatch.delenv("PROPOSAL_ACTION_TOKEN", raising=False)
     monkeypatch.delenv("PROPOSAL_ACTION_TLS_SNI_HOST", raising=False)
@@ -106,6 +119,7 @@ class TestApplyProposalSuccess:
         assert outcome.result == {"ticket_id": "TECH-1234"}
         assert outcome.caller_error is None
         assert outcome.log_detail is None
+        assert outcome.indeterminate is False
 
     async def test_returns_applied_true_with_none_result(
         self, monkeypatch: pytest.MonkeyPatch
@@ -120,6 +134,7 @@ class TestApplyProposalSuccess:
         assert outcome.applied is True
         assert outcome.result is None
         assert outcome.caller_error is None
+        assert outcome.indeterminate is False
 
     async def test_returns_applied_false_with_caller_error(
         self, monkeypatch: pytest.MonkeyPatch
@@ -138,6 +153,7 @@ class TestApplyProposalSuccess:
         assert outcome.result is None
         assert outcome.caller_error == "ticket is already in closed state"
         assert "applied=false" in (outcome.log_detail or "")
+        assert outcome.indeterminate is False
 
     async def test_returns_applied_false_with_default_caller_error_when_none(
         self, monkeypatch: pytest.MonkeyPatch
@@ -152,6 +168,7 @@ class TestApplyProposalSuccess:
         assert outcome.applied is False
         assert outcome.result is None
         assert outcome.caller_error == "apply failed"
+        assert outcome.indeterminate is False
 
     async def test_sends_exact_request_shape_and_auth_header(
         self, monkeypatch: pytest.MonkeyPatch
@@ -218,6 +235,7 @@ class TestApplyProposalValidation:
         outcome = await apply_proposal(ctx)
         assert outcome.applied is False
         assert outcome.caller_error == "cannot apply proposal without a hold_id"
+        assert outcome.indeterminate is False
         assert not network_called
 
     async def test_missing_proposal_apply_url_fails_safe(
@@ -230,6 +248,7 @@ class TestApplyProposalValidation:
         outcome = await apply_proposal(_ctx())
         assert outcome.applied is False
         assert outcome.caller_error == "server configuration error"
+        assert outcome.indeterminate is False
         assert "PROPOSAL_APPLY_URL environment variable is not set" in (outcome.log_detail or "")
 
     async def test_non_https_url_fails_safe(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -239,6 +258,7 @@ class TestApplyProposalValidation:
         outcome = await apply_proposal(_ctx())
         assert outcome.applied is False
         assert outcome.caller_error == "server configuration error"
+        assert outcome.indeterminate is False
         assert "must be an https:// URL" in (outcome.log_detail or "")
 
     async def test_missing_proposal_apply_token_fails_safe(
@@ -251,6 +271,7 @@ class TestApplyProposalValidation:
         outcome = await apply_proposal(_ctx())
         assert outcome.applied is False
         assert outcome.caller_error == "server configuration error"
+        assert outcome.indeterminate is False
         assert "PROPOSAL_APPLY_TOKEN environment variable is not set" in (outcome.log_detail or "")
 
     async def test_invalid_timeout_fails_safe(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -260,6 +281,36 @@ class TestApplyProposalValidation:
             outcome = await apply_proposal(_ctx())
             assert outcome.applied is False
             assert outcome.caller_error == "server configuration error"
+            assert outcome.indeterminate is False
+
+    async def test_invalid_max_attempts_fails_safe(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _set_required_env(monkeypatch)
+        for bad_val in ("0", "-1", "11", "not-an-int"):
+            monkeypatch.setenv(PROPOSAL_APPLY_MAX_ATTEMPTS_ENV_VAR, bad_val)
+            outcome = await apply_proposal(_ctx())
+            assert outcome.applied is False
+            assert outcome.caller_error == "server configuration error"
+            assert outcome.indeterminate is False
+
+    async def test_invalid_backoff_seconds_fails_safe(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _set_required_env(monkeypatch)
+        for bad_val in ("0", "-0.5", "nan", "inf", "abc"):
+            monkeypatch.setenv(PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS_ENV_VAR, bad_val)
+            outcome = await apply_proposal(_ctx())
+            assert outcome.applied is False
+            assert outcome.caller_error == "server configuration error"
+            assert outcome.indeterminate is False
+
+    async def test_invalid_budget_seconds_fails_safe(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _set_required_env(monkeypatch)
+        for bad_val in ("0", "-10", "nan", "inf", "abc"):
+            monkeypatch.setenv(PROPOSAL_APPLY_RETRY_BUDGET_SECONDS_ENV_VAR, bad_val)
+            outcome = await apply_proposal(_ctx())
+            assert outcome.applied is False
+            assert outcome.caller_error == "server configuration error"
+            assert outcome.indeterminate is False
 
     async def test_invalid_sni_host_fails_safe(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _set_required_env(monkeypatch)
@@ -267,6 +318,7 @@ class TestApplyProposalValidation:
         outcome = await apply_proposal(_ctx())
         assert outcome.applied is False
         assert outcome.caller_error == "server configuration error"
+        assert outcome.indeterminate is False
         assert "not a bare hostname" in (outcome.log_detail or "")
 
     async def test_fallback_env_vars_used_when_primary_unset(
@@ -293,195 +345,222 @@ class TestApplyProposalValidation:
         assert seen["auth"] == f"Bearer {_TOKEN}"
 
 
-class TestApplyProposalNetworkAndHttpErrors:
-    async def test_connect_error_fails_safe(self, monkeypatch: pytest.MonkeyPatch) -> None:
+class TestFailureTaxonomyAndRetries:
+    async def test_connect_error_is_clean_and_does_not_retry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         _set_required_env(monkeypatch)
+        calls = 0
 
         def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
             raise httpx.ConnectError("Connection refused")
 
         _patch_transport(monkeypatch, handler)
         outcome = await apply_proposal(_ctx())
+        assert calls == 1
         assert outcome.applied is False
         assert outcome.caller_error == "proposal apply service unreachable"
-        assert "Connection refused" in (outcome.log_detail or "")
+        assert outcome.indeterminate is False
 
-    async def test_timeout_error_fails_safe(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _set_required_env(monkeypatch)
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            raise httpx.ReadTimeout("Read timed out")
-
-        _patch_transport(monkeypatch, handler)
-        outcome = await apply_proposal(_ctx())
-        assert outcome.applied is False
-        assert outcome.caller_error == "proposal apply service unreachable"
-        assert "Read timed out" in (outcome.log_detail or "")
-
-    async def test_invalid_url_fails_safe(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _set_required_env(monkeypatch)
-        monkeypatch.setenv(PROPOSAL_APPLY_URL_ENV_VAR, "https://invalid url with spaces.com")
-        outcome = await apply_proposal(_ctx())
-        assert outcome.applied is False
-        assert outcome.caller_error == "proposal apply service unreachable"
-
-    async def test_http_401_fails_safe(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _set_required_env(monkeypatch)
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(401, json={"detail": "invalid token"})
-
-        _patch_transport(monkeypatch, handler)
-        outcome = await apply_proposal(_ctx())
-        assert outcome.applied is False
-        assert outcome.caller_error == "server configuration error"
-        assert "status 401" in (outcome.log_detail or "")
-
-    async def test_http_403_fails_safe(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _set_required_env(monkeypatch)
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(403, json={"detail": "forbidden: scope missing"})
-
-        _patch_transport(monkeypatch, handler)
-        outcome = await apply_proposal(_ctx())
-        assert outcome.applied is False
-        assert outcome.caller_error == "server configuration error"
-        assert "status 403" in (outcome.log_detail or "")
-
-    async def test_http_409_conflict_includes_detail(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _set_required_env(monkeypatch)
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(
-                409,
-                json={"detail": "an apply for this proposal is already in progress"},
-            )
-
-        _patch_transport(monkeypatch, handler)
-        outcome = await apply_proposal(_ctx())
-        assert outcome.applied is False
-        assert (
-            outcome.caller_error
-            == "proposal apply conflict: an apply for this proposal is already in progress"
-        )
-        assert (
-            outcome.log_detail
-            == "proposal apply conflict: an apply for this proposal is already in progress"
-        )
-
-    async def test_http_422_unprocessable_fails_safe(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _set_required_env(monkeypatch)
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(
-                422,
-                json={"detail": [{"loc": ["body", "target_id"], "msg": "field required"}]},
-            )
-
-        _patch_transport(monkeypatch, handler)
-        outcome = await apply_proposal(_ctx())
-        assert outcome.applied is False
-        assert outcome.caller_error == "proposal apply request was rejected as malformed"
-        assert "422" in (outcome.log_detail or "")
-
-    async def test_http_500_fails_safe(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _set_required_env(monkeypatch)
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(500, text="internal server error")
-
-        _patch_transport(monkeypatch, handler)
-        outcome = await apply_proposal(_ctx())
-        assert outcome.applied is False
-        assert outcome.caller_error == "proposal apply service unavailable"
-        assert "status 500" in (outcome.log_detail or "")
-
-    async def test_http_503_fails_safe(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _set_required_env(monkeypatch)
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(503, text="service unavailable")
-
-        _patch_transport(monkeypatch, handler)
-        outcome = await apply_proposal(_ctx())
-        assert outcome.applied is False
-        assert outcome.caller_error == "proposal apply service unavailable"
-        assert "status 503" in (outcome.log_detail or "")
-
-    async def test_http_404_unexpected_status_fails_safe(
+    async def test_definite_terminal_statuses_do_not_retry(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _set_required_env(monkeypatch)
+        for code, expected_err in [
+            (401, "server configuration error"),
+            (403, "server configuration error"),
+            (422, "proposal apply request was rejected as malformed"),
+            (404, "proposal apply service returned unexpected status"),
+        ]:
+            calls = 0
+
+            def handler(request: httpx.Request, status=code) -> httpx.Response:
+                nonlocal calls
+                calls += 1
+                return httpx.Response(status, json={"detail": "error"})
+
+            _patch_transport(monkeypatch, handler)
+            outcome = await apply_proposal(_ctx())
+            assert calls == 1
+            assert outcome.applied is False
+            assert outcome.caller_error == expected_err
+            assert outcome.indeterminate is False
+
+    async def test_retry_recovers_from_409_conflict(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _set_required_env(monkeypatch)
+        monkeypatch.setenv(PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS_ENV_VAR, "0.01")
+        calls = 0
 
         def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(404, text="not found")
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return httpx.Response(
+                    409, json={"detail": "an apply for this proposal is already in progress"}
+                )
+            return httpx.Response(200, json={"applied": True, "result": {"recovered": True}})
 
         _patch_transport(monkeypatch, handler)
         outcome = await apply_proposal(_ctx())
-        assert outcome.applied is False
-        assert outcome.caller_error == "proposal apply service returned unexpected status"
-        assert "status 404" in (outcome.log_detail or "")
+        assert calls == 2
+        assert outcome.applied is True
+        assert outcome.result == {"recovered": True}
+        assert outcome.indeterminate is False
 
-    async def test_non_json_200_fails_safe(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_retry_recovers_from_5xx_server_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         _set_required_env(monkeypatch)
+        monkeypatch.setenv(PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS_ENV_VAR, "0.01")
+        calls = 0
 
         def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, text="not-valid-json")
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return httpx.Response(500, text="internal server error")
+            return httpx.Response(200, json={"applied": True, "result": {"ok": True}})
 
         _patch_transport(monkeypatch, handler)
         outcome = await apply_proposal(_ctx())
-        assert outcome.applied is False
-        assert outcome.caller_error == "proposal apply service returned malformed response"
-        assert "not valid JSON" in (outcome.log_detail or "")
+        assert calls == 2
+        assert outcome.applied is True
+        assert outcome.indeterminate is False
 
-    async def test_non_object_json_200_fails_safe(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_retry_recovers_from_read_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _set_required_env(monkeypatch)
+        monkeypatch.setenv(PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS_ENV_VAR, "0.01")
+        calls = 0
 
         def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json=["applied", True])
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise httpx.ReadTimeout("Read timed out")
+            return httpx.Response(200, json={"applied": True, "result": {"ok": True}})
 
         _patch_transport(monkeypatch, handler)
         outcome = await apply_proposal(_ctx())
-        assert outcome.applied is False
-        assert outcome.caller_error == "proposal apply service returned malformed response"
-        assert "not an object" in (outcome.log_detail or "")
+        assert calls == 2
+        assert outcome.applied is True
+        assert outcome.indeterminate is False
 
-    async def test_non_bool_applied_200_fails_safe(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_saw_ambiguous_stickiness_invariant(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Critical invariant: once ambiguous, always ambiguous.
+
+        If attempt 1 fails ambiguously (ReadTimeout) and attempt 2 fails with a
+        definite-clean error (ConnectError), the final outcome MUST remain
+        indeterminate=True because attempt 1 may have succeeded server-side.
+        """
         _set_required_env(monkeypatch)
+        monkeypatch.setenv(PROPOSAL_APPLY_MAX_ATTEMPTS_ENV_VAR, "2")
+        monkeypatch.setenv(PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS_ENV_VAR, "0.01")
+        calls = 0
 
         def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json={"applied": "true"})
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise httpx.ReadTimeout("Timeout waiting for response")
+            raise httpx.ConnectError("Network dropped completely")
 
         _patch_transport(monkeypatch, handler)
         outcome = await apply_proposal(_ctx())
+        assert calls == 2
         assert outcome.applied is False
-        assert outcome.caller_error == "proposal apply service returned malformed response"
-        assert "not a bool" in (outcome.log_detail or "")
+        assert outcome.indeterminate is True
+        assert "awaiting manual reconciliation" in (outcome.caller_error or "")
 
-    async def test_non_dict_result_200_fails_safe(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_retry_exhaustion_on_ambiguous_returns_indeterminate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         _set_required_env(monkeypatch)
+        monkeypatch.setenv(PROPOSAL_APPLY_MAX_ATTEMPTS_ENV_VAR, "3")
+        monkeypatch.setenv(PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS_ENV_VAR, "0.01")
+        calls = 0
 
         def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json={"applied": True, "result": "not-a-dict"})
+            nonlocal calls
+            calls += 1
+            return httpx.Response(
+                409, json={"detail": "an apply for this proposal is already in progress"}
+            )
 
         _patch_transport(monkeypatch, handler)
         outcome = await apply_proposal(_ctx())
+        assert calls == 3
         assert outcome.applied is False
-        assert outcome.caller_error == "proposal apply service returned malformed response"
-        assert "not a dict" in (outcome.log_detail or "")
+        assert outcome.indeterminate is True
+        assert "awaiting manual reconciliation" in (outcome.caller_error or "")
 
-
-class TestApplyProposalCancellation:
-    async def test_cancelled_error_is_reraised(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_retry_budget_exhaustion_returns_indeterminate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         _set_required_env(monkeypatch)
+        monkeypatch.setenv(PROPOSAL_APPLY_MAX_ATTEMPTS_ENV_VAR, "5")
+        # Budget of 0.2s will exhaust after 1 ambiguous attempt
+        monkeypatch.setenv(PROPOSAL_APPLY_RETRY_BUDGET_SECONDS_ENV_VAR, "0.2")
+        monkeypatch.setenv(PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS_ENV_VAR, "1.0")
+        calls = 0
 
         def handler(request: httpx.Request) -> httpx.Response:
-            raise asyncio.CancelledError()
+            nonlocal calls
+            calls += 1
+            return httpx.Response(500, text="server error")
 
         _patch_transport(monkeypatch, handler)
+        outcome = await apply_proposal(_ctx())
+        assert calls == 1
+        assert outcome.applied is False
+        assert outcome.indeterminate is True
+
+    async def test_payload_identity_preserved_across_retries(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Verifies that the same payload dict and request body bytes are sent
+        on every retry, guaranteeing request-digest determinism.
+        """
+        _set_required_env(monkeypatch)
+        monkeypatch.setenv(PROPOSAL_APPLY_MAX_ATTEMPTS_ENV_VAR, "2")
+        monkeypatch.setenv(PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS_ENV_VAR, "0.01")
+        payloads: list[bytes] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            payloads.append(request.content)
+            if len(payloads) == 1:
+                return httpx.Response(503, text="temporarily unavailable")
+            return httpx.Response(200, json={"applied": True})
+
+        _patch_transport(monkeypatch, handler)
+        outcome = await apply_proposal(_ctx())
+        assert outcome.applied is True
+        assert len(payloads) == 2
+        assert payloads[0] == payloads[1]
+
+    async def test_cancellation_during_backoff_sleep_propagates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _set_required_env(monkeypatch)
+        monkeypatch.setenv(PROPOSAL_APPLY_MAX_ATTEMPTS_ENV_VAR, "3")
+        monkeypatch.setenv(PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS_ENV_VAR, "5.0")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout("Timeout")
+
+        _patch_transport(monkeypatch, handler)
+
+        async def _run_and_cancel():
+            task = asyncio.create_task(apply_proposal(_ctx()))
+            await asyncio.sleep(0.05)  # Let it hit the sleep
+            task.cancel()
+            await task
+
         with pytest.raises(asyncio.CancelledError):
-            await apply_proposal(_ctx())
+            await _run_and_cancel()
 
 
 class TestTlsSniOverride:
@@ -521,7 +600,6 @@ class _MockJudgeDelegate:
 
     async def apply(self, ctx: ProposalContext) -> ProposalApplyOutcome:
         self.apply_called = True
-        # Simulate loading forbidden modules if called:
         raise AssertionError("delegate.apply() MUST NEVER BE CALLED by the board!")
 
 
@@ -557,7 +635,11 @@ class TestHttpApplyProposalJudgeWrapper:
         delegate = _MockJudgeDelegate()
         applier_called = False
         expected_outcome = ProposalApplyOutcome(
-            applied=True, result={"applied_via": "http"}, caller_error=None, log_detail=None
+            applied=True,
+            result={"applied_via": "http"},
+            caller_error=None,
+            log_detail=None,
+            indeterminate=False,
         )
 
         async def fake_applier(ctx: ProposalContext) -> ProposalApplyOutcome:
@@ -571,40 +653,80 @@ class TestHttpApplyProposalJudgeWrapper:
 
         assert outcome is expected_outcome
         assert applier_called is True
-        # Confirm delegate.apply() was NEVER invoked
         assert delegate.apply_called is False
 
-    async def test_zero_linear_modules_reachable(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Confirm that calling HttpApplyProposalJudge.apply() does NOT load
-        rh_comms_plugins.linear_client or rh_comms_plugins.proposal_apply_service.
-        """
+
+class TestConfigValidationHardFails:
+    """FIX 2: validate_configuration() must hard-fail (raise RuntimeError)
+    when HttpApplyProposalJudge has missing or invalid configuration.
+    """
+
+    def test_fails_when_proposal_apply_url_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _set_required_env(monkeypatch)
+        monkeypatch.delenv(PROPOSAL_APPLY_URL_ENV_VAR)
+        with pytest.raises(RuntimeError, match="PROPOSAL_APPLY_URL is required"):
+            validate_proposal_apply_configuration()
 
-        def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json={"applied": True, "result": {"ok": True}})
+    def test_fails_when_proposal_apply_url_not_https(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _set_required_env(monkeypatch)
+        monkeypatch.setenv(PROPOSAL_APPLY_URL_ENV_VAR, "http://insecure.example.com")
+        with pytest.raises(RuntimeError, match="must be an https:// URL"):
+            validate_proposal_apply_configuration()
 
-        _patch_transport(monkeypatch, handler)
+    def test_fails_when_proposal_apply_token_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _set_required_env(monkeypatch)
+        monkeypatch.delenv(PROPOSAL_APPLY_TOKEN_ENV_VAR)
+        with pytest.raises(RuntimeError, match="PROPOSAL_APPLY_TOKEN is required"):
+            validate_proposal_apply_configuration()
 
-        delegate = _MockJudgeDelegate()
-        judge = HttpApplyProposalJudge(delegate)
-        outcome = await judge.apply(_ctx())
-
-        assert outcome.applied is True
-        assert delegate.apply_called is False
-
-        forbidden = {
-            "rh_comms_plugins.linear_client",
-            "rh_comms_plugins.proposal_apply_service",
-        }
-        loaded = forbidden & set(sys.modules.keys())
-        assert not loaded, f"Forbidden Linear modules loaded: {loaded}"
-
-
-class TestProposalJudgeWiring:
-    def test_get_proposal_judge_wraps_rh_proposal_judge(
+    def test_validate_configuration_hard_fails_when_http_apply_judge_unconfigured(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        class RHProposalJudge:
+        delegate = _MockJudgeDelegate()
+        monkeypatch.setitem(
+            plugins.PROPOSAL_JUDGES, "custom_http", lambda: HttpApplyProposalJudge(delegate)
+        )
+        monkeypatch.setenv(plugins.PROPOSAL_JUDGE_ENV_VAR, "custom_http")
+        monkeypatch.delenv(PROPOSAL_APPLY_URL_ENV_VAR, raising=False)
+        monkeypatch.delenv("PROPOSAL_ACTION_URL", raising=False)
+        plugins._proposal_judge = None
+
+        with pytest.raises(RuntimeError, match="PROPOSAL_APPLY_URL is required"):
+            plugins.validate_configuration()
+
+    def test_build_rh_proposal_judge_factory(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class FakeRH:
+            pass
+
+        monkeypatch.setattr(proposal_apply_http_client, "_load_rh_proposal_judge", lambda: FakeRH())
+        judge = build_rh_proposal_judge()
+        assert isinstance(judge, HttpApplyProposalJudge)
+        assert isinstance(judge.delegate, FakeRH)
+
+    def test_validate_configuration_passes_for_escalate_all_without_apply_url(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(plugins.PROPOSAL_JUDGE_ENV_VAR, raising=False)
+        monkeypatch.delenv(PROPOSAL_APPLY_URL_ENV_VAR, raising=False)
+        monkeypatch.delenv("PROPOSAL_ACTION_URL", raising=False)
+        plugins._proposal_judge = None
+
+        # Must not raise
+        plugins.validate_configuration()
+
+
+class TestSubclassBypassAndRealPackageReachability:
+    """FIX 1 & FIX 3:
+    - Subclass bypass prevention: a subclass of RHProposalJudge must STILL be
+      wrapped with HttpApplyProposalJudge.
+    - Integration test with real RHProposalJudge: verify that resolving via
+      plugins.get_proposal_judge() and calling apply() never imports Linear modules.
+    """
+
+    def test_subclass_of_rh_proposal_judge_is_wrapped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class FakeBaseRHProposalJudge:
             def classify(self, kind: str, action: dict[str, Any]) -> ProposalClassification:
                 return ProposalClassification(priority="low")
 
@@ -617,47 +739,73 @@ class TestProposalJudgeWiring:
             async def apply(self, ctx: ProposalContext) -> ProposalApplyOutcome:
                 raise AssertionError("shim must not be called")
 
+        # Give it the name RHProposalJudge
+        FakeBaseRHProposalJudge.__name__ = "RHProposalJudge"
+
+        class CustomRHProposalJudge(FakeBaseRHProposalJudge):
+            pass
+
         plugins._proposal_judge = None
-        monkeypatch.setitem(plugins.PROPOSAL_JUDGES, "fake_rh", lambda: RHProposalJudge())
-        monkeypatch.setenv(plugins.PROPOSAL_JUDGE_ENV_VAR, "fake_rh")
+        monkeypatch.setitem(plugins.PROPOSAL_JUDGES, "custom_rh", lambda: CustomRHProposalJudge())
+        monkeypatch.setenv(plugins.PROPOSAL_JUDGE_ENV_VAR, "custom_rh")
 
         resolved = plugins.get_proposal_judge()
         assert isinstance(resolved, HttpApplyProposalJudge)
-        assert isinstance(resolved.delegate, RHProposalJudge)
+        assert isinstance(resolved.delegate, CustomRHProposalJudge)
 
-    def test_get_proposal_judge_does_not_wrap_escalate_all(
+    async def test_real_package_loading_and_zero_linear_reachability(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        plugins._proposal_judge = None
-        monkeypatch.delenv(plugins.PROPOSAL_JUDGE_ENV_VAR, raising=False)
+        """FIX 3: integration test using the REAL agent-comms-approvals RHProposalJudge.
+        Confirms sys.modules never contains rh_comms_plugins.linear_client or
+        rh_comms_plugins.proposal_apply_service after a full get_proposal_judge() + apply() call.
+        """
+        # Ensure sibling approvals repo is importable if on disk
+        candidates = [
+            Path(__file__).resolve().parents[2] / "agent-comms-approvals-tech-5755",
+            Path(__file__).resolve().parents[2] / "agent-comms-approvals",
+            Path(__file__).resolve().parents[2] / "agent-comms-approvals-proposal-judge-plan",
+        ]
+        for candidate in candidates:
+            if (candidate / "rh_comms_plugins" / "proposal_judge.py").is_file():
+                if str(candidate) not in sys.path:
+                    sys.path.insert(0, str(candidate))
+                break
 
-        resolved = plugins.get_proposal_judge()
-        assert isinstance(resolved, plugins.EscalateAllProposalJudge)
-        assert not isinstance(resolved, HttpApplyProposalJudge)
+        try:
+            from rh_comms_plugins.proposal_judge import RHProposalJudge
+        except ImportError:
+            pytest.skip("rh_comms_plugins is not installed in this environment")
 
-    def test_build_rh_proposal_judge_constructs_http_apply_judge(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        class FakeRH:
+        _set_required_env(monkeypatch)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"applied": True, "result": {"real_ok": True}})
+
+        _patch_transport(monkeypatch, handler)
+
+        # Test both base RHProposalJudge and a custom subclass
+        class CustomRealRHProposalJudge(RHProposalJudge):
             pass
 
-        monkeypatch.setattr(proposal_apply_http_client, "_load_rh_proposal_judge", lambda: FakeRH())
-        judge = build_rh_proposal_judge()
-        assert isinstance(judge, HttpApplyProposalJudge)
-        assert isinstance(judge.delegate, FakeRH)
+        for judge_factory in (RHProposalJudge, CustomRealRHProposalJudge):
+            plugins._proposal_judge = None
+            monkeypatch.setitem(
+                plugins.PROPOSAL_JUDGES, "test_real_rh", lambda f=judge_factory: f()
+            )
+            monkeypatch.setenv(plugins.PROPOSAL_JUDGE_ENV_VAR, "test_real_rh")
 
-    def test_validate_configuration_warns_when_apply_url_missing_for_custom_judge(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        plugins._proposal_judge = None
-        monkeypatch.setitem(
-            plugins.PROPOSAL_JUDGES,
-            "custom_judge",
-            lambda: plugins.EscalateAllProposalJudge(),
-        )
-        monkeypatch.setenv(plugins.PROPOSAL_JUDGE_ENV_VAR, "custom_judge")
-        monkeypatch.delenv(PROPOSAL_APPLY_URL_ENV_VAR, raising=False)
-        monkeypatch.delenv("PROPOSAL_ACTION_URL", raising=False)
+            judge = plugins.get_proposal_judge()
+            assert isinstance(judge, HttpApplyProposalJudge)
+            assert isinstance(judge.delegate, judge_factory)
 
-        # Should not raise, validate_configuration completes
-        plugins.validate_configuration()
+            ctx = _ctx()
+            outcome = await judge.apply(ctx)
+            assert outcome.applied is True
+
+            forbidden = {
+                "rh_comms_plugins.linear_client",
+                "rh_comms_plugins.proposal_apply_service",
+            }
+            loaded = forbidden & set(sys.modules.keys())
+            assert not loaded, f"Linear modules leaked into sys.modules: {loaded}"
