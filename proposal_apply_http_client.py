@@ -682,8 +682,7 @@ async def apply_proposal(ctx: ProposalContext) -> ProposalApplyOutcome:
             applied=False,
             result=None,
             caller_error=(
-                "apply outcome could not be confirmed; retry budget expired before request "
-                "could be made"
+                "apply was not attempted; retry budget expired before any request was sent"
             ),
             log_detail="retry budget expired before attempt could be started",
             indeterminate=False,

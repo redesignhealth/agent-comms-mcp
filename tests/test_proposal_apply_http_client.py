@@ -583,7 +583,8 @@ class TestFailureTaxonomyAndRetries:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Verifies that zero HTTP requests are started when the budget is already expired,
-        and an indeterminate outcome is returned."""
+        and a definite (non-indeterminate) outcome is returned because no request was sent.
+        """
         _set_required_env(monkeypatch)
         calls = 0
 
@@ -601,7 +602,7 @@ class TestFailureTaxonomyAndRetries:
         assert calls == 0
         assert outcome.applied is False
         assert outcome.indeterminate is False
-        assert "retry budget expired before request could be made" in (outcome.caller_error or "")
+        assert "retry budget expired before any request was sent" in (outcome.caller_error or "")
 
 
 class TestTlsSniOverride:

@@ -7520,7 +7520,7 @@ def _normalize_outcome(
     caller_error: str | None = None,
     result: dict[str, Any] | None = None,
     log_detail: str | None = None,
-    hold_id: Any = None,
+    hold_id: uuid.UUID | None = None,
 ) -> ProposalApplyOutcome:
     """Single construction choke-point for ProposalApplyOutcome inside _safe_apply.
 
@@ -7528,7 +7528,8 @@ def _normalize_outcome(
     - If applied is True and indeterminate is True (illegal contract violation),
       it is normalized to applied=False, indeterminate=True.
     - If applied is True, caller_error is cleared to None.
-    - If applied is False and caller_error is empty/None, a safe generic error is assigned.
+    - If applied is False and caller_error is empty/None, a safe generic error is assigned
+      and a warning naming ``hold_id`` is logged.
     - Any caller_error on applied=False is scrubbed and truncated.
     - indeterminate is strictly propagated as a boolean.
     """
@@ -7931,7 +7932,7 @@ async def _apply_or_finalize_proposal_hold(
                 raise cancelled_exc
             return _proposal_dict(hold)
         except asyncio.CancelledError as cancel_err:
-            with contextlib.suppress(BaseException):
+            with contextlib.suppress(Exception, asyncio.CancelledError):
                 await session.rollback()
             raise cancel_err
         except Exception as commit_exc:
@@ -7960,7 +7961,7 @@ async def _apply_or_finalize_proposal_hold(
                 )
                 await session.commit()
             except asyncio.CancelledError as cancel_err:
-                with contextlib.suppress(BaseException):
+                with contextlib.suppress(Exception, asyncio.CancelledError):
                     await session.rollback()
                 raise cancel_err from commit_exc
             except Exception:

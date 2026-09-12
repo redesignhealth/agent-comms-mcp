@@ -9,6 +9,7 @@ board's defensive wrappers around every plugin call (
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
@@ -559,8 +560,11 @@ class TestSafeApplySeam:
         assert result.indeterminate is True
         assert result.caller_error == "timeout after 3 attempts"
 
-    async def test_apply_indeterminate_flag_preserved_when_caller_error_missing(self) -> None:
+    async def test_apply_indeterminate_flag_preserved_when_caller_error_missing(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
         """BLOCKING #1: missing/empty caller_error must still propagate indeterminate=True."""
+        ctx = _ctx()
         judge = FakeProposalJudge(
             apply_result=ProposalApplyOutcome(
                 applied=False,
@@ -570,10 +574,35 @@ class TestSafeApplySeam:
                 indeterminate=True,
             )
         )
-        result = await _safe_apply(judge, _ctx())
+        with caplog.at_level(logging.WARNING, logger="service"):
+            result = await _safe_apply(judge, ctx)
         assert result.applied is False
         assert result.indeterminate is True
         assert result.caller_error == "unable to apply this proposal"
+        assert f"applied=False with no caller_error for hold {ctx.hold_id}" in caplog.text
+
+    async def test_apply_empty_caller_error_logs_warning_and_uses_generic_message(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Item 7: applied=False with empty caller_error logs warning and assigns
+        generic message.
+        """
+        ctx = _ctx()
+        judge = FakeProposalJudge(
+            apply_result=ProposalApplyOutcome(
+                applied=False,
+                result=None,
+                caller_error="   ",
+                log_detail=None,
+                indeterminate=False,
+            )
+        )
+        with caplog.at_level(logging.WARNING, logger="service"):
+            result = await _safe_apply(judge, ctx)
+        assert result.applied is False
+        assert result.indeterminate is False
+        assert result.caller_error == "unable to apply this proposal"
+        assert f"applied=False with no caller_error for hold {ctx.hold_id}" in caplog.text
 
     async def test_apply_indeterminate_flag_preserved_when_caller_error_truncated(self) -> None:
         """BLOCKING #1: truncated caller_error must still propagate indeterminate=True."""
