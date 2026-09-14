@@ -1943,11 +1943,14 @@ nominal `isinstance` checks against `plugins.py` classes:
 
 This is a DELIBERATE deviation from nominal typing, introduced specifically so external plugin
 packages like `agent-comms-approvals` (providing `rh_comms_plugins.proposal_judge`) do not need a
-hard package dependency on this repo's `plugins.py` classes. Conversely, `apply(ctx) -> ProposalApplyOutcome`
+hard package dependency on this repo's `plugins.py` classes. The structural validators are tested
+against locally-defined stand-ins; a contract test against the real `rh_comms_plugins` types is
+deferred to TECH-6271 pending an importskip-gated integration test or an optional dev dependency on
+`rh_comms_plugins`. Conversely, `apply(ctx) -> ProposalApplyOutcome`
 remains deliberately nominally typed (still performs an explicit `isinstance` check on
 `ProposalApplyOutcome`): this asymmetry is safe today because `plugins.get_proposal_judge()` wraps
 every currently-registered RH judge in `HttpApplyProposalJudge`, which constructs the board's native
-`ProposalApplyOutcome` directly — an invariant that would break if a future judge were registered
+`ProposalApplyOutcome` directly -- an invariant that would break if a future judge were registered
 unwrapped. For Redesign Health, the concrete implementation
 (Linear/GitHub-backed deterministic rules) lives in `agent-comms-approvals`'
 `rh_comms_plugins.proposal_judge` -- see "The proposal submission pipeline" below.

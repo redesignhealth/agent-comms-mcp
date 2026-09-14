@@ -6169,7 +6169,7 @@ def _classify_proposal(judge: ProposalJudge, kind: str, action: dict[str, Any]) 
     return priority
 
 
-_MISSING: Any = object()  # distinguishes "attribute absent" from a legitimate None
+_MISSING: object = object()  # distinguishes "attribute absent" from a legitimate None
 
 _FINGERPRINT_CONTRACT_VIOLATION_DETAIL = "unable to verify target status"
 _ALLOWED_PROPOSAL_TARGET_ERROR_STATUS_CODES: frozenset[int] = frozenset({422, 500, 503})
@@ -6285,13 +6285,13 @@ async def _safe_fingerprint(judge: ProposalJudge, ctx: ProposalContext) -> Propo
         result: Any = await judge.fingerprint(ctx)
         status = getattr(result, "status", None)
         digest = getattr(result, "digest", None)
-        error = getattr(result, "error", None)
 
-        if status == FINGERPRINT_DIGEST and isinstance(digest, str):
+        if isinstance(status, str) and status == FINGERPRINT_DIGEST and isinstance(digest, str):
             return ProposalFingerprint(status=FINGERPRINT_DIGEST, digest=digest)
-        if status == FINGERPRINT_NO_TARGET:
+        elif isinstance(status, str) and status == FINGERPRINT_NO_TARGET:
             return ProposalFingerprint(status=FINGERPRINT_NO_TARGET)
-        if status == FINGERPRINT_UNAVAILABLE:
+        elif isinstance(status, str) and status == FINGERPRINT_UNAVAILABLE:
+            error = getattr(result, "error", None)
             validated_err = _is_well_formed_target_error(error)
             if validated_err is not None:
                 scrubbed = (
@@ -7632,7 +7632,7 @@ async def _safe_apply(judge: ProposalJudge, ctx: ProposalContext) -> ProposalApp
         outcome = await judge.apply(ctx)
         # Note: Safe today because get_proposal_judge() (see plugins.py) wraps every
         # currently-registered RH judge in HttpApplyProposalJudge, which constructs
-        # ProposalApplyOutcome directly — this invariant would break if a future judge
+        # ProposalApplyOutcome directly -- this invariant would break if a future judge
         # were registered unwrapped (see TECH-6247, which tracks removing the unused
         # apply() shim entirely, closing this gap).
         if not isinstance(outcome, ProposalApplyOutcome):

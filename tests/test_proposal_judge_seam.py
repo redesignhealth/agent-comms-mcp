@@ -1147,6 +1147,67 @@ class TestForeignStructuralStandinsFingerprint:
         assert result.error.error_code == "server_configuration_error"
         assert result.error.detail == "unable to verify target status"
 
+    async def test_rejects_non_str_status_spoofing_equality_with_valid_status(self) -> None:
+        """A non-str status whose __eq__ returns True when compared to a
+        valid FINGERPRINT_* constant must be rejected by the
+        isinstance(status, str) check -- it must fall through to the
+        generic FINGERPRINT_UNAVAILABLE fail-closed path, not be accepted as
+        FINGERPRINT_NO_TARGET."""
+
+        class _SpoofedNoTargetStatus:
+            def __eq__(self, other: object) -> bool:
+                return other == FINGERPRINT_NO_TARGET
+
+            def __hash__(self) -> int:
+                return hash(FINGERPRINT_NO_TARGET)
+
+        judge = FakeProposalJudge(
+            fingerprint_result=_ForeignFingerprint(status=_SpoofedNoTargetStatus())
+        )
+        result = await _safe_fingerprint(judge, _ctx())
+        assert type(result) is ProposalFingerprint
+        assert result.status == FINGERPRINT_UNAVAILABLE
+        assert type(result.error) is ProposalTargetError
+        assert result.error.status_code == 500
+        assert result.error.error_code == "server_configuration_error"
+        assert result.error.detail == "unable to verify target status"
+
+    async def test_foreign_fingerprint_digest_with_exploding_error_property_succeeds(self) -> None:
+        """A foreign fingerprint with status=FINGERPRINT_DIGEST and a valid digest
+        whose .error property raises must succeed, because .error is only read when
+        status == FINGERPRINT_UNAVAILABLE."""
+
+        class _ExplodingErrorFingerprint:
+            status = FINGERPRINT_DIGEST
+            digest = "sha256:123"
+
+            @property
+            def error(self) -> Any:
+                raise RuntimeError("exploding error property")
+
+        judge = FakeProposalJudge(fingerprint_result=_ExplodingErrorFingerprint())
+        result = await _safe_fingerprint(judge, _ctx())
+        assert type(result) is ProposalFingerprint
+        assert result.status == FINGERPRINT_DIGEST
+        assert result.digest == "sha256:123"
+
+    async def test_foreign_fingerprint_no_target_exploding_error_succeeds(self) -> None:
+        """A foreign fingerprint with status=FINGERPRINT_NO_TARGET whose .error
+        property raises must succeed, because .error is only read when
+        status == FINGERPRINT_UNAVAILABLE."""
+
+        class _ExplodingErrorNoTargetFingerprint:
+            status = FINGERPRINT_NO_TARGET
+
+            @property
+            def error(self) -> Any:
+                raise RuntimeError("exploding error property")
+
+        judge = FakeProposalJudge(fingerprint_result=_ExplodingErrorNoTargetFingerprint())
+        result = await _safe_fingerprint(judge, _ctx())
+        assert type(result) is ProposalFingerprint
+        assert result.status == FINGERPRINT_NO_TARGET
+
 
 @pytest.mark.usefixtures("_migrated_schema")
 class TestForeignStructuralStandinsVerdict:
@@ -1211,7 +1272,7 @@ class TestForeignStructuralStandinsVerdict:
 
     async def test_pending_verdict_note_is_dropped(self, session: AsyncSession) -> None:
         # A legitimately pending judge verdict has decision_note=None by convention
-        # (see service.py ~line 6962); unlike judge error notes, any plugin-supplied
+        # (see service.py ~line 7015); unlike judge error notes, any plugin-supplied
         # note on a pending verdict is intentionally dropped and not persisted.
         judge = FakeProposalJudge(
             judge_result=_ForeignVerdict(
