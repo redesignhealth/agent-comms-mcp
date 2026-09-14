@@ -1933,9 +1933,10 @@ nominal `isinstance` checks against `plugins.py` classes:
    is unavailable); the board always reconstructs its own native `ProposalFingerprint` instance.
 3. Target errors in unavailable fingerprints (`_is_well_formed_target_error`): reads and
    snapshots `status_code` (int in `{422, 500, 503}`), `error_code` (non-empty str <= 64 chars),
-   `detail` (non-empty str, scrubbed and truncated to 500 chars), and optional `log_detail` (None
-   or str) in a single pass to eliminate TOCTOU risks, and reconstructs the board's own
-   `ProposalTargetError`.
+   `detail` (non-empty str), and optional `log_detail` (None or str) in a single pass to eliminate
+   TOCTOU risks, and reconstructs the board's own `ProposalTargetError`. Scrubbing and truncation
+   of `detail` to 500 chars happen afterward, in the caller (`_safe_fingerprint`), not in this
+   validator.
 4. `judge(ctx)`: reads `approved` (strictly `bool`, rejecting truthy non-booleans) and
    `decision_note` (None or str <= 2000 chars, truncated). An object missing either attribute
    fails closed as a judge error.

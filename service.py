@@ -167,7 +167,7 @@ import uuid
 from collections.abc import Callable, Sequence
 from collections.abc import Set as AbstractSet
 from datetime import UTC, datetime, timedelta
-from typing import Any, NamedTuple, NoReturn, Protocol, cast
+from typing import Any, NamedTuple, NoReturn, Protocol
 
 from sqlalchemy import ColumnElement, and_, func, literal, not_, or_, select, text, tuple_
 from sqlalchemy.exc import IntegrityError
@@ -6143,10 +6143,19 @@ def _classify_proposal(judge: ProposalJudge, kind: str, action: dict[str, Any]) 
 
     try:
         priority = getattr(classification, "priority", None)
+        # The isinstance check MUST run before the membership test below: a
+        # non-str priority that happens to compare equal to one of the
+        # PROPOSAL_HOLD_LEVELS strings (e.g. via a pathological __eq__) would
+        # otherwise pass `in` and be forwarded downstream as a non-str value --
+        # cast() has no runtime effect and does not guard against this.
+        if not isinstance(priority, str):
+            raise ValueError(f"priority is not a str: {priority!r}")
+        if priority not in PROPOSAL_HOLD_LEVELS:
+            raise ValueError(f"priority {priority!r} is not one of {sorted(PROPOSAL_HOLD_LEVELS)}")
     except Exception as exc:
         logger.warning(
             "proposal judge classify() returned an unusable result (%r) for kind=%r; "
-            "reading priority raised %s: %s; rejecting submission",
+            "validating priority raised %s: %s; rejecting submission",
             classification,
             kind,
             type(exc).__name__,
@@ -6157,21 +6166,7 @@ def _classify_proposal(judge: ProposalJudge, kind: str, action: dict[str, Any]) 
             f"proposal judge returned invalid priority for kind {kind!r}; "
             f"must be one of {sorted(PROPOSAL_HOLD_LEVELS)}"
         ) from exc
-
-    if priority not in PROPOSAL_HOLD_LEVELS:
-        logger.warning(
-            "proposal judge classify() returned an unusable result (%r) for kind=%r; "
-            "priority=%r is not one of %s; rejecting submission",
-            classification,
-            kind,
-            priority,
-            sorted(PROPOSAL_HOLD_LEVELS),
-        )
-        raise ValueError(
-            f"proposal judge returned invalid priority {priority!r} for kind {kind!r}; "
-            f"must be one of {sorted(PROPOSAL_HOLD_LEVELS)}"
-        )
-    return cast(str, priority)
+    return priority
 
 
 _MISSING: Any = object()  # distinguishes "attribute absent" from a legitimate None
@@ -7638,7 +7633,8 @@ async def _safe_apply(judge: ProposalJudge, ctx: ProposalContext) -> ProposalApp
         # Note: Safe today because get_proposal_judge() (see plugins.py) wraps every
         # currently-registered RH judge in HttpApplyProposalJudge, which constructs
         # ProposalApplyOutcome directly — this invariant would break if a future judge
-        # were registered unwrapped.
+        # were registered unwrapped (see TECH-6247, which tracks removing the unused
+        # apply() shim entirely, closing this gap).
         if not isinstance(outcome, ProposalApplyOutcome):
             logger.warning(
                 "proposal judge apply() returned a malformed result (%r) for hold %s "

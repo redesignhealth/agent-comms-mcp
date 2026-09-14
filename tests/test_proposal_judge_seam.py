@@ -33,6 +33,7 @@ from plugins import (
     ProposalVerdict,
 )
 from service import (
+    MAX_DECISION_REASON_LENGTH,
     PROPOSAL_HOLD_LEVELS,
     _classify_proposal,
     _is_well_formed_target_error,
@@ -826,6 +827,12 @@ class TestJudgeApplyIntegrationSeam:
 # ---------------------------------------------------------------------------
 # Foreign structural stand-ins regression tests (cross-repo duck-typing)
 # ---------------------------------------------------------------------------
+#
+# The _Foreign*/_VerdictOnly* classes below are hand-maintained approximations
+# of the real structural types returned by external plugin packages (e.g.
+# agent-comms-approvals' rh_comms_plugins.proposal_judge) -- they are NOT
+# imported from that package, so they can silently drift from its actual
+# shape over time. See TECH-6271, which tracks this specific gap.
 
 
 class _ForeignClassification(NamedTuple):
@@ -899,6 +906,48 @@ class TestForeignStructuralStandinsClassify:
         with pytest.raises(ValueError, match="invalid priority") as exc_info:
             _classify_proposal(judge, "linear_progress_update", {})
         assert "unsupported proposal kind" not in str(exc_info.value)
+
+    def test_rejects_priority_whose_membership_test_raises(self) -> None:
+        """A priority value that passes the isinstance(str) check but whose
+        __eq__/__hash__ raises during the `priority not in
+        PROPOSAL_HOLD_LEVELS` membership test must be caught and mapped to
+        the same "invalid priority" ValueError -> 422 path, not escape as an
+        uncaught exception (BLOCKING: the membership test must live inside
+        the same try/except as the getattr call). Must subclass `str` so the
+        isinstance guard doesn't short-circuit before the membership test
+        ever runs."""
+
+        class _ExplodingEqPriority(str):
+            def __eq__(self, other: object) -> bool:
+                raise RuntimeError("__eq__ explosion")
+
+            def __hash__(self) -> int:
+                raise RuntimeError("__hash__ explosion")
+
+        judge = FakeProposalJudge(
+            classify_result=_ForeignClassification(priority=_ExplodingEqPriority("junk"))
+        )
+        with pytest.raises(ValueError, match="invalid priority"):
+            _classify_proposal(judge, "linear_progress_update", {})
+
+    def test_rejects_non_str_priority_spoofing_equality_with_valid_level(self) -> None:
+        """A non-str priority whose __eq__ returns True when compared to a
+        valid PROPOSAL_HOLD_LEVELS string must be rejected by the
+        isinstance(priority, str) check -- it must never be accepted as if it
+        were that string, since cast() alone has no runtime effect."""
+
+        class _SpoofedHighPriority:
+            def __eq__(self, other: object) -> bool:
+                return other == "high"
+
+            def __hash__(self) -> int:
+                return hash("high")
+
+        judge = FakeProposalJudge(
+            classify_result=_ForeignClassification(priority=_SpoofedHighPriority())
+        )
+        with pytest.raises(ValueError, match="invalid priority"):
+            _classify_proposal(judge, "linear_progress_update", {})
 
 
 class TestForeignStructuralStandinsTargetError:
@@ -1298,6 +1347,7 @@ class TestForeignStructuralStandinsVerdict:
             result["decision_note"]
             == "judge error: verdict missing approved/decision_note, got _VerdictOnlyApproved"
         )
+        assert judge.apply_calls == []
 
     async def test_rejects_verdict_missing_approved(self, session: AsyncSession) -> None:
         judge = FakeProposalJudge(judge_result=_VerdictOnlyDecisionNote(decision_note="looks good"))
@@ -1319,3 +1369,116 @@ class TestForeignStructuralStandinsVerdict:
             result["decision_note"]
             == "judge error: verdict missing approved/decision_note, got _VerdictOnlyDecisionNote"
         )
+        assert judge.apply_calls == []
+
+    async def test_foreign_verdict_raising_approved_property_fails_closed(
+        self, session: AsyncSession
+    ) -> None:
+        """A foreign verdict whose `approved` property raises a non-AttributeError
+        exception fails closed to the same pending/judge-error path as any other
+        judge.judge() exception (see the outer `except Exception` in
+        service.create_proposal)."""
+
+        class _ExplodingApproved:
+            @property
+            def approved(self) -> Any:
+                raise RuntimeError("exploding approved")
+
+            decision_note = None
+
+        judge = FakeProposalJudge(judge_result=_ExplodingApproved())
+        result = await create_proposal(
+            session,
+            kind="linear_progress_update",
+            proposed_by_bot_id="bot-1",
+            owner_sub="owner-a@example.com",
+            action={"target_id": "TECH-1", "action_type": "close_ticket"},
+            rationale="test",
+            confidence="medium",
+            importance="medium",
+            impact="medium",
+            judge=judge,
+            target_fingerprint="deadbeef",
+        )
+        assert result["status"] == "pending"
+        assert result["decision_note"] == "judge error: RuntimeError"
+        assert judge.apply_calls == []
+
+    async def test_foreign_verdict_with_overlong_decision_note_is_truncated(
+        self, session: AsyncSession
+    ) -> None:
+        """Truncation applies identically to a foreign verdict's decision_note
+        as it does to the native ProposalVerdict path (see
+        test_proposal_service.test_overlong_decision_note_is_truncated)."""
+        overlong_note = "n" * 2500
+        judge = FakeProposalJudge(
+            judge_result=_ForeignVerdict(approved=True, decision_note=overlong_note),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result={"ok": True}, caller_error=None, log_detail=None
+            ),
+        )
+        result = await create_proposal(
+            session,
+            kind="linear_progress_update",
+            proposed_by_bot_id="bot-1",
+            owner_sub="owner-a@example.com",
+            action={"target_id": "TECH-1", "action_type": "close_ticket"},
+            rationale="test",
+            confidence="medium",
+            importance="medium",
+            impact="medium",
+            judge=judge,
+            target_fingerprint="deadbeef",
+        )
+        assert result["status"] == "applied"
+        assert len(result["decision_note"]) == MAX_DECISION_REASON_LENGTH
+        assert result["decision_note"].endswith("... [truncated]")
+        assert result["decision_note"].startswith("n" * 100)
+
+    async def test_foreign_verdict_approved_and_decision_note_read_exactly_once(
+        self, session: AsyncSession
+    ) -> None:
+        """TOCTOU guard: `approved`/`decision_note` must each be read from the
+        foreign verdict object exactly once -- the same value used for
+        validation must be the value that ends up persisted/returned, not a
+        second, possibly-different read."""
+
+        class _FlakyVerdict:
+            def __init__(self) -> None:
+                self.approved_reads = 0
+                self.decision_note_reads = 0
+
+            @property
+            def approved(self) -> Any:
+                self.approved_reads += 1
+                return True
+
+            @property
+            def decision_note(self) -> Any:
+                self.decision_note_reads += 1
+                return "first read" if self.decision_note_reads == 1 else "second read"
+
+        verdict = _FlakyVerdict()
+        judge = FakeProposalJudge(
+            judge_result=verdict,
+            apply_result=ProposalApplyOutcome(
+                applied=True, result={"ok": True}, caller_error=None, log_detail=None
+            ),
+        )
+        result = await create_proposal(
+            session,
+            kind="linear_progress_update",
+            proposed_by_bot_id="bot-1",
+            owner_sub="owner-a@example.com",
+            action={"target_id": "TECH-1", "action_type": "close_ticket"},
+            rationale="test",
+            confidence="medium",
+            importance="medium",
+            impact="medium",
+            judge=judge,
+            target_fingerprint="deadbeef",
+        )
+        assert verdict.approved_reads == 1
+        assert verdict.decision_note_reads == 1
+        assert result["status"] == "applied"
+        assert result["decision_note"] == "first read"
