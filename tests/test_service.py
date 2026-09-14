@@ -10242,6 +10242,266 @@ class TestListConversations:
         assert len(matches) == 1
         assert matches[0]["name"] == "List-conversations name"
 
+    async def test_filter_by_name_whitespace_padded(self, session: AsyncSession) -> None:
+        """TECH-6268: search term with leading/trailing whitespace matches stored name."""
+        creator = await _register(session, "listconv-name-pad-c")
+        target = await _register(session, "listconv-name-pad-t")
+        conv = await start_conversation(
+            session,
+            actor_sub=creator.sub,
+            initiator_agent_id=creator.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            name="Apollo",
+        )
+
+        result = await list_conversations(session, caller_agent_id=creator.id, name="  Apollo  ")
+        ids = [c["conversation_id"] for c in result["conversations"]]
+        assert str(conv.id) in ids
+
+        result_query = await list_conversations(
+            session, caller_agent_id=creator.id, query="  Apollo  "
+        )
+        ids_query = [c["conversation_id"] for c in result_query["conversations"]]
+        assert str(conv.id) in ids_query
+
+    async def test_filter_by_name_substring(self, session: AsyncSession) -> None:
+        """TECH-6268: list_conversations filters by name substring."""
+        creator = await _register(session, "listconv-name-sub-c")
+        target = await _register(session, "listconv-name-sub-t")
+        conv_apollo = await start_conversation(
+            session,
+            actor_sub=creator.sub,
+            initiator_agent_id=creator.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            name="Project Apollo Launch",
+        )
+        conv_zeus = await start_conversation(
+            session,
+            actor_sub=creator.sub,
+            initiator_agent_id=creator.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            name="Project Zeus Launch",
+        )
+
+        result = await list_conversations(session, caller_agent_id=creator.id, name="apollo")
+        ids = [c["conversation_id"] for c in result["conversations"]]
+        assert str(conv_apollo.id) in ids
+        assert str(conv_zeus.id) not in ids
+
+    async def test_filter_by_name_case_insensitive(self, session: AsyncSession) -> None:
+        """TECH-6268: list_conversations name matching is case-insensitive."""
+        creator = await _register(session, "listconv-name-case-c")
+        target = await _register(session, "listconv-name-case-t")
+        conv = await start_conversation(
+            session,
+            actor_sub=creator.sub,
+            initiator_agent_id=creator.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            name="Quantum Computing Sync",
+        )
+
+        result_upper = await list_conversations(session, caller_agent_id=creator.id, name="QUANTUM")
+        ids_upper = [c["conversation_id"] for c in result_upper["conversations"]]
+        assert str(conv.id) in ids_upper
+
+        result_lower = await list_conversations(session, caller_agent_id=creator.id, name="quantum")
+        ids_lower = [c["conversation_id"] for c in result_lower["conversations"]]
+        assert str(conv.id) in ids_lower
+
+    async def test_filter_by_name_combined_with_other_filters(self, session: AsyncSession) -> None:
+        """TECH-6268: name filter combines with other filters (AND semantics)."""
+        creator = await _register(session, "listconv-name-comb-c")
+        target_a = await _register(session, "listconv-name-comb-ta")
+        target_b = await _register(session, "listconv-name-comb-tb")
+        conv_a = await start_conversation(
+            session,
+            actor_sub=creator.sub,
+            initiator_agent_id=creator.id,
+            conversation_type="open",
+            target_agent_ids=[target_a.id],
+            initial_message=_request_payload(),
+            name="Alpha Planning",
+        )
+        conv_b = await start_conversation(
+            session,
+            actor_sub=creator.sub,
+            initiator_agent_id=creator.id,
+            conversation_type="open",
+            target_agent_ids=[target_b.id],
+            initial_message=_request_payload(),
+            name="Alpha Review",
+        )
+
+        result_owner = await list_conversations(
+            session,
+            caller_agent_id=creator.id,
+            name="Alpha",
+            role="owner",
+        )
+        ids_owner = [c["conversation_id"] for c in result_owner["conversations"]]
+        assert str(conv_a.id) in ids_owner
+        assert str(conv_b.id) in ids_owner
+
+        # Target A only participates in conv_a
+        result_target = await list_conversations(
+            session,
+            caller_agent_id=target_a.id,
+            name="Alpha",
+            role="member",
+        )
+        ids_target = [c["conversation_id"] for c in result_target["conversations"]]
+        assert str(conv_a.id) in ids_target
+        assert str(conv_b.id) not in ids_target
+
+    async def test_filter_by_name_no_match(self, session: AsyncSession) -> None:
+        """TECH-6268: name filter returning no match produces empty conversations list."""
+        creator = await _register(session, "listconv-name-nomatch-c")
+        target = await _register(session, "listconv-name-nomatch-t")
+        await start_conversation(
+            session,
+            actor_sub=creator.sub,
+            initiator_agent_id=creator.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            name="Existing Conversation",
+        )
+
+        result = await list_conversations(session, caller_agent_id=creator.id, name="Nonexistent")
+        assert result["conversations"] == []
+        assert result["has_more"] is False
+        assert result["next_cursor"] is None
+
+    async def test_filter_by_name_excludes_null_name(self, session: AsyncSession) -> None:
+        """TECH-6268: conversations with null name are simply excluded from a
+        name-filtered query."""
+        creator = await _register(session, "listconv-name-null-c")
+        target = await _register(session, "listconv-name-null-t")
+        conv_with_name = await start_conversation(
+            session,
+            actor_sub=creator.sub,
+            initiator_agent_id=creator.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            name="Named Topic",
+        )
+        conv_without_name = await start_conversation(
+            session,
+            actor_sub=creator.sub,
+            initiator_agent_id=creator.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            name=None,
+        )
+
+        result = await list_conversations(session, caller_agent_id=creator.id, name="Named")
+        ids = [c["conversation_id"] for c in result["conversations"]]
+        assert str(conv_with_name.id) in ids
+        assert str(conv_without_name.id) not in ids
+
+    async def test_filter_by_query_alias(self, session: AsyncSession) -> None:
+        """TECH-6268: query param acts as an alias for name."""
+        creator = await _register(session, "listconv-query-alias-c")
+        target = await _register(session, "listconv-query-alias-t")
+        conv = await start_conversation(
+            session,
+            actor_sub=creator.sub,
+            initiator_agent_id=creator.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            name="Query Alias Test",
+        )
+
+        result = await list_conversations(session, caller_agent_id=creator.id, query="Alias")
+        ids = [c["conversation_id"] for c in result["conversations"]]
+        assert str(conv.id) in ids
+
+    async def test_filter_by_name_and_query_conflict_rejected(self, session: AsyncSession) -> None:
+        """TECH-6268: providing both name and query raises ValueError regardless
+        of value equality (differing, equal non-empty, equal empty)."""
+        creator = await _register(session, "listconv-conflict-c")
+        for n, q in [("foo", "bar"), ("foo", "foo"), ("", "")]:
+            with pytest.raises(ValueError, match="cannot provide both name and query"):
+                await list_conversations(session, caller_agent_id=creator.id, name=n, query=q)
+
+    async def test_filter_by_name_empty_string_excludes_null_name(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-6268: empty string filter matches all non-null names but excludes NULL."""
+        creator = await _register(session, "listconv-empty-c")
+        target = await _register(session, "listconv-empty-t")
+        conv_named = await start_conversation(
+            session,
+            actor_sub=creator.sub,
+            initiator_agent_id=creator.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            name="Has A Name",
+        )
+        conv_null = await start_conversation(
+            session,
+            actor_sub=creator.sub,
+            initiator_agent_id=creator.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            name=None,
+        )
+
+        result = await list_conversations(session, caller_agent_id=creator.id, name="")
+        ids = [c["conversation_id"] for c in result["conversations"]]
+        assert str(conv_named.id) in ids
+        assert str(conv_null.id) not in ids
+
+    async def test_filter_by_name_too_long_rejected(self, session: AsyncSession) -> None:
+        """TECH-6268: searching with a name exceeding MAX_CONVERSATION_NAME_LENGTH
+        raises ValueError."""
+        creator = await _register(session, "listconv-toolong-c")
+        with pytest.raises(ValueError, match="name exceeds 120 characters"):
+            await list_conversations(
+                session, caller_agent_id=creator.id, name="x" * (MAX_CONVERSATION_NAME_LENGTH + 1)
+            )
+
+    async def test_filter_by_name_special_characters_escaped(self, session: AsyncSession) -> None:
+        """TECH-6268: SQL wildcards (% and _) in search name are autoescaped as literals."""
+        creator = await _register(session, "listconv-escape-c")
+        target = await _register(session, "listconv-escape-t")
+        conv_special = await start_conversation(
+            session,
+            actor_sub=creator.sub,
+            initiator_agent_id=creator.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            name="Progress 100%_done",
+        )
+        conv_other = await start_conversation(
+            session,
+            actor_sub=creator.sub,
+            initiator_agent_id=creator.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            name="Progress 1000done",
+        )
+
+        result = await list_conversations(session, caller_agent_id=creator.id, name="100%_")
+        ids = [c["conversation_id"] for c in result["conversations"]]
+        assert str(conv_special.id) in ids
+        assert str(conv_other.id) not in ids
+
     async def test_invited_participant_sees_conversation(self, session: AsyncSession) -> None:
         creator = await _register(session, "listconv-inviter")
         invited = await _register(session, "listconv-invited")

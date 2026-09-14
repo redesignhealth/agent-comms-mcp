@@ -112,10 +112,10 @@ class TestWhoami:
 
     def test_registered_identity_includes_schema_version_range(self) -> None:
         """An identity that has already registered gets
-        min_schema_version/max_schema_version back from whoami."""
+        status and min_schema_version/max_schema_version back from whoami."""
         token = MagicMock()
         token.claims = {"iss": "agent-jwt", "sub": "ea-agent-svc", "scopes": ["comms:read"]}
-        fake_agent = MagicMock(min_schema_version=1, max_schema_version=2)
+        fake_agent = MagicMock(status="active", min_schema_version=1, max_schema_version=2)
 
         with (
             patch("providers.comms.get_access_token", return_value=token),
@@ -124,8 +124,27 @@ class TestWhoami:
         ):
             result = asyncio.run(_whoami())
 
+        assert result["status"] == "active"
         assert result["min_schema_version"] == 1
         assert result["max_schema_version"] == 2
+
+    def test_registered_suspended_identity_includes_suspended_status(self) -> None:
+        """A registered but suspended identity surfaces status='suspended'
+        in comms_whoami (TECH-6267)."""
+        token = MagicMock()
+        token.claims = {"iss": "agent-jwt", "sub": "ea-agent-svc", "scopes": ["comms:read"]}
+        fake_agent = MagicMock(status="suspended", min_schema_version=1, max_schema_version=1)
+
+        with (
+            patch("providers.comms.get_access_token", return_value=token),
+            _patched_session_factory(),
+            patch("providers.comms.service.get_agent_by_sub", AsyncMock(return_value=fake_agent)),
+        ):
+            result = asyncio.run(_whoami())
+
+        assert result["status"] == "suspended"
+        assert result["min_schema_version"] == 1
+        assert result["max_schema_version"] == 1
 
     def test_unregistered_identity_omits_schema_version_fields(self) -> None:
         """The DB is reachable and answers "no agent for this sub" --
@@ -141,6 +160,7 @@ class TestWhoami:
         ):
             result = asyncio.run(_whoami())
 
+        assert "status" not in result
         assert "min_schema_version" not in result
         assert "max_schema_version" not in result
 
@@ -177,6 +197,7 @@ class TestWhoami:
         assert result["issuer"] == "agent-jwt"
         assert result["caller_type"] == "service"
         assert result["scopes"] == ["comms:read"]
+        assert "status" not in result
         assert "min_schema_version" not in result
         assert "max_schema_version" not in result
         # "unavailable", not just "schema-version lookup":
@@ -215,6 +236,7 @@ class TestWhoami:
         assert result["issuer"] == "agent-jwt"
         assert result["caller_type"] == "service"
         assert result["scopes"] == ["comms:read"]
+        assert "status" not in result
         assert "min_schema_version" not in result
         assert "max_schema_version" not in result
         assert any("schema-version lookup failed" in r.message for r in caplog.records)

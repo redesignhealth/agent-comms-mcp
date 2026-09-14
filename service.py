@@ -2833,6 +2833,8 @@ async def list_conversations(
     cursor: str | None = None,
     include_archived: bool = False,
     include_expired: bool = False,
+    name: str | None = None,
+    query: str | None = None,
 ) -> dict[str, Any]:
     """Paginated list of conversations the caller participates in.
 
@@ -2845,6 +2847,12 @@ async def list_conversations(
       surfaces expired conversations regardless of ``include_expired``, and
       any other explicit state (e.g. ``"completed"``) returns exactly that
       state with no expired rows OR'd in, regardless of ``include_expired``.
+    - ``name``: optional case-insensitive substring match against
+      ``conversations.name``, max 120 characters (``query`` is accepted as
+      an alias; passing both ``name`` and ``query`` is rejected).
+      Conversations with no name (``NULL``) are excluded whenever this
+      filter is active, including when the filter is an empty string (which
+      matches all non-null names but excludes ``NULL``).
     - ``include_archived``: ``bool`` (default ``False``). When ``False``,
       conversations with ``archived_at IS NOT NULL`` are excluded.
     - ``include_expired``: ``bool`` (default ``False``). Only relevant when
@@ -2857,6 +2865,14 @@ async def list_conversations(
     non-left participant row (``invited`` and ``active`` both visible).
     """
     limit = max(1, min(limit, 200))
+
+    if name is not None and query is not None:
+        raise ValueError("cannot provide both name and query")
+    search_name = name if name is not None else query
+    if search_name is not None:
+        search_name = search_name.strip()
+        if len(search_name) > MAX_CONVERSATION_NAME_LENGTH:
+            raise ValueError(f"name exceeds {MAX_CONVERSATION_NAME_LENGTH} characters")
 
     # Base join: conversations the caller participates in (any non-exit status)
     stmt = (
@@ -2879,6 +2895,9 @@ async def list_conversations(
 
     if not include_archived:
         stmt = stmt.where(Conversation.archived_at.is_(None))
+
+    if search_name is not None:
+        stmt = stmt.where(Conversation.name.icontains(search_name, autoescape=True))
 
     if role is not None:
         stmt = stmt.where(Participant.role == role)
