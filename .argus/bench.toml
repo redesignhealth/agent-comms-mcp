@@ -1,0 +1,4 @@
+[bulk_reviewer]
+platform = "gemini"
+model    = "gemini-mini"
+caching  = "auto"
