@@ -6130,7 +6130,6 @@ def _classify_proposal(judge: ProposalJudge, kind: str, action: dict[str, Any]) 
     """
     try:
         classification: Any = judge.classify(kind, action)
-        priority = getattr(classification, "priority", None)
     except ValueError as exc:
         raise ValueError(f"unsupported proposal kind: {kind!r}") from exc
     except Exception as exc:
@@ -6141,6 +6140,23 @@ def _classify_proposal(judge: ProposalJudge, kind: str, action: dict[str, Any]) 
             exc_info=True,
         )
         raise ValueError(f"proposal classification failed for kind {kind!r}") from exc
+
+    try:
+        priority = getattr(classification, "priority", None)
+    except Exception as exc:
+        logger.warning(
+            "proposal judge classify() returned an unusable result (%r) for kind=%r; "
+            "reading priority raised %s: %s; rejecting submission",
+            classification,
+            kind,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
+        raise ValueError(
+            f"proposal judge returned invalid priority for kind {kind!r}; "
+            f"must be one of {sorted(PROPOSAL_HOLD_LEVELS)}"
+        ) from exc
 
     if priority not in PROPOSAL_HOLD_LEVELS:
         logger.warning(
@@ -6213,16 +6229,28 @@ def _truncate_proposal_string(text: str, max_length: int) -> str:
     return text[:prefix_len] + _PROPOSAL_TRUNCATED_SUFFIX
 
 
-def _is_well_formed_target_error(err: Any) -> bool:
-    """True if ``err`` is a well-formed target error with valid field types,
+class _ValidatedTargetError(NamedTuple):
+    status_code: int
+    error_code: str
+    detail: str
+    log_detail: str | None
+
+
+def _is_well_formed_target_error(err: Any) -> _ValidatedTargetError | None:
+    """Validate ``err`` as a well-formed target error with valid field types,
     an allowed status code, and bounded field lengths
     (TECH-5872/TECH-5877 seam defensive check).
+
+    Returns a ``_ValidatedTargetError`` snapshot of the validated fields on
+    success, or ``None`` if validation fails. Returning the snapshot prevents
+    TOCTOU bugs where an untrusted object returns valid values on the first
+    read and invalid values on a subsequent read.
     """
     status_code = getattr(err, "status_code", None)
     error_code = getattr(err, "error_code", None)
     detail = getattr(err, "detail", None)
     log_detail = getattr(err, "log_detail", None)  # absent == None: log-only, never caller-facing
-    return (
+    if (
         isinstance(status_code, int)
         and not isinstance(status_code, bool)
         and status_code in _ALLOWED_PROPOSAL_TARGET_ERROR_STATUS_CODES
@@ -6232,7 +6260,14 @@ def _is_well_formed_target_error(err: Any) -> bool:
         and isinstance(detail, str)
         and bool(detail)
         and (log_detail is None or isinstance(log_detail, str))
-    )
+    ):
+        return _ValidatedTargetError(
+            status_code=status_code,
+            error_code=error_code,
+            detail=detail,
+            log_detail=log_detail,
+        )
+    return None
 
 
 async def _safe_fingerprint(judge: ProposalJudge, ctx: ProposalContext) -> ProposalFingerprint:
@@ -6261,20 +6296,24 @@ async def _safe_fingerprint(judge: ProposalJudge, ctx: ProposalContext) -> Propo
             return ProposalFingerprint(status=FINGERPRINT_DIGEST, digest=digest)
         if status == FINGERPRINT_NO_TARGET:
             return ProposalFingerprint(status=FINGERPRINT_NO_TARGET)
-        if status == FINGERPRINT_UNAVAILABLE and _is_well_formed_target_error(error):
-            assert error is not None
-            scrubbed = (
-                _scrub_proposal_error_string(error.detail) or _FINGERPRINT_CONTRACT_VIOLATION_DETAIL
-            )
-            return ProposalFingerprint(
-                status=FINGERPRINT_UNAVAILABLE,
-                error=ProposalTargetError(
-                    status_code=error.status_code,
-                    error_code=error.error_code,
-                    detail=_truncate_proposal_string(scrubbed, _MAX_PROPOSAL_ERROR_DETAIL_LENGTH),
-                    log_detail=getattr(error, "log_detail", None),
-                ),
-            )
+        if status == FINGERPRINT_UNAVAILABLE:
+            validated_err = _is_well_formed_target_error(error)
+            if validated_err is not None:
+                scrubbed = (
+                    _scrub_proposal_error_string(validated_err.detail)
+                    or _FINGERPRINT_CONTRACT_VIOLATION_DETAIL
+                )
+                return ProposalFingerprint(
+                    status=FINGERPRINT_UNAVAILABLE,
+                    error=ProposalTargetError(
+                        status_code=validated_err.status_code,
+                        error_code=validated_err.error_code,
+                        detail=_truncate_proposal_string(
+                            scrubbed, _MAX_PROPOSAL_ERROR_DETAIL_LENGTH
+                        ),
+                        log_detail=validated_err.log_detail,
+                    ),
+                )
         logger.warning(
             "proposal judge fingerprint() returned a malformed result (%r) for "
             "kind=%r action_type=%r; treating as unavailable",
@@ -7596,8 +7635,10 @@ async def _safe_apply(judge: ProposalJudge, ctx: ProposalContext) -> ProposalApp
     propagation by construction."""
     try:
         outcome = await judge.apply(ctx)
-        # Note: HttpApplyProposalJudge.apply() always constructs the board's own
-        # ProposalApplyOutcome directly; the plugin's stand-in is never reached.
+        # Note: Safe today because get_proposal_judge() (see plugins.py) wraps every
+        # currently-registered RH judge in HttpApplyProposalJudge, which constructs
+        # ProposalApplyOutcome directly — this invariant would break if a future judge
+        # were registered unwrapped.
         if not isinstance(outcome, ProposalApplyOutcome):
             logger.warning(
                 "proposal judge apply() returned a malformed result (%r) for hold %s "
