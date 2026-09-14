@@ -1806,9 +1806,12 @@ async def list_conversations(
       and expired rows are never excluded when ``state="expired"`` is
       explicitly passed.
     - ``name``: optional case-insensitive substring filter against the
-      conversation's human-readable name. Only conversations with a non-null
-      name containing this substring are returned (``query`` is accepted as
-      an alias).
+      conversation's human-readable name, max 120 characters. Only
+      conversations with a non-null name containing this substring are
+      returned (``query`` is accepted as an alias; passing both ``name`` and
+      ``query`` is rejected). A ``NULL`` conversation name is excluded
+      whenever a name/query filter is active, including when the filter is
+      an empty string (which matches all non-null names but excludes ``NULL``).
     - ``include_archived``: ``bool`` (default ``False``). When ``False``,
       conversations with ``archived_at IS NOT NULL`` are excluded.
     - ``include_expired``: ``bool`` (default ``False``). When ``False``,
@@ -1830,7 +1833,7 @@ async def list_conversations(
         raise ToolError(f"invalid_request: type must be one of {sorted(CONVERSATION_TYPES)}")
     if state is not None and state not in CONVERSATION_STATES:
         raise ToolError(f"invalid_request: state must be one of {sorted(CONVERSATION_STATES)}")
-    if name is not None and query is not None and name != query:
+    if name is not None and query is not None:
         raise ToolError("invalid_request: cannot provide both name and query")
     search_name = name if name is not None else query
     if search_name is not None and len(search_name) > MAX_CONVERSATION_NAME_LENGTH:

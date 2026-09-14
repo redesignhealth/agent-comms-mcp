@@ -5299,15 +5299,18 @@ class TestListConversationsTool:
         )
         assert res_none["conversations"] == []
 
-        # Conflicting name and query raises ToolError
-        with pytest.raises(ToolError, match="invalid_request: cannot provide both name and query"):
-            await _call(
-                main,
-                test_session_factory,
-                creator_token,
-                "comms_list_conversations",
-                {"name": "phoenix", "query": "griffin"},
-            )
+        # Providing both name and query raises ToolError regardless of value equality
+        for n, q in [("phoenix", "griffin"), ("phoenix", "phoenix"), ("", "")]:
+            with pytest.raises(
+                ToolError, match="invalid_request: cannot provide both name and query"
+            ):
+                await _call(
+                    main,
+                    test_session_factory,
+                    creator_token,
+                    "comms_list_conversations",
+                    {"name": n, "query": q},
+                )
 
         # Oversized search name raises ToolError
         with pytest.raises(ToolError, match="invalid_request: name exceeds 120 characters"):

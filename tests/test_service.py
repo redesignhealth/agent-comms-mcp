@@ -10404,10 +10404,42 @@ class TestListConversations:
         assert str(conv.id) in ids
 
     async def test_filter_by_name_and_query_conflict_rejected(self, session: AsyncSession) -> None:
-        """TECH-6268: providing conflicting name and query raises ValueError."""
+        """TECH-6268: providing both name and query raises ValueError regardless
+        of value equality (differing, equal non-empty, equal empty)."""
         creator = await _register(session, "listconv-conflict-c")
-        with pytest.raises(ValueError, match="cannot provide conflicting name and query"):
-            await list_conversations(session, caller_agent_id=creator.id, name="foo", query="bar")
+        for n, q in [("foo", "bar"), ("foo", "foo"), ("", "")]:
+            with pytest.raises(ValueError, match="cannot provide both name and query"):
+                await list_conversations(session, caller_agent_id=creator.id, name=n, query=q)
+
+    async def test_filter_by_name_empty_string_excludes_null_name(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-6268: empty string filter matches all non-null names but excludes NULL."""
+        creator = await _register(session, "listconv-empty-c")
+        target = await _register(session, "listconv-empty-t")
+        conv_named = await start_conversation(
+            session,
+            actor_sub=creator.sub,
+            initiator_agent_id=creator.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            name="Has A Name",
+        )
+        conv_null = await start_conversation(
+            session,
+            actor_sub=creator.sub,
+            initiator_agent_id=creator.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            name=None,
+        )
+
+        result = await list_conversations(session, caller_agent_id=creator.id, name="")
+        ids = [c["conversation_id"] for c in result["conversations"]]
+        assert str(conv_named.id) in ids
+        assert str(conv_null.id) not in ids
 
     async def test_filter_by_name_too_long_rejected(self, session: AsyncSession) -> None:
         """TECH-6268: searching with a name exceeding MAX_CONVERSATION_NAME_LENGTH
