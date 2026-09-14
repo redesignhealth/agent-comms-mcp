@@ -25,3 +25,5 @@ htmlcov/
 .DS_Store
 .idea/
 .vscode/
+
+.argus/bench.toml
