@@ -639,12 +639,60 @@ class TestRegister:
     ) -> None:
         """A caller who hasn't called comms_register yet gets the same
         whoami shape as before schema-version negotiation was added — no
-        schema-version fields, and no error just for having never registered
-        (whoami is DB-optional)."""
+        status or schema-version fields, and no error just for having never
+        registered (whoami is DB-optional)."""
         token = _token("agent-never-registered")
         whoami = await _call(main, test_session_factory, token, "comms_whoami")
+        assert "status" not in whoami
         assert "min_schema_version" not in whoami
         assert "max_schema_version" not in whoami
+
+    async def test_whoami_surfaces_active_status_after_registration(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """TECH-6267: comms_whoami surfaces status='active' for an admitted agent."""
+        token = _token("agent-whoami-active")
+        await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {"display_name": "Whoami Active", "accepted_types": ["availability_request"]},
+        )
+        whoami = await _call(main, test_session_factory, token, "comms_whoami")
+        assert whoami["status"] == "active"
+        assert whoami["identity"] == "agent-whoami-active"
+        assert whoami["min_schema_version"] == 1
+        assert whoami["max_schema_version"] == 1
+
+    async def test_whoami_surfaces_suspended_status_after_deregistration(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """TECH-6267: comms_whoami surfaces status='suspended' after deregistration."""
+        token = _token("agent-whoami-suspended")
+        registered = await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {"display_name": "Whoami Suspended", "accepted_types": ["availability_request"]},
+        )
+        whoami_before = await _call(main, test_session_factory, token, "comms_whoami")
+        assert whoami_before["status"] == "active"
+
+        admin_token = _token(
+            "admin-whoami-deregister", scopes=["comms:read", "comms:write", "comms:admin"]
+        )
+        await _call(
+            main,
+            test_session_factory,
+            admin_token,
+            "comms_deregister_agent",
+            {"agent_id": registered["agent_id"]},
+        )
+
+        whoami_after = await _call(main, test_session_factory, token, "comms_whoami")
+        assert whoami_after["status"] == "suspended"
 
     async def test_register_is_shared_true_baseline_scope_succeeds(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
@@ -5179,6 +5227,97 @@ class TestListConversationsTool:
         assert active_conv["conversation_id"] in all_ids
         assert arch_conv["conversation_id"] in all_ids
         assert exp_conv["conversation_id"] in all_ids
+
+    async def test_list_conversations_filter_by_name_and_query(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """TECH-6268: comms_list_conversations supports name and query search filters."""
+        creator_token = _token("listconv-tool-name-c")
+        await _register(main, test_session_factory, "listconv-tool-name-c")
+        target = await _register(main, test_session_factory, "listconv-tool-name-t")
+
+        conv_phoenix = await _call(
+            main,
+            test_session_factory,
+            creator_token,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [target["agent_id"]],
+                "message_type": "availability_request",
+                "initial_message": _availability_request(),
+                "name": "Phoenix Alpha",
+            },
+        )
+        conv_griffin = await _call(
+            main,
+            test_session_factory,
+            creator_token,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [target["agent_id"]],
+                "message_type": "availability_request",
+                "initial_message": _availability_request(),
+                "name": "Griffin Beta",
+            },
+        )
+
+        # Name filter matches case-insensitively
+        res_name = await _call(
+            main,
+            test_session_factory,
+            creator_token,
+            "comms_list_conversations",
+            {"name": "phoenix"},
+        )
+        ids_name = [c["conversation_id"] for c in res_name["conversations"]]
+        assert conv_phoenix["conversation_id"] in ids_name
+        assert conv_griffin["conversation_id"] not in ids_name
+
+        # Query alias works identically
+        res_query = await _call(
+            main,
+            test_session_factory,
+            creator_token,
+            "comms_list_conversations",
+            {"query": "GRIFFIN"},
+        )
+        ids_query = [c["conversation_id"] for c in res_query["conversations"]]
+        assert conv_griffin["conversation_id"] in ids_query
+        assert conv_phoenix["conversation_id"] not in ids_query
+
+        # No match produces empty list
+        res_none = await _call(
+            main,
+            test_session_factory,
+            creator_token,
+            "comms_list_conversations",
+            {"name": "nonexistent"},
+        )
+        assert res_none["conversations"] == []
+
+        # Conflicting name and query raises ToolError
+        with pytest.raises(ToolError, match="invalid_request: cannot provide both name and query"):
+            await _call(
+                main,
+                test_session_factory,
+                creator_token,
+                "comms_list_conversations",
+                {"name": "phoenix", "query": "griffin"},
+            )
+
+        # Oversized search name raises ToolError
+        with pytest.raises(ToolError, match="invalid_request: name exceeds 120 characters"):
+            await _call(
+                main,
+                test_session_factory,
+                creator_token,
+                "comms_list_conversations",
+                {"name": "x" * 121},
+            )
 
 
 # --- Approval pipeline (TECH-5389 PR2) ---------------------------------------

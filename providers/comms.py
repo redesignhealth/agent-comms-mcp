@@ -76,6 +76,7 @@ from models import CONVERSATION_STATES, PARTICIPANT_ROLES, Agent, ApprovalHold
 from schemas import (
     CONVERSATION_TYPES,
     MAX_AGENT_KEY_LENGTH,
+    MAX_CONVERSATION_NAME_LENGTH,
     MAX_PARTICIPANTS_PER_CONVERSATION,
     PayloadValidationError,
 )
@@ -493,7 +494,9 @@ async def whoami(agent_key: str | None = None) -> dict[str, Any]:
     (base_sub::agent_key) that will be used for agent lookups by other tools.
 
     If this identity has already called ``comms_register``, the response
-    also includes ``min_schema_version``/``max_schema_version``
+    also includes ``status`` (reflecting whether this agent is currently
+    ``"active"`` or ``"suspended"``) and
+    ``min_schema_version``/``max_schema_version``
     reflecting this agent's currently-registered wire-schema capability
     range. Omitted entirely if the caller hasn't registered yet, or if the
     board database is unreachable — this tool doubles as an auth-only
@@ -536,6 +539,7 @@ async def whoami(agent_key: str | None = None) -> dict[str, Any]:
         async with session_factory() as session:
             agent = await service.get_agent_by_sub(session, composed_sub)
         if agent is not None:
+            result["status"] = agent.status
             result["min_schema_version"] = agent.min_schema_version
             result["max_schema_version"] = agent.max_schema_version
     except (OperationalError, InterfaceError, OSError) as exc:
@@ -1786,6 +1790,8 @@ async def list_conversations(
     agent_key: str | None = None,
     include_archived: bool = False,
     include_expired: bool = False,
+    name: str | None = None,
+    query: str | None = None,
 ) -> dict[str, Any]:
     """Return a paginated list of conversations the caller participates in.
 
@@ -1799,6 +1805,10 @@ async def list_conversations(
       expired rows are never OR'd in when a specific state is requested,
       and expired rows are never excluded when ``state="expired"`` is
       explicitly passed.
+    - ``name``: optional case-insensitive substring filter against the
+      conversation's human-readable name. Only conversations with a non-null
+      name containing this substring are returned (``query`` is accepted as
+      an alias).
     - ``include_archived``: ``bool`` (default ``False``). When ``False``,
       conversations with ``archived_at IS NOT NULL`` are excluded.
     - ``include_expired``: ``bool`` (default ``False``). When ``False``,
@@ -1820,6 +1830,11 @@ async def list_conversations(
         raise ToolError(f"invalid_request: type must be one of {sorted(CONVERSATION_TYPES)}")
     if state is not None and state not in CONVERSATION_STATES:
         raise ToolError(f"invalid_request: state must be one of {sorted(CONVERSATION_STATES)}")
+    if name is not None and query is not None and name != query:
+        raise ToolError("invalid_request: cannot provide both name and query")
+    search_name = name if name is not None else query
+    if search_name is not None and len(search_name) > MAX_CONVERSATION_NAME_LENGTH:
+        raise ToolError(f"invalid_request: name exceeds {MAX_CONVERSATION_NAME_LENGTH} characters")
 
     async with get_session_factory()() as session:
         caller = await _resolve_caller_agent(session, sub, token)
@@ -1834,6 +1849,7 @@ async def list_conversations(
                 cursor=cursor,
                 include_archived=include_archived,
                 include_expired=include_expired,
+                name=search_name,
             )
 
 
