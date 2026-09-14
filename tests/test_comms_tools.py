@@ -5289,6 +5289,17 @@ class TestListConversationsTool:
         assert conv_griffin["conversation_id"] in ids_query
         assert conv_phoenix["conversation_id"] not in ids_query
 
+        # Whitespace-padded search term matches stripped stored name
+        res_padded = await _call(
+            main,
+            test_session_factory,
+            creator_token,
+            "comms_list_conversations",
+            {"name": "  Phoenix  "},
+        )
+        ids_padded = [c["conversation_id"] for c in res_padded["conversations"]]
+        assert conv_phoenix["conversation_id"] in ids_padded
+
         # No match produces empty list
         res_none = await _call(
             main,

@@ -10242,6 +10242,30 @@ class TestListConversations:
         assert len(matches) == 1
         assert matches[0]["name"] == "List-conversations name"
 
+    async def test_filter_by_name_whitespace_padded(self, session: AsyncSession) -> None:
+        """TECH-6268: search term with leading/trailing whitespace matches stored name."""
+        creator = await _register(session, "listconv-name-pad-c")
+        target = await _register(session, "listconv-name-pad-t")
+        conv = await start_conversation(
+            session,
+            actor_sub=creator.sub,
+            initiator_agent_id=creator.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            name="Apollo",
+        )
+
+        result = await list_conversations(session, caller_agent_id=creator.id, name="  Apollo  ")
+        ids = [c["conversation_id"] for c in result["conversations"]]
+        assert str(conv.id) in ids
+
+        result_query = await list_conversations(
+            session, caller_agent_id=creator.id, query="  Apollo  "
+        )
+        ids_query = [c["conversation_id"] for c in result_query["conversations"]]
+        assert str(conv.id) in ids_query
+
     async def test_filter_by_name_substring(self, session: AsyncSession) -> None:
         """TECH-6268: list_conversations filters by name substring."""
         creator = await _register(session, "listconv-name-sub-c")

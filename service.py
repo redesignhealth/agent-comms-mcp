@@ -2869,8 +2869,10 @@ async def list_conversations(
     if name is not None and query is not None:
         raise ValueError("cannot provide both name and query")
     search_name = name if name is not None else query
-    if search_name is not None and len(search_name) > MAX_CONVERSATION_NAME_LENGTH:
-        raise ValueError(f"name exceeds {MAX_CONVERSATION_NAME_LENGTH} characters")
+    if search_name is not None:
+        search_name = search_name.strip()
+        if len(search_name) > MAX_CONVERSATION_NAME_LENGTH:
+            raise ValueError(f"name exceeds {MAX_CONVERSATION_NAME_LENGTH} characters")
 
     # Base join: conversations the caller participates in (any non-exit status)
     stmt = (

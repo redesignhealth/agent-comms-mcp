@@ -1836,8 +1836,12 @@ async def list_conversations(
     if name is not None and query is not None:
         raise ToolError("invalid_request: cannot provide both name and query")
     search_name = name if name is not None else query
-    if search_name is not None and len(search_name) > MAX_CONVERSATION_NAME_LENGTH:
-        raise ToolError(f"invalid_request: name exceeds {MAX_CONVERSATION_NAME_LENGTH} characters")
+    if search_name is not None:
+        search_name = search_name.strip()
+        if len(search_name) > MAX_CONVERSATION_NAME_LENGTH:
+            raise ToolError(
+                f"invalid_request: name exceeds {MAX_CONVERSATION_NAME_LENGTH} characters"
+            )
 
     async with get_session_factory()() as session:
         caller = await _resolve_caller_agent(session, sub, token)
