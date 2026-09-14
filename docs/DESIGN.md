@@ -1922,8 +1922,36 @@ rejected via 422 at submission time or normalized to a safe outcome (pending sta
 caller-facing error/detail string surfaced through this seam (`ProposalTargetError.detail`,
 `ProposalApplyOutcome.caller_error`) is additionally capped at 500 characters, truncated
 with `"... [truncated]"` if exceeded, so a misbehaving or overly verbose plugin can't blow
-out a TEXT column or leak an unbounded upstream payload through the API. For Redesign
-Health, the concrete implementation
+out a TEXT column or leak an unbounded upstream payload through the API.
+
+Across the first four call sites, the load-bearing contract is based on structural duck
+typing (reading attributes via `getattr` and strictly validating scalar values) rather than
+nominal `isinstance` checks against `plugins.py` classes:
+1. `classify(kind, action)`: reads `priority` (must be a valid string in `PROPOSAL_HOLD_LEVELS`).
+2. `fingerprint(ctx)`: reads `status` (`FINGERPRINT_DIGEST`, `FINGERPRINT_NO_TARGET`, or
+   `FINGERPRINT_UNAVAILABLE`), `digest` (string when status is digest), and `error` (when status
+   is unavailable); the board always reconstructs its own native `ProposalFingerprint` instance.
+3. Target errors in unavailable fingerprints (`_is_well_formed_target_error`): reads and
+   snapshots `status_code` (int in `{422, 500, 503}`), `error_code` (non-empty str <= 64 chars),
+   `detail` (non-empty str), and optional `log_detail` (None or str) in a single pass to eliminate
+   TOCTOU risks, and reconstructs the board's own `ProposalTargetError`. Scrubbing and truncation
+   of `detail` to 500 chars happen afterward, in the caller (`_safe_fingerprint`), not in this
+   validator.
+4. `judge(ctx)`: reads `approved` (strictly `bool`, rejecting truthy non-booleans) and
+   `decision_note` (None or str <= 2000 chars, truncated). An object missing either attribute
+   fails closed as a judge error.
+
+This is a DELIBERATE deviation from nominal typing, introduced specifically so external plugin
+packages like `agent-comms-approvals` (providing `rh_comms_plugins.proposal_judge`) do not need a
+hard package dependency on this repo's `plugins.py` classes. The structural validators are tested
+against locally-defined stand-ins; a contract test against the real `rh_comms_plugins` types is
+deferred to TECH-6271 pending an importskip-gated integration test or an optional dev dependency on
+`rh_comms_plugins`. Conversely, `apply(ctx) -> ProposalApplyOutcome`
+remains deliberately nominally typed (still performs an explicit `isinstance` check on
+`ProposalApplyOutcome`): this asymmetry is safe today because `plugins.get_proposal_judge()` wraps
+every currently-registered RH judge in `HttpApplyProposalJudge`, which constructs the board's native
+`ProposalApplyOutcome` directly -- an invariant that would break if a future judge were registered
+unwrapped. For Redesign Health, the concrete implementation
 (Linear/GitHub-backed deterministic rules) lives in `agent-comms-approvals`'
 `rh_comms_plugins.proposal_judge` -- see "The proposal submission pipeline" below.
 

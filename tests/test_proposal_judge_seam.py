@@ -12,7 +12,7 @@ import asyncio
 import logging
 import uuid
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, NamedTuple
 
 import pytest
 import pytest_asyncio
@@ -33,8 +33,10 @@ from plugins import (
     ProposalVerdict,
 )
 from service import (
+    MAX_DECISION_REASON_LENGTH,
     PROPOSAL_HOLD_LEVELS,
     _classify_proposal,
+    _is_well_formed_target_error,
     _safe_apply,
     _safe_fingerprint,
     _scrub_proposal_error_string,
@@ -121,12 +123,12 @@ class TestClassifyProposalSeam:
 
     def test_classify_returning_none_raises_value_error(self) -> None:
         judge = FakeProposalJudge(classify_result=None)
-        with pytest.raises(ValueError, match="expected ProposalClassification"):
+        with pytest.raises(ValueError, match="invalid priority"):
             _classify_proposal(judge, "linear_progress_update", {})
 
     def test_classify_returning_non_classification_object_raises_value_error(self) -> None:
         judge = FakeProposalJudge(classify_result={"priority": "low"})
-        with pytest.raises(ValueError, match="expected ProposalClassification"):
+        with pytest.raises(ValueError, match="invalid priority"):
             _classify_proposal(judge, "linear_progress_update", {})
 
     def test_valid_priority_passes_through_unchanged(self) -> None:
@@ -781,7 +783,10 @@ class TestJudgeApplyIntegrationSeam:
             target_fingerprint="deadbeef",
         )
         assert result["status"] == "pending"
-        assert result["decision_note"] == "judge error: expected ProposalVerdict, got NoneType"
+        assert (
+            result["decision_note"]
+            == "judge error: verdict missing approved/decision_note, got NoneType"
+        )
         assert judge.apply_calls == []
 
     async def test_apply_returning_none_does_not_strand_row_at_applying(
@@ -817,3 +822,724 @@ class TestJudgeApplyIntegrationSeam:
         assert hold.status == "apply_failed"
         assert hold.status != "applying"
         assert hold.apply_error == "unable to apply this proposal"
+
+
+# ---------------------------------------------------------------------------
+# Foreign structural stand-ins regression tests (cross-repo duck-typing)
+# ---------------------------------------------------------------------------
+#
+# The _Foreign*/_VerdictOnly* classes below are hand-maintained approximations
+# of the real structural types returned by external plugin packages (e.g.
+# agent-comms-approvals' rh_comms_plugins.proposal_judge) -- they are NOT
+# imported from that package, so they can silently drift from its actual
+# shape over time. See TECH-6271, which tracks this specific gap.
+
+
+class _ForeignClassification(NamedTuple):
+    priority: Any
+
+
+class _ForeignTargetError(NamedTuple):
+    status_code: Any
+    error_code: Any
+    detail: Any
+    log_detail: Any = None
+
+
+class _ForeignFingerprint(NamedTuple):
+    status: Any
+    digest: Any = None
+    error: Any = None
+
+
+class _ForeignVerdict(NamedTuple):
+    approved: Any
+    decision_note: Any
+
+
+class _VerdictOnlyApproved(NamedTuple):
+    approved: Any
+
+
+class _VerdictOnlyDecisionNote(NamedTuple):
+    decision_note: Any
+
+
+class TestForeignStructuralStandinsClassify:
+    """Site 1: _classify_proposal accepts foreign ProposalClassification stand-ins
+    and validates priority by value, rejecting invalid values and non-objects."""
+
+    def test_accepts_foreign_classification_for_all_hold_levels(self) -> None:
+        for level in PROPOSAL_HOLD_LEVELS:
+            judge = FakeProposalJudge(classify_result=_ForeignClassification(priority=level))
+            assert _classify_proposal(judge, "linear_progress_update", {}) == level
+
+    @pytest.mark.parametrize("bad_priority", ["urgent", "", "HIGH", None, "invalid", 123])
+    def test_rejects_foreign_classification_with_invalid_priority(self, bad_priority: Any) -> None:
+        judge = FakeProposalJudge(classify_result=_ForeignClassification(priority=bad_priority))
+        with pytest.raises(ValueError, match="invalid priority"):
+            _classify_proposal(judge, "linear_progress_update", {})
+
+    @pytest.mark.parametrize("bad_result", [None, {"priority": "low"}, "low", 42])
+    def test_rejects_none_bare_dict_and_plain_primitives(self, bad_result: Any) -> None:
+        judge = FakeProposalJudge(classify_result=bad_result)
+        with pytest.raises(ValueError, match="invalid priority"):
+            _classify_proposal(judge, "linear_progress_update", {})
+
+    def test_rejects_pathological_raising_priority_property(self) -> None:
+        class _ExplodingPriority:
+            @property
+            def priority(self) -> Any:
+                raise RuntimeError("property explosion")
+
+        judge = FakeProposalJudge(classify_result=_ExplodingPriority())
+        with pytest.raises(ValueError, match="invalid priority"):
+            _classify_proposal(judge, "linear_progress_update", {})
+
+    def test_rejects_pathological_value_error_raising_priority_property(self) -> None:
+        class _ValueErrorPriority:
+            @property
+            def priority(self) -> Any:
+                raise ValueError("property ValueError")
+
+        judge = FakeProposalJudge(classify_result=_ValueErrorPriority())
+        with pytest.raises(ValueError, match="invalid priority") as exc_info:
+            _classify_proposal(judge, "linear_progress_update", {})
+        assert "unsupported proposal kind" not in str(exc_info.value)
+
+    def test_rejects_priority_whose_membership_test_raises(self) -> None:
+        """A priority value that passes the isinstance(str) check but whose
+        __eq__/__hash__ raises during the `priority not in
+        PROPOSAL_HOLD_LEVELS` membership test must be caught and mapped to
+        the same "invalid priority" ValueError -> 422 path, not escape as an
+        uncaught exception (BLOCKING: the membership test must live inside
+        the same try/except as the getattr call). Must subclass `str` so the
+        isinstance guard doesn't short-circuit before the membership test
+        ever runs."""
+
+        class _ExplodingEqPriority(str):
+            def __eq__(self, other: object) -> bool:
+                raise RuntimeError("__eq__ explosion")
+
+            def __hash__(self) -> int:
+                raise RuntimeError("__hash__ explosion")
+
+        judge = FakeProposalJudge(
+            classify_result=_ForeignClassification(priority=_ExplodingEqPriority("junk"))
+        )
+        with pytest.raises(ValueError, match="invalid priority"):
+            _classify_proposal(judge, "linear_progress_update", {})
+
+    def test_rejects_non_str_priority_spoofing_equality_with_valid_level(self) -> None:
+        """A non-str priority whose __eq__ returns True when compared to a
+        valid PROPOSAL_HOLD_LEVELS string must be rejected by the
+        isinstance(priority, str) check -- it must never be accepted as if it
+        were that string, since cast() alone has no runtime effect."""
+
+        class _SpoofedHighPriority:
+            def __eq__(self, other: object) -> bool:
+                return other == "high"
+
+            def __hash__(self) -> int:
+                return hash("high")
+
+        judge = FakeProposalJudge(
+            classify_result=_ForeignClassification(priority=_SpoofedHighPriority())
+        )
+        with pytest.raises(ValueError, match="invalid priority"):
+            _classify_proposal(judge, "linear_progress_update", {})
+
+
+class TestForeignStructuralStandinsTargetError:
+    """Site 2: _is_well_formed_target_error accepts foreign ProposalTargetError stand-ins
+    and rejects malformed shapes, non-objects, and invalid field values."""
+
+    def test_accepts_foreign_target_error_with_log_detail(self) -> None:
+        err = _ForeignTargetError(
+            status_code=503,
+            error_code="service_unavailable",
+            detail="service is down",
+            log_detail="upstream timeout",
+        )
+        validated = _is_well_formed_target_error(err)
+        assert validated is not None
+        assert validated.status_code == 503
+        assert validated.error_code == "service_unavailable"
+        assert validated.detail == "service is down"
+        assert validated.log_detail == "upstream timeout"
+
+    def test_accepts_foreign_target_error_without_log_detail(self) -> None:
+        err = _ForeignTargetError(
+            status_code=422,
+            error_code="invalid_action",
+            detail="action payload unprocessable",
+        )
+        validated = _is_well_formed_target_error(err)
+        assert validated is not None
+        assert validated.status_code == 422
+        assert validated.error_code == "invalid_action"
+        assert validated.detail == "action payload unprocessable"
+        assert validated.log_detail is None
+
+    @pytest.mark.parametrize(
+        "bad_err",
+        [
+            None,
+            "status_code=500",
+            {"status_code": 500, "error_code": "err", "detail": "msg"},
+            _ForeignTargetError(status_code=200, error_code="ok", detail="msg"),
+            _ForeignTargetError(status_code=True, error_code="err", detail="msg"),
+            _ForeignTargetError(status_code="500", error_code="err", detail="msg"),
+            _ForeignTargetError(status_code=500, error_code="", detail="msg"),
+            _ForeignTargetError(status_code=500, error_code="x" * 65, detail="msg"),
+            _ForeignTargetError(status_code=500, error_code="err", detail=""),
+            _ForeignTargetError(status_code=500, error_code="err", detail="msg", log_detail=123),
+        ],
+    )
+    def test_rejects_invalid_foreign_target_errors_and_non_objects(self, bad_err: Any) -> None:
+        assert _is_well_formed_target_error(bad_err) is None
+
+
+class TestForeignStructuralStandinsFingerprint:
+    """Site 3: _safe_fingerprint accepts foreign ProposalFingerprint and ProposalTargetError
+    stand-ins, reconstructing the board's own types on return, and fails closed on invalid shapes.
+    """
+
+    async def test_accepts_foreign_fingerprint_digest(self) -> None:
+        judge = FakeProposalJudge(
+            fingerprint_result=_ForeignFingerprint(status=FINGERPRINT_DIGEST, digest="sha256:abc")
+        )
+        result = await _safe_fingerprint(judge, _ctx())
+        assert type(result) is ProposalFingerprint
+        assert result.status == FINGERPRINT_DIGEST
+        assert result.digest == "sha256:abc"
+
+    async def test_accepts_foreign_fingerprint_no_target(self) -> None:
+        judge = FakeProposalJudge(
+            fingerprint_result=_ForeignFingerprint(status=FINGERPRINT_NO_TARGET)
+        )
+        result = await _safe_fingerprint(judge, _ctx())
+        assert type(result) is ProposalFingerprint
+        assert result.status == FINGERPRINT_NO_TARGET
+
+    async def test_accepts_foreign_fingerprint_unavailable_with_foreign_target_error(self) -> None:
+        foreign_err = _ForeignTargetError(
+            status_code=503,
+            error_code="service_unavailable",
+            detail="linear API unavailable",
+            log_detail="HTTP 503 from linear backend",
+        )
+        judge = FakeProposalJudge(
+            fingerprint_result=_ForeignFingerprint(
+                status=FINGERPRINT_UNAVAILABLE, error=foreign_err
+            )
+        )
+        result = await _safe_fingerprint(judge, _ctx())
+        assert type(result) is ProposalFingerprint
+        assert result.status == FINGERPRINT_UNAVAILABLE
+        assert type(result.error) is ProposalTargetError
+        assert result.error.status_code == 503
+        assert result.error.error_code == "service_unavailable"
+        assert result.error.detail == "linear API unavailable"
+        assert result.error.log_detail == "HTTP 503 from linear backend"
+
+    async def test_foreign_target_error_raising_property_fails_closed(self) -> None:
+        """A foreign target error whose property raises a non-AttributeError exception
+        fails closed to FINGERPRINT_UNAVAILABLE (500) via _safe_fingerprint's outer catch."""
+
+        class _ExplodingTargetError:
+            @property
+            def status_code(self) -> Any:
+                raise RuntimeError("exploding status_code")
+
+            error_code = "service_unavailable"
+            detail = "exploded"
+            log_detail = None
+
+        judge = FakeProposalJudge(
+            fingerprint_result=_ForeignFingerprint(
+                status=FINGERPRINT_UNAVAILABLE, error=_ExplodingTargetError()
+            )
+        )
+        result = await _safe_fingerprint(judge, _ctx())
+        assert type(result) is ProposalFingerprint
+        assert result.status == FINGERPRINT_UNAVAILABLE
+        assert type(result.error) is ProposalTargetError
+        assert result.error.status_code == 500
+        assert result.error.error_code == "server_configuration_error"
+        assert result.error.detail == "unable to verify target status"
+
+    async def test_foreign_target_error_detail_overlong_is_truncated(self) -> None:
+        overlong_detail = "x" * 600
+        foreign_err = _ForeignTargetError(
+            status_code=503,
+            error_code="service_unavailable",
+            detail=overlong_detail,
+            log_detail="raw error detail",
+        )
+        judge = FakeProposalJudge(
+            fingerprint_result=_ForeignFingerprint(
+                status=FINGERPRINT_UNAVAILABLE, error=foreign_err
+            )
+        )
+        result = await _safe_fingerprint(judge, _ctx())
+        assert result.status == FINGERPRINT_UNAVAILABLE
+        assert type(result) is ProposalFingerprint
+        assert type(result.error) is ProposalTargetError
+        assert result.error is not None
+        assert len(result.error.detail) == 500
+        assert result.error.detail.endswith("... [truncated]")
+        assert result.error.detail.startswith("x" * 100)
+        assert result.error.status_code == 503
+        assert result.error.error_code == "service_unavailable"
+        assert result.error.log_detail == "raw error detail"
+
+    async def test_foreign_target_error_toctou_resilient(self) -> None:
+        """A pathological error whose property returns valid on first read
+        and invalid on second read is safely handled by snapshotting."""
+
+        class _FlakyTargetError:
+            def __init__(self) -> None:
+                self._reads = 0
+
+            @property
+            def status_code(self) -> int:
+                self._reads += 1
+                return 503 if self._reads == 1 else 200  # 200 is disallowed
+
+            error_code = "service_unavailable"
+            detail = "service down"
+            log_detail = None
+
+        judge = FakeProposalJudge(
+            fingerprint_result=_ForeignFingerprint(
+                status=FINGERPRINT_UNAVAILABLE, error=_FlakyTargetError()
+            )
+        )
+        result = await _safe_fingerprint(judge, _ctx())
+        assert result.status == FINGERPRINT_UNAVAILABLE
+        assert type(result.error) is ProposalTargetError
+        assert result.error.status_code == 503
+
+    @pytest.mark.parametrize(
+        "bad_result",
+        [
+            None,
+            "no_target",
+            {"status": FINGERPRINT_NO_TARGET},
+            _ForeignFingerprint(status=FINGERPRINT_DIGEST, digest=123),
+            _ForeignFingerprint(status=FINGERPRINT_DIGEST, digest=None),
+            _ForeignFingerprint(status="unknown_status"),
+            _ForeignFingerprint(
+                status=FINGERPRINT_UNAVAILABLE,
+                error=_ForeignTargetError(status_code=200, error_code="ok", detail="msg"),
+            ),
+            _ForeignFingerprint(status=FINGERPRINT_UNAVAILABLE, error=None),
+        ],
+    )
+    async def test_rejects_invalid_foreign_fingerprint_shapes(self, bad_result: Any) -> None:
+        judge = FakeProposalJudge(fingerprint_result=bad_result)
+        result = await _safe_fingerprint(judge, _ctx())
+        assert type(result) is ProposalFingerprint
+        assert result.status == FINGERPRINT_UNAVAILABLE
+        assert type(result.error) is ProposalTargetError
+        assert result.error.status_code == 500
+        assert result.error.error_code == "server_configuration_error"
+        assert result.error.detail == "unable to verify target status"
+
+    async def test_rejects_non_str_status_spoofing_equality_with_valid_status(self) -> None:
+        """A non-str status whose __eq__ returns True when compared to a
+        valid FINGERPRINT_* constant must be rejected by the
+        isinstance(status, str) check -- it must fall through to the
+        generic FINGERPRINT_UNAVAILABLE fail-closed path, not be accepted as
+        FINGERPRINT_NO_TARGET."""
+
+        class _SpoofedNoTargetStatus:
+            def __eq__(self, other: object) -> bool:
+                return other == FINGERPRINT_NO_TARGET
+
+            def __hash__(self) -> int:
+                return hash(FINGERPRINT_NO_TARGET)
+
+        judge = FakeProposalJudge(
+            fingerprint_result=_ForeignFingerprint(status=_SpoofedNoTargetStatus())
+        )
+        result = await _safe_fingerprint(judge, _ctx())
+        assert type(result) is ProposalFingerprint
+        assert result.status == FINGERPRINT_UNAVAILABLE
+        assert type(result.error) is ProposalTargetError
+        assert result.error.status_code == 500
+        assert result.error.error_code == "server_configuration_error"
+        assert result.error.detail == "unable to verify target status"
+
+    async def test_foreign_fingerprint_digest_with_exploding_error_property_succeeds(self) -> None:
+        """A foreign fingerprint with status=FINGERPRINT_DIGEST and a valid digest
+        whose .error property raises must succeed, because .error is only read when
+        status == FINGERPRINT_UNAVAILABLE."""
+
+        class _ExplodingErrorFingerprint:
+            status = FINGERPRINT_DIGEST
+            digest = "sha256:123"
+
+            @property
+            def error(self) -> Any:
+                raise RuntimeError("exploding error property")
+
+        judge = FakeProposalJudge(fingerprint_result=_ExplodingErrorFingerprint())
+        result = await _safe_fingerprint(judge, _ctx())
+        assert type(result) is ProposalFingerprint
+        assert result.status == FINGERPRINT_DIGEST
+        assert result.digest == "sha256:123"
+
+    async def test_foreign_fingerprint_no_target_exploding_error_succeeds(self) -> None:
+        """A foreign fingerprint with status=FINGERPRINT_NO_TARGET whose .error
+        property raises must succeed, because .error is only read when
+        status == FINGERPRINT_UNAVAILABLE."""
+
+        class _ExplodingErrorNoTargetFingerprint:
+            status = FINGERPRINT_NO_TARGET
+
+            @property
+            def error(self) -> Any:
+                raise RuntimeError("exploding error property")
+
+        judge = FakeProposalJudge(fingerprint_result=_ExplodingErrorNoTargetFingerprint())
+        result = await _safe_fingerprint(judge, _ctx())
+        assert type(result) is ProposalFingerprint
+        assert result.status == FINGERPRINT_NO_TARGET
+
+
+@pytest.mark.usefixtures("_migrated_schema")
+class TestForeignStructuralStandinsVerdict:
+    """Site 4: create_proposal accepts foreign ProposalVerdict stand-ins,
+    validates fields by value, and rejects non-bool approved or malformed verdicts."""
+
+    @pytest_asyncio.fixture(autouse=True)
+    async def _clean_tables(self, engine: AsyncEngine) -> AsyncIterator[None]:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("TRUNCATE TABLE proposal_holds, audit_log RESTART IDENTITY CASCADE")
+            )
+        yield
+
+    async def test_accepts_foreign_verdict_approved(self, session: AsyncSession) -> None:
+        judge = FakeProposalJudge(
+            judge_result=_ForeignVerdict(
+                approved=True, decision_note="auto-approved by foreign judge"
+            ),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result=None, caller_error=None, log_detail=None
+            ),
+        )
+        result = await create_proposal(
+            session,
+            kind="linear_progress_update",
+            proposed_by_bot_id="bot-1",
+            owner_sub="owner-a@example.com",
+            action={"target_id": "TECH-1", "action_type": "close_ticket"},
+            rationale="test",
+            confidence="medium",
+            importance="medium",
+            impact="medium",
+            judge=judge,
+            target_fingerprint="deadbeef",
+        )
+        assert result["status"] == "applied"
+        assert result["decision_note"] == "auto-approved by foreign judge"
+
+    async def test_accepts_foreign_verdict_pending_with_none_note(
+        self, session: AsyncSession
+    ) -> None:
+        judge = FakeProposalJudge(
+            judge_result=_ForeignVerdict(approved=False, decision_note=None),
+        )
+        result = await create_proposal(
+            session,
+            kind="linear_progress_update",
+            proposed_by_bot_id="bot-1",
+            owner_sub="owner-a@example.com",
+            action={"target_id": "TECH-1", "action_type": "close_ticket"},
+            rationale="test",
+            confidence="medium",
+            importance="medium",
+            impact="medium",
+            judge=judge,
+            target_fingerprint="deadbeef",
+        )
+        assert result["status"] == "pending"
+        assert result.get("decision_note") is None
+        assert judge.apply_calls == []
+
+    async def test_pending_verdict_note_is_dropped(self, session: AsyncSession) -> None:
+        # A legitimately pending judge verdict has decision_note=None by convention
+        # (see service.py ~line 7015); unlike judge error notes, any plugin-supplied
+        # note on a pending verdict is intentionally dropped and not persisted.
+        judge = FakeProposalJudge(
+            judge_result=_ForeignVerdict(
+                approved=False, decision_note="escalated to human reviewer"
+            ),
+        )
+        result = await create_proposal(
+            session,
+            kind="linear_progress_update",
+            proposed_by_bot_id="bot-1",
+            owner_sub="owner-a@example.com",
+            action={"target_id": "TECH-1", "action_type": "close_ticket"},
+            rationale="test",
+            confidence="medium",
+            importance="medium",
+            impact="medium",
+            judge=judge,
+            target_fingerprint="deadbeef",
+        )
+        assert result["status"] == "pending"
+        assert result.get("decision_note") is None
+        assert judge.apply_calls == []
+
+    @pytest.mark.parametrize(
+        ("bad_approved", "expected_type"),
+        [
+            ("true", "str"),
+            ("false", "str"),
+            (1, "int"),
+            (0, "int"),
+            ([], "list"),
+        ],
+    )
+    async def test_rejects_foreign_verdict_with_non_bool_approved(
+        self, session: AsyncSession, bad_approved: Any, expected_type: str
+    ) -> None:
+        judge = FakeProposalJudge(
+            judge_result=_ForeignVerdict(approved=bad_approved, decision_note=None),
+        )
+        result = await create_proposal(
+            session,
+            kind="linear_progress_update",
+            proposed_by_bot_id="bot-1",
+            owner_sub="owner-a@example.com",
+            action={"target_id": "TECH-1", "action_type": "close_ticket"},
+            rationale="test",
+            confidence="medium",
+            importance="medium",
+            impact="medium",
+            judge=judge,
+            target_fingerprint="deadbeef",
+        )
+        assert result["status"] == "pending"
+        assert (
+            result["decision_note"]
+            == f"judge error: ProposalVerdict.approved must be a bool, got {expected_type}"
+        )
+
+    async def test_rejects_foreign_verdict_with_non_str_decision_note(
+        self, session: AsyncSession
+    ) -> None:
+        judge = FakeProposalJudge(
+            judge_result=_ForeignVerdict(approved=False, decision_note=12345),
+        )
+        result = await create_proposal(
+            session,
+            kind="linear_progress_update",
+            proposed_by_bot_id="bot-1",
+            owner_sub="owner-a@example.com",
+            action={"target_id": "TECH-1", "action_type": "close_ticket"},
+            rationale="test",
+            confidence="medium",
+            importance="medium",
+            impact="medium",
+            judge=judge,
+            target_fingerprint="deadbeef",
+        )
+        assert result["status"] == "pending"
+        assert (
+            result["decision_note"]
+            == "judge error: ProposalVerdict.decision_note must be None or str, got int"
+        )
+
+    @pytest.mark.parametrize(
+        ("bad_verdict", "expected_type"),
+        [
+            (None, "NoneType"),
+            ({"approved": True, "decision_note": "ok"}, "dict"),
+            ("approved", "str"),
+            (123, "int"),
+        ],
+    )
+    async def test_rejects_none_bare_dict_and_plain_primitives_for_verdict(
+        self, session: AsyncSession, bad_verdict: Any, expected_type: str
+    ) -> None:
+        judge = FakeProposalJudge(judge_result=bad_verdict)
+        result = await create_proposal(
+            session,
+            kind="linear_progress_update",
+            proposed_by_bot_id="bot-1",
+            owner_sub="owner-a@example.com",
+            action={"target_id": "TECH-1", "action_type": "close_ticket"},
+            rationale="test",
+            confidence="medium",
+            importance="medium",
+            impact="medium",
+            judge=judge,
+            target_fingerprint="deadbeef",
+        )
+        assert result["status"] == "pending"
+        assert (
+            result["decision_note"]
+            == f"judge error: verdict missing approved/decision_note, got {expected_type}"
+        )
+
+    async def test_rejects_verdict_missing_decision_note(self, session: AsyncSession) -> None:
+        judge = FakeProposalJudge(judge_result=_VerdictOnlyApproved(approved=True))
+        result = await create_proposal(
+            session,
+            kind="linear_progress_update",
+            proposed_by_bot_id="bot-1",
+            owner_sub="owner-a@example.com",
+            action={"target_id": "TECH-1", "action_type": "close_ticket"},
+            rationale="test",
+            confidence="medium",
+            importance="medium",
+            impact="medium",
+            judge=judge,
+            target_fingerprint="deadbeef",
+        )
+        assert result["status"] == "pending"
+        assert (
+            result["decision_note"]
+            == "judge error: verdict missing approved/decision_note, got _VerdictOnlyApproved"
+        )
+        assert judge.apply_calls == []
+
+    async def test_rejects_verdict_missing_approved(self, session: AsyncSession) -> None:
+        judge = FakeProposalJudge(judge_result=_VerdictOnlyDecisionNote(decision_note="looks good"))
+        result = await create_proposal(
+            session,
+            kind="linear_progress_update",
+            proposed_by_bot_id="bot-1",
+            owner_sub="owner-a@example.com",
+            action={"target_id": "TECH-1", "action_type": "close_ticket"},
+            rationale="test",
+            confidence="medium",
+            importance="medium",
+            impact="medium",
+            judge=judge,
+            target_fingerprint="deadbeef",
+        )
+        assert result["status"] == "pending"
+        assert (
+            result["decision_note"]
+            == "judge error: verdict missing approved/decision_note, got _VerdictOnlyDecisionNote"
+        )
+        assert judge.apply_calls == []
+
+    async def test_foreign_verdict_raising_approved_property_fails_closed(
+        self, session: AsyncSession
+    ) -> None:
+        """A foreign verdict whose `approved` property raises a non-AttributeError
+        exception fails closed to the same pending/judge-error path as any other
+        judge.judge() exception (see the outer `except Exception` in
+        service.create_proposal)."""
+
+        class _ExplodingApproved:
+            @property
+            def approved(self) -> Any:
+                raise RuntimeError("exploding approved")
+
+            decision_note = None
+
+        judge = FakeProposalJudge(judge_result=_ExplodingApproved())
+        result = await create_proposal(
+            session,
+            kind="linear_progress_update",
+            proposed_by_bot_id="bot-1",
+            owner_sub="owner-a@example.com",
+            action={"target_id": "TECH-1", "action_type": "close_ticket"},
+            rationale="test",
+            confidence="medium",
+            importance="medium",
+            impact="medium",
+            judge=judge,
+            target_fingerprint="deadbeef",
+        )
+        assert result["status"] == "pending"
+        assert result["decision_note"] == "judge error: RuntimeError"
+        assert judge.apply_calls == []
+
+    async def test_foreign_verdict_with_overlong_decision_note_is_truncated(
+        self, session: AsyncSession
+    ) -> None:
+        """Truncation applies identically to a foreign verdict's decision_note
+        as it does to the native ProposalVerdict path (see
+        test_proposal_service.test_overlong_decision_note_is_truncated)."""
+        overlong_note = "n" * 2500
+        judge = FakeProposalJudge(
+            judge_result=_ForeignVerdict(approved=True, decision_note=overlong_note),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result={"ok": True}, caller_error=None, log_detail=None
+            ),
+        )
+        result = await create_proposal(
+            session,
+            kind="linear_progress_update",
+            proposed_by_bot_id="bot-1",
+            owner_sub="owner-a@example.com",
+            action={"target_id": "TECH-1", "action_type": "close_ticket"},
+            rationale="test",
+            confidence="medium",
+            importance="medium",
+            impact="medium",
+            judge=judge,
+            target_fingerprint="deadbeef",
+        )
+        assert result["status"] == "applied"
+        assert len(result["decision_note"]) == MAX_DECISION_REASON_LENGTH
+        assert result["decision_note"].endswith("... [truncated]")
+        assert result["decision_note"].startswith("n" * 100)
+
+    async def test_foreign_verdict_approved_and_decision_note_read_exactly_once(
+        self, session: AsyncSession
+    ) -> None:
+        """TOCTOU guard: `approved`/`decision_note` must each be read from the
+        foreign verdict object exactly once -- the same value used for
+        validation must be the value that ends up persisted/returned, not a
+        second, possibly-different read."""
+
+        class _FlakyVerdict:
+            def __init__(self) -> None:
+                self.approved_reads = 0
+                self.decision_note_reads = 0
+
+            @property
+            def approved(self) -> Any:
+                self.approved_reads += 1
+                return True
+
+            @property
+            def decision_note(self) -> Any:
+                self.decision_note_reads += 1
+                return "first read" if self.decision_note_reads == 1 else "second read"
+
+        verdict = _FlakyVerdict()
+        judge = FakeProposalJudge(
+            judge_result=verdict,
+            apply_result=ProposalApplyOutcome(
+                applied=True, result={"ok": True}, caller_error=None, log_detail=None
+            ),
+        )
+        result = await create_proposal(
+            session,
+            kind="linear_progress_update",
+            proposed_by_bot_id="bot-1",
+            owner_sub="owner-a@example.com",
+            action={"target_id": "TECH-1", "action_type": "close_ticket"},
+            rationale="test",
+            confidence="medium",
+            importance="medium",
+            impact="medium",
+            judge=judge,
+            target_fingerprint="deadbeef",
+        )
+        assert verdict.approved_reads == 1
+        assert verdict.decision_note_reads == 1
+        assert result["status"] == "applied"
+        assert result["decision_note"] == "first read"

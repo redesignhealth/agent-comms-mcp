@@ -220,12 +220,10 @@ from plugins import (
     MessageRiskContext,
     ParticipantInfo,
     ProposalApplyOutcome,
-    ProposalClassification,
     ProposalContext,
     ProposalFingerprint,
     ProposalJudge,
     ProposalTargetError,
-    ProposalVerdict,
     RiskScorer,
     RiskScoringInfraError,
     resolve_plugin,
@@ -6131,7 +6129,7 @@ def _classify_proposal(judge: ProposalJudge, kind: str, action: dict[str, Any]) 
     silently proceeding or crashing at insert time.
     """
     try:
-        classification = judge.classify(kind, action)
+        classification: Any = judge.classify(kind, action)
     except ValueError as exc:
         raise ValueError(f"unsupported proposal kind: {kind!r}") from exc
     except Exception as exc:
@@ -6143,31 +6141,35 @@ def _classify_proposal(judge: ProposalJudge, kind: str, action: dict[str, Any]) 
         )
         raise ValueError(f"proposal classification failed for kind {kind!r}") from exc
 
-    if not isinstance(classification, ProposalClassification):
+    try:
+        priority = getattr(classification, "priority", None)
+        # The isinstance check MUST run before the membership test below: a
+        # non-str priority that happens to compare equal to one of the
+        # PROPOSAL_HOLD_LEVELS strings (e.g. via a pathological __eq__) would
+        # otherwise pass `in` and be forwarded downstream as a non-str value --
+        # cast() has no runtime effect and does not guard against this.
+        if not isinstance(priority, str):
+            raise ValueError(f"priority is not a str: {priority!r}")
+        if priority not in PROPOSAL_HOLD_LEVELS:
+            raise ValueError(f"priority {priority!r} is not one of {sorted(PROPOSAL_HOLD_LEVELS)}")
+    except Exception as exc:
         logger.warning(
-            "proposal judge classify() returned a malformed result (%r) for kind=%r; "
-            "rejecting submission",
+            "proposal judge classify() returned an unusable result (%r) for kind=%r; "
+            "validating priority raised %s: %s; rejecting submission",
             classification,
             kind,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
         )
         raise ValueError(
-            f"proposal classification failed for kind {kind!r}: "
-            f"expected ProposalClassification, got {type(classification).__name__}"
-        )
-    if classification.priority not in PROPOSAL_HOLD_LEVELS:
-        logger.warning(
-            "proposal judge classify() returned invalid priority %r for kind=%r; "
-            "rejecting submission",
-            classification.priority,
-            kind,
-        )
-        levels = sorted(PROPOSAL_HOLD_LEVELS)
-        raise ValueError(
-            f"proposal judge returned invalid priority {classification.priority!r} "
-            f"for kind {kind!r}; must be one of {levels}"
-        )
-    return classification.priority
+            f"proposal judge returned invalid priority for kind {kind!r}; "
+            f"must be one of {sorted(PROPOSAL_HOLD_LEVELS)}"
+        ) from exc
+    return priority
 
+
+_MISSING: object = object()  # distinguishes "attribute absent" from a legitimate None
 
 _FINGERPRINT_CONTRACT_VIOLATION_DETAIL = "unable to verify target status"
 _ALLOWED_PROPOSAL_TARGET_ERROR_STATUS_CODES: frozenset[int] = frozenset({422, 500, 503})
@@ -6222,23 +6224,45 @@ def _truncate_proposal_string(text: str, max_length: int) -> str:
     return text[:prefix_len] + _PROPOSAL_TRUNCATED_SUFFIX
 
 
-def _is_well_formed_target_error(err: Any) -> bool:
-    """True if ``err`` is a well-formed ``ProposalTargetError`` with valid
-    field types, an allowed status code, and bounded field lengths
+class _ValidatedTargetError(NamedTuple):
+    status_code: int
+    error_code: str
+    detail: str
+    log_detail: str | None
+
+
+def _is_well_formed_target_error(err: Any) -> _ValidatedTargetError | None:
+    """Validate ``err`` as a well-formed target error with valid field types,
+    an allowed status code, and bounded field lengths
     (TECH-5872/TECH-5877 seam defensive check).
+
+    Returns a ``_ValidatedTargetError`` snapshot of the validated fields on
+    success, or ``None`` if validation fails. Returning the snapshot prevents
+    TOCTOU bugs where an untrusted object returns valid values on the first
+    read and invalid values on a subsequent read.
     """
-    return (
-        isinstance(err, ProposalTargetError)
-        and isinstance(err.status_code, int)
-        and not isinstance(err.status_code, bool)
-        and err.status_code in _ALLOWED_PROPOSAL_TARGET_ERROR_STATUS_CODES
-        and isinstance(err.error_code, str)
-        and bool(err.error_code)
-        and len(err.error_code) <= _MAX_PROPOSAL_ERROR_CODE_LENGTH
-        and isinstance(err.detail, str)
-        and bool(err.detail)
-        and (err.log_detail is None or isinstance(err.log_detail, str))
-    )
+    status_code = getattr(err, "status_code", None)
+    error_code = getattr(err, "error_code", None)
+    detail = getattr(err, "detail", None)
+    log_detail = getattr(err, "log_detail", None)  # absent == None: log-only, never caller-facing
+    if (
+        isinstance(status_code, int)
+        and not isinstance(status_code, bool)
+        and status_code in _ALLOWED_PROPOSAL_TARGET_ERROR_STATUS_CODES
+        and isinstance(error_code, str)
+        and bool(error_code)
+        and len(error_code) <= _MAX_PROPOSAL_ERROR_CODE_LENGTH
+        and isinstance(detail, str)
+        and bool(detail)
+        and (log_detail is None or isinstance(log_detail, str))
+    ):
+        return _ValidatedTargetError(
+            status_code=status_code,
+            error_code=error_code,
+            detail=detail,
+            log_detail=log_detail,
+        )
+    return None
 
 
 async def _safe_fingerprint(judge: ProposalJudge, ctx: ProposalContext) -> ProposalFingerprint:
@@ -6258,33 +6282,34 @@ async def _safe_fingerprint(judge: ProposalJudge, ctx: ProposalContext) -> Propo
     ``apply_failed`` at apply time.
     """
     try:
-        result = await judge.fingerprint(ctx)
-        if isinstance(result, ProposalFingerprint):
-            if result.status == FINGERPRINT_DIGEST and isinstance(result.digest, str):
-                return result
-            if result.status == FINGERPRINT_NO_TARGET:
-                return result
-            if result.status == FINGERPRINT_UNAVAILABLE and _is_well_formed_target_error(
-                result.error
-            ):
-                assert result.error is not None
-                scrubbed_detail = _scrub_proposal_error_string(result.error.detail)
-                if not scrubbed_detail:
-                    scrubbed_detail = _FINGERPRINT_CONTRACT_VIOLATION_DETAIL
-                truncated_detail = _truncate_proposal_string(
-                    scrubbed_detail, _MAX_PROPOSAL_ERROR_DETAIL_LENGTH
-                )
-                if truncated_detail != result.error.detail:
+        result: Any = await judge.fingerprint(ctx)
+        status = getattr(result, "status", None)
+        digest = getattr(result, "digest", None)
+
+        if isinstance(status, str):
+            if status == FINGERPRINT_DIGEST and isinstance(digest, str):
+                return ProposalFingerprint(status=FINGERPRINT_DIGEST, digest=digest)
+            elif status == FINGERPRINT_NO_TARGET:
+                return ProposalFingerprint(status=FINGERPRINT_NO_TARGET)
+            elif status == FINGERPRINT_UNAVAILABLE:
+                error = getattr(result, "error", None)
+                validated_err = _is_well_formed_target_error(error)
+                if validated_err is not None:
+                    scrubbed = (
+                        _scrub_proposal_error_string(validated_err.detail)
+                        or _FINGERPRINT_CONTRACT_VIOLATION_DETAIL
+                    )
                     return ProposalFingerprint(
                         status=FINGERPRINT_UNAVAILABLE,
                         error=ProposalTargetError(
-                            status_code=result.error.status_code,
-                            error_code=result.error.error_code,
-                            detail=truncated_detail,
-                            log_detail=result.error.log_detail,
+                            status_code=validated_err.status_code,
+                            error_code=validated_err.error_code,
+                            detail=_truncate_proposal_string(
+                                scrubbed, _MAX_PROPOSAL_ERROR_DETAIL_LENGTH
+                            ),
+                            log_detail=validated_err.log_detail,
                         ),
                     )
-                return result
         logger.warning(
             "proposal judge fingerprint() returned a malformed result (%r) for "
             "kind=%r action_type=%r; treating as unavailable",
@@ -6894,11 +6919,15 @@ async def create_proposal(
         hold_id=hold.id,
     )
     is_judge_error = False
+    decision_note: str | None = None
     try:
-        verdict = await judge.judge(judge_ctx)
-        if not isinstance(verdict, ProposalVerdict):
+        verdict: Any = await judge.judge(judge_ctx)
+        approved = getattr(verdict, "approved", _MISSING)
+        note = getattr(verdict, "decision_note", _MISSING)
+
+        if approved is _MISSING or note is _MISSING:
             logger.warning(
-                "proposal judge for (kind=%r, action_type=%r) returned a malformed verdict "
+                "proposal judge for (kind=%r, action_type=%r) returned an unusable verdict "
                 "(%r) for hold %s",
                 kind,
                 action_type,
@@ -6908,10 +6937,10 @@ async def create_proposal(
             verdict_type = type(verdict).__name__
             judged_status, decision_note = (
                 "pending",
-                f"judge error: expected ProposalVerdict, got {verdict_type}",
+                f"judge error: verdict missing approved/decision_note, got {verdict_type}",
             )
             is_judge_error = True
-        elif not isinstance(verdict.approved, bool):
+        elif not isinstance(approved, bool):
             # Fix 2: approved must be an actual boolean, never plain truthiness.
             # In Python, strings like "false" or numbers like 1 are truthy;
             # treating them as approved would trigger an unauthorized external write.
@@ -6920,36 +6949,37 @@ async def create_proposal(
                 "(%r) for hold %s",
                 kind,
                 action_type,
-                verdict.approved,
+                approved,
                 hold.id,
             )
-            app_type = type(verdict.approved).__name__
+            app_type = type(approved).__name__
             judged_status, decision_note = (
                 "pending",
                 f"judge error: ProposalVerdict.approved must be a bool, got {app_type}",
             )
             is_judge_error = True
-        elif verdict.decision_note is not None and not isinstance(verdict.decision_note, str):
+        elif note is not None and not isinstance(note, str):
             logger.warning(
                 "proposal judge for (kind=%r, action_type=%r) returned non-str decision_note "
                 "(%r) for hold %s",
                 kind,
                 action_type,
-                verdict.decision_note,
+                note,
                 hold.id,
             )
-            note_type = type(verdict.decision_note).__name__
+            note_type = type(note).__name__
             judged_status, decision_note = (
                 "pending",
                 f"judge error: ProposalVerdict.decision_note must be None or str, got {note_type}",
             )
             is_judge_error = True
         else:
-            judged_status = "approved" if verdict.approved else "pending"
-            note = verdict.decision_note
-            if note is not None:
-                note = _truncate_proposal_string(note, MAX_DECISION_REASON_LENGTH)
-            decision_note = note
+            judged_status = "approved" if approved else "pending"
+            decision_note = (
+                _truncate_proposal_string(note, MAX_DECISION_REASON_LENGTH)
+                if note is not None
+                else None
+            )
     except asyncio.CancelledError:
         # BaseException, not Exception -- already excluded from the guard
         # below under Python's actual exception hierarchy, but re-raised
@@ -7601,6 +7631,11 @@ async def _safe_apply(judge: ProposalJudge, ctx: ProposalContext) -> ProposalApp
     propagation by construction."""
     try:
         outcome = await judge.apply(ctx)
+        # Note: Safe today because get_proposal_judge() (see plugins.py) wraps every
+        # currently-registered RH judge in HttpApplyProposalJudge, which constructs
+        # ProposalApplyOutcome directly -- this invariant would break if a future judge
+        # were registered unwrapped (see TECH-6247, which tracks removing the unused
+        # apply() shim entirely, closing this gap).
         if not isinstance(outcome, ProposalApplyOutcome):
             logger.warning(
                 "proposal judge apply() returned a malformed result (%r) for hold %s "
