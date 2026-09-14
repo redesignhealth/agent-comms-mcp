@@ -6286,29 +6286,30 @@ async def _safe_fingerprint(judge: ProposalJudge, ctx: ProposalContext) -> Propo
         status = getattr(result, "status", None)
         digest = getattr(result, "digest", None)
 
-        if isinstance(status, str) and status == FINGERPRINT_DIGEST and isinstance(digest, str):
-            return ProposalFingerprint(status=FINGERPRINT_DIGEST, digest=digest)
-        elif isinstance(status, str) and status == FINGERPRINT_NO_TARGET:
-            return ProposalFingerprint(status=FINGERPRINT_NO_TARGET)
-        elif isinstance(status, str) and status == FINGERPRINT_UNAVAILABLE:
-            error = getattr(result, "error", None)
-            validated_err = _is_well_formed_target_error(error)
-            if validated_err is not None:
-                scrubbed = (
-                    _scrub_proposal_error_string(validated_err.detail)
-                    or _FINGERPRINT_CONTRACT_VIOLATION_DETAIL
-                )
-                return ProposalFingerprint(
-                    status=FINGERPRINT_UNAVAILABLE,
-                    error=ProposalTargetError(
-                        status_code=validated_err.status_code,
-                        error_code=validated_err.error_code,
-                        detail=_truncate_proposal_string(
-                            scrubbed, _MAX_PROPOSAL_ERROR_DETAIL_LENGTH
+        if isinstance(status, str):
+            if status == FINGERPRINT_DIGEST and isinstance(digest, str):
+                return ProposalFingerprint(status=FINGERPRINT_DIGEST, digest=digest)
+            elif status == FINGERPRINT_NO_TARGET:
+                return ProposalFingerprint(status=FINGERPRINT_NO_TARGET)
+            elif status == FINGERPRINT_UNAVAILABLE:
+                error = getattr(result, "error", None)
+                validated_err = _is_well_formed_target_error(error)
+                if validated_err is not None:
+                    scrubbed = (
+                        _scrub_proposal_error_string(validated_err.detail)
+                        or _FINGERPRINT_CONTRACT_VIOLATION_DETAIL
+                    )
+                    return ProposalFingerprint(
+                        status=FINGERPRINT_UNAVAILABLE,
+                        error=ProposalTargetError(
+                            status_code=validated_err.status_code,
+                            error_code=validated_err.error_code,
+                            detail=_truncate_proposal_string(
+                                scrubbed, _MAX_PROPOSAL_ERROR_DETAIL_LENGTH
+                            ),
+                            log_detail=validated_err.log_detail,
                         ),
-                        log_detail=validated_err.log_detail,
-                    ),
-                )
+                    )
         logger.warning(
             "proposal judge fingerprint() returned a malformed result (%r) for "
             "kind=%r action_type=%r; treating as unavailable",
