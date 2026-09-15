@@ -330,6 +330,53 @@ class TestRegistryPerAgentCap:
         assert subscriptions._agent_subscription_counts[agent_id] == 1
         assert len(subscriptions._registry["comms://x"]) == 1
 
+    async def test_reclaim_dead_records_skipped_when_under_cap(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(subscriptions, "MAX_SUBSCRIPTIONS_PER_AGENT", 5)
+        agent_id = _new_agent_id()
+        session = _FakeSession()
+
+        with patch("subscriptions._reclaim_dead_for_agent_locked") as mock_reclaim:
+            is_new = await subscriptions.subscribe("comms://x", session, agent_id=agent_id, sub="a")  # type: ignore[arg-type]
+            assert is_new is True
+            mock_reclaim.assert_not_called()
+
+        assert subscriptions._agent_subscription_counts[agent_id] == 1
+
+        with patch("subscriptions._reclaim_dead_for_agent_locked") as mock_reclaim:
+            has_cap = await subscriptions.has_capacity_for(agent_id)
+            assert has_cap is True
+            mock_reclaim.assert_not_called()
+
+    async def test_concurrent_subscribes_at_cap_only_one_succeeds(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(subscriptions, "MAX_SUBSCRIPTIONS_PER_AGENT", 2)
+        agent_id = _new_agent_id()
+        # Seed 1 subscription so the agent is sitting at cap - 1
+        initial_session = _FakeSession()
+        await subscriptions.subscribe("comms://x0", initial_session, agent_id=agent_id, sub="a")  # type: ignore[arg-type]
+        assert subscriptions._agent_subscription_counts[agent_id] == 1
+
+        # Fire 5 concurrent subscribe calls for different URIs
+        sessions = [_FakeSession() for _ in range(5)]
+
+        async def _do_subscribe(i: int) -> bool:
+            return await subscriptions.subscribe(
+                f"comms://x_race_{i}",
+                sessions[i],
+                agent_id=agent_id,
+                sub="a",  # type: ignore[arg-type]
+            )
+
+        results = await asyncio.gather(
+            *(_do_subscribe(i) for i in range(5)), return_exceptions=True
+        )
+
+        successes = [r for r in results if r is True]
+        failures = [r for r in results if isinstance(r, subscriptions.SubscriptionLimitError)]
+
+        assert len(successes) == 1
+        assert len(failures) == 4
+        assert subscriptions._agent_subscription_counts[agent_id] == 2
+
 
 class TestNotifyConversationEvent:
     async def test_fires_conversation_and_inbox_uris(self) -> None:
@@ -901,6 +948,90 @@ class TestSubscribeAuthorization:
         assert audit_row is not None
         assert audit_row["action"] == "denied.subscribe_limit_reached"
         assert audit_row["detail"] == {"limit": 1}
+
+    async def test_concurrent_subscribe_at_cap_writes_exactly_one_success_audit_and_rejections(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        session: AsyncSession,
+        monkeypatch: Any,
+    ) -> None:
+        monkeypatch.setattr(subscriptions, "MAX_SUBSCRIPTIONS_PER_AGENT", 2)
+        member_sub = "sub-race-member"
+        member_token = _token(member_sub)
+
+        # Create first conversation and subscribe to it (puts agent at cap - 1)
+        conv1, _ = await _start_open_conversation(
+            main, test_session_factory, "sub-race-owner", member_sub
+        )
+        await _call(
+            main, test_session_factory, member_token, "comms_accept", {"conversation_id": conv1}
+        )
+        uri1 = f"comms://comms/conversations/{conv1}"
+
+        # Create 4 more conversations for the race
+        race_uris: list[str] = []
+        for _ in range(4):
+            conv_i, _ = await _start_open_conversation(
+                main, test_session_factory, "sub-race-owner", member_sub
+            )
+            await _call(
+                main,
+                test_session_factory,
+                member_token,
+                "comms_accept",
+                {"conversation_id": conv_i},
+            )
+            race_uris.append(f"comms://comms/conversations/{conv_i}")
+
+        with (
+            _OIDC_PATCH,
+            _ENV_PATCH,
+            patch("providers.comms.get_access_token", return_value=member_token),
+            patch("providers.comms.get_session_factory", return_value=test_session_factory),
+            patch("main.get_session_factory", return_value=test_session_factory),
+        ):
+            async with Client(main.mcp) as client:
+                # 1st subscription succeeds normally
+                await client.session.subscribe_resource(AnyUrl(uri1))
+
+                # Fire 4 concurrent subscribe calls for different URIs
+                results = await asyncio.gather(
+                    *(client.session.subscribe_resource(AnyUrl(u)) for u in race_uris),
+                    return_exceptions=True,
+                )
+
+        successes = [r for r in results if not isinstance(r, Exception)]
+        failures = [
+            r for r in results if isinstance(r, McpError) and "subscription_limit_reached" in str(r)
+        ]
+
+        assert len(successes) == 1
+        assert len(failures) == 3
+
+        # Exactly 2 success audit rows in DB: 1 initial + 1 from race (NO false success audit!)
+        success_audits = (
+            await session.execute(
+                text(
+                    "SELECT COUNT(*) FROM audit_log WHERE actor_sub = :actor_sub "
+                    "AND action = 'resource.subscribe'"
+                ),
+                {"actor_sub": member_sub},
+            )
+        ).scalar()
+        assert success_audits == 2
+
+        # Exactly 3 denial audit rows in DB for the 3 failed calls
+        denial_audits = (
+            await session.execute(
+                text(
+                    "SELECT COUNT(*) FROM audit_log WHERE actor_sub = :actor_sub "
+                    "AND action = 'denied.subscribe_limit_reached'"
+                ),
+                {"actor_sub": member_sub},
+            )
+        ).scalar()
+        assert denial_audits == 3
 
     async def test_successful_subscribe_writes_audit_row(
         self,

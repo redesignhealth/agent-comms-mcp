@@ -20,8 +20,9 @@ or delivery guarantee. Crucially, a successful ``send_resource_updated`` call
 does NOT imply delivery: the MCP SDK silently drops notifications with no
 exception when no GET/SSE stream is attached to the session. The real delivery
 contract is the client's catch-up read via
-``comms_get_conversation(since_seq=...)`` (for conversations) or ``comms_inbox``
-(for inboxes).
+``comms_get_conversation(since_seq=...)`` (for conversations, paging while
+``has_more`` is true) or ``comms_inbox`` (for inboxes, best-effort current-state
+snapshot capped at 100 items).
 
 Cap and prune bookkeeping: the per-agent subscription cap
 (``MAX_SUBSCRIPTIONS_PER_AGENT``) now rejects with ``SubscriptionLimitError``
@@ -122,19 +123,24 @@ async def has_capacity_for(agent_id: uuid.UUID) -> bool:
     """Return True if ``agent_id`` can accept at least one more subscription.
 
     Acquires ``_lock`` and reclaims any dead-session records for ``agent_id``
-    first before checking against ``MAX_SUBSCRIPTIONS_PER_AGENT``.
+    only when the tracked count is at or above ``MAX_SUBSCRIPTIONS_PER_AGENT``,
+    before checking against ``MAX_SUBSCRIPTIONS_PER_AGENT``.
     """
     async with _lock:
-        _reclaim_dead_for_agent_locked(agent_id)
+        if _agent_subscription_counts.get(agent_id, 0) >= MAX_SUBSCRIPTIONS_PER_AGENT:
+            _reclaim_dead_for_agent_locked(agent_id)
         return _agent_subscription_counts.get(agent_id, 0) < MAX_SUBSCRIPTIONS_PER_AGENT
 
 
-async def subscribe(uri: str, session: ServerSession, *, agent_id: uuid.UUID, sub: str) -> None:
+async def subscribe(uri: str, session: ServerSession, *, agent_id: uuid.UUID, sub: str) -> bool:
     """Register ``session`` as a subscriber of ``uri``.
 
     Idempotent per ``(uri, session)`` — re-subscribing the same session to
-    the same URI replaces its record rather than duplicating it. If
-    ``agent_id`` already holds ``MAX_SUBSCRIPTIONS_PER_AGENT`` live
+    the same URI replaces its record rather than duplicating it. Returns
+    ``True`` if a new subscription was added, or ``False`` if this was an
+    idempotent re-subscription for an existing ``(uri, session)``.
+
+    If ``agent_id`` already holds ``MAX_SUBSCRIPTIONS_PER_AGENT`` live
     subscriptions after reclaiming any dead sessions, raises
     ``SubscriptionLimitError`` — the cap now rejects rather than evicting.
     """
@@ -152,7 +158,12 @@ async def subscribe(uri: str, session: ServerSession, *, agent_id: uuid.UUID, su
         if removed_existing:
             _dec_count(agent_id)
 
-        _reclaim_dead_for_agent_locked(agent_id)
+        # Optimization (TECH-6335): only perform the full O(total subscriptions)
+        # scan when the agent's tracked count is actually at or above the cap.
+        # When strictly below cap, trust the tracked count and skip the scan.
+        if _agent_subscription_counts.get(agent_id, 0) >= MAX_SUBSCRIPTIONS_PER_AGENT:
+            _reclaim_dead_for_agent_locked(agent_id)
+
         if _agent_subscription_counts.get(agent_id, 0) >= MAX_SUBSCRIPTIONS_PER_AGENT:
             if not records:
                 _registry.pop(uri, None)
@@ -163,6 +174,7 @@ async def subscribe(uri: str, session: ServerSession, *, agent_id: uuid.UUID, su
         records = _registry.setdefault(uri, [])
         records.append(_Record(weakref.ref(session), agent_id, sub))
         _agent_subscription_counts[agent_id] = _agent_subscription_counts.get(agent_id, 0) + 1
+        return not removed_existing
 
 
 async def is_subscribed(uri: str, session: ServerSession) -> bool:

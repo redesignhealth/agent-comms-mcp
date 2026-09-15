@@ -419,8 +419,9 @@ mcp: FastMCP[Any] = FastMCP(
         "pushes carry only a URI (no payload/ordering/delivery guarantee) — treat "
         "them as hints, not events. Subscribe BEFORE reading to avoid gaps. Catch up "
         "on every hint AND periodically (~60s) via comms_get_conversation("
-        "since_seq=<page_max_seq>) for conversations (not the resource URI, which is "
-        "pinned at since_seq=0) or comms_inbox for inboxes. Re-subscribe on every "
+        "since_seq=<page_max_seq>, paging while has_more is true) for conversations (not "
+        "the resource URI, which is pinned at since_seq=0) or comms_inbox for inboxes "
+        "(best-effort current-state snapshot, capped at 100 items). Re-subscribe on every "
         "MCP re-initialize and periodically (idempotent) to recover from restarts. "
         "Subscribe fails with subscription_limit_reached if an agent holds 100 subscriptions."
     ),
@@ -531,69 +532,70 @@ async def _handle_subscribe_resource(uri: AnyUrl) -> None:
         )
         _deny_resource_subscribe()
     session = _low_level_server.request_context.session
-    # Argus round-5 SUGGESTION: peek (non-mutating) BEFORE the audit write,
-    # mirroring the unsubscribe handler's own no-op gate below -- without
-    # this, an idempotent re-subscribe (same session re-subscribing to a URI
-    # it's already subscribed to -- a legitimate no-op per
-    # `subscriptions.subscribe`'s own idempotency handling) would still write
-    # a fresh `resource.subscribe` audit row every time, unlike the
-    # symmetric no-op case on the unsubscribe side.
+    # Audit ordering tradeoff & TOCTOU elimination (TECH-6335):
     #
-    # Argus round-6 SUGGESTION: `subscriptions.subscribe()` is still called
-    # UNCONDITIONALLY below, even when `already_subscribed` is True -- it
-    # re-binds this session's record idempotently.
+    # Elsewhere (e.g. `_handle_unsubscribe_resource`), this codebase follows
+    # an "audit before mutation" pattern so that an audit DB write failure
+    # prevents modifying in-memory state. However, attempting "audit before
+    # mutation" for subscribe required a pre-check (`has_capacity_for()`)
+    # before auditing, followed by `subscribe()`. Because those were two
+    # separate lock acquisitions, concurrent requests for an agent near its
+    # cap could both pass capacity check, both write success audit rows, and
+    # then one would fail inside `subscribe()` with `SubscriptionLimitError`,
+    # leaving a false success audit row and no denial audit row.
     #
-    # Round-6 also flagged that this race is directionally WORSE than the
-    # unsubscribe TOCTOU below: unsubscribe's race can produce a SURPLUS
-    # audit row for a no-op (tolerable -- every real mutation still has
-    # >=1 row); this race, if a concurrent `notify()` prune removes the
-    # record between this peek and `subscribe()`'s re-add, could produce a
-    # real mutation with ZERO audit rows. Still accepted: it requires a
-    # concurrent prune-on-failed-send racing this exact (uri, session) in
-    # the same narrow window, and the worst case is one missing audit row
-    # for an idempotent-looking call, not a security/access-control gap.
-    already_subscribed = await subscriptions.is_subscribed(auth.canonical_uri, session)
-    if not already_subscribed:
-        if not await subscriptions.has_capacity_for(auth.caller.id):
-            async with get_session_factory()() as db_session:
-                with contextlib.suppress(AccessDeniedError):
-                    await service.deny_resource_subscribe(
-                        db_session,
-                        actor_sub=auth.base_sub,
-                        action="denied.subscribe_limit_reached",
-                        agent_id=auth.caller.id,
-                        conversation_id=auth.conversation_id,
-                        detail={"limit": subscriptions.MAX_SUBSCRIPTIONS_PER_AGENT},
-                    )
-            _deny_subscription_limit()
-        # Argus round-2 BLOCKING catch: audit BEFORE mutating the in-memory
-        # registry (was previously the other way around) -- if
-        # `audit_resource_subscription` fails, the exception now propagates
-        # before `subscriptions.subscribe` ever ran, so state and the audit
-        # trail can't diverge (a subscribe with no audit row).
-        async with get_session_factory()() as db_session:
-            await service.audit_resource_subscription(
-                db_session,
-                actor_sub=auth.base_sub,
-                agent_id=auth.caller.id,
-                action="resource.subscribe",
-                uri=auth.canonical_uri,
-                conversation_id=auth.conversation_id,
-            )
+    # We eliminate that race by performing the atomic `subscribe()` first:
+    # inside `subscriptions.py`, capacity check, dead-session reclamation,
+    # and registration all occur in a single locked critical section.
+    #
+    # If the cap is reached, `SubscriptionLimitError` is raised before any
+    # mutation occurs, and we write `denied.subscribe_limit_reached`.
+    #
+    # If `subscribe()` succeeds and registered a NEW subscription (`is_new`),
+    # we write `resource.subscribe`. To preserve the invariant that in-memory
+    # state and audit trail never diverge (the reason for the original
+    # audit-before-mutation rule), if `audit_resource_subscription` fails,
+    # we roll back the in-memory registration via `unsubscribe()` and re-raise.
+    #
+    # Idempotent re-subscribes (`is_new` is False) write no audit row,
+    # matching unsubscribe's no-op gate without any peek-then-mutate race.
     try:
-        await subscriptions.subscribe(
+        is_new = await subscriptions.subscribe(
             auth.canonical_uri, session, agent_id=auth.caller.id, sub=auth.base_sub
         )
     except subscriptions.SubscriptionLimitError:
-        # Narrow TOCTOU race: another subscribe for this agent took the last slot
-        # between has_capacity_for and subscribe(). Accepted narrow race (same
-        # class as surrounding TOCTOU races in this handler).
-        logger.error(
+        async with get_session_factory()() as db_session:
+            with contextlib.suppress(AccessDeniedError):
+                await service.deny_resource_subscribe(
+                    db_session,
+                    actor_sub=auth.base_sub,
+                    action="denied.subscribe_limit_reached",
+                    agent_id=auth.caller.id,
+                    conversation_id=auth.conversation_id,
+                    detail={"limit": subscriptions.MAX_SUBSCRIPTIONS_PER_AGENT},
+                )
+        logger.warning(
             "subscription limit reached during subscribe for agent %s on uri %r",
             auth.caller.id,
             auth.canonical_uri,
         )
         _deny_subscription_limit()
+
+    if is_new:
+        try:
+            async with get_session_factory()() as db_session:
+                await service.audit_resource_subscription(
+                    db_session,
+                    actor_sub=auth.base_sub,
+                    agent_id=auth.caller.id,
+                    action="resource.subscribe",
+                    uri=auth.canonical_uri,
+                    conversation_id=auth.conversation_id,
+                )
+        except Exception:
+            # Roll back in-memory registration so state and audit log cannot diverge.
+            await subscriptions.unsubscribe(auth.canonical_uri, session)
+            raise
 
 
 @_low_level_server.unsubscribe_resource()  # type: ignore[no-untyped-call, untyped-decorator]
