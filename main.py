@@ -7,6 +7,7 @@ auth, with fail-closed per-tool scope enforcement.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -551,16 +552,18 @@ async def _handle_subscribe_resource(uri: AnyUrl) -> None:
     # If the cap is reached, `SubscriptionLimitError` is raised before any
     # mutation occurs, and we write `denied.subscribe_limit_reached`.
     #
-    # If `subscribe()` succeeds and registered a NEW subscription (`is_new`),
+    # If `subscribe()` succeeds and registered a NEW subscription (`record is not None`),
     # we write `resource.subscribe`. To preserve the invariant that in-memory
     # state and audit trail never diverge (the reason for the original
-    # audit-before-mutation rule), if `audit_resource_subscription` fails,
-    # we roll back the in-memory registration via `unsubscribe()` and re-raise.
+    # audit-before-mutation rule), if `audit_resource_subscription` fails (or is
+    # cancelled), we roll back the in-memory registration via `remove_if_current()`
+    # (matching by exact record identity so a concurrent newer subscription is
+    # never destroyed) and re-raise.
     #
-    # Idempotent re-subscribes (`is_new` is False) write no audit row,
+    # Idempotent re-subscribes (`record is None`) write no audit row,
     # matching unsubscribe's no-op gate without any peek-then-mutate race.
     try:
-        is_new = await subscriptions.subscribe(
+        record = await subscriptions.subscribe(
             auth.canonical_uri, session, agent_id=auth.caller.id, sub=auth.base_sub
         )
     except subscriptions.SubscriptionLimitError:
@@ -581,7 +584,7 @@ async def _handle_subscribe_resource(uri: AnyUrl) -> None:
         )
         _deny_subscription_limit()
 
-    if is_new:
+    if record is not None:
         try:
             async with get_session_factory()() as db_session:
                 await service.audit_resource_subscription(
@@ -592,9 +595,9 @@ async def _handle_subscribe_resource(uri: AnyUrl) -> None:
                     uri=auth.canonical_uri,
                     conversation_id=auth.conversation_id,
                 )
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             # Roll back in-memory registration so state and audit log cannot diverge.
-            await subscriptions.unsubscribe(auth.canonical_uri, session)
+            await subscriptions.remove_if_current(auth.canonical_uri, session, record)
             raise
 
 

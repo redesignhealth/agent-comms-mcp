@@ -27,7 +27,7 @@ import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import anyio
@@ -116,6 +116,61 @@ class TestRegistrySubscribeUnsubscribe:
 
     async def test_unsubscribe_unknown_uri_is_a_noop(self) -> None:
         await subscriptions.unsubscribe("comms://never-subscribed", _FakeSession())  # type: ignore[arg-type]
+
+    async def test_remove_if_current_success(self) -> None:
+        session = _FakeSession()
+        agent_id = _new_agent_id()
+        record = await subscriptions.subscribe("comms://x", session, agent_id=agent_id, sub="a")  # type: ignore[arg-type]
+        assert record is not None
+        assert subscriptions._agent_subscription_counts[agent_id] == 1
+
+        removed = await subscriptions.remove_if_current("comms://x", session, record)  # type: ignore[arg-type]
+        assert removed is True
+        assert "comms://x" not in subscriptions._registry
+        assert agent_id not in subscriptions._agent_subscription_counts
+
+        # Second attempt with same record is a no-op
+        removed_again = await subscriptions.remove_if_current("comms://x", session, record)  # type: ignore[arg-type]
+        assert removed_again is False
+
+    async def test_remove_if_current_stale_record_is_noop_and_preserves_current(self) -> None:
+        """Reproduce the 3-step audit-failure race:
+        1. Coroutine A calls subscribe(uri, session) -> succeeds, registers record R1.
+        2. Coroutine B (same uri, same session, e.g. client re-subscribe) calls
+           subscribe(uri, session) -> replaces R1 with R2 (returns None).
+        3. A's audit write fails and A calls remove_if_current with R1.
+        Assert: returns False, R2 is kept intact, count remains 1.
+        """
+        session = _FakeSession()
+        agent_id = _new_agent_id()
+
+        # Step 1: Coroutine A subscribes and gets record R1
+        r1 = await subscriptions.subscribe("comms://x", session, agent_id=agent_id, sub="a")  # type: ignore[arg-type]
+        assert r1 is not None
+        assert subscriptions._agent_subscription_counts[agent_id] == 1
+        assert subscriptions._registry["comms://x"][0] is r1
+
+        # Step 2: Coroutine B re-subscribes same session to same URI (idempotent replace)
+        r2 = await subscriptions.subscribe("comms://x", session, agent_id=agent_id, sub="a")  # type: ignore[arg-type]
+        assert r2 is None  # Idempotent re-subscribe
+        current_record = subscriptions._registry["comms://x"][0]
+        assert current_record is not r1  # R1 was replaced by a new record
+
+        # Step 3: A's rollback fires with R1
+        removed = await subscriptions.remove_if_current("comms://x", session, r1)  # type: ignore[arg-type]
+        assert removed is False
+        # The newer record R2 was NOT removed
+        assert len(subscriptions._registry["comms://x"]) == 1
+        assert subscriptions._registry["comms://x"][0] is current_record
+        assert subscriptions._agent_subscription_counts[agent_id] == 1
+
+    async def test_remove_if_current_unknown_uri_returns_false(self) -> None:
+        session = _FakeSession()
+        agent_id = _new_agent_id()
+        record = await subscriptions.subscribe("comms://x", session, agent_id=agent_id, sub="a")  # type: ignore[arg-type]
+        assert record is not None
+        removed = await subscriptions.remove_if_current("comms://other", session, record)  # type: ignore[arg-type]
+        assert removed is False
 
 
 def _new_agent_id() -> uuid.UUID:
@@ -336,8 +391,8 @@ class TestRegistryPerAgentCap:
         session = _FakeSession()
 
         with patch("subscriptions._reclaim_dead_for_agent_locked") as mock_reclaim:
-            is_new = await subscriptions.subscribe("comms://x", session, agent_id=agent_id, sub="a")  # type: ignore[arg-type]
-            assert is_new is True
+            record = await subscriptions.subscribe("comms://x", session, agent_id=agent_id, sub="a")  # type: ignore[arg-type]
+            assert isinstance(record, subscriptions._Record)
             mock_reclaim.assert_not_called()
 
         assert subscriptions._agent_subscription_counts[agent_id] == 1
@@ -349,6 +404,20 @@ class TestRegistryPerAgentCap:
 
     async def test_concurrent_subscribes_at_cap_only_one_succeeds(self, monkeypatch: Any) -> None:
         monkeypatch.setattr(subscriptions, "MAX_SUBSCRIPTIONS_PER_AGENT", 2)
+
+        # Force genuine interleaving: replace subscriptions._lock with a lock that
+        # yields to the event loop immediately after acquisition while still holding
+        # the lock. Under cooperative scheduling, this proves that concurrent callers
+        # run, attempt to enter the critical section, and are correctly blocked by
+        # the lock rather than succeeding due to lack of suspension points.
+        class _InterleavingLock(asyncio.Lock):
+            async def acquire(self) -> Literal[True]:
+                acquired = await super().acquire()
+                await asyncio.sleep(0)
+                return acquired
+
+        monkeypatch.setattr(subscriptions, "_lock", _InterleavingLock())
+
         agent_id = _new_agent_id()
         # Seed 1 subscription so the agent is sitting at cap - 1
         initial_session = _FakeSession()
@@ -358,7 +427,7 @@ class TestRegistryPerAgentCap:
         # Fire 5 concurrent subscribe calls for different URIs
         sessions = [_FakeSession() for _ in range(5)]
 
-        async def _do_subscribe(i: int) -> bool:
+        async def _do_subscribe(i: int) -> subscriptions._Record | None:
             return await subscriptions.subscribe(
                 f"comms://x_race_{i}",
                 sessions[i],
@@ -370,7 +439,7 @@ class TestRegistryPerAgentCap:
             *(_do_subscribe(i) for i in range(5)), return_exceptions=True
         )
 
-        successes = [r for r in results if r is True]
+        successes = [r for r in results if isinstance(r, subscriptions._Record)]
         failures = [r for r in results if isinstance(r, subscriptions.SubscriptionLimitError)]
 
         assert len(successes) == 1
@@ -956,6 +1025,14 @@ class TestSubscribeAuthorization:
         session: AsyncSession,
         monkeypatch: Any,
     ) -> None:
+        """Concurrency test under asyncio's cooperative model.
+
+        Exercises concurrent MCP client subscribe requests where handlers
+        naturally yield across async DB queries (authorize_resource_subscribe,
+        service.audit_resource_subscription, service.deny_resource_subscribe).
+        Verifies that exactly one success audit row and N-1 denial audit rows
+        are written to the database with no false successes or missed denials.
+        """
         monkeypatch.setattr(subscriptions, "MAX_SUBSCRIPTIONS_PER_AGENT", 2)
         member_sub = "sub-race-member"
         member_token = _token(member_sub)
@@ -1915,8 +1992,9 @@ class TestAuditBeforeMutationOrdering:
             async with Client(main.mcp) as client:
                 with pytest.raises(Exception):  # noqa: B017 -- any client-side surfacing is fine
                     await client.session.subscribe_resource(AnyUrl(uri))
-                # The failed audit write must have happened BEFORE any
-                # registry mutation -- so the registry must be untouched.
+                # The failed audit write must have triggered rollback of the
+                # in-memory registration via remove_if_current -- so the
+                # registry must be untouched.
                 # `client.session` is the CLIENT-side `mcp.ClientSession`,
                 # not the server-side `ServerSession` object the registry
                 # stores weakrefs to (those two are distinct objects
@@ -1924,6 +2002,38 @@ class TestAuditBeforeMutationOrdering:
                 # server-side one isn't directly reachable from test code)
                 # -- verify via the registry's own shape instead of a
                 # session-identity check.
+                assert uri not in subscriptions._registry
+
+    async def test_cancelled_audit_rolls_back_subscribe_registry_and_reraises(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        conversation_id, _ids = await _start_open_conversation(
+            main, test_session_factory, "audit-cancel-sub-owner", "audit-cancel-sub-member"
+        )
+        member_token = _token("audit-cancel-sub-member")
+        await _call(
+            main,
+            test_session_factory,
+            member_token,
+            "comms_accept",
+            {"conversation_id": conversation_id},
+        )
+        uri = f"comms://comms/conversations/{conversation_id}"
+
+        with (
+            _OIDC_PATCH,
+            _ENV_PATCH,
+            patch("providers.comms.get_access_token", return_value=member_token),
+            patch("providers.comms.get_session_factory", return_value=test_session_factory),
+            patch("main.get_session_factory", return_value=test_session_factory),
+            patch(
+                "service.audit_resource_subscription",
+                AsyncMock(side_effect=asyncio.CancelledError()),
+            ),
+        ):
+            async with Client(main.mcp) as client:
+                with pytest.raises(Exception):  # noqa: B017 -- any client-side surfacing is fine
+                    await client.session.subscribe_resource(AnyUrl(uri))
                 assert uri not in subscriptions._registry
 
     async def test_failed_audit_leaves_unsubscribe_registry_unmutated(
