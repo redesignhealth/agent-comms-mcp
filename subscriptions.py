@@ -132,13 +132,16 @@ async def has_capacity_for(agent_id: uuid.UUID) -> bool:
         return _agent_subscription_counts.get(agent_id, 0) < MAX_SUBSCRIPTIONS_PER_AGENT
 
 
-async def subscribe(uri: str, session: ServerSession, *, agent_id: uuid.UUID, sub: str) -> bool:
+async def subscribe(
+    uri: str, session: ServerSession, *, agent_id: uuid.UUID, sub: str
+) -> _Record | None:
     """Register ``session`` as a subscriber of ``uri``.
 
     Idempotent per ``(uri, session)`` — re-subscribing the same session to
     the same URI replaces its record rather than duplicating it. Returns
-    ``True`` if a new subscription was added, or ``False`` if this was an
-    idempotent re-subscription for an existing ``(uri, session)``.
+    the created ``_Record`` instance if a new subscription was added, or
+    ``None`` if this was an idempotent re-subscription for an existing
+    ``(uri, session)``.
 
     If ``agent_id`` already holds ``MAX_SUBSCRIPTIONS_PER_AGENT`` live
     subscriptions after reclaiming any dead sessions, raises
@@ -172,9 +175,10 @@ async def subscribe(uri: str, session: ServerSession, *, agent_id: uuid.UUID, su
             )
 
         records = _registry.setdefault(uri, [])
-        records.append(_Record(weakref.ref(session), agent_id, sub))
+        new_record = _Record(weakref.ref(session), agent_id, sub)
+        records.append(new_record)
         _agent_subscription_counts[agent_id] = _agent_subscription_counts.get(agent_id, 0) + 1
-        return not removed_existing
+        return new_record if not removed_existing else None
 
 
 async def is_subscribed(uri: str, session: ServerSession) -> bool:
@@ -224,6 +228,35 @@ async def unsubscribe(uri: str, session: ServerSession) -> bool:
             _registry[uri] = remaining
         else:
             del _registry[uri]
+        return removed
+
+
+async def remove_if_current(uri: str, session: ServerSession, record: _Record) -> bool:
+    """Remove ``record`` from ``uri``'s subscribers only if it is still the current record.
+
+    Used by ``main.py``'s subscribe rollback on audit failure (TECH-6335): if
+    another coroutine or client re-subscribe has since replaced or removed this
+    exact record, this is a no-op returning ``False``, avoiding accidentally
+    destroying a newer, valid subscription.
+
+    Returns ``True`` if ``record`` was still registered and removed, ``False`` otherwise.
+    """
+    async with _lock:
+        records = _registry.get(uri)
+        if not records:
+            return False
+        remaining = []
+        removed = False
+        for r in records:
+            if r is record:
+                _dec_count(r.agent_id)
+                removed = True
+                continue
+            remaining.append(r)
+        if remaining:
+            _registry[uri] = remaining
+        else:
+            _registry.pop(uri, None)
         return removed
 
 
