@@ -131,10 +131,11 @@ convention.
 pushes (`notifications/resources/updated`) are strictly at-most-once,
 best-effort hints with no payload or delivery guarantee (a successful server send
 call does not imply receipt). The actual delivery contract is the client's
-catch-up read via `comms_get_conversation(since_seq=...)` for conversations or
-`comms_inbox` for inboxes. Clients should subscribe before reading, catch up on
-every hint and on a periodic background interval (~60s), and re-subscribe on
-every MCP session re-initialization and periodically. An agent may hold up to
+catch-up read via `comms_get_conversation(since_seq=...)` (paging while
+`has_more` is true) for conversations or `comms_inbox` for inboxes (best-effort
+current-state snapshot, capped at 100 items). Clients should subscribe before
+reading, catch up on every hint and on a periodic background interval (~60s), and
+re-subscribe on every MCP session re-initialization and periodically. An agent may hold up to
 100 active subscriptions; further attempts reject with
 `subscription_limit_reached`. See `docs/DESIGN.md` § "Delivery semantics and gap
 recovery (TECH-6335)" for full details.

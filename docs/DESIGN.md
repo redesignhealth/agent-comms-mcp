@@ -870,9 +870,21 @@ to the session.
 
 Because pushes are best-effort hints, the real delivery contract is the client's
 catch-up read via `comms_get_conversation(since_seq=...)` (for conversations) or
-`comms_inbox` (for inboxes). No data is ever lost across restarts or disconnects;
-the only impact of a missed push is notification latency, bounded by the client's
-periodic catch-up interval.
+`comms_inbox` (for inboxes):
+
+- **Conversations:** Catch-up is completely lossless across restarts or disconnects,
+  **PROVIDED the client fully pages via `since_seq`/`page_max_seq` until `has_more=False`
+  on every catch-up**. A single unpaginated read is not sufficient if more than 500
+  messages accrued. When fully paged, no message data is ever lost across restarts or
+  disconnects; the only impact of a missed push is notification latency, bounded by the
+  client's periodic catch-up interval.
+- **Inboxes:** Catch-up via `comms_inbox` is best-effort **CURRENT-STATE reconciliation**
+  (an accurate snapshot of what is currently unread right now), **NOT** lossless
+  event-by-event recovery. `comms_inbox` caps each returned collection (unread conversations,
+  pending invites) at 100 items with no pagination mechanism (see `providers/comms.py`
+  § "No cursor/pagination for this tool"). If more than 100 qualifying items exist, items
+  beyond the cap are not visible until earlier items are resolved (marked read, accepted,
+  or declined) — do not assume or claim "no data lost" for the inbox path.
 
 **The client contract (5 points):**
 
@@ -885,9 +897,13 @@ periodic catch-up interval.
 3. **Catch up on hints and periodically:** On receiving a notification hint —
    AND on a periodic background interval (e.g. ~60s) regardless of hints —
    catch up via `comms_get_conversation(since_seq=<last page_max_seq>)` for
-   conversations, or via `comms_inbox` for inboxes. Note: do NOT re-read the
-   `comms://comms/conversations/{id}` resource for catch-up, because that resource
-   is pinned at `since_seq=0` and returns only the oldest 500 messages.
+   conversations, paging repeatedly while `has_more` is true until exhausted (a
+   single unpaginated read is insufficient if more than 500 messages accrued).
+   For inboxes, reconcile via `comms_inbox` (best-effort current-state snapshot
+   of up to 100 unread conversations and 100 pending invites; not paginated).
+   Note: do NOT re-read the `comms://comms/conversations/{id}` resource for
+   catch-up, because that resource is pinned at `since_seq=0` and returns only
+   the oldest 500 messages.
 4. **Re-subscribe on re-initialize and periodically:** Because server restarts,
    deploys, and task recycles drop the ephemeral in-memory subscription registry,
    clients must re-subscribe on every MCP session re-initialization and periodically
