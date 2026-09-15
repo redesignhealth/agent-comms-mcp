@@ -7,6 +7,7 @@ auth, with fail-closed per-tool scope enforcement.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -409,12 +410,14 @@ mcp: FastMCP[Any] = FastMCP(
         "'availability_request']). A restricted agent's declared list is "
         "enforced: a message of a type it hasn't declared is denied on the "
         "sender's call, with no direct feedback to the recipient. "
-        "Resource subscriptions (resources/subscribe on conversation and "
-        "inbox URIs) are backed by a process-local, in-memory registry: "
-        "this deployment runs a single task (desired_count=1), and the "
-        "registry does not survive a restart or re-initialize -- clients "
-        "must re-subscribe every time they re-initialize the MCP session, "
-        "not just once at first connect."
+        "Resource subscriptions (resources/subscribe on conversation and inbox URIs): "
+        "pushes carry only a URI (no payload/ordering/delivery guarantee) — treat "
+        "them as hints, not events. Subscribe BEFORE reading to avoid gaps. Catch up "
+        "on every hint AND periodically (~60s) via comms_get_conversation("
+        "since_seq=<page_max_seq>) for conversations (not the resource URI, which is "
+        "pinned at since_seq=0) or comms_inbox for inboxes. Re-subscribe on every "
+        "MCP re-initialize and periodically (idempotent) to recover from restarts. "
+        "Subscribe fails with subscription_limit_reached if an agent holds 100 subscriptions."
     ),
     auth=_auth_provider,
 )
@@ -430,6 +433,9 @@ mcp.mount(comms_server, namespace="comms")
 mcp.mount(proposals_server, namespace="proposals")
 
 _RESOURCE_SUBSCRIBE_DENIAL_MESSAGE = "access_denied: not authorized for this resource"
+_RESOURCE_SUBSCRIBE_LIMIT_MESSAGE = (
+    "subscription_limit_reached: too many active subscriptions for this agent"
+)
 
 
 def _deny_resource_subscribe() -> NoReturn:
@@ -454,6 +460,19 @@ def _deny_resource_subscribe() -> NoReturn:
     """
     raise McpError(
         mt.ErrorData(code=mt.INVALID_PARAMS, message=_RESOURCE_SUBSCRIBE_DENIAL_MESSAGE)
+    ) from None
+
+
+def _deny_subscription_limit() -> NoReturn:
+    """Specific denial when an agent exceeds its subscription cap (TECH-6335).
+
+    Deliberately distinct from ``_RESOURCE_SUBSCRIBE_DENIAL_MESSAGE``: the caller
+    is already authorized, and this is an operational limit on its own account,
+    so there is no enumeration risk. The caller needs to distinguish this from
+    access denied to react (e.g. unsubscribe an older resource).
+    """
+    raise McpError(
+        mt.ErrorData(code=mt.INVALID_PARAMS, message=_RESOURCE_SUBSCRIBE_LIMIT_MESSAGE)
     ) from None
 
 
@@ -517,15 +536,7 @@ async def _handle_subscribe_resource(uri: AnyUrl) -> None:
     #
     # Argus round-6 SUGGESTION: `subscriptions.subscribe()` is still called
     # UNCONDITIONALLY below, even when `already_subscribed` is True -- it
-    # drops and re-appends the `_Record` with a freshly incremented `seq`,
-    # which shifts this subscription to the newest position in the agent's
-    # cap-eviction queue. That IS a real state mutation (not "nothing"), and
-    # it now happens with no audit row when idempotent. Accepted: the only
-    # externally-observable fact this changes is eviction ORDERING under a
-    # future cap-eviction, not the set of active subscriptions itself, and
-    # auditing every idempotent re-subscribe (MCP clients commonly
-    # re-subscribe after reconnect) would produce far more audit-log noise
-    # than the ordering effect is worth tracking.
+    # re-binds this session's record idempotently.
     #
     # Round-6 also flagged that this race is directionally WORSE than the
     # unsubscribe TOCTOU below: unsubscribe's race can produce a SURPLUS
@@ -538,6 +549,18 @@ async def _handle_subscribe_resource(uri: AnyUrl) -> None:
     # for an idempotent-looking call, not a security/access-control gap.
     already_subscribed = await subscriptions.is_subscribed(auth.canonical_uri, session)
     if not already_subscribed:
+        if not await subscriptions.has_capacity_for(auth.caller.id):
+            async with get_session_factory()() as db_session:
+                with contextlib.suppress(AccessDeniedError):
+                    await service.deny_resource_subscribe(
+                        db_session,
+                        actor_sub=auth.base_sub,
+                        action="denied.subscribe_limit_reached",
+                        agent_id=auth.caller.id,
+                        conversation_id=auth.conversation_id,
+                        detail={"limit": subscriptions.MAX_SUBSCRIPTIONS_PER_AGENT},
+                    )
+            _deny_subscription_limit()
         # Argus round-2 BLOCKING catch: audit BEFORE mutating the in-memory
         # registry (was previously the other way around) -- if
         # `audit_resource_subscription` fails, the exception now propagates
@@ -552,9 +575,20 @@ async def _handle_subscribe_resource(uri: AnyUrl) -> None:
                 uri=auth.canonical_uri,
                 conversation_id=auth.conversation_id,
             )
-    await subscriptions.subscribe(
-        auth.canonical_uri, session, agent_id=auth.caller.id, sub=auth.base_sub
-    )
+    try:
+        await subscriptions.subscribe(
+            auth.canonical_uri, session, agent_id=auth.caller.id, sub=auth.base_sub
+        )
+    except subscriptions.SubscriptionLimitError:
+        # Narrow TOCTOU race: another subscribe for this agent took the last slot
+        # between has_capacity_for and subscribe(). Accepted narrow race (same
+        # class as surrounding TOCTOU races in this handler).
+        logger.error(
+            "subscription limit reached during subscribe for agent %s on uri %r",
+            auth.caller.id,
+            auth.canonical_uri,
+        )
+        _deny_subscription_limit()
 
 
 @_low_level_server.unsubscribe_resource()  # type: ignore[no-untyped-call, untyped-decorator]

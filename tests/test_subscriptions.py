@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import anyio
 import httpx
 import mcp.types as mt
 import pytest
@@ -60,11 +61,23 @@ _DEFAULT_TEST_DATABASE_URL = "postgresql://postgres:postgres@localhost:55432/age
 class _FakeSession:
     """A minimal weakref-able stand-in for ``mcp.server.session.ServerSession``."""
 
-    def __init__(self, *, fail: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail: bool = False,
+        exc: BaseException | None = None,
+        delay_s: float | None = None,
+    ) -> None:
         self.fail = fail
+        self.exc = exc
+        self.delay_s = delay_s
         self.calls: list[str] = []
 
     async def send_resource_updated(self, uri: str) -> None:
+        if self.delay_s is not None:
+            await asyncio.sleep(self.delay_s)
+        if self.exc is not None:
+            raise self.exc
         if self.fail:
             raise RuntimeError("boom")
         self.calls.append(str(uri))
@@ -74,11 +87,9 @@ class _FakeSession:
 async def _clear_registry() -> AsyncIterator[None]:
     subscriptions._registry.clear()
     subscriptions._agent_subscription_counts.clear()
-    subscriptions._seq_counter = 0
     yield
     subscriptions._registry.clear()
     subscriptions._agent_subscription_counts.clear()
-    subscriptions._seq_counter = 0
 
 
 class TestRegistrySubscribeUnsubscribe:
@@ -181,17 +192,46 @@ class TestRegistryNotify:
         await subscriptions.notify("comms://x")
         assert "comms://x" not in subscriptions._registry
 
-    async def test_failed_send_prunes_the_record(self) -> None:
+    async def test_generic_send_failure_does_not_prune_the_record(self, caplog: Any) -> None:
         agent_id = _new_agent_id()
         session = _FakeSession(fail=True)
         await subscriptions.subscribe("comms://x", session, agent_id=agent_id, sub="a")  # type: ignore[arg-type]
 
-        await subscriptions.notify("comms://x")  # swallows the RuntimeError
-        assert "comms://x" not in subscriptions._registry
+        with caplog.at_level("WARNING"):
+            await subscriptions.notify("comms://x")  # logs warning and retains subscription
+        assert "comms://x" in subscriptions._registry
+        assert subscriptions._agent_subscription_counts[agent_id] == 1
+        assert "notify failed for 'comms://x'" in caplog.text
+        assert "keeping subscription" in caplog.text
 
-        # A second notify must not attempt to call the (now-removed) session
-        # again -- nothing left to prune, and no exception either way.
-        await subscriptions.notify("comms://x")
+    @pytest.mark.parametrize("exc", [anyio.ClosedResourceError(), anyio.BrokenResourceError()])
+    async def test_closed_or_broken_stream_prunes_the_record(
+        self, exc: BaseException, caplog: Any
+    ) -> None:
+        agent_id = _new_agent_id()
+        session = _FakeSession(exc=exc)
+        await subscriptions.subscribe("comms://x", session, agent_id=agent_id, sub="a")  # type: ignore[arg-type]
+
+        with caplog.at_level("WARNING"):
+            await subscriptions.notify("comms://x")
+        assert "comms://x" not in subscriptions._registry
+        assert agent_id not in subscriptions._agent_subscription_counts
+        assert "after closed/broken stream" in caplog.text
+
+    async def test_slow_consumer_times_out_without_pruning(
+        self, monkeypatch: Any, caplog: Any
+    ) -> None:
+        monkeypatch.setattr(subscriptions, "NOTIFY_SEND_TIMEOUT_SECONDS", 0.05)
+        agent_id = _new_agent_id()
+        session = _FakeSession(delay_s=0.2)
+        await subscriptions.subscribe("comms://x", session, agent_id=agent_id, sub="a")  # type: ignore[arg-type]
+
+        with caplog.at_level("WARNING"):
+            await subscriptions.notify("comms://x")
+        assert "comms://x" in subscriptions._registry
+        assert subscriptions._agent_subscription_counts[agent_id] == 1
+        assert "notify timed out after" in caplog.text
+        assert "keeping subscription" in caplog.text
 
     async def test_dead_weakref_excluded_by_recipient_filter_is_still_pruned_and_decremented(
         self,
@@ -223,92 +263,72 @@ class TestRegistryNotify:
 
 
 class TestRegistryPerAgentCap:
-    async def test_oldest_subscription_is_evicted_at_the_cap(self, monkeypatch: Any) -> None:
+    async def test_subscribe_at_cap_raises_subscription_limit_error(self, monkeypatch: Any) -> None:
         monkeypatch.setattr(subscriptions, "MAX_SUBSCRIPTIONS_PER_AGENT", 2)
         agent_id = _new_agent_id()
-        sessions = [_FakeSession() for _ in range(3)]
-        for index, session in enumerate(sessions):
-            await subscriptions.subscribe(f"comms://x{index}", session, agent_id=agent_id, sub="a")  # type: ignore[arg-type]
+        sessions = [_FakeSession(), _FakeSession(), _FakeSession()]
+        await subscriptions.subscribe("comms://x0", sessions[0], agent_id=agent_id, sub="a")  # type: ignore[arg-type]
+        await subscriptions.subscribe("comms://x1", sessions[1], agent_id=agent_id, sub="a")  # type: ignore[arg-type]
 
+        with pytest.raises(
+            subscriptions.SubscriptionLimitError, match="already holds 2 subscriptions"
+        ):
+            await subscriptions.subscribe("comms://x2", sessions[2], agent_id=agent_id, sub="a")  # type: ignore[arg-type]
+
+        # Both pre-existing subscriptions are untouched
         assert subscriptions._agent_subscription_counts[agent_id] == 2
+        assert "comms://x0" in subscriptions._registry
+        assert "comms://x1" in subscriptions._registry
+        assert "comms://x2" not in subscriptions._registry
+
+        # Pre-existing subscriptions are still deliverable
+        await subscriptions.notify("comms://x0")
+        assert sessions[0].calls == ["comms://x0"]
+
+    async def test_has_capacity_for_reclaims_dead_records(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(subscriptions, "MAX_SUBSCRIPTIONS_PER_AGENT", 2)
+        agent_id = _new_agent_id()
+
+        doomed_session: _FakeSession | None = _FakeSession()
+        live_session = _FakeSession()
+        await subscriptions.subscribe("comms://x0", doomed_session, agent_id=agent_id, sub="a")  # type: ignore[arg-type]
+        await subscriptions.subscribe("comms://x1", live_session, agent_id=agent_id, sub="a")  # type: ignore[arg-type]
+
+        # Both sessions are live, count is 2 (at cap)
+        assert subscriptions._agent_subscription_counts[agent_id] == 2
+
+        # Drop reference to doomed_session and force GC
+        del doomed_session
+        gc.collect()
+
+        # Count in bookkeeping is still 2 before reclaim
+        assert subscriptions._agent_subscription_counts[agent_id] == 2
+
+        # has_capacity_for should reclaim the dead record for comms://x0 and return True
+        has_cap = await subscriptions.has_capacity_for(agent_id)
+        assert has_cap is True
+        assert subscriptions._agent_subscription_counts[agent_id] == 1
         assert "comms://x0" not in subscriptions._registry
         assert "comms://x1" in subscriptions._registry
-        assert "comms://x2" in subscriptions._registry
 
-    async def test_eviction_uses_seq_not_dict_order_when_they_diverge(
-        self, monkeypatch: Any
-    ) -> None:
-        """Discriminates true seq-based eviction from a regression back to
-        dict/URI-iteration-order eviction (Argus round-3 SUGGESTION): a
-        naive test that only ever inserts URIs in seq order can't tell the
-        two algorithms apart, since they'd agree on every case where an
-        agent's own dict-position order happens to match its own seq order.
-
-        Divergence requires a URI another agent already subscribed to
-        BEFORE this agent ever touched it: that URI's dict position reflects
-        when it first entered `_registry` (via the OTHER agent), not when
-        THIS agent subscribed to it -- so this agent's chronologically NEWER
-        record can sit at an EARLIER dict position than its chronologically
-        OLDER record in a URI unique to it.
-        """
+    async def test_has_capacity_for_corrects_diverged_count(self, monkeypatch: Any) -> None:
         monkeypatch.setattr(subscriptions, "MAX_SUBSCRIPTIONS_PER_AGENT", 2)
         agent_id = _new_agent_id()
-        other_agent_id = _new_agent_id()
-        # Argus round-4 SUGGESTION: bound to locals so these sessions stay
-        # alive (and their weakrefs live) through the assertions below --
-        # an earlier revision constructed these inline as call arguments,
-        # letting each one get garbage-collected immediately after its own
-        # `subscribe()` call returned, so this test was actually exercising
-        # dead-weakref cleanup rather than live-subscription eviction
-        # ordering.
-        other_session, own_session, shared_session, third_session = (
-            _FakeSession(),
-            _FakeSession(),
-            _FakeSession(),
-            _FakeSession(),
-        )
+        # Count says 2, but registry has zero records
+        subscriptions._agent_subscription_counts[agent_id] = 2
 
-        # "shared" enters `_registry` via `other_agent_id` first, so it sits
-        # at dict position 0 well before `agent_id` ever subscribes to it.
-        await subscriptions.subscribe(
-            "comms://shared",
-            other_session,  # type: ignore[arg-type]
-            agent_id=other_agent_id,
-            sub="other",
-        )
-        # `agent_id`'s chronologically OLDEST record: a URI unique to it,
-        # inserted into the dict only now (dict position 1).
-        await subscriptions.subscribe(
-            "comms://own",
-            own_session,  # type: ignore[arg-type]
-            agent_id=agent_id,
-            sub="a",
-        )
-        # `agent_id`'s chronologically NEWEST record: "shared" already
-        # exists in the dict (from `other_agent_id`) at position 0 -- lower
-        # dict position than "own" despite a higher seq.
-        await subscriptions.subscribe(
-            "comms://shared",
-            shared_session,  # type: ignore[arg-type]
-            agent_id=agent_id,
-            sub="a",
-        )
-        assert subscriptions._agent_subscription_counts[agent_id] == 2
+        assert await subscriptions.has_capacity_for(agent_id) is True
+        assert agent_id not in subscriptions._agent_subscription_counts
 
-        # Push `agent_id` over the cap. Dict-order eviction (the regression
-        # this test guards against) would scan "shared" first and evict
-        # `agent_id`'s record there -- the wrong choice, since "own" is
-        # `agent_id`'s actual oldest record by seq.
-        await subscriptions.subscribe(
-            "comms://third",
-            third_session,  # type: ignore[arg-type]
-            agent_id=agent_id,
-            sub="a",
-        )
+    async def test_subscribe_recovers_from_diverged_count(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(subscriptions, "MAX_SUBSCRIPTIONS_PER_AGENT", 2)
+        agent_id = _new_agent_id()
+        subscriptions._agent_subscription_counts[agent_id] = 2
 
-        assert "comms://own" not in subscriptions._registry
-        assert any(r.agent_id == agent_id for r in subscriptions._registry["comms://shared"])
-        assert "comms://third" in subscriptions._registry
+        session = _FakeSession()
+        await subscriptions.subscribe("comms://x", session, agent_id=agent_id, sub="a")  # type: ignore[arg-type]
+        assert subscriptions._agent_subscription_counts[agent_id] == 1
+        assert len(subscriptions._registry["comms://x"]) == 1
 
 
 class TestNotifyConversationEvent:
@@ -788,6 +808,100 @@ class TestSubscribeAuthorization:
                         AnyUrl("comms://comms/conversations/not-a-uuid-at-all")
                     )
 
+    async def test_subscribe_at_cap_is_denied_with_limit_reached_error(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        session: AsyncSession,
+        monkeypatch: Any,
+    ) -> None:
+        monkeypatch.setattr(subscriptions, "MAX_SUBSCRIPTIONS_PER_AGENT", 1)
+        conversation_id1, _ids1 = await _start_open_conversation(
+            main, test_session_factory, "sub-cap-owner", "sub-cap-member"
+        )
+        member_token = _token("sub-cap-member")
+        await _call(
+            main,
+            test_session_factory,
+            member_token,
+            "comms_accept",
+            {"conversation_id": conversation_id1},
+        )
+        uri1 = f"comms://comms/conversations/{conversation_id1}"
+
+        collector = _NotificationCollector()
+
+        async with Client(main.mcp, message_handler=collector) as client:
+            # 1st subscription succeeds
+            with (
+                _OIDC_PATCH,
+                _ENV_PATCH,
+                patch("providers.comms.get_access_token", return_value=member_token),
+                patch("providers.comms.get_session_factory", return_value=test_session_factory),
+                patch("main.get_session_factory", return_value=test_session_factory),
+            ):
+                await client.session.subscribe_resource(AnyUrl(uri1))
+            assert len(subscriptions._registry.get(uri1, [])) == 1
+
+            # Create 2nd conversation
+            conversation_id2, _ids2 = await _start_open_conversation(
+                main, test_session_factory, "sub-cap-owner", "sub-cap-member"
+            )
+            await _call(
+                main,
+                test_session_factory,
+                member_token,
+                "comms_accept",
+                {"conversation_id": conversation_id2},
+            )
+            uri2 = f"comms://comms/conversations/{conversation_id2}"
+
+            # 2nd subscription must fail with subscription_limit_reached
+            with (
+                _OIDC_PATCH,
+                _ENV_PATCH,
+                patch("providers.comms.get_access_token", return_value=member_token),
+                patch("providers.comms.get_session_factory", return_value=test_session_factory),
+                patch("main.get_session_factory", return_value=test_session_factory),
+            ):
+                with pytest.raises(McpError) as exc_info:
+                    await client.session.subscribe_resource(AnyUrl(uri2))
+            assert "subscription_limit_reached" in str(exc_info.value)
+            assert "access_denied" not in str(exc_info.value)
+
+            # Pre-existing subscription still works
+            owner_token = _token("sub-cap-owner")
+            await _call(
+                main,
+                test_session_factory,
+                owner_token,
+                "comms_post_message",
+                {
+                    "conversation_id": conversation_id1,
+                    "message_type": "needs_clarification",
+                    "payload": {"about_seq": 1},
+                },
+            )
+            await _wait_until(lambda: uri1 in collector.uris)
+
+        # Audit row verification: denied.subscribe_limit_reached exists
+        audit_row = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT action, detail FROM audit_log WHERE actor_sub = :actor_sub "
+                        "AND action = 'denied.subscribe_limit_reached'"
+                    ),
+                    {"actor_sub": "sub-cap-member"},
+                )
+            )
+            .mappings()
+            .first()
+        )
+        assert audit_row is not None
+        assert audit_row["action"] == "denied.subscribe_limit_reached"
+        assert audit_row["detail"] == {"limit": 1}
+
     async def test_successful_subscribe_writes_audit_row(
         self,
         main: Any,
@@ -1014,6 +1128,101 @@ class TestNotificationFiring:
     # See TestSubscribeAuthorization's comment on why this is scoped here
     # rather than file-wide autouse.
     pytestmark = pytest.mark.usefixtures("_migrated_schema", "_clean_tables")
+
+    async def test_restart_simulation_catchup_read_recovers_missed_messages(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Simulate a restart (clearing the in-memory registry) and verify that
+        the subscriber recovers missed messages via catch-up read (TECH-6335)."""
+        conversation_id, _ids = await _start_open_conversation(
+            main, test_session_factory, "notify-restart-owner", "notify-restart-member"
+        )
+        member_token = _token("notify-restart-member")
+        await _call(
+            main,
+            test_session_factory,
+            member_token,
+            "comms_accept",
+            {"conversation_id": conversation_id},
+        )
+        uri = f"comms://comms/conversations/{conversation_id}"
+        collector = _NotificationCollector()
+
+        async with Client(main.mcp, message_handler=collector) as client:
+            with (
+                _OIDC_PATCH,
+                _ENV_PATCH,
+                patch("providers.comms.get_access_token", return_value=member_token),
+                patch("providers.comms.get_session_factory", return_value=test_session_factory),
+                patch("main.get_session_factory", return_value=test_session_factory),
+            ):
+                # 1. Initial subscribe
+                await client.session.subscribe_resource(AnyUrl(uri))
+
+            # 2. Initial catch-up read recording cursor
+            initial_read = await _call(
+                main,
+                test_session_factory,
+                member_token,
+                "comms_get_conversation",
+                {"conversation_id": conversation_id},
+            )
+            cursor = initial_read["page_max_seq"]
+            assert cursor == 1
+
+            # 3. Simulate restart by clearing in-memory subscription registry
+            subscriptions._registry.clear()
+            subscriptions._agent_subscription_counts.clear()
+
+            # 4. Another agent posts 2 messages while server has no subscription record
+            owner_token = _token("notify-restart-owner")
+            await _call(
+                main,
+                test_session_factory,
+                owner_token,
+                "comms_post_message",
+                {
+                    "conversation_id": conversation_id,
+                    "message_type": "needs_clarification",
+                    "payload": {"about_seq": 1},
+                },
+            )
+            await _call(
+                main,
+                test_session_factory,
+                owner_token,
+                "comms_post_message",
+                {
+                    "conversation_id": conversation_id,
+                    "message_type": "needs_clarification",
+                    "payload": {"about_seq": 1},
+                },
+            )
+
+            # 5. Assert subscriber received nothing while registry was cleared
+            await asyncio.sleep(0.1)
+            assert uri not in collector.uris
+
+            # 6. Re-subscribe (idempotent)
+            with (
+                _OIDC_PATCH,
+                _ENV_PATCH,
+                patch("providers.comms.get_access_token", return_value=member_token),
+                patch("providers.comms.get_session_factory", return_value=test_session_factory),
+                patch("main.get_session_factory", return_value=test_session_factory),
+            ):
+                await client.session.subscribe_resource(AnyUrl(uri))
+
+            # 7. Catch-up read using the recorded cursor returns both missed messages
+            catchup = await _call(
+                main,
+                test_session_factory,
+                member_token,
+                "comms_get_conversation",
+                {"conversation_id": conversation_id, "since_seq": cursor},
+            )
+            assert len(catchup["messages"]) == 2
+            assert [m["seq"] for m in catchup["messages"]] == [2, 3]
 
     async def test_subscriber_receives_notification_on_post_message(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
@@ -1627,31 +1836,3 @@ class TestAuditBeforeMutationOrdering:
                 # `subscriptions.unsubscribe()` ran -- so the subscription
                 # must still be live.
                 assert len(subscriptions._registry.get(uri, [])) == 1
-
-
-class TestCapDivergenceRecovery:
-    """Argus round-4 BLOCKING catch: `_evict_oldest_for_agent_locked`'s
-    divergence branch (no records found for an agent despite the count
-    saying it's at cap) had no test -- neither existing eviction test
-    reaches it, since both exercise the normal "a record IS found" path.
-    """
-
-    async def test_subscribe_self_heals_a_diverged_count(
-        self, monkeypatch: Any, caplog: Any
-    ) -> None:
-        monkeypatch.setattr(subscriptions, "MAX_SUBSCRIPTIONS_PER_AGENT", 2)
-        agent_id = _new_agent_id()
-        # Force divergence directly: the count claims `agent_id` is at cap,
-        # but `_registry` has no records for it at all.
-        subscriptions._agent_subscription_counts[agent_id] = 2
-
-        session = _FakeSession()
-        with caplog.at_level("ERROR"):
-            await subscriptions.subscribe("comms://x", session, agent_id=agent_id, sub="a")  # type: ignore[arg-type]
-
-        assert "registry/count state has diverged" in caplog.text
-        # Self-healed, not left at 2+1=3 (or worse, growing unboundedly on
-        # every subsequent subscribe) -- exactly one real record now exists,
-        # so the count must read exactly 1.
-        assert subscriptions._agent_subscription_counts[agent_id] == 1
-        assert len(subscriptions._registry["comms://x"]) == 1
