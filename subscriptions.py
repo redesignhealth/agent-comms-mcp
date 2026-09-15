@@ -10,19 +10,29 @@ caller's own just-committed transaction (see ``notify_conversation_event``'s
 docstring for why this satisfies the "re-check membership at fire time"
 requirement without a second query here).
 
-Deployment fit (plan doc §6): this repo runs one ECS Fargate task
-(``desired_count = 1``) with no shared pub/sub — a process-local registry is
-correct-by-deployment for v1. Sessions and subscriptions are ephemeral: any
-deploy/restart drops the registry and every client must re-subscribe after
-re-initializing.
+Deployment fit and delivery semantics (TECH-6335): this repo runs one ECS
+Fargate task (``desired_count = 1``) with no shared pub/sub — a process-local
+registry is correct-by-deployment for v1. Sessions and subscriptions are
+ephemeral: any deploy/restart drops the registry and every client must
+re-subscribe after re-initializing. A notification push is strictly an
+at-most-once, best-effort hint carrying only a URI, with no payload, ordering,
+or delivery guarantee. Crucially, a successful ``send_resource_updated`` call
+does NOT imply delivery: the MCP SDK silently drops notifications with no
+exception when no GET/SSE stream is attached to the session. The real delivery
+contract is the client's catch-up read via
+``comms_get_conversation(since_seq=...)`` (for conversations, paging while
+``has_more`` is true) or ``comms_inbox`` (for inboxes, best-effort current-state
+snapshot capped at 100 items).
 
-Known gap: per-agent cap eviction (``_evict_oldest_for_agent_locked``) and
-prune-on-dead-weakref/prune-on-send-failure (``notify``) are silent by
-design — no audit row is written for either. Both are system-driven
-cleanup of stale bookkeeping, not a caller-initiated action, so there is no
-actor to attribute an audit row to; giving this module a DB dependency to
-write one would also cut against its deliberate DB-less design (see above).
-Eviction is at least visible via a ``logger.warning`` naming the evicted URI.
+Cap and prune bookkeeping: the per-agent subscription cap
+(``MAX_SUBSCRIPTIONS_PER_AGENT``) now rejects with ``SubscriptionLimitError``
+rather than silently evicting. Pruning is restricted to definitive session death
+(``anyio.ClosedResourceError``, ``anyio.BrokenResourceError``) or dead weakrefs;
+transient send errors or slow consumer timeouts do not prune the subscription.
+No audit row is written for pruning — it is system-driven cleanup of stale
+bookkeeping, not a caller-initiated action, so there is no actor to attribute an
+audit row to, and giving this module a DB dependency would cut against its
+deliberate DB-less design.
 """
 
 from __future__ import annotations
@@ -34,6 +44,7 @@ import weakref
 from collections.abc import Collection, Iterable
 from dataclasses import dataclass
 
+import anyio
 from mcp.server.session import ServerSession
 
 logger = logging.getLogger(__name__)
@@ -43,6 +54,12 @@ logger = logging.getLogger(__name__)
 # send (e.g. its session is still open but it stopped calling tools) would
 # otherwise be able to accumulate unbounded stale records.
 MAX_SUBSCRIPTIONS_PER_AGENT = 100
+NOTIFY_SEND_TIMEOUT_SECONDS = 2.0
+
+
+class SubscriptionLimitError(Exception):
+    """``agent_id`` already holds ``MAX_SUBSCRIPTIONS_PER_AGENT`` live subscriptions."""
+
 
 _CONVERSATION_URI_TEMPLATE = "comms://comms/conversations/{conversation_id}"
 _INBOX_URI_TEMPLATE = "comms://comms/agents/{agent_id}/inbox"
@@ -61,20 +78,11 @@ class _Record:
     session_ref: weakref.ReferenceType[ServerSession]
     agent_id: uuid.UUID
     sub: str
-    # Monotonically increasing creation order (Argus round-2 BLOCKING catch):
-    # `_evict_oldest_for_agent_locked` must evict the record an agent
-    # actually registered longest ago, not merely the first one encountered
-    # via `_registry`'s dict/URI iteration order (which reflects URI
-    # registration order, not per-agent subscription recency) -- without
-    # this field, eviction could drop a subscription registered moments ago
-    # while an actually-older one for the same agent survives.
-    seq: int
 
 
 _registry: dict[str, list[_Record]] = {}
 _agent_subscription_counts: dict[uuid.UUID, int] = {}
 _lock = asyncio.Lock()
-_seq_counter = 0
 
 
 def _dec_count(agent_id: uuid.UUID) -> None:
@@ -85,19 +93,60 @@ def _dec_count(agent_id: uuid.UUID) -> None:
         _agent_subscription_counts.pop(agent_id, None)
 
 
-async def subscribe(uri: str, session: ServerSession, *, agent_id: uuid.UUID, sub: str) -> None:
+def _reclaim_dead_for_agent_locked(agent_id: uuid.UUID) -> None:
+    """Remove dead weakref records for ``agent_id`` and recompute its count.
+
+    Caller must hold ``_lock``. Scans ``_registry``, removes every record
+    belonging to ``agent_id`` whose ``session_ref()`` is ``None``, and
+    recomputes ``_agent_subscription_counts[agent_id]`` from the surviving
+    records (popping the key entirely if count reaches 0). Recomputing from
+    ground truth also self-heals any count/registry divergence.
+    """
+    empty_uris: list[str] = []
+    for uri, records in _registry.items():
+        surviving = [r for r in records if not (r.agent_id == agent_id and r.session_ref() is None)]
+        if len(surviving) != len(records):
+            records[:] = surviving
+        if not records:
+            empty_uris.append(uri)
+    for uri in empty_uris:
+        _registry.pop(uri, None)
+
+    count = sum(1 for records in _registry.values() for r in records if r.agent_id == agent_id)
+    if count > 0:
+        _agent_subscription_counts[agent_id] = count
+    else:
+        _agent_subscription_counts.pop(agent_id, None)
+
+
+async def has_capacity_for(agent_id: uuid.UUID) -> bool:
+    """Return True if ``agent_id`` can accept at least one more subscription.
+
+    Acquires ``_lock`` and reclaims any dead-session records for ``agent_id``
+    only when the tracked count is at or above ``MAX_SUBSCRIPTIONS_PER_AGENT``,
+    before checking against ``MAX_SUBSCRIPTIONS_PER_AGENT``.
+    """
+    async with _lock:
+        if _agent_subscription_counts.get(agent_id, 0) >= MAX_SUBSCRIPTIONS_PER_AGENT:
+            _reclaim_dead_for_agent_locked(agent_id)
+        return _agent_subscription_counts.get(agent_id, 0) < MAX_SUBSCRIPTIONS_PER_AGENT
+
+
+async def subscribe(
+    uri: str, session: ServerSession, *, agent_id: uuid.UUID, sub: str
+) -> _Record | None:
     """Register ``session`` as a subscriber of ``uri``.
 
     Idempotent per ``(uri, session)`` — re-subscribing the same session to
-    the same URI replaces its record rather than duplicating it. If
-    ``agent_id`` is already at ``MAX_SUBSCRIPTIONS_PER_AGENT`` (across every
-    URI), the oldest of its existing records is evicted first — a bound on
-    leakage between prune-on-send-failure opportunities (weakrefs are GC'd
-    automatically, but a still-open, still-connected session that just
-    stopped being useful — e.g. its owning agent went idle — leaks nothing
-    until its next failed send).
+    the same URI replaces its record rather than duplicating it. Returns
+    the created ``_Record`` instance if a new subscription was added, or
+    ``None`` if this was an idempotent re-subscription for an existing
+    ``(uri, session)``.
+
+    If ``agent_id`` already holds ``MAX_SUBSCRIPTIONS_PER_AGENT`` live
+    subscriptions after reclaiming any dead sessions, raises
+    ``SubscriptionLimitError`` — the cap now rejects rather than evicting.
     """
-    global _seq_counter
     async with _lock:
         records = _registry.setdefault(uri, [])
         before = len(records)
@@ -112,95 +161,24 @@ async def subscribe(uri: str, session: ServerSession, *, agent_id: uuid.UUID, su
         if removed_existing:
             _dec_count(agent_id)
 
-        total_for_agent = _agent_subscription_counts.get(agent_id, 0)
-        if total_for_agent >= MAX_SUBSCRIPTIONS_PER_AGENT:
-            # Argus round-4 BLOCKING catch: a prior revision logged the
-            # divergence below but still let `subscribe()` fall through to
-            # the unconditional append+increment afterward, so a diverged
-            # agent's count grew to MAX+1, MAX+2, ... on every subsequent
-            # subscribe -- unbounded, with no recovery path. `evicted` now
-            # tells this caller whether the count was actually backed by a
-            # real record; the log line only fires on that success path, so
-            # it no longer contradicts the divergence error logged below.
-            evicted_uri = _evict_oldest_for_agent_locked(agent_id)
-            if evicted_uri is not None:
-                logger.warning(
-                    "agent %s hit the %d-subscription cap; evicted its oldest "
-                    "subscription (uri=%r)",
-                    agent_id,
-                    MAX_SUBSCRIPTIONS_PER_AGENT,
-                    evicted_uri,
-                )
-            else:
-                # Self-heal: the count claimed `agent_id` was at cap, but no
-                # record backs that claim anywhere in `_registry` -- the
-                # count itself is the stale half of the divergence. Reset it
-                # to 0 (about to become 1 via this subscribe's own append)
-                # rather than leaving it at `MAX_SUBSCRIPTIONS_PER_AGENT` and
-                # letting every future subscribe repeat this same detection
-                # forever without ever correcting the underlying number.
-                _agent_subscription_counts.pop(agent_id, None)
+        # Optimization (TECH-6335): only perform the full O(total subscriptions)
+        # scan when the agent's tracked count is actually at or above the cap.
+        # When strictly below cap, trust the tracked count and skip the scan.
+        if _agent_subscription_counts.get(agent_id, 0) >= MAX_SUBSCRIPTIONS_PER_AGENT:
+            _reclaim_dead_for_agent_locked(agent_id)
 
-        # Re-fetched AFTER eviction, not reused from above (Argus round-2
-        # BLOCKING catch): eviction can delete `_registry[uri]`'s own list
-        # entry entirely (e.g. this agent's oldest subscription happens to
-        # be to this very `uri`) -- appending to the pre-eviction `records`
-        # object in that case would append to a list no longer reachable
-        # from `_registry`, silently dropping this subscription from the
-        # live registry while `_agent_subscription_counts` still counts it
-        # as registered.
+        if _agent_subscription_counts.get(agent_id, 0) >= MAX_SUBSCRIPTIONS_PER_AGENT:
+            if not records:
+                _registry.pop(uri, None)
+            raise SubscriptionLimitError(
+                f"agent {agent_id} already holds {MAX_SUBSCRIPTIONS_PER_AGENT} subscriptions"
+            )
+
         records = _registry.setdefault(uri, [])
-        _seq_counter += 1
-        records.append(_Record(weakref.ref(session), agent_id, sub, _seq_counter))
+        new_record = _Record(weakref.ref(session), agent_id, sub)
+        records.append(new_record)
         _agent_subscription_counts[agent_id] = _agent_subscription_counts.get(agent_id, 0) + 1
-
-
-def _evict_oldest_for_agent_locked(agent_id: uuid.UUID) -> str | None:
-    """Drop the single TRULY oldest record belonging to ``agent_id``, across
-    every URI, by creation order (``_Record.seq``) -- not by ``_registry``'s
-    own dict/URI iteration order, which reflects URI registration order, not
-    this agent's own subscription recency (Argus round-2 BLOCKING catch: the
-    prior first-match-wins scan over `_registry.items()` could evict a
-    subscription this agent registered moments ago while an actually older
-    one for the same agent survived, whenever the older one happened to live
-    under a later-inserted URI key). Caller must hold ``_lock``.
-
-    Returns the evicted record's URI if a record was actually evicted,
-    ``None`` if ``agent_id`` has no records anywhere in ``_registry`` despite
-    being called only when ``_agent_subscription_counts`` says it's at cap --
-    the caller (``subscribe()``) uses this (via truthiness -- a non-``None``
-    string is truthy, ``None`` is falsy) to distinguish a genuine eviction
-    from a registry/count divergence (Argus round-4 BLOCKING catch: an
-    earlier revision only logged this divergence here and let the caller
-    append+increment unconditionally regardless, growing the count
-    unboundedly past the cap on every subsequent subscribe).
-    """
-    oldest_uri: str | None = None
-    oldest_index: int | None = None
-    oldest_seq: int | None = None
-    for uri, records in _registry.items():
-        for index, record in enumerate(records):
-            if record.agent_id == agent_id and (oldest_seq is None or record.seq < oldest_seq):
-                oldest_uri = uri
-                oldest_index = index
-                oldest_seq = record.seq
-    if oldest_uri is None or oldest_index is None:
-        # This is only ever called when the count already says `agent_id`
-        # is at cap, so finding zero of its records here means
-        # `_registry`/`_agent_subscription_counts` have diverged.
-        logger.error(
-            "cap eviction found no records for agent %s despite being at "
-            "the %d-subscription cap -- registry/count state has diverged",
-            agent_id,
-            MAX_SUBSCRIPTIONS_PER_AGENT,
-        )
-        return None
-    records = _registry[oldest_uri]
-    del records[oldest_index]
-    _dec_count(agent_id)
-    if not records:
-        del _registry[oldest_uri]
-    return oldest_uri
+        return new_record if not removed_existing else None
 
 
 async def is_subscribed(uri: str, session: ServerSession) -> bool:
@@ -253,12 +231,51 @@ async def unsubscribe(uri: str, session: ServerSession) -> bool:
         return removed
 
 
+async def remove_if_current(uri: str, session: ServerSession, record: _Record) -> bool:
+    """Remove ``record`` from ``uri``'s subscribers only if it is still the current record.
+
+    Used by ``main.py``'s subscribe rollback on audit failure (TECH-6335): if
+    another coroutine or client re-subscribe has since replaced or removed this
+    exact record, this is a no-op returning ``False``, avoiding accidentally
+    destroying a newer, valid subscription.
+
+    Returns ``True`` if ``record`` was still registered and removed, ``False`` otherwise.
+    """
+    async with _lock:
+        records = _registry.get(uri)
+        if not records:
+            return False
+        remaining = []
+        removed = False
+        for r in records:
+            if r is record:
+                _dec_count(r.agent_id)
+                removed = True
+                continue
+            remaining.append(r)
+        if remaining:
+            _registry[uri] = remaining
+        else:
+            _registry.pop(uri, None)
+        return removed
+
+
 async def notify(uri: str, *, recipient_filter: Collection[uuid.UUID] | None = None) -> None:
     """Best-effort fan-out of a ``notifications/resources/updated`` for ``uri``.
 
-    Never raises: a dead weakref or a failed ``send_resource_updated`` call
-    is pruned and logged, never propagated — matching
-    ``service._fire_approval_notifier``'s "never fails the request" posture.
+    Never raises: a dead weakref or definitive session death
+    (``anyio.ClosedResourceError``, ``anyio.BrokenResourceError``) is pruned and
+    logged, never propagated — matching ``service._fire_approval_notifier``'s
+    "never fails the request" posture. A slow consumer timing out
+    (``TimeoutError`` after ``NOTIFY_SEND_TIMEOUT_SECONDS``) or an unknown/transient
+    exception logs a warning and keeps the subscription alive (its periodic catch-up
+    read covers the missed ping).
+
+    Serial worst-case cost: ``notify()`` sends sequentially per subscriber, so a
+    URI with N stalled subscribers costs up to ``N * NOTIFY_SEND_TIMEOUT_SECONDS``
+    on the post-commit path before returning. This is an accepted tradeoff
+    (documented, not fixed here) — do not attempt to parallelize sends.
+
     ``recipient_filter``, when given, narrows delivery to subscriptions whose
     ``agent_id`` is a member (the caller's own fresh, post-commit view of
     who is still entitled to this ping); ``None`` delivers to every current
@@ -285,7 +302,8 @@ async def notify(uri: str, *, recipient_filter: Collection[uuid.UUID] | None = N
             dead_or_failed.append(record)
             continue
         try:
-            await session.send_resource_updated(uri)  # type: ignore[arg-type]
+            async with asyncio.timeout(NOTIFY_SEND_TIMEOUT_SECONDS):
+                await session.send_resource_updated(uri)  # type: ignore[arg-type]
         except asyncio.CancelledError:
             # BaseException, not Exception -- already excluded from the
             # guard below under Python's actual exception hierarchy, but
@@ -294,15 +312,29 @@ async def notify(uri: str, *, recipient_filter: Collection[uuid.UUID] | None = N
             # `except Exception` below is ever accidentally broadened to
             # `except BaseException`.
             raise
+        except (anyio.ClosedResourceError, anyio.BrokenResourceError) as exc:
+            logger.warning(
+                "dropping subscription to %r for agent %s after closed/broken stream: %s",
+                uri,
+                record.agent_id,
+                type(exc).__name__,
+            )
+            dead_or_failed.append(record)
+        except TimeoutError:
+            logger.warning(
+                "notify timed out after %.1fs for %r (agent %s); keeping subscription",
+                NOTIFY_SEND_TIMEOUT_SECONDS,
+                uri,
+                record.agent_id,
+            )
         except Exception as exc:
             logger.warning(
-                "dropping subscription to %r for agent %s after failed notify: %s",
+                "notify failed for %r (agent %s): %s; keeping subscription",
                 uri,
                 record.agent_id,
                 type(exc).__name__,
                 exc_info=True,
             )
-            dead_or_failed.append(record)
 
     if dead_or_failed:
         async with _lock:

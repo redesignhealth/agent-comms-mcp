@@ -106,14 +106,15 @@ equivalent.
 
 ## MCP resource surface
 
-Read-only companion to the tool surface above (TECH-5903 Phase A — no
-subscribe/unsubscribe yet). Same `comms` namespace and mount-prefix rewrite as
-the tools: a resource registered in `providers/comms.py` as `comms://agents` is
-exposed by the mounted server as `comms://comms/agents` (the table below lists
-the post-mount, actually-reachable form). Enrolled in the fail-closed
-`scopes.RESOURCE_SCOPES`/`scopes.RESOURCE_TEMPLATE_SCOPES` registries (exact vs.
-templated URI, respectively) — same contract as `TOOL_SCOPES`: an unenrolled
-resource is unreadable by agent-jwt callers.
+Companion to the tool surface above (TECH-5903 Phase A/B), supporting both
+read-only inspection and `resources/subscribe` / `resources/unsubscribe`. Same
+`comms` namespace and mount-prefix rewrite as the tools: a resource registered
+in `providers/comms.py` as `comms://agents` is exposed by the mounted server as
+`comms://comms/agents` (the table below lists the post-mount, actually-reachable
+form). Enrolled in the fail-closed `scopes.RESOURCE_SCOPES`/
+`scopes.RESOURCE_TEMPLATE_SCOPES` registries (exact vs. templated URI,
+respectively) — same contract as `TOOL_SCOPES`: an unenrolled resource is
+unreadable by agent-jwt callers.
 
 | Resource | Scope | Purpose |
 |---|---|---|
@@ -126,6 +127,19 @@ authorization/audit contract (including why the inbox resource's self-check
 routes through a public `service.resolve_inbox_target` rather than a
 provider-layer check) and the `_resource_boundary()` error-conversion
 convention.
+
+**Delivery semantics and gap recovery (TECH-6335):** Resource subscription
+pushes (`notifications/resources/updated`) are strictly at-most-once,
+best-effort hints with no payload or delivery guarantee (a successful server send
+call does not imply receipt). The actual delivery contract is the client's
+catch-up read via `comms_get_conversation(since_seq=...)` (paging while
+`has_more` is true) for conversations or `comms_inbox` for inboxes (best-effort
+current-state snapshot, capped at 100 items). Clients should subscribe before
+reading, catch up on every hint and on a periodic background interval (~60s), and
+re-subscribe on every MCP session re-initialization and periodically. An agent may hold up to
+100 active subscriptions; further attempts reject with
+`subscription_limit_reached`. See `docs/DESIGN.md` § "Delivery semantics and gap
+recovery (TECH-6335)" for full details.
 
 ## Non-MCP HTTP routes
 
