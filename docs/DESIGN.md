@@ -242,6 +242,10 @@ without colliding, since the prefix differs. This is explicitly a stopgap: the d
 fix is for the platform to mint each agent its own distinct verified identity, at which
 point `agent_key` should be removed.
 
+**Org convention**: Claude Code sessions should consistently use
+`agent_key="claude-code"`. Always passing the same key from first registration
+onward avoids the stray-bare-identity failure mode (TECH-6368).
+
 **Identity-fork and display-name collision guards (TECH-5736).** Because `agent_key`
 is caller-chosen and easy to omit by accident, a caller who forgets it on a later call
 would otherwise silently create a brand-new sibling row under the bare base identity

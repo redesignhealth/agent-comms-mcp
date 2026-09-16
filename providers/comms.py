@@ -299,14 +299,37 @@ async def _resolve_caller_agent(session: Any, sub: str, token: AccessToken | Non
     token to keep acting on the board.
     """
     agent = await service.get_agent_by_sub(session, sub)
-    if agent is None:
-        raise ToolError(
-            "not_registered: no board agent is bound to this caller yet — call comms_register first"
-        )
-    if agent.status == "suspended":
+    if agent is None or agent.status == "suspended":
+        suffix = ""
+        try:
+            base_sub = sub.split("::", 1)[0]
+            siblings = await service.list_sibling_identities(
+                session, base_sub=base_sub, exclude_sub=sub
+            )
+            active_siblings = [s for s in siblings if s.get("status") == "active"]
+            if len(active_siblings) == 1:
+                key = active_siblings[0]["agent_key"]
+                if key is not None:
+                    suffix = (
+                        f" — other identities exist under this token: '{key}' (active). "
+                        f"Retry with agent_key='{key}'."
+                    )
+                else:
+                    suffix = (
+                        " — other identities exist under this token: bare identity (active). "
+                        "Retry without agent_key."
+                    )
+        except Exception:
+            suffix = ""
+
+        if agent is None:
+            raise ToolError(
+                "not_registered: no board agent is bound to this caller yet — "
+                f"call comms_register first{suffix}"
+            )
         raise ToolError(
             "agent_suspended: this agent has been deregistered (status=suspended) and "
-            "can no longer act on the board"
+            f"can no longer act on the board{suffix}"
         )
     if token is not None and is_registry_backed_agent_token(token):
         await service.write_through_ownership(
@@ -492,16 +515,32 @@ async def whoami(agent_key: str | None = None) -> dict[str, Any]:
 
     When ``agent_key`` is provided, returns the composed identity
     (base_sub::agent_key) that will be used for agent lookups by other tools.
+    Omitting ``agent_key`` resolves to the bare ``base_sub`` identity, which
+    is a genuinely distinct board identity from any keyed identity
+    (``base_sub::agent_key``) — not "whatever identity was last used."
 
-    If this identity has already called ``comms_register``, the response
-    also includes ``status`` (reflecting whether this agent is currently
-    ``"active"`` or ``"suspended"``) and
-    ``min_schema_version``/``max_schema_version``
-    reflecting this agent's currently-registered wire-schema capability
-    range. Omitted entirely if the caller hasn't registered yet, or if the
+    Whenever the board database is reachable, the response includes
+    ``status``, which is one of:
+    - ``"active"``: this identity is registered and active on the board.
+    - ``"suspended"``: this identity was registered but has been deregistered
+      via ``comms_deregister_agent``.
+    - ``"not_registered"``: no board agent row exists for this composed identity.
+
+    When registered, the response also includes
+    ``min_schema_version``/``max_schema_version`` reflecting this agent's
+    currently-registered wire-schema capability range.
+
+    ``status`` and schema version fields are omitted entirely only if the
     board database is unreachable — this tool doubles as an auth-only
     diagnostic (verifying token/scope wiring) and must not start requiring
     DB access to answer the identity/scopes questions it already answers.
+
+    When sibling identities exist under the caller's verified ``base_sub``,
+    the response includes ``other_identities`` (a list of sibling dicts with
+    ``agent_key``, ``sub``, ``display_name``, and ``status``). If the caller's
+    own identity is unusable (``"suspended"`` or ``"not_registered"``) and
+    exactly one sibling is ``"active"``, ``suggested_agent_key`` is also
+    included, indicating which key to pass to switch to that active identity.
     """
     token = _require_token()
     base_sub = _require_identity(token)
@@ -538,10 +577,32 @@ async def whoami(agent_key: str | None = None) -> dict[str, Any]:
     try:
         async with session_factory() as session:
             agent = await service.get_agent_by_sub(session, composed_sub)
-        if agent is not None:
-            result["status"] = agent.status
-            result["min_schema_version"] = agent.min_schema_version
-            result["max_schema_version"] = agent.max_schema_version
+            if agent is not None:
+                result["status"] = agent.status
+                result["min_schema_version"] = agent.min_schema_version
+                result["max_schema_version"] = agent.max_schema_version
+            else:
+                result["status"] = "not_registered"
+
+            try:
+                siblings = await service.list_sibling_identities(
+                    session, base_sub=base_sub, exclude_sub=composed_sub
+                )
+            except (OperationalError, InterfaceError, OSError) as exc:
+                logger.warning(
+                    "whoami: sibling lookup failed (%s), omitting sibling fields",
+                    type(exc).__name__,
+                    exc_info=True,
+                )
+                siblings = []
+
+            if siblings:
+                result["other_identities"] = siblings
+
+            if result.get("status") in ("suspended", "not_registered"):
+                active_siblings = [s for s in siblings if s.get("status") == "active"]
+                if len(active_siblings) == 1:
+                    result["suggested_agent_key"] = active_siblings[0]["agent_key"]
     except (OperationalError, InterfaceError, OSError) as exc:
         # A genuine programming/schema bug (a renamed get_agent_by_sub, a
         # migration not yet applied) raises something OTHER than these
@@ -636,6 +697,10 @@ async def register(
       The existing sibling ``agent_key`` values are recorded in the
       server-side audit log only; they are NOT included in the error
       message returned to the caller.
+
+      **Org convention**: Claude Code sessions should consistently use
+      ``agent_key="claude-code"``. Always passing the same key from first
+      registration onward avoids the stray-bare-identity failure mode.
 
       The ``email`` claim fallback is gated on ``is_interactive_token``
       (``scopes.py``). For a token with no ``iss`` at all, that check and

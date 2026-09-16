@@ -53,6 +53,7 @@ class TestWhoami:
             patch("providers.comms.get_access_token", return_value=token),
             _patched_session_factory(),
             patch("providers.comms.service.get_agent_by_sub", AsyncMock(return_value=None)),
+            patch("providers.comms.service.list_sibling_identities", AsyncMock(return_value=[])),
         ):
             result = asyncio.run(_whoami())
 
@@ -61,6 +62,7 @@ class TestWhoami:
             "issuer": "https://example.okta.com/oauth2/default",
             "caller_type": "interactive",
             "scopes": [],
+            "status": "not_registered",
         }
 
     def test_agent_jwt_caller_reports_service_identity_and_scopes(self) -> None:
@@ -75,6 +77,7 @@ class TestWhoami:
             patch("providers.comms.get_access_token", return_value=token),
             _patched_session_factory(),
             patch("providers.comms.service.get_agent_by_sub", AsyncMock(return_value=None)),
+            patch("providers.comms.service.list_sibling_identities", AsyncMock(return_value=[])),
         ):
             result = asyncio.run(_whoami())
 
@@ -83,6 +86,7 @@ class TestWhoami:
             "issuer": "agent-jwt",
             "caller_type": "service",
             "scopes": ["comms:read"],
+            "status": "not_registered",
         }
 
     def test_agent_jwt_caller_with_forged_email_claim_is_not_impersonated(self) -> None:
@@ -100,10 +104,12 @@ class TestWhoami:
             patch("providers.comms.get_access_token", return_value=token),
             _patched_session_factory(),
             patch("providers.comms.service.get_agent_by_sub", AsyncMock(return_value=None)),
+            patch("providers.comms.service.list_sibling_identities", AsyncMock(return_value=[])),
         ):
             result = asyncio.run(_whoami())
 
         assert result["identity"] == "ea-agent-svc"
+        assert result["status"] == "not_registered"
 
     def test_missing_token_raises_tool_error(self) -> None:
         with patch("providers.comms.get_access_token", return_value=None):
@@ -121,6 +127,7 @@ class TestWhoami:
             patch("providers.comms.get_access_token", return_value=token),
             _patched_session_factory(),
             patch("providers.comms.service.get_agent_by_sub", AsyncMock(return_value=fake_agent)),
+            patch("providers.comms.service.list_sibling_identities", AsyncMock(return_value=[])),
         ):
             result = asyncio.run(_whoami())
 
@@ -139,6 +146,7 @@ class TestWhoami:
             patch("providers.comms.get_access_token", return_value=token),
             _patched_session_factory(),
             patch("providers.comms.service.get_agent_by_sub", AsyncMock(return_value=fake_agent)),
+            patch("providers.comms.service.list_sibling_identities", AsyncMock(return_value=[])),
         ):
             result = asyncio.run(_whoami())
 
@@ -157,10 +165,11 @@ class TestWhoami:
             patch("providers.comms.get_access_token", return_value=token),
             _patched_session_factory(),
             patch("providers.comms.service.get_agent_by_sub", AsyncMock(return_value=None)),
+            patch("providers.comms.service.list_sibling_identities", AsyncMock(return_value=[])),
         ):
             result = asyncio.run(_whoami())
 
-        assert "status" not in result
+        assert result["status"] == "not_registered"
         assert "min_schema_version" not in result
         assert "max_schema_version" not in result
 
@@ -259,3 +268,190 @@ class TestWhoami:
             pytest.raises(AttributeError, match="boom"),
         ):
             asyncio.run(_whoami())
+
+    def test_suspended_caller_with_one_active_sibling_includes_suggestion(self) -> None:
+        """(a) Caller status suspended + exactly one active sibling -> suggested_agent_key
+        present and correct."""
+        token = MagicMock()
+        token.claims = {
+            "iss": "https://example.okta.com/oauth2/default",
+            "email": "dan.costanza@redesignhealth.com",
+        }
+        fake_agent = MagicMock(status="suspended", min_schema_version=1, max_schema_version=1)
+        siblings = [
+            {
+                "agent_key": "claude-code",
+                "sub": "dan.costanza@redesignhealth.com::claude-code",
+                "display_name": "Claude Code",
+                "status": "active",
+            }
+        ]
+        with (
+            patch("providers.comms.get_access_token", return_value=token),
+            _patched_session_factory(),
+            patch("providers.comms.service.get_agent_by_sub", AsyncMock(return_value=fake_agent)),
+            patch(
+                "providers.comms.service.list_sibling_identities",
+                AsyncMock(return_value=siblings),
+            ),
+        ):
+            result = asyncio.run(_whoami())
+
+        assert result["status"] == "suspended"
+        assert result["identity"] == "dan.costanza@redesignhealth.com"
+        assert result["other_identities"] == siblings
+        assert result["suggested_agent_key"] == "claude-code"
+
+    def test_unregistered_caller_with_zero_active_siblings_omits_suggestion(self) -> None:
+        """(b) Caller status not_registered + zero active siblings -> other_identities
+        present if suspended siblings exist, but no suggested_agent_key."""
+        token = MagicMock()
+        token.claims = {
+            "iss": "https://example.okta.com/oauth2/default",
+            "email": "dan.costanza@redesignhealth.com",
+        }
+        siblings = [
+            {
+                "agent_key": "old-agent",
+                "sub": "dan.costanza@redesignhealth.com::old-agent",
+                "display_name": "Old Agent",
+                "status": "suspended",
+            }
+        ]
+        with (
+            patch("providers.comms.get_access_token", return_value=token),
+            _patched_session_factory(),
+            patch("providers.comms.service.get_agent_by_sub", AsyncMock(return_value=None)),
+            patch(
+                "providers.comms.service.list_sibling_identities",
+                AsyncMock(return_value=siblings),
+            ),
+        ):
+            result = asyncio.run(_whoami())
+
+        assert result["status"] == "not_registered"
+        assert result["other_identities"] == siblings
+        assert "suggested_agent_key" not in result
+
+    def test_unregistered_caller_with_multiple_active_siblings_omits_suggestion(self) -> None:
+        """(c) Caller status not_registered + 2+ active siblings -> other_identities
+        present, no suggested_agent_key."""
+        token = MagicMock()
+        token.claims = {
+            "iss": "https://example.okta.com/oauth2/default",
+            "email": "dan.costanza@redesignhealth.com",
+        }
+        siblings = [
+            {
+                "agent_key": "bot-1",
+                "sub": "dan.costanza@redesignhealth.com::bot-1",
+                "display_name": "Bot 1",
+                "status": "active",
+            },
+            {
+                "agent_key": "bot-2",
+                "sub": "dan.costanza@redesignhealth.com::bot-2",
+                "display_name": "Bot 2",
+                "status": "active",
+            },
+        ]
+        with (
+            patch("providers.comms.get_access_token", return_value=token),
+            _patched_session_factory(),
+            patch("providers.comms.service.get_agent_by_sub", AsyncMock(return_value=None)),
+            patch(
+                "providers.comms.service.list_sibling_identities",
+                AsyncMock(return_value=siblings),
+            ),
+        ):
+            result = asyncio.run(_whoami())
+
+        assert result["status"] == "not_registered"
+        assert result["other_identities"] == siblings
+        assert "suggested_agent_key" not in result
+
+    def test_sibling_lookup_db_failure_returns_cleanly(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """(d) Sibling-lookup DB failure -> whoami still returns cleanly,
+        other_identities/suggested_agent_key simply absent."""
+        token = MagicMock()
+        token.claims = {"iss": "agent-jwt", "sub": "ea-agent-svc", "scopes": ["comms:read"]}
+        fake_agent = MagicMock(status="active", min_schema_version=1, max_schema_version=1)
+        with (
+            patch("providers.comms.get_access_token", return_value=token),
+            _patched_session_factory(),
+            patch("providers.comms.service.get_agent_by_sub", AsyncMock(return_value=fake_agent)),
+            patch(
+                "providers.comms.service.list_sibling_identities",
+                AsyncMock(
+                    side_effect=OperationalError("SELECT siblings", {}, Exception("db error"))
+                ),
+            ),
+            caplog.at_level("WARNING", logger="providers.comms"),
+        ):
+            result = asyncio.run(_whoami())
+
+        assert result["status"] == "active"
+        assert result["min_schema_version"] == 1
+        assert "other_identities" not in result
+        assert "suggested_agent_key" not in result
+        assert any("sibling lookup failed" in r.message for r in caplog.records)
+
+    def test_healthy_active_caller_with_siblings_omits_suggestion(self) -> None:
+        """(e) Healthy active caller with siblings present -> other_identities present,
+        no suggested_agent_key."""
+        token = MagicMock()
+        token.claims = {"iss": "agent-jwt", "sub": "ea-agent-svc", "scopes": ["comms:read"]}
+        fake_agent = MagicMock(status="active", min_schema_version=1, max_schema_version=1)
+        siblings = [
+            {
+                "agent_key": "other-agent",
+                "sub": "ea-agent-svc::other-agent",
+                "display_name": "Other Agent",
+                "status": "active",
+            }
+        ]
+        with (
+            patch("providers.comms.get_access_token", return_value=token),
+            _patched_session_factory(),
+            patch("providers.comms.service.get_agent_by_sub", AsyncMock(return_value=fake_agent)),
+            patch(
+                "providers.comms.service.list_sibling_identities",
+                AsyncMock(return_value=siblings),
+            ),
+        ):
+            result = asyncio.run(_whoami())
+
+        assert result["status"] == "active"
+        assert result["other_identities"] == siblings
+        assert "suggested_agent_key" not in result
+
+    def test_identity_is_never_rewritten_to_sibling_sub(self) -> None:
+        """(f) Assert identity is never rewritten to a sibling's sub in any case."""
+        token = MagicMock()
+        token.claims = {
+            "iss": "https://example.okta.com/oauth2/default",
+            "email": "dan.costanza@redesignhealth.com",
+        }
+        siblings = [
+            {
+                "agent_key": "claude-code",
+                "sub": "dan.costanza@redesignhealth.com::claude-code",
+                "display_name": "Claude Code",
+                "status": "active",
+            }
+        ]
+        with (
+            patch("providers.comms.get_access_token", return_value=token),
+            _patched_session_factory(),
+            patch("providers.comms.service.get_agent_by_sub", AsyncMock(return_value=None)),
+            patch(
+                "providers.comms.service.list_sibling_identities",
+                AsyncMock(return_value=siblings),
+            ),
+        ):
+            result = asyncio.run(_whoami())
+
+        assert result["identity"] == "dan.costanza@redesignhealth.com"
+        assert result["suggested_agent_key"] == "claude-code"

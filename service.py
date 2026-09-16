@@ -1043,6 +1043,60 @@ async def get_agent_by_sub(session: AsyncSession, sub: str) -> Agent | None:
     return (await session.execute(select(Agent).where(Agent.sub == sub))).scalar_one_or_none()
 
 
+def _agent_key_from_sub(sub: str, base_sub: str) -> str | None:
+    """Recover the ``agent_key`` half of a composed board identity.
+
+    Inverse of ``providers.comms._compose_sub``: ``sub`` is either exactly
+    ``base_sub`` (no ``agent_key`` was given) or ``f"{base_sub}::{agent_key}"``
+    -- both ``base_sub`` and ``agent_key`` are validated elsewhere to never
+    contain ``"::"`` themselves, so this split is unambiguous. Used only to
+    render existing sibling identities back into a human-readable error
+    (``SiblingIdentityExistsError``) or diagnostic responses — never for
+    any authorization decision.
+    """
+    if sub == base_sub:
+        return None
+    return sub[len(base_sub) + 2 :]
+
+
+async def list_sibling_identities(
+    session: AsyncSession, *, base_sub: str, exclude_sub: str
+) -> list[dict[str, Any]]:
+    """List sibling identities registered under the same base_sub.
+
+    Returns a minimal projection (``agent_key``, ``sub``, ``display_name``,
+    ``status``) for all agent rows matching ``base_sub`` or
+    ``f"{base_sub}::"`` (with ``autoescape=True`` to prevent wildcard
+    injection from IdP-controlled claims containing ``%`` or ``_``),
+    excluding ``exclude_sub``. Ordered by ``sub``.
+
+    A sequential scan on this small table is the accepted, documented
+    tradeoff (a prefix index was previously added and removed as dead weight
+    for this exact predicate shape in migration a45f344c9c00).
+    """
+    stmt = (
+        select(Agent.sub, Agent.display_name, Agent.status)
+        .where(
+            Agent.sub != exclude_sub,
+            or_(
+                Agent.sub == base_sub,
+                Agent.sub.startswith(f"{base_sub}::", autoescape=True),
+            ),
+        )
+        .order_by(Agent.sub)
+    )
+    rows = (await session.execute(stmt)).all()
+    return [
+        {
+            "agent_key": _agent_key_from_sub(row.sub, base_sub),
+            "sub": row.sub,
+            "display_name": row.display_name,
+            "status": row.status,
+        }
+        for row in rows
+    ]
+
+
 async def _fk_safe_agent_id(session: AsyncSession, agent_id: uuid.UUID) -> uuid.UUID | None:
     """Return ``agent_id`` iff it references a real ``Agent`` row, else ``None``.
 
@@ -1528,22 +1582,6 @@ def validate_conversation_name(name: str | None) -> str | None:
     if any(ord(c) < 32 or ord(c) == 127 for c in name):
         raise ValueError("name must not contain control characters")
     return name
-
-
-def _agent_key_from_sub(sub: str, base_sub: str) -> str | None:
-    """Recover the ``agent_key`` half of a composed board identity.
-
-    Inverse of ``providers.comms._compose_sub``: ``sub`` is either exactly
-    ``base_sub`` (no ``agent_key`` was given) or ``f"{base_sub}::{agent_key}"``
-    -- both ``base_sub`` and ``agent_key`` are validated elsewhere to never
-    contain ``"::"`` themselves, so this split is unambiguous. Used only to
-    render existing sibling identities back into a human-readable error
-    (``SiblingIdentityExistsError``) -- never for any authorization
-    decision.
-    """
-    if sub == base_sub:
-        return None
-    return sub[len(base_sub) + 2 :]
 
 
 def _validate_display_name_and_accepted_types(
