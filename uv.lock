@@ -19,6 +19,7 @@ version = "0.8.4"
 source = { editable = "." }
 dependencies = [
     { name = "alembic" },
+    { name = "anyio" },
     { name = "asyncpg" },
     { name = "fastmcp" },
     { name = "greenlet" },
@@ -41,6 +42,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "alembic", specifier = "==1.18.5" },
+    { name = "anyio", specifier = "==4.14.2" },
     { name = "asyncpg", specifier = "==0.31.0" },
     { name = "fastmcp", specifier = "==3.4.2" },
     { name = "greenlet", specifier = "==3.5.4" },

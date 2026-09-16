@@ -124,13 +124,13 @@ class TestRegistrySubscribeUnsubscribe:
         assert record is not None
         assert subscriptions._agent_subscription_counts[agent_id] == 1
 
-        removed = await subscriptions.remove_if_current("comms://x", session, record)  # type: ignore[arg-type]
+        removed = await subscriptions.remove_if_current("comms://x", record)
         assert removed is True
         assert "comms://x" not in subscriptions._registry
         assert agent_id not in subscriptions._agent_subscription_counts
 
         # Second attempt with same record is a no-op
-        removed_again = await subscriptions.remove_if_current("comms://x", session, record)  # type: ignore[arg-type]
+        removed_again = await subscriptions.remove_if_current("comms://x", record)
         assert removed_again is False
 
     async def test_remove_if_current_stale_record_is_noop_and_preserves_current(self) -> None:
@@ -157,7 +157,7 @@ class TestRegistrySubscribeUnsubscribe:
         assert current_record is not r1  # R1 was replaced by a new record
 
         # Step 3: A's rollback fires with R1
-        removed = await subscriptions.remove_if_current("comms://x", session, r1)  # type: ignore[arg-type]
+        removed = await subscriptions.remove_if_current("comms://x", r1)
         assert removed is False
         # The newer record R2 was NOT removed
         assert len(subscriptions._registry["comms://x"]) == 1
@@ -169,7 +169,7 @@ class TestRegistrySubscribeUnsubscribe:
         agent_id = _new_agent_id()
         record = await subscriptions.subscribe("comms://x", session, agent_id=agent_id, sub="a")  # type: ignore[arg-type]
         assert record is not None
-        removed = await subscriptions.remove_if_current("comms://other", session, record)  # type: ignore[arg-type]
+        removed = await subscriptions.remove_if_current("comms://other", record)
         assert removed is False
 
 
@@ -340,7 +340,7 @@ class TestRegistryPerAgentCap:
         await subscriptions.notify("comms://x0")
         assert sessions[0].calls == ["comms://x0"]
 
-    async def test_has_capacity_for_reclaims_dead_records(self, monkeypatch: Any) -> None:
+    async def test_subscribe_reclaims_dead_records_when_at_cap(self, monkeypatch: Any) -> None:
         monkeypatch.setattr(subscriptions, "MAX_SUBSCRIPTIONS_PER_AGENT", 2)
         agent_id = _new_agent_id()
 
@@ -359,21 +359,15 @@ class TestRegistryPerAgentCap:
         # Count in bookkeeping is still 2 before reclaim
         assert subscriptions._agent_subscription_counts[agent_id] == 2
 
-        # has_capacity_for should reclaim the dead record for comms://x0 and return True
-        has_cap = await subscriptions.has_capacity_for(agent_id)
-        assert has_cap is True
-        assert subscriptions._agent_subscription_counts[agent_id] == 1
+        # subscribe() at cap should reclaim the dead record for comms://x0,
+        # freeing capacity for the new subscription to comms://x2.
+        session2 = _FakeSession()
+        record = await subscriptions.subscribe("comms://x2", session2, agent_id=agent_id, sub="a")  # type: ignore[arg-type]
+        assert record is not None
+        assert subscriptions._agent_subscription_counts[agent_id] == 2
         assert "comms://x0" not in subscriptions._registry
         assert "comms://x1" in subscriptions._registry
-
-    async def test_has_capacity_for_corrects_diverged_count(self, monkeypatch: Any) -> None:
-        monkeypatch.setattr(subscriptions, "MAX_SUBSCRIPTIONS_PER_AGENT", 2)
-        agent_id = _new_agent_id()
-        # Count says 2, but registry has zero records
-        subscriptions._agent_subscription_counts[agent_id] = 2
-
-        assert await subscriptions.has_capacity_for(agent_id) is True
-        assert agent_id not in subscriptions._agent_subscription_counts
+        assert "comms://x2" in subscriptions._registry
 
     async def test_subscribe_recovers_from_diverged_count(self, monkeypatch: Any) -> None:
         monkeypatch.setattr(subscriptions, "MAX_SUBSCRIPTIONS_PER_AGENT", 2)
@@ -398,8 +392,13 @@ class TestRegistryPerAgentCap:
         assert subscriptions._agent_subscription_counts[agent_id] == 1
 
         with patch("subscriptions._reclaim_dead_for_agent_locked") as mock_reclaim:
-            has_cap = await subscriptions.has_capacity_for(agent_id)
-            assert has_cap is True
+            record2 = await subscriptions.subscribe(
+                "comms://y",
+                _FakeSession(),  # type: ignore[arg-type]
+                agent_id=agent_id,
+                sub="a",
+            )
+            assert isinstance(record2, subscriptions._Record)
             mock_reclaim.assert_not_called()
 
     async def test_concurrent_subscribes_at_cap_only_one_succeeds(self, monkeypatch: Any) -> None:
@@ -472,6 +471,11 @@ class TestNotifyConversationEvent:
             active_agent_ids={active_agent},
             inbox_agent_ids=[other_agent],
         )
+        # notify_conversation_event schedules each notify() as a background
+        # task (TECH-6335) rather than awaiting it inline -- yield to the
+        # event loop so those tasks actually run before asserting.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
 
         assert conv_session.calls == [subscriptions.conversation_uri(conversation_id)]
         assert inbox_session.calls == [subscriptions.inbox_uri(other_agent)]
@@ -495,6 +499,11 @@ class TestNotifyConversationEvent:
         await subscriptions.notify_conversation_event(
             conversation_id, active_agent_ids=set(), inbox_agent_ids=[]
         )
+        # notify_conversation_event schedules each notify() as a background
+        # task (TECH-6335) rather than awaiting it inline -- yield to the
+        # event loop so any such task actually runs before asserting.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
 
         assert session.calls == []
 
@@ -1078,7 +1087,7 @@ class TestSubscribeAuthorization:
                     return_exceptions=True,
                 )
 
-        successes = [r for r in results if not isinstance(r, Exception)]
+        successes = [r for r in results if not isinstance(r, BaseException)]
         failures = [
             r for r in results if isinstance(r, McpError) and "subscription_limit_reached" in str(r)
         ]
@@ -2020,21 +2029,26 @@ class TestAuditBeforeMutationOrdering:
         )
         uri = f"comms://comms/conversations/{conversation_id}"
 
+        mock_audit = AsyncMock(side_effect=asyncio.CancelledError())
         with (
             _OIDC_PATCH,
             _ENV_PATCH,
             patch("providers.comms.get_access_token", return_value=member_token),
             patch("providers.comms.get_session_factory", return_value=test_session_factory),
             patch("main.get_session_factory", return_value=test_session_factory),
-            patch(
-                "service.audit_resource_subscription",
-                AsyncMock(side_effect=asyncio.CancelledError()),
-            ),
+            patch("service.audit_resource_subscription", mock_audit),
         ):
             async with Client(main.mcp) as client:
-                with pytest.raises(Exception):  # noqa: B017 -- any client-side surfacing is fine
+                # CancelledError is a BaseException, not an Exception -- a bare
+                # `pytest.raises(Exception)` would fail to catch it and let it
+                # propagate uncaught.
+                with pytest.raises(BaseException):  # noqa: B017 -- any client-side surfacing is fine
                     await client.session.subscribe_resource(AnyUrl(uri))
                 assert uri not in subscriptions._registry
+                # Verify the rollback path was genuinely exercised (audit write
+                # was attempted) rather than the assertion above passing for
+                # some unrelated reason.
+                mock_audit.assert_awaited_once()
 
     async def test_failed_audit_leaves_unsubscribe_registry_unmutated(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]

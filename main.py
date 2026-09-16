@@ -473,13 +473,15 @@ def _deny_resource_subscribe() -> NoReturn:
 def _deny_subscription_limit() -> NoReturn:
     """Specific denial when an agent exceeds its subscription cap (TECH-6335).
 
-    Deliberately distinct from ``_RESOURCE_SUBSCRIBE_DENIAL_MESSAGE``: the caller
+    Deliberately distinct from ``_RESOURCE_SUBSCRIBE_DENIAL_MESSAGE`` and uses
+    ``code=mt.INVALID_REQUEST`` rather than ``mt.INVALID_PARAMS``: the caller
     is already authorized, and this is an operational limit on its own account,
-    so there is no enumeration risk. The caller needs to distinguish this from
-    access denied to react (e.g. unsubscribe an older resource).
+    so there is no enumeration risk. Using a distinct error code allows callers
+    to mechanically distinguish a subscription cap rejection from an
+    authorization denial without string-matching message text.
     """
     raise McpError(
-        mt.ErrorData(code=mt.INVALID_PARAMS, message=_RESOURCE_SUBSCRIBE_LIMIT_MESSAGE)
+        mt.ErrorData(code=mt.INVALID_REQUEST, message=_RESOURCE_SUBSCRIBE_LIMIT_MESSAGE)
     ) from None
 
 
@@ -553,15 +555,29 @@ async def _handle_subscribe_resource(uri: AnyUrl) -> None:
     # mutation occurs, and we write `denied.subscribe_limit_reached`.
     #
     # If `subscribe()` succeeds and registered a NEW subscription (`record is not None`),
-    # we write `resource.subscribe`. To preserve the invariant that in-memory
-    # state and audit trail never diverge (the reason for the original
-    # audit-before-mutation rule), if `audit_resource_subscription` fails (or is
+    # we write `resource.subscribe`. If `audit_resource_subscription` fails (or is
     # cancelled), we roll back the in-memory registration via `remove_if_current()`
     # (matching by exact record identity so a concurrent newer subscription is
-    # never destroyed) and re-raise.
+    # never destroyed) and re-raise. This maintains consistency between in-memory
+    # state and the audit trail for the straightforward single-request path.
     #
     # Idempotent re-subscribes (`record is None`) write no audit row,
     # matching unsubscribe's no-op gate without any peek-then-mutate race.
+    #
+    # Known residual race (accepted gap):
+    # `subscribe()` allocates a fresh `_Record` instance on every call, even
+    # when replacing an existing record for the same `(uri, session)`. If two
+    # concurrent subscribe requests for the exact same `(uri, session)` overlap,
+    # the second request to acquire `_lock` sees `removed_existing=True` and
+    # returns `None` (treated as an unaudited idempotent re-subscribe), while
+    # installing its own new record instance. If the first request's audit write
+    # subsequently fails, its `remove_if_current()` call correctly no-ops
+    # because its record is no longer current. However, the second request's
+    # replacement record remains live in memory without an audit row. Closing
+    # this would require auditing idempotent re-subscribes (spamming the audit
+    # trail on routine reconnect traffic) or synchronizing audit state across
+    # replaced record instances; this narrow race under concurrent identical
+    # requests is an accepted, documented design tradeoff.
     try:
         record = await subscriptions.subscribe(
             auth.canonical_uri, session, agent_id=auth.caller.id, sub=auth.base_sub
@@ -596,8 +612,8 @@ async def _handle_subscribe_resource(uri: AnyUrl) -> None:
                     conversation_id=auth.conversation_id,
                 )
         except (Exception, asyncio.CancelledError):
-            # Roll back in-memory registration so state and audit log cannot diverge.
-            await subscriptions.remove_if_current(auth.canonical_uri, session, record)
+            # Roll back in-memory registration on audit failure (best-effort reconciliation).
+            await subscriptions.remove_if_current(auth.canonical_uri, record)
             raise
 
 

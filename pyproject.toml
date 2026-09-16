@@ -11,6 +11,7 @@ authors = [
 # Exact version pins for reproducible builds.
 dependencies = [
     "alembic==1.18.5",
+    "anyio==4.14.2",
     "asyncpg==0.31.0",
     "fastmcp==3.4.2",
     # greenlet is SQLAlchemy's async bridge — pinned explicitly (exact-pin

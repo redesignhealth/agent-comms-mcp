@@ -84,6 +84,11 @@ _registry: dict[str, list[_Record]] = {}
 _agent_subscription_counts: dict[uuid.UUID, int] = {}
 _lock = asyncio.Lock()
 
+# Holds a strong reference to each background `notify()` task scheduled by
+# `notify_conversation_event()` (TECH-6335) so it isn't garbage-collected
+# before it completes; each task discards itself once done.
+_background_notify_tasks: set[asyncio.Task[None]] = set()
+
 
 def _dec_count(agent_id: uuid.UUID) -> None:
     remaining = _agent_subscription_counts.get(agent_id, 0) - 1
@@ -117,19 +122,6 @@ def _reclaim_dead_for_agent_locked(agent_id: uuid.UUID) -> None:
         _agent_subscription_counts[agent_id] = count
     else:
         _agent_subscription_counts.pop(agent_id, None)
-
-
-async def has_capacity_for(agent_id: uuid.UUID) -> bool:
-    """Return True if ``agent_id`` can accept at least one more subscription.
-
-    Acquires ``_lock`` and reclaims any dead-session records for ``agent_id``
-    only when the tracked count is at or above ``MAX_SUBSCRIPTIONS_PER_AGENT``,
-    before checking against ``MAX_SUBSCRIPTIONS_PER_AGENT``.
-    """
-    async with _lock:
-        if _agent_subscription_counts.get(agent_id, 0) >= MAX_SUBSCRIPTIONS_PER_AGENT:
-            _reclaim_dead_for_agent_locked(agent_id)
-        return _agent_subscription_counts.get(agent_id, 0) < MAX_SUBSCRIPTIONS_PER_AGENT
 
 
 async def subscribe(
@@ -231,13 +223,20 @@ async def unsubscribe(uri: str, session: ServerSession) -> bool:
         return removed
 
 
-async def remove_if_current(uri: str, session: ServerSession, record: _Record) -> bool:
+async def remove_if_current(uri: str, record: _Record) -> bool:
     """Remove ``record`` from ``uri``'s subscribers only if it is still the current record.
 
     Used by ``main.py``'s subscribe rollback on audit failure (TECH-6335): if
     another coroutine or client re-subscribe has since replaced or removed this
     exact record, this is a no-op returning ``False``, avoiding accidentally
     destroying a newer, valid subscription.
+
+    Note on known residual race: if two concurrent subscribe requests for the
+    same ``(uri, session)`` race, the second may replace the first with a new
+    record instance and return ``None`` (treated as an unaudited re-subscribe).
+    If the first request's audit write then fails, its rollback will no-op here,
+    leaving the second's replacement record live without an audit row. This narrow
+    race is documented and accepted in ``main.py`` to avoid auditing routine re-subscribes.
 
     Returns ``True`` if ``record`` was still registered and removed, ``False`` otherwise.
     """
@@ -273,8 +272,13 @@ async def notify(uri: str, *, recipient_filter: Collection[uuid.UUID] | None = N
 
     Serial worst-case cost: ``notify()`` sends sequentially per subscriber, so a
     URI with N stalled subscribers costs up to ``N * NOTIFY_SEND_TIMEOUT_SECONDS``
-    on the post-commit path before returning. This is an accepted tradeoff
-    (documented, not fixed here) — do not attempt to parallelize sends.
+    before this call itself returns — ``notify()`` remains synchronous/blocking
+    on its own for whoever awaits it directly. ``notify_conversation_event``
+    (TECH-6335) decouples the post-commit write path from this cost by
+    scheduling each ``notify()`` call as a background task rather than
+    awaiting it inline; a caller awaiting ``notify()`` directly would still
+    block for the full serial cost. This is an accepted tradeoff (documented,
+    not fixed here) — do not attempt to parallelize sends.
 
     ``recipient_filter``, when given, narrows delivery to subscriptions whose
     ``agent_id`` is a member (the caller's own fresh, post-commit view of
@@ -376,7 +380,15 @@ async def notify_conversation_event(
 
     Caller MUST have already committed the transaction that made the
     change — mirrors ``service._fire_approval_notifier``'s contract. Never
-    raises.
+    raises and never blocks on the actual send: each ``notify()`` call is
+    scheduled as a background ``asyncio.Task`` (TECH-6335) rather than
+    awaited inline, so this function returns as soon as the tasks are
+    scheduled, without waiting for any subscriber's send (or its up-to
+    ``NOTIFY_SEND_TIMEOUT_SECONDS`` timeout) to complete. This decouples the
+    write path from a stalled/slow subscriber's cost — see ``notify()``'s
+    own docstring for that cost. The scheduled tasks are held in
+    ``_background_notify_tasks`` so they aren't garbage-collected before
+    they finish; each discards itself from that set once done.
 
     ``active_agent_ids`` is the caller's own fresh, just-queried-post-commit
     set of currently-active participants: passing it as ``notify``'s
@@ -391,6 +403,9 @@ async def notify_conversation_event(
     per-write-path table (e.g. "active participants other than the
     sender").
     """
-    await notify(conversation_uri(conversation_id), recipient_filter=set(active_agent_ids))
-    for agent_id in inbox_agent_ids:
-        await notify(inbox_uri(agent_id))
+    coros = [notify(conversation_uri(conversation_id), recipient_filter=set(active_agent_ids))]
+    coros.extend(notify(inbox_uri(agent_id)) for agent_id in inbox_agent_ids)
+    for coro in coros:
+        task = asyncio.create_task(coro)
+        _background_notify_tasks.add(task)
+        task.add_done_callback(_background_notify_tasks.discard)

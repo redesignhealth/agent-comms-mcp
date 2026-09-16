@@ -1018,7 +1018,8 @@ Fargate task (`desired_count=1`) with no shared pub/sub, so a process-local
 registry is correct-by-deployment — but it is also fully ephemeral: a
 deploy/restart, or a client re-initializing its MCP session, drops every
 subscription and the client must re-subscribe. Bounded per-agent
-(`MAX_SUBSCRIPTIONS_PER_AGENT`, oldest evicted first) so a departed agent that
+(`MAX_SUBSCRIPTIONS_PER_AGENT`, with excess subscribe requests rejected with
+`subscription_limit_reached` rather than evicting the oldest) so a departed agent that
 never triggers a failed send can't accumulate unbounded stale records.
 
 **Low-level handler registration (`main.py`)**: FastMCP's own `@comms_server.resource`
