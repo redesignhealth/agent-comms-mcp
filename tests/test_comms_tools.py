@@ -637,13 +637,12 @@ class TestRegister:
     async def test_whoami_omits_schema_version_before_registration(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
-        """A caller who hasn't called comms_register yet gets the same
-        whoami shape as before schema-version negotiation was added — no
-        status or schema-version fields, and no error just for having never
+        """A caller who hasn't called comms_register yet gets status='not_registered'
+        (TECH-6368) and no schema-version fields, and no error just for having never
         registered (whoami is DB-optional)."""
         token = _token("agent-never-registered")
         whoami = await _call(main, test_session_factory, token, "comms_whoami")
-        assert "status" not in whoami
+        assert whoami["status"] == "not_registered"
         assert "min_schema_version" not in whoami
         assert "max_schema_version" not in whoami
 
@@ -1899,8 +1898,164 @@ class TestNotRegistered:
     async def test_unregistered_caller_gets_distinct_error(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
-        with pytest.raises(ToolError, match="not_registered"):
+        with pytest.raises(ToolError) as exc_info:
             await _call(main, test_session_factory, _token("never-registered"), "comms_inbox")
+        err_msg = str(exc_info.value)
+        assert err_msg.startswith(
+            "not_registered: no board agent is bound to this caller yet -- "
+            "call comms_register first"
+        )
+        assert "-- other identities exist" not in err_msg
+
+    async def test_unregistered_caller_with_single_active_sibling_suggests_key(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        base_sub = "unreg-with-active-sibling"
+        token = _token(base_sub)
+        await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {
+                "display_name": "Active Keyed Agent",
+                "accepted_types": sorted(MESSAGE_TYPES),
+                "agent_key": "claude-code",
+            },
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            await _call(main, test_session_factory, token, "comms_inbox")
+        err_msg = str(exc_info.value)
+        assert err_msg.startswith(
+            "not_registered: no board agent is bound to this caller yet -- "
+            "call comms_register first"
+        )
+        assert (
+            " -- other identities exist under this token: 'claude-code' (active). "
+            "Retry with agent_key='claude-code'." in err_msg
+        )
+
+    async def test_suspended_caller_with_single_active_sibling_suggests_key(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        base_sub = "suspended-with-active-sibling"
+        token = _token(base_sub)
+        bare_reg = await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {
+                "display_name": "Bare Agent",
+                "accepted_types": sorted(MESSAGE_TYPES),
+            },
+        )
+        await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {
+                "display_name": "Active Keyed Agent",
+                "accepted_types": sorted(MESSAGE_TYPES),
+                "agent_key": "claude-code",
+                "confirm_new_identity": True,
+            },
+        )
+        admin_token = _token(
+            "admin-operator-suspension-suggest",
+            scopes=["comms:read", "comms:write", "comms:admin"],
+        )
+        await _call(
+            main,
+            test_session_factory,
+            admin_token,
+            "comms_deregister_agent",
+            {"agent_id": bare_reg["agent_id"]},
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            await _call(main, test_session_factory, token, "comms_inbox")
+        err_msg = str(exc_info.value)
+        assert err_msg.startswith(
+            "agent_suspended: this agent has been deregistered (status=suspended) and "
+            "can no longer act on the board"
+        )
+        assert (
+            " -- other identities exist under this token: 'claude-code' (active). "
+            "Retry with agent_key='claude-code'." in err_msg
+        )
+
+    async def test_suspended_caller_without_active_siblings_has_no_suggestion(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        base_sub = "suspended-without-sibling"
+        token = _token(base_sub)
+        bare_reg = await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {
+                "display_name": "Bare Agent",
+                "accepted_types": sorted(MESSAGE_TYPES),
+            },
+        )
+        admin_token = _token(
+            "admin-operator-suspension-no-suggest",
+            scopes=["comms:read", "comms:write", "comms:admin"],
+        )
+        await _call(
+            main,
+            test_session_factory,
+            admin_token,
+            "comms_deregister_agent",
+            {"agent_id": bare_reg["agent_id"]},
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            await _call(main, test_session_factory, token, "comms_inbox")
+        err_msg = str(exc_info.value)
+        assert err_msg == (
+            "agent_suspended: this agent has been deregistered (status=suspended) and "
+            "can no longer act on the board"
+        )
+
+    async def test_unregistered_keyed_caller_with_active_bare_sibling_suggests_no_key(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Counterpart to
+        ``test_unregistered_caller_with_single_active_sibling_suggests_key``:
+        when the ONE active sibling to suggest IS the bare base_sub identity
+        itself (``agent_key`` is ``None``), the suffix says
+        'Retry without agent_key.' rather than naming a key."""
+        base_sub = "unreg-keyed-with-active-bare-sibling"
+        token = _token(base_sub)
+        await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {
+                "display_name": "Bare Agent",
+                "accepted_types": sorted(MESSAGE_TYPES),
+            },
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            await _call(
+                main, test_session_factory, token, "comms_inbox", {"agent_key": "claude-code"}
+            )
+        err_msg = str(exc_info.value)
+        assert err_msg.startswith(
+            "not_registered: no board agent is bound to this caller yet -- "
+            "call comms_register first"
+        )
+        assert (
+            " -- other identities exist under this token: bare identity (active). "
+            "Retry without agent_key." in err_msg
+        )
 
 
 # --- Full happy-path negotiation ------------------------------------------------------

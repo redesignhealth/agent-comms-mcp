@@ -87,6 +87,7 @@ from service import (
     inbox,
     leave,
     list_conversations,
+    list_sibling_identities,
     may_extend,
     reconcile_agent_ownership,
     register_agent,
@@ -1294,6 +1295,163 @@ class TestRegisterAgent:
             )
         ).scalar_one_or_none()
         assert audit_action == "denied.display_name_collision"
+
+
+# --- list_sibling_identities ---------------------------------------------------
+
+
+class TestListSiblingIdentities:
+    async def test_returns_bare_and_keyed_rows_ordered_by_sub(self, session: AsyncSession) -> None:
+        """list_sibling_identities returns bare and keyed rows matching base_sub,
+        excluding exclude_sub, ordered by sub, with the minimal projection."""
+        base_sub = "sibling-test-user"
+        await _register(
+            session,
+            sub=base_sub,
+            base_sub=base_sub,
+            display_name="User Bare",
+        )
+        await _register(
+            session,
+            sub=f"{base_sub}::bot-b",
+            base_sub=base_sub,
+            display_name="Bot B",
+            confirm_new_identity=True,
+        )
+        await _register(
+            session,
+            sub=f"{base_sub}::bot-a",
+            base_sub=base_sub,
+            display_name="Bot A",
+            confirm_new_identity=True,
+        )
+
+        # Exclude bot-b -> returns bare and bot-a, ordered by sub
+        results = await list_sibling_identities(
+            session, base_sub=base_sub, exclude_sub=f"{base_sub}::bot-b"
+        )
+        assert results == [
+            {
+                "agent_key": None,
+                "sub": base_sub,
+                "display_name": "User Bare",
+                "status": "active",
+            },
+            {
+                "agent_key": "bot-a",
+                "sub": f"{base_sub}::bot-a",
+                "display_name": "Bot A",
+                "status": "active",
+            },
+        ]
+
+    async def test_excludes_caller_own_row(self, session: AsyncSession) -> None:
+        """exclude_sub is omitted from results whether it is the bare identity or keyed."""
+        base_sub = "sibling-exclude-test"
+        await _register(session, sub=base_sub, base_sub=base_sub, display_name="Bare")
+        await _register(
+            session,
+            sub=f"{base_sub}::keyed",
+            base_sub=base_sub,
+            display_name="Keyed",
+            confirm_new_identity=True,
+        )
+
+        results_bare_excluded = await list_sibling_identities(
+            session, base_sub=base_sub, exclude_sub=base_sub
+        )
+        assert [r["sub"] for r in results_bare_excluded] == [f"{base_sub}::keyed"]
+
+        results_keyed_excluded = await list_sibling_identities(
+            session, base_sub=base_sub, exclude_sub=f"{base_sub}::keyed"
+        )
+        assert [r["sub"] for r in results_keyed_excluded] == [base_sub]
+
+    async def test_never_returns_another_owners_rows(self, session: AsyncSession) -> None:
+        """Identities under a different base_sub are never returned."""
+        owner_a = "sibling-owner-a"
+        owner_b = "sibling-owner-b"
+        await _register(session, sub=owner_a, base_sub=owner_a, display_name="Owner A")
+        await _register(
+            session,
+            sub=f"{owner_a}::agent",
+            base_sub=owner_a,
+            display_name="Owner A Agent",
+            confirm_new_identity=True,
+        )
+        await _register(session, sub=owner_b, base_sub=owner_b, display_name="Owner B")
+        await _register(
+            session,
+            sub=f"{owner_b}::agent",
+            base_sub=owner_b,
+            display_name="Owner B Agent",
+            confirm_new_identity=True,
+        )
+
+        results_a = await list_sibling_identities(session, base_sub=owner_a, exclude_sub=owner_a)
+        assert results_a == [
+            {
+                "agent_key": "agent",
+                "sub": f"{owner_a}::agent",
+                "display_name": "Owner A Agent",
+                "status": "active",
+            }
+        ]
+
+    async def test_wildcard_character_escaping_prevents_cross_owner_leak(
+        self, session: AsyncSession
+    ) -> None:
+        """A base_sub containing literal '%' or '_' must not wildcard-match a different
+        owner's sub (regression guard for autoescape=True)."""
+        # '%' wildcard test: "owner%test" must not match "owner1test"
+        pct_base = "owner%test"
+        num_base = "owner1test"
+        await _register(session, sub=pct_base, base_sub=pct_base, display_name="Pct Base")
+        await _register(
+            session,
+            sub=f"{pct_base}::agent",
+            base_sub=pct_base,
+            display_name="Pct Agent",
+            confirm_new_identity=True,
+        )
+        await _register(session, sub=num_base, base_sub=num_base, display_name="Num Base")
+        await _register(
+            session,
+            sub=f"{num_base}::agent",
+            base_sub=num_base,
+            display_name="Num Agent",
+            confirm_new_identity=True,
+        )
+
+        results_pct = await list_sibling_identities(
+            session, base_sub=pct_base, exclude_sub=pct_base
+        )
+        assert [r["sub"] for r in results_pct] == [f"{pct_base}::agent"]
+
+        # '_' wildcard test: "owner_test" must not match "ownerAtest"
+        und_base = "owner_test"
+        chr_base = "ownerAtest"
+        await _register(session, sub=und_base, base_sub=und_base, display_name="Und Base")
+        await _register(
+            session,
+            sub=f"{und_base}::agent",
+            base_sub=und_base,
+            display_name="Und Agent",
+            confirm_new_identity=True,
+        )
+        await _register(session, sub=chr_base, base_sub=chr_base, display_name="Chr Base")
+        await _register(
+            session,
+            sub=f"{chr_base}::agent",
+            base_sub=chr_base,
+            display_name="Chr Agent",
+            confirm_new_identity=True,
+        )
+
+        results_und = await list_sibling_identities(
+            session, base_sub=und_base, exclude_sub=und_base
+        )
+        assert [r["sub"] for r in results_und] == [f"{und_base}::agent"]
 
 
 # --- set_agent_shared ----------------------------------------------------------
