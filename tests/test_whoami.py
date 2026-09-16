@@ -302,6 +302,43 @@ class TestWhoami:
         assert result["other_identities"] == siblings
         assert result["suggested_agent_key"] == "claude-code"
 
+    def test_suspended_caller_with_one_active_bare_sibling_includes_bare_suggestion(
+        self,
+    ) -> None:
+        """(a2) Caller status suspended + exactly one active sibling, and that
+        sibling is the BARE base_sub identity (agent_key is None) ->
+        ``suggested_bare_identity: True`` is set instead of the ambiguous
+        ``suggested_agent_key: None`` (Fix for TECH-6368 doc-drift review)."""
+        token = MagicMock()
+        token.claims = {
+            "iss": "https://example.okta.com/oauth2/default",
+            "email": "dan.costanza@redesignhealth.com",
+        }
+        fake_agent = MagicMock(status="suspended", min_schema_version=1, max_schema_version=1)
+        siblings = [
+            {
+                "agent_key": None,
+                "sub": "dan.costanza@redesignhealth.com",
+                "display_name": "Bare Agent",
+                "status": "active",
+            }
+        ]
+        with (
+            patch("providers.comms.get_access_token", return_value=token),
+            _patched_session_factory(),
+            patch("providers.comms.service.get_agent_by_sub", AsyncMock(return_value=fake_agent)),
+            patch(
+                "providers.comms.service.list_sibling_identities",
+                AsyncMock(return_value=siblings),
+            ),
+        ):
+            result = asyncio.run(_whoami())
+
+        assert result["status"] == "suspended"
+        assert result["other_identities"] == siblings
+        assert result["suggested_bare_identity"] is True
+        assert "suggested_agent_key" not in result
+
     def test_unregistered_caller_with_zero_active_siblings_omits_suggestion(self) -> None:
         """(b) Caller status not_registered + zero active siblings -> other_identities
         present if suspended siblings exist, but no suggested_agent_key."""

@@ -1051,7 +1051,7 @@ def _agent_key_from_sub(sub: str, base_sub: str) -> str | None:
     -- both ``base_sub`` and ``agent_key`` are validated elsewhere to never
     contain ``"::"`` themselves, so this split is unambiguous. Used only to
     render existing sibling identities back into a human-readable error
-    (``SiblingIdentityExistsError``) or diagnostic responses — never for
+    (``SiblingIdentityExistsError``) or diagnostic responses -- never for
     any authorization decision.
     """
     if sub == base_sub:
