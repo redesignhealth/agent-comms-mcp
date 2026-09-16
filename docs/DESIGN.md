@@ -1018,7 +1018,8 @@ Fargate task (`desired_count=1`) with no shared pub/sub, so a process-local
 registry is correct-by-deployment — but it is also fully ephemeral: a
 deploy/restart, or a client re-initializing its MCP session, drops every
 subscription and the client must re-subscribe. Bounded per-agent
-(`MAX_SUBSCRIPTIONS_PER_AGENT`, oldest evicted first) so a departed agent that
+(`MAX_SUBSCRIPTIONS_PER_AGENT`, with excess subscribe requests rejected with
+`subscription_limit_reached` rather than evicting the oldest) so a departed agent that
 never triggers a failed send can't accumulate unbounded stale records.
 
 **Low-level handler registration (`main.py`)**: FastMCP's own `@comms_server.resource`
@@ -1077,6 +1078,81 @@ conversation itself is genuinely new, so there is no conversation URI to
 notify) even though the caller's actual opening content is held — only
 `post_message`/`invite` skip notification entirely when held.
 
+### Delivery semantics and gap recovery (TECH-6335)
+
+A resource notification push (`notifications/resources/updated`) is strictly an
+at-most-once, best-effort hint carrying only a URI, with no payload, sequence
+numbers, or delivery guarantee. Crucially, a successful `send_resource_updated`
+call on the server does NOT imply delivery: the underlying MCP SDK silently
+drops notifications with no exception if no GET/SSE stream is currently attached
+to the session.
+
+Because pushes are best-effort hints, the real delivery contract is the client's
+catch-up read via `comms_get_conversation(since_seq=...)` (for conversations) or
+`comms_inbox` (for inboxes):
+
+- **Conversations:** Catch-up is completely lossless across restarts or disconnects,
+  **PROVIDED the client fully pages via `since_seq`/`page_max_seq` until `has_more=False`
+  on every catch-up**. A single unpaginated read is not sufficient if more than 500
+  messages accrued. When fully paged, no message data is ever lost across restarts or
+  disconnects; the only impact of a missed push is notification latency, bounded by the
+  client's periodic catch-up interval.
+- **Inboxes:** Catch-up via `comms_inbox` is best-effort **CURRENT-STATE reconciliation**
+  (an accurate snapshot of what is currently unread right now), **NOT** lossless
+  event-by-event recovery. `comms_inbox` caps each returned collection (unread conversations,
+  pending invites) at 100 items with no pagination mechanism (see `providers/comms.py`
+  § "No cursor/pagination for this tool"). If more than 100 qualifying items exist, items
+  beyond the cap are not visible until earlier items are resolved (marked read, accepted,
+  or declined) — do not assume or claim "no data lost" for the inbox path.
+
+**The client contract (5 points):**
+
+1. **Push is a hint, not the event:** A notification carries only a resource URI,
+   never message content, sequence numbers, or ordering guarantees. Treat it as
+   a trigger to read, never as the message itself.
+2. **Subscribe before reading:** To avoid missing messages between the initial
+   fetch and subscribing, always subscribe to the resource *before* issuing the
+   first read.
+3. **Catch up on hints and periodically:** On receiving a notification hint —
+   AND on a periodic background interval (e.g. ~60s) regardless of hints —
+   catch up via `comms_get_conversation(since_seq=<last page_max_seq>)` for
+   conversations, paging repeatedly while `has_more` is true until exhausted (a
+   single unpaginated read is insufficient if more than 500 messages accrued).
+   For inboxes, reconcile via `comms_inbox` (best-effort current-state snapshot
+   of up to 100 unread conversations and 100 pending invites; not paginated).
+   Note: do NOT re-read the `comms://comms/conversations/{id}` resource for
+   catch-up, because that resource is pinned at `since_seq=0` and returns only
+   the oldest 500 messages.
+4. **Re-subscribe on re-initialize and periodically:** Because server restarts,
+   deploys, and task recycles drop the ephemeral in-memory subscription registry,
+   clients must re-subscribe on every MCP session re-initialization and periodically
+   (e.g. on every catch-up poll). Re-subscribing is idempotent, cheap, and recovers
+   from server-side subscription loss without waiting for a client-visible error.
+5. **Subscription cap rejects with `subscription_limit_reached`:** An agent may
+   hold at most `MAX_SUBSCRIPTIONS_PER_AGENT` (100) live subscriptions across all
+   URIs. Subscribing beyond this cap is rejected with a specific error
+   (`subscription_limit_reached: too many active subscriptions for this agent`),
+   allowing the client to distinguish cap exhaustion from authorization denials
+   and unsubscribe stale resources.
+
+**Rejected alternatives:**
+- *Persisting subscription intent to Postgres:* Rejected because it duplicates
+  state the client already owns, and the MCP SDK provides no clean lifecycle hook
+  to restore subscriptions onto a new transport session after a restart.
+- *Server-side "last successfully notified" marker:* Rejected because the MCP SDK
+  reports `send_resource_updated` success even when the notification is silently
+  dropped (when no SSE stream is attached), so a server marker would record
+  deliveries that never actually reached the client.
+- *Durable per-subscriber outbox / event bus:* Rejected because the `messages` table's
+  `seq` column already acts as a durable ordered log; a second event-bus store would
+  duplicate it without providing stronger guarantees than `since_seq` reads.
+
+**Cross-instance fanout (TECH-5903 Phase C) is orthogonal:**
+Postgres LISTEN/NOTIFY for multi-instance fanout addresses how multiple server
+processes discover which instance holds an active session; it does not change
+client delivery semantics, session ephemerality, or recovery for dead/disconnected
+consumers.
+
 **Known gaps (Phase B)**, accepted for this PR, not addressed here:
 
 - No rate limiting on the subscribe/unsubscribe handlers (unlike
@@ -1091,11 +1167,14 @@ notify) even though the caller's actual opening content is held — only
   equivalent of `ObservabilityMiddleware`'s `tool_call` event; only
   denials are observable today, via `ScopeEnforcementMiddleware`'s
   `scope_denial` event or the pre-DB `logger.warning` calls in `main.py`.
-- Per-agent cap eviction and prune-on-dead-weakref/prune-on-send-failure
-  (`subscriptions.py`) write no audit row — both are system-driven
-  registry cleanup, not a caller-initiated action, so there's no actor to
-  attribute a row to; cap eviction is at least visible via a
-  `logger.warning` naming the evicted URI.
+- Prune-on-dead-weakref and prune-on-closed/broken-stream (`subscriptions.py`)
+  write no audit row — both are system-driven registry cleanup of stale
+  bookkeeping, not a caller-initiated action, so there's no actor to attribute a
+  row to. Cap exhaustion no longer evicts: it rejects the subscribe request with
+  `subscription_limit_reached` (audited as `denied.subscribe_limit_reached`).
+  Pruning is strictly limited to definitive session death (`anyio.ClosedResourceError`,
+  `anyio.BrokenResourceError`) and dead weakrefs; transient send errors and
+  slow consumer timeouts do not prune subscriptions.
 
 ## 8. Security invariants
 
