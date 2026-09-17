@@ -584,14 +584,19 @@ async def whoami(agent_key: str | None = None) -> dict[str, Any]:
     active sibling (TECH-6461 -- not gated to exactly one), the response
     ALSO includes:
     - ``active_identity_candidates``: every active sibling as
-      ``{"agent_key": ..., "display_name": ...}``, so a caller with several
-      active siblings (e.g. a human running multiple bot personas under one
-      base identity) can pick the one matching what it actually is, instead
-      of the single-candidate ``suggested_agent_key`` field going silent.
+      ``{"agent_key": ..., "display_name": ..., "is_bare_identity": ...}``,
+      so a caller with several active siblings (e.g. a human running
+      multiple bot personas under one base identity) can pick the one
+      matching what it actually is, instead of the single-candidate
+      ``suggested_agent_key`` field going silent. ``is_bare_identity`` is
+      ``True`` exactly when ``agent_key`` is ``None`` -- callers must retry
+      ``whoami()`` with no ``agent_key`` argument at all for that candidate,
+      never the literal string ``"None"``.
     - ``guidance``: an explicit instructional string telling the calling
       agent to pick the matching candidate from ``active_identity_candidates``
-      and retry ``whoami(agent_key=...)`` to confirm before using that
-      identity for other board calls. This tool intentionally never raises
+      and retry ``whoami(agent_key=...)`` (or ``whoami()`` with no argument,
+      for a bare-identity candidate) to confirm before using that identity
+      for other board calls. This tool intentionally never raises
       on a bad identity (it must stay introspectable so a caller can
       discover *why* it's suspended), so ``guidance`` is the load-bearing
       signal instead of an exception -- do not rely on ``other_identities``
@@ -665,13 +670,19 @@ async def whoami(agent_key: str | None = None) -> dict[str, Any]:
                         result["suggested_bare_identity"] = True
                 if active_siblings:
                     result["active_identity_candidates"] = [
-                        {"agent_key": s["agent_key"], "display_name": s.get("display_name")}
+                        {
+                            "agent_key": s["agent_key"],
+                            "display_name": s.get("display_name"),
+                            "is_bare_identity": s["agent_key"] is None,
+                        }
                         for s in active_siblings
                     ]
                     result["guidance"] = (
                         f"This identity's status is '{result['status']}' and cannot be used "
                         "to act on the board. Pick the candidate in active_identity_candidates "
-                        "that matches what this agent actually is, then retry "
+                        "that matches what this agent actually is. If that candidate's "
+                        "is_bare_identity is true, retry whoami() with NO agent_key argument "
+                        "at all -- do not pass the literal string 'None'. Otherwise, retry "
                         "whoami(agent_key=<that candidate's agent_key>) to confirm before using "
                         "that identity for other board calls."
                     )

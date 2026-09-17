@@ -411,11 +411,56 @@ class TestWhoami:
         assert "suggested_agent_key" not in result
         assert "suggested_bare_identity" not in result
         assert result["active_identity_candidates"] == [
-            {"agent_key": "bot-1", "display_name": "Bot 1"},
-            {"agent_key": "bot-2", "display_name": "Bot 2"},
+            {"agent_key": "bot-1", "display_name": "Bot 1", "is_bare_identity": False},
+            {"agent_key": "bot-2", "display_name": "Bot 2", "is_bare_identity": False},
         ]
         assert "guidance" in result
         assert "active_identity_candidates" in result["guidance"]
+
+    def test_multiple_active_siblings_including_bare_identity_marks_is_bare_identity(
+        self,
+    ) -> None:
+        """(c2) When one of several active siblings is the BARE base_sub
+        identity (agent_key is None), its candidate dict has
+        is_bare_identity=True and the guidance explicitly warns against
+        passing the literal string 'None' (Argus round-1 BLOCKING fix,
+        TECH-6461)."""
+        token = MagicMock()
+        token.claims = {
+            "iss": "https://example.okta.com/oauth2/default",
+            "email": "dan.costanza@redesignhealth.com",
+        }
+        siblings = [
+            {
+                "agent_key": None,
+                "sub": "dan.costanza@redesignhealth.com",
+                "display_name": "Bare Agent",
+                "status": "active",
+            },
+            {
+                "agent_key": "bot-2",
+                "sub": "dan.costanza@redesignhealth.com::bot-2",
+                "display_name": "Bot 2",
+                "status": "active",
+            },
+        ]
+        with (
+            patch("providers.comms.get_access_token", return_value=token),
+            _patched_session_factory(),
+            patch("providers.comms.service.get_agent_by_sub", AsyncMock(return_value=None)),
+            patch(
+                "providers.comms.service.list_sibling_identities",
+                AsyncMock(return_value=siblings),
+            ),
+        ):
+            result = asyncio.run(_whoami())
+
+        assert result["active_identity_candidates"] == [
+            {"agent_key": None, "display_name": "Bare Agent", "is_bare_identity": True},
+            {"agent_key": "bot-2", "display_name": "Bot 2", "is_bare_identity": False},
+        ]
+        assert "is_bare_identity" in result["guidance"]
+        assert "literal string 'None'" in result["guidance"]
 
     def test_sibling_lookup_db_failure_returns_cleanly(
         self, caplog: pytest.LogCaptureFixture
