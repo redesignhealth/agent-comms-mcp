@@ -4235,6 +4235,313 @@ class TestExtendConversation:
             )
 
 
+class TestReopenConversation:
+    """TECH-6442: ``comms_reopen_conversation`` end-to-end coverage through
+    the real mounted tool stack."""
+
+    async def _start_open_conversation(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        *,
+        owner_sub: str,
+        member_sub: str,
+        expires_at: str | None = None,
+    ) -> tuple[str, dict[str, str]]:
+        await _register(main, test_session_factory, owner_sub)
+        await _register(main, test_session_factory, member_sub)
+        token_owner = _token(owner_sub)
+        list_result = await _call(main, test_session_factory, token_owner, "comms_list_agents")
+        ids = {a["sub"]: a["agent_id"] for a in list_result["agents"]}
+        payload: dict[str, Any] = {
+            "conversation_type": "open",
+            "target_agent_ids": [ids[member_sub]],
+            "initial_message": _availability_request(),
+        }
+        if expires_at is not None:
+            payload["expires_at"] = expires_at
+        started = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_start_conversation",
+            payload,
+        )
+        return started["conversation_id"], ids
+
+    async def test_owner_can_reopen_completed(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        conversation_id, ids = await self._start_open_conversation(
+            main,
+            test_session_factory,
+            owner_sub="reopen-tool-owner-1",
+            member_sub="reopen-tool-member-1",
+        )
+        token_owner = _token("reopen-tool-owner-1")
+        token_member = _token("reopen-tool-member-1")
+        await _call(
+            main,
+            test_session_factory,
+            token_member,
+            "comms_accept",
+            {"conversation_id": conversation_id},
+        )
+        await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_post_message",
+            {
+                "conversation_id": conversation_id,
+                "message_type": "confirm",
+                "payload": _confirm_payload(),
+            },
+        )
+        conv_before = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_get_conversation",
+            {"conversation_id": conversation_id},
+        )
+        assert conv_before["conversation"]["state"] == "completed"
+
+        result = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_reopen_conversation",
+            {"conversation_id": conversation_id},
+        )
+        assert result["conversation_id"] == conversation_id
+        assert result["agent_id"] == ids["reopen-tool-owner-1"]
+        assert result["reopened"] is True
+        assert result["state"] == "active"
+        assert result["previous_state"] == "completed"
+        assert result["expires_at_changed"] is False
+        assert result["active_participant_count"] == 2
+        assert result["expires_at"] is not None
+        assert result["previous_expires_at"] is not None
+
+    async def test_non_owner_member_reopen_denied(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        conversation_id, _ids = await self._start_open_conversation(
+            main,
+            test_session_factory,
+            owner_sub="reopen-tool-owner-2",
+            member_sub="reopen-tool-member-2",
+        )
+        token_owner = _token("reopen-tool-owner-2")
+        token_member = _token("reopen-tool-member-2")
+        await _call(
+            main,
+            test_session_factory,
+            token_member,
+            "comms_accept",
+            {"conversation_id": conversation_id},
+        )
+        await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_post_message",
+            {
+                "conversation_id": conversation_id,
+                "message_type": "confirm",
+                "payload": _confirm_payload(),
+            },
+        )
+
+        with pytest.raises(
+            ToolError, match=re.escape("access_denied: not authorized for this resource")
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                token_member,
+                "comms_reopen_conversation",
+                {"conversation_id": conversation_id},
+            )
+
+    async def test_reopen_expired_via_tool_requires_ttl(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        past_iso = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
+        conversation_id, _ids = await self._start_open_conversation(
+            main,
+            test_session_factory,
+            owner_sub="reopen-tool-owner-3",
+            member_sub="reopen-tool-member-3",
+            expires_at=past_iso,
+        )
+        token_owner = _token("reopen-tool-owner-3")
+
+        with pytest.raises(
+            ToolError,
+            match=re.escape("invalid_request: reopening a lapsed conversation requires"),
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                token_owner,
+                "comms_reopen_conversation",
+                {"conversation_id": conversation_id},
+            )
+
+        result = await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_reopen_conversation",
+            {"conversation_id": conversation_id, "extend_by_days": 7},
+        )
+        assert result["state"] == "active"
+        assert result["expires_at_changed"] is True
+
+    async def test_reopen_archived_via_tool(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        conversation_id, _ids = await self._start_open_conversation(
+            main,
+            test_session_factory,
+            owner_sub="reopen-tool-owner-4",
+            member_sub="reopen-tool-member-4",
+        )
+        token_owner = _token("reopen-tool-owner-4")
+        await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_post_message",
+            {
+                "conversation_id": conversation_id,
+                "message_type": "confirm",
+                "payload": _confirm_payload(),
+            },
+        )
+        await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_archive_conversation",
+            {"conversation_id": conversation_id},
+        )
+
+        with pytest.raises(ToolError, match="conversation_archived"):
+            await _call(
+                main,
+                test_session_factory,
+                token_owner,
+                "comms_reopen_conversation",
+                {"conversation_id": conversation_id},
+            )
+
+    async def test_reopen_rejects_both_ttl_params_at_tool_layer(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        conversation_id, _ids = await self._start_open_conversation(
+            main,
+            test_session_factory,
+            owner_sub="reopen-tool-owner-5",
+            member_sub="reopen-tool-member-5",
+        )
+        token_owner = _token("reopen-tool-owner-5")
+        await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_post_message",
+            {
+                "conversation_id": conversation_id,
+                "message_type": "confirm",
+                "payload": _confirm_payload(),
+            },
+        )
+
+        with pytest.raises(
+            ToolError,
+            match=re.escape("invalid_request: provide at most one of expires_at or extend_by_days"),
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                token_owner,
+                "comms_reopen_conversation",
+                {
+                    "conversation_id": conversation_id,
+                    "expires_at": (datetime.now(UTC) + timedelta(days=15)).isoformat(),
+                    "extend_by_days": 5,
+                },
+            )
+
+    async def test_reopen_then_post_message_succeeds(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """The actual end-user recovery flow this tool exists for."""
+        conversation_id, _ids = await self._start_open_conversation(
+            main,
+            test_session_factory,
+            owner_sub="reopen-tool-owner-6",
+            member_sub="reopen-tool-member-6",
+        )
+        token_owner = _token("reopen-tool-owner-6")
+        token_member = _token("reopen-tool-member-6")
+        await _call(
+            main,
+            test_session_factory,
+            token_member,
+            "comms_accept",
+            {"conversation_id": conversation_id},
+        )
+        await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_post_message",
+            {
+                "conversation_id": conversation_id,
+                "message_type": "confirm",
+                "payload": _confirm_payload(),
+            },
+        )
+
+        with pytest.raises(ToolError, match=re.escape("is not legal while the conversation is")):
+            await _call(
+                main,
+                test_session_factory,
+                token_member,
+                "comms_post_message",
+                {
+                    "conversation_id": conversation_id,
+                    "message_type": "availability_response",
+                    "payload": _availability_response(),
+                },
+            )
+
+        await _call(
+            main,
+            test_session_factory,
+            token_owner,
+            "comms_reopen_conversation",
+            {"conversation_id": conversation_id},
+        )
+
+        posted = await _call(
+            main,
+            test_session_factory,
+            token_member,
+            "comms_post_message",
+            {
+                "conversation_id": conversation_id,
+                "message_type": "availability_response",
+                "payload": _availability_response(),
+            },
+        )
+        assert posted["type"] == "availability_response"
+
+
 class TestTaskLifecycleToolLayer:
     """End-to-end coverage for tasks-as-conversations: task_assign opens a
     conversation, task_report/task_complete/task_decline/task_cancel drive

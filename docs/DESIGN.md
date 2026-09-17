@@ -771,7 +771,9 @@ Design notes:
     AND resurrects `state` back to `"active"`, making it postable again and
     causing it to reappear in default `comms_list_conversations` listings.
   - **Rejections**: extending a `completed` or `canceled` conversation is
-    rejected with `InvalidConversationStateError`. Extending an archived
+    rejected with `InvalidConversationStateError` -- `comms_reopen_conversation`
+    (TECH-6442, below) is the actual recovery path for those two states;
+    extend only ever resurrects an `expired` conversation. Extending an archived
     conversation (`archived_at IS NOT NULL`) is rejected with
     `ConversationArchivedError` (`denied.archived.extend`). Validation-class
     failures (shortening, non-future expiry, TTL ceiling, invalid parameter
@@ -783,6 +785,58 @@ Design notes:
     `new_expires_at`, `previous_state`, and `resurrected: bool`. If resurrecting
     an `active`-but-past-deadline conversation, lazy expiry emits a
     `conversation.expire` audit row immediately followed by `conversation.extend`.
+
+- **Reopening a conversation (`comms_reopen_conversation`, TECH-6442)**: resurrects
+  a `completed`/`canceled`/`expired` conversation back to `active`, closing a real
+  usability gap -- until this tool existed, a single `confirm`/`task_complete`
+  (-> `completed`) or `task_decline`/`task_cancel`/an all-members `decline` cascade
+  (-> `canceled`) permanently bricked a long-lived coordination conversation with
+  no in-band recovery path. Complements `comms_extend_conversation`, which
+  resurrects ONLY an `expired` conversation and explicitly rejects
+  `completed`/`canceled`. Key rules and behaviors:
+  - **Owner-only (`may_reopen`)**: unlike `comms_archive_conversation`/
+    `comms_rename_conversation`/`comms_extend_conversation`'s "any CURRENTLY
+    `active` participant", reopen requires the caller to be the conversation's
+    `owner`-role participant AND currently `active` -- the uniform
+    `AccessDeniedError` otherwise. This is the only board operation that
+    REVERSES another participant's own explicit terminal decision (an
+    owner-only `task_cancel`, or a member's `task_decline`/`decline`), so the
+    reverser is deliberately pinned to the single participant with the durable
+    interest in the conversation, not opened up to "any active member" the way
+    archive/rename/extend are.
+  - **Roster untouched**: reopening restores the conversation only, never
+    participant statuses -- a participant who posted `decline` stays `declined`
+    (still cannot post, still cannot be re-invited, since `comms_invite` refuses
+    any target with an existing participant row in any status). A conversation
+    canceled by a decline cascade can be reopened without overriding anyone's
+    consent, but may leave the owner alone with no posting counterparty;
+    `active_participant_count` in the response surfaces that.
+  - **Expiry handling**: at most one of `expires_at`/`extend_by_days` may be
+    supplied (unlike `comms_extend_conversation`, where exactly one is
+    required) -- reopening with NEITHER is legal when the existing `expires_at`
+    is still in the future (left unchanged). If NEITHER is supplied and the
+    existing `expires_at` has already lapsed -- always true for an `expired`
+    conversation -- `InvalidExtendError` is raised
+    (`reopening a lapsed conversation requires expires_at or extend_by_days`),
+    since reopening to a stale deadline would produce a conversation that
+    re-lapses on its very next touch. When either is supplied, it is validated
+    by the exact same `_resolve_extended_expires_at` helper
+    `comms_extend_conversation` uses (extend-only, strictly future,
+    `MAX_CONVERSATION_TTL`-bounded) -- the two tools cannot drift on these
+    rules.
+  - **Rejections**: reopening an `active` conversation (including one whose
+    deadline just lazily lapsed to `expired`) is rejected with
+    `InvalidConversationStateError` (`denied.bad_state`,
+    `message_type="reopen"`), not treated as a no-op. Reopening an archived
+    conversation is rejected with `ConversationArchivedError`
+    (`denied.archived.reopen`), checked AFTER the owner-only auth gate (so a
+    non-owner learns nothing about the conversation's archived status) and
+    BEFORE the state check.
+  - **Non-idempotent**: a second reopen of the now-`active` conversation fails
+    the state check above.
+  - **Audit**: logged under `conversation.reopen` with `previous_state`,
+    `new_state`, `previous_expires_at`, `new_expires_at`, and
+    `expires_at_changed: bool`.
 
 - **On-behalf-of registration (`comms_admin_register`)**: `comms_register` always
  derives `sub` from the CALLING token's own verified identity (§4's "owner
@@ -910,14 +964,14 @@ crossing a boundary no longer denies the send — it diverts to a human-approval
 | `availability_request` | no | window {start,end}, duration_min, modality(video\|phone\|in_person), priority, constraints[] (enum-coded) | opens scheduling negotiation |
 | `availability_response` | no | slots[{start,end,preference 0..1}] max 10, or none_available+reason | **`preference` is the product**: judgment crosses the boundary, never calendar data |
 | `counter_proposal` | no | same slots shape | iterate on slots |
-| `confirm` | no | slot {start,end} | transitions conversation → `completed`. Booking itself is EA-side |
-| `decline` | no | reason (enum) | sets sender's participant status to `declined`. All non-owners declined → conversation `canceled` |
+| `confirm` | no | slot {start,end} | transitions conversation → `completed`. Booking itself is EA-side. Recoverable (owner-only) via `comms_reopen_conversation` (TECH-6442) |
+| `decline` | no | reason (enum) | sets sender's participant status to `declined`. All non-owners declined → conversation `canceled`, recoverable (owner-only) via `comms_reopen_conversation`, though the declining sender's own participant status stays `declined` |
 | `needs_clarification` | no | about_seq | pause signal. A human/EA needs to weigh in |
 | `task_assign` | no | action (enum), scheduling params | opens task-coordination; structured spec, no free text |
 | `task_report` | no | progress (enum), optional note_ref | non-terminal status update from assignee |
-| `task_complete` | no | _(minimal)_ | transitions conversation → `completed` |
-| `task_decline` | no | reason (enum) | member-only; transitions conversation → `canceled` |
-| `task_cancel` | no | reason (enum) | owner-only; transitions conversation → `canceled` |
+| `task_complete` | no | _(minimal)_ | transitions conversation → `completed`. Recoverable (owner-only) via `comms_reopen_conversation` |
+| `task_decline` | no | reason (enum) | member-only; transitions conversation → `canceled`. Recoverable (owner-only) via `comms_reopen_conversation` |
+| `task_cancel` | no | reason (enum) | owner-only; transitions conversation → `canceled`. Recoverable (owner-only) via `comms_reopen_conversation` |
 | `note` | **yes** | text (string) | free-text note; posts immediately unless it would cross a boundary, in which case it is held for human approval (never denied for that reason alone — see §9) |
 | `instruction_request` | no | kind (closed `InstructionKind` enum) | a newly-onboarding/handed-off agent's request for one of a fixed set of startup/handoff instructions; no content, so not boundary-sensitive |
 | `instruction_share` | **yes** | kind (`InstructionKind`) + exactly one of text (doc-backed kinds, 1-20000 chars) or link (link-backed kinds, `https://` URL, 1-2048 chars), per `kind`'s group | pre-defined instruction content, never arbitrary text; same posts-immediately-unless-crossing-a-boundary behavior as `note`. Content verified downstream (agent-comms-approvals' `RHAutoApprover`): doc-backed `text` against a canonical per-kind hash, link-backed `link` against a deployment-side allowlist — a mismatch always escalates to a human, never auto-clears |
@@ -955,6 +1009,7 @@ scroll-to-load-more use case.
 | `comms_rename_conversation` | comms:write | set/replace `conversations.name` (required, max 120 chars; TECH-6120); any `active` participant may call it, not just the owner (same status-gated posture as `comms_invite`, see §4); does not require the conversation itself to still be `active`, and is unaffected by `archived_at` (an archived conversation can still be renamed); audited as `conversation.rename` with the previous value |
 | `comms_archive_conversation` | comms:write | archive a conversation (TECH-5887): sets `archived_at`, permanently. Any CURRENT `active` participant may trigger it (symmetric across the whole conversation, not gated to owner/creator) -- distinct from `comms_leave`, which only ever changes the CALLER's own participant row. Once archived: `comms_invite`/`comms_post_message`/`comms_accept` all reject with the specific `conversation_archived` error (not the uniform denial); also blocks approving a pending hold via the HTTP approval endpoint's `decide_hold` (the hold stays `pending_human`, a human can still reject it) -- the only one of the four blocked surfaces that isn't an MCP tool. Archiving never hides history or per-conversation access (`comms_get_conversation`/`comms_inbox`, and `comms_get_hold_status`) -- archiving is not a delete or a redaction, every past message stays fully readable. It does remove the conversation from the default `comms_list_conversations` browse listing, recoverable via `include_archived=true`. Idempotent (re-archiving is a silent no-op, `archived_at` unchanged); one-directional -- no unarchive tool |
 | `comms_extend_conversation` | comms:write | extend conversation expiry (`expires_at`) by an absolute datetime or relative days (`extend_by_days`, 1..90), rolling up to the 90-day `MAX_CONVERSATION_TTL` ceiling from now; any CURRENT `active` participant may trigger it; cannot shorten expiry; resurrects `expired` conversations back to `active`; rejects `completed`, `canceled`, or `archived` conversations; validation errors raise `InvalidExtendError` (mapped with `invalid_request: `); not idempotent |
+| `comms_reopen_conversation` | comms:write | reopen a `completed`/`canceled`/`expired` conversation back to `active` (TECH-6442); OWNER-ONLY (`may_reopen`), unlike every other whole-conversation tool -- the only operation that reverses another participant's own terminal decision; participant statuses (e.g. `declined`) are left untouched; at most one of `expires_at`/`extend_by_days` may be supplied (neither is legal only when the existing expiry is still in the future; a lapsed expiry with neither raises `InvalidExtendError`), validated by the same `_resolve_extended_expires_at` helper `comms_extend_conversation` uses; rejects an already-`active` conversation with `InvalidConversationStateError`, and an archived one with `ConversationArchivedError` (checked after the owner-only auth gate); not idempotent |
 
 ### MCP resource surface (TECH-5903 Phase A)
 
@@ -1070,6 +1125,7 @@ the request, mirroring `service._fire_approval_notifier`'s posture):
 | `main.decide_approval` (approve, invite hold) | Yes (active participants, pre-existing — the newly-admitted target isn't active yet) | only the newly-invited target |
 | `comms_archive_conversation` | Yes (active participants) | none |
 | `comms_extend_conversation` | Yes (active participants) | none |
+| `comms_reopen_conversation` | Yes (active participants) | none |
 
 A held-for-approval outcome (post_message/invite) fires no notification —
 nothing visible changed yet. `comms_start_conversation`'s held branch is

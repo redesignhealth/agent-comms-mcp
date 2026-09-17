@@ -54,7 +54,16 @@ from exceptions import (
     SiblingIdentityExistsError,
     UnknownConversationTypeError,
 )
-from models import Agent, ApprovalHold, AuditLog, Conversation, Message, Participant
+from models import (
+    PARTICIPANT_ROLES,
+    PARTICIPANT_STATUSES,
+    Agent,
+    ApprovalHold,
+    AuditLog,
+    Conversation,
+    Message,
+    Participant,
+)
 from schemas import (
     MAX_ACCEPTED_TYPE_LENGTH,
     MAX_CONVERSATION_NAME_LENGTH,
@@ -89,9 +98,11 @@ from service import (
     list_conversations,
     list_sibling_identities,
     may_extend,
+    may_reopen,
     reconcile_agent_ownership,
     register_agent,
     rename_conversation,
+    reopen_conversation,
     resolve_inbox_target,
     set_agent_shared,
     write_through_ownership,
@@ -5430,6 +5441,474 @@ class TestExtendConversation:
         # extend's own conversation.extend -- assert strict adjacency, not
         # just relative ordering.
         assert actions[-2:] == ["conversation.expire", "conversation.extend"]
+
+
+class TestReopenConversation:
+    """TECH-6442: service-layer coverage for reopen_conversation."""
+
+    async def _start(
+        self,
+        session: AsyncSession,
+        owner_sub: str,
+        target_sub: str,
+        expires_at: datetime | None = None,
+    ) -> Any:
+        owner = await _register(session, owner_sub)
+        target = await _register(session, target_sub)
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+            expires_at=expires_at,
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        return owner, target, conversation
+
+    async def _assigned_task(
+        self, session: AsyncSession, assigner_sub: str, assignee_sub: str
+    ) -> Any:
+        """Mirrors TestTaskLifecycleMessages._assigned_task -- an internal
+        task_assign conversation, needed for the task_cancel reopen case
+        (task_cancel is sender-role-restricted to the conversation's owner)."""
+        assigner = await _register(session, assigner_sub)
+        assignee = await _register(session, assignee_sub)
+        client = _FakeOwnershipClient(
+            {
+                assigner.id: {"is_shared": False, "owners": ["dan"]},
+                assignee.id: {"is_shared": False, "owners": ["dan"]},
+            }
+        )
+        conversation = await start_conversation(
+            session,
+            actor_sub=assigner.sub,
+            initiator_agent_id=assigner.id,
+            conversation_type="internal",
+            target_agent_ids=[assignee.id],
+            initial_message=_task_assign_payload(),
+            message_type="task_assign",
+            ownership_client=client,
+        )
+        await accept_invite(
+            session, actor_sub=assignee.sub, agent_id=assignee.id, conversation_id=conversation.id
+        )
+        return assigner, assignee, conversation, client
+
+    async def test_reopen_completed_returns_to_active(self, session: AsyncSession) -> None:
+        owner, _target, conversation = await self._start(
+            session, "reopen-svc-owner-1", "reopen-svc-target-1"
+        )
+        await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="confirm",
+            payload=_confirm_payload(),
+        )
+        await session.refresh(conversation)
+        assert conversation.state == "completed"
+
+        result = await reopen_conversation(
+            session,
+            actor_sub=owner.sub,
+            agent_id=owner.id,
+            conversation_id=conversation.id,
+        )
+        assert result.conversation.state == "active"
+        assert result.previous_state == "completed"
+        assert result.expires_at_changed is False
+
+        # The actual recovery: a follow-up post_message succeeds now.
+        msg = await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="counter_proposal",
+            payload=_counter_proposal_payload(),
+        )
+        assert msg.seq == 3
+
+    async def test_reopen_canceled_via_task_cancel_returns_to_active(
+        self, session: AsyncSession
+    ) -> None:
+        assigner, _assignee, conversation, client = await self._assigned_task(
+            session, "reopen-svc-assigner-2", "reopen-svc-assignee-2"
+        )
+        await post_message(
+            session,
+            actor_sub=assigner.sub,
+            sender_agent_id=assigner.id,
+            conversation_id=conversation.id,
+            message_type="task_cancel",
+            payload={"reason": "no_longer_needed"},
+            ownership_client=client,
+        )
+        await session.refresh(conversation)
+        assert conversation.state == "canceled"
+
+        result = await reopen_conversation(
+            session,
+            actor_sub=assigner.sub,
+            agent_id=assigner.id,
+            conversation_id=conversation.id,
+        )
+        assert result.conversation.state == "active"
+        assert result.previous_state == "canceled"
+
+    async def test_reopen_canceled_via_decline_cascade_leaves_decliner_declined(
+        self, session: AsyncSession
+    ) -> None:
+        owner, target, conversation = await self._start(
+            session, "reopen-svc-owner-3", "reopen-svc-target-3"
+        )
+        await post_message(
+            session,
+            actor_sub=target.sub,
+            sender_agent_id=target.id,
+            conversation_id=conversation.id,
+            message_type="decline",
+            payload=_decline_payload(),
+        )
+        await session.refresh(conversation)
+        assert conversation.state == "canceled"
+
+        result = await reopen_conversation(
+            session,
+            actor_sub=owner.sub,
+            agent_id=owner.id,
+            conversation_id=conversation.id,
+        )
+        assert result.conversation.state == "active"
+        assert result.active_participant_count == 1
+
+        target_row = await session.get(Participant, (conversation.id, target.id))
+        assert target_row is not None
+        assert target_row.status == "declined"
+
+        # The consent-doctrine finding: reopening never overrides the
+        # decliner's own consent -- they still cannot post.
+        with pytest.raises(AccessDeniedError):
+            await post_message(
+                session,
+                actor_sub=target.sub,
+                sender_agent_id=target.id,
+                conversation_id=conversation.id,
+                message_type="counter_proposal",
+                payload=_counter_proposal_payload(),
+            )
+
+    async def test_reopen_expired_requires_ttl_and_resurrects(self, session: AsyncSession) -> None:
+        past_dt = datetime.now(UTC) - timedelta(seconds=1)
+        owner, _target, conversation = await self._start(
+            session, "reopen-svc-owner-4", "reopen-svc-target-4", expires_at=past_dt
+        )
+        await session.refresh(conversation)
+        assert conversation.state == "expired"
+
+        with pytest.raises(InvalidExtendError, match="requires expires_at or extend_by_days"):
+            await reopen_conversation(
+                session,
+                actor_sub=owner.sub,
+                agent_id=owner.id,
+                conversation_id=conversation.id,
+            )
+
+        before = datetime.now(UTC)
+        result = await reopen_conversation(
+            session,
+            actor_sub=owner.sub,
+            agent_id=owner.id,
+            conversation_id=conversation.id,
+            extend_by_days=7,
+        )
+        after = datetime.now(UTC)
+        assert result.conversation.state == "active"
+        assert result.previous_state == "expired"
+        assert result.expires_at_changed is True
+        assert before + timedelta(days=7) <= result.conversation.expires_at
+        assert result.conversation.expires_at <= after + timedelta(days=7)
+
+    async def test_reopen_completed_with_lapsed_expiry_requires_ttl(
+        self, session: AsyncSession
+    ) -> None:
+        owner, _target, conversation = await self._start(
+            session, "reopen-svc-owner-5", "reopen-svc-target-5"
+        )
+        await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="confirm",
+            payload=_confirm_payload(),
+        )
+        await session.refresh(conversation)
+        assert conversation.state == "completed"
+
+        # Push the (still-completed) conversation's own deadline into the
+        # past -- the "zombie" case: a terminal state that ALSO has a
+        # lapsed expiry.
+        conversation.expires_at = datetime.now(UTC) - timedelta(days=1)
+        await session.commit()
+
+        with pytest.raises(InvalidExtendError, match="requires expires_at or extend_by_days"):
+            await reopen_conversation(
+                session,
+                actor_sub=owner.sub,
+                agent_id=owner.id,
+                conversation_id=conversation.id,
+            )
+
+        result = await reopen_conversation(
+            session,
+            actor_sub=owner.sub,
+            agent_id=owner.id,
+            conversation_id=conversation.id,
+            extend_by_days=7,
+        )
+        assert result.conversation.state == "active"
+        assert result.previous_state == "completed"
+        assert result.expires_at_changed is True
+
+    async def test_reopen_active_conversation_rejected(self, session: AsyncSession) -> None:
+        owner, _target, conversation = await self._start(
+            session, "reopen-svc-owner-6", "reopen-svc-target-6"
+        )
+        assert conversation.state == "active"
+
+        with pytest.raises(InvalidConversationStateError):
+            await reopen_conversation(
+                session,
+                actor_sub=owner.sub,
+                agent_id=owner.id,
+                conversation_id=conversation.id,
+            )
+
+        stmt = (
+            select(AuditLog)
+            .where(
+                AuditLog.conversation_id == conversation.id,
+                AuditLog.action == "denied.bad_state",
+            )
+            .order_by(AuditLog.id.desc())
+        )
+        log = (await session.execute(stmt)).scalars().first()
+        assert log is not None
+        assert log.detail is not None
+        assert log.detail["message_type"] == "reopen"
+
+    async def test_reopen_non_owner_active_member_denied(self, session: AsyncSession) -> None:
+        owner, target, conversation = await self._start(
+            session, "reopen-svc-owner-7", "reopen-svc-target-7"
+        )
+        await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="confirm",
+            payload=_confirm_payload(),
+        )
+        await session.refresh(conversation)
+        assert conversation.state == "completed"
+
+        target_row = await session.get(Participant, (conversation.id, target.id))
+        assert target_row is not None and target_row.role == "member"
+        assert target_row.status == "active"
+
+        with pytest.raises(AccessDeniedError):
+            await reopen_conversation(
+                session,
+                actor_sub=target.sub,
+                agent_id=target.id,
+                conversation_id=conversation.id,
+            )
+
+        actions = await _audit_actions(session, conversation.id)
+        assert "denied.reopen_not_allowed" in actions
+
+    async def test_reopen_archived_rejected(self, session: AsyncSession) -> None:
+        owner, _target, conversation = await self._start(
+            session, "reopen-svc-owner-8", "reopen-svc-target-8"
+        )
+        await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="confirm",
+            payload=_confirm_payload(),
+        )
+        await archive_conversation(
+            session,
+            actor_sub=owner.sub,
+            agent_id=owner.id,
+            conversation_id=conversation.id,
+        )
+
+        with pytest.raises(ConversationArchivedError):
+            await reopen_conversation(
+                session,
+                actor_sub=owner.sub,
+                agent_id=owner.id,
+                conversation_id=conversation.id,
+            )
+        actions = await _audit_actions(session, conversation.id)
+        assert "denied.archived.reopen" in actions
+
+    async def test_reopen_archived_non_owner_gets_uniform_denial_not_archived_error(
+        self, session: AsyncSession
+    ) -> None:
+        """Auth check must run BEFORE the archived check: a non-owner
+        learns nothing about a conversation's archived status."""
+        owner, target, conversation = await self._start(
+            session, "reopen-svc-owner-8b", "reopen-svc-target-8b"
+        )
+        await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="confirm",
+            payload=_confirm_payload(),
+        )
+        await archive_conversation(
+            session,
+            actor_sub=owner.sub,
+            agent_id=owner.id,
+            conversation_id=conversation.id,
+        )
+
+        with pytest.raises(AccessDeniedError):
+            await reopen_conversation(
+                session,
+                actor_sub=target.sub,
+                agent_id=target.id,
+                conversation_id=conversation.id,
+            )
+
+    async def test_reopen_rejects_ttl_ceiling_and_shortening(self, session: AsyncSession) -> None:
+        now = datetime.now(UTC)
+        future_dt = now + timedelta(days=10)
+        owner, _target, conversation = await self._start(
+            session, "reopen-svc-owner-9", "reopen-svc-target-9", expires_at=future_dt
+        )
+        await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="confirm",
+            payload=_confirm_payload(),
+        )
+        await session.refresh(conversation)
+        assert conversation.state == "completed"
+
+        # Beyond the ceiling.
+        too_far = now + MAX_CONVERSATION_TTL + timedelta(seconds=10)
+        with pytest.raises(InvalidExtendError, match="expires_at"):
+            await reopen_conversation(
+                session,
+                actor_sub=owner.sub,
+                agent_id=owner.id,
+                conversation_id=conversation.id,
+                expires_at=too_far,
+            )
+
+        # Ceiling via extend_by_days: 10 + 85 = 95 > 90.
+        with pytest.raises(InvalidExtendError, match="expires_at"):
+            await reopen_conversation(
+                session,
+                actor_sub=owner.sub,
+                agent_id=owner.id,
+                conversation_id=conversation.id,
+                extend_by_days=85,
+            )
+
+        # Shortening -- a future expires_at that is <= the current one.
+        with pytest.raises(InvalidExtendError, match="greater than"):
+            await reopen_conversation(
+                session,
+                actor_sub=owner.sub,
+                agent_id=owner.id,
+                conversation_id=conversation.id,
+                expires_at=now + timedelta(days=5),
+            )
+
+    async def test_reopen_rejects_both_ttl_params(self, session: AsyncSession) -> None:
+        owner, _target, conversation = await self._start(
+            session, "reopen-svc-owner-10", "reopen-svc-target-10"
+        )
+        await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="confirm",
+            payload=_confirm_payload(),
+        )
+        with pytest.raises(InvalidExtendError, match="at most one"):
+            await reopen_conversation(
+                session,
+                actor_sub=owner.sub,
+                agent_id=owner.id,
+                conversation_id=conversation.id,
+                expires_at=datetime.now(UTC) + timedelta(days=15),
+                extend_by_days=5,
+            )
+
+    async def test_reopen_writes_audit_row(self, session: AsyncSession) -> None:
+        owner, _target, conversation = await self._start(
+            session, "reopen-svc-owner-11", "reopen-svc-target-11"
+        )
+        await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="confirm",
+            payload=_confirm_payload(),
+        )
+        await session.refresh(conversation)
+        previous_expires_at = conversation.expires_at
+
+        result = await reopen_conversation(
+            session,
+            actor_sub=owner.sub,
+            agent_id=owner.id,
+            conversation_id=conversation.id,
+        )
+
+        stmt = (
+            select(AuditLog)
+            .where(
+                AuditLog.conversation_id == conversation.id,
+                AuditLog.action == "conversation.reopen",
+            )
+            .order_by(AuditLog.id.desc())
+        )
+        log = (await session.execute(stmt)).scalars().first()
+        assert log is not None
+        assert log.detail is not None
+        assert log.detail["previous_state"] == "completed"
+        assert log.detail["new_state"] == "active"
+        assert log.detail["previous_expires_at"] == previous_expires_at.isoformat()
+        assert log.detail["new_expires_at"] == result.conversation.expires_at.isoformat()
+        assert log.detail["expires_at_changed"] is False
+
+    def test_may_reopen_predicate(self) -> None:
+        assert may_reopen("owner", "active") is True
+        for role in PARTICIPANT_ROLES:
+            for status in PARTICIPANT_STATUSES:
+                if role == "owner" and status == "active":
+                    continue
+                assert may_reopen(role, status) is False
 
 
 # --- get_conversation ----------------------------------------------------------

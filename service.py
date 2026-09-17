@@ -1476,6 +1476,22 @@ def may_extend(participant_status: str) -> bool:
     return participant_status == "active"
 
 
+def may_reopen(participant_role: str, participant_status: str) -> bool:
+    """v1 reopen policy: ONLY the conversation's ``owner`` role, and only
+    while currently ``active``. Deliberately narrower than
+    ``may_invite``/``may_rename``/``may_extend`` (all "any active member") --
+    reopen is the only board operation that REVERSES another participant's
+    explicit terminal decision. After confirm/task_complete/task_decline/
+    task_cancel, every participant's Participant.status stays "active"
+    (only decline's cascade sets the decliner's own row to "declined"), so
+    "any active participant" would let a non-owner member reverse an
+    owner-only task_cancel with no consent check. Owner-only closes this
+    without a second policy axis. Note this takes role AND status, unlike
+    the other three predicates -- role is load-bearing here.
+    """
+    return participant_role == "owner" and participant_status == "active"
+
+
 # --- Serialization helpers ------------------------------------------------------
 
 
@@ -4373,6 +4389,35 @@ class ExtendConversationResult(NamedTuple):
     resurrected: bool
 
 
+def _resolve_extended_expires_at(
+    conversation: Conversation,
+    *,
+    expires_at: datetime | None,
+    extend_by_days: int | None,
+    now: datetime,
+) -> datetime:
+    """Compute+validate a new expires_at from exactly one of the two
+    parameter shapes. Raises InvalidExtendError on: a resulting expiry not
+    strictly in the future, a shortening/no-op expiry
+    (<= conversation.expires_at), or a MAX_CONVERSATION_TTL ceiling
+    violation. Shared verbatim by extend_conversation and
+    reopen_conversation so the four rules cannot drift between them."""
+    if extend_by_days is not None:
+        base_dt = max(conversation.expires_at, now)
+        computed_new_expires_at = base_dt + timedelta(days=extend_by_days)
+    else:
+        assert expires_at is not None
+        computed_new_expires_at = expires_at
+
+    if computed_new_expires_at <= now:
+        raise InvalidExtendError("new expires_at must be in the future")
+    if computed_new_expires_at <= conversation.expires_at:
+        raise InvalidExtendError("new expires_at must be greater than current expires_at")
+    if computed_new_expires_at - now > MAX_CONVERSATION_TTL:
+        raise InvalidExtendError(f"expires_at may not be more than {MAX_CONVERSATION_TTL} from now")
+    return computed_new_expires_at
+
+
 async def extend_conversation(
     session: AsyncSession,
     *,
@@ -4464,19 +4509,9 @@ async def extend_conversation(
         )
 
     now = _now()
-    if extend_by_days is not None:
-        base_dt = max(conversation.expires_at, now)
-        computed_new_expires_at = base_dt + timedelta(days=extend_by_days)
-    else:
-        assert expires_at is not None
-        computed_new_expires_at = expires_at
-
-    if computed_new_expires_at <= now:
-        raise InvalidExtendError("new expires_at must be in the future")
-    if computed_new_expires_at <= conversation.expires_at:
-        raise InvalidExtendError("new expires_at must be greater than current expires_at")
-    if computed_new_expires_at - now > MAX_CONVERSATION_TTL:
-        raise InvalidExtendError(f"expires_at may not be more than {MAX_CONVERSATION_TTL} from now")
+    computed_new_expires_at = _resolve_extended_expires_at(
+        conversation, expires_at=expires_at, extend_by_days=extend_by_days, now=now
+    )
 
     previous_expires_at = conversation.expires_at
     previous_state = conversation.state
@@ -4504,6 +4539,179 @@ async def extend_conversation(
         conversation=conversation,
         previous_expires_at=previous_expires_at,
         resurrected=resurrected,
+    )
+
+
+class ReopenConversationResult(NamedTuple):
+    """Result of a successful ``reopen_conversation`` call. A typed result
+    rather than dynamic attributes on the ORM instance, matching
+    ExtendConversationResult's own rationale."""
+
+    conversation: Conversation
+    previous_state: str
+    previous_expires_at: datetime
+    expires_at_changed: bool
+    active_participant_count: int
+
+
+async def reopen_conversation(
+    session: AsyncSession,
+    *,
+    actor_sub: str,
+    agent_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    expires_at: datetime | None = None,
+    extend_by_days: int | None = None,
+) -> ReopenConversationResult:
+    """Reopen a terminal conversation (TECH-6442): ``completed``/``canceled``/
+    ``expired`` -> ``active``, making it postable again.
+
+    OWNER-ONLY (``may_reopen``), unlike ``archive_conversation``/
+    ``rename_conversation``/``extend_conversation``'s "any CURRENTLY active
+    participant" posture: reopen is the only board operation that REVERSES
+    another participant's own explicit terminal decision (an owner-only
+    ``task_cancel``, or a non-owner's ``task_decline``/``decline``), so the
+    reverser is pinned to the single participant with the durable interest
+    in the conversation. Requires the caller to be the conversation's
+    ``owner``-role participant AND currently ``active`` (uniform
+    ``AccessDeniedError`` otherwise, identical whether the caller was never
+    a participant, is a non-owner member, is still ``invited``, or has
+    ``left``/``declined``).
+
+    Reopen restores the CONVERSATION only, never the ROSTER: participant
+    statuses are left untouched (a participant who posted ``decline``
+    remains ``declined`` and still cannot post or be re-invited).
+
+    Archived conversations (``archived_at is not None``) are rejected with
+    ``ConversationArchivedError`` (``denied.archived.reopen``), checked
+    AFTER the owner-only auth gate above (so a non-owner learns nothing
+    about a conversation's archived status) and BEFORE the state check
+    below.
+
+    Only ``completed``/``canceled``/``expired`` conversations may be
+    reopened; an ``active`` conversation (including one whose deadline has
+    just lazily lapsed to ``expired`` by ``_load_participant_for_transition``'s
+    own ``_maybe_expire`` call) is rejected with
+    ``InvalidConversationStateError`` (``denied.bad_state``,
+    ``message_type="reopen"``) -- there is nothing to reopen, and
+    ``extend_conversation`` is the right tool for pushing an ``active``
+    conversation's deadline further out.
+
+    Expiry handling: at most one of ``expires_at``/``extend_by_days`` may be
+    supplied (``InvalidExtendError`` if both are) -- unlike
+    ``extend_conversation``, where exactly one is REQUIRED, here NEITHER is
+    also legal. When either is supplied, the new expiry is computed and
+    validated by the same ``_resolve_extended_expires_at`` helper
+    ``extend_conversation`` uses (extend-only, strictly future, bounded by
+    ``MAX_CONVERSATION_TTL``). When neither is supplied: if the
+    conversation's existing ``expires_at`` is still in the future, it is
+    left unchanged; if it has already lapsed (the common case, since an
+    ``expired`` conversation by definition has a lapsed deadline), this
+    raises ``InvalidExtendError`` -- reopening a lapsed conversation with no
+    new deadline would produce a zombie that renders (and re-lapses) as
+    ``expired`` on the very next touch.
+
+    Non-idempotent: reopening an already-``active`` conversation is
+    rejected above, not treated as a no-op.
+
+    Audited as ``conversation.reopen`` with ``previous_state``,
+    ``new_state``, ``previous_expires_at``, ``new_expires_at``, and
+    ``expires_at_changed``.
+    """
+    if expires_at is not None and extend_by_days is not None:
+        raise InvalidExtendError("provide at most one of expires_at or extend_by_days")
+
+    if extend_by_days is not None and (
+        isinstance(extend_by_days, bool)
+        or not isinstance(extend_by_days, int)
+        or not (1 <= extend_by_days <= 90)
+    ):
+        raise InvalidExtendError("extend_by_days must be an integer between 1 and 90")
+
+    if expires_at is not None and expires_at.tzinfo is None:
+        raise InvalidExtendError("expires_at must be timezone-aware")
+
+    conversation, participant = await _load_participant_for_transition(
+        session,
+        actor_sub=actor_sub,
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+        required_status="active",
+        # Locks the conversation row for the duration of this call so two
+        # concurrent reopens serialize instead of racing -- same pattern
+        # as archive_conversation's (TECH-5887) and extend_conversation's
+        # (TECH-6195) own for_update=True.
+        for_update=True,
+    )
+    if not may_reopen(participant.role, participant.status):
+        await _deny(
+            session,
+            actor_sub=actor_sub,
+            action="denied.reopen_not_allowed",
+            agent_id=agent_id,
+            conversation_id=conversation.id,
+        )
+
+    if conversation.archived_at is not None:
+        await _deny_archived(
+            session,
+            actor_sub=actor_sub,
+            agent_id=agent_id,
+            conversation_id=conversation.id,
+            action="denied.archived.reopen",
+        )
+
+    if conversation.state not in ("completed", "canceled", "expired"):
+        await _deny_bad_state(
+            session,
+            actor_sub=actor_sub,
+            agent_id=agent_id,
+            conversation_id=conversation.id,
+            current_state=conversation.state,
+            message_type="reopen",
+        )
+
+    now = _now()
+    if expires_at is not None or extend_by_days is not None:
+        resolved_expires_at = _resolve_extended_expires_at(
+            conversation, expires_at=expires_at, extend_by_days=extend_by_days, now=now
+        )
+    elif conversation.expires_at <= now:
+        raise InvalidExtendError(
+            "reopening a lapsed conversation requires expires_at or extend_by_days"
+        )
+    else:
+        resolved_expires_at = conversation.expires_at
+
+    previous_state = conversation.state
+    previous_expires_at = conversation.expires_at
+    conversation.state = "active"
+    expires_at_changed = resolved_expires_at != previous_expires_at
+    if expires_at_changed:
+        conversation.expires_at = resolved_expires_at
+
+    _audit(
+        session,
+        actor_sub=actor_sub,
+        action="conversation.reopen",
+        agent_id=agent_id,
+        conversation_id=conversation.id,
+        detail={
+            "previous_state": previous_state,
+            "new_state": "active",
+            "previous_expires_at": _iso(previous_expires_at),
+            "new_expires_at": _iso(conversation.expires_at),
+            "expires_at_changed": expires_at_changed,
+        },
+    )
+    active_participant_count = len(await get_active_participant_agent_ids(session, conversation.id))
+    await session.commit()
+    return ReopenConversationResult(
+        conversation=conversation,
+        previous_state=previous_state,
+        previous_expires_at=previous_expires_at,
+        expires_at_changed=expires_at_changed,
+        active_participant_count=active_participant_count,
     )
 
 
@@ -9933,6 +10141,7 @@ __all__ = [
     "ExtendConversationResult",
     "OwnershipClient",
     "OwnershipClientFactory",
+    "ReopenConversationResult",
     "accept_invite",
     "archive_conversation",
     "audit_denied_approval_requires_interactive",
@@ -9965,10 +10174,12 @@ __all__ = [
     "may_extend",
     "may_invite",
     "may_rename",
+    "may_reopen",
     "post_message",
     "reconcile_agent_ownership",
     "register_agent",
     "rename_conversation",
+    "reopen_conversation",
     "resolve_conversation_participant",
     "resolve_inbox_target",
     "resolve_proposal_owner_sub",

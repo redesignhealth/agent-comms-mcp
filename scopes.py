@@ -134,6 +134,12 @@ TOOL_SCOPES: dict[str, str] = {
     # action mirroring comms_archive_conversation -- any active member may
     # trigger it, so it uses the baseline comms:write scope.
     "comms_extend_conversation": "comms:write",
+    # TECH-6442: reopening is a mutating whole-conversation action, but --
+    # unlike comms_archive_conversation/comms_extend_conversation -- it is
+    # owner-only, enforced in-handler by service.may_reopen, not by this
+    # table. Baseline comms:write here; do not assume TOOL_SCOPES alone
+    # gates who may call it.
+    "comms_reopen_conversation": "comms:write",
     # --- proposals (provider: providers/proposals.py, namespace="proposals",
     # TECH-6018 follow-up) ---
     # All five reuse the SAME PROPOSAL_SUBMIT_SCOPE (defined above this

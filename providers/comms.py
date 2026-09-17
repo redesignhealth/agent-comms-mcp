@@ -2376,6 +2376,156 @@ async def extend_conversation(
     }
 
 
+@comms_server.tool
+async def reopen_conversation(
+    conversation_id: str,
+    expires_at: str | None = None,
+    extend_by_days: int | None = None,
+    agent_key: str | None = None,
+) -> dict[str, Any]:
+    """Reopen a terminal conversation: ``completed``/``canceled``/``expired``
+    -> ``active``, making it postable again.
+
+    Complements ``comms_extend_conversation``, which resurrects ONLY an
+    ``expired`` conversation and explicitly rejects ``completed``/``canceled``
+    with ``invalid_conversation_state``. Until this tool existed, a single
+    ``confirm``/``task_complete`` (-> ``completed``) or
+    ``task_decline``/``task_cancel``/an all-members ``decline`` cascade
+    (-> ``canceled``) permanently bricked a long-lived coordination
+    conversation for every participant, with no in-band recovery -- see
+    ``comms_post_message``'s "Side effects" paragraph for exactly which
+    message types transition, and under what condition.
+
+    OWNER-ONLY, unlike every other whole-conversation tool. Requires the
+    caller to be the conversation's ``owner``-role participant AND currently
+    ``active`` (uniform ``access_denied`` otherwise -- identical whether the
+    caller was never a participant, is a non-owner member, is still
+    ``invited``, or has ``left``/``declined``). This is a deliberate
+    narrowing from ``comms_archive_conversation``/``comms_rename_conversation``/
+    ``comms_extend_conversation``'s "any CURRENTLY active participant may do
+    this": reopen is the only board operation that REVERSES another
+    participant's explicit terminal decision (e.g. an owner-only
+    ``task_cancel``, or a member's ``task_decline``), so the reverser is
+    pinned to the single party with the durable interest in the
+    conversation.
+
+    Reopen restores the CONVERSATION, never the ROSTER. Participant statuses
+    are untouched: a participant who posted ``decline`` remains ``declined``,
+    still cannot post, and still cannot be re-invited (``comms_invite``
+    refuses any target that already has a participant row in ANY status --
+    "decline is the consent mechanism"). So reopening a conversation that was
+    canceled by a decline cascade never overrides anyone's consent; it may,
+    however, leave the owner in a conversation with no other posting member.
+    ``active_participant_count`` in the response makes that immediately
+    visible -- invite a NEW agent if you need a counterparty.
+
+    Parameters:
+    - ``conversation_id``: UUID string of the conversation to reopen.
+    - ``expires_at``: optional absolute ISO 8601 timezone-aware datetime.
+    - ``extend_by_days``: optional relative extension in days (1..90),
+      relative to ``max(current expires_at, now())``.
+    - ``agent_key``: optional key when running multiple agents under one token.
+
+    At most ONE of ``expires_at``/``extend_by_days`` may be supplied -- unlike
+    ``comms_extend_conversation``, where exactly one is REQUIRED.
+
+    Expiry handling (this is not optional bookkeeping -- read it):
+    - Both omitted, and the conversation's existing ``expires_at`` is still in
+      the future: expiry is left unchanged, and this is a one-argument call.
+    - Both omitted, and ``expires_at`` has already lapsed: REJECTED with
+      ``invalid_request: reopening a lapsed conversation requires expires_at
+      or extend_by_days``. The board will not invent a retention window on
+      your behalf, and reopening to ``active`` with a past deadline would
+      produce a zombie -- it would render as ``expired`` on the very next read
+      and flip back to ``expired`` on the next write (lazy expiry). Since an
+      ``expired`` conversation by definition has a lapsed deadline, reopening
+      one ALWAYS requires one of these two parameters.
+    - Either supplied: validated exactly as ``comms_extend_conversation``
+      does -- extend-only (a new expiry ``<=`` the current one is rejected
+      even when the current one is stale), strictly in the future, and
+      bounded by the rolling 90-day ``MAX_CONVERSATION_TTL`` ceiling.
+
+    Rules & behavior:
+    - ``expired`` is accepted here too, so this is a single entry point for
+      "make this conversation postable again" regardless of which terminal
+      state it is in -- a caller cannot reliably know that without a prior
+      read, and the state can change between that read and this write.
+      ``comms_extend_conversation``'s own ``expired`` resurrection is
+      unchanged; the two differ in authorization (any active participant vs.
+      owner-only), so prefer extend when you only mean to push a deadline.
+    - Reopening an ``active`` conversation is REJECTED with
+      ``invalid_conversation_state``, not treated as a no-op: there is
+      nothing to reopen, the caller is probably reaching for
+      ``comms_extend_conversation``, and -- unlike the parameterless,
+      idempotent ``comms_archive_conversation`` -- a "no-op" here would be
+      ambiguous about whether the expiry parameters still applied. An
+      ``active`` conversation already past its deadline is lazily flipped to
+      ``expired`` before this check and is therefore reopenable.
+    - Archived conversations are REJECTED with ``conversation_archived``,
+      checked before the state check. Archiving is permanent, orthogonal to
+      ``state``, and has no undo (see ``comms_archive_conversation``); reopen
+      is not a back door into it.
+    - Not idempotent: a second reopen of the now-``active`` conversation
+      fails the state check above.
+    - Audited as ``conversation.reopen`` with ``previous_state``,
+      ``new_state``, ``previous_expires_at``, ``new_expires_at``, and
+      ``expires_at_changed``.
+    """
+    token = _require_token()
+    base_sub = _require_identity(token)
+    agent_key = _validate_agent_key(agent_key)
+    sub = _compose_sub(base_sub, agent_key)
+    conv_id = _parse_uuid("conversation_id", conversation_id)
+
+    if expires_at is not None and extend_by_days is not None:
+        raise ToolError("invalid_request: provide at most one of expires_at or extend_by_days")
+
+    if extend_by_days is not None and (
+        isinstance(extend_by_days, bool)
+        or not isinstance(extend_by_days, int)
+        or not (1 <= extend_by_days <= 90)
+    ):
+        raise ToolError("invalid_request: extend_by_days must be between 1 and 90")
+
+    expires_dt = None
+    if expires_at is not None:
+        expires_dt = _parse_expires_at(expires_at)
+        assert expires_dt is not None
+        if expires_dt <= datetime.now(UTC):
+            raise ToolError("invalid_request: expires_at must be in the future")
+        if expires_dt - datetime.now(UTC) > service.MAX_CONVERSATION_TTL:
+            raise ToolError(
+                "invalid_request: expires_at may not be more than "
+                f"{service.MAX_CONVERSATION_TTL} from now"
+            )
+
+    async with get_session_factory()() as session:
+        caller = await _resolve_caller_agent(session, sub, token)
+        async with _map_service_errors():
+            result = await service.reopen_conversation(
+                session,
+                actor_sub=sub,
+                agent_id=caller.id,
+                conversation_id=conv_id,
+                expires_at=expires_dt,
+                extend_by_days=extend_by_days,
+            )
+        active_ids = await _get_active_participant_agent_ids_or_empty(session, conv_id)
+
+    await subscriptions.notify_conversation_event(conv_id, active_agent_ids=active_ids)
+    return {
+        "conversation_id": str(conv_id),
+        "agent_id": str(caller.id),
+        "reopened": True,
+        "state": "active",
+        "previous_state": result.previous_state,
+        "expires_at": _iso(result.conversation.expires_at),
+        "previous_expires_at": _iso(result.previous_expires_at),
+        "expires_at_changed": result.expires_at_changed,
+        "active_participant_count": result.active_participant_count,
+    }
+
+
 # --- Resources (reads-only mirror of a subset of the tools above) -----------------
 #
 # Phase A (TECH-5903): plain reads, no subscribe/unsubscribe. Every resource
