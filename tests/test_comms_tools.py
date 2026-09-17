@@ -1987,6 +1987,77 @@ class TestNotRegistered:
             "Retry with agent_key='claude-code'." in err_msg
         )
 
+    async def test_suspended_caller_with_multiple_active_siblings_lists_all_candidates(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """TECH-6461: with MORE than one active sibling, the suffix must not
+        go silent (the old "exactly one" gate) -- every active candidate is
+        listed instead."""
+        base_sub = "suspended-with-multiple-active-siblings"
+        token = _token(base_sub)
+        bare_reg = await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {
+                "display_name": "Bare Agent",
+                "accepted_types": sorted(MESSAGE_TYPES),
+            },
+        )
+        await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {
+                "display_name": "Claude Code",
+                "accepted_types": sorted(MESSAGE_TYPES),
+                "agent_key": "claude-code",
+                "confirm_new_identity": True,
+            },
+        )
+        await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {
+                "display_name": "OpenCode",
+                "accepted_types": sorted(MESSAGE_TYPES),
+                "agent_key": "opencode",
+                "confirm_new_identity": True,
+            },
+        )
+        admin_token = _token(
+            "admin-operator-suspension-multi-suggest",
+            scopes=["comms:read", "comms:write", "comms:admin"],
+        )
+        await _call(
+            main,
+            test_session_factory,
+            admin_token,
+            "comms_deregister_agent",
+            {"agent_id": bare_reg["agent_id"]},
+        )
+
+        with pytest.raises(ToolError) as exc_info:
+            await _call(main, test_session_factory, token, "comms_inbox")
+        err_msg = str(exc_info.value)
+        assert err_msg.startswith(
+            "agent_suspended: this agent has been deregistered (status=suspended) and "
+            "can no longer act on the board"
+        )
+        assert "multiple other identities exist under this token" in err_msg
+        assert "'claude-code'" in err_msg
+        assert "'opencode'" in err_msg
+        assert "(all active)" in err_msg
+        # Neither the single-candidate "Retry with agent_key='...'" nor the
+        # single-candidate "Retry without agent_key." phrasing should appear
+        # -- those are the exactly-one suffix shape, not this one.
+        assert "Retry with agent_key=" not in err_msg
+        assert "Retry without agent_key." not in err_msg
+
     async def test_suspended_caller_without_active_siblings_has_no_suggestion(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:

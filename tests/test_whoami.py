@@ -370,9 +370,12 @@ class TestWhoami:
         assert result["other_identities"] == siblings
         assert "suggested_agent_key" not in result
 
-    def test_unregistered_caller_with_multiple_active_siblings_omits_suggestion(self) -> None:
+    def test_unregistered_caller_with_multiple_active_siblings_includes_guidance(self) -> None:
         """(c) Caller status not_registered + 2+ active siblings -> other_identities
-        present, no suggested_agent_key."""
+        present, no suggested_agent_key (ambiguous which one), but
+        active_identity_candidates lists every active sibling plus a
+        guidance string (TECH-6461 -- the "exactly one" gate no longer
+        leaves the caller with zero signal)."""
         token = MagicMock()
         token.claims = {
             "iss": "https://example.okta.com/oauth2/default",
@@ -406,6 +409,13 @@ class TestWhoami:
         assert result["status"] == "not_registered"
         assert result["other_identities"] == siblings
         assert "suggested_agent_key" not in result
+        assert "suggested_bare_identity" not in result
+        assert result["active_identity_candidates"] == [
+            {"agent_key": "bot-1", "display_name": "Bot 1"},
+            {"agent_key": "bot-2", "display_name": "Bot 2"},
+        ]
+        assert "guidance" in result
+        assert "active_identity_candidates" in result["guidance"]
 
     def test_sibling_lookup_db_failure_returns_cleanly(
         self, caplog: pytest.LogCaptureFixture
