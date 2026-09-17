@@ -5703,6 +5703,37 @@ class TestReopenConversation:
         assert log.detail is not None
         assert log.detail["message_type"] == "reopen"
 
+    async def test_reopen_active_conversation_with_lapsed_expiry_is_accepted(
+        self, session: AsyncSession
+    ) -> None:
+        """An `active` conversation whose deadline lapses is NOT the same as
+        a genuinely active one: unlike test_reopen_active_conversation_rejected
+        above, this conversation's *stored* state is still "active" going in --
+        by the time reopen's own participant-load step runs its lazy-expiry
+        check, this row flips to "expired" mid-call and lands in the
+        ACCEPTED branch, not the rejection one."""
+        owner, _target, conversation = await self._start(
+            session, "reopen-svc-owner-8", "reopen-svc-target-8"
+        )
+        assert conversation.state == "active"
+
+        # Directly lapse the deadline without any intervening read/write
+        # that would trigger _maybe_expire -- the conversation's stored
+        # state is still "active" at this point, not yet "expired".
+        conversation.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+
+        result = await reopen_conversation(
+            session,
+            actor_sub=owner.sub,
+            agent_id=owner.id,
+            conversation_id=conversation.id,
+            extend_by_days=7,
+        )
+        assert result.conversation.state == "active"
+        assert result.previous_state == "expired"
+        assert result.expires_at_changed is True
+
     async def test_reopen_non_owner_active_member_denied(self, session: AsyncSession) -> None:
         owner, target, conversation = await self._start(
             session, "reopen-svc-owner-7", "reopen-svc-target-7"

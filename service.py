@@ -4589,13 +4589,15 @@ async def reopen_conversation(
     below.
 
     Only ``completed``/``canceled``/``expired`` conversations may be
-    reopened; an ``active`` conversation (including one whose deadline has
-    just lazily lapsed to ``expired`` by ``_load_participant_for_transition``'s
-    own ``_maybe_expire`` call) is rejected with
+    reopened; a genuinely ``active`` conversation is rejected with
     ``InvalidConversationStateError`` (``denied.bad_state``,
     ``message_type="reopen"``) -- there is nothing to reopen, and
     ``extend_conversation`` is the right tool for pushing an ``active``
-    conversation's deadline further out.
+    conversation's deadline further out. This is NOT the same as an
+    ``active`` conversation whose deadline has already lapsed: by the time
+    this check runs, ``_load_participant_for_transition``'s own
+    ``_maybe_expire`` call has already flipped such a row's state to
+    ``expired``, so it lands in the ACCEPTED branch above, not this one.
 
     Expiry handling: at most one of ``expires_at``/``extend_by_days`` may be
     supplied (``InvalidExtendError`` if both are) -- unlike

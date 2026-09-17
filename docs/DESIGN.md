@@ -824,11 +824,13 @@ Design notes:
     `comms_extend_conversation` uses (extend-only, strictly future,
     `MAX_CONVERSATION_TTL`-bounded) -- the two tools cannot drift on these
     rules.
-  - **Rejections**: reopening an `active` conversation (including one whose
-    deadline just lazily lapsed to `expired`) is rejected with
-    `InvalidConversationStateError` (`denied.bad_state`,
-    `message_type="reopen"`), not treated as a no-op. Reopening an archived
-    conversation is rejected with `ConversationArchivedError`
+  - **Rejections**: reopening a genuinely `active` conversation is rejected
+    with `InvalidConversationStateError` (`denied.bad_state`,
+    `message_type="reopen"`), not treated as a no-op. This is NOT the same
+    as an `active` conversation whose deadline has already lapsed: the
+    participant-load step's own lazy-expiry check flips such a row to
+    `expired` before this check runs, so it is accepted, not rejected.
+    Reopening an archived conversation is rejected with `ConversationArchivedError`
     (`denied.archived.reopen`), checked AFTER the owner-only auth gate (so a
     non-owner learns nothing about the conversation's archived status) and
     BEFORE the state check.
