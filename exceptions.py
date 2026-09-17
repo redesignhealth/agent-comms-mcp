@@ -46,7 +46,14 @@ service/tools boundary:
   while business-rule checks (shortening, ceiling, future-expiry) run
   post-auth once the caller has already been verified as an active
   participant with legitimate access to the conversation's current state.
-  Mapped with an ``invalid_request: `` prefix at the tool boundary.
+  Mapped with an ``invalid_request: `` prefix at the tool boundary. Also
+  raised by ``reopen_conversation``/``comms_reopen_conversation`` (TECH-6442),
+  which shares the same TTL-computation/validation helper
+  (``_resolve_extended_expires_at``) and adds one more case of its own: a
+  no-TTL-parameter reopen of a conversation whose ``expires_at`` has already
+  lapsed (the common case, since ``expired``-state reopening always implies
+  a lapsed deadline) is rejected rather than silently reopening to a
+  zombie that would immediately re-lapse.
 
 - ``ConversationArchivedError`` (TECH-5887): ``comms_invite``/
   ``comms_post_message``/``comms_accept`` targeted a conversation that has
@@ -171,6 +178,18 @@ class InvalidExtendError(Exception):
     ``expires_at``, a resulting expiry not strictly in the future, a
     shortening/no-op expiry (``new_expires_at <= current expires_at``), or a
     ceiling violation (``new_expires_at - now() > MAX_CONVERSATION_TTL``).
+
+    Also raised by ``reopen_conversation`` (TECH-6442), which shares
+    ``extend_conversation``'s ``_resolve_extended_expires_at`` TTL
+    validation helper (so the future/shortening/ceiling rules cannot drift
+    between the two) but relaxes the "neither or both supplied" rule to
+    "at most one" -- reopening with neither ``expires_at`` nor
+    ``extend_by_days`` is legal there when the conversation's existing
+    expiry is still in the future. It adds exactly one case of its own:
+    reopening with NEITHER parameter while the existing ``expires_at`` has
+    already lapsed is rejected, since silently reopening to a stale
+    deadline would produce a conversation that renders (and re-lapses) as
+    ``expired`` on its very next read.
 
     Specific and client-actionable by design, unlike the generic bare-
     ``ValueError`` mapping ``_map_service_errors`` otherwise applies.

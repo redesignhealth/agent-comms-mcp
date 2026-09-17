@@ -101,6 +101,12 @@ class TestToolScopesRegistry:
         comms_archive_conversation), same scope as every other write."""
         assert TOOL_SCOPES["comms_extend_conversation"] == "comms:write"
 
+    def test_reopen_conversation_uses_comms_write(self) -> None:
+        """TECH-6442: comms_reopen_conversation registers at the baseline
+        comms:write scope even though it is owner-only -- that authorization
+        is enforced in-handler by service.may_reopen, not by this table."""
+        assert TOOL_SCOPES["comms_reopen_conversation"] == "comms:write"
+
 
 class TestRequiredScopeFor:
     def test_known_tool(self) -> None:
