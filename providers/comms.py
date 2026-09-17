@@ -305,6 +305,13 @@ async def _resolve_caller_agent(
     below. Only ``agent_inbox_resource`` passes this -- its URI has no
     ``agent_key`` parameter, so "Retry with agent_key=..." advice is
     unfollowable there.
+
+    The suggestion suffix is included whenever at least one sibling is
+    active (TECH-6461) -- not only when there is exactly one. With more
+    than one active sibling, every active candidate is listed (agent_key
+    plus how to retry) so the calling agent can pick the one matching what
+    it actually is, rather than the suffix going silent and leaving a bare,
+    unactionable ``agent_suspended``/``not_registered`` error.
     """
     agent = await service.get_agent_by_sub(session, sub)
     if agent is None or agent.status == "suspended":
@@ -328,6 +335,17 @@ async def _resolve_caller_agent(
                             " -- other identities exist under this token: bare identity (active). "
                             "Retry without agent_key."
                         )
+                elif len(active_siblings) > 1:
+                    candidates = ", ".join(
+                        f"'{s['agent_key']}'" if s["agent_key"] is not None else "bare identity"
+                        for s in active_siblings
+                    )
+                    suffix = (
+                        f" -- multiple other identities exist under this token: {candidates} "
+                        "(all active). Pick the one matching what this agent actually is and "
+                        "retry with that identity's agent_key (or without agent_key, for the "
+                        "bare identity)."
+                    )
             except (OperationalError, InterfaceError, OSError) as exc:
                 logger.warning(
                     "_resolve_caller_agent: sibling lookup failed (%s), omitting suggestion",
@@ -561,6 +579,29 @@ async def whoami(agent_key: str | None = None) -> dict[str, Any]:
       the bare ``base_sub`` identity itself (no ``agent_key``) -- a plain
       ``suggested_agent_key: None`` would be indistinguishable from "no
       suggestion", so this case gets its own explicit boolean field instead.
+
+    When the caller's own identity is unusable and there is at least one
+    active sibling (TECH-6461 -- not gated to exactly one), the response
+    ALSO includes:
+    - ``active_identity_candidates``: every active sibling as
+      ``{"agent_key": ..., "display_name": ..., "is_bare_identity": ...}``,
+      so a caller with several active siblings (e.g. a human running
+      multiple bot personas under one base identity) can pick the one
+      matching what it actually is, instead of the single-candidate
+      ``suggested_agent_key`` field going silent. ``is_bare_identity`` is
+      ``True`` exactly when ``agent_key`` is ``None`` -- callers must retry
+      ``whoami()`` with no ``agent_key`` argument at all for that candidate,
+      never the literal string ``"None"``.
+    - ``guidance``: an explicit instructional string telling the calling
+      agent to pick the matching candidate from ``active_identity_candidates``
+      and retry ``whoami(agent_key=...)`` (or ``whoami()`` with no argument,
+      for a bare-identity candidate) to confirm before using that identity
+      for other board calls. This tool intentionally never raises
+      on a bad identity (it must stay introspectable so a caller can
+      discover *why* it's suspended), so ``guidance`` is the load-bearing
+      signal instead of an exception -- do not rely on ``other_identities``
+      alone to surface this, since a caller can easily overlook a passive
+      list.
     """
     token = _require_token()
     base_sub = _require_identity(token)
@@ -627,6 +668,24 @@ async def whoami(agent_key: str | None = None) -> dict[str, Any]:
                         result["suggested_agent_key"] = suggested_key
                     else:
                         result["suggested_bare_identity"] = True
+                if active_siblings:
+                    result["active_identity_candidates"] = [
+                        {
+                            "agent_key": s["agent_key"],
+                            "display_name": s.get("display_name"),
+                            "is_bare_identity": s["agent_key"] is None,
+                        }
+                        for s in active_siblings
+                    ]
+                    result["guidance"] = (
+                        f"This identity's status is '{result['status']}' and cannot be used "
+                        "to act on the board. Pick the candidate in active_identity_candidates "
+                        "that matches what this agent actually is. If that candidate's "
+                        "is_bare_identity is true, retry whoami() with NO agent_key argument "
+                        "at all -- do not pass the literal string 'None'. Otherwise, retry "
+                        "whoami(agent_key=<that candidate's agent_key>) to confirm before using "
+                        "that identity for other board calls."
+                    )
     except (OperationalError, InterfaceError, OSError) as exc:
         # A genuine programming/schema bug (a renamed get_agent_by_sub, a
         # migration not yet applied) raises something OTHER than these
