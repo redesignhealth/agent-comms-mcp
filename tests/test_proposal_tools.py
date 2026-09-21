@@ -1148,3 +1148,67 @@ class TestProposalToolsSenderAgentId:
         hold = await session.get(ProposalHold, uuid.UUID(proposal_id))
         assert hold is not None
         assert hold.sender_agent_id == agent.id
+
+    async def test_dedup_resubmission_with_agent_key_updates_null_sender_agent_id(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        session: AsyncSession,
+    ) -> None:
+        """Suggestion #3 (round 2): dedup resubmission with agent_key updates
+        previously-NULL sender_agent_id via MCP tool."""
+        agent = await service.register_agent(
+            session,
+            sub="tool-bot-dedup-up::worker",
+            base_sub="tool-bot-dedup-up",
+            owner_sub="owner@example.com",
+            owner_email="owner@example.com",
+            display_name="Dedup Update Worker",
+            accepted_types=None,
+        )
+        token = _token("tool-bot-dedup-up", owner_sub="owner@example.com")
+        # First submit without agent_key
+        submitted1 = await _call(
+            main,
+            test_session_factory,
+            token,
+            "proposals_submit",
+            {
+                "kind": "linear_progress_update",
+                "action": _action(target_id="TOOL-DEDUP-UPDATE"),
+                "rationale": "initial rationale",
+                "confidence": "medium",
+                "importance": "medium",
+                "impact": "medium",
+            },
+        )
+        assert "sender_agent_id" not in submitted1
+        proposal_id = submitted1["proposal_id"]
+        hold1 = await session.get(ProposalHold, uuid.UUID(proposal_id))
+        assert hold1 is not None
+        assert hold1.sender_agent_id is None
+
+        # Second submit with agent_key="worker" for same action
+        submitted2 = await _call(
+            main,
+            test_session_factory,
+            token,
+            "proposals_submit",
+            {
+                "kind": "linear_progress_update",
+                "action": _action(target_id="TOOL-DEDUP-UPDATE"),
+                "rationale": "updated rationale",
+                "confidence": "medium",
+                "importance": "medium",
+                "impact": "medium",
+                "agent_key": "worker",
+            },
+        )
+        assert submitted2["proposal_id"] == proposal_id
+        assert submitted2["sender_agent_id"] == str(agent.id)
+
+        expected_agent_id = agent.id
+        session.expire_all()
+        hold2 = await session.get(ProposalHold, uuid.UUID(proposal_id))
+        assert hold2 is not None
+        assert hold2.sender_agent_id == expected_agent_id

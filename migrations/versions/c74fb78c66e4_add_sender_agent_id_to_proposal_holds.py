@@ -17,11 +17,14 @@ board-registered at all (cite ``main.py``'s
 means "submitter is not a registered agent," never "lookup failed," and no
 backfill is possible or intended for pre-existing rows.
 
-Pure additive column, nullable, with a foreign key created NOT VALID and
-validated in its own autocommit block (via ``op.get_context().autocommit_block()``,
-same pattern as ``572b2b9a96d6``/``a9faca2517d7``) so the constraint validation
-runs with SHARE UPDATE EXCLUSIVE rather than holding ACCESS EXCLUSIVE across
-the table scan. Safe for a normal rolling deploy in either direction.
+Pure additive column, nullable, with a foreign key created NOT VALID
+(``postgresql_not_valid=True``) so this migration only takes a brief
+``ACCESS EXCLUSIVE`` lock to add the catalog entries -- no table scan, since
+``NOT VALID`` skips checking existing rows. The scan that validates existing
+rows is deferred to the next migration (``ef3600cf1d37``), which runs it in
+its own transaction so it takes ``SHARE UPDATE EXCLUSIVE`` instead of
+``ACCESS EXCLUSIVE`` (matching the established pattern of ``cf72736e07f5`` /
+``572b2b9a96d6``). Safe for a normal rolling deploy in either direction.
 
 ``downgrade()`` drops the FK constraint and column using raw SQL with genuine
 ``IF EXISTS`` guards for true idempotence.
@@ -55,10 +58,6 @@ def upgrade() -> None:
         ["id"],
         postgresql_not_valid=True,
     )
-    with op.get_context().autocommit_block():
-        op.execute(
-            "ALTER TABLE proposal_holds VALIDATE CONSTRAINT fk_proposal_holds_sender_agent_id"
-        )
 
 
 def downgrade() -> None:

@@ -935,18 +935,31 @@ class TestProposalHoldsSchema:
     async def test_tech_6668_migration_upgrade_and_downgrade_cleanly(
         self, engine: AsyncEngine, database_url: str
     ) -> None:
-        """TECH-6668: verify migration c74fb78c66e4 downgrades and upgrades cleanly."""
+        """TECH-6668: verify migrations c74fb78c66e4 and ef3600cf1d37 downgrade
+        and upgrade cleanly."""
         env = {**os.environ, "DATABASE_URL": database_url.replace("+asyncpg", "")}
         try:
-            # Downgrade to 44da57c6d9b9
-            res_down = subprocess.run(
+            # Downgrade from head (ef3600cf1d37) to c74fb78c66e4 (step 1)
+            res_down1 = subprocess.run(
+                [sys.executable, "-m", "alembic", "downgrade", "c74fb78c66e4"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert res_down1.returncode == 0, res_down1.stderr
+            cols_mid = await _columns(engine, "proposal_holds")
+            assert "sender_agent_id" in cols_mid
+
+            # Downgrade to 44da57c6d9b9 (step 2)
+            res_down2 = subprocess.run(
                 [sys.executable, "-m", "alembic", "downgrade", "44da57c6d9b9"],
                 cwd=SERVICE_ROOT,
                 env=env,
                 capture_output=True,
                 text=True,
             )
-            assert res_down.returncode == 0, res_down.stderr
+            assert res_down2.returncode == 0, res_down2.stderr
             cols_after_down = await _columns(engine, "proposal_holds")
             assert "sender_agent_id" not in cols_after_down
         finally:

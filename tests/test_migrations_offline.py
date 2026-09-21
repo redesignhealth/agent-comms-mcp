@@ -490,8 +490,9 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
     )
     commit_pos = result.stdout.index("COMMIT;", not_valid_pos)
     assert not_valid_pos < commit_pos < validate_pos
-    # c74fb78c66e4 (TECH-6668): sender_agent_id on proposal_holds, nullable,
-    # with FK to agents(id) validated in autocommit block.
+    # c74fb78c66e4 / ef3600cf1d37 (TECH-6668): sender_agent_id on proposal_holds, nullable,
+    # with FK to agents(id) added NOT VALID (c74fb78c66e4) then validated in
+    # separate migration (ef3600cf1d37).
     assert "ALTER TABLE proposal_holds ADD COLUMN IF NOT EXISTS sender_agent_id UUID" in (
         result.stdout
     )

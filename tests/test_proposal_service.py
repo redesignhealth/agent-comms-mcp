@@ -79,7 +79,7 @@ pytestmark = pytest.mark.usefixtures("_migrated_schema")
 async def _clean_tables(engine: AsyncEngine) -> AsyncIterator[None]:
     async with engine.begin() as conn:
         await conn.execute(
-            text("TRUNCATE TABLE proposal_holds, audit_log RESTART IDENTITY CASCADE")
+            text("TRUNCATE TABLE proposal_holds, audit_log, agents RESTART IDENTITY CASCADE")
         )
     yield
 
@@ -2617,3 +2617,125 @@ class TestListProposalsForBot:
         assert set(PROPOSAL_TERMINAL_STATUSES) | {"pending", "applying", "approved"} == set(
             PROPOSAL_HOLD_STATUSES
         )
+
+
+class TestResolveAttributionAndOwner:
+    """Direct unit tests for service.resolve_attribution_sub and
+    service.resolve_proposal_agent_and_owner (TECH-6668)."""
+
+    def test_resolve_attribution_sub_without_agent_key(self) -> None:
+        assert service.resolve_attribution_sub("bot-plain", None) == "bot-plain"
+        assert service.resolve_attribution_sub("bot-plain", "") == "bot-plain"
+        # Bot sub with '::' and no agent_key does not raise
+        assert service.resolve_attribution_sub("bot::opaque::id", None) == "bot::opaque::id"
+
+    def test_resolve_attribution_sub_with_valid_agent_key(self) -> None:
+        assert service.resolve_attribution_sub("bot-1", "worker") == "bot-1::worker"
+
+    def test_resolve_attribution_sub_composition_failure_returns_none(self) -> None:
+        # bot_sub containing '::' with agent_key triggers ToolError in _compose_sub
+        assert service.resolve_attribution_sub("bot::with::colons", "worker") is None
+        # agent_key containing '::' triggers ToolError in _compose_sub
+        assert service.resolve_attribution_sub("bot-1", "worker::nested") is None
+
+    async def test_resolve_proposal_agent_and_owner_with_registered_agent(
+        self, session: AsyncSession
+    ) -> None:
+        agent = await service.register_agent(
+            session,
+            sub="bot-unit::keyed",
+            base_sub="bot-unit",
+            owner_sub="owner-agent@example.com",
+            owner_email="owner-agent@example.com",
+            display_name="Unit Worker",
+            accepted_types=None,
+        )
+        # Token owner_sub is None -> resolves owner_sub from agent
+        resolved_agent, owner_sub = await service.resolve_proposal_agent_and_owner(
+            session,
+            bot_sub="bot-unit",
+            agent_key="keyed",
+            token_owner_sub=None,
+        )
+        assert resolved_agent is not None
+        assert resolved_agent.id == agent.id
+        assert owner_sub == "owner-agent@example.com"
+
+    async def test_resolve_proposal_agent_and_owner_preserves_token_owner_sub(
+        self, session: AsyncSession
+    ) -> None:
+        agent = await service.register_agent(
+            session,
+            sub="bot-unit::keyed2",
+            base_sub="bot-unit",
+            owner_sub="owner-agent@example.com",
+            owner_email="owner-agent@example.com",
+            display_name="Unit Worker 2",
+            accepted_types=None,
+        )
+        # Token owner_sub provided -> takes precedence
+        resolved_agent, owner_sub = await service.resolve_proposal_agent_and_owner(
+            session,
+            bot_sub="bot-unit",
+            agent_key="keyed2",
+            token_owner_sub="token-owner@example.com",
+        )
+        assert resolved_agent is not None
+        assert resolved_agent.id == agent.id
+        assert owner_sub == "token-owner@example.com"
+
+    async def test_resolve_proposal_agent_and_owner_unresolvable_agent_key_falls_back(
+        self, session: AsyncSession
+    ) -> None:
+        base_agent = await service.register_agent(
+            session,
+            sub="bot-base-registered",
+            base_sub="bot-base-registered",
+            owner_sub="base-owner@example.com",
+            owner_email="base-owner@example.com",
+            display_name="Base Registered",
+            accepted_types=None,
+        )
+        # Unresolvable agent_key with token_owner_sub=None falls back to base agent
+        resolved_agent, owner_sub = await service.resolve_proposal_agent_and_owner(
+            session,
+            bot_sub="bot-base-registered",
+            agent_key="unresolvable",
+            token_owner_sub=None,
+        )
+        assert resolved_agent is None
+        assert owner_sub == base_agent.owner_sub
+
+    async def test_resolve_proposal_agent_and_owner_unregistered_bot_unresolvable_key(
+        self, session: AsyncSession
+    ) -> None:
+        resolved_agent, owner_sub = await service.resolve_proposal_agent_and_owner(
+            session,
+            bot_sub="completely-unregistered-bot",
+            agent_key="unresolvable",
+            token_owner_sub=None,
+        )
+        assert resolved_agent is None
+        assert owner_sub is None
+
+    async def test_resolve_proposal_agent_and_owner_colon_sub_without_key(
+        self, session: AsyncSession
+    ) -> None:
+        colon_agent = await service.register_agent(
+            session,
+            sub="bot::with::colons",
+            base_sub="bot::with::colons",
+            owner_sub="colon-owner@example.com",
+            owner_email="colon-owner@example.com",
+            display_name="Colon Bot",
+            accepted_types=None,
+        )
+        resolved_agent, owner_sub = await service.resolve_proposal_agent_and_owner(
+            session,
+            bot_sub="bot::with::colons",
+            agent_key=None,
+            token_owner_sub=None,
+        )
+        assert resolved_agent is not None
+        assert resolved_agent.id == colon_agent.id
+        assert owner_sub == "colon-owner@example.com"

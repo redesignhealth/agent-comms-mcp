@@ -6717,17 +6717,18 @@ def resolve_attribution_sub(bot_sub: str, agent_key: str | None) -> str | None:
     """Resolve the composed agent sub for proposal attribution, or None on failure (TECH-6668).
 
     When ``agent_key`` is omitted or empty, returns ``bot_sub`` as-is without
-    invoking ``_compose_sub``. When ``agent_key`` is provided, attempts composition
-    and logs a warning (returning ``None``) if ``_compose_sub`` raises, ensuring
-    malformed or collision-inducing inputs degrade to un-attributed rather than
-    failing the proposal.
+    invoking ``_compose_sub``. When ``agent_key`` is provided, attempts validation
+    and composition, logging a warning (and returning ``None``) if either raises,
+    ensuring malformed or collision-inducing inputs degrade to un-attributed rather
+    than failing the proposal.
     """
     if not agent_key:
         return bot_sub
-    try:
-        from providers.comms import _compose_sub
+    from providers.comms import _compose_sub, _validate_agent_key
 
-        return _compose_sub(bot_sub, agent_key)
+    try:
+        clean_key = _validate_agent_key(agent_key)
+        return _compose_sub(bot_sub, clean_key)
     except Exception as exc:
         logger.warning(
             "failed to compose attribution sub for bot_sub=%s agent_key=%s: %s",
