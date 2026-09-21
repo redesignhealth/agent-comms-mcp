@@ -212,7 +212,14 @@ async def submit(
     (``sender_agent_id``).
     """
     bot_sub = _require_bot_sub()
-    composed_sub = _compose_sub(bot_sub, agent_key)
+    lookup_sub: str | None
+    if agent_key:
+        try:
+            lookup_sub = _compose_sub(bot_sub, agent_key)
+        except Exception:
+            lookup_sub = None
+    else:
+        lookup_sub = bot_sub
     if not isinstance(action, dict):
         raise ToolError("invalid_request: action must be an object")
     if len(json.dumps(action)) > service.MAX_PROPOSAL_ACTION_BYTES:
@@ -257,7 +264,9 @@ async def submit(
         raise ToolError("no access token provided")
     owner_sub = service.resolve_proposal_owner_sub(token)
     async with get_session_factory()() as session:
-        agent = await service.get_agent_by_sub(session, composed_sub)
+        agent = (
+            await service.get_agent_by_sub(session, lookup_sub) if lookup_sub is not None else None
+        )
         if owner_sub is None and agent is not None:
             owner_sub = agent.owner_sub
         if owner_sub is None:

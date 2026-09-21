@@ -1040,14 +1040,21 @@ async def submit_proposal(request: Request) -> Response:
             {"error": "invalid_request", "detail": "agent_key must be a string"},
             status_code=422,
         )
-    try:
-        composed_sub = _compose_sub(bot_sub, agent_key)
-    except ToolError as exc:
-        return JSONResponse({"error": "invalid_request", "detail": str(exc)}, status_code=422)
+
+    lookup_sub: str | None
+    if agent_key:
+        try:
+            lookup_sub = _compose_sub(bot_sub, agent_key)
+        except Exception:
+            lookup_sub = None
+    else:
+        lookup_sub = bot_sub
 
     owner_sub = service.resolve_proposal_owner_sub(bot_token)
     async with get_session_factory()() as session:
-        agent = await service.get_agent_by_sub(session, composed_sub)
+        agent = (
+            await service.get_agent_by_sub(session, lookup_sub) if lookup_sub is not None else None
+        )
         if owner_sub is None and agent is not None:
             owner_sub = agent.owner_sub
         if owner_sub is None:

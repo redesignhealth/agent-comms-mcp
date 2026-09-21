@@ -907,3 +907,100 @@ class TestProposalToolsSenderAgentId:
         hold = await session.get(ProposalHold, uuid.UUID(submitted["proposal_id"]))
         assert hold is not None
         assert hold.owner_sub == "fallback-owner@example.com"
+
+    async def test_sub_containing_colons_without_agent_key_succeeds_unregistered(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        session: AsyncSession,
+    ) -> None:
+        """Regression test: proposing bot with sub containing '::' without agent_key
+        must not fail due to _compose_sub."""
+        opaque_sub = "opaque::legacy::tool-bot"
+        token = _token(opaque_sub, owner_sub="owner@example.com")
+        submitted = await _call(
+            main,
+            test_session_factory,
+            token,
+            "proposals_submit",
+            {
+                "kind": "linear_progress_update",
+                "action": _action(target_id="TOOL-OPAQUE-1"),
+                "rationale": "because reasons",
+                "confidence": "medium",
+                "importance": "medium",
+                "impact": "medium",
+            },
+        )
+        assert "sender_agent_id" not in submitted
+        hold = await session.get(ProposalHold, uuid.UUID(submitted["proposal_id"]))
+        assert hold is not None
+        assert hold.sender_agent_id is None
+        assert hold.proposed_by_bot_id == opaque_sub
+
+    async def test_sub_containing_colons_without_agent_key_resolves_registered(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        session: AsyncSession,
+    ) -> None:
+        """Proposing bot with sub containing '::' matches a registered agent with that raw sub."""
+        opaque_sub = "opaque::legacy::tool-bot-reg"
+        agent = await service.register_agent(
+            session,
+            sub=opaque_sub,
+            base_sub=opaque_sub,
+            owner_sub="owner@example.com",
+            owner_email="owner@example.com",
+            display_name="Legacy Opaque MCP Bot",
+            accepted_types=None,
+        )
+        token = _token(opaque_sub, owner_sub="owner@example.com")
+        submitted = await _call(
+            main,
+            test_session_factory,
+            token,
+            "proposals_submit",
+            {
+                "kind": "linear_progress_update",
+                "action": _action(target_id="TOOL-OPAQUE-2"),
+                "rationale": "because reasons",
+                "confidence": "medium",
+                "importance": "medium",
+                "impact": "medium",
+            },
+        )
+        assert submitted["sender_agent_id"] == str(agent.id)
+        hold = await session.get(ProposalHold, uuid.UUID(submitted["proposal_id"]))
+        assert hold is not None
+        assert hold.sender_agent_id == agent.id
+
+    async def test_sub_containing_colons_with_agent_key_degrades_gracefully(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        session: AsyncSession,
+    ) -> None:
+        """Proposing bot with sub containing '::' passing agent_key must degrade gracefully
+        to sender_agent_id=None without failing submission."""
+        opaque_sub = "opaque::legacy::tool-bot-keyed"
+        token = _token(opaque_sub, owner_sub="owner@example.com")
+        submitted = await _call(
+            main,
+            test_session_factory,
+            token,
+            "proposals_submit",
+            {
+                "kind": "linear_progress_update",
+                "action": _action(target_id="TOOL-OPAQUE-3"),
+                "rationale": "because reasons",
+                "confidence": "medium",
+                "importance": "medium",
+                "impact": "medium",
+                "agent_key": "some-key",
+            },
+        )
+        assert "sender_agent_id" not in submitted
+        hold = await session.get(ProposalHold, uuid.UUID(submitted["proposal_id"]))
+        assert hold is not None
+        assert hold.sender_agent_id is None

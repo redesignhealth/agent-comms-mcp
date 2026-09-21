@@ -2234,3 +2234,84 @@ class TestProposalSenderAgentIdAttribution:
         )
         assert resp.status_code == 422
         assert resp.json()["error"] == "invalid_request"
+
+    async def test_sub_containing_colons_without_agent_key_succeeds_unregistered(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        """Regression test for TECH-6668 finding: bot_sub containing '::'
+        submitting without agent_key must not be rejected by _compose_sub."""
+        http_client, provider = client
+        opaque_sub = "opaque::legacy::bot-sub"
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            opaque_sub, scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        resp = await http_client.post(
+            "/proposals",
+            json=_PROPOSAL_BODY,
+            headers={"Authorization": "Bearer bot-token"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "sender_agent_id" not in data
+        hold = await session.get(ProposalHold, uuid.UUID(data["proposal_id"]))
+        assert hold is not None
+        assert hold.sender_agent_id is None
+        assert hold.proposed_by_bot_id == opaque_sub
+
+    async def test_sub_containing_colons_without_agent_key_resolves_registered_agent(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        """Bot with sub containing '::' matches a registered agent with that raw sub."""
+        http_client, provider = client
+        opaque_sub = "opaque::legacy::bot-sub"
+        agent = await service.register_agent(
+            session,
+            sub=opaque_sub,
+            base_sub=opaque_sub,
+            owner_sub="owner-a@example.com",
+            owner_email="owner-a@example.com",
+            display_name="Legacy Opaque Bot",
+            accepted_types=None,
+        )
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            opaque_sub, scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        resp = await http_client.post(
+            "/proposals",
+            json=_PROPOSAL_BODY,
+            headers={"Authorization": "Bearer bot-token"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["sender_agent_id"] == str(agent.id)
+        hold = await session.get(ProposalHold, uuid.UUID(data["proposal_id"]))
+        assert hold is not None
+        assert hold.sender_agent_id == agent.id
+
+    async def test_sub_containing_colons_with_agent_key_degrades_gracefully(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        """Bot with sub containing '::' passing agent_key triggers composition error,
+        which must degrade gracefully to sender_agent_id=None without failing submission."""
+        http_client, provider = client
+        opaque_sub = "opaque::legacy::bot-sub"
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            opaque_sub, scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        resp = await http_client.post(
+            "/proposals",
+            json={**_PROPOSAL_BODY, "agent_key": "some-key"},
+            headers={"Authorization": "Bearer bot-token"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "sender_agent_id" not in data
+        hold = await session.get(ProposalHold, uuid.UUID(data["proposal_id"]))
+        assert hold is not None
+        assert hold.sender_agent_id is None
