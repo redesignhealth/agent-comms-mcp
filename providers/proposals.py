@@ -83,7 +83,6 @@ from exceptions import (
     RateLimitExceededError,
 )
 from identity import try_resolve_email
-from providers.comms import _compose_sub
 from scopes import is_interactive_token
 
 proposals_server: FastMCP[Any] = FastMCP("proposals")
@@ -212,14 +211,8 @@ async def submit(
     (``sender_agent_id``).
     """
     bot_sub = _require_bot_sub()
-    lookup_sub: str | None
-    if agent_key:
-        try:
-            lookup_sub = _compose_sub(bot_sub, agent_key)
-        except Exception:
-            lookup_sub = None
-    else:
-        lookup_sub = bot_sub
+    if agent_key is not None and not isinstance(agent_key, str):
+        raise ToolError("invalid_request: agent_key must be a string")
     if not isinstance(action, dict):
         raise ToolError("invalid_request: action must be an object")
     if len(json.dumps(action)) > service.MAX_PROPOSAL_ACTION_BYTES:
@@ -262,33 +255,39 @@ async def submit(
     token = get_access_token()
     if token is None:
         raise ToolError("no access token provided")
-    owner_sub = service.resolve_proposal_owner_sub(token)
+    token_owner_sub = service.resolve_proposal_owner_sub(token)
     async with get_session_factory()() as session:
-        agent = (
-            await service.get_agent_by_sub(session, lookup_sub) if lookup_sub is not None else None
+        agent, owner_sub = await service.resolve_proposal_agent_and_owner(
+            session,
+            bot_sub=bot_sub,
+            agent_key=agent_key,
+            token_owner_sub=token_owner_sub,
         )
-        if owner_sub is None and agent is not None:
-            owner_sub = agent.owner_sub
-        if owner_sub is None:
-            raise ToolError(
-                "owner_sub_unresolvable: no owner_sub claim on the bot's token, and no "
-                "registered board agent to fall back to"
-            )
-        async with _map_proposal_errors():
-            return await service.create_proposal(
-                session,
-                kind=kind,
-                proposed_by_bot_id=bot_sub,
-                owner_sub=owner_sub,
-                action=action,
-                rationale=rationale,
-                confidence=confidence,
-                importance=importance,
-                impact=impact,
-                judge=plugins.get_proposal_judge(),
-                target_fingerprint=target_fingerprint,
-                sender_agent_id=agent.id if agent else None,
-            )
+
+    if owner_sub is None:
+        raise ToolError(
+            "owner_sub_unresolvable: no owner_sub claim on the bot's token, and no "
+            "registered board agent to fall back to"
+        )
+
+    async with (
+        get_session_factory()() as session,
+        _map_proposal_errors(),
+    ):
+        return await service.create_proposal(
+            session,
+            kind=kind,
+            proposed_by_bot_id=bot_sub,
+            owner_sub=owner_sub,
+            action=action,
+            rationale=rationale,
+            confidence=confidence,
+            importance=importance,
+            impact=impact,
+            judge=plugins.get_proposal_judge(),
+            target_fingerprint=target_fingerprint,
+            sender_agent_id=agent.id if agent else None,
+        )
 
 
 @proposals_server.tool

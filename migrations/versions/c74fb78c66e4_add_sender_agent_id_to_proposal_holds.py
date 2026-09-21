@@ -18,12 +18,13 @@ means "submitter is not a registered agent," never "lookup failed," and no
 backfill is possible or intended for pre-existing rows.
 
 Pure additive column, nullable, with a foreign key created NOT VALID and
-validated in a separate step, plus a composite index on
-``(sender_agent_id, status, created_at)``. Safe for a normal rolling deploy
-in either direction.
+validated in its own autocommit block (via ``op.get_context().autocommit_block()``,
+same pattern as ``572b2b9a96d6``/``a9faca2517d7``) so the constraint validation
+runs with SHARE UPDATE EXCLUSIVE rather than holding ACCESS EXCLUSIVE across
+the table scan. Safe for a normal rolling deploy in either direction.
 
-``downgrade()`` drops the index, FK constraint, and column, all with
-``if_exists=True`` guards.
+``downgrade()`` drops the FK constraint and column using raw SQL with genuine
+``IF EXISTS`` guards for true idempotence.
 """
 
 from __future__ import annotations
@@ -54,26 +55,14 @@ def upgrade() -> None:
         ["id"],
         postgresql_not_valid=True,
     )
-    op.execute("ALTER TABLE proposal_holds VALIDATE CONSTRAINT fk_proposal_holds_sender_agent_id")
-    op.create_index(
-        "idx_proposal_holds_sender_agent_id_status_created_at",
-        "proposal_holds",
-        ["sender_agent_id", "status", "created_at"],
-        if_not_exists=True,
-    )
+    with op.get_context().autocommit_block():
+        op.execute(
+            "ALTER TABLE proposal_holds VALIDATE CONSTRAINT fk_proposal_holds_sender_agent_id"
+        )
 
 
 def downgrade() -> None:
-    op.drop_index(
-        "idx_proposal_holds_sender_agent_id_status_created_at",
-        table_name="proposal_holds",
-        schema="public",
-        if_exists=True,
+    op.execute(
+        "ALTER TABLE proposal_holds DROP CONSTRAINT IF EXISTS fk_proposal_holds_sender_agent_id"
     )
-    op.drop_constraint(
-        "fk_proposal_holds_sender_agent_id",
-        "proposal_holds",
-        type_="foreignkey",
-        if_exists=True,
-    )
-    op.drop_column("proposal_holds", "sender_agent_id", if_exists=True)
+    op.execute("ALTER TABLE proposal_holds DROP COLUMN IF EXISTS sender_agent_id")

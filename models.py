@@ -856,19 +856,11 @@ class ProposalHold(Base):
             "status",
             "created_at",
         ),
-        # Backs sender_agent_id-scoped lookups (best-effort bot attribution,
-        # mirroring approval_holds.sender_agent_id -- TECH-6668).
-        Index(
-            "idx_proposal_holds_sender_agent_id_status_created_at",
-            "sender_agent_id",
-            "status",
-            "created_at",
-        ),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
     sender_agent_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("agents.id"), nullable=True
+        ForeignKey("agents.id", name="fk_proposal_holds_sender_agent_id"), nullable=True
     )
     kind: Mapped[str] = mapped_column(Text, nullable=False)
     proposed_by_bot_id: Mapped[str] = mapped_column(Text, nullable=False)

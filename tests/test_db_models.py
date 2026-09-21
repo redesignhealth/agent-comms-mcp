@@ -894,7 +894,6 @@ class TestProposalHoldsSchema:
         indexes = await _indexes(engine, "proposal_holds")
         assert "idx_proposal_holds_status_created_at" in indexes
         assert "idx_proposal_holds_owner_sub_status_created_at" in indexes
-        assert "idx_proposal_holds_sender_agent_id_status_created_at" in indexes
 
     async def test_sender_agent_id_fk(self, engine: AsyncEngine) -> None:
         async with engine.connect() as conn:
@@ -938,27 +937,28 @@ class TestProposalHoldsSchema:
     ) -> None:
         """TECH-6668: verify migration c74fb78c66e4 downgrades and upgrades cleanly."""
         env = {**os.environ, "DATABASE_URL": database_url.replace("+asyncpg", "")}
-        # Downgrade to 44da57c6d9b9
-        res_down = subprocess.run(
-            [sys.executable, "-m", "alembic", "downgrade", "44da57c6d9b9"],
-            cwd=SERVICE_ROOT,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
-        assert res_down.returncode == 0, res_down.stderr
-        cols_after_down = await _columns(engine, "proposal_holds")
-        assert "sender_agent_id" not in cols_after_down
-
-        # Upgrade back to head
-        res_up = subprocess.run(
-            [sys.executable, "-m", "alembic", "upgrade", "head"],
-            cwd=SERVICE_ROOT,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
-        assert res_up.returncode == 0, res_up.stderr
+        try:
+            # Downgrade to 44da57c6d9b9
+            res_down = subprocess.run(
+                [sys.executable, "-m", "alembic", "downgrade", "44da57c6d9b9"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert res_down.returncode == 0, res_down.stderr
+            cols_after_down = await _columns(engine, "proposal_holds")
+            assert "sender_agent_id" not in cols_after_down
+        finally:
+            # Upgrade back to head so subsequent tests have full schema
+            res_up = subprocess.run(
+                [sys.executable, "-m", "alembic", "upgrade", "head"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert res_up.returncode == 0, res_up.stderr
         cols_after_up = await _columns(engine, "proposal_holds")
         assert "sender_agent_id" in cols_after_up
 

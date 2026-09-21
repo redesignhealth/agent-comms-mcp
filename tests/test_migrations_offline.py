@@ -491,7 +491,7 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
     commit_pos = result.stdout.index("COMMIT;", not_valid_pos)
     assert not_valid_pos < commit_pos < validate_pos
     # c74fb78c66e4 (TECH-6668): sender_agent_id on proposal_holds, nullable,
-    # with FK to agents(id) and status-covering index.
+    # with FK to agents(id) validated in autocommit block.
     assert "ALTER TABLE proposal_holds ADD COLUMN IF NOT EXISTS sender_agent_id UUID" in (
         result.stdout
     )
@@ -503,7 +503,12 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
         "ALTER TABLE proposal_holds VALIDATE CONSTRAINT fk_proposal_holds_sender_agent_id"
         in result.stdout
     )
-    assert (
-        "CREATE INDEX IF NOT EXISTS idx_proposal_holds_sender_agent_id_status_created_at "
-        "ON proposal_holds (sender_agent_id, status, created_at)" in result.stdout
+    fk_not_valid_pos = result.stdout.index(
+        "ALTER TABLE proposal_holds ADD CONSTRAINT fk_proposal_holds_sender_agent_id "
+        "FOREIGN KEY(sender_agent_id) REFERENCES agents (id) NOT VALID"
     )
+    fk_validate_pos = result.stdout.index(
+        "ALTER TABLE proposal_holds VALIDATE CONSTRAINT fk_proposal_holds_sender_agent_id"
+    )
+    fk_commit_pos = result.stdout.index("COMMIT;", fk_not_valid_pos)
+    assert fk_not_valid_pos < fk_commit_pos < fk_validate_pos

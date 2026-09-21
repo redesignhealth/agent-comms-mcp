@@ -6713,6 +6713,64 @@ def resolve_proposal_owner_sub(token: Any) -> str | None:
     return value
 
 
+def resolve_attribution_sub(bot_sub: str, agent_key: str | None) -> str | None:
+    """Resolve the composed agent sub for proposal attribution, or None on failure (TECH-6668).
+
+    When ``agent_key`` is omitted or empty, returns ``bot_sub`` as-is without
+    invoking ``_compose_sub``. When ``agent_key`` is provided, attempts composition
+    and logs a warning (returning ``None``) if ``_compose_sub`` raises, ensuring
+    malformed or collision-inducing inputs degrade to un-attributed rather than
+    failing the proposal.
+    """
+    if not agent_key:
+        return bot_sub
+    try:
+        from providers.comms import _compose_sub
+
+        return _compose_sub(bot_sub, agent_key)
+    except Exception as exc:
+        logger.warning(
+            "failed to compose attribution sub for bot_sub=%s agent_key=%s: %s",
+            bot_sub,
+            agent_key,
+            exc,
+        )
+        return None
+
+
+async def resolve_proposal_agent_and_owner(
+    session: AsyncSession,
+    *,
+    bot_sub: str,
+    agent_key: str | None,
+    token_owner_sub: str | None,
+) -> tuple[Agent | None, str | None]:
+    """Resolve the attribution Agent (if any) and the effective owner_sub (TECH-6668).
+
+    Performs the best-effort agent lookup for ``sender_agent_id`` attribution using
+    the composed sub if ``agent_key`` is provided, or ``bot_sub`` if omitted.
+
+    If ``token_owner_sub`` is None, resolves ``owner_sub`` from the matched agent.
+    If the attribution lookup yielded no agent and ``lookup_sub != bot_sub`` (i.e.
+    an ``agent_key`` was provided that did not match any registered row), falls
+    back to looking up the uncomposed ``bot_sub`` to preserve pre-existing
+    ``owner_sub`` resolution for registered base bots.
+    """
+    lookup_sub = resolve_attribution_sub(bot_sub, agent_key)
+    agent = await get_agent_by_sub(session, lookup_sub) if lookup_sub is not None else None
+
+    owner_sub = token_owner_sub
+    if owner_sub is None:
+        if agent is not None:
+            owner_sub = agent.owner_sub
+        elif lookup_sub != bot_sub:
+            base_agent = await get_agent_by_sub(session, bot_sub)
+            if base_agent is not None:
+                owner_sub = base_agent.owner_sub
+
+    return agent, owner_sub
+
+
 def validate_proposal_string_field(
     name: str,
     value: Any,

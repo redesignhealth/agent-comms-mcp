@@ -54,7 +54,6 @@ from observability import (
 from plugins import validate_configuration as validate_plugin_configuration
 from providers.comms import (
     ResourceSubscribeDeniedError,
-    _compose_sub,
     authorize_resource_subscribe,
     comms_server,
 )
@@ -1041,34 +1040,28 @@ async def submit_proposal(request: Request) -> Response:
             status_code=422,
         )
 
-    lookup_sub: str | None
-    if agent_key:
-        try:
-            lookup_sub = _compose_sub(bot_sub, agent_key)
-        except Exception:
-            lookup_sub = None
-    else:
-        lookup_sub = bot_sub
-
-    owner_sub = service.resolve_proposal_owner_sub(bot_token)
+    token_owner_sub = service.resolve_proposal_owner_sub(bot_token)
     async with get_session_factory()() as session:
-        agent = (
-            await service.get_agent_by_sub(session, lookup_sub) if lookup_sub is not None else None
+        agent, owner_sub = await service.resolve_proposal_agent_and_owner(
+            session,
+            bot_sub=bot_sub,
+            agent_key=agent_key,
+            token_owner_sub=token_owner_sub,
         )
-        if owner_sub is None and agent is not None:
-            owner_sub = agent.owner_sub
-        if owner_sub is None:
-            return JSONResponse(
-                {
-                    "error": "owner_sub_unresolvable",
-                    "detail": (
-                        "no owner_sub claim on the bot's token, and no registered "
-                        "board agent to fall back to"
-                    ),
-                },
-                status_code=422,
-            )
 
+    if owner_sub is None:
+        return JSONResponse(
+            {
+                "error": "owner_sub_unresolvable",
+                "detail": (
+                    "no owner_sub claim on the bot's token, and no registered "
+                    "board agent to fall back to"
+                ),
+            },
+            status_code=422,
+        )
+
+    async with get_session_factory()() as session:
         try:
             result = await service.create_proposal(
                 session,

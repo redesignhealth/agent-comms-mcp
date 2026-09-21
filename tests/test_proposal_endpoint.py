@@ -2315,3 +2315,85 @@ class TestProposalSenderAgentIdAttribution:
         hold = await session.get(ProposalHold, uuid.UUID(data["proposal_id"]))
         assert hold is not None
         assert hold.sender_agent_id is None
+
+    async def test_unresolvable_agent_key_falls_back_to_base_bot_owner_sub(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        """BLOCKING #3: unresolvable agent_key must not break owner_sub resolution
+        when base bot_sub is registered and token lacks owner_sub claim."""
+        http_client, provider = client
+        base_sub = "http-base-registered-bot"
+        await service.register_agent(
+            session,
+            sub=base_sub,
+            base_sub=base_sub,
+            owner_sub="fallback-owner@example.com",
+            owner_email="fallback-owner@example.com",
+            display_name="HTTP Base Registered Bot",
+            accepted_types=None,
+        )
+        # Token carries NO owner_sub
+        provider.tokens["bot-token"] = _agent_jwt_token(base_sub, scopes=["comms:proposals:write"])
+        resp = await http_client.post(
+            "/proposals",
+            json={**_PROPOSAL_BODY, "agent_key": "unresolvable-key"},
+            headers={"Authorization": "Bearer bot-token"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "sender_agent_id" not in data
+        hold = await session.get(ProposalHold, uuid.UUID(data["proposal_id"]))
+        assert hold is not None
+        assert hold.sender_agent_id is None
+        assert hold.owner_sub == "fallback-owner@example.com"
+
+    async def test_dedup_resubmission_without_agent_key_preserves_sender_agent_id(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        """Suggestion #5: dedup resubmission without agent_key preserves existing
+        sender_agent_id."""
+        http_client, provider = client
+        agent = await service.register_agent(
+            session,
+            sub="http-dedup-bot::worker",
+            base_sub="http-dedup-bot",
+            owner_sub="owner-a@example.com",
+            owner_email="owner-a@example.com",
+            display_name="HTTP Dedup Worker",
+            accepted_types=None,
+        )
+        agent_id = agent.id
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "http-dedup-bot", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+
+        # First submission with agent_key="worker"
+        resp1 = await http_client.post(
+            "/proposals",
+            json={**_PROPOSAL_BODY, "agent_key": "worker"},
+            headers={"Authorization": "Bearer bot-token"},
+        )
+        assert resp1.status_code == 200
+        data1 = resp1.json()
+        assert data1["sender_agent_id"] == str(agent_id)
+        proposal_id = data1["proposal_id"]
+
+        # Second submission without agent_key for same action
+        resp2 = await http_client.post(
+            "/proposals",
+            json={**_PROPOSAL_BODY, "rationale": "new rationale without key"},
+            headers={"Authorization": "Bearer bot-token"},
+        )
+        assert resp2.status_code == 200
+        data2 = resp2.json()
+        assert data2["proposal_id"] == proposal_id
+        assert data2["sender_agent_id"] == str(agent_id)
+
+        session.expire_all()
+        hold = await session.get(ProposalHold, uuid.UUID(proposal_id))
+        assert hold is not None
+        assert hold.sender_agent_id == agent_id
