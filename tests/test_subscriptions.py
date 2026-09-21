@@ -106,6 +106,41 @@ class TestRegistrySubscribeUnsubscribe:
         # record.
         assert subscriptions._agent_subscription_counts[agent_id] == 1
 
+    async def test_resubscribe_same_session_different_identity_replaces_cap_charge(
+        self,
+    ) -> None:
+        """TECH-6697 regression guard: re-subscribing the SAME session/URI
+        pair under a DIFFERENT ``agent_id`` (e.g. a sibling-identity switch
+        via the identity-qualified conversation URI, which canonicalizes to
+        the same registry key regardless of which sibling resolved it) must
+        decrement the OLD (replaced) identity's cap count, not the NEW
+        identity's. Before the fix, the decrement was mis-targeted at the
+        incoming ``agent_id`` -- leaving the replaced identity's count
+        permanently stale (never decremented) while the new identity's
+        count could be erroneously decremented if it happened to already
+        hold real subscriptions elsewhere, letting a caller bypass the cap
+        by alternating identities on the same session."""
+        agent_a, agent_b = _new_agent_id(), _new_agent_id()
+        session = _FakeSession()
+
+        r1 = await subscriptions.subscribe("comms://x", session, agent_id=agent_a, sub="a")  # type: ignore[arg-type]
+        assert r1 is not None
+        assert r1.replaced_agent_id is None
+        assert subscriptions._agent_subscription_counts[agent_a] == 1
+
+        r2 = await subscriptions.subscribe("comms://x", session, agent_id=agent_b, sub="b")  # type: ignore[arg-type]
+        assert r2 is not None
+        assert r2.replaced_agent_id == agent_a
+
+        # Sibling A's count is correctly decremented back to zero (and thus
+        # dropped from the tracking dict entirely) -- not left stale.
+        assert agent_a not in subscriptions._agent_subscription_counts
+        # Sibling B is correctly charged exactly once -- not double-counted.
+        assert subscriptions._agent_subscription_counts[agent_b] == 1
+        # Exactly one live record for this (uri, session), now under agent_b.
+        assert len(subscriptions._registry["comms://x"]) == 1
+        assert subscriptions._registry["comms://x"][0].agent_id == agent_b
+
     async def test_unsubscribe_is_idempotent(self) -> None:
         session = _FakeSession()
         agent_id = _new_agent_id()
@@ -1507,6 +1542,121 @@ class TestSubscribeAuthorization:
         ).scalar_one()
         assert str(audit_row) == sibling_id
 
+    async def test_agent_conversation_resubscribe_as_different_sibling_writes_replacement_audit(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        session: AsyncSession,
+    ) -> None:
+        """TECH-6697 end-to-end regression guard: the SAME underlying MCP
+        session re-subscribing to the same conversation via a DIFFERENT
+        sibling identity's agent-qualified URI (both canonicalize to the
+        identical registry key) must (1) correctly move the subscription-cap
+        charge from sibling A to sibling B, and (2) write a distinct,
+        security-relevant `resource.subscribe_identity_replaced` audit row --
+        not silently drop the switch as an idempotent no-op."""
+        base_sub = "conv-sub-swap-bare"
+        token = _token(base_sub)
+        await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {
+                "display_name": "Sibling A",
+                "accepted_types": sorted(MESSAGE_TYPES),
+                "agent_key": "claude-code",
+            },
+        )
+        await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {
+                "display_name": "Sibling B",
+                "accepted_types": sorted(MESSAGE_TYPES),
+                "agent_key": "worker",
+                "confirm_new_identity": True,
+            },
+        )
+        await _register(main, test_session_factory, "conv-sub-swap-counter")
+        counter_token = _token("conv-sub-swap-counter")
+
+        list_res = await _call(main, test_session_factory, token, "comms_list_agents")
+        ids = {a["sub"]: a["agent_id"] for a in list_res["agents"]}
+        sibling_a_id = ids[f"{base_sub}::claude-code"]
+        sibling_b_id = ids[f"{base_sub}::worker"]
+
+        started = await _call(
+            main,
+            test_session_factory,
+            counter_token,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [sibling_a_id, sibling_b_id],
+                "initial_message": _availability_request(),
+            },
+        )
+        conv_id = started["conversation_id"]
+
+        await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_accept",
+            {"conversation_id": conv_id, "agent_key": "claude-code"},
+        )
+        await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_accept",
+            {"conversation_id": conv_id, "agent_key": "worker"},
+        )
+
+        uri_a = f"comms://comms/agents/{sibling_a_id}/conversations/{conv_id}"
+        uri_b = f"comms://comms/agents/{sibling_b_id}/conversations/{conv_id}"
+        canonical_uri = subscriptions.conversation_uri(uuid.UUID(conv_id))
+
+        with (
+            _OIDC_PATCH,
+            _ENV_PATCH,
+            patch("providers.comms.get_access_token", return_value=token),
+            patch("providers.comms.get_session_factory", return_value=test_session_factory),
+            patch("main.get_session_factory", return_value=test_session_factory),
+        ):
+            # Same MCP session (same `Client`/`ServerSession`) subscribes
+            # first as sibling A, then re-subscribes as sibling B -- both
+            # URIs canonicalize to `canonical_uri`.
+            async with Client(main.mcp) as client:
+                await client.session.subscribe_resource(AnyUrl(uri_a))
+                assert subscriptions._agent_subscription_counts.get(uuid.UUID(sibling_a_id)) == 1
+
+                await client.session.subscribe_resource(AnyUrl(uri_b))
+
+        # Sibling A's cap charge is correctly released, sibling B's is
+        # correctly charged -- exactly once each, not double-counted.
+        assert uuid.UUID(sibling_a_id) not in subscriptions._agent_subscription_counts
+        assert subscriptions._agent_subscription_counts[uuid.UUID(sibling_b_id)] == 1
+        assert len(subscriptions._registry.get(canonical_uri, [])) == 1
+
+        # A distinct, security-relevant audit row was written for the switch.
+        audit_row = (
+            await session.execute(
+                text(
+                    "SELECT agent_id, detail FROM audit_log "
+                    "WHERE action = 'resource.subscribe_identity_replaced' "
+                    "AND actor_sub = :actor_sub "
+                    "ORDER BY id DESC LIMIT 1"
+                ),
+                {"actor_sub": base_sub},
+            )
+        ).one()
+        assert str(audit_row.agent_id) == sibling_b_id
+        assert audit_row.detail["previous_agent_id"] == sibling_a_id
+
     async def test_agent_conversation_subscribe_stranger_agent_id_denied(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
@@ -1522,6 +1672,99 @@ class TestSubscribeAuthorization:
             _OIDC_PATCH,
             _ENV_PATCH,
             patch("providers.comms.get_access_token", return_value=stranger_token),
+            patch("providers.comms.get_session_factory", return_value=test_session_factory),
+            patch("main.get_session_factory", return_value=test_session_factory),
+        ):
+            async with Client(main.mcp) as client:
+                with pytest.raises(McpError, match=re.escape("access_denied")):
+                    await client.session.subscribe_resource(AnyUrl(uri))
+
+    async def test_agent_conversation_subscribe_unknown_agent_id_denied(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Mirrors the inbox-subscribe equivalent (`agent_target_unavailable`-
+        style denial): an `agent_id` that doesn't resolve to any registered
+        agent must be uniformly denied, not crash or fall back to the caller's
+        own identity."""
+        conv_id, _ids = await _start_open_conversation(
+            main, test_session_factory, "agent-sub-u1", "agent-sub-u2"
+        )
+        unknown_id = "00000000-0000-0000-0000-000000000000"
+        token = _token("agent-sub-u1")
+
+        uri = f"comms://comms/agents/{unknown_id}/conversations/{conv_id}"
+        with (
+            _OIDC_PATCH,
+            _ENV_PATCH,
+            patch("providers.comms.get_access_token", return_value=token),
+            patch("providers.comms.get_session_factory", return_value=test_session_factory),
+            patch("main.get_session_factory", return_value=test_session_factory),
+        ):
+            async with Client(main.mcp) as client:
+                with pytest.raises(McpError, match=re.escape("access_denied")):
+                    await client.session.subscribe_resource(AnyUrl(uri))
+
+    async def test_agent_conversation_subscribe_suspended_sibling_denied(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Mirrors the inbox-subscribe equivalent: the named `agent_id` IS one
+        of the caller's own sibling identities, but that sibling has since been
+        suspended -- must be denied, not silently subscribed."""
+        base_sub = "agent-sub-susp-sib"
+        token = _token(base_sub)
+        await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {
+                "display_name": "Worker Sibling",
+                "accepted_types": sorted(MESSAGE_TYPES),
+                "agent_key": "worker",
+            },
+        )
+        await _register(main, test_session_factory, "agent-sub-susp-counter")
+        counter_token = _token("agent-sub-susp-counter")
+
+        list_res = await _call(main, test_session_factory, token, "comms_list_agents")
+        ids = {a["sub"]: a["agent_id"] for a in list_res["agents"]}
+        worker_id = ids[f"{base_sub}::worker"]
+
+        started = await _call(
+            main,
+            test_session_factory,
+            counter_token,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [worker_id],
+                "initial_message": _availability_request(),
+            },
+        )
+        conv_id = started["conversation_id"]
+
+        await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_accept",
+            {"conversation_id": conv_id, "agent_key": "worker"},
+        )
+
+        admin_token = _token("admin-operator", scopes=["comms:read", "comms:write", "comms:admin"])
+        await _call(
+            main,
+            test_session_factory,
+            admin_token,
+            "comms_deregister_agent",
+            {"agent_id": worker_id},
+        )
+
+        uri = f"comms://comms/agents/{worker_id}/conversations/{conv_id}"
+        with (
+            _OIDC_PATCH,
+            _ENV_PATCH,
+            patch("providers.comms.get_access_token", return_value=token),
             patch("providers.comms.get_session_factory", return_value=test_session_factory),
             patch("main.get_session_factory", return_value=test_session_factory),
         ):

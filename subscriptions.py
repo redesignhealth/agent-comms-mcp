@@ -78,6 +78,13 @@ class _Record:
     session_ref: weakref.ReferenceType[ServerSession]
     agent_id: uuid.UUID
     sub: str
+    # Set only when this record replaced a same-``(uri, session)`` record
+    # that was registered under a DIFFERENT ``agent_id`` (TECH-6697
+    # identity-replacement fix) -- i.e. the identity this session acts as
+    # for this subscription slot just switched from ``replaced_agent_id``
+    # to this record's own ``agent_id``. ``None`` for a brand-new
+    # subscription or an idempotent same-identity re-subscribe.
+    replaced_agent_id: uuid.UUID | None = None
 
 
 _registry: dict[str, list[_Record]] = {}
@@ -133,7 +140,30 @@ async def subscribe(
     the same URI replaces its record rather than duplicating it. Returns
     the created ``_Record`` instance if a new subscription was added, or
     ``None`` if this was an idempotent re-subscription for an existing
-    ``(uri, session)``.
+    ``(uri, session)`` under the SAME ``agent_id`` as before.
+
+    TECH-6697 identity-replacement fix: a caller-supplied ``agent_id`` need
+    not match the ``agent_id`` recorded for this exact ``(uri, session)``
+    on a prior call -- this happens when the same underlying session
+    re-subscribes to a CANONICALIZED URI it already holds a record for
+    (e.g. ``conversation_uri()`` is agent-agnostic, so subscribing via
+    ``comms://comms/agents/{sibling_A}/conversations/{conv_id}`` and later
+    via ``comms://comms/agents/{sibling_B}/conversations/{conv_id}``
+    canonicalize to the identical registry key). Two cases:
+
+    - Same identity (``agent_id`` unchanged): idempotent, as documented
+      above -- the existing record's count is decremented then immediately
+      re-incremented below (net no-op), and this returns ``None``.
+    - Different identity (``agent_id`` changed): this is an identity
+      REPLACEMENT, not a routine idempotent re-subscribe. The OLD record's
+      own ``agent_id`` (the one actually being replaced) is decremented --
+      never the new, caller-supplied ``agent_id`` -- so per-agent cap
+      bookkeeping stays correct for both identities. The cap check and
+      increment below still apply to the NEW ``agent_id`` being charged.
+      This returns the new ``_Record``, with its ``replaced_agent_id``
+      field set to the old identity, so callers (``main.py``) can audit
+      the switch as a distinct, security-relevant event rather than
+      silently dropping it as an idempotent no-op.
 
     If ``agent_id`` already holds ``MAX_SUBSCRIPTIONS_PER_AGENT`` live
     subscriptions after reclaiming any dead sessions, raises
@@ -142,6 +172,7 @@ async def subscribe(
     async with _lock:
         records = _registry.setdefault(uri, [])
         before = len(records)
+        existing_for_session = next((r for r in records if r.session_ref() is session), None)
         records[:] = [r for r in records if r.session_ref() is not session]
         # Idempotent re-subscribe (same uri, same session): the filter above
         # just dropped this session's existing record. Without decrementing
@@ -149,9 +180,23 @@ async def subscribe(
         # `agent_id` -- Argus round-2 BLOCKING catch (a caller re-subscribing
         # to the same URI N times would inflate its count by N, eventually
         # tripping the cap on a genuinely idempotent no-op).
+        #
+        # TECH-6697 BLOCKING catch: decrement the REMOVED record's own
+        # `agent_id` (`existing_for_session.agent_id`), not the new,
+        # caller-supplied `agent_id` parameter -- those two can now differ
+        # (identity replacement, see docstring above). Decrementing the
+        # wrong identity here either leaks a stale count on the identity
+        # actually being replaced (it's never decremented) or corrupts an
+        # unrelated identity's count (if the new `agent_id` happens to have
+        # its own real subscriptions elsewhere), letting a caller bypass
+        # the cap by alternating sibling identities on the same session.
         removed_existing = len(records) < before
+        replaced_agent_id: uuid.UUID | None = None
         if removed_existing:
-            _dec_count(agent_id)
+            assert existing_for_session is not None
+            _dec_count(existing_for_session.agent_id)
+            if existing_for_session.agent_id != agent_id:
+                replaced_agent_id = existing_for_session.agent_id
 
         # Optimization (TECH-6335): only perform the full O(total subscriptions)
         # scan when the agent's tracked count is actually at or above the cap.
@@ -167,10 +212,12 @@ async def subscribe(
             )
 
         records = _registry.setdefault(uri, [])
-        new_record = _Record(weakref.ref(session), agent_id, sub)
+        new_record = _Record(weakref.ref(session), agent_id, sub, replaced_agent_id)
         records.append(new_record)
         _agent_subscription_counts[agent_id] = _agent_subscription_counts.get(agent_id, 0) + 1
-        return new_record if not removed_existing else None
+        if removed_existing and replaced_agent_id is None:
+            return None
+        return new_record
 
 
 async def is_subscribed(uri: str, session: ServerSession) -> bool:

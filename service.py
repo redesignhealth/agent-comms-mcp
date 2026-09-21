@@ -9569,6 +9569,7 @@ async def audit_resource_subscription(
     action: str,
     uri: str,
     conversation_id: uuid.UUID | None = None,
+    replaced_agent_id: uuid.UUID | None = None,
 ) -> None:
     """Audit + commit a successful ``resource.subscribe``/``resource.unsubscribe``
     (TECH-5903 Phase B). Unlike every other tool/resource call, the low-level
@@ -9580,6 +9581,15 @@ async def audit_resource_subscription(
     threads through onto the audit row for parity with ``deny_resource_subscribe``
     (Argus round-2 SUGGESTION) -- omitted (``None``) for inbox URIs, which
     have no conversation to attribute.
+
+    ``replaced_agent_id``, when set (TECH-6697 identity-replacement fix),
+    is the ``agent_id`` this subscription just replaced for the same
+    underlying session -- i.e. this session switched which board identity
+    it subscribes as for this exact ``(uri, session)`` slot (see
+    ``subscriptions.subscribe``'s docstring). This is a security-relevant
+    event, so a SECOND, distinct ``resource.subscribe_identity_replaced``
+    audit row is staged alongside the normal one rather than folding it
+    silently into the ordinary subscribe row's detail.
     """
     _audit(
         session,
@@ -9589,6 +9599,15 @@ async def audit_resource_subscription(
         conversation_id=conversation_id,
         detail={"uri": uri},
     )
+    if replaced_agent_id is not None:
+        _audit(
+            session,
+            actor_sub=actor_sub,
+            action="resource.subscribe_identity_replaced",
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            detail={"uri": uri, "previous_agent_id": str(replaced_agent_id)},
+        )
     await session.commit()
 
 

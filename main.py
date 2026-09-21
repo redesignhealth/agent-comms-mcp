@@ -619,6 +619,15 @@ async def _handle_subscribe_resource(uri: AnyUrl) -> None:
                     action="resource.subscribe",
                     uri=auth.canonical_uri,
                     conversation_id=auth.conversation_id,
+                    # TECH-6697: set only when this session just switched
+                    # which board identity it subscribes as for this exact
+                    # `(uri, session)` slot (e.g. re-subscribing to the same
+                    # canonicalized conversation URI via a different sibling
+                    # `agent_id` than before) -- writes an additional,
+                    # distinct audit row for this security-relevant event
+                    # rather than folding it silently into the ordinary
+                    # `resource.subscribe` row.
+                    replaced_agent_id=record.replaced_agent_id,
                 )
         except (Exception, asyncio.CancelledError):
             # Roll back in-memory registration on audit failure (best-effort reconciliation).
