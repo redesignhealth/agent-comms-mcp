@@ -40,6 +40,8 @@ from sqlalchemy.ext.asyncio import (
 )
 
 import plugins
+import service
+from models import ProposalHold
 from plugins import (
     FINGERPRINT_DIGEST,
     FINGERPRINT_UNAVAILABLE,
@@ -767,3 +769,141 @@ class TestListPendingAndHistory:
         )
         assert result["has_more"] is False
         assert len(result["proposals"]) == 1
+
+
+class TestProposalToolsSenderAgentId:
+    """TECH-6668: sender_agent_id attribution on proposal tools."""
+
+    async def test_submit_with_valid_agent_key_populates_sender_agent_id(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        session: AsyncSession,
+    ) -> None:
+        agent = await service.register_agent(
+            session,
+            sub="tool-bot::worker",
+            base_sub="tool-bot",
+            owner_sub="owner@example.com",
+            owner_email="owner@example.com",
+            display_name="Tool Worker",
+            accepted_types=None,
+        )
+        token = _token("tool-bot", owner_sub="owner@example.com")
+        submitted = await _call(
+            main,
+            test_session_factory,
+            token,
+            "proposals_submit",
+            {
+                "kind": "linear_progress_update",
+                "action": _action(target_id="TOOL-1"),
+                "rationale": "because reasons",
+                "confidence": "medium",
+                "importance": "medium",
+                "impact": "medium",
+                "agent_key": "worker",
+            },
+        )
+        assert submitted["sender_agent_id"] == str(agent.id)
+        proposal_id = submitted["proposal_id"]
+
+        # proposals_get
+        got = await _call(
+            main,
+            test_session_factory,
+            token,
+            "proposals_get",
+            {"proposal_id": proposal_id},
+        )
+        assert got["sender_agent_id"] == str(agent.id)
+
+        # proposals_list_pending
+        pending = await _call(
+            main,
+            test_session_factory,
+            token,
+            "proposals_list_pending",
+        )
+        matching = [p for p in pending["proposals"] if p["proposal_id"] == proposal_id]
+        assert len(matching) == 1
+        assert matching[0]["sender_agent_id"] == str(agent.id)
+
+        # decide and check proposals_list_history
+        await decide_proposal(
+            session,
+            approver_sub="owner@example.com",
+            hold_id=uuid.UUID(proposal_id),
+            decision="reject",
+            decision_note="rejected",
+            judge=FakeProposalJudge(),
+        )
+        history = await _call(
+            main,
+            test_session_factory,
+            token,
+            "proposals_list_history",
+        )
+        matching_hist = [p for p in history["proposals"] if p["proposal_id"] == proposal_id]
+        assert len(matching_hist) == 1
+        assert matching_hist[0]["sender_agent_id"] == str(agent.id)
+
+    async def test_submit_with_unresolvable_agent_key_omits_sender_agent_id(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+    ) -> None:
+        token = _token("tool-bot", owner_sub="owner@example.com")
+        submitted = await _call(
+            main,
+            test_session_factory,
+            token,
+            "proposals_submit",
+            {
+                "kind": "linear_progress_update",
+                "action": _action(target_id="TOOL-2"),
+                "rationale": "because reasons",
+                "confidence": "medium",
+                "importance": "medium",
+                "impact": "medium",
+                "agent_key": "unregistered",
+            },
+        )
+        assert "sender_agent_id" not in submitted
+
+    async def test_submit_without_owner_sub_falls_back_to_keyed_agent(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        session: AsyncSession,
+    ) -> None:
+        agent = await service.register_agent(
+            session,
+            sub="tool-bot-no-owner::keyed",
+            base_sub="tool-bot-no-owner",
+            owner_sub="fallback-owner@example.com",
+            owner_email="fallback-owner@example.com",
+            display_name="Fallback Agent",
+            accepted_types=None,
+        )
+        # Token carries NO owner_sub
+        token = _token("tool-bot-no-owner", owner_sub=None)
+        submitted = await _call(
+            main,
+            test_session_factory,
+            token,
+            "proposals_submit",
+            {
+                "kind": "linear_progress_update",
+                "action": _action(target_id="TOOL-3"),
+                "rationale": "because reasons",
+                "confidence": "medium",
+                "importance": "medium",
+                "impact": "medium",
+                "agent_key": "keyed",
+            },
+        )
+        assert submitted["sender_agent_id"] == str(agent.id)
+        hold = await session.get(ProposalHold, uuid.UUID(submitted["proposal_id"]))
+        assert hold is not None
+        assert hold.owner_sub == "fallback-owner@example.com"

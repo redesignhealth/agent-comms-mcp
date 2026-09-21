@@ -83,6 +83,7 @@ from exceptions import (
     RateLimitExceededError,
 )
 from identity import try_resolve_email
+from providers.comms import _compose_sub
 from scopes import is_interactive_token
 
 proposals_server: FastMCP[Any] = FastMCP("proposals")
@@ -176,6 +177,7 @@ async def submit(
     importance: str,
     impact: str,
     target_fingerprint: str = "",
+    agent_key: str | None = None,
 ) -> dict[str, Any]:
     """Submit a proposal for a bot-initiated action needing human (or
     TECH-5877 auto-judge) approval before it takes effect. Same body shape
@@ -204,8 +206,13 @@ async def submit(
     ``""``, with no error; a caller that still sends a non-empty value
     (for backward compatibility with existing callers) gets no special
     treatment either -- it's accepted and silently ignored either way.
+
+    ``agent_key``: optional key when running multiple agents under one token.
+    Resolves to a registered agent row for best-effort attribution
+    (``sender_agent_id``).
     """
     bot_sub = _require_bot_sub()
+    composed_sub = _compose_sub(bot_sub, agent_key)
     if not isinstance(action, dict):
         raise ToolError("invalid_request: action must be an object")
     if len(json.dumps(action)) > service.MAX_PROPOSAL_ACTION_BYTES:
@@ -250,9 +257,9 @@ async def submit(
         raise ToolError("no access token provided")
     owner_sub = service.resolve_proposal_owner_sub(token)
     async with get_session_factory()() as session:
-        if owner_sub is None:
-            agent = await service.get_agent_by_sub(session, bot_sub)
-            owner_sub = agent.owner_sub if agent is not None else None
+        agent = await service.get_agent_by_sub(session, composed_sub)
+        if owner_sub is None and agent is not None:
+            owner_sub = agent.owner_sub
         if owner_sub is None:
             raise ToolError(
                 "owner_sub_unresolvable: no owner_sub claim on the bot's token, and no "
@@ -271,6 +278,7 @@ async def submit(
                 impact=impact,
                 judge=plugins.get_proposal_judge(),
                 target_fingerprint=target_fingerprint,
+                sender_agent_id=agent.id if agent else None,
             )
 
 

@@ -6618,6 +6618,8 @@ def _proposal_dict(hold: ProposalHold) -> dict[str, Any]:
         result["apply_error"] = hold.apply_error
     if hold.apply_result is not None:
         result["apply_result"] = hold.apply_result
+    if hold.sender_agent_id is not None:
+        result["sender_agent_id"] = str(hold.sender_agent_id)
     return result
 
 
@@ -6791,6 +6793,7 @@ def _apply_proposal_resubmission(
     impact: str,
     priority: str,
     target_fingerprint: str,
+    sender_agent_id: uuid.UUID | None = None,
 ) -> None:
     """Mutate an existing pending ``ProposalHold`` in place for a dedup
     match. Deliberately does NOT set ``hold.updated_at`` itself (Argus
@@ -6805,6 +6808,8 @@ def _apply_proposal_resubmission(
     hold.impact = impact
     hold.priority = priority
     hold.target_fingerprint = target_fingerprint
+    if sender_agent_id is not None:
+        hold.sender_agent_id = sender_agent_id
 
 
 def _proposal_resubmission_snapshot(hold: ProposalHold) -> tuple[Any, ...]:
@@ -6853,6 +6858,7 @@ async def _dedup_or_insert_proposal(
     action_type: str,
     priority: str,
     target_fingerprint: str,
+    sender_agent_id: uuid.UUID | None = None,
 ) -> ProposalHold:
     """INSERT a new ``proposal_holds`` row, or UPDATE an existing pending
     dedup match in place (TECH-5872 B1/B2).
@@ -6891,6 +6897,7 @@ async def _dedup_or_insert_proposal(
                 impact=impact,
                 priority=priority,
                 target_fingerprint=target_fingerprint,
+                sender_agent_id=sender_agent_id,
             )
         return existing
 
@@ -6906,6 +6913,7 @@ async def _dedup_or_insert_proposal(
         priority=priority,
         status="pending",
         target_fingerprint=target_fingerprint,
+        sender_agent_id=sender_agent_id,
     )
     session.add(hold)
     try:
@@ -6934,6 +6942,7 @@ async def _dedup_or_insert_proposal(
                 impact=impact,
                 priority=priority,
                 target_fingerprint=target_fingerprint,
+                sender_agent_id=sender_agent_id,
             )
         return existing_after_race
     return hold
@@ -6952,6 +6961,7 @@ async def create_proposal(
     impact: str,
     judge: ProposalJudge,
     target_fingerprint: str,
+    sender_agent_id: uuid.UUID | None = None,
 ) -> dict[str, Any]:
     """``POST /proposals`` (main.py, non-MCP, bot-submission-gated).
 
@@ -7125,6 +7135,7 @@ async def create_proposal(
         action_type=action_type,
         priority=priority,
         target_fingerprint=target_fingerprint,
+        sender_agent_id=sender_agent_id,
     )
 
     # Commit the pending row and release this session's DB connection
