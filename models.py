@@ -859,6 +859,9 @@ class ProposalHold(Base):
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
+    sender_agent_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("agents.id", name="fk_proposal_holds_sender_agent_id"), nullable=True
+    )
     kind: Mapped[str] = mapped_column(Text, nullable=False)
     proposed_by_bot_id: Mapped[str] = mapped_column(Text, nullable=False)
     owner_sub: Mapped[str] = mapped_column(Text, nullable=False)

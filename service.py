@@ -6618,6 +6618,8 @@ def _proposal_dict(hold: ProposalHold) -> dict[str, Any]:
         result["apply_error"] = hold.apply_error
     if hold.apply_result is not None:
         result["apply_result"] = hold.apply_result
+    if hold.sender_agent_id is not None:
+        result["sender_agent_id"] = str(hold.sender_agent_id)
     return result
 
 
@@ -6711,6 +6713,65 @@ def resolve_proposal_owner_sub(token: Any) -> str | None:
     return value
 
 
+def resolve_attribution_sub(bot_sub: str, agent_key: str | None) -> str | None:
+    """Resolve the composed agent sub for proposal attribution, or None on failure (TECH-6668).
+
+    When ``agent_key`` is omitted or empty, returns ``bot_sub`` as-is without
+    invoking ``_compose_sub``. When ``agent_key`` is provided, attempts validation
+    and composition, logging a warning (and returning ``None``) if either raises,
+    ensuring malformed or collision-inducing inputs degrade to un-attributed rather
+    than failing the proposal.
+    """
+    if not agent_key:
+        return bot_sub
+    from providers.comms import _compose_sub, _validate_agent_key
+
+    try:
+        clean_key = _validate_agent_key(agent_key)
+        return _compose_sub(bot_sub, clean_key)
+    except Exception as exc:
+        logger.warning(
+            "failed to compose attribution sub for bot_sub=%s agent_key=%s: %s",
+            bot_sub,
+            agent_key,
+            exc,
+        )
+        return None
+
+
+async def resolve_proposal_agent_and_owner(
+    session: AsyncSession,
+    *,
+    bot_sub: str,
+    agent_key: str | None,
+    token_owner_sub: str | None,
+) -> tuple[Agent | None, str | None]:
+    """Resolve the attribution Agent (if any) and the effective owner_sub (TECH-6668).
+
+    Performs the best-effort agent lookup for ``sender_agent_id`` attribution using
+    the composed sub if ``agent_key`` is provided, or ``bot_sub`` if omitted.
+
+    If ``token_owner_sub`` is None, resolves ``owner_sub`` from the matched agent.
+    If the attribution lookup yielded no agent and ``lookup_sub != bot_sub`` (i.e.
+    an ``agent_key`` was provided that did not match any registered row), falls
+    back to looking up the uncomposed ``bot_sub`` to preserve pre-existing
+    ``owner_sub`` resolution for registered base bots.
+    """
+    lookup_sub = resolve_attribution_sub(bot_sub, agent_key)
+    agent = await get_agent_by_sub(session, lookup_sub) if lookup_sub is not None else None
+
+    owner_sub = token_owner_sub
+    if owner_sub is None:
+        if agent is not None:
+            owner_sub = agent.owner_sub
+        elif lookup_sub != bot_sub:
+            base_agent = await get_agent_by_sub(session, bot_sub)
+            if base_agent is not None:
+                owner_sub = base_agent.owner_sub
+
+    return agent, owner_sub
+
+
 def validate_proposal_string_field(
     name: str,
     value: Any,
@@ -6791,6 +6852,7 @@ def _apply_proposal_resubmission(
     impact: str,
     priority: str,
     target_fingerprint: str,
+    sender_agent_id: uuid.UUID | None = None,
 ) -> None:
     """Mutate an existing pending ``ProposalHold`` in place for a dedup
     match. Deliberately does NOT set ``hold.updated_at`` itself (Argus
@@ -6805,6 +6867,8 @@ def _apply_proposal_resubmission(
     hold.impact = impact
     hold.priority = priority
     hold.target_fingerprint = target_fingerprint
+    if sender_agent_id is not None:
+        hold.sender_agent_id = sender_agent_id
 
 
 def _proposal_resubmission_snapshot(hold: ProposalHold) -> tuple[Any, ...]:
@@ -6853,6 +6917,7 @@ async def _dedup_or_insert_proposal(
     action_type: str,
     priority: str,
     target_fingerprint: str,
+    sender_agent_id: uuid.UUID | None = None,
 ) -> ProposalHold:
     """INSERT a new ``proposal_holds`` row, or UPDATE an existing pending
     dedup match in place (TECH-5872 B1/B2).
@@ -6891,6 +6956,7 @@ async def _dedup_or_insert_proposal(
                 impact=impact,
                 priority=priority,
                 target_fingerprint=target_fingerprint,
+                sender_agent_id=sender_agent_id,
             )
         return existing
 
@@ -6906,6 +6972,7 @@ async def _dedup_or_insert_proposal(
         priority=priority,
         status="pending",
         target_fingerprint=target_fingerprint,
+        sender_agent_id=sender_agent_id,
     )
     session.add(hold)
     try:
@@ -6934,6 +7001,7 @@ async def _dedup_or_insert_proposal(
                 impact=impact,
                 priority=priority,
                 target_fingerprint=target_fingerprint,
+                sender_agent_id=sender_agent_id,
             )
         return existing_after_race
     return hold
@@ -6952,6 +7020,7 @@ async def create_proposal(
     impact: str,
     judge: ProposalJudge,
     target_fingerprint: str,
+    sender_agent_id: uuid.UUID | None = None,
 ) -> dict[str, Any]:
     """``POST /proposals`` (main.py, non-MCP, bot-submission-gated).
 
@@ -7125,6 +7194,7 @@ async def create_proposal(
         action_type=action_type,
         priority=priority,
         target_fingerprint=target_fingerprint,
+        sender_agent_id=sender_agent_id,
     )
 
     # Commit the pending row and release this session's DB connection

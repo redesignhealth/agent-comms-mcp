@@ -26,7 +26,8 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 
 import plugins
-from models import AuditLog
+import service
+from models import AuditLog, ProposalHold
 from plugins import (
     FINGERPRINT_DIGEST,
     FINGERPRINT_UNAVAILABLE,
@@ -48,7 +49,7 @@ pytestmark = pytest.mark.usefixtures("_migrated_schema")
 async def _clean_tables(engine: AsyncEngine) -> AsyncIterator[None]:
     async with engine.begin() as conn:
         await conn.execute(
-            text("TRUNCATE TABLE proposal_holds, audit_log RESTART IDENTITY CASCADE")
+            text("TRUNCATE TABLE proposal_holds, audit_log, agents RESTART IDENTITY CASCADE")
         )
     yield
 
@@ -2027,3 +2028,372 @@ class TestProposalRouteRegistrationOrder:
         assert "/proposals/{proposal_id}" in paths
         assert paths.index("/proposals/pending") < paths.index("/proposals/{proposal_id}")
         assert paths.index("/proposals/history") < paths.index("/proposals/{proposal_id}")
+
+
+class TestProposalSenderAgentIdAttribution:
+    """TECH-6668: sender_agent_id attribution on proposal_holds."""
+
+    async def test_submitting_with_no_agent_key_unregistered_bot(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        resp = await http_client.post(
+            "/proposals", json=_PROPOSAL_BODY, headers={"Authorization": "Bearer bot-token"}
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "sender_agent_id" not in data
+        hold = await session.get(ProposalHold, uuid.UUID(data["proposal_id"]))
+        assert hold is not None
+        assert hold.sender_agent_id is None
+
+    async def test_submitting_with_valid_agent_key_populates_all_four_surfaces(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        http_client, provider = client
+        agent = await service.register_agent(
+            session,
+            sub="bot-1::worker",
+            base_sub="bot-1",
+            owner_sub="owner-a@example.com",
+            owner_email="owner-a@example.com",
+            display_name="Worker Bot",
+            accepted_types=None,
+        )
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+
+        body = {**_PROPOSAL_BODY, "agent_key": "worker"}
+        resp = await http_client.post(
+            "/proposals", json=body, headers={"Authorization": "Bearer bot-token"}
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        proposal_id = data["proposal_id"]
+        assert data["sender_agent_id"] == str(agent.id)
+
+        # Verify DB row
+        hold = await session.get(ProposalHold, uuid.UUID(proposal_id))
+        assert hold is not None
+        assert hold.sender_agent_id == agent.id
+
+        # Surface 1: GET /proposals/pending (human caller)
+        pending_resp = await http_client.get(
+            "/proposals/pending", headers={"Authorization": "Bearer human-token"}
+        )
+        assert pending_resp.status_code == 200
+        pending_proposals = pending_resp.json()["proposals"]
+        matching = [p for p in pending_proposals if p["proposal_id"] == proposal_id]
+        assert len(matching) == 1
+        assert matching[0]["sender_agent_id"] == str(agent.id)
+
+        # Surface 2: GET /proposals/{proposal_id} (bot caller)
+        get_resp = await http_client.get(
+            f"/proposals/{proposal_id}", headers={"Authorization": "Bearer bot-token"}
+        )
+        assert get_resp.status_code == 200
+        assert get_resp.json()["sender_agent_id"] == str(agent.id)
+
+        # Surface 3: POST /proposals/{proposal_id}/decide (human caller)
+        decide_resp = await http_client.post(
+            f"/proposals/{proposal_id}/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={"decision": "reject", "decision_note": "rejected"},
+        )
+        assert decide_resp.status_code == 200
+        assert decide_resp.json()["sender_agent_id"] == str(agent.id)
+
+        # Surface 4: GET /proposals/history (human caller)
+        history_resp = await http_client.get(
+            "/proposals/history", headers={"Authorization": "Bearer human-token"}
+        )
+        assert history_resp.status_code == 200
+        history_proposals = history_resp.json()["proposals"]
+        matching_history = [p for p in history_proposals if p["proposal_id"] == proposal_id]
+        assert len(matching_history) == 1
+        assert matching_history[0]["sender_agent_id"] == str(agent.id)
+
+    async def test_submitting_with_unresolvable_agent_key_is_none_no_error(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        body = {**_PROPOSAL_BODY, "agent_key": "unregistered-key"}
+        resp = await http_client.post(
+            "/proposals", json=body, headers={"Authorization": "Bearer bot-token"}
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "sender_agent_id" not in data
+        hold = await session.get(ProposalHold, uuid.UUID(data["proposal_id"]))
+        assert hold is not None
+        assert hold.sender_agent_id is None
+
+    async def test_dedup_resubmission_updates_previously_null_sender_agent_id(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        http_client, provider = client
+        agent = await service.register_agent(
+            session,
+            sub="bot-1::worker",
+            base_sub="bot-1",
+            owner_sub="owner-a@example.com",
+            owner_email="owner-a@example.com",
+            display_name="Worker Bot",
+            accepted_types=None,
+        )
+        agent_id = agent.id
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+
+        # First submission without agent_key
+        resp1 = await http_client.post(
+            "/proposals", json=_PROPOSAL_BODY, headers={"Authorization": "Bearer bot-token"}
+        )
+        assert resp1.status_code == 200
+        data1 = resp1.json()
+        assert "sender_agent_id" not in data1
+        hold1 = await session.get(ProposalHold, uuid.UUID(data1["proposal_id"]))
+        assert hold1 is not None
+        assert hold1.sender_agent_id is None
+
+        # Second submission with agent_key="worker" for same target
+        resp2 = await http_client.post(
+            "/proposals",
+            json={**_PROPOSAL_BODY, "agent_key": "worker"},
+            headers={"Authorization": "Bearer bot-token"},
+        )
+        assert resp2.status_code == 200
+        data2 = resp2.json()
+        assert data2["proposal_id"] == data1["proposal_id"]
+        assert data2["sender_agent_id"] == str(agent_id)
+
+        # Re-fetch from DB
+        session.expire_all()
+        hold2 = await session.get(ProposalHold, uuid.UUID(data1["proposal_id"]))
+        assert hold2 is not None
+        assert hold2.sender_agent_id == agent_id
+
+    async def test_latent_bug_fix_owner_sub_fallback_with_agent_key(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        http_client, provider = client
+        agent = await service.register_agent(
+            session,
+            sub="bot-1::keyed",
+            base_sub="bot-1",
+            owner_sub="owner-from-agent@example.com",
+            owner_email="owner-from-agent@example.com",
+            display_name="Keyed Agent",
+            accepted_types=None,
+        )
+        # Token carries NO owner_sub claim
+        provider.tokens["bot-token"] = _agent_jwt_token("bot-1", scopes=["comms:proposals:write"])
+        resp = await http_client.post(
+            "/proposals",
+            json={**_PROPOSAL_BODY, "agent_key": "keyed"},
+            headers={"Authorization": "Bearer bot-token"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["sender_agent_id"] == str(agent.id)
+        hold = await session.get(ProposalHold, uuid.UUID(data["proposal_id"]))
+        assert hold is not None
+        assert hold.owner_sub == "owner-from-agent@example.com"
+        assert hold.sender_agent_id == agent.id
+
+    async def test_invalid_agent_key_type_rejected(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        resp = await http_client.post(
+            "/proposals",
+            json={**_PROPOSAL_BODY, "agent_key": 123},
+            headers={"Authorization": "Bearer bot-token"},
+        )
+        assert resp.status_code == 422
+        assert resp.json()["error"] == "invalid_request"
+
+    async def test_sub_containing_colons_without_agent_key_succeeds_unregistered(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        """Regression test for TECH-6668 finding: bot_sub containing '::'
+        submitting without agent_key must not be rejected by _compose_sub."""
+        http_client, provider = client
+        opaque_sub = "opaque::legacy::bot-sub"
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            opaque_sub, scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        resp = await http_client.post(
+            "/proposals",
+            json=_PROPOSAL_BODY,
+            headers={"Authorization": "Bearer bot-token"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "sender_agent_id" not in data
+        hold = await session.get(ProposalHold, uuid.UUID(data["proposal_id"]))
+        assert hold is not None
+        assert hold.sender_agent_id is None
+        assert hold.proposed_by_bot_id == opaque_sub
+
+    async def test_sub_containing_colons_without_agent_key_resolves_registered_agent(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        """Bot with sub containing '::' matches a registered agent with that raw sub."""
+        http_client, provider = client
+        opaque_sub = "opaque::legacy::bot-sub"
+        agent = await service.register_agent(
+            session,
+            sub=opaque_sub,
+            base_sub=opaque_sub,
+            owner_sub="owner-a@example.com",
+            owner_email="owner-a@example.com",
+            display_name="Legacy Opaque Bot",
+            accepted_types=None,
+        )
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            opaque_sub, scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        resp = await http_client.post(
+            "/proposals",
+            json=_PROPOSAL_BODY,
+            headers={"Authorization": "Bearer bot-token"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["sender_agent_id"] == str(agent.id)
+        hold = await session.get(ProposalHold, uuid.UUID(data["proposal_id"]))
+        assert hold is not None
+        assert hold.sender_agent_id == agent.id
+
+    async def test_sub_containing_colons_with_agent_key_degrades_gracefully(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        """Bot with sub containing '::' passing agent_key triggers composition error,
+        which must degrade gracefully to sender_agent_id=None without failing submission."""
+        http_client, provider = client
+        opaque_sub = "opaque::legacy::bot-sub"
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            opaque_sub, scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        resp = await http_client.post(
+            "/proposals",
+            json={**_PROPOSAL_BODY, "agent_key": "some-key"},
+            headers={"Authorization": "Bearer bot-token"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "sender_agent_id" not in data
+        hold = await session.get(ProposalHold, uuid.UUID(data["proposal_id"]))
+        assert hold is not None
+        assert hold.sender_agent_id is None
+
+    async def test_unresolvable_agent_key_falls_back_to_base_bot_owner_sub(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        """BLOCKING #3: unresolvable agent_key must not break owner_sub resolution
+        when base bot_sub is registered and token lacks owner_sub claim."""
+        http_client, provider = client
+        base_sub = "http-base-registered-bot"
+        await service.register_agent(
+            session,
+            sub=base_sub,
+            base_sub=base_sub,
+            owner_sub="fallback-owner@example.com",
+            owner_email="fallback-owner@example.com",
+            display_name="HTTP Base Registered Bot",
+            accepted_types=None,
+        )
+        # Token carries NO owner_sub
+        provider.tokens["bot-token"] = _agent_jwt_token(base_sub, scopes=["comms:proposals:write"])
+        resp = await http_client.post(
+            "/proposals",
+            json={**_PROPOSAL_BODY, "agent_key": "unresolvable-key"},
+            headers={"Authorization": "Bearer bot-token"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "sender_agent_id" not in data
+        hold = await session.get(ProposalHold, uuid.UUID(data["proposal_id"]))
+        assert hold is not None
+        assert hold.sender_agent_id is None
+        assert hold.owner_sub == "fallback-owner@example.com"
+
+    async def test_dedup_resubmission_without_agent_key_preserves_sender_agent_id(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        """Suggestion #5: dedup resubmission without agent_key preserves existing
+        sender_agent_id."""
+        http_client, provider = client
+        agent = await service.register_agent(
+            session,
+            sub="http-dedup-bot::worker",
+            base_sub="http-dedup-bot",
+            owner_sub="owner-a@example.com",
+            owner_email="owner-a@example.com",
+            display_name="HTTP Dedup Worker",
+            accepted_types=None,
+        )
+        agent_id = agent.id
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "http-dedup-bot", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+
+        # First submission with agent_key="worker"
+        resp1 = await http_client.post(
+            "/proposals",
+            json={**_PROPOSAL_BODY, "agent_key": "worker"},
+            headers={"Authorization": "Bearer bot-token"},
+        )
+        assert resp1.status_code == 200
+        data1 = resp1.json()
+        assert data1["sender_agent_id"] == str(agent_id)
+        proposal_id = data1["proposal_id"]
+
+        # Second submission without agent_key for same action
+        resp2 = await http_client.post(
+            "/proposals",
+            json={**_PROPOSAL_BODY, "rationale": "new rationale without key"},
+            headers={"Authorization": "Bearer bot-token"},
+        )
+        assert resp2.status_code == 200
+        data2 = resp2.json()
+        assert data2["proposal_id"] == proposal_id
+        assert data2["sender_agent_id"] == str(agent_id)
+
+        session.expire_all()
+        hold = await session.get(ProposalHold, uuid.UUID(proposal_id))
+        assert hold is not None
+        assert hold.sender_agent_id == agent_id

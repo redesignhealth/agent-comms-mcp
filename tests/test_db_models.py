@@ -19,6 +19,7 @@ import asyncio
 import os
 import subprocess
 import sys
+import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -667,6 +668,7 @@ class TestProposalHoldsSchema:
         cols = await _columns(engine, "proposal_holds")
         for expected in (
             "id",
+            "sender_agent_id",
             "kind",
             "proposed_by_bot_id",
             "owner_sub",
@@ -690,6 +692,7 @@ class TestProposalHoldsSchema:
         ):
             assert expected in cols, f"proposal_holds.{expected} missing"
         assert cols["action"] == "jsonb"
+        assert cols["sender_agent_id"] == "uuid"
         # migration d88cc7e6e21b (TECH-5873 follow-up: open_ticket creates
         # a real Linear issue) -- apply_result is nullable JSONB, same
         # column type/nullability as `action`, just nullable.
@@ -704,7 +707,17 @@ class TestProposalHoldsSchema:
                     )
                 )
             ).scalar_one()
+            sender_agent_id_nullable = (
+                await conn.execute(
+                    text(
+                        "SELECT is_nullable FROM information_schema.columns "
+                        "WHERE table_schema = 'public' AND table_name = 'proposal_holds' "
+                        "AND column_name = 'sender_agent_id'"
+                    )
+                )
+            ).scalar_one()
         assert nullable == "YES"
+        assert sender_agent_id_nullable == "YES"
 
     async def test_status_defaults_to_pending(self, engine: AsyncEngine) -> None:
         async with engine.connect() as conn:
@@ -881,6 +894,86 @@ class TestProposalHoldsSchema:
         indexes = await _indexes(engine, "proposal_holds")
         assert "idx_proposal_holds_status_created_at" in indexes
         assert "idx_proposal_holds_owner_sub_status_created_at" in indexes
+
+    async def test_sender_agent_id_fk(self, engine: AsyncEngine) -> None:
+        async with engine.connect() as conn:
+            fk_info = [
+                (row.conname, row.confrelid_name)
+                for row in (
+                    await conn.execute(
+                        text(
+                            "SELECT conname, confrelid::regclass::text AS confrelid_name "
+                            "FROM pg_constraint "
+                            "WHERE conrelid = 'proposal_holds'::regclass AND contype = 'f'"
+                        )
+                    )
+                )
+            ]
+        assert any(
+            name == "fk_proposal_holds_sender_agent_id" and target == "agents"
+            for name, target in fk_info
+        )
+
+        # FK violation raises IntegrityError
+        bogus_agent_id = uuid.uuid4()
+        async with engine.connect() as conn:
+            with pytest.raises(IntegrityError, match="fk_proposal_holds_sender_agent_id"):
+                async with conn.begin():
+                    await conn.execute(
+                        text(
+                            "INSERT INTO proposal_holds "
+                            "(kind, proposed_by_bot_id, owner_sub, action, rationale, "
+                            "confidence, importance, impact, priority, status, "
+                            "target_fingerprint, sender_agent_id) "
+                            "VALUES ('linear_progress_update', 'test-bot', 'test-owner', "
+                            "'{}'::jsonb, 'rationale', 'low', 'low', 'low', 'low', 'pending', "
+                            "'deadbeef', :sender_agent_id)"
+                        ),
+                        {"sender_agent_id": bogus_agent_id},
+                    )
+
+    async def test_tech_6668_migration_upgrade_and_downgrade_cleanly(
+        self, engine: AsyncEngine, database_url: str
+    ) -> None:
+        """TECH-6668: verify migrations c74fb78c66e4 and ef3600cf1d37 downgrade
+        and upgrade cleanly."""
+        env = {**os.environ, "DATABASE_URL": database_url.replace("+asyncpg", "")}
+        try:
+            # Downgrade from head (ef3600cf1d37) to c74fb78c66e4 (step 1)
+            res_down1 = subprocess.run(
+                [sys.executable, "-m", "alembic", "downgrade", "c74fb78c66e4"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert res_down1.returncode == 0, res_down1.stderr
+            cols_mid = await _columns(engine, "proposal_holds")
+            assert "sender_agent_id" in cols_mid
+
+            # Downgrade to 44da57c6d9b9 (step 2)
+            res_down2 = subprocess.run(
+                [sys.executable, "-m", "alembic", "downgrade", "44da57c6d9b9"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert res_down2.returncode == 0, res_down2.stderr
+            cols_after_down = await _columns(engine, "proposal_holds")
+            assert "sender_agent_id" not in cols_after_down
+        finally:
+            # Upgrade back to head so subsequent tests have full schema
+            res_up = subprocess.run(
+                [sys.executable, "-m", "alembic", "upgrade", "head"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert res_up.returncode == 0, res_up.stderr
+        cols_after_up = await _columns(engine, "proposal_holds")
+        assert "sender_agent_id" in cols_after_up
 
     async def test_decision_consistency_check_constraint_rejects_pending_with_decision(
         self, engine: AsyncEngine

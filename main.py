@@ -52,7 +52,11 @@ from observability import (
     log_user_active,
 )
 from plugins import validate_configuration as validate_plugin_configuration
-from providers.comms import ResourceSubscribeDeniedError, authorize_resource_subscribe, comms_server
+from providers.comms import (
+    ResourceSubscribeDeniedError,
+    authorize_resource_subscribe,
+    comms_server,
+)
 from providers.proposals import proposals_server
 from scopes import (
     PROPOSAL_SUBMIT_SCOPE,
@@ -1029,11 +1033,22 @@ async def submit_proposal(request: Request) -> Response:
     except ValueError as exc:
         return JSONResponse({"error": "invalid_request", "detail": str(exc)}, status_code=422)
 
-    owner_sub = service.resolve_proposal_owner_sub(bot_token)
-    if owner_sub is None:
-        async with get_session_factory()() as session:
-            agent = await service.get_agent_by_sub(session, bot_sub)
-        owner_sub = agent.owner_sub if agent is not None else None
+    agent_key = body.get("agent_key")
+    if agent_key is not None and not isinstance(agent_key, str):
+        return JSONResponse(
+            {"error": "invalid_request", "detail": "agent_key must be a string"},
+            status_code=422,
+        )
+
+    token_owner_sub = service.resolve_proposal_owner_sub(bot_token)
+    async with get_session_factory()() as session:
+        agent, owner_sub = await service.resolve_proposal_agent_and_owner(
+            session,
+            bot_sub=bot_sub,
+            agent_key=agent_key,
+            token_owner_sub=token_owner_sub,
+        )
+
     if owner_sub is None:
         return JSONResponse(
             {
@@ -1060,6 +1075,7 @@ async def submit_proposal(request: Request) -> Response:
                 impact=impact,
                 judge=plugins.get_proposal_judge(),
                 target_fingerprint=target_fingerprint,
+                sender_agent_id=agent.id if agent else None,
             )
         except RateLimitExceededError as exc:
             # TECH-5875: rejection is operationally visible via this WARNING
