@@ -9440,10 +9440,12 @@ async def resolve_inbox_target(
     sub: str,
     target_agent_id: uuid.UUID,
 ) -> Agent:
-    """Resolve ``target_agent_id`` for a self-or-sibling inbox read (TECH-5903).
+    """Resolve ``target_agent_id`` for a self-or-sibling resource read (TECH-5903, TECH-6697).
 
     Public service entry point for the ``comms://agents/{agent_id}/inbox``
-    resource (``providers.comms.agent_inbox_resource``): the resource layer
+    and ``comms://agents/{agent_id}/conversations/{conversation_id}``
+    resources (``providers.comms.agent_inbox_resource``,
+    ``providers.comms.agent_conversation_resource``): the resource layer
     must not reach into ``_find_agent_by_id`` (private) or raise
     ``AccessDeniedError`` directly itself, since neither path writes the
     ``audit_log`` row DESIGN.md §5 requires for every denial — this

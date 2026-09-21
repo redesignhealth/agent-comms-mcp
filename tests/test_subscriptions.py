@@ -1340,6 +1340,317 @@ class TestSubscribeAuthorization:
                 with pytest.raises(McpError, match=re.escape("access_denied")):
                     await client.session.subscribe_resource(AnyUrl(uri))
 
+    async def test_sibling_inbox_subscribe_succeeds_when_bare_unregistered(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        session: AsyncSession,
+    ) -> None:
+        base_sub = "inbox-unreg-bare"
+        token = _token(base_sub)
+        # Register sibling ONLY (bare is never registered)
+        await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {
+                "display_name": "Claude Code Sibling",
+                "accepted_types": sorted(MESSAGE_TYPES),
+                "agent_key": "claude-code",
+            },
+        )
+        list_res = await _call(main, test_session_factory, token, "comms_list_agents")
+        sibling_id = next(
+            a["agent_id"] for a in list_res["agents"] if a["sub"] == f"{base_sub}::claude-code"
+        )
+        uri = f"comms://comms/agents/{sibling_id}/inbox"
+
+        with (
+            _OIDC_PATCH,
+            _ENV_PATCH,
+            patch("providers.comms.get_access_token", return_value=token),
+            patch("providers.comms.get_session_factory", return_value=test_session_factory),
+            patch("main.get_session_factory", return_value=test_session_factory),
+        ):
+            async with Client(main.mcp) as client:
+                await client.session.subscribe_resource(AnyUrl(uri))
+
+        # Check audit row: agent_id is the target sibling (TECH-6697 revisit of Argus round-2)
+        audit_row = (
+            await session.execute(
+                text(
+                    "SELECT agent_id FROM audit_log "
+                    "WHERE action = 'resource.subscribe' "
+                    "AND actor_sub = :actor_sub "
+                    "ORDER BY id DESC LIMIT 1"
+                ),
+                {"actor_sub": base_sub},
+            )
+        ).scalar_one()
+        assert str(audit_row) == sibling_id
+
+    async def test_sibling_inbox_subscribe_succeeds_when_bare_suspended(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        base_sub = "inbox-susp-bare"
+        token = _token(base_sub)
+        registered = await _register(main, test_session_factory, base_sub)
+        bare_id = registered["agent_id"]
+        await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {
+                "display_name": "Active Sibling",
+                "accepted_types": sorted(MESSAGE_TYPES),
+                "agent_key": "worker",
+                "confirm_new_identity": True,
+            },
+        )
+        admin_token = _token("admin-operator", scopes=["comms:read", "comms:write", "comms:admin"])
+        await _call(
+            main,
+            test_session_factory,
+            admin_token,
+            "comms_deregister_agent",
+            {"agent_id": bare_id},
+        )
+
+        list_res = await _call(main, test_session_factory, token, "comms_list_agents")
+        sibling_id = next(
+            a["agent_id"] for a in list_res["agents"] if a["sub"] == f"{base_sub}::worker"
+        )
+        uri = f"comms://comms/agents/{sibling_id}/inbox"
+
+        with (
+            _OIDC_PATCH,
+            _ENV_PATCH,
+            patch("providers.comms.get_access_token", return_value=token),
+            patch("providers.comms.get_session_factory", return_value=test_session_factory),
+            patch("main.get_session_factory", return_value=test_session_factory),
+        ):
+            async with Client(main.mcp) as client:
+                await client.session.subscribe_resource(AnyUrl(uri))
+
+    async def test_sibling_agent_conversation_subscribe_succeeds_and_charges_sibling(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        session: AsyncSession,
+    ) -> None:
+        base_sub = "conv-sub-sib-bare"
+        token = _token(base_sub)
+        await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {
+                "display_name": "Claude Code Sibling",
+                "accepted_types": sorted(MESSAGE_TYPES),
+                "agent_key": "claude-code",
+            },
+        )
+        await _register(main, test_session_factory, "conv-sub-counter")
+        counter_token = _token("conv-sub-counter")
+
+        list_res = await _call(main, test_session_factory, token, "comms_list_agents")
+        sibling_id = next(
+            a["agent_id"] for a in list_res["agents"] if a["sub"] == f"{base_sub}::claude-code"
+        )
+
+        started = await _call(
+            main,
+            test_session_factory,
+            counter_token,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [sibling_id],
+                "initial_message": _availability_request(),
+            },
+        )
+        conv_id = started["conversation_id"]
+
+        await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_accept",
+            {"conversation_id": conv_id, "agent_key": "claude-code"},
+        )
+
+        uri = f"comms://comms/agents/{sibling_id}/conversations/{conv_id}"
+        with (
+            _OIDC_PATCH,
+            _ENV_PATCH,
+            patch("providers.comms.get_access_token", return_value=token),
+            patch("providers.comms.get_session_factory", return_value=test_session_factory),
+            patch("main.get_session_factory", return_value=test_session_factory),
+        ):
+            async with Client(main.mcp) as client:
+                await client.session.subscribe_resource(AnyUrl(uri))
+
+        # Check audit row: agent_id is the sibling agent (charged to sibling)
+        audit_row = (
+            await session.execute(
+                text(
+                    "SELECT agent_id FROM audit_log "
+                    "WHERE action = 'resource.subscribe' "
+                    "AND actor_sub = :actor_sub "
+                    "ORDER BY id DESC LIMIT 1"
+                ),
+                {"actor_sub": base_sub},
+            )
+        ).scalar_one()
+        assert str(audit_row) == sibling_id
+
+    async def test_agent_conversation_subscribe_stranger_agent_id_denied(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        conv_id, ids = await _start_open_conversation(
+            main, test_session_factory, "agent-sub-owner", "agent-sub-member"
+        )
+        member_id = ids["agent-sub-member"]
+        await _register(main, test_session_factory, "agent-sub-stranger")
+        stranger_token = _token("agent-sub-stranger")
+
+        uri = f"comms://comms/agents/{member_id}/conversations/{conv_id}"
+        with (
+            _OIDC_PATCH,
+            _ENV_PATCH,
+            patch("providers.comms.get_access_token", return_value=stranger_token),
+            patch("providers.comms.get_session_factory", return_value=test_session_factory),
+            patch("main.get_session_factory", return_value=test_session_factory),
+        ):
+            async with Client(main.mcp) as client:
+                with pytest.raises(McpError, match=re.escape("access_denied")):
+                    await client.session.subscribe_resource(AnyUrl(uri))
+
+    async def test_agent_conversation_subscribe_invited_sibling_denied(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        base_sub = "conv-sub-inv-sib"
+        token = _token(base_sub)
+        await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {
+                "display_name": "Invited Sibling",
+                "accepted_types": sorted(MESSAGE_TYPES),
+                "agent_key": "worker",
+            },
+        )
+        await _register(main, test_session_factory, "conv-sub-inv-counter")
+        counter_token = _token("conv-sub-inv-counter")
+
+        list_res = await _call(main, test_session_factory, token, "comms_list_agents")
+        sibling_id = next(
+            a["agent_id"] for a in list_res["agents"] if a["sub"] == f"{base_sub}::worker"
+        )
+
+        started = await _call(
+            main,
+            test_session_factory,
+            counter_token,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [sibling_id],
+                "initial_message": _availability_request(),
+            },
+        )
+        conv_id = started["conversation_id"]
+        # Do NOT accept invite -- sibling is invited only
+
+        uri = f"comms://comms/agents/{sibling_id}/conversations/{conv_id}"
+        with (
+            _OIDC_PATCH,
+            _ENV_PATCH,
+            patch("providers.comms.get_access_token", return_value=token),
+            patch("providers.comms.get_session_factory", return_value=test_session_factory),
+            patch("main.get_session_factory", return_value=test_session_factory),
+        ):
+            async with Client(main.mcp) as client:
+                with pytest.raises(McpError, match=re.escape("access_denied")):
+                    await client.session.subscribe_resource(AnyUrl(uri))
+
+    async def test_plain_conversation_subscribe_does_not_fallback_to_sibling(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Regression guard: bare comms://comms/conversations/{conv_id} strictly
+        requires bare base_sub to be registered/active, no fallback."""
+        base_sub = "conv-sub-nf-bare"
+        token = _token(base_sub)
+        await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {
+                "display_name": "Active Sibling",
+                "accepted_types": sorted(MESSAGE_TYPES),
+                "agent_key": "worker",
+            },
+        )
+        await _register(main, test_session_factory, "conv-sub-nf-counter")
+        counter_token = _token("conv-sub-nf-counter")
+
+        list_res = await _call(main, test_session_factory, token, "comms_list_agents")
+        sibling_id = next(
+            a["agent_id"] for a in list_res["agents"] if a["sub"] == f"{base_sub}::worker"
+        )
+
+        started = await _call(
+            main,
+            test_session_factory,
+            counter_token,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [sibling_id],
+                "initial_message": _availability_request(),
+            },
+        )
+        conv_id = started["conversation_id"]
+
+        await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_accept",
+            {"conversation_id": conv_id, "agent_key": "worker"},
+        )
+
+        # Plain conversation subscribe fails because bare identity is not registered
+        uri = f"comms://comms/conversations/{conv_id}"
+        with (
+            _OIDC_PATCH,
+            _ENV_PATCH,
+            patch("providers.comms.get_access_token", return_value=token),
+            patch("providers.comms.get_session_factory", return_value=test_session_factory),
+            patch("main.get_session_factory", return_value=test_session_factory),
+        ):
+            async with Client(main.mcp) as client:
+                with pytest.raises(McpError, match=re.escape("access_denied")):
+                    await client.session.subscribe_resource(AnyUrl(uri))
+
+        # Explicit agent-qualified subscribe succeeds
+        agent_uri = f"comms://comms/agents/{sibling_id}/conversations/{conv_id}"
+        with (
+            _OIDC_PATCH,
+            _ENV_PATCH,
+            patch("providers.comms.get_access_token", return_value=token),
+            patch("providers.comms.get_session_factory", return_value=test_session_factory),
+            patch("main.get_session_factory", return_value=test_session_factory),
+        ):
+            async with Client(main.mcp) as client:
+                await client.session.subscribe_resource(AnyUrl(agent_uri))
+
 
 class TestNotificationFiring:
     # See TestSubscribeAuthorization's comment on why this is scoped here
@@ -1482,6 +1793,85 @@ class TestNotificationFiring:
             )
 
             await _wait_until(lambda: uri in collector.uris)
+
+    async def test_agent_conversation_subscriber_receives_notification_on_post_message(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Load-bearing test: proves identity-qualified conversation subscription
+        canonicalizes to the canonical conversation URI and charges the sibling agent_id,
+        so notify_conversation_event's recipient_filter (active participant agent_ids)
+        allows notification delivery and the ping arrives."""
+        base_sub = "notify-agent-sub"
+        token = _token(base_sub)
+        # Register sibling ONLY (bare is unregistered)
+        await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {
+                "display_name": "Agent Subscriber",
+                "accepted_types": sorted(MESSAGE_TYPES),
+                "agent_key": "worker",
+            },
+        )
+        await _register(main, test_session_factory, "notify-agent-owner")
+        owner_token = _token("notify-agent-owner")
+
+        list_res = await _call(main, test_session_factory, token, "comms_list_agents")
+        sibling_id = next(
+            a["agent_id"] for a in list_res["agents"] if a["sub"] == f"{base_sub}::worker"
+        )
+
+        started = await _call(
+            main,
+            test_session_factory,
+            owner_token,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [sibling_id],
+                "initial_message": _availability_request(),
+            },
+        )
+        conv_id = started["conversation_id"]
+
+        await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_accept",
+            {"conversation_id": conv_id, "agent_key": "worker"},
+        )
+
+        sub_uri = f"comms://comms/agents/{sibling_id}/conversations/{conv_id}"
+        canonical_uri = f"comms://comms/conversations/{conv_id}"
+        collector = _NotificationCollector()
+
+        async with Client(main.mcp, message_handler=collector) as client:
+            with (
+                _OIDC_PATCH,
+                _ENV_PATCH,
+                patch("providers.comms.get_access_token", return_value=token),
+                patch("providers.comms.get_session_factory", return_value=test_session_factory),
+                patch("main.get_session_factory", return_value=test_session_factory),
+            ):
+                await client.session.subscribe_resource(AnyUrl(sub_uri))
+
+            # Counterparty posts a message
+            await _call(
+                main,
+                test_session_factory,
+                owner_token,
+                "comms_post_message",
+                {
+                    "conversation_id": conv_id,
+                    "message_type": "needs_clarification",
+                    "payload": {"about_seq": 1},
+                },
+            )
+
+            await _wait_until(lambda: canonical_uri in collector.uris)
 
     async def test_departed_subscriber_stops_receiving_conversation_notifications(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]

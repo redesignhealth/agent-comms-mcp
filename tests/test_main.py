@@ -462,6 +462,10 @@ class TestResourceScopeRegistryParity:
             "comms://comms/agents/{agent_id}/inbox is not a mounted resource "
             f"template — registration drifted. Mounted: {sorted(template_uris)}"
         )
+        assert "comms://comms/agents/{agent_id}/conversations/{conversation_id}" in template_uris, (
+            "comms://comms/agents/{agent_id}/conversations/{conversation_id} is not a mounted "
+            f"resource template — registration drifted. Mounted: {sorted(template_uris)}"
+        )
         unenrolled = [
             uri for uri in template_uris if required_scope_for_resource(_example_uri(uri)) is None
         ]
