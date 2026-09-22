@@ -3012,6 +3012,12 @@ async def authorize_resource_subscribe(
                 target = await service.resolve_inbox_target(
                     session, sub=base_sub, target_agent_id=target_agent_id
                 )
+                # Note on cap-bypass bounds (TECH-6697 Argus round-3): because
+                # `canonical_uri` is agent-agnostic while the charged identity
+                # is caller-selected, this is where cross-sibling cap spreading
+                # across conversations is possible. It is bounded by
+                # `subscriptions.MAX_SUBSCRIPTIONS_PER_SESSION` rather than by
+                # changing the charged identity.
                 try:
                     caller = await _resolve_caller_agent(
                         session, target.sub, token, include_suggestion=False
@@ -3089,6 +3095,13 @@ async def authorize_resource_subscribe(
         # own. This is inherited, accepted behavior, not a new decision made here --
         # `agent_inbox_resource` (the read path) already does the identical thing
         # when resolving an inbox's owner.
+        #
+        # Note on cap-bypass bounds (TECH-6697 Argus round-3): the round-2
+        # per-sibling charging decision stands. The cap-bypass concern is
+        # bounded here at one record per sibling (inbox URIs are per-sibling
+        # and `resolve_inbox_target` is self-or-sibling only), and the
+        # cross-identity accumulation bound across a session is enforced by
+        # `subscriptions.MAX_SUBSCRIPTIONS_PER_SESSION` instead.
         try:
             acting = await _resolve_caller_agent(session, target.sub, token)
         except ToolError:

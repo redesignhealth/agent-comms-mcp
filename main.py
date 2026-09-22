@@ -450,7 +450,7 @@ mcp.mount(proposals_server, namespace="proposals")
 
 _RESOURCE_SUBSCRIBE_DENIAL_MESSAGE = "access_denied: not authorized for this resource"
 _RESOURCE_SUBSCRIBE_LIMIT_MESSAGE = (
-    "subscription_limit_reached: too many active subscriptions for this agent"
+    "subscription_limit_reached: too many active subscriptions for this agent or session"
 )
 
 
@@ -565,7 +565,7 @@ async def _handle_subscribe_resource(uri: AnyUrl) -> None:
     #
     # If `subscribe()` succeeds and registered a NEW subscription (`record is not None`),
     # we write `resource.subscribe`. If `audit_resource_subscription` fails (or is
-    # cancelled), we roll back the in-memory registration via `remove_if_current()`
+    # cancelled), we roll back the in-memory registration via `rollback_subscribe()`
     # (matching by exact record identity so a concurrent newer subscription is
     # never destroyed) and re-raise. This maintains consistency between in-memory
     # state and the audit trail for the straightforward single-request path.
@@ -580,7 +580,7 @@ async def _handle_subscribe_resource(uri: AnyUrl) -> None:
     # the second request to acquire `_lock` sees `removed_existing=True` and
     # returns `None` (treated as an unaudited idempotent re-subscribe), while
     # installing its own new record instance. If the first request's audit write
-    # subsequently fails, its `remove_if_current()` call correctly no-ops
+    # subsequently fails, its `rollback_subscribe()` call correctly no-ops
     # because its record is no longer current. However, the second request's
     # replacement record remains live in memory without an audit row. Closing
     # this would require auditing idempotent re-subscribes (spamming the audit
@@ -588,10 +588,10 @@ async def _handle_subscribe_resource(uri: AnyUrl) -> None:
     # replaced record instances; this narrow race under concurrent identical
     # requests is an accepted, documented design tradeoff.
     try:
-        record = await subscriptions.subscribe(
+        result = await subscriptions.subscribe(
             auth.canonical_uri, session, agent_id=auth.caller.id, sub=auth.base_sub
         )
-    except subscriptions.SubscriptionLimitError:
+    except subscriptions.SubscriptionLimitError as exc:
         async with get_session_factory()() as db_session:
             with contextlib.suppress(AccessDeniedError):
                 await service.deny_resource_subscribe(
@@ -600,7 +600,7 @@ async def _handle_subscribe_resource(uri: AnyUrl) -> None:
                     action="denied.subscribe_limit_reached",
                     agent_id=auth.caller.id,
                     conversation_id=auth.conversation_id,
-                    detail={"limit": subscriptions.MAX_SUBSCRIPTIONS_PER_AGENT},
+                    detail={"limit": exc.limit, "scope": exc.scope},
                 )
         logger.warning(
             "subscription limit reached during subscribe for agent %s on uri %r",
@@ -609,6 +609,7 @@ async def _handle_subscribe_resource(uri: AnyUrl) -> None:
         )
         _deny_subscription_limit()
 
+    record = result.record
     if record is not None:
         try:
             async with get_session_factory()() as db_session:
@@ -630,8 +631,15 @@ async def _handle_subscribe_resource(uri: AnyUrl) -> None:
                     replaced_agent_id=record.replaced_agent_id,
                 )
         except (Exception, asyncio.CancelledError):
-            # Roll back in-memory registration on audit failure (best-effort reconciliation).
-            await subscriptions.remove_if_current(auth.canonical_uri, record)
+            # Restore the pre-subscribe state exactly: drop this record AND
+            # re-insert the sibling identity's record this call displaced
+            # (TECH-6697 -- without `restore=`, an identity-replacement
+            # subscribe whose audit write fails left the slot EMPTY,
+            # silently destroying the displaced sibling's valid, already-
+            # audited subscription with no audit trail of the loss).
+            await subscriptions.rollback_subscribe(
+                auth.canonical_uri, record, restore=result.displaced
+            )
             raise
 
 

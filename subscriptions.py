@@ -25,7 +25,8 @@ contract is the client's catch-up read via
 snapshot capped at 100 items).
 
 Cap and prune bookkeeping: the per-agent subscription cap
-(``MAX_SUBSCRIPTIONS_PER_AGENT``) now rejects with ``SubscriptionLimitError``
+(``MAX_SUBSCRIPTIONS_PER_AGENT``) and per-session cap
+(``MAX_SUBSCRIPTIONS_PER_SESSION``) now reject with ``SubscriptionLimitError``
 rather than silently evicting. Pruning is restricted to definitive session death
 (``anyio.ClosedResourceError``, ``anyio.BrokenResourceError``) or dead weakrefs;
 transient send errors or slow consumer timeouts do not prune the subscription.
@@ -43,6 +44,7 @@ import uuid
 import weakref
 from collections.abc import Collection, Iterable
 from dataclasses import dataclass
+from typing import Literal
 
 import anyio
 from mcp.server.session import ServerSession
@@ -54,11 +56,33 @@ logger = logging.getLogger(__name__)
 # send (e.g. its session is still open but it stopped calling tools) would
 # otherwise be able to accumulate unbounded stale records.
 MAX_SUBSCRIPTIONS_PER_AGENT = 100
+
+# Companion bound to MAX_SUBSCRIPTIONS_PER_AGENT (TECH-6697 Argus round-3):
+# the per-agent cap is keyed on board identity, and a single token may hold
+# many sibling identities (DESIGN.md §5), each with its own counter bucket.
+# Because the agent-qualified conversation URI canonicalizes to an
+# AGENT-AGNOSTIC key, one session can choose which sibling to charge each
+# conversation subscription to and thereby hold N * MAX_SUBSCRIPTIONS_PER_AGENT
+# live records. This cap bounds what the per-agent cap cannot: how many live
+# subscriptions ONE session may hold, regardless of identity. The two are
+# complementary -- per-agent bounds accumulation across sessions on one
+# identity; per-session bounds accumulation across identities in one session.
+#
+# Residual gap, accepted: one *token* opening many MCP sessions still
+# accumulates sessions * MAX_SUBSCRIPTIONS_PER_SESSION records -- but each
+# session is separately bounded, and the registry is ephemeral per process.
+# Closing that would need token-keyed accounting, out of scope for this round.
+MAX_SUBSCRIPTIONS_PER_SESSION = 100
 NOTIFY_SEND_TIMEOUT_SECONDS = 2.0
 
 
 class SubscriptionLimitError(Exception):
-    """``agent_id`` already holds ``MAX_SUBSCRIPTIONS_PER_AGENT`` live subscriptions."""
+    """A subscription cap (per-agent or per-session) is already exhausted."""
+
+    def __init__(self, message: str, *, limit: int, scope: Literal["agent", "session"]) -> None:
+        super().__init__(message)
+        self.limit = limit
+        self.scope = scope
 
 
 _CONVERSATION_URI_TEMPLATE = "comms://comms/conversations/{conversation_id}"
@@ -85,6 +109,22 @@ class _Record:
     # to this record's own ``agent_id``. ``None`` for a brand-new
     # subscription or an idempotent same-identity re-subscribe.
     replaced_agent_id: uuid.UUID | None = None
+
+
+@dataclass(frozen=True)
+class SubscribeResult:
+    """Outcome of a ``subscribe()`` call.
+
+    ``record`` is the newly-registered ``_Record``, or ``None`` for an
+    idempotent same-identity re-subscribe (caller writes no audit row).
+    ``displaced`` is the record this call evicted from the ``(uri, session)``
+    slot, set ONLY on an identity replacement -- the caller must hand it
+    back to ``rollback_subscribe`` so a failed audit write restores the
+    pre-subscribe state exactly, rather than leaving the slot empty.
+    """
+
+    record: _Record | None
+    displaced: _Record | None
 
 
 _registry: dict[str, list[_Record]] = {}
@@ -131,16 +171,31 @@ def _reclaim_dead_for_agent_locked(agent_id: uuid.UUID) -> None:
         _agent_subscription_counts.pop(agent_id, None)
 
 
+def _count_for_session_locked(session: ServerSession) -> int:
+    """Live record count for ``session``. Caller must hold ``_lock``.
+
+    Needs no dead-weakref reclamation (unlike the per-agent path): the caller
+    holds a strong reference to ``session``, so every record matching it is by
+    definition live. Computed by scan rather than a parallel counter dict --
+    subscribe is a low-frequency, connect-time operation, and this module has
+    already burned several BLOCKING rounds on counter/registry divergence;
+    adding a fifth mutation site to keep in sync is not worth the microseconds.
+    """
+    return sum(1 for records in _registry.values() for r in records if r.session_ref() is session)
+
+
 async def subscribe(
     uri: str, session: ServerSession, *, agent_id: uuid.UUID, sub: str
-) -> _Record | None:
+) -> SubscribeResult:
     """Register ``session`` as a subscriber of ``uri``.
 
     Idempotent per ``(uri, session)`` — re-subscribing the same session to
     the same URI replaces its record rather than duplicating it. Returns
-    the created ``_Record`` instance if a new subscription was added, or
-    ``None`` if this was an idempotent re-subscription for an existing
-    ``(uri, session)`` under the SAME ``agent_id`` as before.
+    a ``SubscribeResult`` with ``record`` set to the created ``_Record``
+    instance if a new subscription was added, or ``record=None`` if this was
+    an idempotent re-subscription for an existing ``(uri, session)`` under the
+    SAME ``agent_id`` as before. On an identity replacement, ``displaced``
+    carries the evicted record for rollback restoration.
 
     TECH-6697 identity-replacement fix: a caller-supplied ``agent_id`` need
     not match the ``agent_id`` recorded for this exact ``(uri, session)``
@@ -152,72 +207,79 @@ async def subscribe(
     canonicalize to the identical registry key). Two cases:
 
     - Same identity (``agent_id`` unchanged): idempotent, as documented
-      above -- the existing record's count is decremented then immediately
-      re-incremented below (net no-op), and this returns ``None``.
+      above -- net-zero change to ``agent_id``'s count, and this returns
+      ``SubscribeResult(record=None, displaced=None)``.
     - Different identity (``agent_id`` changed): this is an identity
       REPLACEMENT, not a routine idempotent re-subscribe. The OLD record's
       own ``agent_id`` (the one actually being replaced) is decremented --
       never the new, caller-supplied ``agent_id`` -- so per-agent cap
       bookkeeping stays correct for both identities. The cap check and
       increment below still apply to the NEW ``agent_id`` being charged.
-      This returns the new ``_Record``, with its ``replaced_agent_id``
-      field set to the old identity, so callers (``main.py``) can audit
-      the switch as a distinct, security-relevant event rather than
-      silently dropping it as an idempotent no-op.
+      This returns ``SubscribeResult(record=new_record, displaced=displaced)``,
+      with ``new_record.replaced_agent_id`` set to the old identity, so
+      callers (``main.py``) can audit the switch as a distinct,
+      security-relevant event rather than silently dropping it as an
+      idempotent no-op.
 
     If ``agent_id`` already holds ``MAX_SUBSCRIPTIONS_PER_AGENT`` live
     subscriptions after reclaiming any dead sessions, raises
-    ``SubscriptionLimitError`` — the cap now rejects rather than evicting.
+    ``SubscriptionLimitError(scope="agent")``. If ``session`` already holds
+    ``MAX_SUBSCRIPTIONS_PER_SESSION`` live subscriptions when adding a new
+    record, raises ``SubscriptionLimitError(scope="session")``.
     """
     async with _lock:
-        records = _registry.setdefault(uri, [])
-        before = len(records)
-        existing_for_session = next((r for r in records if r.session_ref() is session), None)
-        records[:] = [r for r in records if r.session_ref() is not session]
-        # Idempotent re-subscribe (same uri, same session): the filter above
-        # just dropped this session's existing record. Without decrementing
-        # here, the unconditional increment below double-counts it against
-        # `agent_id` -- Argus round-2 BLOCKING catch (a caller re-subscribing
-        # to the same URI N times would inflate its count by N, eventually
-        # tripping the cap on a genuinely idempotent no-op).
-        #
-        # TECH-6697 BLOCKING catch: decrement the REMOVED record's own
-        # `agent_id` (`existing_for_session.agent_id`), not the new,
-        # caller-supplied `agent_id` parameter -- those two can now differ
-        # (identity replacement, see docstring above). Decrementing the
-        # wrong identity here either leaks a stale count on the identity
-        # actually being replaced (it's never decremented) or corrupts an
-        # unrelated identity's count (if the new `agent_id` happens to have
-        # its own real subscriptions elsewhere), letting a caller bypass
-        # the cap by alternating sibling identities on the same session.
-        removed_existing = len(records) < before
-        replaced_agent_id: uuid.UUID | None = None
-        if removed_existing:
-            assert existing_for_session is not None
-            _dec_count(existing_for_session.agent_id)
-            if existing_for_session.agent_id != agent_id:
-                replaced_agent_id = existing_for_session.agent_id
+        # Non-mutating lookup FIRST -- use .get(), not .setdefault(), so a
+        # rejected call never leaves a spurious empty list under `uri`.
+        records = _registry.get(uri)
+        existing = (
+            next((r for r in records if r.session_ref() is session), None) if records else None
+        )
+        # A same-identity replacement nets zero change to `agent_id`'s count,
+        # so its own cap must never block it (documented no-op, see docstring).
+        same_identity = existing is not None and existing.agent_id == agent_id
 
-        # Optimization (TECH-6335): only perform the full O(total subscriptions)
-        # scan when the agent's tracked count is actually at or above the cap.
-        # When strictly below cap, trust the tracked count and skip the scan.
+        # Optimization (TECH-6335) -- unchanged, and deliberately NOT gated on
+        # `same_identity`: the recompute-from-ground-truth self-heal of a
+        # diverged count must still run on the idempotent path.
         if _agent_subscription_counts.get(agent_id, 0) >= MAX_SUBSCRIPTIONS_PER_AGENT:
             _reclaim_dead_for_agent_locked(agent_id)
-
-        if _agent_subscription_counts.get(agent_id, 0) >= MAX_SUBSCRIPTIONS_PER_AGENT:
-            if not records:
-                _registry.pop(uri, None)
+        if (
+            not same_identity
+            and _agent_subscription_counts.get(agent_id, 0) >= MAX_SUBSCRIPTIONS_PER_AGENT
+        ):
             raise SubscriptionLimitError(
-                f"agent {agent_id} already holds {MAX_SUBSCRIPTIONS_PER_AGENT} subscriptions"
+                f"agent {agent_id} already holds {MAX_SUBSCRIPTIONS_PER_AGENT} subscriptions",
+                limit=MAX_SUBSCRIPTIONS_PER_AGENT,
+                scope="agent",
             )
 
-        records = _registry.setdefault(uri, [])
+        # Per-session cap (Finding 3) -- only when a record is genuinely ADDED.
+        # Any replacement (same or different identity) is net-zero for the session.
+        if existing is None and _count_for_session_locked(session) >= MAX_SUBSCRIPTIONS_PER_SESSION:
+            raise SubscriptionLimitError(
+                f"session already holds {MAX_SUBSCRIPTIONS_PER_SESSION} subscriptions",
+                limit=MAX_SUBSCRIPTIONS_PER_SESSION,
+                scope="session",
+            )
+
+        # ---- no caller-visible mutation above this line ----
+        records = _registry.setdefault(uri, [])  # re-fetch: reclaim may have popped `uri`
+        displaced: _Record | None = None
+        replaced_agent_id: uuid.UUID | None = None
+        if existing is not None:
+            records[:] = [r for r in records if r.session_ref() is not session]
+            _dec_count(existing.agent_id)
+            if existing.agent_id != agent_id:
+                replaced_agent_id = existing.agent_id
+                displaced = existing
+
         new_record = _Record(weakref.ref(session), agent_id, sub, replaced_agent_id)
         records.append(new_record)
         _agent_subscription_counts[agent_id] = _agent_subscription_counts.get(agent_id, 0) + 1
-        if removed_existing and replaced_agent_id is None:
-            return None
-        return new_record
+
+        if existing is not None and replaced_agent_id is None:
+            return SubscribeResult(record=None, displaced=None)  # idempotent no-op
+        return SubscribeResult(record=new_record, displaced=displaced)
 
 
 async def is_subscribed(uri: str, session: ServerSession) -> bool:
@@ -270,22 +332,27 @@ async def unsubscribe(uri: str, session: ServerSession) -> bool:
         return removed
 
 
-async def remove_if_current(uri: str, record: _Record) -> bool:
-    """Remove ``record`` from ``uri``'s subscribers only if it is still the current record.
+async def rollback_subscribe(uri: str, record: _Record, *, restore: _Record | None = None) -> bool:
+    """Undo a ``subscribe()`` whose caller-side audit write failed.
 
-    Used by ``main.py``'s subscribe rollback on audit failure (TECH-6335): if
-    another coroutine or client re-subscribe has since replaced or removed this
-    exact record, this is a no-op returning ``False``, avoiding accidentally
-    destroying a newer, valid subscription.
+    Atomic (single ``_lock`` acquisition) and idempotent. Contract:
 
-    Note on known residual race: if two concurrent subscribe requests for the
-    same ``(uri, session)`` race, the second may replace the first with a new
-    record instance and return ``None`` (treated as an unaudited re-subscribe).
-    If the first request's audit write then fails, its rollback will no-op here,
-    leaving the second's replacement record live without an audit row. This narrow
-    race is documented and accepted in ``main.py`` to avoid auditing routine re-subscribes.
+    - If ``record`` is no longer the registered record for ``uri`` (identity
+      comparison, ``r is record``), this is a complete no-op returning
+      ``False`` -- a concurrent subscribe has since taken ownership of this
+      ``(uri, session)`` slot and is authoritative. ``restore`` is
+      deliberately NOT re-inserted in that case: doing so would leave TWO
+      records for one ``(uri, session)``, breaking the registry's
+      one-record-per-slot invariant (duplicate notify sends, leaked count).
+      This is the same "only if still current" guard the pre-TECH-6697
+      ``remove_if_current`` documented, extended to the restore half.
+    - Otherwise ``record`` is removed and its agent decremented; then, if
+      ``restore`` is given AND its session is still alive, it is re-inserted
+      and its agent re-incremented.
 
-    Returns ``True`` if ``record`` was still registered and removed, ``False`` otherwise.
+    No cap check on the restore path: ``restore``'s count was decremented by
+    the very ``subscribe()`` call being undone, so re-incrementing merely
+    returns it to its previously-valid value. Do not "fix" this by adding one.
     """
     async with _lock:
         records = _registry.get(uri)
@@ -299,11 +366,20 @@ async def remove_if_current(uri: str, record: _Record) -> bool:
                 removed = True
                 continue
             remaining.append(r)
+        if not removed:
+            return False
+
+        if restore is not None and restore.session_ref() is not None:
+            remaining.append(restore)
+            _agent_subscription_counts[restore.agent_id] = (
+                _agent_subscription_counts.get(restore.agent_id, 0) + 1
+            )
+
         if remaining:
             _registry[uri] = remaining
         else:
             _registry.pop(uri, None)
-        return removed
+        return True
 
 
 async def notify(uri: str, *, recipient_filter: Collection[uuid.UUID] | None = None) -> None:
