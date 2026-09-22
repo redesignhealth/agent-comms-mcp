@@ -9440,10 +9440,12 @@ async def resolve_inbox_target(
     sub: str,
     target_agent_id: uuid.UUID,
 ) -> Agent:
-    """Resolve ``target_agent_id`` for a self-or-sibling inbox read (TECH-5903).
+    """Resolve ``target_agent_id`` for a self-or-sibling resource read (TECH-5903, TECH-6697).
 
     Public service entry point for the ``comms://agents/{agent_id}/inbox``
-    resource (``providers.comms.agent_inbox_resource``): the resource layer
+    and ``comms://agents/{agent_id}/conversations/{conversation_id}``
+    resources (``providers.comms.agent_inbox_resource``,
+    ``providers.comms.agent_conversation_resource``): the resource layer
     must not reach into ``_find_agent_by_id`` (private) or raise
     ``AccessDeniedError`` directly itself, since neither path writes the
     ``audit_log`` row DESIGN.md §5 requires for every denial — this
@@ -9567,6 +9569,7 @@ async def audit_resource_subscription(
     action: str,
     uri: str,
     conversation_id: uuid.UUID | None = None,
+    replaced_agent_id: uuid.UUID | None = None,
 ) -> None:
     """Audit + commit a successful ``resource.subscribe``/``resource.unsubscribe``
     (TECH-5903 Phase B). Unlike every other tool/resource call, the low-level
@@ -9578,6 +9581,15 @@ async def audit_resource_subscription(
     threads through onto the audit row for parity with ``deny_resource_subscribe``
     (Argus round-2 SUGGESTION) -- omitted (``None``) for inbox URIs, which
     have no conversation to attribute.
+
+    ``replaced_agent_id``, when set (TECH-6697 identity-replacement fix),
+    is the ``agent_id`` this subscription just replaced for the same
+    underlying session -- i.e. this session switched which board identity
+    it subscribes as for this exact ``(uri, session)`` slot (see
+    ``subscriptions.subscribe``'s docstring). This is a security-relevant
+    event, so a SECOND, distinct ``resource.subscribe_identity_replaced``
+    audit row is staged alongside the normal one rather than folding it
+    silently into the ordinary subscribe row's detail.
     """
     _audit(
         session,
@@ -9587,6 +9599,15 @@ async def audit_resource_subscription(
         conversation_id=conversation_id,
         detail={"uri": uri},
     )
+    if replaced_agent_id is not None:
+        _audit(
+            session,
+            actor_sub=actor_sub,
+            action="resource.subscribe_identity_replaced",
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            detail={"uri": uri, "previous_agent_id": str(replaced_agent_id)},
+        )
     await session.commit()
 
 
