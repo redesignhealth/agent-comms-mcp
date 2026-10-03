@@ -472,6 +472,15 @@ def _classify_response(
             log_detail=None,
             indeterminate=False,
         )
+    indeterminate = bool(body.get("indeterminate", False))
+    if indeterminate:
+        return _DISPOSITION_AMBIGUOUS, ProposalApplyOutcome(
+            applied=False,
+            result=None,
+            caller_error=caller_error or "apply indeterminate",
+            log_detail=f"proposal apply outcome was indeterminate: {caller_error}",
+            indeterminate=True,
+        )
     return _DISPOSITION_DECIDED, ProposalApplyOutcome(
         applied=False,
         result=None,
