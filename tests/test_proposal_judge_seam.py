@@ -592,7 +592,7 @@ class TestSafeApplySeam:
             )
 
         _patch_transport(monkeypatch, handler)
-        http_judge = HttpApplyProposalJudge()
+        http_judge = HttpApplyProposalJudge(FakeProposalJudge())
         result = await _safe_apply(http_judge, _ctx())
         assert result.applied is False
         assert result.indeterminate is True
