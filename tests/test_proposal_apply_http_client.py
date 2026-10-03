@@ -168,6 +168,55 @@ class TestApplyProposalSuccess:
         assert outcome.caller_error == "apply failed"
         assert outcome.indeterminate is False
 
+    async def test_returns_applied_false_with_indeterminate_true_preserves_indeterminate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """TECH-7170: When approvals returns 200 with applied=false and indeterminate=true
+        (e.g. backend transport timeout), proposal_apply_http_client treats it as ambiguous,
+        preserving indeterminate=True so the hold remains at status='applying'."""
+        _set_required_env(monkeypatch)
+        monkeypatch.setenv(PROPOSAL_APPLY_MAX_ATTEMPTS_ENV_VAR, "1")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "applied": False,
+                    "caller_error": "Arcana API timeout",
+                    "indeterminate": True,
+                },
+            )
+
+        _patch_transport(monkeypatch, handler)
+        outcome = await apply_proposal(_ctx())
+        assert outcome.applied is False
+        assert outcome.indeterminate is True
+        assert "awaiting manual reconciliation" in (outcome.caller_error or "")
+        assert "Arcana API timeout" in str(outcome.log_detail)
+
+    async def test_indeterminate_false_or_missing_returns_decided_terminal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Backward compatibility: when indeterminate is explicitly false or missing,
+        applied=false is a decided terminal failure (indeterminate=False)."""
+        _set_required_env(monkeypatch)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "applied": False,
+                    "caller_error": "stale head revision",
+                    "indeterminate": False,
+                },
+            )
+
+        _patch_transport(monkeypatch, handler)
+        outcome = await apply_proposal(_ctx())
+        assert outcome.applied is False
+        assert outcome.indeterminate is False
+        assert outcome.caller_error == "stale head revision"
+
     async def test_sends_exact_request_shape_and_auth_header(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

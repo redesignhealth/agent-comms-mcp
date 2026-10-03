@@ -1300,6 +1300,64 @@ class TestDecideProposal:
         assert resubmitted["proposal_id"] == str(hold_id)
         assert resubmitted["status"] == "applying"
 
+    async def test_http_apply_indeterminate_200_response_leaves_hold_at_applying(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """TECH-7170 cross-repo contract: an approvals HTTP 200 response with
+        applied=false, indeterminate=true flows through proposal_apply_http_client
+        -> ProposalApplyOutcome(indeterminate=True) -> service.py leaving hold.status
+        at 'applying', blocking duplicate resubmissions.
+        """
+        import httpx
+
+        from proposal_apply_http_client import (
+            PROPOSAL_APPLY_MAX_ATTEMPTS_ENV_VAR,
+            PROPOSAL_APPLY_TOKEN_ENV_VAR,
+            PROPOSAL_APPLY_URL_ENV_VAR,
+            HttpApplyProposalJudge,
+        )
+        from tests.test_proposal_apply_http_client import _patch_transport
+
+        monkeypatch.setenv(PROPOSAL_APPLY_URL_ENV_VAR, "https://approvals.example.ts.net/actions")
+        monkeypatch.setenv(PROPOSAL_APPLY_TOKEN_ENV_VAR, "mock-token")
+        monkeypatch.setenv(PROPOSAL_APPLY_MAX_ATTEMPTS_ENV_VAR, "1")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "applied": False,
+                    "caller_error": "Arcana API timeout",
+                    "indeterminate": True,
+                },
+            )
+
+        _patch_transport(monkeypatch, handler)
+
+        delegate_judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+        )
+        http_judge = HttpApplyProposalJudge(delegate=delegate_judge)
+
+        submitted = await _submit(session, judge=http_judge)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        decided = await _decide(session, hold_id=hold_id, decision="approve", judge=http_judge)
+        assert decided["status"] == "applying"
+        assert decided["apply_error"] == _APPLY_ERROR_INDETERMINATE_MESSAGE
+
+        row = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        assert row.status == "applying"
+        assert row.apply_error == _APPLY_ERROR_INDETERMINATE_MESSAGE
+        assert row.applied_at is None
+        assert row.apply_result is None
+
+        # Confirm resubmission for the same dedup key remains blocked and folds into this row
+        resubmitted = await _submit(session, judge=http_judge)
+        assert resubmitted["proposal_id"] == str(hold_id)
+        assert resubmitted["status"] == "applying"
+
     async def test_cancellation_with_message_uses_message_in_raw_error_only(
         self, session: AsyncSession
     ) -> None:

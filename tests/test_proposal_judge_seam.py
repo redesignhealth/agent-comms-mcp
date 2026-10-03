@@ -562,6 +562,43 @@ class TestSafeApplySeam:
         assert result.indeterminate is True
         assert result.caller_error == "timeout after 3 attempts"
 
+    async def test_apply_http_judge_indeterminate_200_response_propagates_indeterminate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """TECH-7170: HttpApplyProposalJudge receiving approvals HTTP 200 with
+        applied=false, indeterminate=true yields indeterminate=True through _safe_apply."""
+        import httpx
+
+        from proposal_apply_http_client import (
+            PROPOSAL_APPLY_MAX_ATTEMPTS_ENV_VAR,
+            PROPOSAL_APPLY_TOKEN_ENV_VAR,
+            PROPOSAL_APPLY_URL_ENV_VAR,
+            HttpApplyProposalJudge,
+        )
+        from tests.test_proposal_apply_http_client import _patch_transport
+
+        monkeypatch.setenv(PROPOSAL_APPLY_URL_ENV_VAR, "https://approvals.example.ts.net/actions")
+        monkeypatch.setenv(PROPOSAL_APPLY_TOKEN_ENV_VAR, "mock-token")
+        monkeypatch.setenv(PROPOSAL_APPLY_MAX_ATTEMPTS_ENV_VAR, "1")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "applied": False,
+                    "caller_error": "Arcana API timeout",
+                    "indeterminate": True,
+                },
+            )
+
+        _patch_transport(monkeypatch, handler)
+        http_judge = HttpApplyProposalJudge()
+        result = await _safe_apply(http_judge, _ctx())
+        assert result.applied is False
+        assert result.indeterminate is True
+        assert result.caller_error is not None
+        assert "awaiting manual reconciliation" in result.caller_error
+
     async def test_apply_indeterminate_flag_preserved_when_caller_error_missing(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
