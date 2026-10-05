@@ -2057,7 +2057,7 @@ wrapped defensively by the board (`service._classify_proposal`/`_safe_fingerprin
 plugin, or one returning a contract-violating value (a `priority` outside
 `PROPOSAL_HOLD_LEVELS`, a non-boolean `approved` verdict, an unrecognized
 `fingerprint().status`, an `applied=True` outcome with a non-`dict` result, or a
-`ProposalTargetError.status_code` outside the allowlisted `{422, 500, 503}`), is
+`ProposalTargetError.status_code` outside the allowlisted `{403, 404, 422, 500, 503}`), is
 rejected via 422 at submission time or normalized to a safe outcome (pending status or
 `apply_failed`) rather than reaching an unhandled 500 or a DB CHECK violation. Every
 caller-facing error/detail string surfaced through this seam (`ProposalTargetError.detail`,
@@ -2073,7 +2073,7 @@ nominal `isinstance` checks against `plugins.py` classes:
    `FINGERPRINT_UNAVAILABLE`), `digest` (string when status is digest), and `error` (when status
    is unavailable); the board always reconstructs its own native `ProposalFingerprint` instance.
 3. Target errors in unavailable fingerprints (`_is_well_formed_target_error`): reads and
-   snapshots `status_code` (int in `{422, 500, 503}`), `error_code` (non-empty str <= 64 chars),
+   snapshots `status_code` (int in `{403, 404, 422, 500, 503}`), `error_code` (non-empty str <= 64 chars),
    `detail` (non-empty str), and optional `log_detail` (None or str) in a single pass to eliminate
    TOCTOU risks, and reconstructs the board's own `ProposalTargetError`. Scrubbing and truncation
    of `detail` to 500 chars happen afterward, in the caller (`_safe_fingerprint`), not in this

@@ -622,6 +622,44 @@ class TestSubmitGetWithdraw:
         with pytest.raises(ToolError, match=r"^Linear API unavailable$"):
             await _submit(main, test_session_factory, bot_sub="bot-transport-error")
 
+    async def test_fingerprint_unavailable_forbidden_raises_sanitized_tool_error(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        _default_proposal_judge: FakeProposalJudge,
+    ) -> None:
+        """TECH-7163: admission denial typed 403 raises sanitized ToolError."""
+        _default_proposal_judge.fingerprint_result = ProposalFingerprint(
+            status=FINGERPRINT_UNAVAILABLE,
+            error=ProposalTargetError(
+                status_code=403,
+                error_code="forbidden",
+                detail="bot principal is not authorized to propose",
+                log_detail="arcana admission denied: propose_scope_missing",
+            ),
+        )
+        with pytest.raises(ToolError, match=r"^bot principal is not authorized to propose$"):
+            await _submit(main, test_session_factory, bot_sub="bot-forbidden-error")
+
+    async def test_fingerprint_unavailable_not_found_raises_sanitized_tool_error(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        _default_proposal_judge: FakeProposalJudge,
+    ) -> None:
+        """TECH-7163: target not found typed 404 raises sanitized ToolError."""
+        _default_proposal_judge.fingerprint_result = ProposalFingerprint(
+            status=FINGERPRINT_UNAVAILABLE,
+            error=ProposalTargetError(
+                status_code=404,
+                error_code="not_found",
+                detail="Arcana resource not found",
+                log_detail="target source does not exist",
+            ),
+        )
+        with pytest.raises(ToolError, match=r"^Arcana resource not found$"):
+            await _submit(main, test_session_factory, bot_sub="bot-not-found-error")
+
 
 # --- list_pending / list_history -------------------------------------------------
 

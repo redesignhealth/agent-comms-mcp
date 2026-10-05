@@ -6420,7 +6420,7 @@ def _classify_proposal(judge: ProposalJudge, kind: str, action: dict[str, Any]) 
 _MISSING: object = object()  # distinguishes "attribute absent" from a legitimate None
 
 _FINGERPRINT_CONTRACT_VIOLATION_DETAIL = "unable to verify target status"
-_ALLOWED_PROPOSAL_TARGET_ERROR_STATUS_CODES: frozenset[int] = frozenset({422, 500, 503})
+_ALLOWED_PROPOSAL_TARGET_ERROR_STATUS_CODES: frozenset[int] = frozenset({403, 404, 422, 500, 503})
 _MAX_PROPOSAL_ERROR_DETAIL_LENGTH = 500
 _MAX_PROPOSAL_ERROR_CODE_LENGTH = 64
 _PROPOSAL_TRUNCATED_SUFFIX = "... [truncated]"
