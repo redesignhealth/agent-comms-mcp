@@ -1018,6 +1018,34 @@ class TestForeignStructuralStandinsTargetError:
         assert validated.detail == "action payload unprocessable"
         assert validated.log_detail is None
 
+    def test_accepts_foreign_target_error_403(self) -> None:
+        err = _ForeignTargetError(
+            status_code=403,
+            error_code="forbidden",
+            detail="bot principal is not authorized to propose",
+            log_detail="arcana admission denied",
+        )
+        validated = _is_well_formed_target_error(err)
+        assert validated is not None
+        assert validated.status_code == 403
+        assert validated.error_code == "forbidden"
+        assert validated.detail == "bot principal is not authorized to propose"
+        assert validated.log_detail == "arcana admission denied"
+
+    def test_accepts_foreign_target_error_404(self) -> None:
+        err = _ForeignTargetError(
+            status_code=404,
+            error_code="not_found",
+            detail="Arcana resource not found",
+            log_detail="source not found",
+        )
+        validated = _is_well_formed_target_error(err)
+        assert validated is not None
+        assert validated.status_code == 404
+        assert validated.error_code == "not_found"
+        assert validated.detail == "Arcana resource not found"
+        assert validated.log_detail == "source not found"
+
     @pytest.mark.parametrize(
         "bad_err",
         [

@@ -774,6 +774,58 @@ class TestSubmitProposal:
         assert resp.json()["error"] == "service_unavailable"
         assert resp.json()["detail"] == "Linear API unavailable"
 
+    async def test_fingerprint_unavailable_during_submission_returns_403_sanitized(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        _default_proposal_judge: FakeProposalJudge,
+    ) -> None:
+        """TECH-7163: admission denial typed 403 returns 403 with sanitized detail."""
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        _default_proposal_judge.fingerprint_result = ProposalFingerprint(
+            status=FINGERPRINT_UNAVAILABLE,
+            error=ProposalTargetError(
+                status_code=403,
+                error_code="forbidden",
+                detail="bot principal is not authorized to propose",
+                log_detail="arcana admission denied: propose_scope_missing",
+            ),
+        )
+        resp = await http_client.post(
+            "/proposals", json=_PROPOSAL_BODY, headers={"Authorization": "Bearer bot-token"}
+        )
+        assert resp.status_code == 403
+        assert resp.json()["error"] == "forbidden"
+        assert resp.json()["detail"] == "bot principal is not authorized to propose"
+
+    async def test_fingerprint_unavailable_during_submission_returns_404_sanitized(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        _default_proposal_judge: FakeProposalJudge,
+    ) -> None:
+        """TECH-7163: target resource not found typed 404 returns 404 with sanitized detail."""
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        _default_proposal_judge.fingerprint_result = ProposalFingerprint(
+            status=FINGERPRINT_UNAVAILABLE,
+            error=ProposalTargetError(
+                status_code=404,
+                error_code="not_found",
+                detail="Arcana resource not found",
+                log_detail="target source does not exist",
+            ),
+        )
+        resp = await http_client.post(
+            "/proposals", json=_PROPOSAL_BODY, headers={"Authorization": "Bearer bot-token"}
+        )
+        assert resp.status_code == 404
+        assert resp.json()["error"] == "not_found"
+        assert resp.json()["detail"] == "Arcana resource not found"
+
 
 class TestListPendingAuthGate:
     async def test_missing_token_returns_401(

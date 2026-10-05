@@ -1242,7 +1242,7 @@ class ProposalTargetError(NamedTuple):
     sees.
     """
 
-    status_code: int  # 422 | 500 | 503
+    status_code: int  # 403 | 404 | 422 | 500 | 503
     error_code: str  # "invalid_request" | "server_configuration_error" | ...
     detail: str
     log_detail: str | None
@@ -1326,13 +1326,13 @@ class ProposalJudge(Protocol):
       message and mapped to 422.
     - ``fingerprint()``: ``error.detail`` is capped at 500 chars (truncated
       with ``"... [truncated]"``), ``error.error_code`` is capped at 64 chars,
-      and ``error.status_code`` MUST be one of ``{422, 500, 503}`` -- any other
-      value (e.g. 404, 409, 429, all reasonable-seeming choices) is silently
+      and ``error.status_code`` MUST be one of ``{403, 404, 422, 500, 503}`` -- any other
+      value (e.g. 400, 409, 429, all reasonable-seeming choices) is silently
       replaced with a synthesized 500/``server_configuration_error`` rather
       than reaching the caller, with no signal to the plugin that this happened.
       Map LLM-API or upstream rate-limit errors to `503` (service temporarily
       unavailable), not `429`, to preserve the retryable signal within the
-      `{422, 500, 503}` allowlist.
+      `{403, 404, 422, 500, 503}` allowlist.
     - ``judge()``: ``decision_note`` is capped at 2000 chars (truncated
       with ``"... [truncated]"``).
     - ``apply()``: ``caller_error`` is capped at 500 chars (truncated
