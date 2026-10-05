@@ -181,6 +181,7 @@ RESOURCE_SCOPES: dict[str, str] = {
 # `comms://comms/conversations/<uuid>` against a template key.
 RESOURCE_TEMPLATE_SCOPES: dict[str, str] = {
     "comms://comms/conversations/{conversation_id}": "comms:read",
+    "comms://comms/agents/{agent_id}/conversations/{conversation_id}": "comms:read",
     "comms://comms/agents/{agent_id}/inbox": "comms:read",
 }
 

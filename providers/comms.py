@@ -2671,6 +2671,45 @@ async def conversation_resource(conversation_id: str) -> dict[str, Any]:
     return result
 
 
+@comms_server.resource("comms://agents/{agent_id}/conversations/{conversation_id}")
+async def agent_conversation_resource(agent_id: str, conversation_id: str) -> dict[str, Any]:
+    """Read a conversation as an explicit one of the caller's own board identities.
+
+    Self-only, same convention as `agent_inbox_resource`: `agent_id` must resolve
+    to the CALLER's own board identity (bare base sub or one of its own
+    `{base_sub}::`-prefixed siblings). Exists because `conversation_resource`
+    (the bare-identity-only variant) has no way to act as a sibling identity --
+    this is the explicit alternative, not an auto-guessing fallback.
+    """
+    async with _resource_boundary():
+        token = _require_token()
+        base_sub = _require_identity(token)
+        target_id = _parse_uuid("agent_id", agent_id)
+        conv_id = _parse_uuid("conversation_id", conversation_id)
+
+        async with get_session_factory()() as session, _map_service_errors(ResourceError):
+            # reuse: pure self-or-sibling ownership check, name aside
+            target = await service.resolve_inbox_target(
+                session,
+                sub=base_sub,
+                target_agent_id=target_id,
+            )
+            caller = await _resolve_caller_agent(
+                session, target.sub, token, include_suggestion=False
+            )
+            result = await service.get_conversation(
+                session,
+                actor_sub=target.sub,
+                caller_agent_id=caller.id,
+                conversation_id=conv_id,
+                since_seq=0,
+                mark_read=False,
+            )
+    if "messages_in_page" in result:
+        result["messages_returned"] = result.pop("messages_in_page")
+    return result
+
+
 @comms_server.resource("comms://agents/{agent_id}/inbox")
 async def agent_inbox_resource(agent_id: str) -> dict[str, Any]:
     """Read an agent's inbox: identical shape to ``comms_inbox`` with default filters.
@@ -2793,7 +2832,7 @@ async def agents_directory_resource() -> dict[str, Any]:
 # already relies on, just with named capture groups instead of a bare
 # yes/no match.
 def _find_template(needle: str) -> str:
-    """Return the sole ``RESOURCE_TEMPLATE_SCOPES`` key containing ``needle``.
+    """Return the sole ``RESOURCE_TEMPLATE_SCOPES`` key matching ``needle``.
 
     A bare ``next(...)`` with no default raises an undiagnostic
     ``StopIteration`` at import time if ``RESOURCE_TEMPLATE_SCOPES``'s shape
@@ -2806,27 +2845,30 @@ def _find_template(needle: str) -> str:
     same ``needle`` substring -- scan the whole collection and raise loudly
     on a second match instead of returning early on the first.
     """
-    match: str | None = None
-    for template in RESOURCE_TEMPLATE_SCOPES:
-        if needle in template:
-            if match is not None:
-                raise RuntimeError(
-                    f"ambiguous RESOURCE_TEMPLATE_SCOPES lookup for {needle!r} -- "
-                    f"both {match!r} and {template!r} match; subscribe/unsubscribe "
-                    "authorization cannot resolve which URI template this needle refers to"
-                )
-            match = template
-    if match is None:
+    if needle in RESOURCE_TEMPLATE_SCOPES:
+        return needle
+    matches = [t for t in RESOURCE_TEMPLATE_SCOPES if needle in t]
+    if len(matches) > 1:
         raise RuntimeError(
-            f"no RESOURCE_TEMPLATE_SCOPES entry contains {needle!r} -- "
+            f"ambiguous RESOURCE_TEMPLATE_SCOPES lookup for {needle!r} -- "
+            f"multiple entries match ({matches!r}); subscribe/unsubscribe "
+            "authorization cannot resolve which URI template this needle refers to"
+        )
+    if not matches:
+        raise RuntimeError(
+            f"no RESOURCE_TEMPLATE_SCOPES entry matches {needle!r} -- "
             "subscribe/unsubscribe authorization cannot resolve its URI templates"
         )
-    return match
+    return matches[0]
 
 
-_CONVERSATION_SUBSCRIBE_TEMPLATE = _find_template("/conversations/")
-_INBOX_SUBSCRIBE_TEMPLATE = _find_template("/inbox")
+_CONVERSATION_SUBSCRIBE_TEMPLATE = _find_template("comms://comms/conversations/{conversation_id}")
+_AGENT_CONVERSATION_SUBSCRIBE_TEMPLATE = _find_template(
+    "comms://comms/agents/{agent_id}/conversations/{conversation_id}"
+)
+_INBOX_SUBSCRIBE_TEMPLATE = _find_template("comms://comms/agents/{agent_id}/inbox")
 _CONVERSATION_SUBSCRIBE_URI_RE = compile_uri_template(_CONVERSATION_SUBSCRIBE_TEMPLATE)
+_AGENT_CONVERSATION_SUBSCRIBE_URI_RE = compile_uri_template(_AGENT_CONVERSATION_SUBSCRIBE_TEMPLATE)
 _INBOX_SUBSCRIBE_URI_RE = compile_uri_template(_INBOX_SUBSCRIBE_TEMPLATE)
 
 
@@ -2883,7 +2925,10 @@ async def authorize_resource_subscribe(
     of ``main.py``'s low-level handlers.
 
     ``require_active`` distinguishes the two directions (Argus round-2
-    BLOCKING catch): subscribing to a conversation URI requires the caller
+    BLOCKING catch): subscribing to a conversation URI (either
+    ``comms://comms/conversations/{conversation_id}`` or
+    ``comms://comms/agents/{agent_id}/conversations/{conversation_id}``)
+    requires the caller (or the explicit identity named by ``agent_id``)
     to be an ``active`` participant — stricter than a plain read, which
     allows ``invited`` for metadata-only access (plan doc §6 point 6): an
     ``invited`` participant that hasn't accepted yet must not learn message
@@ -2896,12 +2941,11 @@ async def authorize_resource_subscribe(
     linger until cap-eviction or a failed send prunes it instead).
     ``main.py``'s subscribe handler passes ``True``; its unsubscribe handler
     passes ``False``. The underlying membership/self-or-sibling check
-    (``service.resolve_conversation_participant``) always applies regardless
-    of ``require_active`` — you must still be a participant/self either way,
-    just not necessarily ``active`` to unsubscribe. The membership check
-    itself is the exact same helper ``conversation_resource``'s read path
-    resolves through (via ``service.get_conversation``), with the additional
-    ``status == "active"`` gate layered on top here (only when
+    always applies regardless of ``require_active`` — you must still be a
+    participant/self either way, just not necessarily ``active`` to
+    unsubscribe. The membership check itself is the exact same helper
+    the read paths resolve through (via ``service.get_conversation``), with
+    the additional ``status == "active"`` gate layered on top here (only when
     ``require_active``), not a separately maintained rule.
 
     Inbox URIs reuse ``service.resolve_inbox_target`` unchanged — the same
@@ -2932,13 +2976,22 @@ async def authorize_resource_subscribe(
         raise ResourceSubscribeDeniedError("unresolvable_identity")
 
     conversation_match = _CONVERSATION_SUBSCRIBE_URI_RE.match(uri)
+    agent_conversation_match = _AGENT_CONVERSATION_SUBSCRIBE_URI_RE.match(uri)
     inbox_match = _INBOX_SUBSCRIBE_URI_RE.match(uri)
 
     conversation_id: uuid.UUID | None = None
     target_agent_id: uuid.UUID | None = None
+    is_agent_conversation = False
     if conversation_match is not None:
         try:
             conversation_id = uuid.UUID(conversation_match.group("conversation_id"))
+        except ValueError as exc:
+            raise ResourceSubscribeDeniedError("malformed_uuid") from exc
+    elif agent_conversation_match is not None:
+        is_agent_conversation = True
+        try:
+            conversation_id = uuid.UUID(agent_conversation_match.group("conversation_id"))
+            target_agent_id = uuid.UUID(agent_conversation_match.group("agent_id"))
         except ValueError as exc:
             raise ResourceSubscribeDeniedError("malformed_uuid") from exc
     elif inbox_match is not None:
@@ -2949,107 +3002,125 @@ async def authorize_resource_subscribe(
     else:
         raise ResourceSubscribeDeniedError("unknown_uri")
 
-    async with get_session_factory()() as session:
-        try:
-            requester = await _resolve_caller_agent(session, base_sub, token)
-        except ToolError as exc:
-            raise ResourceSubscribeDeniedError(str(exc)) from exc
+    async with (
+        get_session_factory()() as session,
+        _map_service_errors(ResourceSubscribeDeniedError),
+    ):
+        if conversation_id is not None:
+            if is_agent_conversation:
+                assert target_agent_id is not None
+                target = await service.resolve_inbox_target(
+                    session, sub=base_sub, target_agent_id=target_agent_id
+                )
+                # Note on cap-bypass bounds (TECH-6697 Argus round-3): because
+                # `canonical_uri` is agent-agnostic while the charged identity
+                # is caller-selected, this is where cross-sibling cap spreading
+                # across conversations is possible. It is bounded by
+                # `subscriptions.MAX_SUBSCRIPTIONS_PER_SESSION` rather than by
+                # changing the charged identity.
+                try:
+                    caller = await _resolve_caller_agent(
+                        session, target.sub, token, include_suggestion=False
+                    )
+                except ToolError:
+                    raise ResourceSubscribeDeniedError("agent_target_unavailable") from None
+            else:
+                try:
+                    caller = await _resolve_caller_agent(session, base_sub, token)
+                except ToolError as exc:
+                    raise ResourceSubscribeDeniedError(str(exc)) from exc
 
-        async with _map_service_errors(ResourceSubscribeDeniedError):
-            if conversation_id is not None:
-                # `allow_terminal_status=not require_active`: the unsubscribe
-                # call site (`require_active=False`) must tolerate a
-                # `left`/`declined` participant cleaning up its own stale
-                # subscription -- without this, `resolve_conversation_participant`
-                # (via `_load_participant_for_read`) denies a terminal-status
-                # participant BEFORE control ever reaches the
-                # `require_active` check below, making `require_active=False`
-                # a no-op for exactly the departed-participant case it exists
-                # to support (Argus round-2 BLOCKING catch).
-                _, participant = await service.resolve_conversation_participant(
+            # `allow_terminal_status=not require_active`: the unsubscribe
+            # call site (`require_active=False`) must tolerate a
+            # `left`/`declined` participant cleaning up its own stale
+            # subscription -- without this, `resolve_conversation_participant`
+            # (via `_load_participant_for_read`) denies a terminal-status
+            # participant BEFORE control ever reaches the
+            # `require_active` check below, making `require_active=False`
+            # a no-op for exactly the departed-participant case it exists
+            # to support (Argus round-2 BLOCKING catch).
+            _, participant = await service.resolve_conversation_participant(
+                session,
+                actor_sub=base_sub,
+                agent_id=caller.id,
+                conversation_id=conversation_id,
+                allow_terminal_status=not require_active,
+            )
+            if require_active and participant.status != "active":
+                await service.deny_resource_subscribe(
                     session,
                     actor_sub=base_sub,
-                    agent_id=requester.id,
+                    action=f"denied.subscribe_requires_active.{participant.status}",
+                    agent_id=caller.id,
                     conversation_id=conversation_id,
-                    allow_terminal_status=not require_active,
+                    detail={"current_status": participant.status},
                 )
-                if require_active and participant.status != "active":
-                    await service.deny_resource_subscribe(
-                        session,
-                        actor_sub=base_sub,
-                        action=f"denied.subscribe_requires_active.{participant.status}",
-                        agent_id=requester.id,
-                        conversation_id=conversation_id,
-                        detail={"current_status": participant.status},
-                    )
-                    # Argus round-2 SUGGESTION belt-and-suspenders guard,
-                    # matching `resolve_inbox_target`'s established pattern:
-                    # `deny_resource_subscribe` is `-> NoReturn`, so this is
-                    # genuinely unreachable -- a plain `raise` (never
-                    # optimized away under `python -O`), not a bare
-                    # `assert`.
-                    raise ResourceSubscribeDeniedError(
-                        "unreachable: deny_resource_subscribe must have raised"
-                    )
-                return ResourceSubscribeAuthorization(
-                    caller=requester,
-                    base_sub=base_sub,
-                    canonical_uri=subscriptions.conversation_uri(conversation_id),
-                    conversation_id=conversation_id,
+                # Argus round-2 SUGGESTION belt-and-suspenders guard,
+                # matching `resolve_inbox_target`'s established pattern:
+                # `deny_resource_subscribe` is `-> NoReturn`, so this is
+                # genuinely unreachable -- a plain `raise` (never
+                # optimized away under `python -O`), not a bare
+                # `assert`.
+                raise ResourceSubscribeDeniedError(
+                    "unreachable: deny_resource_subscribe must have raised"
                 )
-
-            if target_agent_id is None:
-                raise RuntimeError(
-                    "unreachable: exactly one of conversation_id/target_agent_id is always set"
-                )
-            target = await service.resolve_inbox_target(
-                session, sub=base_sub, target_agent_id=target_agent_id
-            )
-            # Argus round-2 BLOCKING catch: this used to reassign `caller`
-            # to the resolved TARGET/inbox-owner agent and return that for
-            # cap-charging/audit purposes -- when the target is a sibling
-            # identity under the same base_sub (not the requester's own
-            # primary agent), that let a single session accumulate
-            # N x MAX_SUBSCRIPTIONS_PER_AGENT across N siblings, and mixed
-            # up the audit log's agent_id attribution. `_resolve_caller_agent`
-            # is still called here (its suspension check/ownership
-            # write-through side effects apply to the TARGET), but its
-            # return value is discarded -- `requester` (the caller's own
-            # agent, resolved above) is what gets charged/audited.
-            #
-            # Argus round-5 SUGGESTION: this call still passes the
-            # REQUESTER's own `token`, so its ownership-metadata write-through
-            # side effect (see `_resolve_caller_agent`'s own docstring) is
-            # applied to the TARGET using the requester's token/claims, not
-            # the target's own. This is inherited, accepted behavior, not a
-            # new decision made here -- `agent_inbox_resource` (the read
-            # path) already does the identical thing when resolving an
-            # inbox's owner. Documented explicitly rather than changed:
-            # changing it would be a design decision affecting the read path
-            # too, out of scope for this subscribe/unsubscribe authorization
-            # change.
-            try:
-                await _resolve_caller_agent(session, target.sub, token)
-            except ToolError:
-                # Argus round-3 SUGGESTION: `main.py`'s denial handler logs
-                # this exception's message server-side (`reason=%s`) --
-                # forwarding the raw `ToolError` text here (as the first
-                # `_resolve_caller_agent` call above still does, since that
-                # one resolves the REQUESTER's own identity, not someone
-                # else's) would leak the TARGET/inbox-owner's suspension or
-                # registration state to anyone with log access, even though
-                # the client-facing denial stays uniform either way. Use a
-                # fixed category string instead of `str(exc)`. `from None`
-                # (Argus round-4 SUGGESTION), not `from exc`: the latter
-                # still attaches the original `ToolError` as `__cause__`, so
-                # any error-monitoring sink capturing the full exception
-                # chain (Sentry, `logging.exception`, ...) would still see
-                # the target's suspension/registration text even though the
-                # message on this exception itself is scrubbed.
-                raise ResourceSubscribeDeniedError("inbox_target_unavailable") from None
             return ResourceSubscribeAuthorization(
-                caller=requester,
+                caller=caller,
                 base_sub=base_sub,
-                canonical_uri=subscriptions.inbox_uri(target_agent_id),
-                conversation_id=None,
+                canonical_uri=subscriptions.conversation_uri(conversation_id),
+                conversation_id=conversation_id,
             )
+
+        if target_agent_id is None:
+            raise RuntimeError(
+                "unreachable: exactly one of conversation_id/target_agent_id is always set"
+            )
+        target = await service.resolve_inbox_target(
+            session, sub=base_sub, target_agent_id=target_agent_id
+        )
+        # Revisit of Argus round-2 decision (TECH-6697):
+        # We previously pinned `caller` to the base_sub requester for cap-charging
+        # and audit purposes. But the premise that a valid `base_sub` agent always
+        # exists to charge is false under the org's `agent_key="claude-code"`-always
+        # convention (where the bare base_sub may never be registered).
+        # Charging per-identity is consistent with how the conversation path
+        # already works; inbox notifications have no `recipient_filter` so
+        # delivery is provably unaffected by this change; audit attribution
+        # becomes `actor_sub=base_sub` (who acted) + `agent_id=target.id` (whose inbox),
+        # matching `resolve_inbox_target`'s own `_deny` shape.
+        #
+        # This call still passes the REQUESTER's own `token`, so its ownership-metadata
+        # write-through side effect (see `_resolve_caller_agent`'s own docstring) is
+        # applied to the TARGET using the requester's token/claims, not the target's
+        # own. This is inherited, accepted behavior, not a new decision made here --
+        # `agent_inbox_resource` (the read path) already does the identical thing
+        # when resolving an inbox's owner.
+        #
+        # Note on cap-bypass bounds (TECH-6697 Argus round-3): the round-2
+        # per-sibling charging decision stands. The cap-bypass concern is
+        # bounded here at one record per sibling (inbox URIs are per-sibling
+        # and `resolve_inbox_target` is self-or-sibling only), and the
+        # cross-identity accumulation bound across a session is enforced by
+        # `subscriptions.MAX_SUBSCRIPTIONS_PER_SESSION` instead.
+        try:
+            acting = await _resolve_caller_agent(session, target.sub, token)
+        except ToolError:
+            # Argus round-3 SUGGESTION: `main.py`'s denial handler logs
+            # this exception's message server-side (`reason=%s`) --
+            # forwarding the raw `ToolError` text here would leak the
+            # TARGET/inbox-owner's suspension or registration state to
+            # anyone with log access, even though the client-facing
+            # denial stays uniform either way. Use a fixed category
+            # string instead of `str(exc)`. `from None`, not `from exc`:
+            # the latter still attaches the original `ToolError` as
+            # `__cause__`, so any error-monitoring sink capturing the
+            # full exception chain would still see the target's
+            # suspension/registration text even though the message on
+            # this exception itself is scrubbed.
+            raise ResourceSubscribeDeniedError("inbox_target_unavailable") from None
+        return ResourceSubscribeAuthorization(
+            caller=acting,
+            base_sub=base_sub,
+            canonical_uri=subscriptions.inbox_uri(target_agent_id),
+            conversation_id=None,
+        )

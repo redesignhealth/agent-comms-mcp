@@ -1077,7 +1077,9 @@ deploy/restart, or a client re-initializing its MCP session, drops every
 subscription and the client must re-subscribe. Bounded per-agent
 (`MAX_SUBSCRIPTIONS_PER_AGENT`, with excess subscribe requests rejected with
 `subscription_limit_reached` rather than evicting the oldest) so a departed agent that
-never triggers a failed send can't accumulate unbounded stale records.
+never triggers a failed send can't accumulate unbounded stale records; further
+bounded per-session (`MAX_SUBSCRIPTIONS_PER_SESSION`, 100) to cap cross-sibling
+subscription accumulation across a single MCP session.
 
 **Low-level handler registration (`main.py`)**: FastMCP's own `@comms_server.resource`
 decorator has no subscribe counterpart, so `_handle_subscribe_resource`/
@@ -1188,8 +1190,9 @@ catch-up read via `comms_get_conversation(since_seq=...)` (for conversations) or
    from server-side subscription loss without waiting for a client-visible error.
 5. **Subscription cap rejects with `subscription_limit_reached`:** An agent may
    hold at most `MAX_SUBSCRIPTIONS_PER_AGENT` (100) live subscriptions across all
-   URIs. Subscribing beyond this cap is rejected with a specific error
-   (`subscription_limit_reached: too many active subscriptions for this agent`),
+   URIs, and an individual MCP session may hold at most `MAX_SUBSCRIPTIONS_PER_SESSION`
+   (100) subscriptions regardless of identity. Subscribing beyond either cap is rejected
+   with a specific error (`subscription_limit_reached: too many active subscriptions for this agent or session`),
    allowing the client to distinguish cap exhaustion from authorization denials
    and unsubscribe stale resources.
 
@@ -1228,8 +1231,9 @@ consumers.
 - Prune-on-dead-weakref and prune-on-closed/broken-stream (`subscriptions.py`)
   write no audit row — both are system-driven registry cleanup of stale
   bookkeeping, not a caller-initiated action, so there's no actor to attribute a
-  row to. Cap exhaustion no longer evicts: it rejects the subscribe request with
-  `subscription_limit_reached` (audited as `denied.subscribe_limit_reached`).
+   row to. Cap exhaustion (per-agent or per-session) no longer evicts: it rejects the
+   subscribe request with `subscription_limit_reached` (audited as
+   `denied.subscribe_limit_reached`, carrying the exceeded `limit` and `scope` in `detail`).
   Pruning is strictly limited to definitive session death (`anyio.ClosedResourceError`,
   `anyio.BrokenResourceError`) and dead weakrefs; transient send errors and
   slow consumer timeouts do not prune subscriptions.
