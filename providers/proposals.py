@@ -382,3 +382,70 @@ async def withdraw(proposal_id: str, reason: str | None = None) -> dict[str, Any
         return await service.withdraw_proposal(
             session, hold_id=hold_id, requesting_bot_sub=bot_sub, reason=reason
         )
+
+
+# --- Arcana private-brain source reads (TECH-7170 pilot) -----------------------
+#
+# The bot reads back ITS OWN stored source through the board; it never holds an
+# Arcana key. ``bot_id`` is the verified token's own sub and is the ONLY
+# authority passed on -- there is deliberately no brain/company/bot parameter.
+# The board's service read token (``proposals:arcana_read``, held by the board,
+# never by the bot) is used by ``rh_comms_plugins.arcana_read_http_client``,
+# which exists only in the board-derived image; the base board image has no such
+# package, so these tools then fail closed with a fixed message.
+
+_ARCANA_READ_UNAVAILABLE = "arcana source reads are not available"
+
+
+def _arcana_read_client() -> Any:
+    try:
+        from rh_comms_plugins import (  # type: ignore[import-not-found,unused-ignore]
+            arcana_read_http_client,
+        )
+    except ImportError:
+        raise ToolError(_ARCANA_READ_UNAVAILABLE) from None
+    return arcana_read_http_client
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    if hasattr(value, "model_dump"):
+        return dict(value.model_dump())
+    if hasattr(value, "_asdict"):
+        return dict(value._asdict())
+    return dict(vars(value))
+
+
+@proposals_server.tool
+async def arcana_source_metadata(logical_id: str) -> dict[str, Any]:
+    """Look up the calling bot's OWN stored private-brain source by
+    ``logical_id``. Returns ``{"exists": false}`` when it has none, else its
+    ``revision_id``, ``sha256``, ``filename``, ``status`` and ``brain_id``.
+    Scoped to the caller by its verified token; no other bot's or brain's
+    source is ever reachable."""
+    bot_sub = _require_bot_sub()
+    client = _arcana_read_client()
+    try:
+        found = await client.fetch_source_metadata(bot_sub, logical_id)
+    except Exception:
+        raise ToolError(_ARCANA_READ_UNAVAILABLE) from None
+    if found is None:
+        return {"exists": False}
+    return {"exists": True, **_as_dict(found)}
+
+
+@proposals_server.tool
+async def arcana_source_span(revision_id: str, offset: int, length: int) -> dict[str, Any]:
+    """Read ``length`` characters of the calling bot's OWN stored source
+    revision, starting at ``offset``. Offsets count Unicode code points over
+    the STORED markdown, including its leading ``Source document: <filename>``
+    marker line and blank line -- not over the body originally proposed. A
+    revision that is not the caller's, or a span out of bounds, fails."""
+    bot_sub = _require_bot_sub()
+    if not (isinstance(offset, int) and isinstance(length, int)) or offset < 0 or length < 1:
+        raise ToolError("invalid_request: offset must be >= 0 and length >= 1")
+    client = _arcana_read_client()
+    try:
+        span = await client.fetch_source_span(bot_sub, revision_id, offset, length)
+    except Exception:
+        raise ToolError(_ARCANA_READ_UNAVAILABLE) from None
+    return _as_dict(span)
