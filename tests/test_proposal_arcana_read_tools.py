@@ -76,16 +76,68 @@ async def test_identity_is_the_verified_sub_and_nothing_else(
     assert fake.calls == [("span", ("pclip-dev-brain-pilot-01", "rev-1", 0, 5))]
 
     # No tool accepts a bot/brain/company argument: extras are rejected.
-    for extra in ("bot_id", "brain_id", "company_id"):
-        with pytest.raises(ToolError):
-            await _call(
-                main,
-                test_session_factory,
-                token,
-                "proposals_arcana_source_span",
-                {**_SPAN_ARGS, extra: "other"},
-            )
+    for tool, base in (
+        ("proposals_arcana_source_span", _SPAN_ARGS),
+        ("proposals_arcana_source_metadata", {"logical_id": "s"}),
+    ):
+        for extra in ("bot_id", "brain_id", "company_id"):
+            with pytest.raises(ToolError):
+                await _call(main, test_session_factory, token, tool, {**base, extra: "other"})
     assert len(fake.calls) == 1
+
+
+async def test_response_is_an_allowlist_and_exists_cannot_be_overridden(
+    main: Any,  # noqa: F811
+    test_session_factory: async_sessionmaker[AsyncSession],
+    fake: _Fake,
+) -> None:
+    fake.metadata = types.SimpleNamespace(
+        revision_id="rev-1", exists=False, internal_secret="nope", owner_bot_id="x"
+    )
+    out = await _call(
+        main,
+        test_session_factory,
+        _token("bot-a"),
+        "proposals_arcana_source_metadata",
+        {"logical_id": "s"},
+    )
+    assert out["exists"] is True and out["revision_id"] == "rev-1"
+    assert "internal_secret" not in out and "owner_bot_id" not in out
+
+
+@pytest.mark.parametrize("bad", ["", "   "])
+async def test_empty_identifiers_are_rejected_before_any_read(
+    bad: str,
+    main: Any,  # noqa: F811
+    test_session_factory: async_sessionmaker[AsyncSession],
+    fake: _Fake,
+) -> None:
+    for tool, args in (
+        ("proposals_arcana_source_metadata", {"logical_id": bad}),
+        ("proposals_arcana_source_span", {**_SPAN_ARGS, "revision_id": bad}),
+    ):
+        with pytest.raises(ToolError, match="invalid_request"):
+            await _call(main, test_session_factory, _token("bot-a"), tool, args)
+    assert fake.calls == []
+
+
+async def test_failure_is_logged_for_the_operator_not_the_bot(
+    main: Any,  # noqa: F811
+    test_session_factory: async_sessionmaker[AsyncSession],
+    fake: _Fake,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake.error = RuntimeError("upstream exploded")
+    with pytest.raises(ToolError) as caught:
+        await _call(
+            main,
+            test_session_factory,
+            _token("bot-a"),
+            "proposals_arcana_source_span",
+            _SPAN_ARGS,
+        )
+    assert "exploded" not in str(caught.value)
+    assert any("upstream exploded" in (r.exc_text or "") for r in caplog.records)
 
 
 async def test_metadata_absent_and_present(
@@ -104,7 +156,16 @@ async def test_metadata_absent_and_present(
     present = await _call(
         main, test_session_factory, token, "proposals_arcana_source_metadata", args
     )
-    assert present == {"exists": True, "revision_id": "rev-1", "sha256": "ab", "brain_id": "b"}
+    assert present == {
+        "exists": True,
+        "revision_id": "rev-1",
+        "sha256": "ab",
+        "brain_id": "b",
+        "logical_id": None,
+        "filename": None,
+        "status": None,
+        "created_at": None,
+    }
     assert [c[1][0] for c in fake.calls] == ["bot-a", "bot-a"]
 
 
@@ -123,7 +184,9 @@ async def test_upstream_failure_never_leaks_detail(
     assert "secret" not in str(caught.value) and "arcana.internal" not in str(caught.value)
 
 
+@pytest.mark.parametrize("tool", _TOOLS)
 async def test_base_image_without_the_plugin_fails_closed(
+    tool: str,
     main: Any,  # noqa: F811
     test_session_factory: async_sessionmaker[AsyncSession],
     monkeypatch: pytest.MonkeyPatch,
@@ -134,8 +197,8 @@ async def test_base_image_without_the_plugin_fails_closed(
             main,
             test_session_factory,
             _token("bot-a"),
-            "proposals_arcana_source_metadata",
-            {"logical_id": "s"},
+            tool,
+            {"logical_id": "s"} if tool.endswith("metadata") else _SPAN_ARGS,
         )
 
 
@@ -159,7 +222,10 @@ async def test_scope_and_interactive_callers_are_denied(
     assert fake.calls == []
 
 
-@pytest.mark.parametrize(("offset", "length"), [(-1, 5), (0, 0)])
+@pytest.mark.parametrize(
+    ("offset", "length"),
+    [(-1, 5), (0, 0), (0, 100_001), (10_000_001, 5)],
+)
 async def test_span_bounds_are_validated_before_any_read(
     offset: int,
     length: int,

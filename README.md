@@ -112,6 +112,8 @@ equivalent.
 | `proposals_list_pending` | `comms:proposals:write` | List the calling bot's OWN still-`pending` proposals; new capability, no HTTP route equivalent |
 | `proposals_list_history` | `comms:proposals:write` | List the calling bot's OWN already-actioned proposals; new capability, no bot-facing HTTP route equivalent (`GET /proposals/history` is the human-facing counterpart, scoped to `owner_sub` rather than the submitting bot) |
 | `proposals_withdraw` | `comms:proposals:write` | Retract the calling bot's own still-`pending` proposal; same body shape as `POST /proposals/{id}/withdraw` |
+| `proposals_arcana_source_metadata` | `comms:proposals:write` | Look up the calling bot's OWN stored private-brain source by `logical_id` (TECH-7170). Identity is the token's `sub` only. Works only in the board-derived image (needs the approvals package's read client plus `PROPOSAL_READ_URL`/`PROPOSAL_READ_TOKEN`, a `proposals:arcana_read` service token the bot never holds); the base image fails closed |
+| `proposals_arcana_source_span` | `comms:proposals:write` | Read an exact span of the calling bot's OWN stored source revision, offsets in Unicode code points over the stored markdown including the `Source document:` marker line. Same board-derived-image requirement |
 
 ## MCP resource surface
 

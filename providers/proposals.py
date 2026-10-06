@@ -64,6 +64,7 @@ scope.
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -84,6 +85,8 @@ from exceptions import (
 )
 from identity import try_resolve_email
 from scopes import is_interactive_token
+
+logger = logging.getLogger(__name__)
 
 proposals_server: FastMCP[Any] = FastMCP("proposals")
 
@@ -395,6 +398,20 @@ async def withdraw(proposal_id: str, reason: str | None = None) -> dict[str, Any
 # package, so these tools then fail closed with a fixed message.
 
 _ARCANA_READ_UNAVAILABLE = "arcana source reads are not available"
+# Mirror the approvals package's own span bounds (arcana_contracts) so an
+# oversized request fails here, before any read.
+_MAX_SPAN_OFFSET = 10_000_000
+_MAX_SPAN_LENGTH = 100_000
+_METADATA_FIELDS = (
+    "brain_id",
+    "logical_id",
+    "revision_id",
+    "sha256",
+    "filename",
+    "status",
+    "created_at",
+)
+_SPAN_FIELDS = ("brain_id", "revision_id", "offset", "length", "text")
 
 
 def _arcana_read_client() -> Any:
@@ -407,12 +424,19 @@ def _arcana_read_client() -> Any:
     return arcana_read_http_client
 
 
-def _as_dict(value: Any) -> dict[str, Any]:
-    if hasattr(value, "model_dump"):
-        return dict(value.model_dump())
-    if hasattr(value, "_asdict"):
-        return dict(value._asdict())
-    return dict(vars(value))
+def _project(value: Any, fields: tuple[str, ...]) -> dict[str, Any]:
+    """Only the named fields, never whatever else the client object carries."""
+    return {name: getattr(value, name, None) for name in fields}
+
+
+def _require_identifier(name: str, value: Any) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ToolError(f"invalid_request: {name} must be a non-empty string")
+
+
+def _require_int(name: str, value: Any, *, minimum: int, maximum: int) -> None:
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise ToolError(f"invalid_request: {name} must be an integer in [{minimum}, {maximum}]")
 
 
 @proposals_server.tool
@@ -423,14 +447,18 @@ async def arcana_source_metadata(logical_id: str) -> dict[str, Any]:
     Scoped to the caller by its verified token; no other bot's or brain's
     source is ever reachable."""
     bot_sub = _require_bot_sub()
+    _require_identifier("logical_id", logical_id)
     client = _arcana_read_client()
     try:
         found = await client.fetch_source_metadata(bot_sub, logical_id)
+        result = None if found is None else _project(found, _METADATA_FIELDS)
     except Exception:
+        # Detail goes to the operator log only, never to the bot.
+        logger.warning("arcana source metadata read failed", exc_info=True)
         raise ToolError(_ARCANA_READ_UNAVAILABLE) from None
-    if found is None:
+    if result is None:
         return {"exists": False}
-    return {"exists": True, **_as_dict(found)}
+    return {**result, "exists": True}
 
 
 @proposals_server.tool
@@ -441,11 +469,16 @@ async def arcana_source_span(revision_id: str, offset: int, length: int) -> dict
     marker line and blank line -- not over the body originally proposed. A
     revision that is not the caller's, or a span out of bounds, fails."""
     bot_sub = _require_bot_sub()
-    if not (isinstance(offset, int) and isinstance(length, int)) or offset < 0 or length < 1:
-        raise ToolError("invalid_request: offset must be >= 0 and length >= 1")
+    _require_identifier("revision_id", revision_id)
+    _require_int("offset", offset, minimum=0, maximum=_MAX_SPAN_OFFSET)
+    _require_int("length", length, minimum=1, maximum=_MAX_SPAN_LENGTH)
     client = _arcana_read_client()
     try:
-        span = await client.fetch_source_span(bot_sub, revision_id, offset, length)
+        span = _project(
+            await client.fetch_source_span(bot_sub, revision_id, offset, length), _SPAN_FIELDS
+        )
     except Exception:
+        # Detail goes to the operator log only, never to the bot.
+        logger.warning("arcana source span read failed", exc_info=True)
         raise ToolError(_ARCANA_READ_UNAVAILABLE) from None
-    return _as_dict(span)
+    return span
