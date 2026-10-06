@@ -398,8 +398,10 @@ async def withdraw(proposal_id: str, reason: str | None = None) -> dict[str, Any
 # package, so these tools then fail closed with a fixed message.
 
 _ARCANA_READ_UNAVAILABLE = "arcana source reads are not available"
-# Mirror the approvals package's own span bounds (arcana_contracts) so an
-# oversized request fails here, before any read.
+# Mirror the approvals package's own span bounds (arcana_contracts.MAX_SPAN_*)
+# so an oversized request fails here, before any read. The package remains the
+# authority: if these ever drift below its limits the only effect is an earlier,
+# clearer rejection; above them, the package's own check still rejects.
 _MAX_SPAN_OFFSET = 10_000_000
 _MAX_SPAN_LENGTH = 100_000
 _METADATA_FIELDS = (
@@ -425,8 +427,14 @@ def _arcana_read_client() -> Any:
 
 
 def _project(value: Any, fields: tuple[str, ...]) -> dict[str, Any]:
-    """Only the named fields, never whatever else the client object carries."""
-    return {name: getattr(value, name, None) for name in fields}
+    """Only the named fields, never whatever else the client object carries.
+    A field the client no longer returns is drift against the approvals
+    package: fail closed rather than hand the bot a silent ``None``."""
+    missing = [name for name in fields if not hasattr(value, name)]
+    if missing:
+        logger.error("arcana read client result is missing fields: %s", ", ".join(missing))
+        raise ToolError(_ARCANA_READ_UNAVAILABLE)
+    return {name: getattr(value, name) for name in fields}
 
 
 def _require_identifier(name: str, value: Any) -> None:
@@ -442,8 +450,9 @@ def _require_int(name: str, value: Any, *, minimum: int, maximum: int) -> None:
 @proposals_server.tool
 async def arcana_source_metadata(logical_id: str) -> dict[str, Any]:
     """Look up the calling bot's OWN stored private-brain source by
-    ``logical_id``. Returns ``{"exists": false}`` when it has none, else its
-    ``revision_id``, ``sha256``, ``filename``, ``status`` and ``brain_id``.
+    ``logical_id``. Returns ``{"exists": false}`` when it has none, else
+    ``exists: true`` with its ``brain_id``, ``logical_id``, ``revision_id``,
+    ``sha256``, ``filename``, ``status`` and ``created_at``.
     Scoped to the caller by its verified token; no other bot's or brain's
     source is ever reachable."""
     bot_sub = _require_bot_sub()
@@ -451,14 +460,13 @@ async def arcana_source_metadata(logical_id: str) -> dict[str, Any]:
     client = _arcana_read_client()
     try:
         found = await client.fetch_source_metadata(bot_sub, logical_id)
-        result = None if found is None else _project(found, _METADATA_FIELDS)
     except Exception:
         # Detail goes to the operator log only, never to the bot.
         logger.warning("arcana source metadata read failed", exc_info=True)
         raise ToolError(_ARCANA_READ_UNAVAILABLE) from None
-    if result is None:
+    if found is None:
         return {"exists": False}
-    return {**result, "exists": True}
+    return {**_project(found, _METADATA_FIELDS), "exists": True}
 
 
 @proposals_server.tool
@@ -474,11 +482,9 @@ async def arcana_source_span(revision_id: str, offset: int, length: int) -> dict
     _require_int("length", length, minimum=1, maximum=_MAX_SPAN_LENGTH)
     client = _arcana_read_client()
     try:
-        span = _project(
-            await client.fetch_source_span(bot_sub, revision_id, offset, length), _SPAN_FIELDS
-        )
+        span = await client.fetch_source_span(bot_sub, revision_id, offset, length)
     except Exception:
         # Detail goes to the operator log only, never to the bot.
         logger.warning("arcana source span read failed", exc_info=True)
         raise ToolError(_ARCANA_READ_UNAVAILABLE) from None
-    return span
+    return _project(span, _SPAN_FIELDS)

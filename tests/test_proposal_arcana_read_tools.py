@@ -17,6 +17,15 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from tests.test_proposal_tools import _call, _token, main  # noqa: F401
 
 _TOOLS = ("proposals_arcana_source_metadata", "proposals_arcana_source_span")
+_FULL_METADATA = {
+    "brain_id": "b",
+    "logical_id": "src-1",
+    "revision_id": "rev-1",
+    "sha256": "ab",
+    "filename": "f.md",
+    "status": "pending",
+    "created_at": "2026-10-06T00:00:00Z",
+}
 _SPAN_ARGS = {"revision_id": "rev-1", "offset": 0, "length": 5}
 
 
@@ -92,7 +101,7 @@ async def test_response_is_an_allowlist_and_exists_cannot_be_overridden(
     fake: _Fake,
 ) -> None:
     fake.metadata = types.SimpleNamespace(
-        revision_id="rev-1", exists=False, internal_secret="nope", owner_bot_id="x"
+        **_FULL_METADATA, exists=False, internal_secret="nope", owner_bot_id="x"
     )
     out = await _call(
         main,
@@ -127,17 +136,35 @@ async def test_failure_is_logged_for_the_operator_not_the_bot(
     fake: _Fake,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level("WARNING", logger="providers.proposals")
     fake.error = RuntimeError("upstream exploded")
-    with pytest.raises(ToolError) as caught:
-        await _call(
-            main,
-            test_session_factory,
-            _token("bot-a"),
-            "proposals_arcana_source_span",
-            _SPAN_ARGS,
-        )
-    assert "exploded" not in str(caught.value)
-    assert any("upstream exploded" in (r.exc_text or "") for r in caplog.records)
+    for tool, args in (
+        ("proposals_arcana_source_span", _SPAN_ARGS),
+        ("proposals_arcana_source_metadata", {"logical_id": "s"}),
+    ):
+        caplog.clear()
+        with pytest.raises(ToolError) as caught:
+            await _call(main, test_session_factory, _token("bot-a"), tool, args)
+        assert "exploded" not in str(caught.value)
+        assert any(r.exc_info and "upstream exploded" in str(r.exc_info[1]) for r in caplog.records)
+
+
+async def test_span_response_is_an_allowlist_and_missing_fields_fail_closed(
+    main: Any,  # noqa: F811
+    test_session_factory: async_sessionmaker[AsyncSession],
+    fake: _Fake,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token, tool = _token("bot-a"), "proposals_arcana_source_span"
+    out = await _call(main, test_session_factory, token, tool, _SPAN_ARGS)
+    assert set(out) == {"brain_id", "revision_id", "offset", "length", "text"}
+
+    async def _short(bot_id: str, revision_id: str, offset: int, length: int) -> Any:
+        return types.SimpleNamespace(revision_id=revision_id, text="x")  # drifted client
+
+    monkeypatch.setattr(fake, "fetch_source_span", _short)
+    with pytest.raises(ToolError, match="not available"):
+        await _call(main, test_session_factory, token, tool, _SPAN_ARGS)
 
 
 async def test_metadata_absent_and_present(
@@ -152,20 +179,11 @@ async def test_metadata_absent_and_present(
     )
     assert absent == {"exists": False}
 
-    fake.metadata = types.SimpleNamespace(revision_id="rev-1", sha256="ab", brain_id="b")
+    fake.metadata = types.SimpleNamespace(**_FULL_METADATA)
     present = await _call(
         main, test_session_factory, token, "proposals_arcana_source_metadata", args
     )
-    assert present == {
-        "exists": True,
-        "revision_id": "rev-1",
-        "sha256": "ab",
-        "brain_id": "b",
-        "logical_id": None,
-        "filename": None,
-        "status": None,
-        "created_at": None,
-    }
+    assert present == {"exists": True, **_FULL_METADATA}
     assert [c[1][0] for c in fake.calls] == ["bot-a", "bot-a"]
 
 
