@@ -1713,8 +1713,10 @@ across two opposite auth postures:
 
 **Bot-facing MCP tool surface** (`providers/proposals.py`, mounted
 `namespace="proposals"` -- `proposals_submit`, `proposals_get`,
-`proposals_list_pending`, `proposals_list_history`, `proposals_withdraw`)
-[TECH-6018 follow-up]. A bot submitting/polling/listing/withdrawing its own
+`proposals_list_pending`, `proposals_list_history`, `proposals_withdraw`;
+TECH-7170 adds `proposals_arcana_source_metadata` and `proposals_arcana_source_span`,
+which read the calling bot's own stored Arcana source and work only in the
+board-derived image) [TECH-6018 follow-up]. A bot submitting/polling/listing/withdrawing its own
 proposals is exactly as bot-initiated as any `comms_*` action, so these are
 real `listTools()`-visible MCP tools, not just raw HTTP -- mirroring
 `providers/comms.py`'s shape (resolve identity -> open session -> call one

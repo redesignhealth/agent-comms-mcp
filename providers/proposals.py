@@ -64,6 +64,7 @@ scope.
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -84,6 +85,8 @@ from exceptions import (
 )
 from identity import try_resolve_email
 from scopes import is_interactive_token
+
+logger = logging.getLogger(__name__)
 
 proposals_server: FastMCP[Any] = FastMCP("proposals")
 
@@ -382,3 +385,106 @@ async def withdraw(proposal_id: str, reason: str | None = None) -> dict[str, Any
         return await service.withdraw_proposal(
             session, hold_id=hold_id, requesting_bot_sub=bot_sub, reason=reason
         )
+
+
+# --- Arcana private-brain source reads (TECH-7170 pilot) -----------------------
+#
+# The bot reads back ITS OWN stored source through the board; it never holds an
+# Arcana key. ``bot_id`` is the verified token's own sub and is the ONLY
+# authority passed on -- there is deliberately no brain/company/bot parameter.
+# The board's service read token (``proposals:arcana_read``, held by the board,
+# never by the bot) is used by ``rh_comms_plugins.arcana_read_http_client``,
+# which exists only in the board-derived image; the base board image has no such
+# package, so these tools then fail closed with a fixed message.
+
+_ARCANA_READ_UNAVAILABLE = "arcana source reads are not available"
+# Mirror the approvals package's own span bounds (arcana_contracts.MAX_SPAN_*)
+# so an oversized request fails here, before any read. The package remains the
+# authority: if these ever drift below its limits the only effect is an earlier,
+# clearer rejection; above them, the package's own check still rejects.
+_MAX_SPAN_OFFSET = 10_000_000
+_MAX_SPAN_LENGTH = 100_000
+_METADATA_FIELDS = (
+    "brain_id",
+    "logical_id",
+    "revision_id",
+    "sha256",
+    "filename",
+    "status",
+    "created_at",
+)
+_SPAN_FIELDS = ("brain_id", "revision_id", "offset", "length", "text")
+
+
+def _arcana_read_client() -> Any:
+    try:
+        from rh_comms_plugins import (  # type: ignore[import-not-found,unused-ignore]
+            arcana_read_http_client,
+        )
+    except ImportError:
+        raise ToolError(_ARCANA_READ_UNAVAILABLE) from None
+    return arcana_read_http_client
+
+
+def _project(value: Any, fields: tuple[str, ...]) -> dict[str, Any]:
+    """Only the named fields, never whatever else the client object carries.
+    A field the client no longer returns is drift against the approvals
+    package: fail closed rather than hand the bot a silent ``None``."""
+    missing = [name for name in fields if not hasattr(value, name)]
+    if missing:
+        logger.error("arcana read client result is missing fields: %s", ", ".join(missing))
+        raise ToolError(_ARCANA_READ_UNAVAILABLE)
+    return {name: getattr(value, name) for name in fields}
+
+
+def _require_identifier(name: str, value: Any) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ToolError(f"invalid_request: {name} must be a non-empty string")
+
+
+def _require_int(name: str, value: Any, *, minimum: int, maximum: int) -> None:
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise ToolError(f"invalid_request: {name} must be an integer in [{minimum}, {maximum}]")
+
+
+@proposals_server.tool
+async def arcana_source_metadata(logical_id: str) -> dict[str, Any]:
+    """Look up the calling bot's OWN stored private-brain source by
+    ``logical_id``. Returns ``{"exists": false}`` when it has none, else
+    ``exists: true`` with its ``brain_id``, ``logical_id``, ``revision_id``,
+    ``sha256``, ``filename``, ``status`` and ``created_at``.
+    Scoped to the caller by its verified token; no other bot's or brain's
+    source is ever reachable."""
+    bot_sub = _require_bot_sub()
+    _require_identifier("logical_id", logical_id)
+    client = _arcana_read_client()
+    try:
+        found = await client.fetch_source_metadata(bot_sub, logical_id)
+    except Exception:
+        # Detail goes to the operator log only, never to the bot.
+        logger.warning("arcana source metadata read failed", exc_info=True)
+        raise ToolError(_ARCANA_READ_UNAVAILABLE) from None
+    if found is None:
+        return {"exists": False}
+    return {**_project(found, _METADATA_FIELDS), "exists": True}
+
+
+@proposals_server.tool
+async def arcana_source_span(revision_id: str, offset: int, length: int) -> dict[str, Any]:
+    """Read ``length`` characters of the calling bot's OWN stored source
+    revision, starting at ``offset``. Offsets count Unicode code points over
+    the STORED markdown, including its leading ``Source document: <filename>``
+    marker line and blank line -- not over the body originally proposed. A
+    revision that is not the caller's, or a span out of bounds, fails."""
+    bot_sub = _require_bot_sub()
+    _require_identifier("revision_id", revision_id)
+    _require_int("offset", offset, minimum=0, maximum=_MAX_SPAN_OFFSET)
+    _require_int("length", length, minimum=1, maximum=_MAX_SPAN_LENGTH)
+    client = _arcana_read_client()
+    try:
+        span = await client.fetch_source_span(bot_sub, revision_id, offset, length)
+    except Exception:
+        # Detail goes to the operator log only, never to the bot.
+        logger.warning("arcana source span read failed", exc_info=True)
+        raise ToolError(_ARCANA_READ_UNAVAILABLE) from None
+    return _project(span, _SPAN_FIELDS)
