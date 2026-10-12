@@ -357,7 +357,14 @@ class TestRequestOwnerReassignmentUnit:
         (https-only, no query/fragment/userinfo) instead of the old bare
         startswith check -- the round-1 userinfo/query observation is closed."""
         monkeypatch.setenv("DECISION_PAGE_BASE_URL", bad_base)
-        with patch("providers.comms.get_access_token", return_value=_admin_token()):
+        session = _mock_session_with_agent(None)
+        with (
+            patch("providers.comms.get_access_token", return_value=_admin_token()),
+            patch(
+                "providers.comms.get_session_factory",
+                return_value=lambda: _dummy_session(session),
+            ),
+        ):
             with pytest.raises(ToolError, match="misconfigured:"):
                 asyncio.run(
                     _request_owner_reassignment(
@@ -368,7 +375,14 @@ class TestRequestOwnerReassignmentUnit:
 
     def test_missing_decision_page_base_url_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("DECISION_PAGE_BASE_URL", raising=False)
-        with patch("providers.comms.get_access_token", return_value=_admin_token()):
+        session = _mock_session_with_agent(None)
+        with (
+            patch("providers.comms.get_access_token", return_value=_admin_token()),
+            patch(
+                "providers.comms.get_session_factory",
+                return_value=lambda: _dummy_session(session),
+            ),
+        ):
             with pytest.raises(
                 ToolError, match="misconfigured: DECISION_PAGE_BASE_URL is not configured"
             ):
@@ -381,7 +395,14 @@ class TestRequestOwnerReassignmentUnit:
 
     def test_http_decision_page_base_url_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("DECISION_PAGE_BASE_URL", "http://insecure.example.com")
-        with patch("providers.comms.get_access_token", return_value=_admin_token()):
+        session = _mock_session_with_agent(None)
+        with (
+            patch("providers.comms.get_access_token", return_value=_admin_token()),
+            patch(
+                "providers.comms.get_session_factory",
+                return_value=lambda: _dummy_session(session),
+            ),
+        ):
             with pytest.raises(
                 ToolError, match="misconfigured: DECISION_PAGE_BASE_URL must be an https:// URL"
             ):
@@ -396,7 +417,14 @@ class TestRequestOwnerReassignmentUnit:
         """A scheme-less value fails the same https:// guard as an explicit
         http:// one -- no accidental "startswith" acceptance of a bare host."""
         monkeypatch.setenv("DECISION_PAGE_BASE_URL", "decisions.example.com")
-        with patch("providers.comms.get_access_token", return_value=_admin_token()):
+        session = _mock_session_with_agent(None)
+        with (
+            patch("providers.comms.get_access_token", return_value=_admin_token()),
+            patch(
+                "providers.comms.get_session_factory",
+                return_value=lambda: _dummy_session(session),
+            ),
+        ):
             with pytest.raises(
                 ToolError, match="misconfigured: DECISION_PAGE_BASE_URL must be an https:// URL"
             ):
@@ -607,7 +635,14 @@ class TestRequestOwnerReassignmentUnit:
         service's loopback-dev allowance, the board emits operator-facing
         approval links and must be https-only, loopback included."""
         monkeypatch.setenv("DECISION_PAGE_BASE_URL", "http://127.0.0.1")
-        with patch("providers.comms.get_access_token", return_value=_admin_token()):
+        session = _mock_session_with_agent(None)
+        with (
+            patch("providers.comms.get_access_token", return_value=_admin_token()),
+            patch(
+                "providers.comms.get_session_factory",
+                return_value=lambda: _dummy_session(session),
+            ),
+        ):
             with pytest.raises(ToolError, match="misconfigured:"):
                 asyncio.run(
                     _request_owner_reassignment(
@@ -636,7 +671,14 @@ class TestRequestOwnerReassignmentUnit:
         'working' operator link (a trimmed base would change the destination
         the operator configured)."""
         monkeypatch.setenv("DECISION_PAGE_BASE_URL", raw_base)
-        with patch("providers.comms.get_access_token", return_value=_admin_token()):
+        session = _mock_session_with_agent(None)
+        with (
+            patch("providers.comms.get_access_token", return_value=_admin_token()),
+            patch(
+                "providers.comms.get_session_factory",
+                return_value=lambda: _dummy_session(session),
+            ),
+        ):
             with pytest.raises(ToolError, match="misconfigured:"):
                 asyncio.run(
                     _request_owner_reassignment(
@@ -644,3 +686,32 @@ class TestRequestOwnerReassignmentUnit:
                         new_owner_email="bob@redesignhealth.com",
                     )
                 )
+
+    def test_unauthorized_token_denied_at_handler_before_config_check(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Non-admin callers are denied before config parsing: missing or invalid
+        DECISION_PAGE_BASE_URL still raises access_denied, not misconfigured."""
+        monkeypatch.delenv("DECISION_PAGE_BASE_URL", raising=False)
+        session = _mock_session_with_agent(None)
+        agent_id = uuid.uuid4()
+
+        with (
+            patch("providers.comms.get_access_token", return_value=_unauthorized_token()),
+            patch(
+                "providers.comms.get_session_factory",
+                return_value=lambda: _dummy_session(session),
+            ),
+        ):
+            with pytest.raises(ToolError, match="access_denied"):
+                asyncio.run(
+                    _request_owner_reassignment(
+                        agent_id=str(agent_id),
+                        new_owner_email="bob@redesignhealth.com",
+                    )
+                )
+        session.add.assert_called_once()
+        denial_audit = session.add.call_args[0][0]
+        assert isinstance(denial_audit, AuditLog)
+        assert denial_audit.action == "denied.owner_reassignment_requires_elevated_scope"
+        assert denial_audit.detail == {"target_agent_id": str(agent_id)}

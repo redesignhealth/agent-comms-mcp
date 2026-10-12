@@ -2748,6 +2748,28 @@ def parse_decision_page_base_url(raw_url: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip('/')}"
 
 
+async def authorize_owner_reassignment(
+    session: AsyncSession,
+    *,
+    actor_sub: str,
+    agent_id: uuid.UUID,
+    admin_authorized: bool,
+) -> None:
+    """Authorize owner reassignment: enforces elevated admin scope or interactive session.
+
+    If ``admin_authorized`` is False, records a denial audit row with action
+    ``denied.owner_reassignment_requires_elevated_scope`` (detail containing only
+    ``target_agent_id``) and raises ``AccessDeniedError``.
+    """
+    if not admin_authorized:
+        await _deny(
+            session,
+            actor_sub=actor_sub,
+            action="denied.owner_reassignment_requires_elevated_scope",
+            detail={"target_agent_id": str(agent_id)},
+        )
+
+
 async def request_owner_reassignment(
     session: AsyncSession,
     *,
@@ -2776,13 +2798,12 @@ async def request_owner_reassignment(
     is a human identity (contains '@' in sub), is a keyed alias, has sibling
     aliases registered under the base credential, or if ``new_owner_email`` is invalid.
     """
-    if not admin_authorized:
-        await _deny(
-            session,
-            actor_sub=actor_sub,
-            action="denied.owner_reassignment_requires_elevated_scope",
-            detail={"target_agent_id": str(agent_id), "new_owner_email": new_owner_email},
-        )
+    await authorize_owner_reassignment(
+        session,
+        actor_sub=actor_sub,
+        agent_id=agent_id,
+        admin_authorized=admin_authorized,
+    )
 
     agent = await _find_agent_by_id(session, agent_id)
     if agent is None:
@@ -10373,6 +10394,7 @@ __all__ = [
     "audit_denied_approval_requires_interactive",
     "audit_denied_proposal_submission",
     "audit_resource_subscription",
+    "authorize_owner_reassignment",
     "create_proposal",
     "decide_hold",
     "decide_proposal",
@@ -10401,11 +10423,13 @@ __all__ = [
     "may_invite",
     "may_rename",
     "may_reopen",
+    "parse_decision_page_base_url",
     "post_message",
     "reconcile_agent_ownership",
     "register_agent",
     "rename_conversation",
     "reopen_conversation",
+    "request_owner_reassignment",
     "resolve_conversation_participant",
     "resolve_inbox_target",
     "resolve_proposal_owner_sub",

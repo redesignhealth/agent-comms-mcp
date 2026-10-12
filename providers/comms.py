@@ -1245,29 +1245,36 @@ async def request_owner_reassignment(
     actor_sub = _compose_sub(_require_identity(token), agent_key)
     admin_authorized = is_interactive_token(token) or "comms:admin" in scopes_for_token(token)
 
-    raw_base_url = os.environ.get(DECISION_PAGE_BASE_URL_ENV_VAR)
-    if not raw_base_url or not raw_base_url.strip():
-        raise ToolError(f"misconfigured: {DECISION_PAGE_BASE_URL_ENV_VAR} is not configured")
-    try:
-        base_url = service.parse_decision_page_base_url(raw_base_url)
-    except (ValueError, TypeError) as exc:
-        raise ToolError(f"misconfigured: {exc}") from exc
-
     target_id = _parse_uuid("agent_id", agent_id)
 
-    async with get_session_factory()() as session, _map_service_errors():
-        (
-            agent,
-            canonical_new_email,
-            credential_sub,
-            affected_board_identities,
-        ) = await service.request_owner_reassignment(
-            session,
-            actor_sub=actor_sub,
-            agent_id=target_id,
-            new_owner_email=new_owner_email,
-            admin_authorized=admin_authorized,
-        )
+    async with get_session_factory()() as session:
+        async with _map_service_errors():
+            await service.authorize_owner_reassignment(
+                session,
+                actor_sub=actor_sub,
+                agent_id=target_id,
+                admin_authorized=admin_authorized,
+            )
+
+        raw_base_url = os.environ.get(DECISION_PAGE_BASE_URL_ENV_VAR, "")
+        try:
+            base_url = service.parse_decision_page_base_url(raw_base_url)
+        except (ValueError, TypeError) as exc:
+            raise ToolError(f"misconfigured: {exc}") from exc
+
+        async with _map_service_errors():
+            (
+                agent,
+                canonical_new_email,
+                credential_sub,
+                affected_board_identities,
+            ) = await service.request_owner_reassignment(
+                session,
+                actor_sub=actor_sub,
+                agent_id=target_id,
+                new_owner_email=new_owner_email,
+                admin_authorized=admin_authorized,
+            )
 
     params = {"sub": credential_sub, "new_owner_email": canonical_new_email}
     approval_url = f"{base_url}/ownership/reassign?{urlencode(params)}"
