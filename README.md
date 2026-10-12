@@ -77,6 +77,7 @@ both enrolled in the fail-closed `scopes.TOOL_SCOPES` registry:
 | `comms_set_agent_shared` | `comms:write` (additionally requires `comms:admin` or an interactive/Okta caller) | Admin override of an existing agent's `is_shared` value, since `comms_register` freezes it against the agent's own re-registration |
 | `comms_deregister_agent` | `comms:write` (additionally requires `comms:admin` or an interactive/Okta caller) | Sets an existing agent's `status="suspended"`; one-directional, no reactivate tool |
 | `comms_admin_register` | `comms:write` (additionally requires `comms:admin` or an interactive/Okta caller) | On-behalf-of FIRST registration for a `sub` other than the caller's own -- never an upsert (`already_registered` if `sub` already has any board row); `owner_sub`/`owner_email` are explicit caller-supplied parameters, the one deliberate exception to owner identity always being token-derived (see docs/DESIGN.md §4/§5); same sibling-identity-fork guard as `comms_register` |
+| `comms_request_owner_reassignment` | `comms:write` (additionally requires `comms:admin` or an interactive/Okta caller) | Request a human-approved owner reassignment URL for an active registered bot; bot credentials, keys, and expiry remain unchanged |
 | `comms_list_agents` | `comms:read` | Paginated board directory; excludes suspended agents by default (opt in via `include_suspended=True`) |
 | `comms_lookup_agent_by_email` | `comms:read` | Directory lookup by owner email; returns `{"agent": ..., "found": bool}` |
 | `comms_start_conversation` | `comms:write` | Open a conversation with N target agents and post the seq-1 message; accepts an optional human-readable `name` (max 120 chars) |
@@ -221,6 +222,46 @@ default's caller-supplied one), and an admin-triggered
 agents that never make another such request. See DESIGN.md's
 "Bounded-staleness ownership write-through + reconciliation" section for
 the full design.
+
+### Agent owner reassignment (TECH-7389)
+
+An existing agent's owner can be reassigned through human approval without rotating, re-minting, or revoking its credential:
+- **Shared & private bots supported**: Both private and shared (`is_shared=True`) bots have a single canonical registry owner email and are supported. Reassignment changes the registered owner only; the bot's shared/private classification, scopes, key, and expiry are untouched. Shared agents' conversation admission rules (no internal admission, asymmetric bypass) remain unchanged.
+- **No key rotation or expiry changes**: The bot's existing token and keys continue to work uninterrupted in consumers (e.g. Paperclip). Expiry/TTL remains unchanged; ownership reassignment is never credential revocation.
+- **Eligibility**:
+  - Target agent must be board-active (`status == "active"`).
+  - Must not be a human identity (no `@` in `sub`).
+  - Must be a bare, non-keyed credential identity (`agent.sub == credential_sub`, i.e., no `::` key component; keyed aliases cannot be reassigned directly).
+  - Must have no registered sibling aliases under the base credential (including suspended siblings; credential reassignment affects the entire credential subject).
+  - `new_owner_email` must be a valid, normalized `@redesignhealth.com` corporate address (validated via `normalize_corp_email`).
+- **Workflow**:
+  1. An admin or interactive caller invokes `comms_request_owner_reassignment(agent_id=..., new_owner_email=...)`. The board validates target eligibility and emits an `agent.owner_reassignment_requested` audit event without mutating the agent row or making external network calls.
+  2. The tool returns an AXI response containing:
+     - `approval_url`: Human-approval URL on the decision page (`${DECISION_PAGE_BASE_URL}/ownership/reassign?sub=...&new_owner_email=...`).
+     - `sub`: Target agent's board identity.
+     - `credential_sub`: Target agent's bare credential subject identifier (`sub` and `credential_sub` are identical bare IDs because keyed identities are excluded).
+     - `affected_board_identities`: List containing the single bare board identity (`[agent.sub]`).
+     - `current_owner_email`: Cached owner email on the board's `Agent` row.
+     - `new_owner_email`: Normalized destination corporate email address.
+     - `is_shared`: Target's shared flag (preserved).
+     - `classification_unchanged`: `True`.
+     - `requires_human_approval`: `True`.
+     - `key_unchanged`: `True`.
+     - `note`: Operator-facing continuity and cache propagation notice.
+  3. An authorized human navigates to `approval_url`, signs in via Okta (`${DECISION_PAGE_BASE_URL}/ownership/oauth/callback`), reviews the transfer details, and checks an explicit approval box to confirm.
+  4. The decision page executes an atomic CAS update in the ownership registry (`agent_owners`), setting `owner_email`, `updated_by`, and `updated_at`. Cross-service contract reference: approvals PR #86 (`rh_comms_plugins/auth.py`, `cache.py`), requiring single-use nonce, active status, expected current owner email, and expected `updated_at`. The active registry row requirement is enforced downstream by the decision page approval gate, not by a board tool precheck.
+- **Holds & propagation**:
+  - Newly created approval holds post-reassignment route to the new owner once the verifier cache has refreshed; already-pending holds remain bound to the previous owner.
+  - Verifier `OwnerCache` (`RHAgentVerifier` in approvals PR #86 / `rh_comms_plugins/auth.py`) caches positive registry lookups for 300s (with up to 24h stale-on-outage ceiling). This ~300s TTL belongs to the verifier's cache layer, **not** to the board's database rows (board rows have no TTL). Avoid unconditional "at most 300s wall-clock" promises, as bot requests and cache layer refresh govern actual timing.
+  - Board rows (`agents.owner_sub` / `agents.owner_email`) update only via write-through upon the bot's *next* tool call resolving its own row (tools like `comms_whoami` and `comms_register` do not resolve caller rows and do not write through).
+  - Ownership reconciliation is a manual admin call (`POST /admin/agents/reconcile-ownership`), not an automated background scheduler. It reconciles private agents' `owner_sub` only (not email), and is only effective with a registry-backed `OWNERSHIP_CLIENT` (the default `AgentTableOwnershipClient` compares the agent table to itself, making reconciliation a no-op).
+  - An idle bot remains stale on the board until its next qualifying request or manual reconciliation. Built-in `agent_jwt_hs256` static tokens are unaffected (claims derived from static tokens).
+  - Bot conversation memberships and past history carry over seamlessly. Past message authorship and creation provenance remain intact.
+- **Configuration & Setup**:
+  - Requires `DECISION_PAGE_BASE_URL` configured on the board with an `https://` origin.
+  - The decision page OAuth callback URI `${DECISION_PAGE_BASE_URL}/ownership/oauth/callback` must be added to the registry Okta app's allowed redirect URIs.
+  - Okta app assignments to the registry application must be restricted to authorized operators/admins.
+  - Note: Automated comms operations do NOT require Okta login; only human reassignment approval uses the registry Okta login flow.
 
 ## Local development
 

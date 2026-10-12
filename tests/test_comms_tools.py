@@ -27,12 +27,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 import pytest_asyncio
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -41,6 +42,9 @@ from sqlalchemy.ext.asyncio import (
 )
 
 import plugins
+import service
+from exceptions import AccessDeniedError
+from models import AuditLog
 from schemas import MESSAGE_TYPES
 
 # Coverage for MESSAGE_TYPES fitting within MAX_ACCEPTED_TYPES (a precondition
@@ -1520,6 +1524,1024 @@ class TestAdminRegister:
                     "accepted_types": sorted(MESSAGE_TYPES),
                 },
             )
+
+
+class TestRequestOwnerReassignment:
+    """TECH-7389: comms_request_owner_reassignment, admin-gated link generation."""
+
+    async def test_admin_scope_can_request_reassignment(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("DECISION_PAGE_BASE_URL", "https://decisions.example.com")
+        registered = await _register(main, test_session_factory, "agent-for-reassign")
+
+        admin_token = _token(
+            "admin-operator-reassign", scopes=["comms:read", "comms:write", "comms:admin"]
+        )
+        result = await _call(
+            main,
+            test_session_factory,
+            admin_token,
+            "comms_request_owner_reassignment",
+            {
+                "agent_id": registered["agent_id"],
+                "new_owner_email": "new-owner@redesignhealth.com",
+            },
+        )
+        assert result["requires_human_approval"] is True
+        assert result["key_unchanged"] is True
+        assert result["is_shared"] is False
+        assert result["classification_unchanged"] is True
+        assert "This changes the registered owner only" in result["note"]
+        assert result["sub"] == registered["sub"]
+        assert result["new_owner_email"] == "new-owner@redesignhealth.com"
+        assert result["approval_url"].startswith(
+            "https://decisions.example.com/ownership/reassign?"
+        )
+        assert f"sub={registered['sub']}" in result["approval_url"]
+        assert "new_owner_email=new-owner%40redesignhealth.com" in result["approval_url"]
+        # Round-2 fields: credential-wide scope of the human approval.
+        assert result["credential_sub"] == registered["sub"]
+        assert result["affected_board_identities"] == [registered["sub"]]
+
+        # Verify board agents row was NOT mutated
+        async with test_session_factory() as session:
+            agent = await service._find_agent_by_id(session, uuid.UUID(registered["agent_id"]))
+            assert agent is not None
+            assert agent.owner_email != "new-owner@redesignhealth.com"
+            assert agent.status == "active"
+
+            # Verify audit trail
+            audit_stmt = select(AuditLog).where(
+                AuditLog.action == "agent.owner_reassignment_requested",
+                AuditLog.agent_id == agent.id,
+            )
+            audit_row = (await session.execute(audit_stmt)).scalar_one_or_none()
+            assert audit_row is not None
+            assert audit_row.actor_sub == "admin-operator-reassign"
+            assert audit_row.detail["new_owner_email"] == "new-owner@redesignhealth.com"
+            assert audit_row.detail["credential_sub"] == registered["sub"]
+            assert audit_row.detail["affected_board_identities"] == [registered["sub"]]
+
+    async def test_interactive_caller_can_request_reassignment(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("DECISION_PAGE_BASE_URL", "https://decisions.example.com")
+        registered = await _register(main, test_session_factory, "agent-for-reassign-interactive")
+
+        # Interactive/Okta caller -- the established convention (see
+        # TestSetAgentShared/TestDeregisterAgent's interactive tests): a raw
+        # MagicMock token whose ``iss`` is NOT "agent-jwt", so
+        # scopes.is_interactive_token() bypasses scope enforcement and
+        # identity.try_resolve_email() resolves the human from the ``email``
+        # claim. No comms:admin scope needed.
+        interactive_token = MagicMock()
+        interactive_token.claims = {
+            "iss": "https://agent-comms.example/mcp",
+            "sub": "00u-interactive-reassign-human",
+            "email": "user@redesignhealth.com",
+        }
+        interactive_token.scopes = []
+        interactive_token.client_id = "user@redesignhealth.com"
+        result = await _call(
+            main,
+            test_session_factory,
+            interactive_token,
+            "comms_request_owner_reassignment",
+            {
+                "agent_id": registered["agent_id"],
+                "new_owner_email": "new-owner2@redesignhealth.com",
+            },
+        )
+        assert result["requires_human_approval"] is True
+        assert result["key_unchanged"] is True
+
+        # The interactive caller's EMAIL is what lands in the audit trail's
+        # actor_sub (identity.try_resolve_email prefers the email claim for
+        # non-agent-jwt issuers).
+        async with test_session_factory() as session:
+            agent = await service._find_agent_by_id(session, uuid.UUID(registered["agent_id"]))
+            audit_stmt = select(AuditLog).where(
+                AuditLog.action == "agent.owner_reassignment_requested",
+                AuditLog.agent_id == agent.id,
+            )
+            audit_row = (await session.execute(audit_stmt)).scalar_one_or_none()
+            assert audit_row is not None
+            assert audit_row.actor_sub == "user@redesignhealth.com"
+
+    async def test_requires_admin_scope_or_interactive(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("DECISION_PAGE_BASE_URL", "https://decisions.example.com")
+        registered = await _register(main, test_session_factory, "agent-unauthorized-reassign")
+
+        unauthorized_token = _token("unauthorized-operator", scopes=["comms:read", "comms:write"])
+        with pytest.raises(
+            ToolError, match=re.escape("access_denied: not authorized for this resource")
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                unauthorized_token,
+                "comms_request_owner_reassignment",
+                {
+                    "agent_id": registered["agent_id"],
+                    "new_owner_email": "new-owner@redesignhealth.com",
+                },
+            )
+
+    async def test_unknown_agent_id_denied(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("DECISION_PAGE_BASE_URL", "https://decisions.example.com")
+        admin_token = _token("admin-op", scopes=["comms:read", "comms:write", "comms:admin"])
+        with pytest.raises(
+            ToolError, match=re.escape("access_denied: not authorized for this resource")
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                admin_token,
+                "comms_request_owner_reassignment",
+                {
+                    "agent_id": str(uuid.uuid4()),
+                    "new_owner_email": "new-owner@redesignhealth.com",
+                },
+            )
+
+    async def test_suspended_agent_denied(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("DECISION_PAGE_BASE_URL", "https://decisions.example.com")
+        registered = await _register(main, test_session_factory, "agent-suspended-target")
+        admin_token = _token("admin-op", scopes=["comms:read", "comms:write", "comms:admin"])
+
+        # Suspend the agent
+        await _call(
+            main,
+            test_session_factory,
+            admin_token,
+            "comms_deregister_agent",
+            {"agent_id": registered["agent_id"]},
+        )
+
+        with pytest.raises(
+            ToolError, match=re.escape("access_denied: not authorized for this resource")
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                admin_token,
+                "comms_request_owner_reassignment",
+                {
+                    "agent_id": registered["agent_id"],
+                    "new_owner_email": "new-owner@redesignhealth.com",
+                },
+            )
+
+    async def test_shared_agent_allowed_and_is_shared_unchanged(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("DECISION_PAGE_BASE_URL", "https://decisions.example.com")
+        registered = await _register(main, test_session_factory, "agent-shared-target")
+        admin_token = _token("admin-op", scopes=["comms:read", "comms:write", "comms:admin"])
+
+        # Make it shared
+        await _call(
+            main,
+            test_session_factory,
+            admin_token,
+            "comms_set_agent_shared",
+            {"agent_id": registered["agent_id"], "is_shared": True},
+        )
+
+        result = await _call(
+            main,
+            test_session_factory,
+            admin_token,
+            "comms_request_owner_reassignment",
+            {
+                "agent_id": registered["agent_id"],
+                "new_owner_email": "new-owner@redesignhealth.com",
+            },
+        )
+        assert result["requires_human_approval"] is True
+        assert result["key_unchanged"] is True
+        assert result["is_shared"] is True
+        assert result["classification_unchanged"] is True
+        assert "This changes the registered owner only" in result["note"]
+
+        # Verify is_shared remains True in DB (never flipped)
+        async with test_session_factory() as session:
+            agent = await service._find_agent_by_id(session, uuid.UUID(registered["agent_id"]))
+            assert agent is not None
+            assert agent.is_shared is True
+
+    async def test_invalid_new_owner_email_rejected(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("DECISION_PAGE_BASE_URL", "https://decisions.example.com")
+        registered = await _register(main, test_session_factory, "agent-email-val")
+        admin_token = _token("admin-op", scopes=["comms:read", "comms:write", "comms:admin"])
+
+        with pytest.raises(
+            ToolError,
+            match=re.escape(
+                "invalid_request: new_owner_email must be a valid "
+                "@redesignhealth.com corporate address"
+            ),
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                admin_token,
+                "comms_request_owner_reassignment",
+                {
+                    "agent_id": registered["agent_id"],
+                    "new_owner_email": "attacker@external.com",
+                },
+            )
+
+    async def test_decision_page_base_url_misconfigured(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        registered = await _register(main, test_session_factory, "agent-baseurl-test")
+        admin_token = _token("admin-op", scopes=["comms:read", "comms:write", "comms:admin"])
+
+        # Unset
+        monkeypatch.delenv("DECISION_PAGE_BASE_URL", raising=False)
+        with pytest.raises(
+            ToolError, match="misconfigured: DECISION_PAGE_BASE_URL is not configured"
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                admin_token,
+                "comms_request_owner_reassignment",
+                {
+                    "agent_id": registered["agent_id"],
+                    "new_owner_email": "new@redesignhealth.com",
+                },
+            )
+
+        # HTTP instead of HTTPS
+        monkeypatch.setenv("DECISION_PAGE_BASE_URL", "http://decisions.example.com")
+        with pytest.raises(
+            ToolError, match="misconfigured: DECISION_PAGE_BASE_URL must be an https:// URL"
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                admin_token,
+                "comms_request_owner_reassignment",
+                {
+                    "agent_id": registered["agent_id"],
+                    "new_owner_email": "new@redesignhealth.com",
+                },
+            )
+
+    async def test_read_only_scope_denied_by_middleware_before_handler(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """comms_request_owner_reassignment is enrolled at comms:write (the
+        comms:admin gate is IN-handler), so a read-only service token is
+        denied by ScopeEnforcementMiddleware BEFORE the tool body -- and
+        therefore BEFORE the agent lookup -- runs at all. Observables: the
+        middleware's own insufficient_scope message (deliberately distinct
+        from the in-handler uniform access_denied), and not a single audit
+        row written (contrast the in-handler denial, which writes
+        denied.owner_reassignment_requires_elevated_scope)."""
+        monkeypatch.setenv("DECISION_PAGE_BASE_URL", "https://decisions.example.com")
+        registered = await _register(main, test_session_factory, "agent-readonly-target")
+
+        read_only_token = _token("read-only-caller", scopes=["comms:read"])
+        with pytest.raises(
+            ToolError,
+            match=re.escape(
+                "insufficient_scope: tool 'comms_request_owner_reassignment' "
+                "requires elevated permissions"
+            ),
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                read_only_token,
+                "comms_request_owner_reassignment",
+                {
+                    "agent_id": registered["agent_id"],
+                    "new_owner_email": "new@redesignhealth.com",
+                },
+            )
+
+        async with test_session_factory() as session:
+            # The registration audit row exists; what must NOT exist is any
+            # row the reassignment path itself could have written -- the
+            # handler never ran, so neither its request audit nor any
+            # in-handler denial audit can be present.
+            reassignment_actions = (
+                "agent.owner_reassignment_requested",
+                "denied.owner_reassignment_requires_elevated_scope",
+                "denied.unknown_agent",
+                "denied.agent_suspended",
+            )
+            rows = (
+                (
+                    await session.execute(
+                        select(AuditLog).where(AuditLog.action.in_(reassignment_actions))
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert rows == []  # middleware denial: no handler, no audit
+
+    async def test_non_admin_denial_is_uniform_and_precedes_lookup(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A read+write service token without comms:admin is denied in-handler
+        BEFORE the target lookup: the error is byte-identical whether the
+        agent id exists or not (anti-enumeration), and the only DB writes are
+        the denial audit row -- the agent row itself is never touched."""
+        monkeypatch.setenv("DECISION_PAGE_BASE_URL", "https://decisions.example.com")
+        registered = await _register(main, test_session_factory, "agent-nonadmin-target")
+        unauthorized = _token("non-admin-caller", scopes=["comms:read", "comms:write"])
+
+        for agent_id in (registered["agent_id"], str(uuid.uuid4())):
+            with pytest.raises(
+                ToolError,
+                match=re.escape("access_denied: not authorized for this resource"),
+            ) as exc_info:
+                await _call(
+                    main,
+                    test_session_factory,
+                    unauthorized,
+                    "comms_request_owner_reassignment",
+                    {
+                        "agent_id": agent_id,
+                        "new_owner_email": "new@redesignhealth.com",
+                    },
+                )
+            # Uniform denial: same message for a real and a bogus agent id.
+            assert str(exc_info.value) == "access_denied: not authorized for this resource"
+
+        async with test_session_factory() as session:
+            agent = await service._find_agent_by_id(session, uuid.UUID(registered["agent_id"]))
+            assert agent is not None
+            assert agent.status == "active"
+            # Exactly the denial audit rows -- no reassignment-requested row.
+            denial_rows = (
+                (
+                    await session.execute(
+                        select(AuditLog).where(
+                            AuditLog.actor_sub == "non-admin-caller",
+                            AuditLog.action == "denied.owner_reassignment_requires_elevated_scope",
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert len(denial_rows) == 2
+            requested_rows = (
+                (
+                    await session.execute(
+                        select(AuditLog).where(
+                            AuditLog.action == "agent.owner_reassignment_requested"
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert requested_rows == []
+
+    async def test_non_admin_denial_with_missing_and_invalid_config_for_real_and_random_agents(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A non-admin caller gets the exact same uniform access_denied whether
+        DECISION_PAGE_BASE_URL is missing or invalid, and whether the target
+        agent exists or not (anti-enumeration & no config disclosure). No
+        agent.owner_reassignment_requested row is ever written."""
+        registered = await _register(main, test_session_factory, "agent-nonadmin-cfg-target")
+        unauthorized = _token("non-admin-cfg-caller", scopes=["comms:read", "comms:write"])
+
+        config_cases: list[str | None] = [
+            None,  # missing config
+            "http://insecure.example.com",  # invalid scheme
+        ]
+        target_ids = [registered["agent_id"], str(uuid.uuid4())]
+
+        for cfg in config_cases:
+            if cfg is None:
+                monkeypatch.delenv("DECISION_PAGE_BASE_URL", raising=False)
+            else:
+                monkeypatch.setenv("DECISION_PAGE_BASE_URL", cfg)
+
+            for target_id in target_ids:
+                with pytest.raises(
+                    ToolError,
+                    match=re.escape("access_denied: not authorized for this resource"),
+                ) as exc_info:
+                    await _call(
+                        main,
+                        test_session_factory,
+                        unauthorized,
+                        "comms_request_owner_reassignment",
+                        {
+                            "agent_id": target_id,
+                            "new_owner_email": "new@redesignhealth.com",
+                        },
+                    )
+                assert str(exc_info.value) == "access_denied: not authorized for this resource"
+
+        async with test_session_factory() as session:
+            requested_rows = (
+                (
+                    await session.execute(
+                        select(AuditLog).where(
+                            AuditLog.action == "agent.owner_reassignment_requested"
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert requested_rows == []
+            denial_rows = (
+                (
+                    await session.execute(
+                        select(AuditLog).where(
+                            AuditLog.actor_sub == "non-admin-cfg-caller",
+                            AuditLog.action == "denied.owner_reassignment_requires_elevated_scope",
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert len(denial_rows) == len(config_cases) * len(target_ids)
+
+    async def test_denied_email_not_stored_in_audit_detail(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Denial audit row detail contains ONLY target_agent_id; large or malicious
+        new_owner_email strings are not stored in audit_log."""
+        monkeypatch.setenv("DECISION_PAGE_BASE_URL", "https://decisions.example.com")
+        target_agent_id = str(uuid.uuid4())
+        giant_email = "a" * 100000
+        unauthorized = _token("non-admin-giant-email", scopes=["comms:read", "comms:write"])
+
+        with pytest.raises(
+            ToolError,
+            match=re.escape("access_denied: not authorized for this resource"),
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                unauthorized,
+                "comms_request_owner_reassignment",
+                {
+                    "agent_id": target_agent_id,
+                    "new_owner_email": giant_email,
+                },
+            )
+
+        async with test_session_factory() as session:
+            denial = (
+                await session.execute(
+                    select(AuditLog).where(
+                        AuditLog.actor_sub == "non-admin-giant-email",
+                        AuditLog.action == "denied.owner_reassignment_requires_elevated_scope",
+                    )
+                )
+            ).scalar_one()
+            assert denial.detail == {"target_agent_id": target_agent_id}
+            assert "new_owner_email" not in denial.detail
+
+    async def test_admin_misconfigured_base_url_emits_zero_audit_entries(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When DECISION_PAGE_BASE_URL is missing or invalid, an admin caller gets
+        misconfigured ToolError and zero audit entries are written (no requested,
+        no denial, no audit log rows)."""
+        registered = await _register(main, test_session_factory, "agent-admin-misconfig")
+        admin_token = _token(
+            "admin-misconfig-op", scopes=["comms:read", "comms:write", "comms:admin"]
+        )
+
+        # Case 1: missing
+        monkeypatch.delenv("DECISION_PAGE_BASE_URL", raising=False)
+        with pytest.raises(
+            ToolError, match="misconfigured: DECISION_PAGE_BASE_URL is not configured"
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                admin_token,
+                "comms_request_owner_reassignment",
+                {
+                    "agent_id": registered["agent_id"],
+                    "new_owner_email": "new@redesignhealth.com",
+                },
+            )
+
+        # Case 2: invalid URL
+        monkeypatch.setenv("DECISION_PAGE_BASE_URL", "http://insecure.example.com")
+        with pytest.raises(
+            ToolError, match="misconfigured: DECISION_PAGE_BASE_URL must be an https:// URL"
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                admin_token,
+                "comms_request_owner_reassignment",
+                {
+                    "agent_id": registered["agent_id"],
+                    "new_owner_email": "new@redesignhealth.com",
+                },
+            )
+
+        async with test_session_factory() as session:
+            audit_rows = (
+                (
+                    await session.execute(
+                        select(AuditLog).where(AuditLog.actor_sub == "admin-misconfig-op")
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert audit_rows == []
+
+    async def test_direct_service_call_still_denies_non_admin(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """S2's auth-before-config split gave the tool handler its own
+        pre-flight ``authorize_owner_reassignment`` call, but the SERVICE
+        function must keep guarding itself: a DIRECT call to
+        ``service.request_owner_reassignment`` -- no tool handler, so no
+        pre-flight authorization and no DECISION_PAGE_BASE_URL parsing --
+        with ``admin_authorized=False`` is denied against a fully eligible
+        target. Stripping the internal guard because "the handler already
+        authorizes" would leave every direct service caller (future tools,
+        scripts, api-main) unauthenticated, and only this path catches it."""
+        registered = await _register(main, test_session_factory, "agent-direct-service-target")
+
+        async with test_session_factory() as session:
+            with pytest.raises(AccessDeniedError) as exc_info:
+                await service.request_owner_reassignment(
+                    session,
+                    actor_sub="direct-service-caller",
+                    agent_id=uuid.UUID(registered["agent_id"]),
+                    new_owner_email="new@redesignhealth.com",
+                    admin_authorized=False,
+                )
+        assert str(exc_info.value) == "access_denied: not authorized for this resource"
+        assert exc_info.value.reason == "denied.owner_reassignment_requires_elevated_scope"
+
+        # A FRESH session: the denial audit row must be committed (the
+        # service-layer ``_deny`` commits before raising), not just staged.
+        async with test_session_factory() as session:
+            denial = (
+                await session.execute(
+                    select(AuditLog).where(
+                        AuditLog.actor_sub == "direct-service-caller",
+                        AuditLog.action == "denied.owner_reassignment_requires_elevated_scope",
+                    )
+                )
+            ).scalar_one()
+            # Bounded denial detail at the service layer too: exactly the
+            # target UUID, never the (possibly huge) new_owner_email.
+            assert denial.detail == {"target_agent_id": registered["agent_id"]}
+            assert "new_owner_email" not in denial.detail
+            requested_rows = (
+                (
+                    await session.execute(
+                        select(AuditLog).where(
+                            AuditLog.action == "agent.owner_reassignment_requested"
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert requested_rows == []
+            agent = await service._find_agent_by_id(session, uuid.UUID(registered["agent_id"]))
+            assert agent is not None
+            assert agent.owner_email != "new@redesignhealth.com"
+            assert agent.status == "active"
+
+    async def test_approval_url_query_carries_only_sub_and_new_owner_email(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The generated approval URL carries EXACTLY two query parameters --
+        the target's sub and the canonical new owner email. No flags, no
+        agent_id, no token, nothing that could smuggle a pre-authorization
+        or a classification change into the human-approval page."""
+        monkeypatch.setenv("DECISION_PAGE_BASE_URL", "https://decisions.example.com")
+        registered = await _register(main, test_session_factory, "agent-url-shape")
+
+        admin_token = _token("admin-op", scopes=["comms:read", "comms:write", "comms:admin"])
+        result = await _call(
+            main,
+            test_session_factory,
+            admin_token,
+            "comms_request_owner_reassignment",
+            {
+                "agent_id": registered["agent_id"],
+                "new_owner_email": "  New.Owner@RedesignHealth.com ",
+            },
+        )
+        parsed = urlparse(result["approval_url"])
+        assert parsed.scheme == "https"
+        assert parsed.netloc == "decisions.example.com"
+        assert parsed.path == "/ownership/reassign"
+        assert set(parse_qs(parsed.query).keys()) == {"sub", "new_owner_email"}
+        # Proper encoding + canonicalization of the email.
+        assert parse_qs(parsed.query)["new_owner_email"] == ["new.owner@redesignhealth.com"]
+        assert parse_qs(parsed.query)["sub"] == [registered["sub"]]
+        # The result payload mirrors the same canonicalization.
+        assert result["new_owner_email"] == "new.owner@redesignhealth.com"
+
+    async def test_agent_row_fully_unchanged_by_request(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The tool is audit-only: a FULL column snapshot of the target
+        Agent row (owner_sub, owner_email, is_shared, status, bound_at,
+        schema versions, display name, timestamps, ...) is identical
+        before and after the call -- shared AND private targets alike."""
+        monkeypatch.setenv("DECISION_PAGE_BASE_URL", "https://decisions.example.com")
+        admin_token = _token("admin-op", scopes=["comms:read", "comms:write", "comms:admin"])
+
+        for shared in (False, True):
+            sub = "agent-snapshot-shared" if shared else "agent-snapshot-private"
+            registered = await _register(main, test_session_factory, sub)
+            if shared:
+                await _call(
+                    main,
+                    test_session_factory,
+                    admin_token,
+                    "comms_set_agent_shared",
+                    {"agent_id": registered["agent_id"], "is_shared": True},
+                )
+
+            def _snapshot(agent: service.Agent) -> dict[str, Any]:
+                return {
+                    col.name: getattr(agent, col.name) for col in service.Agent.__table__.columns
+                }
+
+            async with test_session_factory() as session:
+                before = _snapshot(
+                    await service._find_agent_by_id(session, uuid.UUID(registered["agent_id"]))
+                )
+            assert before["is_shared"] is shared  # precondition
+
+            result = await _call(
+                main,
+                test_session_factory,
+                admin_token,
+                "comms_request_owner_reassignment",
+                {
+                    "agent_id": registered["agent_id"],
+                    "new_owner_email": "new-owner@redesignhealth.com",
+                },
+            )
+            assert result["is_shared"] is shared
+            assert result["classification_unchanged"] is True
+
+            async with test_session_factory() as session:
+                after = _snapshot(
+                    await service._find_agent_by_id(session, uuid.UUID(registered["agent_id"]))
+                )
+            # No column moved -- not even updated_at.
+            assert after == before
+
+    async def test_email_shaped_agent_row_rejected(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A human identity (email-shaped sub) can never be an ownership
+        reassignment TARGET. Registration refuses to create such rows, so
+        this seeds one directly in the DB -- proving the service-layer
+        guard, not just the registration gate."""
+        monkeypatch.setenv("DECISION_PAGE_BASE_URL", "https://decisions.example.com")
+        async with test_session_factory() as session:
+            human_row = service.Agent(
+                sub="human-row@redesignhealth.com",
+                owner_sub="owner-human",
+                owner_email="owner-human@redesignhealth.com",
+                display_name="Human Identity Row",
+                accepted_types=[],
+                status="active",
+                min_schema_version=1,
+                max_schema_version=1,
+                is_shared=False,
+            )
+            session.add(human_row)
+            await session.commit()
+            human_agent_id = human_row.id
+
+        admin_token = _token("admin-op", scopes=["comms:read", "comms:write", "comms:admin"])
+        with pytest.raises(
+            ToolError,
+            match=re.escape("invalid_request: cannot reassign owner of a human identity"),
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                admin_token,
+                "comms_request_owner_reassignment",
+                {
+                    "agent_id": str(human_agent_id),
+                    "new_owner_email": "new@redesignhealth.com",
+                },
+            )
+
+    async def test_keyed_identity_target_rejected(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """HIGH round-2 finding: a keyed identity (base::key) can never be a
+        reassignment TARGET. The board's compose rules mean a keyed row's JWT
+        cannot act board-side, and its base is authoritative -- reassigning a
+        keyed row directly would be a wrong-subject transfer. The tool must
+        reject it BEFORE issuing any link or writing any audit row."""
+        monkeypatch.setenv("DECISION_PAGE_BASE_URL", "https://decisions.example.com")
+        register_token = _token("keyed-base-identity")
+        registered = await _call(
+            main,
+            test_session_factory,
+            register_token,
+            "comms_register",
+            {
+                "display_name": "keyed reassignment target",
+                "accepted_types": sorted(MESSAGE_TYPES),
+                "agent_key": "bot-9",
+            },
+        )
+        assert registered["sub"] == "keyed-base-identity::bot-9"
+
+        admin_token = _token("admin-op", scopes=["comms:read", "comms:write", "comms:admin"])
+        with pytest.raises(
+            ToolError,
+            match=re.escape(
+                "invalid_request: cannot reassign keyed agent identity "
+                "'keyed-base-identity::bot-9' directly"
+            ),
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                admin_token,
+                "comms_request_owner_reassignment",
+                {
+                    "agent_id": registered["agent_id"],
+                    "new_owner_email": "new@redesignhealth.com",
+                },
+            )
+
+        # Zero side effects: no reassignment-requested audit row, row unchanged.
+        async with test_session_factory() as session:
+            agent = await service._find_agent_by_id(session, uuid.UUID(registered["agent_id"]))
+            assert agent is not None
+            assert agent.sub == "keyed-base-identity::bot-9"
+            requested = (
+                (
+                    await session.execute(
+                        select(AuditLog).where(
+                            AuditLog.action == "agent.owner_reassignment_requested"
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert requested == []
+
+    async def test_bare_target_with_active_keyed_sibling_rejected(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A BARE target with ANY sibling alias under the same base credential
+        is rejected (active sibling case): the transfer is credential-wide, so
+        a bare-only link would silently miss the sibling identities."""
+        monkeypatch.setenv("DECISION_PAGE_BASE_URL", "https://decisions.example.com")
+        base_token = _token("sib-base-active")
+        bare = await _call(
+            main,
+            test_session_factory,
+            base_token,
+            "comms_register",
+            {
+                "display_name": "bare sibling base",
+                "accepted_types": sorted(MESSAGE_TYPES),
+            },
+        )
+        keyed = await _call(
+            main,
+            test_session_factory,
+            base_token,
+            "comms_register",
+            {
+                "display_name": "keyed sibling alias",
+                "accepted_types": sorted(MESSAGE_TYPES),
+                "agent_key": "two",
+                # The TECH-5736 fork guard requires the explicit acknowledge
+                # for a second identity under the same base sub.
+                "confirm_new_identity": True,
+            },
+        )
+        assert keyed["sub"] == "sib-base-active::two"
+
+        admin_token = _token("admin-op", scopes=["comms:read", "comms:write", "comms:admin"])
+        with pytest.raises(
+            ToolError,
+            match=re.escape("invalid_request: cannot reassign agent identity with sibling aliases"),
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                admin_token,
+                "comms_request_owner_reassignment",
+                {
+                    "agent_id": bare["agent_id"],
+                    "new_owner_email": "new@redesignhealth.com",
+                },
+            )
+
+        async with test_session_factory() as session:
+            requested = (
+                (
+                    await session.execute(
+                        select(AuditLog).where(
+                            AuditLog.action == "agent.owner_reassignment_requested"
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert requested == []
+            for sub in ("sib-base-active", "sib-base-active::two"):
+                agent = await service._find_agent_by_id(
+                    session,
+                    uuid.UUID(bare["agent_id"] if sub == "sib-base-active" else keyed["agent_id"]),
+                )
+                assert agent is not None and agent.sub == sub
+
+    async def test_bare_target_with_suspended_sibling_rejected(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """ANY sibling blocks the bare target -- a SUSPENDED sibling alias
+        equally counts (it still exists as a board identity under the same
+        credential; a reactivation would resurrect the stale-owner copy)."""
+        monkeypatch.setenv("DECISION_PAGE_BASE_URL", "https://decisions.example.com")
+        base_token = _token("sib-base-susp")
+        bare = await _call(
+            main,
+            test_session_factory,
+            base_token,
+            "comms_register",
+            {
+                "display_name": "bare sibling base susp",
+                "accepted_types": sorted(MESSAGE_TYPES),
+            },
+        )
+        keyed = await _call(
+            main,
+            test_session_factory,
+            base_token,
+            "comms_register",
+            {
+                "display_name": "keyed sibling susp",
+                "accepted_types": sorted(MESSAGE_TYPES),
+                "agent_key": "two",
+                "confirm_new_identity": True,
+            },
+        )
+        admin_token = _token("admin-op", scopes=["comms:read", "comms:write", "comms:admin"])
+        # Suspend the keyed sibling.
+        await _call(
+            main,
+            test_session_factory,
+            admin_token,
+            "comms_deregister_agent",
+            {"agent_id": keyed["agent_id"]},
+        )
+
+        with pytest.raises(
+            ToolError,
+            match=re.escape("invalid_request: cannot reassign agent identity with sibling aliases"),
+        ):
+            await _call(
+                main,
+                test_session_factory,
+                admin_token,
+                "comms_request_owner_reassignment",
+                {
+                    "agent_id": bare["agent_id"],
+                    "new_owner_email": "new@redesignhealth.com",
+                },
+            )
+
+        async with test_session_factory() as session:
+            requested = (
+                (
+                    await session.execute(
+                        select(AuditLog).where(
+                            AuditLog.action == "agent.owner_reassignment_requested"
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert requested == []
+
+    async def test_note_documents_key_continuity_and_cache_propagation(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The operator-facing note must state the two TECH-7389 invariants:
+        classification/key/expiry continuity, and that registry ownership
+        propagates within standard CACHE windows (a delay, not a
+        revocation)."""
+        monkeypatch.setenv("DECISION_PAGE_BASE_URL", "https://decisions.example.com")
+        registered = await _register(main, test_session_factory, "agent-note-check")
+        admin_token = _token("admin-op", scopes=["comms:read", "comms:write", "comms:admin"])
+        result = await _call(
+            main,
+            test_session_factory,
+            admin_token,
+            "comms_request_owner_reassignment",
+            {
+                "agent_id": registered["agent_id"],
+                "new_owner_email": "new@redesignhealth.com",
+            },
+        )
+        note = result["note"]
+        assert "This changes the registered owner only" in note
+        assert "not changed" in note
+        assert "cache windows" in note  # delay-not-revocation wording
+        assert "carry over" in note  # history/memberships continuity
 
 
 # --- AXI empty-state / shape spot checks --------------------------------------------

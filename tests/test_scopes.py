@@ -107,10 +107,28 @@ class TestToolScopesRegistry:
         is enforced in-handler by service.may_reopen, not by this table."""
         assert TOOL_SCOPES["comms_reopen_conversation"] == "comms:write"
 
+    def test_request_owner_reassignment_uses_comms_write(self) -> None:
+        """TECH-7389: comms_request_owner_reassignment registers at the
+        baseline comms:write scope even though it is admin-gated -- the
+        comms:admin (or interactive-caller) authorization is enforced by an
+        in-handler check, NOT by this table. Registering comms:admin here
+        would invert the gate semantics (see test_comms_admin_not_a_tool_scope);
+        registering comms:write keeps the middleware denial (a read-only
+        service token) distinct from the in-handler anti-enumeration denial
+        (a read+write token without admin)."""
+        assert TOOL_SCOPES["comms_request_owner_reassignment"] == "comms:write"
+
 
 class TestRequiredScopeFor:
     def test_known_tool(self) -> None:
         assert required_scope_for("comms_whoami") == "comms:read"
+
+    def test_request_owner_reassignment_requires_write(self) -> None:
+        """TECH-7389: the reassignment-link tool must stay enrolled (an
+        unenrolled tool is fail-closed only for agent-jwt callers, and a
+        future rename dropping it from TOOL_SCOPES would silently change the
+        denial layer for every service caller)."""
+        assert required_scope_for("comms_request_owner_reassignment") == "comms:write"
 
     def test_unmapped_tool_returns_none(self) -> None:
         assert required_scope_for("definitely_not_a_real_tool") is None
@@ -372,13 +390,14 @@ class TestCommsAdminConsumers:
     """Guards scopes.py's ``:admin`` verb comment claim that the remaining
     in-handler ``comms:admin`` checks (gating a privileged PARAMETER within
     an already-``comms:write``-scoped tool, distinct from a route-level
-    auth gate) are exactly ``set_agent_shared``, ``deregister_agent``, and
-    ``admin_register`` in ``providers/comms.py``. Enumerates every function
-    in that module whose source contains the ``comms:admin`` scope check --
-    if a future PR adds a fourth, this test fails and forces an intentional
-    update rather than letting the comment quietly go stale."""
+    auth gate) are exactly ``set_agent_shared``, ``deregister_agent``,
+    ``admin_register``, and ``request_owner_reassignment`` in
+    ``providers/comms.py``. Enumerates every function in that module whose
+    source contains the ``comms:admin`` scope check -- if a future PR adds
+    another, this test fails and forces an intentional update rather than
+    letting the comment quietly go stale."""
 
-    def test_exactly_three_functions_gate_on_comms_admin(self) -> None:
+    def test_exactly_four_functions_gate_on_comms_admin(self) -> None:
         admin_gated = []
         for name, func in inspect.getmembers(comms_provider, inspect.iscoroutinefunction):
             source = inspect.getsource(func)
@@ -388,5 +407,6 @@ class TestCommsAdminConsumers:
         assert sorted(admin_gated) == [
             "admin_register",
             "deregister_agent",
+            "request_owner_reassignment",
             "set_agent_shared",
         ]

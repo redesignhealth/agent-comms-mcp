@@ -44,6 +44,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Annotated, Any
+from urllib.parse import urlencode
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ResourceError, ToolError
@@ -66,6 +67,7 @@ from exceptions import (
     DocsVerificationFailedError,
     InvalidConversationStateError,
     InvalidExtendError,
+    InvalidOwnerReassignmentError,
     RateLimitExceededError,
     SchemaVersionMismatchError,
     SiblingIdentityExistsError,
@@ -459,7 +461,7 @@ async def _map_service_errors(error_cls: type[Exception] = ToolError) -> AsyncIt
         yield
     except AccessDeniedError as exc:
         raise error_cls(str(exc)) from None
-    except InvalidExtendError as exc:
+    except (InvalidExtendError, InvalidOwnerReassignmentError) as exc:
         msg = str(exc)
         if not msg.startswith("invalid_request: "):
             msg = f"invalid_request: {msg}"
@@ -1208,6 +1210,92 @@ async def admin_register(
         "is_shared": agent.is_shared,
         "min_schema_version": agent.min_schema_version,
         "max_schema_version": agent.max_schema_version,
+    }
+
+
+@comms_server.tool
+async def request_owner_reassignment(
+    agent_id: str,
+    new_owner_email: str,
+    agent_key: str | None = None,
+) -> dict[str, Any]:
+    """Request a human-approved owner reassignment link for a registered agent (TECH-7389).
+
+    Admin-gated operation: requires the caller's token to carry the
+    ``comms:admin`` scope (or be an interactive/Okta caller) — same gate
+    as ``comms_set_agent_shared``/``comms_deregister_agent``. A caller without
+    it gets the standard anti-enumeration ``access_denied`` error.
+
+    Admin human final approval is required: this tool generates a secure
+    human-approval URL on the decision page rather than mutating the owner directly.
+    An authorized human must sign in via Okta on that page to review and
+    confirm the transfer.
+
+    The agent's is_shared flag, credentials, API keys, and token expiry remain completely unchanged.
+    Past conversation history, memberships, and provenance carry over uninterrupted.
+
+    - ``agent_id``: UUID string of the target agent from ``comms_list_agents``.
+      Target must be board-active, and not a human identity.
+    - ``new_owner_email``: Target owner's canonical @redesignhealth.com email address.
+    - ``agent_key``: Optional key when running multiple agents under one token.
+    """
+    token = _require_token()
+    if agent_key is not None:
+        agent_key = _validate_agent_key(agent_key)
+    actor_sub = _compose_sub(_require_identity(token), agent_key)
+    admin_authorized = is_interactive_token(token) or "comms:admin" in scopes_for_token(token)
+
+    target_id = _parse_uuid("agent_id", agent_id)
+
+    async with get_session_factory()() as session:
+        async with _map_service_errors():
+            await service.authorize_owner_reassignment(
+                session,
+                actor_sub=actor_sub,
+                agent_id=target_id,
+                admin_authorized=admin_authorized,
+            )
+
+        raw_base_url = os.environ.get(DECISION_PAGE_BASE_URL_ENV_VAR, "")
+        try:
+            base_url = service.parse_decision_page_base_url(raw_base_url)
+        except (ValueError, TypeError) as exc:
+            raise ToolError(f"misconfigured: {exc}") from exc
+
+        async with _map_service_errors():
+            (
+                agent,
+                canonical_new_email,
+                credential_sub,
+                affected_board_identities,
+            ) = await service.request_owner_reassignment(
+                session,
+                actor_sub=actor_sub,
+                agent_id=target_id,
+                new_owner_email=new_owner_email,
+                admin_authorized=admin_authorized,
+            )
+
+    params = {"sub": credential_sub, "new_owner_email": canonical_new_email}
+    approval_url = f"{base_url}/ownership/reassign?{urlencode(params)}"
+
+    return {
+        "approval_url": approval_url,
+        "sub": agent.sub,
+        "credential_sub": credential_sub,
+        "affected_board_identities": affected_board_identities,
+        "current_owner_email": agent.owner_email,
+        "new_owner_email": canonical_new_email,
+        "is_shared": agent.is_shared,
+        "classification_unchanged": True,
+        "requires_human_approval": True,
+        "key_unchanged": True,
+        "note": (
+            "This changes the registered owner only. The bot's shared/private classification, "
+            "scopes, key and expiry are not changed. Existing conversation history and "
+            "memberships carry over. Once approved, registry ownership propagates within "
+            "standard cache windows."
+        ),
     }
 
 
