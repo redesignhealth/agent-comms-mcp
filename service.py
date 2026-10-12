@@ -168,6 +168,7 @@ from collections.abc import Callable, Sequence
 from collections.abc import Set as AbstractSet
 from datetime import UTC, datetime, timedelta
 from typing import Any, NamedTuple, NoReturn, Protocol
+from urllib.parse import urlsplit
 
 from sqlalchemy import ColumnElement, and_, func, literal, not_, or_, select, text, tuple_
 from sqlalchemy.exc import IntegrityError
@@ -186,6 +187,7 @@ from exceptions import (
     HoldExpiredError,
     InvalidConversationStateError,
     InvalidExtendError,
+    InvalidOwnerReassignmentError,
     ProposalTargetUnavailableError,
     RateLimitExceededError,
     SchemaVersionMismatchError,
@@ -2693,6 +2695,158 @@ async def deregister_agent(
     )
     await session.commit()
     return agent
+
+
+_CORP_LOCAL_PART_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9._+-]*[a-z0-9])?$")
+
+
+def normalize_corp_email(email: str) -> str:
+    """Validate and canonicalize a corporate redesignhealth.com email address."""
+    if not isinstance(email, str):
+        raise TypeError("email must be a string")
+    cleaned = email.strip().lower()
+    if not cleaned or len(cleaned) > 254:
+        raise ValueError("email must be between 1 and 254 characters")
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in cleaned):
+        raise ValueError("email must not contain whitespace or control characters")
+    parts = cleaned.split("@")
+    if len(parts) != 2:
+        raise ValueError("email must contain exactly one '@'")
+    local_part, domain = parts
+    if domain != "redesignhealth.com":
+        raise ValueError("email must belong to domain @redesignhealth.com")
+    if not local_part or len(local_part) > 64:
+        raise ValueError("email local part must be between 1 and 64 characters")
+    if ".." in local_part:
+        raise ValueError("email local part must not contain consecutive dots")
+    if not _CORP_LOCAL_PART_PATTERN.match(local_part):
+        raise ValueError("email local part contains invalid characters or dot edges")
+    return cleaned
+
+
+def parse_decision_page_base_url(raw_url: str) -> str:
+    """Validate DECISION_PAGE_BASE_URL: strictly https, valid hostname, no query/fragment."""
+    if not isinstance(raw_url, str):
+        raise TypeError("DECISION_PAGE_BASE_URL must be a string")
+    if not raw_url.strip():
+        raise ValueError("DECISION_PAGE_BASE_URL is not configured")
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in raw_url):
+        raise ValueError("DECISION_PAGE_BASE_URL must not contain whitespace or control characters")
+    parsed = urlsplit(raw_url)
+    if parsed.scheme != "https":
+        raise ValueError("DECISION_PAGE_BASE_URL must be an https:// URL")
+    if parsed.query or parsed.fragment:
+        raise ValueError("DECISION_PAGE_BASE_URL must not contain query or fragment")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("DECISION_PAGE_BASE_URL must not contain userinfo")
+    if not parsed.hostname:
+        raise ValueError("DECISION_PAGE_BASE_URL must contain a valid hostname")
+    try:
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError("DECISION_PAGE_BASE_URL contains invalid port") from exc
+    return f"{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip('/')}"
+
+
+async def request_owner_reassignment(
+    session: AsyncSession,
+    *,
+    actor_sub: str,
+    agent_id: uuid.UUID,
+    new_owner_email: str,
+    admin_authorized: bool,
+) -> tuple[Agent, str, str, list[str]]:
+    """Admin-gated owner reassignment request: validates target agent eligibility,
+    normalizes the new owner email, and records an append-only audit event
+    (TECH-7389).
+
+    Does NOT modify the agent row in the database, nor make any HTTP calls
+    to the external registry service (respects the board's NO external writes
+    invariant).
+
+    Returns (agent, canonical_new_email, credential_sub, affected_board_identities).
+
+    Raises ``AccessDeniedError`` with reason
+    ``denied.owner_reassignment_requires_elevated_scope`` if
+    ``admin_authorized`` is False, or ``denied.unknown_agent`` if ``agent_id``
+    does not match any agent, or ``denied.agent_suspended`` if target agent is
+    suspended.
+
+    Raises ``InvalidOwnerReassignmentError`` if the target agent
+    is a human identity (contains '@' in sub), is a keyed alias, has sibling
+    aliases registered under the base credential, or if ``new_owner_email`` is invalid.
+    """
+    if not admin_authorized:
+        await _deny(
+            session,
+            actor_sub=actor_sub,
+            action="denied.owner_reassignment_requires_elevated_scope",
+            detail={"target_agent_id": str(agent_id), "new_owner_email": new_owner_email},
+        )
+
+    agent = await _find_agent_by_id(session, agent_id)
+    if agent is None:
+        await _deny(
+            session,
+            actor_sub=actor_sub,
+            action="denied.unknown_agent",
+            detail={"target_agent_id": str(agent_id)},
+        )
+
+    if agent.status != "active":
+        await _deny(
+            session,
+            actor_sub=actor_sub,
+            action="denied.agent_suspended",
+            detail={"target_agent_id": str(agent_id), "sub": agent.sub, "status": agent.status},
+        )
+
+    if "@" in agent.sub:
+        raise InvalidOwnerReassignmentError("cannot reassign owner of a human identity")
+
+    # Wire credential base check: reject keyed agent targets
+    credential_sub = agent.sub.split("::", 1)[0]
+    if agent.sub != credential_sub:
+        raise InvalidOwnerReassignmentError(
+            f"cannot reassign keyed agent identity {agent.sub!r} directly; "
+            "only bare credential identities can be reassigned"
+        )
+
+    # Reject bare target if any sibling aliases exist under this base_sub
+    siblings = await list_sibling_identities(
+        session, base_sub=credential_sub, exclude_sub=credential_sub
+    )
+    if siblings:
+        raise InvalidOwnerReassignmentError(
+            f"cannot reassign agent identity with sibling aliases under base credential "
+            f"{credential_sub!r} ({len(siblings)} sibling alias(es) found); "
+            "credential reassignment affects the entire credential subject"
+        )
+
+    try:
+        canonical_email = normalize_corp_email(new_owner_email)
+    except ValueError as exc:
+        raise InvalidOwnerReassignmentError(
+            f"new_owner_email must be a valid @redesignhealth.com corporate address: {exc}"
+        ) from exc
+
+    affected_board_identities = [agent.sub]
+
+    _audit(
+        session,
+        actor_sub=actor_sub,
+        action="agent.owner_reassignment_requested",
+        agent_id=agent.id,
+        detail={
+            "target_sub": agent.sub,
+            "credential_sub": credential_sub,
+            "affected_board_identities": affected_board_identities,
+            "current_owner_email": agent.owner_email,
+            "new_owner_email": canonical_email,
+        },
+    )
+    await session.commit()
+    return agent, canonical_email, credential_sub, affected_board_identities
 
 
 # Shared between the comms_list_agents tool's own default and the

@@ -59,11 +59,12 @@ from observability import log_auth_rejected
 #             (gating a privileged PARAMETER within an already-scoped
 #             tool, as opposed to a route-level auth gate like
 #             ``main.py``'s ``/admin/agents/reconcile-ownership``) are
-#             exactly the three listed above: ``comms_set_agent_shared``,
-#             ``comms_deregister_agent``, and ``comms_admin_register`` --
+#             exactly the four: ``comms_set_agent_shared``,
+#             ``comms_deregister_agent``, ``comms_admin_register``, and
+#             ``comms_request_owner_reassignment`` (TECH-7389) --
 #             enforced by
 #             ``tests/test_scopes.py::TestCommsAdminConsumers``, which
-#             will fail if a future PR adds a fourth without updating
+#             will fail if a future PR adds another without updating
 #             this comment.
 # ``POST /proposals`` (TECH-5872) is a non-MCP ``mcp.custom_route`` in
 # main.py, not a tool dispatched through ``ScopeEnforcementMiddleware`` --
@@ -109,6 +110,10 @@ TOOL_SCOPES: dict[str, str] = {
     # registration power -- do not assume TOOL_SCOPES alone gates this
     # tool.
     "comms_admin_register": "comms:write",
+    # Registered at comms:write deliberately -- the actual authorization
+    # (comms:admin OR an interactive/Okta caller) is enforced by an
+    # in-handler check, not by this table.
+    "comms_request_owner_reassignment": "comms:write",
     "comms_start_conversation": "comms:write",
     "comms_post_message": "comms:write",
     "comms_accept": "comms:write",

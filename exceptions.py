@@ -468,6 +468,10 @@ class ProposalTargetUnavailableError(Exception):
         self.detail = detail
 
 
+class InvalidOwnerReassignmentError(Exception):
+    """Raised when an owner reassignment request is rejected by business rules (TECH-7389)."""
+
+
 __all__ = [
     "AccessDeniedError",
     "AgentAlreadyRegisteredError",
@@ -481,6 +485,7 @@ __all__ = [
     "HoldExpiredError",
     "InvalidConversationStateError",
     "InvalidExtendError",
+    "InvalidOwnerReassignmentError",
     "ProposalTargetUnavailableError",
     "RateLimitExceededError",
     "SchemaVersionMismatchError",
