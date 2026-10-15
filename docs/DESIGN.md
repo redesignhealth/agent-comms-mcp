@@ -1303,7 +1303,7 @@ consumers.
  written in its own fresh transaction after the main commit already succeeded.
 6. Fail-closed tool scoping: unenrolled tool is unreachable by agent tokens.
 7. Rate limits per sender (30 messages/hour/conversation, 10 conversation-starts/hour,
- 2 approval holds/minute), message size caps, participant cap (50 per conversation),
+ 25 approval holds/minute), message size caps, participant cap (50 per conversation),
  and conversation expiry (7 days).
 
 ## 9. Two-axis model: conversation type (admission) × message type (boundary)
@@ -1943,7 +1943,7 @@ a code-execution primitive worth guarding against would be inconsistent with
 every other startup-time configuration knob in this codebase.
 
 `APPROVAL_HOLD_TTL` (7 days) and the
-`approval_holds_per_minute` rate limit (2, per sender) are code constants, not
+`approval_holds_per_minute` rate limit (25, per sender) are code constants, not
 env-configurable, matching every other rate limit/TTL in this codebase.
 
 **A fourth seam, `OWNERSHIP_CLIENT`** (default `agent_table`), resolves the same way

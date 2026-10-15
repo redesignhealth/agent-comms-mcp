@@ -378,7 +378,7 @@ GET_CONVERSATION_MAX_CONTEXT_HOURS = 168  # 7 days
 # per sender -- same table-count pattern as every other rate limit in this
 # module (no Redis).
 APPROVAL_HOLD_TTL = timedelta(days=7)
-MAX_APPROVAL_HOLDS_PER_MINUTE = 2
+MAX_APPROVAL_HOLDS_PER_MINUTE = 25
 
 # RFC 5321 4.5.3.1.3 total-address cap. Hoisted here (Argus round 2,
 # TECH-5786 PR follow-up) rather than left as two independently-drifting
@@ -993,11 +993,10 @@ async def _deny_rate_limited_holds(
     ``messages``/``conversations`` rows. Never part of the divert-don't-deny
     reversal -- a sender flooding the human approval queue is still capped.
 
-    At MAX_APPROVAL_HOLDS_PER_MINUTE=2 (Argus round-2), the sustained rate
-    this permits (120/hour) equals MAX_MESSAGES_PER_SENDER_PER_HOUR exactly,
-    so this cap only shapes bursts (at most 2 holds back-to-back); it no
-    longer provides an independent sustained-flood ceiling below the global
-    per-sender message cap."""
+    At MAX_APPROVAL_HOLDS_PER_MINUTE=25 (TECH-7591; originally 2), the
+    burst cap allows up to 25 approval holds per minute; sustained message
+    rate across all conversations remains bounded by
+    MAX_MESSAGES_PER_SENDER_PER_HOUR (120/hour)."""
     one_minute_ago = _now() - timedelta(minutes=1)
     count = (
         await session.execute(

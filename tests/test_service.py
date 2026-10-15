@@ -9436,6 +9436,20 @@ class TestRateLimits:
         )
         assert conversation_rows == []
 
+    def test_approval_hold_rate_limit_constant_is_25(self) -> None:
+        """TECH-7591 pins the requested default at 25 per minute (originally 2).
+
+        A hard value pin, deliberately NOT dynamic: the two behavioral tests
+        below loop ``range(MAX_APPROVAL_HOLDS_PER_MINUTE)`` and assert against
+        that same constant, so they silently shrink with the constant -- a
+        revert to 2 would pass every one of them. Only this assertion fails on
+        that revert, holding the value to what docs/DESIGN.md §8 and
+        docs/TECH-5389-APPROVAL-PIPELINE.md §5 document. The downstream
+        approvals-wake-webhook contract test still tolerates (2, 25) while
+        its board-scope-test environment pins agent-comms-mcp==0.8.3, so this
+        pin is the only guard against that revert on either side."""
+        assert MAX_APPROVAL_HOLDS_PER_MINUTE == 25
+
     async def test_approval_hold_rate_limit_under_limit_creates_holds(
         self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -9554,6 +9568,74 @@ class TestRateLimits:
         )
         # The refused call must not have created an (MAX_APPROVAL_HOLDS_PER_MINUTE + 1)th hold.
         assert len(holds) == MAX_APPROVAL_HOLDS_PER_MINUTE
+
+    async def test_approval_hold_rate_limit_window_rolls_after_one_minute(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The cap is a rolling 1-minute window -- ``created_at > now - 1
+        minute`` in ``_deny_rate_limited_holds`` -- not a lifetime cap: a
+        sender denied at the cap can create holds again once the window
+        rolls past their existing holds.
+
+        ``ApprovalHold.created_at`` is DB-stamped (``server_default=now()``,
+        NOT the service ``_now``), so -- extending the freeze rationale of
+        the two sibling tests above by one step -- freeze ``_now`` for the
+        window arithmetic, then ADVANCE the frozen clock past the window
+        rather than wait out a real minute. The advance carries 30s of
+        margin beyond the window: every hold above is DB-stamped within
+        seconds of ``frozen_now``, and a hold still counts against the
+        advanced window only if it was stamped more than 30s after
+        ``frozen_now`` -- i.e. only if setup plus the first post already
+        took over half a minute, which no runner here approaches."""
+        frozen_now = datetime.now(UTC)
+        monkeypatch.setattr(_service, "_now", lambda: frozen_now)
+        owner = await _register(session, "rl-hold-owner-3")
+        target = await _register(session, "rl-hold-target-3")
+        conversation = await start_conversation(
+            session,
+            actor_sub=owner.sub,
+            initiator_agent_id=owner.id,
+            conversation_type="open",
+            target_agent_ids=[target.id],
+            initial_message=_request_payload(),
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        for _ in range(MAX_APPROVAL_HOLDS_PER_MINUTE):
+            await post_message(
+                session,
+                actor_sub=owner.sub,
+                sender_agent_id=owner.id,
+                conversation_id=conversation.id,
+                message_type="note",
+                payload={"text": "hello"},
+            )
+        # At the cap inside the window: denied. Repeated from the sibling
+        # over-limit test on purpose -- the recovery below can only pass
+        # because the window rolled, never because the cap went missing.
+        with pytest.raises(RateLimitExceededError):
+            await post_message(
+                session,
+                actor_sub=owner.sub,
+                sender_agent_id=owner.id,
+                conversation_id=conversation.id,
+                message_type="note",
+                payload={"text": "still capped"},
+            )
+        # Roll the frozen clock past the window: the holds above (all
+        # DB-stamped within seconds of frozen_now) now fall outside
+        # ``created_at > now - 1 minute``, so hold creation is allowed again.
+        monkeypatch.setattr(_service, "_now", lambda: frozen_now + timedelta(minutes=1, seconds=30))
+        result = await post_message(
+            session,
+            actor_sub=owner.sub,
+            sender_agent_id=owner.id,
+            conversation_id=conversation.id,
+            message_type="note",
+            payload={"text": "window rolled"},
+        )
+        assert isinstance(result, ApprovalHold)
 
 
 # --- list_pending_approval_holds ---------------------------------------------------
