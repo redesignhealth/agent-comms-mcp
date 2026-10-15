@@ -9444,10 +9444,12 @@ class TestRateLimits:
         that same constant, so they silently shrink with the constant -- a
         revert to 2 would pass every one of them. Only this assertion fails on
         that revert, holding the value to what docs/DESIGN.md §8 and
-        docs/TECH-5389-APPROVAL-PIPELINE.md §5 document. The downstream
-        approvals-wake-webhook contract test still tolerates (2, 25) while
-        its board-scope-test environment pins agent-comms-mcp==0.8.3, so this
-        pin is the only guard against that revert on either side."""
+        docs/TECH-5389-APPROVAL-PIPELINE.md §5 document. Downstream
+        agent-comms-approvals-wake-webhook temporarily accepts (2, 25) in its
+        contract test until a new board release is cut and updated downstream;
+        tightening that contract test from (2, 25) tolerance to exact 25 once
+        the newer wheel is adopted is tracked as a release follow-up in
+        https://linear.app/redesign/issue/TECH-7591."""
         assert MAX_APPROVAL_HOLDS_PER_MINUTE == 25
 
     async def test_approval_hold_rate_limit_under_limit_creates_holds(

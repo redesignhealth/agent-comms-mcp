@@ -654,7 +654,7 @@ aggregation read-path any company approval UI (e.g. RH's Slack + list view) cons
 | `approval.notify_failed` | sender agent's sub (the request whose post-commit hook failed) | notifier raised (detail: notifier name, error type) |
 | `message.post` (existing) | approver / system actor / initiator | approval-time insert (detail gains `hold_id`); the synthesized opener's row carries `system_synthesized: true` |
 | `denied.risk_unscored` | sender's sub | scorer infrastructure failure — hard deny (detail: cause) |
-| `denied.rate_limited` (`approval_holds_per_minute`) | sender's sub | hold burst cap (25/min; sustained rate across all conversations remains bounded by `MAX_MESSAGES_PER_SENDER_PER_HOUR` — TECH-7591) |
+| `denied.rate_limited` (`approval_holds_per_minute`) | sender's sub | hold rate cap (rolling 25/min per sender, ~1500/hour sustained, no separate hourly hold cap; distinct from `MAX_MESSAGES_PER_SENDER_PER_HOUR` which only counts committed Message rows; TECH-7591) |
 | `denied.system_message_type` | sender's sub | agent tried to post `conversation_opened` directly |
 | `denied.approval_requires_interactive` | endpoint caller identity | non-interactive (agent) token hit a decide/list endpoint — bearer failed interactive-provider verification; the agent chain is consulted for attribution only (§9) |
 | `denied.unknown_hold` / `denied.hold_not_owner` / `denied.hold_not_sender` | caller | uniform-denial pairs (endpoint 404s; tool uniform error) |
@@ -966,3 +966,14 @@ All three closed by the ticket owner (2026-08-17):
   path in the service (predates TECH-5389), not something this pipeline introduced, and
   addressing it (e.g. a per-agent denial rate limit) is a broader hardening question than
   this ticket's scope.
+
+## 19. TECH-7591 Release Checklist
+
+Follow-up sequence for raising `MAX_APPROVAL_HOLDS_PER_MINUTE` from 2 to 25:
+
+1. **Upstream main CI**: Merge PR 80 into `agent-comms-mcp` and ensure the push-triggered `ci.yml` workflow on `main` succeeds.
+2. **Board release**: Cut a full release on `main`. Both `publish.yml` (publishes wheel to PyPI) and `deploy.yml` (builds and pushes container images to dev and prod ECR) require a successful `main` CI run before proceeding.
+3. **Downstream test pin and contract test**: Once the new `agent-comms-mcp` wheel is published to PyPI, update the downstream `board-scope-test` dependency pin and tighten `tests/rh_comms_plugins/test_internal_invite_board_contract.py` to `assert service.MAX_APPROVAL_HOLDS_PER_MINUTE == 25` together in a single PR.
+4. **Downstream plugin package on Gitea**: Merge the downstream PR to `main` and confirm that downstream `publish.yml` successfully publishes the updated package version to RH's private Gitea package index.
+5. **Dispatch derived board image build**: Manually dispatch downstream `deploy.yml` (`workflow_dispatch`), supplying the newly pushed dev-ECR image URI (`<account>.dkr.ecr.us-east-1.amazonaws.com/rh-platform-dev/apps/reclaw-comms-mcp:sha-<sha>`) as `base_image` to build and push the derived board image to dev and prod ECR.
+6. **Infrastructure image update and rollout**: Update and apply the infrastructure Terraform image pins (in `rh-data-platform`), then verify that the deployed board enforces the 25 holds/minute limit and monitor hold creation under normal load, tracking Linear issue [TECH-7591](https://linear.app/redesign/issue/TECH-7591).

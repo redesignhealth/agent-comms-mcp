@@ -993,10 +993,11 @@ async def _deny_rate_limited_holds(
     ``messages``/``conversations`` rows. Never part of the divert-don't-deny
     reversal -- a sender flooding the human approval queue is still capped.
 
-    At MAX_APPROVAL_HOLDS_PER_MINUTE=25 (TECH-7591; originally 2), the
-    burst cap allows up to 25 approval holds per minute; sustained message
-    rate across all conversations remains bounded by
-    MAX_MESSAGES_PER_SENDER_PER_HOUR (120/hour)."""
+    At MAX_APPROVAL_HOLDS_PER_MINUTE=25 (TECH-7591; originally 2), the cap
+    is a rolling 25 holds per minute per sender with no separate hourly hold
+    cap (~1500/hour sustained). The 120/hour MAX_MESSAGES_PER_SENDER_PER_HOUR
+    cap counts only committed Message rows; pending or rejected message holds
+    and invite holds do not consume it."""
     one_minute_ago = _now() - timedelta(minutes=1)
     count = (
         await session.execute(
