@@ -76,6 +76,14 @@ from observability import log_auth_rejected
 # hardcoding the string literal a second time.
 PROPOSAL_SUBMIT_SCOPE = "comms:proposals:write"
 
+# ``GET /proposals/{hold_id}/apply-record`` (TECH-7694) is a service-to-service
+# read for the approvals service's pre-apply re-check: it returns what the board
+# itself recorded about a hold's decision, so ``POST /actions/proposals/apply``
+# need not trust the board's apply token alone. Self-checked by the route (a
+# non-MCP ``mcp.custom_route``), like ``PROPOSAL_SUBMIT_SCOPE`` above. Never
+# grant it to an agent or human token.
+PROPOSAL_APPLY_RECORD_SCOPE = "proposals:apply_record:read"
+
 
 TOOL_SCOPES: dict[str, str] = {
     # --- comms (provider: providers/comms.py, namespace="comms") ---
@@ -431,6 +439,7 @@ def scopes_for_token(token: AccessToken) -> list[str]:
 
 
 __all__ = [
+    "PROPOSAL_APPLY_RECORD_SCOPE",
     "PROPOSAL_SUBMIT_SCOPE",
     "RESOURCE_SCOPES",
     "RESOURCE_TEMPLATE_SCOPES",
