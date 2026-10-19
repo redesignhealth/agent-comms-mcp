@@ -255,6 +255,22 @@ class TestApplyProposalSuccess:
             "hold_id": str(fixed_hold_id),
         }
 
+    async def test_cross_brain_target_is_sent_only_when_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _set_required_env(monkeypatch)
+        bodies: list[dict[str, Any]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            bodies.append(json.loads(request.content))
+            return httpx.Response(200, json={"applied": True, "result": None})
+
+        _patch_transport(monkeypatch, handler)
+        await apply_proposal(_ctx())
+        await apply_proposal(_ctx()._replace(cross_brain_target_sub="target-sub"))
+        assert "cross_brain_target_sub" not in bodies[0]
+        assert bodies[1]["cross_brain_target_sub"] == "target-sub"
+
 
 class TestApplyProposalValidation:
     async def test_returns_safe_outcome_when_hold_id_is_none(

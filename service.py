@@ -162,6 +162,7 @@ import contextlib
 import itertools
 import json
 import logging
+import os
 import re
 import uuid
 from collections.abc import Callable, Sequence
@@ -6795,6 +6796,9 @@ def _proposal_dict(hold: ProposalHold) -> dict[str, Any]:
         result["apply_result"] = hold.apply_result
     if hold.sender_agent_id is not None:
         result["sender_agent_id"] = str(hold.sender_agent_id)
+    if hold.cross_brain is not None:
+        result["cross_brain"] = hold.cross_brain
+        result["approvals"] = hold.approvals or []
     return result
 
 
@@ -6835,6 +6839,17 @@ def _redact_bot_facing_dict(
     guard this replaced at ``create_proposal``'s auto-judge happy path)."""
     if decision_source == "human":
         result.pop("decided_by_actor_id", None)
+    cross = result.get("cross_brain")
+    if cross is not None:
+        # Owner identities (emails) never reach a bot: keep the target and
+        # how far along the human approvals are.
+        result["cross_brain"] = {
+            "target_sub": cross["target_sub"],
+            "target_display_name": cross.get("target_display_name"),
+            "approvals_required": len(cross.get("required_owner_subs") or []),
+            "approvals_received": len(result.get("approvals") or []),
+        }
+        result.pop("approvals", None)
     return result
 
 
@@ -6979,7 +6994,12 @@ def validate_proposal_string_field(
 
 
 def _proposal_dedup_where(
-    *, kind: str, proposed_by_bot_id: str, target_id: str, action_type: str
+    *,
+    kind: str,
+    proposed_by_bot_id: str,
+    target_id: str,
+    action_type: str,
+    cross_target_sub: str = "",
 ) -> tuple[Any, ...]:
     """Shared create-time dedup predicate (TECH-5872, Argus review B1 fix):
     ``(kind, proposed_by_bot_id, target_id, action_type)`` against any
@@ -7014,6 +7034,9 @@ def _proposal_dedup_where(
         ProposalHold.status.in_(("pending", "applying")),
         ProposalHold.action["target_id"].astext == target_id,
         ProposalHold.action["action_type"].astext == action_type,
+        # TECH-7665: same key as the COALESCE(...) term in the unique index
+        # (migration c7665a1b2d3e); '' for every non-cross-brain hold.
+        func.coalesce(ProposalHold.cross_brain["target_sub"].astext, "") == cross_target_sub,
     )
 
 
@@ -7028,6 +7051,7 @@ def _apply_proposal_resubmission(
     priority: str,
     target_fingerprint: str,
     sender_agent_id: uuid.UUID | None = None,
+    cross_brain: dict[str, Any] | None = None,
 ) -> None:
     """Mutate an existing pending ``ProposalHold`` in place for a dedup
     match. Deliberately does NOT set ``hold.updated_at`` itself (Argus
@@ -7044,6 +7068,10 @@ def _apply_proposal_resubmission(
     hold.target_fingerprint = target_fingerprint
     if sender_agent_id is not None:
         hold.sender_agent_id = sender_agent_id
+    # TECH-7665: a changed payload invalidates any owner approvals already
+    # recorded against the old one; a cross-brain hold starts its approvals over.
+    hold.cross_brain = cross_brain
+    hold.approvals = None
 
 
 def _proposal_resubmission_snapshot(hold: ProposalHold) -> tuple[Any, ...]:
@@ -7093,6 +7121,7 @@ async def _dedup_or_insert_proposal(
     priority: str,
     target_fingerprint: str,
     sender_agent_id: uuid.UUID | None = None,
+    cross_brain: dict[str, Any] | None = None,
 ) -> ProposalHold:
     """INSERT a new ``proposal_holds`` row, or UPDATE an existing pending
     dedup match in place (TECH-5872 B1/B2).
@@ -7110,6 +7139,7 @@ async def _dedup_or_insert_proposal(
         proposed_by_bot_id=proposed_by_bot_id,
         target_id=target_id,
         action_type=action_type,
+        cross_target_sub=cross_brain["target_sub"] if cross_brain else "",
     )
     existing = (await session.execute(select(ProposalHold).where(*where))).scalar_one_or_none()
     if existing is not None:
@@ -7132,6 +7162,7 @@ async def _dedup_or_insert_proposal(
                 priority=priority,
                 target_fingerprint=target_fingerprint,
                 sender_agent_id=sender_agent_id,
+                cross_brain=cross_brain,
             )
         return existing
 
@@ -7148,6 +7179,7 @@ async def _dedup_or_insert_proposal(
         status="pending",
         target_fingerprint=target_fingerprint,
         sender_agent_id=sender_agent_id,
+        cross_brain=cross_brain,
     )
     session.add(hold)
     try:
@@ -7177,9 +7209,144 @@ async def _dedup_or_insert_proposal(
                 priority=priority,
                 target_fingerprint=target_fingerprint,
                 sender_agent_id=sender_agent_id,
+                cross_brain=cross_brain,
             )
         return existing_after_race
     return hold
+
+
+# --- TECH-7665: cross-brain proposals -----------------------------------------
+# A proposal of one of these kinds may name ANOTHER agent's brain in
+# ``action["target"]`` (a board agent id or board sub). Open proposing: there is
+# no relationship check; the target only has to exist and be active. v1 is
+# human-only: every required owner (target's owner, plus the submitter's owner
+# when different) must approve, and the proposal is never auto-approved.
+CROSS_BRAIN_KINDS = frozenset({"arcana_source_add"})
+CROSS_BRAIN_ENABLED_ENV_VAR = "CROSS_BRAIN_PROPOSALS_ENABLED"
+CROSS_BRAIN_MAX_PENDING_PER_SUBMITTER_ENV_VAR = "CROSS_BRAIN_MAX_PENDING_PER_SUBMITTER"
+CROSS_BRAIN_MAX_PENDING_PER_TARGET_ENV_VAR = "CROSS_BRAIN_MAX_PENDING_PER_TARGET"
+_CROSS_BRAIN_DEFAULT_MAX_PENDING_PER_SUBMITTER = 5
+_CROSS_BRAIN_DEFAULT_MAX_PENDING_PER_TARGET = 20
+_CROSS_BRAIN_MAX_TARGET_REF_LENGTH = 256
+
+
+def cross_brain_enabled() -> bool:
+    """Kill switch (default OFF): read live so an operator can flip it with a restart."""
+    return os.environ.get(CROSS_BRAIN_ENABLED_ENV_VAR, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+async def _resolve_cross_brain_target(
+    session: AsyncSession,
+    *,
+    kind: str,
+    action: dict[str, Any],
+    proposed_by_bot_id: str,
+    owner_sub: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Return ``(cross_brain, action)`` for ``create_proposal``.
+
+    ``cross_brain`` is ``None`` for an own-brain proposal (no ``target``, or a
+    ``target`` that resolves to the submitter itself, which is stripped), and the
+    action is returned untouched in every non-cross-brain case. In every
+    ``target``-bearing case the returned action has ``target`` removed (the
+    strict action models forbid it); a real cross-brain target is carried on
+    ``cross_brain`` as the canonical board sub instead.
+
+    With the kill switch off, a ``target`` on a cross-brain kind is refused with
+    the same ``unsupported proposal kind`` message the strict action models gave
+    before this feature existed. An unknown or inactive target is an opaque
+    ``target_not_found`` -- the same answer whether it never existed or is
+    suspended, so a caller cannot probe the directory.
+    """
+    if kind not in CROSS_BRAIN_KINDS or "target" not in action:
+        return None, action
+    if not cross_brain_enabled():
+        raise ValueError(f"unsupported proposal kind: {kind!r}")
+    ref = action["target"]
+    if not isinstance(ref, str) or not ref.strip() or len(ref) > _CROSS_BRAIN_MAX_TARGET_REF_LENGTH:
+        raise ValueError("action.target must be a non-empty string (a board agent id or sub)")
+    ref = ref.strip()
+    try:
+        by_id = uuid.UUID(ref)
+    except ValueError:
+        by_id = None
+    clause = Agent.id == by_id if by_id is not None else Agent.sub == ref
+    target = (
+        await session.execute(select(Agent).where(clause, Agent.status == "active"))
+    ).scalar_one_or_none()
+    if target is None:
+        raise ProposalTargetUnavailableError(
+            status_code=404, error_code="target_not_found", detail="target not found"
+        )
+    if target.sub == proposed_by_bot_id:
+        # Naming yourself is just an own-brain proposal.
+        return None, {k: v for k, v in action.items() if k != "target"}
+
+    pending = ProposalHold.status.in_(("pending", "applying"))
+    per_submitter = (
+        await session.execute(
+            select(func.count())
+            .select_from(ProposalHold)
+            .where(
+                pending,
+                ProposalHold.proposed_by_bot_id == proposed_by_bot_id,
+                ProposalHold.cross_brain.is_not(None),
+            )
+        )
+    ).scalar_one()
+    per_target = (
+        await session.execute(
+            select(func.count())
+            .select_from(ProposalHold)
+            .where(pending, ProposalHold.cross_brain["target_sub"].astext == target.sub)
+        )
+    ).scalar_one()
+    if per_submitter >= _env_positive_int(
+        CROSS_BRAIN_MAX_PENDING_PER_SUBMITTER_ENV_VAR,
+        _CROSS_BRAIN_DEFAULT_MAX_PENDING_PER_SUBMITTER,
+    ) or per_target >= _env_positive_int(
+        CROSS_BRAIN_MAX_PENDING_PER_TARGET_ENV_VAR, _CROSS_BRAIN_DEFAULT_MAX_PENDING_PER_TARGET
+    ):
+        raise RateLimitExceededError(
+            "too many pending cross-brain proposals; wait for the owners to decide",
+            reason="cross_brain_pending_cap",
+        )
+
+    required = list(dict.fromkeys([target.owner_sub, owner_sub]))
+    cross_brain = {
+        "target_sub": target.sub,
+        "target_agent_id": str(target.id),
+        "target_display_name": target.display_name,
+        "target_owner_sub": target.owner_sub,
+        "target_owner_email": target.owner_email,
+        "required_owner_subs": required,
+    }
+    # The target lives on the hold (``cross_brain``), not in ``action``: the
+    # strict per-kind action models forbid undeclared fields.
+    return cross_brain, {k: v for k, v in action.items() if k != "target"}
+
+
+def _cross_brain_required_owners(hold: ProposalHold) -> list[str]:
+    cross = hold.cross_brain
+    if cross is None:
+        return [hold.owner_sub]
+    return list(cross.get("required_owner_subs") or [hold.owner_sub])
 
 
 async def create_proposal(
@@ -7301,6 +7468,13 @@ async def create_proposal(
     # attempt marker is audited + committed below -- otherwise a malformed
     # (but authenticated) request that fails here still burns a rate-limit
     # slot before ever reaching a 422.
+    cross_brain, action = await _resolve_cross_brain_target(
+        session,
+        kind=kind,
+        action=action,
+        proposed_by_bot_id=proposed_by_bot_id,
+        owner_sub=owner_sub,
+    )
     target_id, action_type = _extract_proposal_target(action)
     priority = _classify_proposal(judge, kind, action)
 
@@ -7330,6 +7504,7 @@ async def create_proposal(
         proposed_by_bot_id=proposed_by_bot_id,
         owner_sub=owner_sub,
         hold_id=None,
+        cross_brain_target_sub=cross_brain["target_sub"] if cross_brain else None,
     )
     fingerprint_result = await _safe_fingerprint(judge, submit_ctx)
     if fingerprint_result.status == FINGERPRINT_NO_TARGET:
@@ -7370,6 +7545,7 @@ async def create_proposal(
         priority=priority,
         target_fingerprint=target_fingerprint,
         sender_agent_id=sender_agent_id,
+        cross_brain=cross_brain,
     )
 
     # Commit the pending row and release this session's DB connection
@@ -7410,6 +7586,7 @@ async def create_proposal(
         proposed_by_bot_id=proposed_by_bot_id,
         owner_sub=owner_sub,
         hold_id=hold.id,
+        cross_brain_target_sub=(hold.cross_brain or {}).get("target_sub"),
     )
     is_judge_error = False
     decision_note: str | None = None
@@ -7536,6 +7713,12 @@ async def create_proposal(
     # would be exactly the kind of path-dependent bug this comment exists
     # to prevent a future edit from reintroducing.
     await session.refresh(hold)
+    if cross_brain is not None and judged_status == "approved":
+        # TECH-7665 v1: a cross-brain proposal is NEVER auto-approved, whatever
+        # the judge plugin says (defense in depth; the approvals judge also
+        # refuses). It always waits for the required human owners.
+        judged_status = "pending"
+        decision_note = "cross-brain proposals always require human approval"
     auto_approved = judged_status == "approved" and hold.status == "pending"
 
     if not auto_approved:
@@ -7662,6 +7845,15 @@ if set(PROPOSAL_TERMINAL_STATUSES) | _NON_TERMINAL_PROPOSAL_STATUSES != set(PROP
     )
 
 
+def _proposal_visible_to_owner(owner_sub: str) -> ColumnElement[bool]:
+    """The submitter's owner (as always) or, for a cross-brain hold, any other
+    required owner (the target's owner)."""
+    return or_(
+        ProposalHold.owner_sub == owner_sub,
+        ProposalHold.cross_brain["required_owner_subs"].contains([owner_sub]),
+    )
+
+
 async def list_pending_proposal_holds(
     session: AsyncSession, *, owner_sub: str, limit: int = 50
 ) -> dict[str, Any]:
@@ -7672,7 +7864,7 @@ async def list_pending_proposal_holds(
     limit = max(1, min(limit, 200))
     stmt = (
         select(ProposalHold)
-        .where(ProposalHold.owner_sub == owner_sub, ProposalHold.status == "pending")
+        .where(_proposal_visible_to_owner(owner_sub), ProposalHold.status == "pending")
         .order_by(ProposalHold.created_at.asc())
         .limit(limit + 1)
     )
@@ -7720,7 +7912,7 @@ async def list_proposal_history_for_owner(
     stmt = (
         select(ProposalHold)
         .where(
-            ProposalHold.owner_sub == owner_sub,
+            _proposal_visible_to_owner(owner_sub),
             ProposalHold.status.in_(PROPOSAL_TERMINAL_STATUSES),
         )
         .order_by(ProposalHold.created_at.desc())
@@ -7822,6 +8014,10 @@ async def get_proposal_apply_record(
         "decision_source": hold.decision_source,
         "decided_by_actor_id": hold.decided_by_actor_id,
         "decided_at": _iso(hold.decided_at),
+        # TECH-7665: present only for a cross-brain hold, so the approvals
+        # service can verify every required owner approved the exact target.
+        "cross_brain": hold.cross_brain,
+        "approvals": hold.approvals or [],
     }
 
 
@@ -8396,11 +8592,25 @@ async def _apply_or_finalize_proposal_hold(
     proposed_by_bot_id = hold.proposed_by_bot_id
     owner_sub = hold.owner_sub
     stored_fingerprint = hold.target_fingerprint
+    cross_brain_target_sub = (hold.cross_brain or {}).get("target_sub")
+    # Defense in depth (TECH-7665): a cross-brain hold never writes unless a
+    # human decided it and every required owner's approval is recorded.
+    cross_brain_unapproved = hold.cross_brain is not None and not (
+        decision_source == "human"
+        and all(
+            any(a.get("sub") == r for a in (hold.approvals or []))
+            for r in _cross_brain_required_owners(hold)
+        )
+    )
     await session.commit()
 
     is_stale = False
-    apply_error: str | None = None
-    raw_apply_error: str | None = None
+    apply_error: str | None = (
+        "cross-brain proposal is missing a required owner approval"
+        if cross_brain_unapproved
+        else None
+    )
+    raw_apply_error: str | None = apply_error
     apply_result: dict[str, Any] | None = None
     apply_ctx = ProposalContext(
         kind=kind,
@@ -8411,6 +8621,7 @@ async def _apply_or_finalize_proposal_hold(
         proposed_by_bot_id=proposed_by_bot_id,
         owner_sub=owner_sub,
         hold_id=hold_id,
+        cross_brain_target_sub=cross_brain_target_sub,
     )
     # Argus review round-5 B1: `asyncio.CancelledError` (a `BaseException`,
     # not caught by `except Exception`) previously propagated straight out
@@ -8434,7 +8645,11 @@ async def _apply_or_finalize_proposal_hold(
     cancelled_exc: asyncio.CancelledError | None = None
     is_indeterminate: bool = False
     try:
-        fingerprint_result = await _safe_fingerprint(judge, apply_ctx)
+        fingerprint_result = (
+            await _safe_fingerprint(judge, apply_ctx)
+            if apply_error is None
+            else ProposalFingerprint(status=FINGERPRINT_NO_TARGET)
+        )
         if fingerprint_result.status == FINGERPRINT_DIGEST:
             is_stale = fingerprint_result.digest != stored_fingerprint
         elif fingerprint_result.status == FINGERPRINT_UNAVAILABLE:
@@ -8921,7 +9136,8 @@ async def decide_proposal(
             action="denied.unknown_proposal_hold",
             detail={"attempted_hold_id": str(hold_id)},
         )
-    if hold.owner_sub != approver_sub:
+    required_owners = _cross_brain_required_owners(hold)
+    if approver_sub not in required_owners:
         await _deny(
             session,
             actor_sub=approver_sub,
@@ -8962,7 +9178,26 @@ async def decide_proposal(
         return _proposal_dict(hold)
 
     # decision == "approve" (main.py's route already restricts `decision`
-    # to these two values before calling in). Argus review S1: commit now
+    # to these two values before calling in).
+    if hold.cross_brain is not None:
+        # TECH-7665: every required owner must approve before anything applies.
+        # Record this owner's approval (re-approving is an idempotent no-op);
+        # only the last outstanding approval falls through to the claim below.
+        approvals = list(hold.approvals or [])
+        if not any(a.get("sub") == approver_sub for a in approvals):
+            approvals.append({"sub": approver_sub, "at": _now().isoformat(), "note": decision_note})
+            hold.approvals = approvals
+            _audit(
+                session,
+                actor_sub=approver_sub,
+                action="proposal.approve_partial",
+                detail={"hold_id": str(hold_id)},
+            )
+        if not all(any(a.get("sub") == r for a in approvals) for r in required_owners):
+            await session.commit()
+            await session.refresh(hold)
+            return _proposal_dict(hold)
+    # Argus review S1: commit now
     # to release the `FOR UPDATE` lock acquired above BEFORE
     # ``_apply_or_finalize_proposal_hold``'s ~10s external HTTP calls --
     # holding a row lock across those would let a handful of concurrent
