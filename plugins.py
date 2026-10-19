@@ -1214,6 +1214,11 @@ class ProposalContext(NamedTuple):
     proposed_by_bot_id: str
     owner_sub: str
     hold_id: uuid.UUID | None
+    # TECH-7665: the board sub of ANOTHER agent whose brain this proposal
+    # writes to (cross-brain), else ``None`` (the proposer's own brain). The
+    # board only ever sets this after it resolved the target and (for the
+    # apply stage) after every required human owner approved.
+    cross_brain_target_sub: str | None = None
 
 
 class ProposalClassification(NamedTuple):

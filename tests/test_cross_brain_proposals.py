@@ -28,6 +28,7 @@ from service import (
     CROSS_BRAIN_ENABLED_ENV_VAR,
     CROSS_BRAIN_MAX_PENDING_PER_SUBMITTER_ENV_VAR,
     CROSS_BRAIN_MAX_PENDING_PER_TARGET_ENV_VAR,
+    _apply_or_finalize_proposal_hold,
     create_proposal,
     decide_proposal,
     get_proposal_apply_record,
@@ -331,3 +332,49 @@ class TestCaps:
         await _submit(session, TARGET, target_id="d1")
         with pytest.raises(RateLimitExceededError):
             await _submit(session, TARGET, bot="other", owner="dave@example.com", target_id="d2")
+
+
+class TestApplyContext:
+    async def test_judge_sees_target_at_every_stage(
+        self, session: AsyncSession, agents: tuple[Agent, Agent]
+    ) -> None:
+        judge = _applied_judge()
+        hold_id = (await _submit(session, TARGET, judge=judge))["proposal_id"]
+        assert judge.fingerprint_calls[0].cross_brain_target_sub == TARGET
+        assert judge.judge_calls[0].cross_brain_target_sub == TARGET
+        await _decide(session, hold_id, TARGET_OWNER, judge=judge)
+        await _decide(session, hold_id, SUBMITTER_OWNER, judge=judge)
+        assert judge.apply_calls[0].cross_brain_target_sub == TARGET
+
+    async def test_own_brain_context_has_no_target(
+        self, session: AsyncSession, agents: tuple[Agent, Agent]
+    ) -> None:
+        judge = _applied_judge()
+        hold_id = (await _submit(session, None, judge=judge))["proposal_id"]
+        await _decide(session, hold_id, SUBMITTER_OWNER, judge=judge)
+        assert judge.apply_calls[0].cross_brain_target_sub is None
+
+    async def test_apply_refuses_without_every_approval(
+        self, session: AsyncSession, agents: tuple[Agent, Agent]
+    ) -> None:
+        hold_id = (await _submit(session, TARGET))["proposal_id"]
+        hold = (await session.execute(select(ProposalHold))).scalar_one()
+        hold.status = "applying"
+        hold.decision_source = "human"
+        hold.decided_by_actor_id = TARGET_OWNER
+        hold.decided_at = datetime.now(UTC)
+        hold.approvals = [{"sub": TARGET_OWNER}]
+        await session.commit()
+        judge = _applied_judge()
+        result = await _apply_or_finalize_proposal_hold(
+            session,
+            hold_id=uuid.UUID(hold_id),
+            expected_status="applying",
+            decided_by_actor_id=TARGET_OWNER,
+            decision_source="human",
+            decision_note=None,
+            judge=judge,
+        )
+        assert result is not None
+        assert result["status"] == "apply_failed"
+        assert judge.apply_calls == []

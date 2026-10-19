@@ -911,9 +911,9 @@ class TestInstructionRegistryDriftGuard:
             expected = hashlib.sha256(
                 plugins.normalize_instruction_text(entry["text"]).encode("utf-8")
             ).hexdigest()
-            assert entry["sha256"] == expected, (
-                f"{kind}: stored hash does not match sha256(normalize(text))"
-            )
+            assert (
+                entry["sha256"] == expected
+            ), f"{kind}: stored hash does not match sha256(normalize(text))"
 
     def _entry(self, text: str = "placeholder text") -> dict[str, str]:
         return {

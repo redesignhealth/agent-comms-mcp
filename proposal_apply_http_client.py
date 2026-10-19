@@ -591,6 +591,8 @@ async def apply_proposal(ctx: ProposalContext) -> ProposalApplyOutcome:
         "owner_sub": ctx.owner_sub,
         "hold_id": str(ctx.hold_id),
     }
+    if ctx.cross_brain_target_sub is not None:
+        payload["cross_brain_target_sub"] = ctx.cross_brain_target_sub
 
     start_time = time.monotonic()
     deadline = start_time + retry_budget_seconds

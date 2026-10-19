@@ -7504,6 +7504,7 @@ async def create_proposal(
         proposed_by_bot_id=proposed_by_bot_id,
         owner_sub=owner_sub,
         hold_id=None,
+        cross_brain_target_sub=cross_brain["target_sub"] if cross_brain else None,
     )
     fingerprint_result = await _safe_fingerprint(judge, submit_ctx)
     if fingerprint_result.status == FINGERPRINT_NO_TARGET:
@@ -7585,6 +7586,7 @@ async def create_proposal(
         proposed_by_bot_id=proposed_by_bot_id,
         owner_sub=owner_sub,
         hold_id=hold.id,
+        cross_brain_target_sub=(hold.cross_brain or {}).get("target_sub"),
     )
     is_judge_error = False
     decision_note: str | None = None
@@ -8590,11 +8592,25 @@ async def _apply_or_finalize_proposal_hold(
     proposed_by_bot_id = hold.proposed_by_bot_id
     owner_sub = hold.owner_sub
     stored_fingerprint = hold.target_fingerprint
+    cross_brain_target_sub = (hold.cross_brain or {}).get("target_sub")
+    # Defense in depth (TECH-7665): a cross-brain hold never writes unless a
+    # human decided it and every required owner's approval is recorded.
+    cross_brain_unapproved = hold.cross_brain is not None and not (
+        decision_source == "human"
+        and all(
+            any(a.get("sub") == r for a in (hold.approvals or []))
+            for r in _cross_brain_required_owners(hold)
+        )
+    )
     await session.commit()
 
     is_stale = False
-    apply_error: str | None = None
-    raw_apply_error: str | None = None
+    apply_error: str | None = (
+        "cross-brain proposal is missing a required owner approval"
+        if cross_brain_unapproved
+        else None
+    )
+    raw_apply_error: str | None = apply_error
     apply_result: dict[str, Any] | None = None
     apply_ctx = ProposalContext(
         kind=kind,
@@ -8605,6 +8621,7 @@ async def _apply_or_finalize_proposal_hold(
         proposed_by_bot_id=proposed_by_bot_id,
         owner_sub=owner_sub,
         hold_id=hold_id,
+        cross_brain_target_sub=cross_brain_target_sub,
     )
     # Argus review round-5 B1: `asyncio.CancelledError` (a `BaseException`,
     # not caught by `except Exception`) previously propagated straight out
@@ -8628,7 +8645,11 @@ async def _apply_or_finalize_proposal_hold(
     cancelled_exc: asyncio.CancelledError | None = None
     is_indeterminate: bool = False
     try:
-        fingerprint_result = await _safe_fingerprint(judge, apply_ctx)
+        fingerprint_result = (
+            await _safe_fingerprint(judge, apply_ctx)
+            if apply_error is None
+            else ProposalFingerprint(status=FINGERPRINT_NO_TARGET)
+        )
         if fingerprint_result.status == FINGERPRINT_DIGEST:
             is_stale = fingerprint_result.digest != stored_fingerprint
         elif fingerprint_result.status == FINGERPRINT_UNAVAILABLE:
