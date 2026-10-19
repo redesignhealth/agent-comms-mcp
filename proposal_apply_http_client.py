@@ -759,6 +759,13 @@ class HttpApplyProposalJudge:
     def delegate(self) -> Any:
         return self._delegate
 
+    @property
+    def supported_proposal_kinds(self) -> Any:
+        """Forward the delegate's optional ``supported_proposal_kinds``
+        capability (``plugins.PROPOSAL_SUPPORTED_KINDS_ATTR``, TECH-7711);
+        ``None`` ("unknown") when the delegate does not declare one."""
+        return getattr(self._delegate, "supported_proposal_kinds", None)
+
     def classify(self, kind: str, action: dict[str, Any]) -> ProposalClassification:
         return cast(ProposalClassification, self._delegate.classify(kind, action))
 

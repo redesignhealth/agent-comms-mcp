@@ -165,7 +165,7 @@ import logging
 import os
 import re
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from datetime import UTC, datetime, timedelta
 from typing import Any, NamedTuple, NoReturn, Protocol
@@ -189,6 +189,7 @@ from exceptions import (
     InvalidConversationStateError,
     InvalidExtendError,
     InvalidOwnerReassignmentError,
+    InvalidProposalActionError,
     ProposalTargetUnavailableError,
     RateLimitExceededError,
     SchemaVersionMismatchError,
@@ -211,6 +212,9 @@ from plugins import (
     FINGERPRINT_DIGEST,
     FINGERPRINT_NO_TARGET,
     FINGERPRINT_UNAVAILABLE,
+    PROPOSAL_ACTION_ERROR_CODES,
+    PROPOSAL_ACTION_ERRORS_ATTR,
+    PROPOSAL_SUPPORTED_KINDS_ATTR,
     ActiveChecker,
     ApprovalNotification,
     ApprovalNotifier,
@@ -6530,6 +6534,157 @@ def _extract_proposal_target(action: dict[str, Any]) -> tuple[str, str]:
 _NO_PRE_EXISTING_TARGET_FINGERPRINT = "n/a:no-pre-existing-target"
 
 
+_SAFE_PROPOSAL_KIND_LABEL_RE = re.compile(r"[a-z][a-z0-9_]{0,63}")
+# A reported field path: 1 schema field name plus up to 7 more field-name or
+# numeric-index segments (TECH-7711). Matched with ``fullmatch`` (a trailing
+# newline must not slip past a ``$`` anchor) and length-capped separately.
+_PROPOSAL_ACTION_ERROR_PATH_RE = re.compile(
+    r"[a-z][a-z0-9_]{0,63}(?:\.(?:[a-z][a-z0-9_]{0,63}|[0-9]{1,4})){0,7}"
+)
+_PROPOSAL_ACTION_ERROR_PATH_MAX_LENGTH = 128
+_PROPOSAL_ACTION_ERROR_FALLBACK_PATH = "action"
+_PROPOSAL_ACTION_ERROR_FALLBACK_CODE = "invalid_value"
+_MAX_PLUGIN_ACTION_ERRORS_INSPECTED = 200
+_MAX_REPORTED_PROPOSAL_ACTION_ERRORS = 20
+_MAX_SUPPORTED_PROPOSAL_KINDS = 32
+
+
+def _safe_proposal_kind_label(kind: Any) -> str | None:
+    """``kind`` if it is a plain ``str`` shaped like a registered proposal
+    kind (``[a-z][a-z0-9_]{0,63}``), else ``None``. Anything that is not safe
+    is never echoed back to the caller (TECH-7711)."""
+    if type(kind) is str and _SAFE_PROPOSAL_KIND_LABEL_RE.fullmatch(kind):
+        return kind
+    return None
+
+
+def _sanitize_plugin_action_errors(
+    exc: BaseException,
+) -> tuple[bool, tuple[tuple[str, str], ...], int]:
+    """Read the duck-typed ``proposal_action_errors`` attribute a judge's
+    ``ValueError`` subclass may carry (``plugins.PROPOSAL_ACTION_ERRORS_ATTR``)
+    and return ``(signalled, field_errors, omitted)``.
+
+    ``signalled`` is True whenever the attribute is present at all -- even a
+    malformed one, or a property that raises -- because the plugin meant
+    "invalid action"; a malformed value just yields no (or fallback) reasons
+    rather than ever surfacing plugin text. Only exact ``tuple``/``list``
+    containers and exact ``str`` members are trusted (no subclass can run
+    caller-controlled ``__iter__``/``__len__``/``__str__`` here). At most
+    ``_MAX_PLUGIN_ACTION_ERRORS_INSPECTED`` raw entries are inspected; each
+    path is re-validated against ``_PROPOSAL_ACTION_ERROR_PATH_RE`` (else
+    ``action``) and each code against ``plugins.PROPOSAL_ACTION_ERROR_CODES``
+    (else ``invalid_value``). The result is deduplicated, sorted, and capped
+    at ``_MAX_REPORTED_PROPOSAL_ACTION_ERRORS``; ``omitted`` counts the unique
+    reasons cut by that cap plus raw entries never inspected."""
+    try:
+        raw: Any = getattr(exc, PROPOSAL_ACTION_ERRORS_ATTR, _MISSING)
+    except Exception:
+        return True, (), 0
+    if raw is _MISSING:
+        return False, (), 0
+    if type(raw) not in (tuple, list):
+        return True, (), 0
+    pairs: set[tuple[str, str]] = set()
+    for item in raw[:_MAX_PLUGIN_ACTION_ERRORS_INSPECTED]:
+        if (
+            type(item) in (tuple, list)
+            and len(item) == 2
+            and type(item[0]) is str
+            and type(item[1]) is str
+        ):
+            path, code = item
+            if len(path) > _PROPOSAL_ACTION_ERROR_PATH_MAX_LENGTH or not (
+                _PROPOSAL_ACTION_ERROR_PATH_RE.fullmatch(path)
+            ):
+                path = _PROPOSAL_ACTION_ERROR_FALLBACK_PATH
+            if code not in PROPOSAL_ACTION_ERROR_CODES:
+                code = _PROPOSAL_ACTION_ERROR_FALLBACK_CODE
+        else:
+            path = _PROPOSAL_ACTION_ERROR_FALLBACK_PATH
+            code = _PROPOSAL_ACTION_ERROR_FALLBACK_CODE
+        pairs.add((path, code))
+    ordered = sorted(pairs)
+    reported = tuple(ordered[:_MAX_REPORTED_PROPOSAL_ACTION_ERRORS])
+    omitted = len(ordered) - len(reported)
+    omitted += max(0, len(raw) - _MAX_PLUGIN_ACTION_ERRORS_INSPECTED)
+    return True, reported, omitted
+
+
+def _read_supported_proposal_kinds(judge: Any) -> frozenset[str] | None:
+    """The judge's optional ``supported_proposal_kinds`` capability
+    (``plugins.PROPOSAL_SUPPORTED_KINDS_ATTR``), or ``None`` when absent,
+    ``None``, empty, or in any way untrustworthy (a ``str``/``bytes``/mapping,
+    a non-iterable, an iteration error, more than
+    ``_MAX_SUPPORTED_PROPOSAL_KINDS`` entries, or any entry that is not a safe
+    kind label). Inspects at most one more entry than the cap, so a runaway
+    iterable is never drained. Never raises."""
+    try:
+        raw: Any = getattr(judge, PROPOSAL_SUPPORTED_KINDS_ATTR, None)
+        if raw is None or isinstance(raw, str | bytes | bytearray | Mapping):
+            return None
+        kinds: set[str] = set()
+        inspected = 0
+        for item in itertools.islice(iter(raw), _MAX_SUPPORTED_PROPOSAL_KINDS + 1):
+            inspected += 1
+            label = _safe_proposal_kind_label(item)
+            if label is None:
+                return None
+            kinds.add(label)
+        if inspected == 0 or inspected > _MAX_SUPPORTED_PROPOSAL_KINDS:
+            return None
+        return frozenset(kinds)
+    except Exception:
+        return None
+
+
+def _bound_proposal_error_message(message: str) -> str:
+    """Final scrub + truncation of a caller-facing proposal error string."""
+    return _truncate_proposal_string(
+        _scrub_proposal_error_string(message), _MAX_PROPOSAL_ERROR_DETAIL_LENGTH
+    )
+
+
+def _invalid_proposal_action_error(
+    kind: Any, field_errors: tuple[tuple[str, str], ...], omitted: int
+) -> InvalidProposalActionError:
+    label = _safe_proposal_kind_label(kind)
+    message = f"invalid {label} action" if label else "invalid proposal action"
+    if field_errors:
+        message += ": " + "; ".join(f"{path}: {code}" for path, code in field_errors)
+    if omitted:
+        message += f" (+{omitted} more)"
+    return InvalidProposalActionError(
+        _bound_proposal_error_message(message), field_errors=field_errors, omitted=omitted
+    )
+
+
+def _classify_value_error_to_proposal_error(judge: Any, kind: Any, exc: ValueError) -> ValueError:
+    """Map a ``ValueError`` raised by ``judge.classify()`` to the caller-facing
+    422 error (TECH-7711). Never uses ``str(exc)`` or the exception class.
+
+    1. The exception carries ``proposal_action_errors`` -> the kind is
+       supported but the ``action`` is malformed:
+       ``InvalidProposalActionError`` with sanitized field reasons.
+    2. A bare ``ValueError`` and the judge declares ``kind`` supported (via the
+       optional ``supported_proposal_kinds``) -> the same error type with no
+       field reasons (the plugin did not say which fields).
+    3. Otherwise -> a plain ``ValueError`` "unsupported proposal kind" naming
+       the (safe) kind and, if the judge declared them, the supported kinds.
+    """
+    signalled, field_errors, omitted = _sanitize_plugin_action_errors(exc)
+    if signalled:
+        return _invalid_proposal_action_error(kind, field_errors, omitted)
+    supported = _read_supported_proposal_kinds(judge)
+    label = _safe_proposal_kind_label(kind)
+    if supported is not None and label is not None and label in supported:
+        return _invalid_proposal_action_error(kind, (), 0)
+    message = f"unsupported proposal kind: {label!r}" if label else "unsupported proposal kind"
+    if supported is not None:
+        message += "; supported kinds: " + ", ".join(sorted(supported))
+    return ValueError(_bound_proposal_error_message(message))
+
+
 def _classify_proposal(judge: ProposalJudge, kind: str, action: dict[str, Any]) -> str:
     """Call the injected ``plugins.ProposalJudge.classify()`` defensively
     and return its ``priority`` -- NEVER a caller-supplied value
@@ -6537,8 +6692,10 @@ def _classify_proposal(judge: ProposalJudge, kind: str, action: dict[str, Any]) 
 
     ``classify()`` is contractually synchronous, side-effect-free, and
     allowed exactly one exception type: ``ValueError``, for an unsupported
-    ``kind`` -- wrapped into a board-controlled message and mapped to 422 by
-    both ``main.py`` and ``providers.proposals`` (preserving the original
+    ``kind`` or (TECH-7711) a malformed ``action`` on a supported kind --
+    wrapped into a board-controlled message by
+    ``_classify_value_error_to_proposal_error`` and mapped to 422 by both
+    ``main.py`` and ``providers.proposals`` (preserving the original
     exception as ``__cause__`` for logging). Any OTHER exception is a plugin bug,
     not a caller-input problem -- but this runs before
     ``_dedup_or_insert_proposal``, so there is no hold yet to fail closed
@@ -6555,7 +6712,7 @@ def _classify_proposal(judge: ProposalJudge, kind: str, action: dict[str, Any]) 
     try:
         classification: Any = judge.classify(kind, action)
     except ValueError as exc:
-        raise ValueError(f"unsupported proposal kind: {kind!r}") from exc
+        raise _classify_value_error_to_proposal_error(judge, kind, exc) from exc
     except Exception as exc:
         logger.warning(
             "proposal judge classify() raised for kind=%r: %s",

@@ -468,6 +468,37 @@ class ProposalTargetUnavailableError(Exception):
         self.detail = detail
 
 
+class InvalidProposalActionError(ValueError):
+    """Raised by ``service.create_proposal`` when the configured
+    ``plugins.ProposalJudge`` says the proposal's ``kind`` is supported but its
+    ``action`` payload is malformed (TECH-7711) -- distinct from the bare
+    ``ValueError`` "unsupported proposal kind" for a kind the judge does not
+    know.
+
+    Subclasses ``ValueError`` so every existing ``except ValueError`` -> 422
+    mapping (REST ``main.py``, MCP ``providers.proposals``) keeps working;
+    ``main.py`` additionally catches this type first to expose
+    ``field_errors``. ``str(exc)`` is the sanitized, bounded caller-facing
+    message; ``field_errors`` is a tuple of at most 20 ``(path, code)`` pairs
+    already validated by ``service._sanitize_plugin_action_errors`` (paths are
+    schema field paths, never input values; codes come from the closed
+    ``plugins.PROPOSAL_ACTION_ERROR_CODES`` set), and ``omitted`` counts
+    further reasons that were not reported. Nothing here ever carries the
+    plugin's own exception text."""
+
+    def __init__(
+        self,
+        detail: str,
+        *,
+        field_errors: tuple[tuple[str, str], ...] = (),
+        omitted: int = 0,
+    ) -> None:
+        super().__init__(detail)
+        self.detail = detail
+        self.field_errors = field_errors
+        self.omitted = omitted
+
+
 class InvalidOwnerReassignmentError(Exception):
     """Raised when an owner reassignment request is rejected by business rules (TECH-7389)."""
 
@@ -486,6 +517,7 @@ __all__ = [
     "InvalidConversationStateError",
     "InvalidExtendError",
     "InvalidOwnerReassignmentError",
+    "InvalidProposalActionError",
     "ProposalTargetUnavailableError",
     "RateLimitExceededError",
     "SchemaVersionMismatchError",

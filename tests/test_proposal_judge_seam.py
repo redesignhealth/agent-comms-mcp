@@ -19,11 +19,15 @@ import pytest_asyncio
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
+from exceptions import InvalidProposalActionError
 from models import ProposalHold
 from plugins import (
     FINGERPRINT_DIGEST,
     FINGERPRINT_NO_TARGET,
     FINGERPRINT_UNAVAILABLE,
+    PROPOSAL_ACTION_ERROR_CODES,
+    PROPOSAL_ACTION_ERRORS_ATTR,
+    PROPOSAL_SUPPORTED_KINDS_ATTR,
     EscalateAllProposalJudge,
     ProposalApplyOutcome,
     ProposalClassification,
@@ -35,10 +39,15 @@ from plugins import (
 from service import (
     MAX_DECISION_REASON_LENGTH,
     PROPOSAL_HOLD_LEVELS,
+    _bound_proposal_error_message,
     _classify_proposal,
+    _classify_value_error_to_proposal_error,
     _is_well_formed_target_error,
+    _read_supported_proposal_kinds,
     _safe_apply,
     _safe_fingerprint,
+    _safe_proposal_kind_label,
+    _sanitize_plugin_action_errors,
     _scrub_proposal_error_string,
     create_proposal,
 )
@@ -1608,3 +1617,593 @@ class TestForeignStructuralStandinsVerdict:
         assert verdict.decision_note_reads == 1
         assert result["status"] == "applied"
         assert result["decision_note"] == "first read"
+
+
+# ---------------------------------------------------------------------------
+# TECH-7711: structured "malformed action for a supported kind" signal
+# ---------------------------------------------------------------------------
+#
+# A judge's ``classify()`` reports a malformed ``action`` on an otherwise
+# supported ``kind`` by raising a ``ValueError`` subclass carrying a
+# duck-typed ``proposal_action_errors`` tuple of ``(path, code)`` pairs --
+# never by its class name, never by its message text. The tests below cover
+# ``service._sanitize_plugin_action_errors`` (the adversarial re-validation
+# of a plugin-supplied signal), ``service._read_supported_proposal_kinds``
+# (the optional capability), and ``service._classify_value_error_to_proposal_
+# error`` / ``_classify_proposal`` (the rebuilt, board-owned 422 error).
+
+# Distinctive sentinel carried ONLY on the plugin exception's own message and
+# ``__cause__`` (which the board deliberately preserves for logging) -- it
+# must never reach any caller-facing string below.
+_PLUGIN_SENTINEL = "SECRET-PLUGIN-INTERNALS-7711"
+_PLUGIN_SENTINEL_MESSAGE = (
+    f"pydantic internals: content={_PLUGIN_SENTINEL} api_key=sk-{_PLUGIN_SENTINEL}"
+)
+
+
+class _ForeignInvalidActionError(ValueError):
+    """Duck-typed stand-in for agent-comms-approvals'
+    ``rh_comms_plugins.proposal_judge.InvalidProposalAction`` (TECH-7711) --
+    hand-maintained in the same spirit as the ``_Foreign*`` stand-ins above:
+    NOT imported from that package, so it can drift, which is exactly what
+    the board's own re-validation defends against (every test below feeds
+    it adversarial shapes a real plugin would never emit).
+
+    The attribute name must match ``plugins.PROPOSAL_ACTION_ERRORS_ATTR``
+    literally -- pinned by the test directly below.
+    """
+
+    def __init__(self, errors: Any, message: str = _PLUGIN_SENTINEL_MESSAGE) -> None:
+        self.proposal_action_errors = errors
+        super().__init__(message)
+
+
+class TestProposalActionSignalContractConstants:
+    """Pin the duck-typed contract constants the plugins module exports."""
+
+    def test_attribute_names_are_the_duck_typed_literals(self) -> None:
+        assert PROPOSAL_ACTION_ERRORS_ATTR == "proposal_action_errors"
+        assert PROPOSAL_SUPPORTED_KINDS_ATTR == "supported_proposal_kinds"
+
+    def test_error_codes_is_the_closed_ten_code_set(self) -> None:
+        expected = {
+            "missing",
+            "extra_field",
+            "invalid_type",
+            "too_short",
+            "too_long",
+            "out_of_range",
+            "invalid_format",
+            "invalid_value",
+            "not_canonical",
+            "digest_mismatch",
+        }
+        assert frozenset(expected) == PROPOSAL_ACTION_ERROR_CODES
+
+    def test_foreign_invalid_action_error_is_a_value_error_carrying_the_attr(self) -> None:
+        exc = _ForeignInvalidActionError([("content", "missing")])
+        assert isinstance(exc, ValueError)
+        assert getattr(exc, PROPOSAL_ACTION_ERRORS_ATTR) == [("content", "missing")]
+
+
+class TestSanitizePluginActionErrors:
+    """``service._sanitize_plugin_action_errors`` -- adversarial re-validation
+    of the plugin-supplied ``proposal_action_errors`` signal. Only exact
+    ``tuple``/``list`` containers, exact ``str`` members and at most 200 raw
+    entries are inspected; every path is re-validated against the strict path
+    grammar (else ``"action"``), every code against the closed set (else
+    ``"invalid_value"``); the result is deduplicated, sorted and capped at 20
+    with ``omitted`` counting everything cut."""
+
+    def test_absent_attribute_is_not_signalled(self) -> None:
+        signalled, field_errors, omitted = _sanitize_plugin_action_errors(ValueError("x"))
+        assert (signalled, field_errors, omitted) == (False, (), 0)
+
+    def test_well_formed_pairs_pass_through_sorted_and_deduplicated(self) -> None:
+        exc = _ForeignInvalidActionError(
+            [("content", "missing"), ("citations.0.quote", "too_long"), ("content", "missing")]
+        )
+        signalled, field_errors, omitted = _sanitize_plugin_action_errors(exc)
+        assert signalled is True
+        assert field_errors == (("citations.0.quote", "too_long"), ("content", "missing"))
+        assert omitted == 0
+
+    @pytest.mark.parametrize(
+        ("raw_path", "expected_path"),
+        [
+            # Attacker-chosen keys / values can never reach the output: only
+            # the strict lowercase-snake grammar (with bounded numeric list
+            # indexes) survives, everything else collapses to "action".
+            ("Evil-Key!", "action"),
+            ("target_id; DROP TABLE", "action"),
+            ("content\ninjection", "action"),
+            ("content extra", "action"),
+            ("9content", "action"),
+            ("-content", "action"),
+            ("content ", "action"),
+            ("a" * 129, "action"),
+            ("a.b.c.d.e.f.g.h.i", "action"),  # 9 segments (max is 8)
+            ("citations.99999.quote", "action"),  # 5-digit index (max is 4)
+            ("citations.-1.quote", "action"),
+            ("Citations.0.quote", "action"),
+            # Grammar-valid shapes survive (schema-awareness is NOT claimed --
+            # a grammar-valid but schema-unknown key is still safe to echo).
+            ("content", "content"),
+            ("citations.0.quote", "citations.0.quote"),
+            ("a.b.c.d.e.f.g.h", "a.b.c.d.e.f.g.h"),  # 8 segments
+            ("citations.9999.quote", "citations.9999.quote"),
+        ],
+    )
+    def test_paths_are_revalidated_against_the_grammar(
+        self, raw_path: str, expected_path: str
+    ) -> None:
+        exc = _ForeignInvalidActionError([(raw_path, "missing")])
+        _, field_errors, _ = _sanitize_plugin_action_errors(exc)
+        assert field_errors == ((expected_path, "missing"),)
+
+    @pytest.mark.parametrize("bad_code", ["nope", "MISSING", "missing ", "", "not_canonical!"])
+    def test_unknown_codes_downgrade_to_invalid_value(self, bad_code: str) -> None:
+        exc = _ForeignInvalidActionError([("content", bad_code)])
+        _, field_errors, _ = _sanitize_plugin_action_errors(exc)
+        assert field_errors == (("content", "invalid_value"),)
+
+    @pytest.mark.parametrize(
+        "bad_item",
+        [
+            "not-a-pair",
+            42,
+            None,
+            ("one",),
+            ("a", "b", "c"),
+            (1, "missing"),
+            ("content", 7),
+            (None, "missing"),
+            (["content"], "missing"),
+        ],
+    )
+    def test_malformed_items_collapse_to_the_generic_pair(self, bad_item: Any) -> None:
+        exc = _ForeignInvalidActionError([("content", "missing"), bad_item])
+        _, field_errors, _ = _sanitize_plugin_action_errors(exc)
+        assert field_errors == (
+            ("action", "invalid_value"),
+            ("content", "missing"),
+        )
+
+    @pytest.mark.parametrize(
+        "bad_raw",
+        [
+            "content:missing",  # a plain str
+            {"content": "missing"},  # mapping
+            None,
+            42,
+            iter([("content", "missing")]),  # generator: not a tuple/list
+            frozenset({("content", "missing")}),
+        ],
+    )
+    def test_non_container_raw_values_signal_with_no_field_errors(self, bad_raw: Any) -> None:
+        """A present-but-untrustworthy attribute still means "invalid action"
+        -- it just yields no (or fallback) reasons rather than ever surfacing
+        plugin text."""
+        exc = _ForeignInvalidActionError(bad_raw)
+        signalled, field_errors, omitted = _sanitize_plugin_action_errors(exc)
+        assert signalled is True
+        assert field_errors == ()
+        assert omitted == 0
+
+    def test_flat_two_tuple_is_a_container_of_two_malformed_items(self) -> None:
+        """A flat ``("content", "missing")`` 2-tuple is accepted as a
+        container (the container check is type-based, not shape-based) and
+        its two plain-``str`` members each collapse to the generic pair -- a
+        safe fallback, never an echo of either member."""
+        exc = _ForeignInvalidActionError(("content", "missing"))
+        signalled, field_errors, omitted = _sanitize_plugin_action_errors(exc)
+        assert signalled is True
+        assert field_errors == (("action", "invalid_value"),)
+        assert omitted == 0
+
+    def test_raising_attribute_signals_with_no_field_errors(self) -> None:
+        class _ExplodingSignalError(ValueError):
+            @property
+            def proposal_action_errors(self) -> Any:
+                raise RuntimeError(f"exploding attr {_PLUGIN_SENTINEL}")
+
+        signalled, field_errors, omitted = _sanitize_plugin_action_errors(
+            _ExplodingSignalError("x")
+        )
+        assert signalled is True
+        assert field_errors == ()
+        assert omitted == 0
+
+    def test_more_than_200_raw_entries_are_counted_as_omitted(self) -> None:
+        raw = [(f"field{i:04d}", "missing") for i in range(250)]
+        exc = _ForeignInvalidActionError(raw)
+        signalled, field_errors, omitted = _sanitize_plugin_action_errors(exc)
+        assert signalled is True
+        assert len(field_errors) == 20  # the reported cap
+        # 250 raw entries: 200 inspected -> 200 unique -> 20 reported
+        # (180 omitted) + 50 never inspected. Entries past the 200-entry
+        # inspection cap contribute ONLY to this count -- they are never
+        # read as pairs (all 250 are distinct, so only prefixes from the
+        # first 200, "field0000".."field0199", can appear in the output).
+        assert omitted == 230
+        assert all(path < "field0200" for path, _code in field_errors)
+
+    def test_more_than_20_unique_pairs_are_capped_with_omitted_count(self) -> None:
+        raw = [(f"field{i:02d}", "missing") for i in range(25)]
+        exc = _ForeignInvalidActionError(raw)
+        _, field_errors, omitted = _sanitize_plugin_action_errors(exc)
+        assert len(field_errors) == 20
+        assert field_errors == tuple(sorted(raw)[:20])
+        assert omitted == 5
+
+    def test_list_raw_container_is_accepted(self) -> None:
+        exc = _ForeignInvalidActionError([("content", "missing")])
+        _, field_errors, _ = _sanitize_plugin_action_errors(exc)
+        assert field_errors == (("content", "missing"),)
+
+    def test_tuple_raw_container_is_accepted(self) -> None:
+        exc = _ForeignInvalidActionError((("content", "missing"),))
+        _, field_errors, _ = _sanitize_plugin_action_errors(exc)
+        assert field_errors == (("content", "missing"),)
+
+
+class TestReadSupportedProposalKinds:
+    """``service._read_supported_proposal_kinds`` -- the optional
+    ``supported_proposal_kinds`` capability, read defensively. Absent, ``None``,
+    empty, a ``str``/``bytes``/mapping, a non-iterable, an iteration error,
+    more than 32 entries, or any entry that is not a safe kind label all mean
+    "unknown" (``None``); at most 33 entries are ever pulled from a runaway
+    iterable."""
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            (
+                frozenset({"arcana_source_add", "linear_progress_update"}),
+                frozenset({"arcana_source_add", "linear_progress_update"}),
+            ),
+            (
+                ["arcana_source_add", "linear_progress_update"],
+                frozenset({"arcana_source_add", "linear_progress_update"}),
+            ),
+            (("arcana_source_add",), frozenset({"arcana_source_add"})),
+            ({"arcana_source_add"}, frozenset({"arcana_source_add"})),  # a set, not a mapping
+        ],
+    )
+    def test_valid_iterables_round_trip(self, raw: Any, expected: frozenset[str]) -> None:
+        judge = type("J", (), {PROPOSAL_SUPPORTED_KINDS_ATTR: raw})()
+        assert _read_supported_proposal_kinds(judge) == expected
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            None,  # explicit None value
+            "arcana_source_add",  # a plain str
+            b"arcana_source_add",
+            bytearray(b"x"),
+            {"arcana_source_add": True},  # mapping
+            [],  # empty iterable
+            (),  # empty tuple
+            set(),  # empty set
+            42,  # non-iterable
+        ],
+    )
+    def test_untrustworthy_values_read_as_unknown(self, raw: Any) -> None:
+        judge = type("J", (), {PROPOSAL_SUPPORTED_KINDS_ATTR: raw})()
+        assert _read_supported_proposal_kinds(judge) is None
+
+    def test_absent_attribute_reads_as_unknown(self) -> None:
+        assert _read_supported_proposal_kinds(object()) is None
+
+    def test_at_most_32_entries_are_accepted(self) -> None:
+        judge = type("J", (), {PROPOSAL_SUPPORTED_KINDS_ATTR: [f"kind{i}" for i in range(32)]})()
+        assert len(_read_supported_proposal_kinds(judge) or ()) == 32
+
+    def test_more_than_32_entries_read_as_unknown(self) -> None:
+        judge = type("J", (), {PROPOSAL_SUPPORTED_KINDS_ATTR: [f"kind{i}" for i in range(33)]})()
+        assert _read_supported_proposal_kinds(judge) is None
+
+    @pytest.mark.parametrize(
+        "entry",
+        ["Not-Lowercase", "x" * 65, "", "has-dash", "9starts-digit", "kind with space", 42, None],
+    )
+    def test_any_unsafe_entry_kills_the_whole_capability(self, entry: Any) -> None:
+        judge = type("J", (), {PROPOSAL_SUPPORTED_KINDS_ATTR: ["arcana_source_add", entry]})()
+        assert _read_supported_proposal_kinds(judge) is None
+
+    def test_raising_property_reads_as_unknown(self) -> None:
+        class _Raising:
+            @property
+            def supported_proposal_kinds(self) -> Any:
+                raise RuntimeError(f"boom {_PLUGIN_SENTINEL}")
+
+        assert _read_supported_proposal_kinds(_Raising()) is None
+
+    def test_runaway_iterable_is_never_drained_past_33(self) -> None:
+        pulled = {"n": 0}
+
+        def infinite() -> Any:
+            i = 0
+            while True:
+                pulled["n"] += 1
+                if pulled["n"] > 100:
+                    raise AssertionError("a runaway iterable must never be drained past 33")
+                yield f"kind{i}"
+                i += 1
+
+        judge = type("J", (), {PROPOSAL_SUPPORTED_KINDS_ATTR: infinite()})()
+        assert _read_supported_proposal_kinds(judge) is None
+        assert pulled["n"] == 33
+
+
+class TestSafeProposalKindLabel:
+    """``service._safe_proposal_kind_label`` -- a ``kind`` is echoed back to
+    the caller only when it is a plain ``str`` matching
+    ``[a-z][a-z0-9_]{0,63}``."""
+
+    @pytest.mark.parametrize(
+        "label",
+        ["arcana_source_add", "linear_progress_update", "a", "x" * 64, "kind9with_digits_2"],
+    )
+    def test_safe_labels_pass_through(self, label: str) -> None:
+        assert _safe_proposal_kind_label(label) == label
+
+    @pytest.mark.parametrize(
+        "label",
+        [
+            "UPPER",
+            "Arcana_Source_Add",
+            "x" * 65,
+            "",
+            "kind-dash",
+            "9kind",
+            "kind space",
+            "kind\nnewline",
+            "kind; DROP TABLE",
+            "arcana-source:add",
+        ],
+    )
+    def test_unsafe_labels_read_as_none(self, label: str) -> None:
+        assert _safe_proposal_kind_label(label) is None
+
+    def test_non_str_kinds_read_as_none(self) -> None:
+        for bad in (42, None, b"bytes", ["kind"], {"kind": 1}, "KIND"):
+            assert _safe_proposal_kind_label(bad) is None
+
+
+class TestBoundProposalErrorMessage:
+    """``service._bound_proposal_error_message`` -- final scrub + 500-char
+    truncation of a caller-facing proposal error string."""
+
+    def test_scrubs_credential_kv_tokens_and_url_query_strings(self) -> None:
+        message = (
+            "upstream failed: token=secret12345 at "
+            "https://api.linear.app/graphql?api_key=abc456 end"
+        )
+        bound = _bound_proposal_error_message(message)
+        assert "secret12345" not in bound
+        assert "abc456" not in bound
+        assert "api_key=" not in bound
+        assert bound == "upstream failed: at https://api.linear.app/graphql end"
+
+    def test_truncates_to_500_chars_with_suffix(self) -> None:
+        bound = _bound_proposal_error_message("y" * 600)
+        assert len(bound) == 500
+        assert bound.endswith("... [truncated]")
+        assert bound.startswith("y" * 100)
+
+    def test_short_clean_messages_pass_through_unchanged(self) -> None:
+        assert _bound_proposal_error_message("invalid x action: a: missing") == (
+            "invalid x action: a: missing"
+        )
+
+
+class TestClassifyValueErrorToProposalError:
+    """``service._classify_value_error_to_proposal_error`` -- the board-owned
+    mapping of a judge ``ValueError`` to the caller-facing 422 error. Never
+    uses ``str(exc)`` or the exception class."""
+
+    def test_signalled_error_maps_to_invalid_proposal_action_error(self) -> None:
+        judge = FakeProposalJudge()
+        exc = _ForeignInvalidActionError([("content", "missing")])
+        mapped = _classify_value_error_to_proposal_error(judge, "arcana_source_add", exc)
+        assert isinstance(mapped, InvalidProposalActionError)
+        assert isinstance(mapped, ValueError)
+        assert mapped.detail == "invalid arcana_source_add action: content: missing"
+        assert mapped.field_errors == (("content", "missing"),)
+        assert mapped.omitted == 0
+        assert _PLUGIN_SENTINEL not in mapped.detail
+
+    def test_signalled_error_message_lists_pairs_sorted_with_omitted_suffix(self) -> None:
+        exc = _ForeignInvalidActionError(
+            [("z_field", "missing"), ("a_field", "too_long"), ("m_field", "missing")]
+        )
+        mapped = _classify_value_error_to_proposal_error(
+            FakeProposalJudge(), "arcana_source_add", exc
+        )
+        assert isinstance(mapped, InvalidProposalActionError)
+        assert mapped.detail == (
+            "invalid arcana_source_add action: a_field: too_long; "
+            "m_field: missing; z_field: missing"
+        )
+
+    def test_omitted_reasons_appear_as_a_bounded_suffix(self) -> None:
+        raw = [(f"field{i:02d}", "missing") for i in range(25)]
+        exc = _ForeignInvalidActionError(raw)
+        mapped = _classify_value_error_to_proposal_error(
+            FakeProposalJudge(), "arcana_source_add", exc
+        )
+        assert isinstance(mapped, InvalidProposalActionError)
+        assert mapped.detail.endswith("(+5 more)")
+        assert mapped.omitted == 5
+        assert len(mapped.field_errors) == 20
+
+    def test_message_is_capped_at_500_chars_even_with_maximal_pairs(self) -> None:
+        # 20 DISTINCT grammar-valid 127-char paths (identical pairs would
+        # dedup to one; a dotless path can be at most 64 chars, so use the
+        # full 8-segment dotted shape).
+        raw = [(".".join([f"p{i:02d}" + "s" * 12] + ["s" * 15] * 7), "missing") for i in range(20)]
+        assert all(len(path) == 127 for path, _code in raw)
+        exc = _ForeignInvalidActionError(raw)
+        mapped = _classify_value_error_to_proposal_error(
+            FakeProposalJudge(), "arcana_source_add", exc
+        )
+        assert isinstance(mapped, InvalidProposalActionError)
+        assert len(mapped.detail) == 500
+        assert mapped.detail.endswith("... [truncated]")
+
+    def test_unsafe_kind_label_yields_a_generic_invalid_action_message(self) -> None:
+        for kind in ("UPPER", "x" * 65, "kind; DROP TABLE", "kind\ninjection"):
+            exc = _ForeignInvalidActionError([("content", "missing")])
+            mapped = _classify_value_error_to_proposal_error(FakeProposalJudge(), kind, exc)
+            assert isinstance(mapped, InvalidProposalActionError)
+            assert mapped.detail == "invalid proposal action: content: missing"
+            assert kind not in mapped.detail
+
+    def test_malformed_signal_yields_generic_invalid_action_without_plugin_text(self) -> None:
+        exc = _ForeignInvalidActionError("content:missing")
+        mapped = _classify_value_error_to_proposal_error(
+            FakeProposalJudge(), "arcana_source_add", exc
+        )
+        assert isinstance(mapped, InvalidProposalActionError)
+        assert mapped.detail == "invalid arcana_source_add action"
+        assert mapped.field_errors == ()
+        assert _PLUGIN_SENTINEL not in mapped.detail
+
+    def test_bare_value_error_for_a_declared_supported_kind_is_invalid_action(self) -> None:
+        judge = FakeProposalJudge(supported_proposal_kinds=frozenset({"arcana_source_add"}))
+        mapped = _classify_value_error_to_proposal_error(
+            judge, "arcana_source_add", ValueError(f"plugin detail {_PLUGIN_SENTINEL}")
+        )
+        assert isinstance(mapped, InvalidProposalActionError)
+        assert mapped.detail == "invalid arcana_source_add action"
+        assert mapped.field_errors == ()
+        assert _PLUGIN_SENTINEL not in mapped.detail
+
+    def test_bare_value_error_for_an_undeclared_kind_lists_supported_kinds(self) -> None:
+        judge = FakeProposalJudge(
+            supported_proposal_kinds=["arcana_source_add", "arcana_source_revise"]
+        )
+        mapped = _classify_value_error_to_proposal_error(
+            judge, "arcana_source_upsert", ValueError(f"plugin detail {_PLUGIN_SENTINEL}")
+        )
+        assert type(mapped) is ValueError
+        assert mapped.args[0] == (
+            "unsupported proposal kind: 'arcana_source_upsert'; "
+            "supported kinds: arcana_source_add, arcana_source_revise"
+        )
+        assert _PLUGIN_SENTINEL not in mapped.args[0]
+
+    def test_bare_value_error_without_the_capability_keeps_the_plain_message(self) -> None:
+        judge = FakeProposalJudge()  # supported_proposal_kinds defaults to None (unknown)
+        mapped = _classify_value_error_to_proposal_error(
+            judge, "arcana_source_upsert", ValueError("plugin detail")
+        )
+        assert type(mapped) is ValueError
+        assert mapped.args[0] == "unsupported proposal kind: 'arcana_source_upsert'"
+
+    def test_capability_with_an_unsafe_kind_still_names_supported_kinds(self) -> None:
+        judge = FakeProposalJudge(supported_proposal_kinds=frozenset({"arcana_source_add"}))
+        mapped = _classify_value_error_to_proposal_error(
+            judge, "UPPER-CASE-KIND", ValueError("plugin detail")
+        )
+        assert type(mapped) is ValueError
+        assert mapped.args[0] == "unsupported proposal kind; supported kinds: arcana_source_add"
+        assert "UPPER-CASE-KIND" not in mapped.args[0]
+
+    def test_message_is_scrubbed_when_rebuilt_from_pairs(self) -> None:
+        """The rebuilt message goes through the credential/URL scrub before
+        reaching the caller -- a path/code pair can never smuggle
+        credential-shaped text through because paths are grammar-validated,
+        but the kind label and the assembled message are still scrubbed
+        end-to-end."""
+        exc = _ForeignInvalidActionError([("content", "missing")])
+        mapped = _classify_value_error_to_proposal_error(
+            FakeProposalJudge(), "arcana_source_add", exc
+        )
+        assert isinstance(mapped, InvalidProposalActionError)
+        assert "api_key" not in mapped.detail
+        assert "sk-" not in mapped.detail
+
+
+class TestClassifyProposalInvalidActionSeam:
+    """``service._classify_proposal`` end-to-end with the TECH-7711 signal:
+    the duck-typed error maps to ``InvalidProposalActionError`` with the
+    sanitized, board-owned message, preserving the plugin exception as
+    ``__cause__`` (where the sentinel lives, and only there)."""
+
+    def test_signalled_error_through_classify_proposal(self) -> None:
+        judge = FakeProposalJudge(
+            classify_raises=_ForeignInvalidActionError([("content", "missing")])
+        )
+        with pytest.raises(InvalidProposalActionError) as exc_info:
+            _classify_proposal(judge, "arcana_source_add", {})
+        assert exc_info.value.detail == "invalid arcana_source_add action: content: missing"
+        assert exc_info.value.field_errors == (("content", "missing"),)
+        assert exc_info.value.omitted == 0
+        # The plugin's own exception (with its sentinel text) is preserved as
+        # __cause__ for logging -- but never reaches the caller-facing detail.
+        assert isinstance(exc_info.value.__cause__, _ForeignInvalidActionError)
+        assert _PLUGIN_SENTINEL in str(exc_info.value.__cause__)
+        assert _PLUGIN_SENTINEL not in exc_info.value.detail
+
+    def test_bare_value_error_with_capability_through_classify_proposal(self) -> None:
+        judge = FakeProposalJudge(
+            classify_raises=ValueError(f"plugin detail {_PLUGIN_SENTINEL}"),
+            supported_proposal_kinds=frozenset({"arcana_source_add", "arcana_source_revise"}),
+        )
+        with pytest.raises(InvalidProposalActionError) as exc_info:
+            _classify_proposal(judge, "arcana_source_add", {})
+        assert exc_info.value.detail == "invalid arcana_source_add action"
+        assert exc_info.value.field_errors == ()
+        assert _PLUGIN_SENTINEL not in exc_info.value.detail
+
+    def test_unknown_kind_with_capability_through_classify_proposal(self) -> None:
+        judge = FakeProposalJudge(
+            classify_raises=ValueError("unsupported kind: 'arcana_source_upsert'"),
+            supported_proposal_kinds=frozenset(
+                {"arcana_source_add", "arcana_source_revise", "linear_progress_update"}
+            ),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            _classify_proposal(judge, "arcana_source_upsert", {})
+        assert not isinstance(exc_info.value, InvalidProposalActionError)
+        assert exc_info.value.args[0] == (
+            "unsupported proposal kind: 'arcana_source_upsert'; "
+            "supported kinds: arcana_source_add, arcana_source_revise, linear_progress_update"
+        )
+        assert _PLUGIN_SENTINEL not in exc_info.value.args[0]
+        assert "unsupported kind: 'arcana_source_upsert'" in str(exc_info.value.__cause__)
+
+    def test_plugin_sentinel_never_reaches_the_caller_facing_message(self) -> None:
+        judge = FakeProposalJudge(
+            classify_raises=_ForeignInvalidActionError(
+                [("Evil-Key; secret=" + _PLUGIN_SENTINEL, "nope")],
+                message=f"echoes content={_PLUGIN_SENTINEL}",
+            )
+        )
+        with pytest.raises(InvalidProposalActionError) as exc_info:
+            _classify_proposal(judge, "arcana_source_add", {})
+        assert exc_info.value.detail == "invalid arcana_source_add action: action: invalid_value"
+        assert _PLUGIN_SENTINEL not in exc_info.value.detail
+        assert _PLUGIN_SENTINEL not in repr(exc_info.value.field_errors)
+
+    def test_generic_exception_path_message_is_unchanged(self) -> None:
+        """Pre-TECH-7711 behavior pinned deliberately (scope note for review):
+        a non-ValueError plugin bug still echoes the caller-supplied ``kind``
+        in ``proposal classification failed for kind {kind!r}``."""
+        judge = FakeProposalJudge(classify_raises=RuntimeError("boom"))
+        with pytest.raises(ValueError, match="proposal classification failed for kind") as exc_info:
+            _classify_proposal(judge, "linear_progress_update", {})
+        assert "'linear_progress_update'" in str(exc_info.value)
+
+    def test_priority_validation_path_message_is_unchanged(self) -> None:
+        """Pre-TECH-7711 behavior pinned deliberately (scope note for review):
+        an unusable priority still echoes the caller-supplied ``kind``."""
+        judge = FakeProposalJudge(classify_result=ProposalClassification(priority="urgent!!"))
+        with pytest.raises(
+            ValueError,
+            match="proposal judge returned invalid priority for kind 'linear_progress_update'",
+        ) as exc_info:
+            _classify_proposal(judge, "linear_progress_update", {})
+        assert "must be one of" in str(exc_info.value)

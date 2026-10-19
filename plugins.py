@@ -1322,13 +1322,63 @@ class ProposalApplyOutcome(NamedTuple):
     indeterminate: bool = False
 
 
+# --- Structured "malformed action for a supported kind" signal (TECH-7711) ---
+#
+# A ``classify()`` implementation reports "this kind is supported, but its
+# ``action`` payload is malformed" by raising a ``ValueError`` SUBCLASS that
+# carries this duck-typed attribute (no Protocol member, no import of this
+# module required -- a plugin repo that does not depend on the board simply
+# sets the attribute by name): a tuple of ``(path, code)`` string pairs.
+#
+# - ``path``: a dotted path of schema-declared field names and numeric list
+#   indexes (``content``, ``citations.0.quote``), or ``action`` for the
+#   whole payload. Never an attacker-supplied key or an input value. The
+#   board re-validates every path (lowercase snake_case segments or 1-4
+#   digit indexes, at most 8 segments, 128 characters) and replaces
+#   anything else with ``action``.
+# - ``code``: one of ``PROPOSAL_ACTION_ERROR_CODES``. The board replaces any
+#   other string with ``invalid_value``.
+#
+# The board NEVER echoes the exception's own text (it may contain
+# plugin-internal or caller-supplied detail) -- it rebuilds the caller-facing
+# message from the sanitized ``(path, code)`` pairs only. A bare
+# ``ValueError`` without this attribute keeps meaning "unsupported kind".
+PROPOSAL_ACTION_ERRORS_ATTR = "proposal_action_errors"
+PROPOSAL_ACTION_ERROR_CODES: frozenset[str] = frozenset(
+    {
+        "missing",
+        "extra_field",
+        "invalid_type",
+        "too_short",
+        "too_long",
+        "out_of_range",
+        "invalid_format",
+        "invalid_value",
+        "not_canonical",
+        "digest_mismatch",
+    }
+)
+
+# Optional capability a judge MAY expose (never required by ``ProposalJudge``,
+# read defensively with ``getattr``): ``supported_proposal_kinds``, an
+# iterable of at most 32 kind strings matching ``[a-z][a-z0-9_]{0,63}``. When
+# present and valid the board uses it to tell "unsupported kind" apart from
+# "malformed action" for a bare ``ValueError`` and to list the supported
+# kinds in the unsupported-kind message. Absent, ``None`` or malformed means
+# "unknown" and the board keeps its generic unsupported-kind message.
+PROPOSAL_SUPPORTED_KINDS_ATTR = "supported_proposal_kinds"
+
+
 class ProposalJudge(Protocol):
     """Pluggable proposal judging and applying seam (TECH-5872/TECH-5877).
 
     The board defensively validates all return values and exceptions at
     the seam boundary:
     - ``classify()``: ``ValueError`` is wrapped into a board-controlled
-      message and mapped to 422.
+      message and mapped to 422 -- "unsupported kind" for a bare
+      ``ValueError``, "invalid action" (with sanitized field-level reasons)
+      for a ``ValueError`` subclass carrying ``proposal_action_errors``
+      (see ``PROPOSAL_ACTION_ERRORS_ATTR``).
     - ``fingerprint()``: ``error.detail`` is capped at 500 chars (truncated
       with ``"... [truncated]"``), ``error.error_code`` is capped at 64 chars,
       and ``error.status_code`` MUST be one of ``{403, 404, 422, 500, 503}`` -- any other
@@ -1358,15 +1408,24 @@ class ProposalJudge(Protocol):
         Synchronous and side-effect-free by contract -- called before the
         rate-limit attempt marker is committed, so it must not perform I/O.
 
-        Raise ``ValueError`` for an unsupported ``kind``, and ONLY for an
-        unsupported ``kind`` -- never for any other reason (a malformed
-        ``action`` shape on an otherwise-supported ``kind``, for instance).
-        The board wraps that exception into a board-controlled
-        "unsupported proposal kind" message and maps it to 422, preserving
-        the original exception as ``__cause__`` for logging -- so a
-        ``ValueError`` raised for a different reason would surface to the
-        caller as a misleading "unsupported kind" error instead of
-        whatever the real problem was. LLM response parsing failures --
+        Raise a bare ``ValueError`` for an unsupported ``kind``, and ONLY
+        for an unsupported ``kind``. The board wraps that exception into a
+        board-controlled "unsupported proposal kind" message and maps it to
+        422, preserving the original exception as ``__cause__`` for logging
+        -- so a bare ``ValueError`` raised for a different reason would
+        surface to the caller as a misleading "unsupported kind" error
+        instead of whatever the real problem was.
+
+        A malformed ``action`` on an otherwise-SUPPORTED ``kind`` is
+        signalled by raising a ``ValueError`` subclass that carries a
+        ``proposal_action_errors`` tuple of ``(path, code)`` pairs (see
+        ``PROPOSAL_ACTION_ERRORS_ATTR`` / ``PROPOSAL_ACTION_ERROR_CODES``).
+        The board maps it to the same 422 with a distinct "invalid action"
+        message built ONLY from the sanitized pairs, never from the
+        exception text. A judge may additionally expose an optional
+        ``supported_proposal_kinds`` iterable (see
+        ``PROPOSAL_SUPPORTED_KINDS_ATTR``); it is not a Protocol member.
+        LLM response parsing failures --
         e.g. a `classify()` implementation synchronously parsing
         already-fetched LLM output embedded in `action`, NOT making a
         live LLM call itself (that would violate the "must not perform
@@ -1532,6 +1591,8 @@ __all__ = [
     "FINGERPRINT_UNAVAILABLE",
     "INSTRUCTION_REGISTRY_PATH",
     "INSTRUCTION_TEXT_HASHES",
+    "PROPOSAL_ACTION_ERRORS_ATTR",
+    "PROPOSAL_ACTION_ERROR_CODES",
     "PROPOSAL_APPLY_MAX_ATTEMPTS_ENV_VAR",
     "PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS_ENV_VAR",
     "PROPOSAL_APPLY_RETRY_BUDGET_SECONDS_ENV_VAR",
@@ -1541,6 +1602,7 @@ __all__ = [
     "PROPOSAL_APPLY_URL_ENV_VAR",
     "PROPOSAL_JUDGES",
     "PROPOSAL_JUDGE_ENV_VAR",
+    "PROPOSAL_SUPPORTED_KINDS_ATTR",
     "RISK_SCORERS",
     "RISK_SCORER_ENV_VAR",
     "ActiveChecker",

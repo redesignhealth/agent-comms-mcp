@@ -19,6 +19,7 @@ principle" section for why).
 from __future__ import annotations
 
 import asyncio
+import re
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -35,6 +36,7 @@ import service
 from exceptions import (
     AccessDeniedError,
     HoldAlreadyDecidedError,
+    InvalidProposalActionError,
     ProposalTargetUnavailableError,
     RateLimitExceededError,
 )
@@ -67,7 +69,15 @@ from service import (
     list_proposals_for_bot,
     withdraw_proposal,
 )
-from tests.proposal_judge_fakes import FakeProposalJudge
+from tests.proposal_judge_fakes import (
+    INVALID_ACTION_CASES,
+    PLUGIN_SENTINEL,
+    FakeProposalJudge,
+    arcana_style_action,
+    expected_invalid_action_detail,
+    invalid_action_judge,
+    invalid_action_kind,
+)
 
 # Real-Postgres fixtures (database_url, _migrated_schema, engine) are shared
 # via tests/conftest.py (Argus review S15) -- this module opts in explicitly
@@ -478,6 +488,103 @@ class TestClassifyDispatch:
         with pytest.raises(ValueError, match=pattern) as exc_info:
             await _submit(session, judge=judge)
         assert "unsupported kind: 'nonsense'" in str(exc_info.value.__cause__)
+
+
+class TestInvalidActionDispatch:
+    """TECH-7711 board-side coverage of ``create_proposal`` when the injected
+    judge signals "supported kind, malformed action" via the duck-typed
+    ``proposal_action_errors`` attribute (a ``ValueError`` subclass) -- the
+    six-case matrix (unknown kind / wrong action_type / missing field /
+    extra field / bad canonical target / sha mismatch) driven by the shared
+    ``tests.proposal_judge_fakes`` six-case driver, which mirrors the exact
+    pairs the REAL judge (agent-comms-approvals' ``InvalidProposalAction``)
+    emits for the same six cases.
+
+    For every case, ``classify()`` runs BEFORE the fingerprint fetch, the
+    rate-limit attempt marker, and the dedup-or-insert -- so a rejected
+    submission never touches the database, never calls ``fingerprint()``,
+    and never burns rate-limit budget."""
+
+    @pytest.mark.parametrize("case", list(INVALID_ACTION_CASES))
+    async def test_case_raises_with_the_board_owned_message(
+        self, session: AsyncSession, case: str
+    ) -> None:
+        judge = invalid_action_judge(case)
+        expected_detail = expected_invalid_action_detail(case)
+        with pytest.raises(ValueError, match=re.escape(expected_detail)) as exc_info:
+            await _submit(
+                session, kind=invalid_action_kind(case), action=arcana_style_action(), judge=judge
+            )
+        if case == "unknown_kind":
+            assert not isinstance(exc_info.value, InvalidProposalActionError)
+        else:
+            assert isinstance(exc_info.value, InvalidProposalActionError)
+            pairs = INVALID_ACTION_CASES[case]
+            assert exc_info.value.field_errors == pairs
+            assert exc_info.value.omitted == 0
+        # The plugin's own exception (with its sentinel text) is preserved
+        # as __cause__ for logging -- but the sentinel never reaches the
+        # caller-facing message.
+        assert PLUGIN_SENTINEL in str(exc_info.value.__cause__)
+        assert PLUGIN_SENTINEL not in str(exc_info.value)
+
+    @pytest.mark.parametrize("case", list(INVALID_ACTION_CASES))
+    async def test_case_never_touches_the_database_or_rate_budget(
+        self, session: AsyncSession, case: str
+    ) -> None:
+        """classify() raises before the fingerprint fetch, the
+        ``proposal.submission_attempt`` audit marker, the rate-limit check,
+        and the dedup-or-insert: no hold row, no audit row of any kind, and
+        ``fingerprint()`` never called."""
+        judge = invalid_action_judge(case)
+        with pytest.raises(ValueError):
+            await _submit(
+                session, kind=invalid_action_kind(case), action=arcana_style_action(), judge=judge
+            )
+        assert judge.fingerprint_calls == []
+        assert judge.judge_calls == []
+        assert judge.apply_calls == []
+        holds = (await session.execute(select(ProposalHold))).scalars().all()
+        assert holds == []
+        audits = (await session.execute(select(AuditLog))).scalars().all()
+        assert audits == []
+
+    async def test_preexisting_pending_dedup_row_is_left_unchanged(
+        self, session: AsyncSession
+    ) -> None:
+        """A malformed-action resubmission (same ``kind``/``target_id``/
+        ``action_type`` as an existing pending row) 422s at classify -- BEFORE
+        the dedup-or-insert -- so the preexisting pending row is never
+        upserted, overwritten, or duplicated."""
+        seeded = await _submit(
+            session,
+            kind="arcana_source_add",
+            action=arcana_style_action(),
+            rationale="original rationale",
+            judge=FakeProposalJudge(
+                fingerprint_result=ProposalFingerprint(
+                    status=FINGERPRINT_DIGEST, digest="fp-seeded"
+                )
+            ),
+        )
+        assert seeded["status"] == "pending"
+
+        judge = invalid_action_judge("sha_mismatch")
+        with pytest.raises(InvalidProposalActionError, match="sha256: digest_mismatch"):
+            await _submit(
+                session,
+                kind="arcana_source_add",
+                action=arcana_style_action(),
+                rationale="malformed resubmission rationale",
+                judge=judge,
+            )
+
+        rows = (await session.execute(select(ProposalHold))).scalars().all()
+        assert len(rows) == 1
+        assert str(rows[0].id) == seeded["proposal_id"]
+        assert rows[0].rationale == "original rationale"
+        assert rows[0].target_fingerprint == "fp-seeded"
+        assert rows[0].status == "pending"
 
 
 class TestJudgeApplyBoardMechanics:
