@@ -2589,6 +2589,20 @@ inverse of `e1db7c2e6b70`'s (safe) widening.
  introduced, either move the retirement check (in both functions) to run after it, or
  fold retirement into the uniform denial for that gate specifically.
 
+## 10a. Cross-brain proposals (TECH-7665)
+
+Behind `CROSS_BRAIN_PROPOSALS_ENABLED` (default off). For `arcana_source_add`, `action.target`
+names another agent's brain. Proposing is open (the target only has to exist and be active; an
+unknown or suspended target is an opaque 404). The board moves `target` out of `action` onto the
+hold (`cross_brain`: canonical `target_sub`, `required_owner_subs` = the target's human owner plus
+the submitter's owner when different) and never auto-approves. `decide_proposal` records each
+required owner's approval in `approvals`; one reject ends it, and only the last outstanding
+approval claims and applies. Naming yourself is just an own-brain proposal. The dedup key includes
+the target. Per-submitter and per-target pending caps bound abuse
+(`CROSS_BRAIN_MAX_PENDING_PER_SUBMITTER`, `..._PER_TARGET`). Bots see only the target and approval
+counts, never owner identities. The apply-record read carries `cross_brain` and `approvals` so the
+approvals service can verify every required owner approved the exact target before writing.
+
 ## 11. Deployment
 
 See [README.md: Deployment](../README.md#deployment) for setup and

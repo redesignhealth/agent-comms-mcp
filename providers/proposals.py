@@ -193,6 +193,13 @@ async def submit(
     proposing the identical ``(kind, target_id, action_type)`` gets its
     own separate row.
 
+    Cross-brain (TECH-7665, off unless the board enables it): for
+    ``arcana_source_add``, ``action.target`` may name ANOTHER agent's brain
+    (a board agent id or sub). Any agent may propose; the proposal is never
+    auto-approved and applies only after the target's human owner (and yours,
+    when different) both approve. An unknown or inactive target is an opaque
+    ``target_not_found``.
+
     ``confidence``/``importance``/``impact`` must each be ``"low"``,
     ``"medium"``, or ``"high"``. ``priority`` is always server-derived --
     there is no caller-supplied priority. Rate-limited per bot (TECH-5875).

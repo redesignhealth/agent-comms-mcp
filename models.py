@@ -837,6 +837,10 @@ class ProposalHold(Base):
             "proposed_by_bot_id",
             text("(action ->> 'target_id')"),
             text("(action ->> 'action_type')"),
+            # TECH-7665: a cross-brain proposal's target is part of the dedup key
+            # (empty string for every non-cross-brain hold, so their dedup is
+            # unchanged); see migration c7665a1b2d3e.
+            text("COALESCE(cross_brain ->> 'target_sub', '')"),
             postgresql_where=text("status IN ('pending', 'applying')"),
             unique=True,
         ),
@@ -887,6 +891,12 @@ class ProposalHold(Base):
     # structured to report returns `None`, so this stays unset for those
     # rows -- see `service._apply_or_finalize_proposal_hold`.
     apply_result: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    # TECH-7665: NULL for own-brain (and every pre-existing) hold. For a hold that
+    # names another agent's brain: {target_sub, target_agent_id, target_display_name,
+    # target_owner_sub, target_owner_email, required_owner_subs}.
+    cross_brain: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    # Human owners who have approved so far: [{"sub": ..., "at": iso}, ...].
+    approvals: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _updated_at()
 
