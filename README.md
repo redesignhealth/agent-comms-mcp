@@ -172,7 +172,15 @@ of it. `GET /proposals/history` (TECH-6030) is `GET /proposals/pending`'s
 terminal-status sibling -- same interactive-only, owner_sub-scoped gate,
 but every already-decided (or bot-withdrawn) proposal instead of the
 still-pending ones; likewise a DIFFERENT, human-scoped listing than
-`proposals_list_history` above, not a duplicate of it. `POST
+`proposals_list_history` above, not a duplicate of it. `GET
+/proposals/{hold_id}/apply-record` (TECH-7694) is a service-to-service read
+of what the board recorded about a hold's decision (status, decision source,
+approver, owner, the action), used by `agent-comms-approvals` to re-check an
+approval before applying it. Gated on the agent-token chain only (never Okta),
+the `proposals:apply_record:read` scope, and a subject allowlist
+(`PROPOSAL_APPLY_RECORD_ALLOWED_SUBS`, default `agent-comms-approvals`);
+unknown holds are a uniform 404 and denials are audited under
+`denied.proposal_apply_record_missing_scope`. `POST
 /proposals/{id}/decide` (TECH-5873) is the
 human decide-and-synchronously-apply side: `approve`/`reject` on a
 `"pending"` proposal, same interactive-only + owner_sub-scoped gate as

@@ -5806,7 +5806,7 @@ ALLOWED_DENIAL_REASONS = frozenset({"not_agent_token", "missing_scope"})
 # `surface` parameter already exists to prevent on the interactive side.
 # "submit" is the default so every pre-existing call site/test (which never
 # passed a surface) keeps writing the exact same action string as before.
-PROPOSAL_SUBMITTER_SURFACES = frozenset({"submit", "get", "withdraw"})
+PROPOSAL_SUBMITTER_SURFACES = frozenset({"submit", "get", "withdraw", "apply_record"})
 
 
 async def audit_denied_proposal_submission(
@@ -7782,6 +7782,47 @@ async def get_proposal_for_bot(
             detail={"attempted_hold_id": str(hold_id)},
         )
     return _bot_facing_proposal_dict(hold)
+
+
+async def get_proposal_apply_record(
+    session: AsyncSession, *, hold_id: uuid.UUID, requesting_sub: str
+) -> dict[str, Any]:
+    """``GET /proposals/{hold_id}/apply-record`` (main.py, non-MCP,
+    service-gated -- TECH-7694). What the board itself recorded about a
+    proposal hold's decision, for the approvals service's pre-apply
+    re-check. Read-only (no lock). Unknown ``hold_id`` raises the uniform
+    ``AccessDeniedError`` (-> 404), audited as ``denied.unknown_proposal_hold``.
+
+    Unlike ``get_proposal_for_bot`` this deliberately includes
+    ``decided_by_actor_id`` (a human approver's sub) and ``owner_sub``: the
+    caller is a service credential, never a bot, and needs both to verify
+    that the approver is the submitter's owner. ``target_id`` and
+    ``action_type`` come from the same extraction the apply path uses, so
+    the caller recomputes its request digest from identical inputs.
+    """
+    hold = await _find_proposal_hold(session, hold_id)
+    if hold is None:
+        await _deny(
+            session,
+            actor_sub=requesting_sub,
+            action="denied.unknown_proposal_hold",
+            detail={"attempted_hold_id": str(hold_id)},
+        )
+    target_id, action_type = _extract_proposal_target(hold.action)
+    return {
+        "hold_id": str(hold.id),
+        "status": hold.status,
+        "kind": hold.kind,
+        "proposed_by_bot_id": hold.proposed_by_bot_id,
+        "owner_sub": hold.owner_sub,
+        "action": hold.action,
+        "target_id": target_id,
+        "action_type": action_type,
+        "rationale": hold.rationale,
+        "decision_source": hold.decision_source,
+        "decided_by_actor_id": hold.decided_by_actor_id,
+        "decided_at": _iso(hold.decided_at),
+    }
 
 
 async def withdraw_proposal(

@@ -59,6 +59,7 @@ from providers.comms import (
 )
 from providers.proposals import proposals_server
 from scopes import (
+    PROPOSAL_APPLY_RECORD_SCOPE,
     PROPOSAL_SUBMIT_SCOPE,
     check_resource_scope,
     is_interactive_token,
@@ -931,6 +932,46 @@ async def _authenticate_proposal_submitter(
     return None, None, 403
 
 
+# Subjects allowed to read ``GET /proposals/{hold_id}/apply-record`` (TECH-7694):
+# a comma-separated allowlist on top of the scope, so a token that merely
+# carries the scope under some other subject is refused. The default is the
+# approvals service's own service identity.
+PROPOSAL_APPLY_RECORD_SUBS_ENV = "PROPOSAL_APPLY_RECORD_ALLOWED_SUBS"
+_DEFAULT_PROPOSAL_APPLY_RECORD_SUBS = "agent-comms-approvals"
+
+
+async def _authenticate_apply_record_caller(request: Request) -> tuple[str | None, int]:
+    """Gate for ``GET /proposals/{hold_id}/apply-record`` (TECH-7694):
+    a verified agent-chain service token (never Okta/interactive) carrying
+    ``PROPOSAL_APPLY_RECORD_SCOPE`` whose subject is on the
+    ``PROPOSAL_APPLY_RECORD_ALLOWED_SUBS`` allowlist. Returns
+    ``(sub, 200)`` or ``(None, 401 | 403)``; every 403 is audited under the
+    ``apply_record`` surface."""
+    token_str = _extract_bearer_token(request)
+    if token_str is None:
+        return None, 401
+    token = await _verify_agent_token(token_str)
+    if token is None:
+        return None, 401
+    sub = try_resolve_email(token)
+    if sub is None:
+        return None, 401
+    allowed = {
+        entry.strip()
+        for entry in os.environ.get(
+            PROPOSAL_APPLY_RECORD_SUBS_ENV, _DEFAULT_PROPOSAL_APPLY_RECORD_SUBS
+        ).split(",")
+        if entry.strip()
+    }
+    if PROPOSAL_APPLY_RECORD_SCOPE not in scopes_for_token(token) or sub not in allowed:
+        async with get_session_factory()() as session:
+            await service.audit_denied_proposal_submission(
+                session, actor_sub=sub, reason="missing_scope", surface="apply_record"
+            )
+        return None, 403
+    return sub, 200
+
+
 @mcp.custom_route("/proposals", methods=["POST"])
 async def submit_proposal(request: Request) -> Response:
     """Bot-submission endpoint for a generalized action-approval proposal
@@ -1269,6 +1310,35 @@ async def withdraw_proposal_route(request: Request) -> Response:
             return JSONResponse({"error": "already_decided", "status": exc.status}, status_code=409)
         except Exception:
             logger.exception("withdraw_proposal invariant violation for hold_id=%s", proposal_id)
+            return JSONResponse({"error": "internal_error"}, status_code=500)
+
+    return JSONResponse(result, status_code=200)
+
+
+@mcp.custom_route("/proposals/{hold_id}/apply-record", methods=["GET"])
+async def get_proposal_apply_record_route(request: Request) -> Response:
+    """Service-only read of what the board recorded about a proposal hold's
+    decision (TECH-7694), for the approvals service's pre-apply re-check.
+    Auth: ``_authenticate_apply_record_caller`` (scope + subject allowlist).
+    Unknown hold: uniform 404. Read-only; never mutates the hold."""
+    caller_sub, status = await _authenticate_apply_record_caller(request)
+    if caller_sub is None:
+        return JSONResponse({"error": "unauthorized"}, status_code=status)
+
+    try:
+        hold_id = uuid.UUID(request.path_params["hold_id"])
+    except ValueError:
+        return JSONResponse(_UNIFORM_HOLD_NOT_FOUND, status_code=404)
+
+    async with get_session_factory()() as session:
+        try:
+            result = await service.get_proposal_apply_record(
+                session, hold_id=hold_id, requesting_sub=caller_sub
+            )
+        except AccessDeniedError:
+            return JSONResponse(_UNIFORM_HOLD_NOT_FOUND, status_code=404)
+        except Exception:
+            logger.exception("get_proposal_apply_record failure for hold_id=%s", hold_id)
             return JSONResponse({"error": "internal_error"}, status_code=500)
 
     return JSONResponse(result, status_code=200)
