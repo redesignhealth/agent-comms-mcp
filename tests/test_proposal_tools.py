@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import subprocess
 import sys
 import uuid
@@ -31,7 +32,7 @@ import pytest
 import pytest_asyncio
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -41,7 +42,7 @@ from sqlalchemy.ext.asyncio import (
 
 import plugins
 import service
-from models import ProposalHold
+from models import AuditLog, ProposalHold
 from plugins import (
     FINGERPRINT_DIGEST,
     FINGERPRINT_UNAVAILABLE,
@@ -50,7 +51,16 @@ from plugins import (
     ProposalTargetError,
 )
 from service import decide_proposal
-from tests.proposal_judge_fakes import FakeProposalJudge
+from tests.proposal_judge_fakes import (
+    INVALID_ACTION_CASES,
+    PLUGIN_SENTINEL,
+    SUPPORTED_PROPOSAL_KINDS,
+    FakeProposalJudge,
+    arcana_style_action,
+    expected_invalid_action_detail,
+    invalid_action_classify_raises,
+    invalid_action_kind,
+)
 
 SERVICE_ROOT = Path(__file__).parent.parent
 _DEFAULT_TEST_DATABASE_URL = "postgresql://postgres:postgres@localhost:55432/agent_comms"
@@ -1250,3 +1260,106 @@ class TestProposalToolsSenderAgentId:
         hold2 = await session.get(ProposalHold, uuid.UUID(proposal_id))
         assert hold2 is not None
         assert hold2.sender_agent_id == expected_agent_id
+
+
+# --- TECH-7711: invalid-action parity with the REST route ---------------------
+
+
+class TestSubmitInvalidAction:
+    """MCP parity for a judge signaling "supported kind, malformed action"
+    via the duck-typed ``proposal_action_errors`` attribute (the six-case
+    matrix from ``tests.proposal_judge_fakes``, mirroring the exact pairs the
+    REAL judge emits): the tool surface must raise ``ToolError`` carrying the
+    IDENTICAL board-owned ``detail`` the REST route returns as ``detail``
+    (``providers.proposals._map_proposal_errors`` passes the sanitized
+    ``ValueError`` through verbatim; the structured ``field_errors`` list is
+    REST-only). Same invariants as the REST route: no hold row, no audit row,
+    and the judge's ``fingerprint()`` was never reached."""
+
+    @pytest.mark.parametrize("case", list(INVALID_ACTION_CASES))
+    async def test_case_raises_tool_error_with_the_rest_routes_detail(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        session: AsyncSession,
+        _default_proposal_judge: FakeProposalJudge,
+        case: str,
+    ) -> None:
+        _default_proposal_judge.classify_raises = invalid_action_classify_raises(case)
+        _default_proposal_judge.supported_proposal_kinds = SUPPORTED_PROPOSAL_KINDS
+        token = _token("bot-invalid-action", owner_sub="owner@example.com")
+        expected_detail = expected_invalid_action_detail(case)
+        with pytest.raises(ToolError, match=re.escape(expected_detail)) as exc_info:
+            await _call(
+                main,
+                test_session_factory,
+                token,
+                "proposals_submit",
+                {
+                    "kind": invalid_action_kind(case),
+                    "action": arcana_style_action(),
+                    "rationale": "because reasons",
+                    "confidence": "medium",
+                    "importance": "medium",
+                    "impact": "medium",
+                },
+            )
+        # REST parity: the ToolError text carries the exact same sanitized
+        # detail (search-matched above), and never the plugin's own text.
+        assert expected_invalid_action_detail(case) in str(exc_info.value)
+        assert PLUGIN_SENTINEL not in str(exc_info.value)
+
+        assert _default_proposal_judge.fingerprint_calls == []
+        holds = (await session.execute(select(ProposalHold))).scalars().all()
+        assert holds == []
+        audits = (await session.execute(select(AuditLog))).scalars().all()
+        assert audits == []
+
+    async def test_preexisting_pending_row_is_left_unchanged(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        session: AsyncSession,
+        _default_proposal_judge: FakeProposalJudge,
+    ) -> None:
+        """A malformed-action resubmission (same kind/target_id/action_type as
+        an existing pending row) fails at classify, before the
+        dedup-or-insert -- the pending row is never upserted or duplicated."""
+        token = _token("bot-invalid-action", owner_sub="owner@example.com")
+        submitted = await _call(
+            main,
+            test_session_factory,
+            token,
+            "proposals_submit",
+            {
+                "kind": "arcana_source_add",
+                "action": arcana_style_action(),
+                "rationale": "original rationale",
+                "confidence": "medium",
+                "importance": "medium",
+                "impact": "medium",
+            },
+        )
+        proposal_id = submitted["proposal_id"]
+
+        _default_proposal_judge.classify_raises = invalid_action_classify_raises("sha_mismatch")
+        with pytest.raises(ToolError, match="sha256: digest_mismatch"):
+            await _call(
+                main,
+                test_session_factory,
+                token,
+                "proposals_submit",
+                {
+                    "kind": "arcana_source_add",
+                    "action": arcana_style_action(),
+                    "rationale": "malformed resubmission rationale",
+                    "confidence": "medium",
+                    "importance": "medium",
+                    "impact": "medium",
+                },
+            )
+
+        holds = (await session.execute(select(ProposalHold))).scalars().all()
+        assert len(holds) == 1
+        assert str(holds[0].id) == proposal_id
+        assert holds[0].rationale == "original rationale"

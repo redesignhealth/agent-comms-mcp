@@ -2045,8 +2045,14 @@ startup WARNING -- not a crash -- when this one specifically is left unset, sinc
 default is safe but silent). Unlike the other six, it owns FOUR responsibilities for one
 pipeline (the proposal submission pipeline below) rather than one question for the
 comms pipeline: `classify(kind, action) -> ProposalClassification` (submit-time
-admission + server-derived priority -- synchronous, side-effect-free, may raise
-`ValueError` for an unsupported `kind`), `fingerprint(ctx) -> ProposalFingerprint`
+admission + server-derived priority -- synchronous, side-effect-free, raises a bare
+`ValueError` for an unsupported `kind`, or a `ValueError` subclass carrying a duck-typed
+`proposal_action_errors` tuple of `(path, code)` pairs for a malformed `action` on a
+supported kind -- TECH-7711: the board re-sanitizes the pairs against a closed code set and
+a strict path grammar, never echoes the exception text, and maps it to
+`InvalidProposalActionError` (422 `invalid_request`, REST adds `field_errors`); a judge
+may also expose an optional `supported_proposal_kinds` iterable, which is not a Protocol
+member), `fingerprint(ctx) -> ProposalFingerprint`
 (the target's current state digest, or `FINGERPRINT_NO_TARGET`/`FINGERPRINT_UNAVAILABLE`),
 `judge(ctx) -> ProposalVerdict` (auto-apply now, or hold for a human -- never rejects on a
 bot's behalf), and `apply(ctx) -> ProposalApplyOutcome` (perform the actual external

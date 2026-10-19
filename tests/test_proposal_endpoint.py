@@ -10,6 +10,7 @@ block and fake-auth-provider idiom. Auth is exercised against
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import uuid
@@ -37,7 +38,16 @@ from plugins import (
     ProposalTargetError,
     ProposalVerdict,
 )
-from tests.proposal_judge_fakes import FakeProposalJudge
+from tests.proposal_judge_fakes import (
+    INVALID_ACTION_CASES,
+    PLUGIN_SENTINEL,
+    SUPPORTED_PROPOSAL_KINDS,
+    FakeProposalJudge,
+    arcana_style_action,
+    expected_invalid_action_detail,
+    invalid_action_classify_raises,
+    invalid_action_kind,
+)
 
 # Real-Postgres fixtures (database_url, _migrated_schema, engine) are shared
 # via tests/conftest.py (Argus review S15) -- this module opts in explicitly
@@ -531,6 +541,95 @@ class TestSubmitProposal:
             "/proposals", json=body, headers={"Authorization": "Bearer bot-token"}
         )
         assert resp.status_code == 422
+
+    @pytest.mark.parametrize("case", list(INVALID_ACTION_CASES))
+    async def test_invalid_action_returns_422_with_sanitized_field_errors(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        _default_proposal_judge: FakeProposalJudge,
+        session: AsyncSession,
+        caplog: pytest.LogCaptureFixture,
+        case: str,
+    ) -> None:
+        """TECH-7711 REST parity: the judge signals "supported kind,
+        malformed action" via the duck-typed ``proposal_action_errors``
+        attribute (the six-case matrix from ``tests.proposal_judge_fakes``,
+        mirroring the exact pairs the REAL judge emits) -- the route must
+        return 422 ``invalid_request`` with the SAME board-owned
+        ``detail`` the service layer raises, plus the additive, already
+        sanitized ``field_errors`` list. The plugin's own exception text
+        (sentinel) must never reach the response body or the logs."""
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        _default_proposal_judge.classify_raises = invalid_action_classify_raises(case)
+        _default_proposal_judge.supported_proposal_kinds = SUPPORTED_PROPOSAL_KINDS
+        body = {
+            **_PROPOSAL_BODY,
+            "kind": invalid_action_kind(case),
+            "action": arcana_style_action(),
+        }
+        with caplog.at_level(logging.WARNING):
+            resp = await http_client.post(
+                "/proposals", json=body, headers={"Authorization": "Bearer bot-token"}
+            )
+        assert resp.status_code == 422
+        payload = resp.json()
+        assert payload["error"] == "invalid_request"
+        assert payload["detail"] == expected_invalid_action_detail(case)
+        pairs = INVALID_ACTION_CASES[case]
+        if pairs is None:
+            assert "field_errors" not in payload
+        else:
+            assert payload["field_errors"] == [{"path": path, "code": code} for path, code in pairs]
+        assert PLUGIN_SENTINEL not in resp.text
+        assert PLUGIN_SENTINEL not in caplog.text
+
+        # No hold row, no audit row (no submission attempt / rate-limit
+        # denial), and the judge's fingerprint() was never reached.
+        assert _default_proposal_judge.fingerprint_calls == []
+        holds = (await session.execute(select(ProposalHold))).scalars().all()
+        assert holds == []
+        audits = (await session.execute(select(AuditLog))).scalars().all()
+        assert audits == []
+
+    async def test_invalid_action_422_leaves_preexisting_pending_row_unchanged(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        _default_proposal_judge: FakeProposalJudge,
+        session: AsyncSession,
+    ) -> None:
+        """A malformed-action resubmission 422s at classify, before the
+        dedup-or-insert -- the preexisting pending row (same
+        kind/target_id/action_type) is never upserted or duplicated."""
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        first = await http_client.post(
+            "/proposals", json=_PROPOSAL_BODY, headers={"Authorization": "Bearer bot-token"}
+        )
+        assert first.status_code == 200
+        seeded_id = first.json()["proposal_id"]
+
+        _default_proposal_judge.classify_raises = invalid_action_classify_raises("sha_mismatch")
+        body = {
+            **_PROPOSAL_BODY,
+            "kind": "arcana_source_add",
+            "action": arcana_style_action(),
+            "rationale": "malformed resubmission rationale",
+        }
+        resp = await http_client.post(
+            "/proposals", json=body, headers={"Authorization": "Bearer bot-token"}
+        )
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == expected_invalid_action_detail("sha_mismatch")
+
+        rows = (await session.execute(select(ProposalHold))).scalars().all()
+        assert len(rows) == 1
+        assert str(rows[0].id) == seeded_id
+        assert rows[0].rationale == _PROPOSAL_BODY["rationale"]
 
     async def test_interactive_token_with_proposal_scope_still_returns_403(
         self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]

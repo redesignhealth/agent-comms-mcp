@@ -709,6 +709,26 @@ class _MockJudgeDelegate:
         raise AssertionError("delegate.apply() MUST NEVER BE CALLED by the board!")
 
 
+# TECH-7711: a duck-typed stand-in for agent-comms-approvals'
+# rh_comms_plugins.proposal_judge.InvalidProposalAction, plus the sentinel its
+# message carries (preserved on __cause__ for logging, never echoed to a
+# caller).
+_FORWARDED_PLUGIN_SENTINEL = "SECRET-DELEGATE-INTERNALS-7711"
+
+
+class _DuckTypedInvalidActionError(ValueError):
+    def __init__(self, errors: Any) -> None:
+        self.proposal_action_errors = errors
+        super().__init__(f"delegate internals: {_FORWARDED_PLUGIN_SENTINEL}")
+
+
+class _CapabilityDelegate(_MockJudgeDelegate):
+    """A delegate exposing the optional ``supported_proposal_kinds``
+    capability (an instance attribute, set by each test)."""
+
+    supported_proposal_kinds: Any = None
+
+
 class TestHttpApplyProposalJudgeWrapper:
     def test_classify_delegates_to_underlying_judge(self) -> None:
         delegate = _MockJudgeDelegate()
@@ -716,6 +736,104 @@ class TestHttpApplyProposalJudgeWrapper:
         res = judge.classify("kind", {"foo": "bar"})
         assert delegate.classify_called is True
         assert res.priority == "medium"
+
+    def test_supported_proposal_kinds_forwards_the_delegate_capability(self) -> None:
+        """TECH-7711: the wrapper forwards the delegate's optional
+        ``supported_proposal_kinds`` capability verbatim -- same object, so
+        the board's defensive read sees exactly what the delegate declares."""
+        kinds = frozenset({"arcana_source_add", "arcana_source_revise", "linear_progress_update"})
+        delegate = _CapabilityDelegate()
+        delegate.supported_proposal_kinds = kinds
+        judge = HttpApplyProposalJudge(delegate)
+        assert judge.supported_proposal_kinds is kinds
+
+    def test_supported_proposal_kinds_is_none_when_delegate_lacks_it(self) -> None:
+        """A delegate without the capability forwards ``None`` -- "unknown",
+        the same value the board's defensive read treats exactly like an
+        absent attribute."""
+        judge = HttpApplyProposalJudge(_MockJudgeDelegate())
+        assert judge.supported_proposal_kinds is None
+
+    def test_raising_delegate_capability_is_absorbed_by_the_boards_defensive_read(self) -> None:
+        """A delegate whose ``supported_proposal_kinds`` property raises
+        makes the WRAPPER's own property raise too -- but the board never
+        reads it outside ``service._read_supported_proposal_kinds``'s
+        try/except, so the capability still reads as "unknown" (``None``),
+        never an escaping exception."""
+        from service import _read_supported_proposal_kinds
+
+        class _RaisingCapabilityDelegate(_MockJudgeDelegate):
+            @property
+            def supported_proposal_kinds(self) -> Any:
+                raise RuntimeError("exploding capability")
+
+        judge = HttpApplyProposalJudge(_RaisingCapabilityDelegate())
+        with pytest.raises(RuntimeError, match="exploding capability"):
+            _ = judge.supported_proposal_kinds
+        assert _read_supported_proposal_kinds(judge) is None
+
+    def test_classify_signal_flows_through_the_wrapper_into_the_board_error(self) -> None:
+        """End-to-end through the wrapper: the delegate's duck-typed
+        ``proposal_action_errors`` signal (the shape agent-comms-approvals'
+        real ``InvalidProposalAction`` emits) surfaces through
+        ``service._classify_proposal`` as ``InvalidProposalActionError`` with
+        the sanitized, board-owned message -- the deployment-realistic path
+        (board configured with ``PROPOSAL_JUDGE=custom_http`` wrapping the
+        real approvals judge)."""
+
+        class _InvalidActionDelegate(_MockJudgeDelegate):
+            def classify(self, kind: str, action: dict[str, Any]) -> ProposalClassification:
+                self.classify_called = True
+                raise _DuckTypedInvalidActionError([("content", "missing")])
+
+        from exceptions import InvalidProposalActionError
+        from service import _classify_proposal
+
+        judge = HttpApplyProposalJudge(_InvalidActionDelegate())
+        with pytest.raises(InvalidProposalActionError) as exc_info:
+            _classify_proposal(judge, "arcana_source_add", {})
+        assert exc_info.value.detail == "invalid arcana_source_add action: content: missing"
+        assert exc_info.value.field_errors == (("content", "missing"),)
+        assert _FORWARDED_PLUGIN_SENTINEL not in exc_info.value.detail
+
+    def test_unsupported_kind_through_the_wrapper_lists_forwarded_kinds(self) -> None:
+
+        class _UnsupportedKindDelegate(_MockJudgeDelegate):
+            supported_proposal_kinds = frozenset(
+                {"arcana_source_add", "arcana_source_revise", "linear_progress_update"}
+            )
+
+            def classify(self, kind: str, action: dict[str, Any]) -> ProposalClassification:
+                self.classify_called = True
+                raise ValueError("unsupported kind: 'arcana_source_upsert'")
+
+        from service import _classify_proposal
+
+        judge = HttpApplyProposalJudge(_UnsupportedKindDelegate())
+        with pytest.raises(ValueError) as exc_info:
+            _classify_proposal(judge, "arcana_source_upsert", {})
+        assert exc_info.value.args[0] == (
+            "unsupported proposal kind: 'arcana_source_upsert'; "
+            "supported kinds: arcana_source_add, arcana_source_revise, linear_progress_update"
+        )
+
+    def test_bare_value_error_for_a_forwarded_supported_kind_is_invalid_action(self) -> None:
+
+        class _BareErrorDelegate(_MockJudgeDelegate):
+            supported_proposal_kinds = frozenset({"arcana_source_add"})
+
+            def classify(self, kind: str, action: dict[str, Any]) -> ProposalClassification:
+                self.classify_called = True
+                raise ValueError("plugin internals only")
+
+        from exceptions import InvalidProposalActionError
+        from service import _classify_proposal
+
+        judge = HttpApplyProposalJudge(_BareErrorDelegate())
+        with pytest.raises(InvalidProposalActionError) as exc_info:
+            _classify_proposal(judge, "arcana_source_add", {})
+        assert exc_info.value.detail == "invalid arcana_source_add action"
+        assert exc_info.value.field_errors == ()
 
     async def test_fingerprint_delegates_to_underlying_judge(self) -> None:
         delegate = _MockJudgeDelegate()

@@ -41,6 +41,7 @@ from exceptions import (
     HoldAwaitingAutoReviewError,
     HoldExpiredError,
     InvalidConversationStateError,
+    InvalidProposalActionError,
     ProposalTargetUnavailableError,
     RateLimitExceededError,
 )
@@ -1123,6 +1124,20 @@ async def submit_proposal(request: Request) -> Response:
             # log (proposal_holds has no dedicated metrics pipeline yet).
             logger.warning("proposal submission rate-limited for proposed_by_bot_id=%s", bot_sub)
             return JSONResponse({"error": "rate_limited", "detail": str(exc)}, status_code=429)
+        except InvalidProposalActionError as exc:
+            # TECH-7711: a supported kind with a malformed action. Same
+            # error/detail shape as the plain ValueError below plus an
+            # additive, already-sanitized ``field_errors`` list (schema field
+            # paths + closed-set codes, never input values). Must precede the
+            # bare ``ValueError`` clause: this type subclasses it.
+            return JSONResponse(
+                {
+                    "error": "invalid_request",
+                    "detail": str(exc),
+                    "field_errors": [{"path": p, "code": c} for p, c in exc.field_errors],
+                },
+                status_code=422,
+            )
         except ValueError as exc:
             return JSONResponse({"error": "invalid_request", "detail": str(exc)}, status_code=422)
         except ProposalTargetUnavailableError as exc:
