@@ -973,6 +973,9 @@ async def _authenticate_apply_record_caller(request: Request) -> tuple[str | Non
     return sub, 200
 
 
+MAX_PROPOSAL_REQUEST_BYTES = 5 * 1024 * 1024  # 5 MiB (TECH-7720)
+
+
 @mcp.custom_route("/proposals", methods=["POST"])
 async def submit_proposal(request: Request) -> Response:
     """Bot-submission endpoint for a generalized action-approval proposal
@@ -1011,9 +1014,26 @@ async def submit_proposal(request: Request) -> Response:
     if bot_sub is None or bot_token is None:
         return JSONResponse({"error": "unauthorized"}, status_code=status)
 
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > MAX_PROPOSAL_REQUEST_BYTES:
+                return JSONResponse({"error": "request_too_large"}, status_code=413)
+        except ValueError:
+            pass
+
+    chunks = []
+    total_bytes = 0
+    async for chunk in request.stream():
+        total_bytes += len(chunk)
+        if total_bytes > MAX_PROPOSAL_REQUEST_BYTES:
+            return JSONResponse({"error": "request_too_large"}, status_code=413)
+        chunks.append(chunk)
+    raw_body = b"".join(chunks)
+
     try:
-        body = await request.json()
-    except json.JSONDecodeError:
+        body = json.loads(raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
         return JSONResponse({"error": "invalid_json"}, status_code=422)
     if not isinstance(body, dict):
         return JSONResponse({"error": "invalid_body"}, status_code=422)
@@ -1034,11 +1054,12 @@ async def submit_proposal(request: Request) -> Response:
     # with no size/depth limit otherwise -- bound its serialized size, and
     # separately cap target_id/action_type since they flow straight into
     # the DB-level dedup index (idx_proposal_holds_pending_dedup).
-    if len(json.dumps(action)) > service.MAX_PROPOSAL_ACTION_BYTES:
+    action_limit = service.max_proposal_action_bytes(kind)
+    if service.proposal_action_serialized_bytes(action) > action_limit:
         return JSONResponse(
             {
                 "error": "invalid_request",
-                "detail": f"action exceeds {service.MAX_PROPOSAL_ACTION_BYTES} bytes serialized",
+                "detail": f"action exceeds {action_limit} bytes serialized",
             },
             status_code=422,
         )

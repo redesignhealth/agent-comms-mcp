@@ -63,7 +63,6 @@ scope.
 
 from __future__ import annotations
 
-import json
 import logging
 import uuid
 from collections.abc import AsyncIterator
@@ -230,14 +229,16 @@ async def submit(
         raise ToolError("invalid_request: agent_key must be a string")
     if not isinstance(action, dict):
         raise ToolError("invalid_request: action must be an object")
-    if len(json.dumps(action)) > service.MAX_PROPOSAL_ACTION_BYTES:
-        raise ToolError(
-            f"invalid_request: action exceeds {service.MAX_PROPOSAL_ACTION_BYTES} bytes serialized"
-        )
     try:
         kind = service.validate_proposal_string_field(
             "kind", kind, max_length=service.MAX_PROPOSAL_KIND_LENGTH
         )
+    except ValueError as exc:
+        raise ToolError(f"invalid_request: {exc}") from exc
+    action_limit = service.max_proposal_action_bytes(kind)
+    if service.proposal_action_serialized_bytes(action) > action_limit:
+        raise ToolError(f"invalid_request: action exceeds {action_limit} bytes serialized")
+    try:
         rationale = service.validate_proposal_string_field("rationale", rationale)
         target_fingerprint = service.validate_proposal_string_field(
             "target_fingerprint", target_fingerprint, required=False

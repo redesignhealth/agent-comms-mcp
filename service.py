@@ -171,9 +171,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, NamedTuple, NoReturn, Protocol
 from urllib.parse import urlsplit
 
-from sqlalchemy import ColumnElement, and_, func, literal, not_, or_, select, text, tuple_
+from sqlalchemy import ColumnElement, and_, case, func, literal, not_, or_, select, text, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import defer
 
 from exceptions import (
     AccessDeniedError,
@@ -6920,14 +6921,21 @@ async def _safe_fingerprint(judge: ProposalJudge, ctx: ProposalContext) -> Propo
 
 
 _PROPOSAL_JUDGE_DECIDED_BY = "system:judge"
+_DEFAULT_ACTION = object()
 
 
-def _proposal_dict(hold: ProposalHold) -> dict[str, Any]:
+def _proposal_dict(
+    hold: ProposalHold,
+    *,
+    action_override: Any = _DEFAULT_ACTION,
+    elided_action_fields: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    action = hold.action if action_override is _DEFAULT_ACTION else action_override
     result: dict[str, Any] = {
         "proposal_id": str(hold.id),
         "kind": hold.kind,
         "proposed_by_bot_id": hold.proposed_by_bot_id,
-        "action": hold.action,
+        "action": action,
         "rationale": hold.rationale,
         "confidence": hold.confidence,
         "importance": hold.importance,
@@ -6937,6 +6945,8 @@ def _proposal_dict(hold: ProposalHold) -> dict[str, Any]:
         "created_at": _iso(hold.created_at),
         "updated_at": _iso(hold.updated_at),
     }
+    if elided_action_fields is not None:
+        result["elided_action_fields"] = elided_action_fields
     if hold.decision_source is not None:
         result["decision_source"] = hold.decision_source
     if hold.decided_by_actor_id is not None:
@@ -6959,7 +6969,12 @@ def _proposal_dict(hold: ProposalHold) -> dict[str, Any]:
     return result
 
 
-def _bot_facing_proposal_dict(hold: ProposalHold) -> dict[str, Any]:
+def _bot_facing_proposal_dict(
+    hold: ProposalHold,
+    *,
+    action_override: Any = _DEFAULT_ACTION,
+    elided_action_fields: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """``_proposal_dict(hold)``, redacted for a response going back to the
     SUBMITTING bot (TECH-6018, Argus review round-2 BLOCKING) -- omits
     ``decided_by_actor_id`` when ``decision_source == "human"``, so a
@@ -6982,7 +6997,14 @@ def _bot_facing_proposal_dict(hold: ProposalHold) -> dict[str, Any]:
     directly for that call site instead of duplicating the redaction rule
     inline (Argus review round-4 suggestion).
     """
-    return _redact_bot_facing_dict(_proposal_dict(hold), decision_source=hold.decision_source)
+    return _redact_bot_facing_dict(
+        _proposal_dict(
+            hold,
+            action_override=action_override,
+            elided_action_fields=elided_action_fields,
+        ),
+        decision_source=hold.decision_source,
+    )
 
 
 def _redact_bot_facing_dict(
@@ -7031,6 +7053,50 @@ MAX_PROPOSAL_KIND_LENGTH = 200
 # sub-fields used as dedup keys (target_id/action_type) since an oversized
 # value there would otherwise flow straight into the DB-level dedup index.
 MAX_PROPOSAL_ACTION_BYTES = 16_384
+MAX_DOCUMENT_PROPOSAL_ACTION_BYTES = 4 * 1024 * 1024  # 4 MiB (TECH-7720)
+DOCUMENT_PROPOSAL_KINDS: frozenset[str] = frozenset({"arcana_source_add", "arcana_source_revise"})
+
+
+def max_proposal_action_bytes(kind: str | None) -> int:
+    """Return maximum allowed serialized bytes for ``action`` given ``kind``.
+
+    Document proposal kinds (arcana_source_add/revise) are permitted up to 4 MiB
+    to accommodate up to 1 MiB of UTF-8 content with JSON Unicode escaping and
+    associated action metadata. All other proposal kinds retain the default
+    16 KiB limit (TECH-7720).
+    """
+    if isinstance(kind, str) and kind in DOCUMENT_PROPOSAL_KINDS:
+        return MAX_DOCUMENT_PROPOSAL_ACTION_BYTES
+    return MAX_PROPOSAL_ACTION_BYTES
+
+
+def proposal_action_serialized_bytes(action: Any) -> int:
+    """Return the serialized byte count of ``action``.
+
+    Uses standard ``json.dumps`` with default ``ensure_ascii=True``, producing
+    an ASCII representation whose character length equals its byte size (TECH-7720).
+    """
+    return len(json.dumps(action))
+
+
+def _proposal_projected_columns() -> tuple[Any, Any, Any]:
+    content_text = ProposalHold.action.op("->>")("content")
+    is_arcana = ProposalHold.kind.in_(tuple(DOCUMENT_PROPOSAL_KINDS))
+    is_string = func.jsonb_typeof(ProposalHold.action.op("->")("content")) == "string"
+    octet_len = func.octet_length(content_text)
+    char_len = func.char_length(content_text)
+
+    cond = and_(is_arcana, is_string, octet_len > MAX_PROPOSAL_ACTION_BYTES)
+
+    projected_action = case(
+        (cond, ProposalHold.action.op("-")("content")),
+        else_=ProposalHold.action,
+    ).label("projected_action")
+    elided_utf8_bytes = case((cond, octet_len), else_=None).label("elided_utf8_bytes")
+    elided_chars = case((cond, char_len), else_=None).label("elided_chars")
+    return projected_action, elided_utf8_bytes, elided_chars
+
+
 MAX_PROPOSAL_ACTION_FIELD_LENGTH = 500
 # Shared cap for the free-text `reason`/`decision_note` fields on withdraw
 # and decide -- both HTTP routes and the `proposals_withdraw` MCP tool.
@@ -8019,16 +8085,40 @@ async def list_pending_proposal_holds(
     the caller, oldest first -- same owner_sub-scoped visibility pattern as
     ``list_pending_approval_holds``."""
     limit = max(1, min(limit, 200))
-    stmt = (
-        select(ProposalHold)
-        .where(_proposal_visible_to_owner(owner_sub), ProposalHold.status == "pending")
-        .order_by(ProposalHold.created_at.asc())
+    where_clause = and_(_proposal_visible_to_owner(owner_sub), ProposalHold.status == "pending")
+    order_clause = ProposalHold.created_at.asc()
+    subq = (
+        select(ProposalHold.id.label("id"))
+        .where(where_clause)
+        .order_by(order_clause)
         .limit(limit + 1)
+        .subquery()
     )
-    rows = (await session.execute(stmt)).scalars().all()
+    projected_action, elided_utf8_bytes, elided_chars = _proposal_projected_columns()
+    stmt = (
+        select(
+            ProposalHold,
+            projected_action,
+            elided_utf8_bytes,
+            elided_chars,
+        )
+        .options(defer(ProposalHold.action, raiseload=True))
+        .join(subq, ProposalHold.id == subq.c.id)
+        .order_by(order_clause)
+    )
+    rows = (await session.execute(stmt)).all()
     has_more = len(rows) > limit
     rows = rows[:limit]
-    proposals = [_proposal_dict(hold) for hold in rows]
+    proposals = []
+    for hold, action_val, utf8_bytes, chars in rows:
+        elided = (
+            {"content": {"utf8_bytes": utf8_bytes, "chars": chars}}
+            if utf8_bytes is not None
+            else None
+        )
+        proposals.append(
+            _proposal_dict(hold, action_override=action_val, elided_action_fields=elided)
+        )
     return {"proposals": proposals, "has_more": has_more}
 
 
@@ -8066,19 +8156,43 @@ async def list_proposal_history_for_owner(
     bot-facing surface's deliberate redaction of that same field.
     """
     limit = max(1, min(limit, 200))
-    stmt = (
-        select(ProposalHold)
-        .where(
-            _proposal_visible_to_owner(owner_sub),
-            ProposalHold.status.in_(PROPOSAL_TERMINAL_STATUSES),
-        )
-        .order_by(ProposalHold.created_at.desc())
-        .limit(limit + 1)
+    where_clause = and_(
+        _proposal_visible_to_owner(owner_sub),
+        ProposalHold.status.in_(PROPOSAL_TERMINAL_STATUSES),
     )
-    rows = (await session.execute(stmt)).scalars().all()
+    order_clause = ProposalHold.created_at.desc()
+    subq = (
+        select(ProposalHold.id.label("id"))
+        .where(where_clause)
+        .order_by(order_clause)
+        .limit(limit + 1)
+        .subquery()
+    )
+    projected_action, elided_utf8_bytes, elided_chars = _proposal_projected_columns()
+    stmt = (
+        select(
+            ProposalHold,
+            projected_action,
+            elided_utf8_bytes,
+            elided_chars,
+        )
+        .options(defer(ProposalHold.action, raiseload=True))
+        .join(subq, ProposalHold.id == subq.c.id)
+        .order_by(order_clause)
+    )
+    rows = (await session.execute(stmt)).all()
     has_more = len(rows) > limit
     rows = rows[:limit]
-    proposals = [_proposal_dict(hold) for hold in rows]
+    proposals = []
+    for hold, action_val, utf8_bytes, chars in rows:
+        elided = (
+            {"content": {"utf8_bytes": utf8_bytes, "chars": chars}}
+            if utf8_bytes is not None
+            else None
+        )
+        proposals.append(
+            _proposal_dict(hold, action_override=action_val, elided_action_fields=elided)
+        )
     return {"proposals": proposals, "has_more": has_more}
 
 
@@ -8279,19 +8393,43 @@ async def list_proposals_for_bot(
     identity leaking to the bot as any single-id lookup is.
     """
     limit = max(1, min(limit, 200))
-    stmt = (
-        select(ProposalHold)
-        .where(
-            ProposalHold.proposed_by_bot_id == requesting_bot_sub,
-            ProposalHold.status.in_(statuses),
-        )
-        .order_by(ProposalHold.created_at.asc())
-        .limit(limit + 1)
+    where_clause = and_(
+        ProposalHold.proposed_by_bot_id == requesting_bot_sub,
+        ProposalHold.status.in_(statuses),
     )
-    rows = (await session.execute(stmt)).scalars().all()
+    order_clause = ProposalHold.created_at.asc()
+    subq = (
+        select(ProposalHold.id.label("id"))
+        .where(where_clause)
+        .order_by(order_clause)
+        .limit(limit + 1)
+        .subquery()
+    )
+    projected_action, elided_utf8_bytes, elided_chars = _proposal_projected_columns()
+    stmt = (
+        select(
+            ProposalHold,
+            projected_action,
+            elided_utf8_bytes,
+            elided_chars,
+        )
+        .options(defer(ProposalHold.action, raiseload=True))
+        .join(subq, ProposalHold.id == subq.c.id)
+        .order_by(order_clause)
+    )
+    rows = (await session.execute(stmt)).all()
     has_more = len(rows) > limit
     rows = rows[:limit]
-    proposals = [_bot_facing_proposal_dict(hold) for hold in rows]
+    proposals = []
+    for hold, action_val, utf8_bytes, chars in rows:
+        elided = (
+            {"content": {"utf8_bytes": utf8_bytes, "chars": chars}}
+            if utf8_bytes is not None
+            else None
+        )
+        proposals.append(
+            _bot_facing_proposal_dict(hold, action_override=action_val, elided_action_fields=elided)
+        )
     return {"proposals": proposals, "has_more": has_more}
 
 
@@ -10800,9 +10938,11 @@ __all__ = [
     "CONVERSATION_TTL",
     "DEFAULT_OWNERSHIP_CLIENT",
     "DEFAULT_RECONCILIATION_BATCH_SIZE",
+    "DOCUMENT_PROPOSAL_KINDS",
     "MAX_APPROVAL_HOLDS_PER_MINUTE",
     "MAX_CONVERSATION_STARTS_PER_HOUR",
     "MAX_DECISION_REASON_LENGTH",
+    "MAX_DOCUMENT_PROPOSAL_ACTION_BYTES",
     "MAX_LOOKUP_EMAIL_LENGTH",
     "MAX_MESSAGES_PER_CONVERSATION_PER_HOUR",
     "MAX_PROPOSALS_PER_BOT_PER_WINDOW",
@@ -10851,6 +10991,7 @@ __all__ = [
     "list_proposal_history_for_owner",
     "list_proposals_for_bot",
     "lookup_agent_by_email",
+    "max_proposal_action_bytes",
     "may_assign",
     "may_extend",
     "may_invite",
@@ -10858,6 +10999,7 @@ __all__ = [
     "may_reopen",
     "parse_decision_page_base_url",
     "post_message",
+    "proposal_action_serialized_bytes",
     "reconcile_agent_ownership",
     "register_agent",
     "rename_conversation",

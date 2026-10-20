@@ -66,6 +66,23 @@
    environment — this repo does not do that (see `deploy.yml`'s header comment).
    The release is **not** live in either environment until that separate step is done.
 
+## Cross-service compatibility for large Arcana proposals (TECH-7720)
+
+When rolling out the 1 MiB Arcana source-content contract, deploy the related
+services in this order:
+
+1. **Arcana** — deploy the 1,048,576-byte UTF-8 content bound.
+2. **agent-comms-approvals** — deploy the matching contract validator,
+   applier, and decision-page summary handling.
+3. **agent-comms-mcp** — build and deploy the board-derived image containing
+   the new approvals package.
+
+Do not run a new board with an older approvals package: the board may admit a
+large Unicode action that the older validator or applier cannot accept. This
+sequence is a deployment compatibility requirement, not a version-number
+change; the services' current versions remain the source of truth until a
+separate release task bumps them.
+
 ## Pre-releases
 
 Pre-releases (GitHub "Set as a pre-release" flag) trigger `publish.yml` but **not** `deploy.yml`.
