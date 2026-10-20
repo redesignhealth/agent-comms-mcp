@@ -1677,6 +1677,7 @@ class TestProposalActionSignalContractConstants:
             "invalid_value",
             "not_canonical",
             "digest_mismatch",
+            "unsupported",
         }
         assert frozenset(expected) == PROPOSAL_ACTION_ERROR_CODES
 

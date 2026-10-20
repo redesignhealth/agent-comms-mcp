@@ -1356,6 +1356,7 @@ PROPOSAL_ACTION_ERROR_CODES: frozenset[str] = frozenset(
         "invalid_value",
         "not_canonical",
         "digest_mismatch",
+        "unsupported",
     }
 )
 

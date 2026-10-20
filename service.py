@@ -7573,6 +7573,12 @@ async def _resolve_cross_brain_target(
         # Naming yourself is just an own-brain proposal.
         return None, {k: v for k, v in action.items() if k != "target"}
 
+    # TECH-7721: evidence is read from the writing brain, so the applier refuses a
+    # cross-brain proposal that carries citations. Refuse it here instead of after a
+    # human has approved it.
+    if action.get("citations"):
+        raise _invalid_proposal_action_error(kind, (("citations", "unsupported"),), 0)
+
     pending = ProposalHold.status.in_(("pending", "applying"))
     per_submitter = (
         await session.execute(

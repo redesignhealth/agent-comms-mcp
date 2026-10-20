@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from exceptions import (
     AccessDeniedError,
     HoldAlreadyDecidedError,
+    InvalidProposalActionError,
     ProposalTargetUnavailableError,
     RateLimitExceededError,
 )
@@ -77,10 +78,16 @@ async def _agent(session: AsyncSession, sub: str, owner: str, *, status: str = "
     return agent
 
 
-def _action(ref: str | None = None, target_id: str = "doc-1") -> dict[str, Any]:
+def _action(
+    ref: str | None = None,
+    target_id: str = "doc-1",
+    citations: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     action: dict[str, Any] = {"action_type": "add_source", "target_id": target_id}
     if ref is not None:
         action["target"] = ref
+    if citations is not None:
+        action["citations"] = citations
     return action
 
 
@@ -100,13 +107,14 @@ async def _submit(
     owner: str = SUBMITTER_OWNER,
     target_id: str = "doc-1",
     judge: FakeProposalJudge | None = None,
+    citations: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     return await create_proposal(
         session,
         kind=KIND,
         proposed_by_bot_id=bot,
         owner_sub=owner,
-        action=_action(ref, target_id),
+        action=_action(ref, target_id, citations),
         rationale="r",
         confidence="medium",
         importance="medium",
@@ -190,6 +198,29 @@ class TestResolution:
         self, session: AsyncSession, agents: tuple[Agent, Agent]
     ) -> None:
         await _submit(session, SUBMITTER)
+        hold = (await session.execute(select(ProposalHold))).scalar_one()
+        assert hold.cross_brain is None
+
+    async def test_cross_brain_citations_are_refused_at_submit(
+        self, session: AsyncSession, agents: tuple[Agent, Agent]
+    ) -> None:
+        with pytest.raises(InvalidProposalActionError) as exc:
+            await _submit(session, TARGET, citations=[{"revision_id": "rev-1"}])
+        assert exc.value.field_errors == (("citations", "unsupported"),)
+        assert (await session.execute(select(ProposalHold))).scalars().all() == []
+
+    async def test_cross_brain_empty_citations_are_accepted(
+        self, session: AsyncSession, agents: tuple[Agent, Agent]
+    ) -> None:
+        await _submit(session, TARGET, citations=[])
+        hold = (await session.execute(select(ProposalHold))).scalar_one()
+        assert hold.cross_brain is not None
+
+    async def test_own_brain_citations_are_not_refused_here(
+        self, session: AsyncSession, agents: tuple[Agent, Agent]
+    ) -> None:
+        # naming yourself is an own-brain proposal; citations stay valid there
+        await _submit(session, SUBMITTER, citations=[{"revision_id": "rev-1"}])
         hold = (await session.execute(select(ProposalHold))).scalar_one()
         assert hold.cross_brain is None
 

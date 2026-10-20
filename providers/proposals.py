@@ -189,6 +189,10 @@ async def submit(
     TECH-5877 auto-judge) approval before it takes effect. Same body shape
     and validation as ``POST /proposals`` -- see ``service.create_proposal``.
 
+    Paperclip agents: before submitting an Arcana brain proposal, read
+    skills/paperclip/references/arcana-brain-proposals.md for payloads,
+    citation rules, and current document-update support.
+
     ``action`` must contain ``target_id`` and ``action_type`` (both
     strings) -- these are the create-time dedup key, together with
     ``kind`` and the calling bot's own identity: resubmitting with the
@@ -202,7 +206,8 @@ async def submit(
     (a board agent id or sub). Any agent may propose; the proposal is never
     auto-approved and applies only after the target's human owner (and yours,
     when different) both approve. An unknown or inactive target is an opaque
-    ``target_not_found``.
+    ``target_not_found``. A cross-brain proposal takes no citations (refused
+    at submit, TECH-7721).
 
     ``confidence``/``importance``/``impact`` must each be ``"low"``,
     ``"medium"``, or ``"high"``. ``priority`` is always server-derived --
