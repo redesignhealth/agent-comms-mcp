@@ -1797,18 +1797,26 @@ stays human-only and HTTP-only.
   - To prevent memory exhaustion when large documents are listed in bulk, an inner ID subquery
     (`limit + 1`, matching filters and sort) joins an outer query using a SQL `CASE` expression:
     ONLY for Arcana document proposals whose `action.content` string exceeds 16,384 UTF-8 bytes
-    (`octet_length(action ->> 'content') > 16384`), `action` is projected without `content`
+    (`octet_length(action ->> 'content') > DOCUMENT_PROPOSAL_CONTENT_ELISION_BYTES`, a projection-only
+    constant that is independent of the `MAX_PROPOSAL_ACTION_BYTES` validation limit), `action` is projected without `content`
     (`action - 'content'`), and a top-level `elided_action_fields: {"content": {"utf8_bytes": N, "chars": M}}`
     is attached. All other keys (including `sha256`, `target_id`, `logical_id`, `filename`) are preserved.
   - Rows with content <= 16,384 bytes and all non-Arcana rows remain byte-identical and unelided.
+  - Pages are ordered by `created_at` with `ProposalHold.id` as a same-direction tie-breaker, in both the
+    inner `limit + 1` subquery and the outer query, so rows sharing a timestamp page and report `has_more`
+    deterministically.
   - Existing non-large holds (including legacy holds at or below 16 KiB) are unchanged. The SQL
     `octet_length` check still makes Postgres detoast the JSON value when needed; this projection
     avoids transferring the large string into Python but is not a zero-cost index or a guaranteed
     out-of-memory threshold. The bounded metadata is a response-shape bound, not a strict whole-process
     memory guarantee, and retention is outside this change.
+  - Non-`content` keys of a document action are bounded by the approvals judge's strict Arcana contract
+    (`extra="forbid"`; `logical_id`/`filename`/`revision_id` at most 256 chars, `sha256` exactly 64, at most
+    10 citations of at most 4,096 chars each), which `classify()` enforces before any hold row is inserted.
+    The board deliberately does not add a second, board-side cap on those keys.
   - The ORM query uses `defer(ProposalHold.action, raiseload=True)` so that `ProposalHold.action` is never
     unintentionally lazy-loaded into memory during listing.
-- *Retrieval of full actions*: Callers receiving an elided proposal in a listing can fetch the complete,
+  - *Retrieval of full actions*: Callers receiving an elided proposal in a listing can fetch the complete,
     unelided action via the existing sender-scoped single-proposal lookup routes: `GET /proposals/{id}`
     (REST) or the `proposals_get` MCP tool; both use the bot proposal scope and return only that
     bot's own proposal. The service-to-service

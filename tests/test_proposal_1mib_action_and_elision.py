@@ -43,7 +43,7 @@ import os
 import re
 import sys
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -65,9 +65,11 @@ from exceptions import InvalidProposalActionError
 from models import AuditLog, ProposalHold
 from plugins import (
     FINGERPRINT_DIGEST,
+    ProposalApplyOutcome,
     ProposalFingerprint,
     ProposalVerdict,
 )
+from scopes import PROPOSAL_APPLY_RECORD_SCOPE
 from tests.proposal_judge_fakes import FakeProposalJudge
 
 pytestmark = pytest.mark.usefixtures("_migrated_schema")
@@ -179,6 +181,11 @@ async def client(
             Route("/proposals/pending", main.list_pending_proposals, methods=["GET"]),
             Route("/proposals/history", main.list_proposal_history, methods=["GET"]),
             Route("/proposals/{proposal_id}", main.get_proposal, methods=["GET"]),
+            Route(
+                "/proposals/{hold_id}/apply-record",
+                main.get_proposal_apply_record_route,
+                methods=["GET"],
+            ),
         ]
     )
     with (
@@ -195,6 +202,36 @@ async def client(
 
 def _sha(text_val: str) -> str:
     return hashlib.sha256(text_val.encode("utf-8")).hexdigest()
+
+
+# ======================================================================
+# 0. Unit: service.max_proposal_action_bytes
+# ======================================================================
+
+
+@pytest.mark.parametrize("kind", ["arcana_source_add", "arcana_source_revise"])
+def test_max_proposal_action_bytes_document_kinds_get_the_4mib_limit(kind: str) -> None:
+    assert service.max_proposal_action_bytes(kind) == 4 * 1024 * 1024
+    assert service.max_proposal_action_bytes(kind) == service.MAX_DOCUMENT_PROPOSAL_ACTION_BYTES
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "linear_progress_update",
+        "unknown_kind",
+        "",
+        "Arcana_Source_Add",  # kinds are matched exactly, case-sensitively
+        " arcana_source_add",
+        None,
+        123,
+        b"arcana_source_add",
+        ["arcana_source_add"],  # unhashable: must not raise
+        {"kind": "arcana_source_add"},
+    ],
+)
+def test_max_proposal_action_bytes_everything_else_keeps_the_16kib_limit(kind: Any) -> None:
+    assert service.max_proposal_action_bytes(kind) == service.MAX_PROPOSAL_ACTION_BYTES == 16_384
 
 
 # ======================================================================
@@ -871,6 +908,29 @@ async def test_rest_stream_malformed_content_length_is_ignored(
     )
     assert resp.status_code == 200
     assert await _count_rows(session, ProposalHold) == 1
+
+
+async def test_rest_stream_malformed_content_length_with_oversize_body_is_413(
+    client: tuple[httpx.AsyncClient, _FakeAuthProvider], session: AsyncSession
+) -> None:
+    """An unparseable Content-Length is ignored by the header gate, so the
+    actual-byte-count loop must still stop a body over 5 MiB: 413, static
+    body, nothing persisted or audited."""
+    _register_bot_token(client)
+    http_client, _provider = client
+    resp = await http_client.post(
+        "/proposals",
+        headers={
+            "Authorization": "Bearer tok-bot-1",
+            "Content-Length": "not-a-number",
+            "Content-Type": "application/json",
+        },
+        content=b"a" * (5 * 1024 * 1024 + 1),
+    )
+    assert resp.status_code == 413
+    assert resp.json() == {"error": "request_too_large"}
+    assert await _count_rows(session, ProposalHold) == 0
+    assert await _count_rows(session, AuditLog) == 0
 
 
 async def test_rest_stream_deceptive_undersize_content_length_governs_actual_bytes(
@@ -1586,6 +1646,123 @@ async def test_pagination_with_elided_rows(session: AsyncSession) -> None:
     assert len(hist3["proposals"]) == 3
 
 
+async def _seed_tied_rows(
+    session: AsyncSession,
+    *,
+    bot_sub: str,
+    owner_sub: str,
+    ids: list[uuid.UUID],
+    created_at: Any,
+) -> None:
+    """Insert one elided Arcana row per id, in the given insertion order, all
+    sharing the SAME explicit ``created_at`` so only the ``id`` tie-breaker can
+    order them."""
+    for hold_id in ids:
+        hold = _seed_arcana_row(
+            session,
+            bot_sub=bot_sub,
+            owner_sub=owner_sub,
+            content="é" * 8_193,
+            logical_id=f"doc-tie-{hold_id.int}",
+        )
+        hold.id = hold_id
+        hold.created_at = created_at
+    await session.commit()
+    session.expunge_all()
+
+
+def _logical_ids(res: dict[str, Any]) -> list[str]:
+    return [p["action"]["logical_id"] for p in res["proposals"]]
+
+
+async def test_equal_created_at_orders_by_id_in_pending_and_bot_lists(
+    session: AsyncSession,
+) -> None:
+    """Rows with an identical ``created_at`` page deterministically, ``id``
+    ascending (the same direction as the ``created_at`` ascending order), in
+    both the ``limit + 1`` subquery and the outer query -- so a short page is
+    always a prefix of the full order and ``has_more`` is consistent."""
+    bot_sub, owner_sub = "bot-tie-asc", "owner-tie-asc@example.com"
+    ids = [uuid.UUID(int=n) for n in (1, 2, 3, 4)]
+    tie_ts = service._now()
+    # Insert in DESCENDING id order, so heap/insertion order disagrees with the
+    # expected order.
+    await _seed_tied_rows(
+        session, bot_sub=bot_sub, owner_sub=owner_sub, ids=ids[::-1], created_at=tie_ts
+    )
+    expected = [f"doc-tie-{i.int}" for i in ids]
+
+    for lister in (
+        lambda limit: service.list_pending_proposal_holds(
+            session, owner_sub=owner_sub, limit=limit
+        ),
+        lambda limit: service.list_proposals_for_bot(
+            session, requesting_bot_sub=bot_sub, statuses=["pending"], limit=limit
+        ),
+    ):
+        full = await lister(4)
+        assert _logical_ids(full) == expected
+        assert full["has_more"] is False
+        page = await lister(2)
+        assert _logical_ids(page) == expected[:2]
+        assert page["has_more"] is True
+        page3 = await lister(3)
+        assert _logical_ids(page3) == expected[:3]
+        assert page3["has_more"] is True
+
+
+async def test_equal_created_at_orders_by_id_descending_in_history_list(
+    session: AsyncSession,
+) -> None:
+    """History is newest-first, so the tie-breaker is ``id`` DESCENDING in both
+    the ``limit + 1`` subquery and the outer query."""
+    bot_sub, owner_sub = "bot-tie-desc", "owner-tie-desc@example.com"
+    ids = [uuid.UUID(int=n) for n in (1, 2, 3, 4)]
+    tie_ts = service._now()
+    # Insert in ASCENDING id order (the opposite of the expected order).
+    await _seed_tied_rows(session, bot_sub=bot_sub, owner_sub=owner_sub, ids=ids, created_at=tie_ts)
+    for hold_id in ids:
+        await _transition_to_rejected(session, hold_id)
+    expected = [f"doc-tie-{i.int}" for i in ids[::-1]]
+
+    full = await service.list_proposal_history_for_owner(session, owner_sub=owner_sub, limit=4)
+    assert _logical_ids(full) == expected
+    assert full["has_more"] is False
+    page = await service.list_proposal_history_for_owner(session, owner_sub=owner_sub, limit=2)
+    assert _logical_ids(page) == expected[:2]
+    assert page["has_more"] is True
+    page3 = await service.list_proposal_history_for_owner(session, owner_sub=owner_sub, limit=3)
+    assert _logical_ids(page3) == expected[:3]
+    assert page3["has_more"] is True
+
+
+async def test_elision_threshold_is_its_own_constant_not_the_validation_limit(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The projection threshold is ``DOCUMENT_PROPOSAL_CONTENT_ELISION_BYTES``
+    (16,384), decoupled from ``MAX_PROPOSAL_ACTION_BYTES``: moving the
+    validation limit does not move where listings start eliding."""
+    assert service.DOCUMENT_PROPOSAL_CONTENT_ELISION_BYTES == 16_384
+    monkeypatch.setattr(service, "MAX_PROPOSAL_ACTION_BYTES", 100)
+    bot_sub, owner_sub = "bot-const", "owner-const@example.com"
+    at_threshold = _seed_arcana_row(
+        session, bot_sub=bot_sub, owner_sub=owner_sub, content="a" * 16_384, logical_id="doc-at"
+    )
+    over_threshold = _seed_arcana_row(
+        session, bot_sub=bot_sub, owner_sub=owner_sub, content="a" * 16_385, logical_id="doc-over"
+    )
+    await session.commit()
+    session.expunge_all()
+    res = await service.list_pending_proposal_holds(session, owner_sub=owner_sub, limit=10)
+    by_id = {p["proposal_id"]: p for p in res["proposals"]}
+    assert by_id[str(at_threshold.id)]["action"]["content"] == "a" * 16_384
+    assert "elided_action_fields" not in by_id[str(at_threshold.id)]
+    assert "content" not in by_id[str(over_threshold.id)]["action"]
+    assert by_id[str(over_threshold.id)]["elided_action_fields"] == {
+        "content": {"utf8_bytes": 16_385, "chars": 16_385}
+    }
+
+
 # ======================================================================
 # 12. Cross-repo: the REAL agent-comms-approvals judge (optional,
 #     gated on a sibling checkout of that repo)
@@ -1604,8 +1781,32 @@ def _aca_checkout_root() -> Path | None:
     return None
 
 
+@pytest.fixture
+def aca_overlay(monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    """Overlay a sibling agent-comms-approvals checkout onto ``sys.path`` for
+    ONE test, then fully undo it. ``sys.path`` is replaced through
+    ``monkeypatch`` (restored on teardown) and the checkout is APPENDED, never
+    prepended, so this repo's own root keeps winning for shared top-level
+    module names; every ``rh_comms_plugins*`` module imported through the
+    overlay is evicted afterwards so nothing leaks into other tests. Skips
+    when no sibling checkout exists (CI on this repo alone)."""
+    aca_root = _aca_checkout_root()
+    if aca_root is None:
+        pytest.skip(
+            "no sibling agent-comms-approvals checkout (e.g. aca-tech7720) found -- "
+            "cross-repo real-judge test unavailable in this environment"
+        )
+    monkeypatch.setattr(sys, "path", [*sys.path, str(aca_root)])
+    importlib.invalidate_caches()
+    already_imported = {n for n in sys.modules if n.split(".")[0] == "rh_comms_plugins"}
+    yield aca_root
+    for name in [n for n in sys.modules if n.split(".")[0] == "rh_comms_plugins"]:
+        if name not in already_imported:
+            del sys.modules[name]
+
+
 async def test_real_judge_oversize_content_rejected_before_any_side_effect(
-    session: AsyncSession,
+    session: AsyncSession, aca_overlay: Path
 ) -> None:
     """The real judge (agent-comms-approvals' ``RHProposalJudge``, no fakes)
     rejects a > 1 MiB UTF-8 content action through the board's own
@@ -1615,17 +1816,6 @@ async def test_real_judge_oversize_content_rejected_before_any_side_effect(
     at all. Uses a byte-boundary vector (524,289 code points, 1,048,577
     UTF-8 bytes) that passes the contracts' cheap code-point Field max, so
     it is specifically the byte-ceiling validator that fires."""
-    aca_root = _aca_checkout_root()
-    if aca_root is None:
-        pytest.skip(
-            "no sibling agent-comms-approvals checkout (e.g. aca-tech7720) found -- "
-            "cross-repo real-judge test unavailable in this environment"
-        )
-    # PYTHONPATH-style overlay of the sibling repo, APPENDED (never
-    # prepended) so this repo's own root keeps winning for shared
-    # top-level module names -- and no lock/dependency change, ever.
-    if str(aca_root) not in sys.path:
-        sys.path.append(str(aca_root))
     proposal_judge = importlib.import_module("rh_comms_plugins.proposal_judge")
     judge = proposal_judge.RHProposalJudge()
 
@@ -1829,30 +2019,56 @@ async def test_arcana_rows_with_non_string_content_are_never_elided(session: Asy
 # ======================================================================
 
 
-# A BARE ``action`` select item always renders flanked by comma-spaces
-# (``..., proposal_holds.action, ...``) -- it is never the first column
-# (``id`` is) and never the last (``updated_at`` is). Inside the projected
-# CASE expressions ``proposal_holds.action`` is always followed by an
-# operator (`` -> ``, `` ->> ``, `` - ``) or `` END`` -- never directly by
-# a comma -- so this signature matches ONLY an unprojected select item.
-_BARE_ACTION_SELECT_ITEM = re.compile(r",\s*proposal_holds\.action\s*,")
+def _top_level_select_items(sql: str) -> list[str]:
+    """The outer statement's SELECT list as whitespace-normalized items, split
+    on commas at parenthesis depth 0 (so commas inside function calls, ``IN``
+    lists, and CASE expressions never split an item). Independent of SQL line
+    wrapping, indentation, and column order."""
+    norm = " ".join(sql.split())
+    start = norm.index("SELECT ") + len("SELECT ")
+    items: list[str] = []
+    depth = 0
+    current_start = start
+    i = start
+    while i < len(norm):
+        ch = norm[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif depth == 0 and norm.startswith(" FROM ", i):
+            break
+        elif depth == 0 and ch == ",":
+            items.append(norm[current_start:i].strip())
+            current_start = i + 1
+        i += 1
+    items.append(norm[current_start:i].strip())
+    return items
 
 
 def _assert_projected_list_sql(sql: str) -> None:
     """Assert a captured statement IS one of the three production list
-    queries, carries the projection columns, and never selects the
-    unprojected full ``action`` column (probe-verified rendering against
-    the asyncpg dialect: ``AS projected_action``/``AS elided_utf8_bytes``/
-    ``AS elided_chars`` labels; ``->``/``->>``/``-`` operator fragments;
-    the ``JOIN (SELECT proposal_holds.id AS id`` keyset-subquery shape)."""
-    assert "JOIN (SELECT proposal_holds.id AS id" in sql  # the keyset subquery
-    assert sql.count("AS projected_action") == 1
-    assert sql.count("AS elided_utf8_bytes") == 1
-    assert sql.count("AS elided_chars") == 1
-    assert re.search(r"proposal_holds\.action -> ", sql)
-    assert re.search(r"proposal_holds\.action ->> ", sql)
-    assert re.search(r"proposal_holds\.action - ", sql)
-    assert _BARE_ACTION_SELECT_ITEM.search(sql) is None
+    queries, carries the three projection columns, and never selects the
+    unprojected full ``action`` column. Structural, not textual: the outer
+    SELECT list is parsed into items (see ``_top_level_select_items``), so
+    this does not depend on whitespace, column order, or where the bare
+    column would be positioned. The ORM-level raiseload assertions in the
+    caller remain the real guarantee that ``action`` is never loaded."""
+    norm = " ".join(sql.split())
+    # The ID-only keyset subquery joined back to the outer query.
+    assert re.search(r"JOIN \( ?SELECT proposal_holds\.id AS id\b", norm)
+    items = _top_level_select_items(sql)
+    for label in ("projected_action", "elided_utf8_bytes", "elided_chars"):
+        assert sum(bool(re.search(rf"\bAS {label}$", item)) for item in items) == 1, label
+    # The projection reads action via ``->`` (type check), ``->>`` (content
+    # text), and ``-`` (key removal) -- all inside labelled CASE items.
+    projected = [i for i in items if re.search(r"\bAS (projected_action|elided_\w+)$", i)]
+    joined = " ".join(projected)
+    assert re.search(r"proposal_holds\.action\s*->(?!>)", joined)
+    assert re.search(r"proposal_holds\.action\s*->>", joined)
+    assert re.search(r"proposal_holds\.action\s*-(?!>)", joined)
+    # No select item is the bare, unprojected column.
+    assert "proposal_holds.action" not in items
 
 
 async def test_production_list_sql_never_selects_the_unprojected_action_column(
@@ -1924,6 +2140,11 @@ async def test_production_list_sql_never_selects_the_unprojected_action_column(
     # instances as the production call loads them, at the mapper level.
     event.listen(ProposalHold, "load", _capture_orm_load)
     try:
+        # Detach everything first: an instance still sitting in the session's
+        # identity map (kept alive by an earlier assertion's traceback cycle)
+        # would be reused without firing the ``load`` event this test relies
+        # on, making the capture depend on garbage-collection timing.
+        session.expunge_all()
         sql_captured.clear()
         orm_captured.clear()
         pending = await service.list_pending_proposal_holds(session, owner_sub=owner_sub, limit=50)
@@ -1935,6 +2156,11 @@ async def test_production_list_sql_never_selects_the_unprojected_action_column(
         _action_is_raised(elided_hold.id)
         _action_is_raised(small_hold.id)
 
+        # Detach everything first: an instance still sitting in the session's
+        # identity map (kept alive by an earlier assertion's traceback cycle)
+        # would be reused without firing the ``load`` event this test relies
+        # on, making the capture depend on garbage-collection timing.
+        session.expunge_all()
         sql_captured.clear()
         orm_captured.clear()
         bot_listed = await service.list_proposals_for_bot(
@@ -1951,6 +2177,11 @@ async def test_production_list_sql_never_selects_the_unprojected_action_column(
         for hold in (elided_hold, small_hold):
             await _transition_to_rejected(session, hold.id)
 
+        # Detach everything first: an instance still sitting in the session's
+        # identity map (kept alive by an earlier assertion's traceback cycle)
+        # would be reused without firing the ``load`` event this test relies
+        # on, making the capture depend on garbage-collection timing.
+        session.expunge_all()
         sql_captured.clear()
         orm_captured.clear()
         history = await service.list_proposal_history_for_owner(
@@ -1965,3 +2196,210 @@ async def test_production_list_sql_never_selects_the_unprojected_action_column(
     finally:
         event.remove(engine.sync_engine, "before_cursor_execute", _capture_sql)
         event.remove(ProposalHold, "load", _capture_orm_load)
+
+
+# ======================================================================
+# 16. Full-action retrieval stays intact: HTTP apply-record + the real
+#     service decide/withdraw lifecycle for a ~1 MiB action
+# ======================================================================
+
+_ONE_MIB_CONTENT = "\u4e2d" * 349_525  # 3 UTF-8 bytes each -> 1,048,575 bytes (just under 1 MiB)
+_SERVICE_SUB = "agent-comms-approvals"  # the apply-record route's default allowlisted subject
+
+
+def _service_token_claims(
+    sub: str = _SERVICE_SUB, scopes: list[str] | None = None
+) -> dict[str, Any]:
+    return {
+        "iss": "agent-jwt",
+        "sub": sub,
+        "scopes": [PROPOSAL_APPLY_RECORD_SCOPE] if scopes is None else scopes,
+    }
+
+
+def _arcana_action(logical_id: str, content: str) -> dict[str, Any]:
+    return {
+        "target_id": f"arcana-source:{logical_id}",
+        "action_type": "source_add",
+        "logical_id": logical_id,
+        "filename": "doc.md",
+        "audience": "private",
+        "sha256": _sha(content),
+        "content": content,
+    }
+
+
+async def test_apply_record_route_returns_full_large_action_with_matching_digest(
+    client: tuple[httpx.AsyncClient, _FakeAuthProvider], session: AsyncSession
+) -> None:
+    """Through the REAL route (service-token auth, scope + subject allowlist),
+    the approvals service gets the whole ~1 MiB action: never elided, and the
+    returned content's SHA-256 equals the digest the board stored -- while the
+    same row IS elided in a listing."""
+    http_client, provider = client
+    assert len(_ONE_MIB_CONTENT.encode("utf-8")) <= 1_048_576
+    hold = _seed_arcana_row(
+        session,
+        bot_sub="bot-apply-rec",
+        owner_sub="owner-apply-rec@example.com",
+        content=_ONE_MIB_CONTENT,
+        logical_id="doc-apply-rec",
+    )
+    hold.status = "applying"
+    hold.decision_source = "human"
+    hold.decided_by_actor_id = "owner-apply-rec@example.com"
+    hold.decided_at = service._now()
+    await session.commit()
+    session.expunge_all()
+    provider.tokens["svc"] = _FakeAccessToken(_service_token_claims())
+
+    resp = await http_client.get(
+        f"/proposals/{hold.id}/apply-record", headers={"Authorization": "Bearer svc"}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["action"]["content"] == _ONE_MIB_CONTENT
+    assert "elided_action_fields" not in body
+    assert (
+        hashlib.sha256(body["action"]["content"].encode("utf-8")).hexdigest()
+        == body["action"]["sha256"]
+        == _sha(_ONE_MIB_CONTENT)
+    )
+    assert body["target_id"] == "arcana-source:doc-apply-rec"
+
+    listed = await service.list_proposals_for_bot(
+        session, requesting_bot_sub="bot-apply-rec", statuses=["applying"], limit=10
+    )
+    assert "content" not in listed["proposals"][0]["action"]
+    assert listed["proposals"][0]["elided_action_fields"]["content"]["utf8_bytes"] == len(
+        _ONE_MIB_CONTENT.encode("utf-8")
+    )
+
+
+@pytest.mark.parametrize(
+    ("token_claims", "expected_status"),
+    [
+        (None, 401),  # no credential at all
+        (_service_token_claims(sub="some-other-service"), 403),  # right scope, wrong subject
+        (_service_token_claims(scopes=["comms:proposals:write"]), 403),  # right sub, wrong scope
+        (_service_token_claims(sub="bot-1", scopes=["comms:proposals:write"]), 403),  # a bot
+    ],
+)
+async def test_apply_record_route_refuses_unauthorised_callers_without_leaking_content(
+    client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+    session: AsyncSession,
+    token_claims: dict[str, Any] | None,
+    expected_status: int,
+) -> None:
+    http_client, provider = client
+    hold = _seed_arcana_row(
+        session,
+        bot_sub="bot-apply-rec-denied",
+        owner_sub="owner-apply-rec-denied@example.com",
+        content="secret-document-body-" + "x" * 20_000,
+        logical_id="doc-apply-rec-denied",
+    )
+    await session.commit()
+    headers: dict[str, str] = {}
+    if token_claims is not None:
+        provider.tokens["tok"] = _FakeAccessToken(token_claims)
+        headers["Authorization"] = "Bearer tok"
+    resp = await http_client.get(f"/proposals/{hold.id}/apply-record", headers=headers)
+    assert resp.status_code == expected_status
+    assert "secret-document-body" not in resp.text
+
+
+async def test_large_action_survives_real_decide_and_withdraw_lifecycle(
+    session: AsyncSession, _default_proposal_judge: FakeProposalJudge
+) -> None:
+    """Real ``create_proposal`` / ``decide_proposal`` / ``withdraw_proposal``
+    (only the judge is the shared fake) on ~1 MiB actions: lists elide, but
+    approve hands the applier the FULL content, and the decide / withdraw /
+    reject responses and the stored rows all keep the whole, hash-equal action
+    (no elision marker) -- nothing on the lifecycle path reads the projected
+    list shape."""
+    judge = _default_proposal_judge
+    judge.apply_result = ProposalApplyOutcome(
+        applied=True, result={"ok": True}, caller_error=None, log_detail=None
+    )
+    bot_sub, owner_sub = "bot-life", "owner-life@example.com"
+    ids: dict[str, str] = {}
+    for name in ("approve", "reject", "withdraw"):
+        created = await service.create_proposal(
+            session,
+            kind="arcana_source_add",
+            proposed_by_bot_id=bot_sub,
+            owner_sub=owner_sub,
+            action=_arcana_action(f"doc-life-{name}", _ONE_MIB_CONTENT),
+            rationale="r",
+            confidence="high",
+            importance="high",
+            impact="high",
+            judge=judge,
+            target_fingerprint="",
+        )
+        assert created["status"] == "pending"
+        ids[name] = created["proposal_id"]
+
+    listed = await service.list_pending_proposal_holds(session, owner_sub=owner_sub, limit=10)
+    assert len(listed["proposals"]) == 3
+    assert all("content" not in p["action"] for p in listed["proposals"])
+    assert all("elided_action_fields" in p for p in listed["proposals"])
+
+    def _assert_full(proposal: dict[str, Any]) -> None:
+        assert proposal["action"]["content"] == _ONE_MIB_CONTENT
+        assert (
+            hashlib.sha256(proposal["action"]["content"].encode("utf-8")).hexdigest()
+            == proposal["action"]["sha256"]
+        )
+        assert "elided_action_fields" not in proposal
+
+    approved = await service.decide_proposal(
+        session,
+        approver_sub=owner_sub,
+        hold_id=uuid.UUID(ids["approve"]),
+        decision="approve",
+        decision_note=None,
+        judge=judge,
+    )
+    assert approved["status"] == "applied"
+    _assert_full(approved)
+    assert len(judge.apply_calls) == 1
+    applied_action = judge.apply_calls[0].action
+    assert applied_action["content"] == _ONE_MIB_CONTENT
+    assert applied_action["sha256"] == _sha(_ONE_MIB_CONTENT)
+
+    rejected = await service.decide_proposal(
+        session,
+        approver_sub=owner_sub,
+        hold_id=uuid.UUID(ids["reject"]),
+        decision="reject",
+        decision_note="no",
+        judge=judge,
+    )
+    assert rejected["status"] == "rejected"
+    _assert_full(rejected)
+
+    withdrawn = await service.withdraw_proposal(
+        session,
+        hold_id=uuid.UUID(ids["withdraw"]),
+        requesting_bot_sub=bot_sub,
+        reason="changed my mind",
+    )
+    assert withdrawn["status"] == "withdrawn"
+    _assert_full(withdrawn)
+
+    for name in ("approve", "reject", "withdraw"):
+        record = await service.get_proposal_apply_record(
+            session, hold_id=uuid.UUID(ids[name]), requesting_sub=_SERVICE_SUB
+        )
+        _assert_full(record)
+        single = await service.get_proposal_for_bot(
+            session, hold_id=uuid.UUID(ids[name]), requesting_bot_sub=bot_sub
+        )
+        _assert_full(single)
+
+    history = await service.list_proposal_history_for_owner(session, owner_sub=owner_sub, limit=10)
+    assert len(history["proposals"]) == 3
+    assert all("content" not in p["action"] for p in history["proposals"])
+    assert all("elided_action_fields" in p for p in history["proposals"])

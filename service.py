@@ -168,7 +168,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from datetime import UTC, datetime, timedelta
-from typing import Any, NamedTuple, NoReturn, Protocol
+from typing import Any, Final, NamedTuple, NoReturn, Protocol
 from urllib.parse import urlsplit
 
 from sqlalchemy import ColumnElement, and_, case, func, literal, not_, or_, select, text, tuple_
@@ -6921,7 +6921,7 @@ async def _safe_fingerprint(judge: ProposalJudge, ctx: ProposalContext) -> Propo
 
 
 _PROPOSAL_JUDGE_DECIDED_BY = "system:judge"
-_DEFAULT_ACTION = object()
+_DEFAULT_ACTION: Final[object] = object()
 
 
 def _proposal_dict(
@@ -7055,6 +7055,11 @@ MAX_PROPOSAL_KIND_LENGTH = 200
 MAX_PROPOSAL_ACTION_BYTES = 16_384
 MAX_DOCUMENT_PROPOSAL_ACTION_BYTES = 4 * 1024 * 1024  # 4 MiB (TECH-7720)
 DOCUMENT_PROPOSAL_KINDS: frozenset[str] = frozenset({"arcana_source_add", "arcana_source_revise"})
+# Listing projection only (TECH-7720): document ``action.content`` larger than
+# this many UTF-8 bytes is elided from list responses. Deliberately its own
+# constant, not ``MAX_PROPOSAL_ACTION_BYTES`` -- that one is a submit-time
+# validation limit for non-document kinds; the two just happen to be equal today.
+DOCUMENT_PROPOSAL_CONTENT_ELISION_BYTES = 16_384
 
 
 def max_proposal_action_bytes(kind: str | None) -> int:
@@ -7079,14 +7084,16 @@ def proposal_action_serialized_bytes(action: Any) -> int:
     return len(json.dumps(action))
 
 
-def _proposal_projected_columns() -> tuple[Any, Any, Any]:
+def _proposal_projected_columns() -> tuple[
+    ColumnElement[Any], ColumnElement[Any], ColumnElement[Any]
+]:
     content_text = ProposalHold.action.op("->>")("content")
     is_arcana = ProposalHold.kind.in_(tuple(DOCUMENT_PROPOSAL_KINDS))
     is_string = func.jsonb_typeof(ProposalHold.action.op("->")("content")) == "string"
     octet_len = func.octet_length(content_text)
     char_len = func.char_length(content_text)
 
-    cond = and_(is_arcana, is_string, octet_len > MAX_PROPOSAL_ACTION_BYTES)
+    cond = and_(is_arcana, is_string, octet_len > DOCUMENT_PROPOSAL_CONTENT_ELISION_BYTES)
 
     projected_action = case(
         (cond, ProposalHold.action.op("-")("content")),
@@ -7095,6 +7102,51 @@ def _proposal_projected_columns() -> tuple[Any, Any, Any]:
     elided_utf8_bytes = case((cond, octet_len), else_=None).label("elided_utf8_bytes")
     elided_chars = case((cond, char_len), else_=None).label("elided_chars")
     return projected_action, elided_utf8_bytes, elided_chars
+
+
+async def _list_proposals_with_elision(
+    session: AsyncSession,
+    *,
+    where_clause: ColumnElement[bool],
+    order_clauses: tuple[ColumnElement[Any], ...],
+    limit: int,
+    to_dict: Callable[..., dict[str, Any]],
+) -> dict[str, Any]:
+    """Shared body of the three proposal list queries (TECH-7720).
+
+    ``limit`` is already clamped by the caller. An inner ID-only subquery
+    applies the filter, order, and ``limit + 1`` (so ``has_more`` needs no
+    second query); the outer query joins it back, re-applies the SAME order,
+    and projects ``action`` through ``_proposal_projected_columns`` so oversize
+    Arcana ``content`` never leaves Postgres. ``order_clauses`` must end in a
+    unique tie-breaker (``ProposalHold.id``) so rows sharing a ``created_at``
+    page and ``has_more`` deterministically.
+    """
+    subq = (
+        select(ProposalHold.id.label("id"))
+        .where(where_clause)
+        .order_by(*order_clauses)
+        .limit(limit + 1)
+        .subquery()
+    )
+    projected_action, elided_utf8_bytes, elided_chars = _proposal_projected_columns()
+    stmt = (
+        select(ProposalHold, projected_action, elided_utf8_bytes, elided_chars)
+        .options(defer(ProposalHold.action, raiseload=True))
+        .join(subq, ProposalHold.id == subq.c.id)
+        .order_by(*order_clauses)
+    )
+    rows = (await session.execute(stmt)).all()
+    has_more = len(rows) > limit
+    proposals = []
+    for hold, action_val, utf8_bytes, chars in rows[:limit]:
+        elided = (
+            {"content": {"utf8_bytes": utf8_bytes, "chars": chars}}
+            if utf8_bytes is not None
+            else None
+        )
+        proposals.append(to_dict(hold, action_override=action_val, elided_action_fields=elided))
+    return {"proposals": proposals, "has_more": has_more}
 
 
 MAX_PROPOSAL_ACTION_FIELD_LENGTH = 500
@@ -8085,41 +8137,13 @@ async def list_pending_proposal_holds(
     the caller, oldest first -- same owner_sub-scoped visibility pattern as
     ``list_pending_approval_holds``."""
     limit = max(1, min(limit, 200))
-    where_clause = and_(_proposal_visible_to_owner(owner_sub), ProposalHold.status == "pending")
-    order_clause = ProposalHold.created_at.asc()
-    subq = (
-        select(ProposalHold.id.label("id"))
-        .where(where_clause)
-        .order_by(order_clause)
-        .limit(limit + 1)
-        .subquery()
+    return await _list_proposals_with_elision(
+        session,
+        where_clause=and_(_proposal_visible_to_owner(owner_sub), ProposalHold.status == "pending"),
+        order_clauses=(ProposalHold.created_at.asc(), ProposalHold.id.asc()),
+        limit=limit,
+        to_dict=_proposal_dict,
     )
-    projected_action, elided_utf8_bytes, elided_chars = _proposal_projected_columns()
-    stmt = (
-        select(
-            ProposalHold,
-            projected_action,
-            elided_utf8_bytes,
-            elided_chars,
-        )
-        .options(defer(ProposalHold.action, raiseload=True))
-        .join(subq, ProposalHold.id == subq.c.id)
-        .order_by(order_clause)
-    )
-    rows = (await session.execute(stmt)).all()
-    has_more = len(rows) > limit
-    rows = rows[:limit]
-    proposals = []
-    for hold, action_val, utf8_bytes, chars in rows:
-        elided = (
-            {"content": {"utf8_bytes": utf8_bytes, "chars": chars}}
-            if utf8_bytes is not None
-            else None
-        )
-        proposals.append(
-            _proposal_dict(hold, action_override=action_val, elided_action_fields=elided)
-        )
-    return {"proposals": proposals, "has_more": has_more}
 
 
 async def list_proposal_history_for_owner(
@@ -8156,44 +8180,16 @@ async def list_proposal_history_for_owner(
     bot-facing surface's deliberate redaction of that same field.
     """
     limit = max(1, min(limit, 200))
-    where_clause = and_(
-        _proposal_visible_to_owner(owner_sub),
-        ProposalHold.status.in_(PROPOSAL_TERMINAL_STATUSES),
+    return await _list_proposals_with_elision(
+        session,
+        where_clause=and_(
+            _proposal_visible_to_owner(owner_sub),
+            ProposalHold.status.in_(PROPOSAL_TERMINAL_STATUSES),
+        ),
+        order_clauses=(ProposalHold.created_at.desc(), ProposalHold.id.desc()),
+        limit=limit,
+        to_dict=_proposal_dict,
     )
-    order_clause = ProposalHold.created_at.desc()
-    subq = (
-        select(ProposalHold.id.label("id"))
-        .where(where_clause)
-        .order_by(order_clause)
-        .limit(limit + 1)
-        .subquery()
-    )
-    projected_action, elided_utf8_bytes, elided_chars = _proposal_projected_columns()
-    stmt = (
-        select(
-            ProposalHold,
-            projected_action,
-            elided_utf8_bytes,
-            elided_chars,
-        )
-        .options(defer(ProposalHold.action, raiseload=True))
-        .join(subq, ProposalHold.id == subq.c.id)
-        .order_by(order_clause)
-    )
-    rows = (await session.execute(stmt)).all()
-    has_more = len(rows) > limit
-    rows = rows[:limit]
-    proposals = []
-    for hold, action_val, utf8_bytes, chars in rows:
-        elided = (
-            {"content": {"utf8_bytes": utf8_bytes, "chars": chars}}
-            if utf8_bytes is not None
-            else None
-        )
-        proposals.append(
-            _proposal_dict(hold, action_override=action_val, elided_action_fields=elided)
-        )
-    return {"proposals": proposals, "has_more": has_more}
 
 
 async def get_proposal_for_bot(
@@ -8393,44 +8389,16 @@ async def list_proposals_for_bot(
     identity leaking to the bot as any single-id lookup is.
     """
     limit = max(1, min(limit, 200))
-    where_clause = and_(
-        ProposalHold.proposed_by_bot_id == requesting_bot_sub,
-        ProposalHold.status.in_(statuses),
+    return await _list_proposals_with_elision(
+        session,
+        where_clause=and_(
+            ProposalHold.proposed_by_bot_id == requesting_bot_sub,
+            ProposalHold.status.in_(statuses),
+        ),
+        order_clauses=(ProposalHold.created_at.asc(), ProposalHold.id.asc()),
+        limit=limit,
+        to_dict=_bot_facing_proposal_dict,
     )
-    order_clause = ProposalHold.created_at.asc()
-    subq = (
-        select(ProposalHold.id.label("id"))
-        .where(where_clause)
-        .order_by(order_clause)
-        .limit(limit + 1)
-        .subquery()
-    )
-    projected_action, elided_utf8_bytes, elided_chars = _proposal_projected_columns()
-    stmt = (
-        select(
-            ProposalHold,
-            projected_action,
-            elided_utf8_bytes,
-            elided_chars,
-        )
-        .options(defer(ProposalHold.action, raiseload=True))
-        .join(subq, ProposalHold.id == subq.c.id)
-        .order_by(order_clause)
-    )
-    rows = (await session.execute(stmt)).all()
-    has_more = len(rows) > limit
-    rows = rows[:limit]
-    proposals = []
-    for hold, action_val, utf8_bytes, chars in rows:
-        elided = (
-            {"content": {"utf8_bytes": utf8_bytes, "chars": chars}}
-            if utf8_bytes is not None
-            else None
-        )
-        proposals.append(
-            _bot_facing_proposal_dict(hold, action_override=action_val, elided_action_fields=elided)
-        )
-    return {"proposals": proposals, "has_more": has_more}
 
 
 async def _find_proposal_hold(
@@ -10938,6 +10906,7 @@ __all__ = [
     "CONVERSATION_TTL",
     "DEFAULT_OWNERSHIP_CLIENT",
     "DEFAULT_RECONCILIATION_BATCH_SIZE",
+    "DOCUMENT_PROPOSAL_CONTENT_ELISION_BYTES",
     "DOCUMENT_PROPOSAL_KINDS",
     "MAX_APPROVAL_HOLDS_PER_MINUTE",
     "MAX_CONVERSATION_STARTS_PER_HOUR",
