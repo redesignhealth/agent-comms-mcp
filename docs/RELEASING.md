@@ -66,6 +66,48 @@
    environment — this repo does not do that (see `deploy.yml`'s header comment).
    The release is **not** live in either environment until that separate step is done.
 
+## Cross-service compatibility for large Arcana proposals (TECH-7720)
+
+When rolling out the 1 MiB Arcana source-content contract, deploy the related
+services in this order:
+
+1. **Arcana**: deploy the 1,048,576-byte UTF-8 content bound.
+2. **agent-comms-approvals**: publish the matching contract validator,
+   applier, and decision-page summary handling.
+3. **agent-comms-mcp**: build and deploy the board-derived image containing
+   the new approvals package.
+
+Do not run a new board with an older approvals package: the board may admit a
+large Unicode action that the older validator or applier cannot accept. This
+sequence is a deployment compatibility requirement, not a version-number
+change; the services' current versions remain the source of truth until a
+separate release task bumps them. The board enforces no runtime check of the
+approvals package version, so confirm the pin below before deploying.
+
+**Where the derived image pins the approvals package.** The board that runs in
+the live environments is not this repo's plain image. It is the derived
+`reclaw-comms-mcp-rh` image built by the `agent-comms-approvals` repo, and the
+pin lives in three places (all outside this repo, so check them read-only):
+
+- `agent-comms-approvals/pyproject.toml` `[project].version`: its `deploy.yml`
+  ("Read agent-comms-approvals package version" step) reads this and passes it
+  as the `AGENT_COMMS_APPROVALS_VERSION` build-arg to `Dockerfile.board-derived`,
+  which `uv pip install`s `agent-comms-approvals==<version>` (with `--no-deps`)
+  from the Gitea package index on top of the board base image. The approvals
+  version containing the 1 MiB contract must be published to that index first.
+- `agent-comms-approvals` `deploy.yml` (`workflow_dispatch`, `base_image` input
+  = this repo's `sha-<40 hex>` image): emits the derived image tag
+  `sha-<approvals commit>-base-<board commit>`.
+- `rh-data-platform` `infrastructure/environments/{dev,prod}/terraform.tfvars`
+  `reclaw_comms_rh_image_tag`: the tag the running ECS task uses. It is bumped
+  by `deploy-reclaw-comms.yml` (see `MCP_HOSTING_RUNBOOK.md`, reclaw-comms-mcp
+  section).
+
+Before promoting a board build containing TECH-7720, confirm that the
+`reclaw_comms_rh_image_tag` the target environment will run was built from an
+`agent-comms-approvals` commit that includes the 1 MiB contract
+(`MAX_CONTENT_BYTES = 1_048_576` in `rh_comms_plugins/arcana_contracts.py`).
+
 ## Pre-releases
 
 Pre-releases (GitHub "Set as a pre-release" flag) trigger `publish.yml` but **not** `deploy.yml`.

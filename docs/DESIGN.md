@@ -1771,6 +1771,75 @@ unreachable by any bot's agent-jwt token by construction, not convention
 gate). Approving/rejecting a proposal is the one proposal action that
 stays human-only and HTTP-only.
 
+**Action limits, transport bounds, and SQL projection elision (TECH-7720)**:
+- **Authoritative content limit (1 MiB)**: Arcana document proposals
+  (`kind IN ("arcana_source_add", "arcana_source_revise")`) allow up to
+  1,048,576 UTF-8 bytes (1 MiB) of document content. This limit is measured
+  strictly on the UTF-8 bytes of `action.content` (provenance marker excluded);
+  the `sha256` digest is computed over this exact byte stream.
+- **Serialized action limits**:
+  - Non-document proposal kinds retain `MAX_PROPOSAL_ACTION_BYTES = 16_384` (16 KiB serialized JSON).
+  - Document proposal kinds are permitted up to `MAX_DOCUMENT_PROPOSAL_ACTION_BYTES = 4_194_304`
+    (4 MiB serialized JSON). This 4 MiB allowance accommodates up to 1 MiB of UTF-8 content with
+    standard JSON ASCII Unicode escaping (`ensure_ascii=True`, where non-ASCII codepoints expand up to
+    6 characters `\uXXXX`) and associated metadata.
+  - *Transport and envelope limits*: REST proposal submission (`POST /proposals`) bounds request
+    bodies to 5 MiB (`MAX_PROPOSAL_REQUEST_BYTES = 5 * 1024 * 1024`), checked early via the
+    `Content-Length` header and streamed byte counter, returning a static 413 `{"error": "request_too_large"}`
+    before JSON parsing. In the MCP transport, the underlying framework ingress imposes a 4 MiB whole-body
+    limit, meaning envelope/metadata overhead may cause an MCP request to return 413 before reaching the 4 MiB
+    action boundary (the transport ceilings are not identical). In pathological cases involving dense C0 control
+    characters or extreme escaping, the serialized payload may encounter transport ceilings even when content
+    is under 1 MiB.
+- **Bulk memory & SQL projection elision**:
+  - Proposal listing queries (`list_pending_proposal_holds`, `list_proposal_history_for_owner`,
+    `list_proposals_for_bot`) previously loaded the entire `action` column into Python memory.
+  - To prevent memory exhaustion when large documents are listed in bulk, an inner ID subquery
+    (`limit + 1`, matching filters and sort) joins an outer query using a SQL `CASE` expression:
+    ONLY for Arcana document proposals whose `action.content` string exceeds 16,384 UTF-8 bytes
+    (`octet_length(action ->> 'content') > DOCUMENT_PROPOSAL_CONTENT_ELISION_BYTES`, a projection-only
+    constant that is independent of the `MAX_PROPOSAL_ACTION_BYTES` validation limit), `action` is projected without `content`
+    (`action - 'content'`), and a top-level `elided_action_fields: {"content": {"utf8_bytes": N, "chars": M}}`
+    is attached. All other keys (including `sha256`, `target_id`, `logical_id`, `filename`) are preserved.
+  - Rows with content <= 16,384 bytes and all non-Arcana rows remain byte-identical and unelided.
+  - Pages are ordered by `created_at` with `ProposalHold.id` as a same-direction tie-breaker, in both the
+    inner `limit + 1` subquery and the outer query, so rows sharing a timestamp page and report `has_more`
+    deterministically.
+  - Existing non-large holds (including legacy holds at or below 16 KiB) are unchanged. The SQL
+    `octet_length` check still makes Postgres detoast the JSON value when needed; this projection
+    avoids transferring the large string into Python but is not a zero-cost index or a guaranteed
+    out-of-memory threshold. The bounded metadata is a response-shape bound, not a strict whole-process
+    memory guarantee, and retention is outside this change.
+  - Non-`content` keys of a document action are bounded by the approvals judge's strict Arcana contract
+    (`extra="forbid"`; `logical_id`/`filename`/`revision_id` at most 256 chars, `sha256` exactly 64, at most
+    10 citations of at most 4,096 chars each), which `classify()` enforces before any hold row is inserted.
+    The board deliberately does not add a second, board-side cap on those keys.
+  - The ORM query uses `defer(ProposalHold.action, raiseload=True)` so that `ProposalHold.action` is never
+    unintentionally lazy-loaded into memory during listing.
+  - *Retrieval of full actions*: Callers receiving an elided proposal in a listing can fetch the complete,
+    unelided action via the existing sender-scoped single-proposal lookup routes: `GET /proposals/{id}`
+    (REST) or the `proposals_get` MCP tool; both use the bot proposal scope and return only that
+    bot's own proposal. The service-to-service
+    `GET /proposals/{id}/apply-record` route is separate and remains restricted to the
+    `proposals:apply_record:read` scope plus its subject allowlist; it is not a general bot lookup.
+    Single-lookup paths (`get_proposal_for_bot`, `get_proposal_apply_record`, `withdraw_proposal`,
+    `decide_proposal`) always retain the full, unelided action and hash-equal content.
+- **Auto-approval & Human Review**:
+  - Auto-approval character limits (64k chars) and sensitivity limits (200k chars) remain unchanged;
+    large documents (> 64k chars) will always pend for human review.
+  - In `decision_page`, `_arcana_proposal_summary` checks `elided_action_fields.content.chars` (validating
+    it is an `int`, not a `bool`, in `0..10_000_000`) before falling back to inline content length, and
+    never renders raw document content.
+- **Deployment sequencing & releasing compatibility**:
+  - Deployments must proceed in strict order:
+    1. **Arcana**: Deploy first with 1 MiB (`1_048_576` bytes) limit in `SourceCreate`.
+    2. **Approvals**: Deploy `agent-comms-approvals` (applier + decision page) with updated `arcana_contracts.py`
+       (1 MiB byte validator) and `_arcana_proposal_summary`.
+    3. **Board**: Build and deploy `agent-comms-mcp` (derived image containing the NEW approvals package).
+  - *Releasing incompatibility warning*: Running a new board with an old approvals plugin package is
+    strictly unacceptable: if the new board admitted a large Unicode document action, the old plugin
+    would fail during validation or apply.
+
 **Create-time dedup key: `(kind, proposed_by_bot_id, target_id,
 action_type)`** -- scoped to the SUBMITTING BOT. A resubmission matching an
 existing `status='pending'` row under this key UPDATEs it in place instead
