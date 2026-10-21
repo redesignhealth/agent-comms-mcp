@@ -1711,11 +1711,15 @@ async def set_agent_ownership(request: Request) -> Response:
     its registry CAS commits (see ``service.apply_owner_reassignment`` for
     the semantics, including how ``owner_sub`` is handled).
 
-    Auth: identical to ``reconcile_ownership`` -- interactive (Okta) caller OR
-    an agent-jwt token carrying ``comms:admin``. The registry is already
-    authoritative and has been committed by a human-approved decision, so the
-    board applies unconditionally; the caller cannot pick an owner that the
-    registry has not already accepted without holding ``comms:admin``.
+    Auth: an agent-jwt (service) token carrying ``comms:admin`` ONLY --
+    deliberately narrower than ``reconcile_ownership``: interactive (Okta)
+    sessions are NOT admitted. The approvals service is the only intended
+    caller, and letting any employee session rewrite a bot's owner here would
+    bypass the registry's human approval. (``scopes_for_token`` returns no
+    scopes for a non-agent-jwt token, so the scope check alone excludes
+    interactive callers.) The registry is already authoritative and has been
+    committed by a human-approved decision, so the board applies
+    unconditionally.
 
     ``sub`` is the bare board identity (URL-encoded). Unknown/non-active
     agents get a uniform 404.
@@ -1726,12 +1730,12 @@ async def set_agent_ownership(request: Request) -> Response:
     access_token = await _auth_provider.verify_token(token_str)
     if access_token is None:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-    if not (is_interactive_token(access_token) or "comms:admin" in scopes_for_token(access_token)):
+    if "comms:admin" not in scopes_for_token(access_token):
         return JSONResponse({"error": "forbidden"}, status_code=403)
 
     try:
         body = await request.json()
-    except json.JSONDecodeError:
+    except ValueError:  # json.JSONDecodeError and UnicodeDecodeError
         return JSONResponse({"error": "invalid_json"}, status_code=422)
     if not isinstance(body, dict):
         return JSONResponse({"error": "invalid_body"}, status_code=422)
@@ -1747,8 +1751,9 @@ async def set_agent_ownership(request: Request) -> Response:
     if body.get("source") != service.OWNER_REASSIGNMENT_SOURCE:
         return JSONResponse({"error": "invalid_source"}, status_code=422)
 
-    # Audit actor: the caller's own verified identity (same resolver every
-    # other route here uses), never a body field.
+    # Audit actor: the caller's verified agent-jwt ``sub`` (same resolver every
+    # other route here uses; interactive tokens are rejected above), never a
+    # body field.
     actor_sub = try_resolve_email(access_token) or "unknown"
     async with get_session_factory()() as session:
         try:

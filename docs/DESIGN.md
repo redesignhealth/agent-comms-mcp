@@ -2286,8 +2286,11 @@ approved owner reassignments, below):
    (`changed=false`, no audit row, when nothing differs); an
    `expected_previous_owner_email` that differs from the row is applied anyway
    and recorded in the `agent.ownership_reassigned` audit detail. `is_shared`,
-   keys, status and scopes are untouched. Auth is the same as mechanism 2
-   (interactive or agent-jwt `comms:admin`); unknown/non-active agents get a
+   keys, status and scopes are untouched. Auth is an agent-jwt token carrying
+   `comms:admin` ONLY -- unlike mechanism 2, interactive (Okta) sessions are
+   rejected with 403, since the approvals service is the sole intended caller
+   and an employee session must not be able to rewrite a bot's owner without
+   the registry's human approval; unknown/non-active agents get a
    uniform 404. Mechanisms 1 and 2 remain the secondary paths that converge any
    row this call missed.
 
