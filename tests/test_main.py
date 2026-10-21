@@ -759,9 +759,11 @@ class TestEndToEnd:
             "issuer": "https://example.okta.com/oauth2/default",
             "caller_type": "interactive",
             "scopes": [],
+            "agent_token_verifier": None,
         }
 
-    def test_whoami_end_to_end_for_agent_jwt_caller(self) -> None:
+    def test_whoami_in_memory_with_verified_service_context(self) -> None:
+        """Inject an already-verified context; this is not HTTP authentication coverage."""
         from fastmcp import Client
 
         main = _import_main()
@@ -771,6 +773,7 @@ class TestEndToEnd:
             "iss": "agent-jwt",
             "sub": "ea-agent-svc",
             "scopes": ["comms:read"],
+            "_agent_token_verifier": "agent_jwt_hs256",
         }
         bot_token.scopes = []
         bot_token.client_id = "ea-agent-svc"
@@ -799,6 +802,7 @@ class TestEndToEnd:
             "issuer": "agent-jwt",
             "caller_type": "service",
             "scopes": ["comms:read"],
+            "agent_token_verifier": "agent_jwt_hs256",
         }
 
     def test_whoami_end_to_end_denied_without_scope(self) -> None:

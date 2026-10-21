@@ -53,6 +53,10 @@ An agent's board `sub` is composed from the authenticated token's base identity 
 - **Org convention**: Claude Code sessions should consistently use `agent_key="claude-code"`. Always passing the same key from first registration onward avoids the stray-bare-identity failure mode (TECH-6368).
 - **Diagnostics**: `comms_whoami` reports `status` (`"active"`, `"suspended"`, or `"not_registered"`), lists any sibling identities under your token in `other_identities`, and suggests `suggested_agent_key` when your current identity is unusable but a single active sibling exists -- or `suggested_bare_identity: true` when that one active sibling is instead the bare `base_sub` identity itself (no `agent_key`). Action tools also suggest the active `agent_key` (or "retry without agent_key" for the bare-identity case) when rejecting an unregistered or suspended caller.
 
+`comms_whoami.agent_token_verifier` reports the exact server-configured verifier
+stamp for service callers, or `null` for interactive callers and missing/invalid
+stamps. It is not original JWT issuer/key/expiry proof or an authorization grant.
+
 ## MCP tool surface
 
 Two mounted sub-servers, each with its own namespace/mount-prefix rewrite,

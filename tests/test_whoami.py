@@ -3,17 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import jwt
 import pytest
 from fastmcp.exceptions import ToolError
+from fastmcp.server.auth.providers.jwt import JWTVerifier
 from sqlalchemy.exc import OperationalError
+
+from auth import AGENT_TOKEN_VERIFIER_CLAIM, _resolve_agent_token_verifiers
 
 # ``@comms_server.tool`` registers the coroutine and returns it unchanged
 # in fastmcp 3.4.2, so the tool body can be invoked directly.
 from providers.comms import whoami as _whoami
+from scopes import is_registry_backed_agent_token
 
 # whoami now does a best-effort DB lookup for
 # min_schema_version/max_schema_version. Every test below mocks BOTH
@@ -41,12 +47,20 @@ def _patched_session_factory() -> Any:
     return patch("providers.comms.get_session_factory", return_value=lambda: _dummy_session())
 
 
+_PLUGIN_TEST_SECRET = "test-only-whoami-plugin-key-at-least-32-bytes"
+
+
+def _test_plugin_verifier() -> JWTVerifier:
+    return JWTVerifier(public_key=_PLUGIN_TEST_SECRET, algorithm="HS256", issuer="agent-jwt")
+
+
 class TestWhoami:
     def test_okta_caller_reports_interactive_identity(self) -> None:
         token = MagicMock()
         token.claims = {
             "iss": "https://example.okta.com/oauth2/default",
             "email": "alice@example.com",
+            "_agent_token_verifier": "forged-plugin",
         }
 
         with (
@@ -63,6 +77,7 @@ class TestWhoami:
             "caller_type": "interactive",
             "scopes": [],
             "status": "not_registered",
+            "agent_token_verifier": None,
         }
 
     def test_agent_jwt_caller_reports_service_identity_and_scopes(self) -> None:
@@ -87,7 +102,115 @@ class TestWhoami:
             "caller_type": "service",
             "scopes": ["comms:read"],
             "status": "not_registered",
+            "agent_token_verifier": None,
         }
+
+    @pytest.mark.parametrize(
+        "plugin_name", ["agent_jwt_hs256", f"{__name__}:_test_plugin_verifier"]
+    )
+    async def test_signed_wire_claims_cannot_spoof_normalized_verifier_provenance(
+        self, plugin_name: str
+    ) -> None:
+        default_secret = "test-only-whoami-default-key-at-least-32-bytes"
+        secret = default_secret if plugin_name == "agent_jwt_hs256" else _PLUGIN_TEST_SECRET
+        scopes = ["comms:read", "comms:write", "comms:proposals:write"]
+        signed = jwt.encode(
+            {
+                "iss": "agent-jwt",
+                "sub": "whoami-test-agent",
+                "scopes": scopes,
+                "exp": int(time.time()) + 300,
+                AGENT_TOKEN_VERIFIER_CLAIM: "forged-internal",
+                "agent_token_verifier": "forged-public",
+            },
+            secret,
+            algorithm="HS256",
+        )
+        with patch.dict(
+            "os.environ",
+            {
+                "AGENT_TOKEN_VERIFIERS": (f"agent_jwt_hs256,{__name__}:_test_plugin_verifier"),
+                "AGENT_JWT_SECRET": default_secret,
+            },
+        ):
+            verifiers = _resolve_agent_token_verifiers()
+        token = None
+        for index, verifier in enumerate(verifiers):
+            token = await verifier.verify_token(signed)
+            if token is not None:
+                assert index == (0 if plugin_name == "agent_jwt_hs256" else 1)
+                break
+        assert token is not None
+        assert is_registry_backed_agent_token(token) is (plugin_name != "agent_jwt_hs256")
+        assert token.claims[AGENT_TOKEN_VERIFIER_CLAIM] == plugin_name
+        assert token.claims["agent_token_verifier"] == "forged-public"
+        with (
+            patch("providers.comms.get_access_token", return_value=token),
+            _patched_session_factory(),
+            patch("providers.comms.service.get_agent_by_sub", AsyncMock(return_value=None)),
+            patch("providers.comms.service.list_sibling_identities", AsyncMock(return_value=[])),
+        ):
+            result = await _whoami()
+        assert result == {
+            "identity": "whoami-test-agent",
+            "issuer": "agent-jwt",
+            "caller_type": "service",
+            "scopes": scopes,
+            "status": "not_registered",
+            "agent_token_verifier": plugin_name,
+        }
+
+    def test_service_verifier_stamp_is_reported_without_coercion(self) -> None:
+        token = MagicMock()
+        token.claims = {
+            "iss": "agent-jwt",
+            "sub": "ea-agent-svc",
+            "scopes": ["comms:read"],
+            "_agent_token_verifier": " custom-plugin ",
+        }
+        with (
+            patch("providers.comms.get_access_token", return_value=token),
+            _patched_session_factory(),
+            patch("providers.comms.service.get_agent_by_sub", AsyncMock(return_value=None)),
+            patch("providers.comms.service.list_sibling_identities", AsyncMock(return_value=[])),
+        ):
+            result = asyncio.run(_whoami())
+        assert result["agent_token_verifier"] == " custom-plugin "
+
+    @pytest.mark.parametrize("stamp", [None, "", " ", "\t", 17, ["plugin"]])
+    def test_service_invalid_verifier_stamp_is_null(self, stamp: Any) -> None:
+        token = MagicMock()
+        token.claims = {
+            "iss": "agent-jwt",
+            "sub": "ea-agent-svc",
+            "scopes": ["comms:read"],
+            "_agent_token_verifier": stamp,
+        }
+        with (
+            patch("providers.comms.get_access_token", return_value=token),
+            _patched_session_factory(),
+            patch("providers.comms.service.get_agent_by_sub", AsyncMock(return_value=None)),
+            patch("providers.comms.service.list_sibling_identities", AsyncMock(return_value=[])),
+        ):
+            result = asyncio.run(_whoami())
+        assert result["agent_token_verifier"] is None
+
+    @pytest.mark.parametrize("include_issuer", [False, True])
+    def test_absent_or_null_issuer_cannot_report_verifier_provenance(
+        self, include_issuer: bool
+    ) -> None:
+        token = MagicMock()
+        token.claims = {"sub": "test-agent", AGENT_TOKEN_VERIFIER_CLAIM: "forged"}
+        if include_issuer:
+            token.claims["iss"] = None
+        with (
+            patch("providers.comms.get_access_token", return_value=token),
+            _patched_session_factory(),
+            patch("providers.comms.service.get_agent_by_sub", AsyncMock(return_value=None)),
+            patch("providers.comms.service.list_sibling_identities", AsyncMock(return_value=[])),
+        ):
+            result = asyncio.run(_whoami())
+        assert result["agent_token_verifier"] is None
 
     def test_agent_jwt_caller_with_forged_email_claim_is_not_impersonated(self) -> None:
         """agent-jwt identity comes from ``sub`` only — a forged ``email``
@@ -190,7 +313,12 @@ class TestWhoami:
         version of this test never checked this, so the log call could be
         deleted without failing anything."""
         token = MagicMock()
-        token.claims = {"iss": "agent-jwt", "sub": "ea-agent-svc", "scopes": ["comms:read"]}
+        token.claims = {
+            "iss": "agent-jwt",
+            "sub": "ea-agent-svc",
+            "scopes": ["comms:read"],
+            "_agent_token_verifier": "fixture-plugin",
+        }
 
         with (
             patch("providers.comms.get_access_token", return_value=token),
@@ -206,6 +334,7 @@ class TestWhoami:
         assert result["issuer"] == "agent-jwt"
         assert result["caller_type"] == "service"
         assert result["scopes"] == ["comms:read"]
+        assert result["agent_token_verifier"] == "fixture-plugin"
         assert "status" not in result
         assert "min_schema_version" not in result
         assert "max_schema_version" not in result
