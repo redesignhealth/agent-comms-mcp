@@ -49,6 +49,7 @@ from exceptions import (
     HoldExpiredError,
     InvalidConversationStateError,
     InvalidExtendError,
+    InvalidOwnerReassignmentError,
     RateLimitExceededError,
     SchemaVersionMismatchError,
     SiblingIdentityExistsError,
@@ -88,6 +89,7 @@ from service import (
     _enforce_message_type_accepted,
     accept_invite,
     admin_register_agent,
+    apply_owner_reassignment,
     archive_conversation,
     decline_invite,
     deregister_agent,
@@ -12185,6 +12187,267 @@ class TestReconcileAgentOwnership:
         )
 
         assert result == {"checked": 1, "updated": 1, "skipped_shared": 0, "errors": 0}
+
+
+class TestApplyOwnerReassignment:
+    """TECH-7824: approval-time sync of the board's own agents row after the
+    registry's owner reassignment commits."""
+
+    _DAN = "dan.costanza@redesignhealth.com"
+    _LELAND = "leland.brewster@redesignhealth.com"
+
+    async def _apply(self, session: AsyncSession, sub: str, **overrides: Any) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "actor_sub": "admin-caller",
+            "sub": sub,
+            "new_owner_email": self._LELAND,
+            "new_owner_sub": None,
+            "expected_previous_owner_email": None,
+            "approved_by": "approver@redesignhealth.com",
+        }
+        kwargs.update(overrides)
+        return await apply_owner_reassignment(session, **kwargs)
+
+    async def _register_dan(self, session: AsyncSession, sub: str, **overrides: Any) -> Agent:
+        return await _register(
+            session, sub, owner_sub=self._DAN, owner_email=self._DAN, **overrides
+        )
+
+    async def _audit_rows(self, session: AsyncSession, agent: Agent) -> list[AuditLog]:
+        return list(
+            (
+                await session.execute(
+                    select(AuditLog).where(
+                        AuditLog.agent_id == agent.id,
+                        AuditLog.action == "agent.ownership_reassigned",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    async def test_changed_updates_email_and_derived_sub_and_audits(
+        self, session: AsyncSession
+    ) -> None:
+        agent = await self._register_dan(session, "apply-changed")
+
+        result = await self._apply(
+            session,
+            "apply-changed",
+            new_owner_email="  Leland.Brewster@RedesignHealth.com ",
+            expected_previous_owner_email=self._DAN,
+        )
+
+        assert result == {
+            "sub": "apply-changed",
+            "changed": True,
+            "owner_email": self._LELAND,
+            "previous_owner_email": self._DAN,
+            "owner_sub_updated": True,
+        }
+        row = (await session.execute(select(Agent).where(Agent.id == agent.id))).scalar_one()
+        assert (row.owner_email, row.owner_sub) == (self._LELAND, self._LELAND)
+        (audit,) = await self._audit_rows(session, agent)
+        assert audit.actor_sub == "admin-caller"
+        assert audit.detail == {
+            "owner_email": {"old": self._DAN, "new": self._LELAND},
+            "owner_sub": {"old": self._DAN, "new": self._LELAND},
+            "approved_by": "approver@redesignhealth.com",
+            "source": "owner_reassignment",
+            "expected_previous_owner_email": self._DAN,
+        }
+
+    async def test_explicit_new_owner_sub_is_used(self, session: AsyncSession) -> None:
+        agent = await self._register_dan(session, "apply-explicit-sub")
+
+        result = await self._apply(session, "apply-explicit-sub", new_owner_sub="okta|leland")
+
+        assert result["owner_sub_updated"] is True
+        row = (await session.execute(select(Agent).where(Agent.id == agent.id))).scalar_one()
+        assert (row.owner_email, row.owner_sub) == (self._LELAND, "okta|leland")
+
+    async def test_opaque_owner_sub_is_left_untouched_and_reported(
+        self, session: AsyncSession
+    ) -> None:
+        agent = await _register(
+            session, "apply-opaque", owner_sub="opaque-idp-subject", owner_email=self._DAN
+        )
+
+        result = await self._apply(session, "apply-opaque")
+
+        assert result["changed"] is True
+        assert result["owner_sub_updated"] is False
+        assert "owner_sub_note" in result
+        row = (await session.execute(select(Agent).where(Agent.id == agent.id))).scalar_one()
+        assert (row.owner_email, row.owner_sub) == (self._LELAND, "opaque-idp-subject")
+        (audit,) = await self._audit_rows(session, agent)
+        assert "owner_sub" not in audit.detail
+
+    async def test_idempotent_second_call_writes_no_audit(self, session: AsyncSession) -> None:
+        agent = await self._register_dan(session, "apply-idempotent")
+        await self._apply(session, "apply-idempotent")
+
+        result = await self._apply(session, "apply-idempotent")
+
+        assert result == {
+            "sub": "apply-idempotent",
+            "changed": False,
+            "owner_email": self._LELAND,
+            "previous_owner_email": self._LELAND,
+            "owner_sub_updated": False,
+        }
+        assert len(await self._audit_rows(session, agent)) == 1
+
+    async def test_expected_previous_mismatch_still_applies_and_is_audited(
+        self, session: AsyncSession
+    ) -> None:
+        agent = await self._register_dan(session, "apply-mismatch")
+
+        result = await self._apply(
+            session,
+            "apply-mismatch",
+            expected_previous_owner_email="someone.else@redesignhealth.com",
+        )
+
+        assert result["changed"] is True
+        (audit,) = await self._audit_rows(session, agent)
+        assert audit.detail["expected_previous_owner_mismatch"] is True
+        assert audit.detail["expected_previous_owner_email"] == "someone.else@redesignhealth.com"
+
+    async def test_preserves_shared_flag_status_and_accepted_types(
+        self, session: AsyncSession
+    ) -> None:
+        agent = await self._register_dan(
+            session, "apply-shared", is_shared=True, accepted_types=["note"]
+        )
+
+        await self._apply(session, "apply-shared")
+
+        row = (await session.execute(select(Agent).where(Agent.id == agent.id))).scalar_one()
+        assert row.is_shared is True
+        assert row.status == "active"
+        assert list(row.accepted_types) == ["note"]
+        assert row.display_name == agent.display_name
+
+    @pytest.mark.parametrize(
+        "sub", ["human@redesignhealth.com", "apply-base::keyed", "apply-base::"]
+    )
+    async def test_ineligible_identities_rejected(self, session: AsyncSession, sub: str) -> None:
+        with pytest.raises(InvalidOwnerReassignmentError):
+            await self._apply(session, sub)
+
+    @pytest.mark.parametrize(
+        "bad_email", ["leland@example.com", "not-an-email", "", "a@b@redesignhealth.com"]
+    )
+    async def test_invalid_new_owner_email_rejected_without_change(
+        self, session: AsyncSession, bad_email: str
+    ) -> None:
+        agent = await self._register_dan(session, "apply-bad-email")
+
+        with pytest.raises(InvalidOwnerReassignmentError):
+            await self._apply(session, "apply-bad-email", new_owner_email=bad_email)
+
+        row = (await session.execute(select(Agent).where(Agent.id == agent.id))).scalar_one()
+        assert row.owner_email == self._DAN
+
+    async def test_blank_new_owner_sub_rejected(self, session: AsyncSession) -> None:
+        await self._register_dan(session, "apply-blank-sub")
+        with pytest.raises(InvalidOwnerReassignmentError):
+            await self._apply(session, "apply-blank-sub", new_owner_sub="   ")
+
+    async def test_unknown_agent_denied_and_audited(self, session: AsyncSession) -> None:
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await self._apply(session, "apply-nobody")
+        assert exc_info.value.reason == "denied.unknown_agent"
+
+    async def test_suspended_agent_denied_and_unchanged(self, session: AsyncSession) -> None:
+        agent = await self._register_dan(session, "apply-suspended")
+        await deregister_agent(
+            session, actor_sub="admin-caller", agent_id=agent.id, deregister_authorized=True
+        )
+
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await self._apply(session, "apply-suspended")
+
+        assert exc_info.value.reason == "denied.agent_suspended"
+        row = (await session.execute(select(Agent).where(Agent.id == agent.id))).scalar_one()
+        assert row.owner_email == self._DAN
+
+    async def test_internal_admission_uses_new_owner_immediately(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-7824 regression: before the sync, the board row kept the OLD
+        owner after an approved reassignment, so a conversation between the
+        reassigned bot and its old owner's bot was wrongly admitted as
+        ``internal`` with no human approval."""
+        peer = await self._register_dan(session, "apply-int-peer")
+        reassigned = await self._register_dan(session, "apply-int-reassigned")
+        before = await start_conversation(
+            session,
+            actor_sub=peer.sub,
+            initiator_agent_id=peer.id,
+            conversation_type="internal",
+            target_agent_ids=[reassigned.id],
+            initial_message=_request_payload(),
+        )
+        assert before.state == "active"
+
+        await self._apply(session, "apply-int-reassigned")
+
+        with pytest.raises(AccessDeniedError) as exc_info:
+            await start_conversation(
+                session,
+                actor_sub=peer.sub,
+                initiator_agent_id=peer.id,
+                conversation_type="internal",
+                target_agent_ids=[reassigned.id],
+                initial_message=_request_payload(),
+            )
+        assert exc_info.value.reason == "denied.not_same_owner"
+
+    async def test_boundary_check_uses_new_owner_immediately(self, session: AsyncSession) -> None:
+        """Same regression for an already-open conversation: the next post is
+        held as a boundary crossing as soon as the sync runs, with no call by
+        the reassigned bot itself."""
+        sender = await self._register_dan(session, "apply-bnd-sender")
+        reassigned = await self._register_dan(session, "apply-bnd-reassigned")
+        conversation = await start_conversation(
+            session,
+            actor_sub=sender.sub,
+            initiator_agent_id=sender.id,
+            conversation_type="asymmetric",
+            target_agent_ids=[reassigned.id],
+            initial_message=_request_payload(),
+        )
+        await accept_invite(
+            session,
+            actor_sub=reassigned.sub,
+            agent_id=reassigned.id,
+            conversation_id=conversation.id,
+        )
+        first = await post_message(
+            session,
+            actor_sub=sender.sub,
+            sender_agent_id=sender.id,
+            conversation_id=conversation.id,
+            message_type="note",
+            payload={"text": "same owner"},
+        )
+        assert first.type == "note"
+
+        await self._apply(session, "apply-bnd-reassigned")
+
+        held = await post_message(
+            session,
+            actor_sub=sender.sub,
+            sender_agent_id=sender.id,
+            conversation_id=conversation.id,
+            message_type="note",
+            payload={"text": "different owner now"},
+        )
+        assert isinstance(held, ApprovalHold)
+        assert held.risk_reason == "boundary_crossing"
 
 
 # --- deregister_agent (TECH-5736) -------------------------------------------
