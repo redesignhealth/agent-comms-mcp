@@ -41,6 +41,7 @@ from exceptions import (
     HoldAwaitingAutoReviewError,
     HoldExpiredError,
     InvalidConversationStateError,
+    InvalidOwnerReassignmentError,
     InvalidProposalActionError,
     ProposalTargetUnavailableError,
     RateLimitExceededError,
@@ -1700,6 +1701,77 @@ async def reconcile_ownership(request: Request) -> Response:
             ownership_client=service.get_ownership_client_factory()(session),
             limit=limit,
         )
+    return JSONResponse(result, status_code=200)
+
+
+@mcp.custom_route("/admin/agents/{sub}/ownership", methods=["POST"])
+async def set_agent_ownership(request: Request) -> Response:
+    """Apply an already-approved owner reassignment to the board's own
+    ``agents`` row (TECH-7824), called by the approvals service right after
+    its registry CAS commits (see ``service.apply_owner_reassignment`` for
+    the semantics, including how ``owner_sub`` is handled).
+
+    Auth: an agent-jwt (service) token carrying ``comms:admin`` ONLY --
+    deliberately narrower than ``reconcile_ownership``: interactive (Okta)
+    sessions are NOT admitted. The approvals service is the only intended
+    caller, and letting any employee session rewrite a bot's owner here would
+    bypass the registry's human approval. (``scopes_for_token`` returns no
+    scopes for a non-agent-jwt token, so the scope check alone excludes
+    interactive callers.) The registry is already authoritative and has been
+    committed by a human-approved decision, so the board applies
+    unconditionally.
+
+    ``sub`` is the bare board identity (URL-encoded). Unknown/non-active
+    agents get a uniform 404.
+    """
+    token_str = _extract_bearer_token(request)
+    if token_str is None:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    access_token = await _auth_provider.verify_token(token_str)
+    if access_token is None:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    if "comms:admin" not in scopes_for_token(access_token):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+
+    try:
+        body = await request.json()
+    except ValueError:  # json.JSONDecodeError and UnicodeDecodeError
+        return JSONResponse({"error": "invalid_json"}, status_code=422)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "invalid_body"}, status_code=422)
+    new_owner_email = body.get("new_owner_email")
+    if not isinstance(new_owner_email, str):
+        return JSONResponse({"error": "invalid_new_owner_email"}, status_code=422)
+    for key in ("new_owner_sub", "expected_previous_owner_email"):
+        if body.get(key) is not None and not isinstance(body[key], str):
+            return JSONResponse({"error": f"invalid_{key}"}, status_code=422)
+    approved_by = body.get("approved_by")
+    if not isinstance(approved_by, str) or not approved_by.strip():
+        return JSONResponse({"error": "invalid_approved_by"}, status_code=422)
+    if body.get("source") != service.OWNER_REASSIGNMENT_SOURCE:
+        return JSONResponse({"error": "invalid_source"}, status_code=422)
+
+    # Audit actor: the caller's verified agent-jwt ``sub`` (same resolver every
+    # other route here uses; interactive tokens are rejected above), never a
+    # body field.
+    actor_sub = try_resolve_email(access_token) or "unknown"
+    async with get_session_factory()() as session:
+        try:
+            result = await service.apply_owner_reassignment(
+                session,
+                actor_sub=actor_sub,
+                sub=request.path_params["sub"],
+                new_owner_email=new_owner_email,
+                new_owner_sub=body.get("new_owner_sub"),
+                expected_previous_owner_email=body.get("expected_previous_owner_email"),
+                approved_by=approved_by.strip(),
+            )
+        except AccessDeniedError:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        except InvalidOwnerReassignmentError as exc:
+            return JSONResponse(
+                {"error": "invalid_owner_reassignment", "detail": str(exc)}, status_code=422
+            )
     return JSONResponse(result, status_code=200)
 
 

@@ -2206,7 +2206,8 @@ for a hot path. Left alone, that cache would only ever update if an agent
 re-registers via `comms_register` — and even then, `register_agent`
 deliberately freezes `owner_sub` against re-registration (see the provenance
 discussion above), so nothing short of a fresh mint would move it. Two
-mechanisms bound that staleness instead:
+mechanisms bound that staleness instead (plus a third, event-driven one for
+approved owner reassignments, below):
 
 1. **Per-request write-through** (`service.write_through_ownership`, called
    from `providers.comms._resolve_caller_agent`). Not every tool call goes
@@ -2266,6 +2267,32 @@ mechanisms bound that staleness instead:
    to exploit (it only triggers a read-then-conditionally-write pass against
    the platform's own configured ownership source, never a caller-chosen
    outcome).
+3. **Approval-time owner reassignment** (`service.apply_owner_reassignment`,
+   exposed as `POST /admin/agents/{sub}/ownership`, TECH-7824). A human-approved
+   owner reassignment (`comms_request_owner_reassignment` -> approvals decision
+   page -> registry CAS) used to leave the board row stale until mechanism 1
+   fired on the bot's own later call, so the board's admission checks
+   (`internal` same-owner, invites, boundary-crossing holds) and directory
+   lookups kept using the previous owner. The approvals service now calls this
+   endpoint right after its registry CAS commits. The registry is already
+   authoritative, so the board applies UNCONDITIONALLY to the active, bare
+   (non-keyed, non-human) agent row: `owner_email` becomes the normalized
+   `@redesignhealth.com` address, and `owner_sub` becomes the supplied
+   `new_owner_sub` or, when omitted, the new canonical email -- but only if the
+   row already follows the `owner_sub == owner's email` convention (the same
+   one `mint_token --owner-email` and the decide endpoint's
+   `hold.owner_sub == approver email` match rely on); an opaque `owner_sub` is
+   left untouched and the response says so (`owner_sub_note`). Idempotent
+   (`changed=false`, no audit row, when nothing differs); an
+   `expected_previous_owner_email` that differs from the row is applied anyway
+   and recorded in the `agent.ownership_reassigned` audit detail. `is_shared`,
+   keys, status and scopes are untouched. Auth is an agent-jwt token carrying
+   `comms:admin` ONLY -- unlike mechanism 2, interactive (Okta) sessions are
+   rejected with 403, since the approvals service is the sole intended caller
+   and an employee session must not be able to rewrite a bot's owner without
+   the registry's human approval; unknown/non-active agents get a
+   uniform 404. Mechanisms 1 and 2 remain the secondary paths that converge any
+   row this call missed.
 
 ### Configuration: pluggable agent-token verification (`AGENT_TOKEN_VERIFIERS`) [TECH-5396]
 

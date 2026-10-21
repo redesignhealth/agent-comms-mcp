@@ -2754,6 +2754,23 @@ def parse_decision_page_base_url(raw_url: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip('/')}"
 
 
+def _require_reassignable_sub(sub: str) -> str:
+    """Shape-based eligibility shared by ``request_owner_reassignment`` and
+    ``apply_owner_reassignment``: not a human identity, and a bare (non-keyed)
+    credential identity. Returns the credential sub (== ``sub``)."""
+    if "@" in sub:
+        raise InvalidOwnerReassignmentError("cannot reassign owner of a human identity")
+
+    # Wire credential base check: reject keyed agent targets
+    credential_sub = sub.split("::", 1)[0]
+    if sub != credential_sub:
+        raise InvalidOwnerReassignmentError(
+            f"cannot reassign keyed agent identity {sub!r} directly; "
+            "only bare credential identities can be reassigned"
+        )
+    return credential_sub
+
+
 async def authorize_owner_reassignment(
     session: AsyncSession,
     *,
@@ -2828,16 +2845,7 @@ async def request_owner_reassignment(
             detail={"target_agent_id": str(agent_id), "sub": agent.sub, "status": agent.status},
         )
 
-    if "@" in agent.sub:
-        raise InvalidOwnerReassignmentError("cannot reassign owner of a human identity")
-
-    # Wire credential base check: reject keyed agent targets
-    credential_sub = agent.sub.split("::", 1)[0]
-    if agent.sub != credential_sub:
-        raise InvalidOwnerReassignmentError(
-            f"cannot reassign keyed agent identity {agent.sub!r} directly; "
-            "only bare credential identities can be reassigned"
-        )
+    credential_sub = _require_reassignable_sub(agent.sub)
 
     # Reject bare target if any sibling aliases exist under this base_sub
     siblings = await list_sibling_identities(
@@ -2874,6 +2882,140 @@ async def request_owner_reassignment(
     )
     await session.commit()
     return agent, canonical_email, credential_sub, affected_board_identities
+
+
+OWNER_REASSIGNMENT_SOURCE = "owner_reassignment"
+
+
+async def apply_owner_reassignment(
+    session: AsyncSession,
+    *,
+    actor_sub: str,
+    sub: str,
+    new_owner_email: str,
+    new_owner_sub: str | None,
+    expected_previous_owner_email: str | None,
+    approved_by: str,
+) -> dict[str, Any]:
+    """Apply an already-approved owner reassignment to the board's own
+    ``agents`` row (TECH-7824).
+
+    The ownership registry (``agent_owners``) has already committed the change
+    and is authoritative, so this applies UNCONDITIONALLY -- it is not a CAS.
+    The board's admission checks (``internal`` same-owner, invites,
+    boundary-crossing holds) and directory lookups read this row, so it must
+    move at approval time rather than waiting for the agent's next
+    registry-backed call (``write_through_ownership``, still the secondary
+    path).
+
+    ``owner_email`` is set to the normalized corporate address. ``owner_sub``
+    is set to ``new_owner_sub`` when supplied. Otherwise it is derived ONLY
+    when the row already follows the board's ``owner_sub == owner's email``
+    convention (``owner_sub`` equals the row's current ``owner_email``, case-
+    insensitively -- the convention ``mint_token --owner-email`` and the
+    approval decide endpoint's ``hold.owner_sub == approver email`` match both
+    rely on); then ``owner_sub`` becomes the new canonical email. A row whose
+    ``owner_sub`` is opaque (an IdP subject, a self-owned bot sub) is left
+    untouched and the result carries ``owner_sub_note`` -- no mapping is
+    invented.
+
+    Idempotent: a row already holding the resulting values returns
+    ``changed=False`` and writes no audit row. A mismatch between
+    ``expected_previous_owner_email`` and the row's ``owner_email`` does not
+    block the apply; it is recorded in the audit detail. ``is_shared``, keys,
+    status and scopes are never touched.
+
+    Raises ``InvalidOwnerReassignmentError`` for a human or keyed ``sub`` or an
+    invalid ``new_owner_email``/``new_owner_sub`` (checked before any lookup),
+    and ``AccessDeniedError`` (``denied.unknown_agent`` /
+    ``denied.agent_suspended``) for an unknown or non-active agent. Authorization
+    (``comms:admin``/interactive) is the caller's job, as for
+    ``reconcile_agent_ownership``.
+    """
+    _require_reassignable_sub(sub)
+    try:
+        canonical_email = normalize_corp_email(new_owner_email)
+    except ValueError as exc:
+        raise InvalidOwnerReassignmentError(
+            f"new_owner_email must be a valid @redesignhealth.com corporate address: {exc}"
+        ) from exc
+    if new_owner_sub is not None:
+        new_owner_sub = new_owner_sub.strip()
+        if not new_owner_sub or len(new_owner_sub) > MAX_SUB_LENGTH:
+            raise InvalidOwnerReassignmentError(
+                f"new_owner_sub must be 1-{MAX_SUB_LENGTH} characters when provided"
+            )
+
+    agent = (
+        await session.execute(select(Agent).where(Agent.sub == sub).with_for_update())
+    ).scalar_one_or_none()
+    if agent is None:
+        await _deny(
+            session,
+            actor_sub=actor_sub,
+            action="denied.unknown_agent",
+            detail={"target_sub": sub},
+        )
+    if agent.status != "active":
+        await _deny(
+            session,
+            actor_sub=actor_sub,
+            action="denied.agent_suspended",
+            agent_id=agent.id,
+            detail={"target_sub": sub, "status": agent.status},
+        )
+
+    previous_email = agent.owner_email
+    previous_sub = agent.owner_sub
+    target_sub = new_owner_sub
+    owner_sub_note: str | None = None
+    if target_sub is None:
+        if previous_sub.strip().lower() == previous_email.strip().lower():
+            target_sub = canonical_email
+        else:
+            owner_sub_note = (
+                "owner_sub left unchanged: it is not email-shaped for this row, so the "
+                "new owner's sub cannot be derived; supply new_owner_sub"
+            )
+
+    changed_fields: dict[str, dict[str, str]] = {}
+    if previous_email != canonical_email:
+        changed_fields["owner_email"] = {"old": previous_email, "new": canonical_email}
+    if target_sub is not None and target_sub != previous_sub:
+        changed_fields["owner_sub"] = {"old": previous_sub, "new": target_sub}
+
+    if changed_fields:
+        detail: dict[str, Any] = {
+            **changed_fields,
+            "approved_by": approved_by,
+            "source": OWNER_REASSIGNMENT_SOURCE,
+        }
+        if expected_previous_owner_email is not None:
+            detail["expected_previous_owner_email"] = expected_previous_owner_email
+            if expected_previous_owner_email.strip().lower() != previous_email.strip().lower():
+                detail["expected_previous_owner_mismatch"] = True
+        agent.owner_email = canonical_email
+        if "owner_sub" in changed_fields:
+            agent.owner_sub = changed_fields["owner_sub"]["new"]
+        _audit(
+            session,
+            actor_sub=actor_sub,
+            action="agent.ownership_reassigned",
+            agent_id=agent.id,
+            detail=detail,
+        )
+        await session.commit()
+
+    result: dict[str, Any] = {
+        "sub": agent.sub,
+        "changed": bool(changed_fields),
+        "owner_email": canonical_email,
+        "previous_owner_email": previous_email,
+        "owner_sub_updated": "owner_sub" in changed_fields,
+    }
+    if owner_sub_note is not None:
+        result["owner_sub_note"] = owner_sub_note
+    return result
 
 
 # Shared between the comms_list_agents tool's own default and the
@@ -10928,6 +11070,7 @@ __all__ = [
     "MAX_RECONCILIATION_BATCH_SIZE",
     "OWNERSHIP_CLIENTS",
     "OWNERSHIP_CLIENT_ENV_VAR",
+    "OWNER_REASSIGNMENT_SOURCE",
     "PROPOSAL_HOLD_LEVELS",
     "PROPOSAL_RATE_LIMIT_WINDOW",
     "PROPOSAL_SUBMITTER_SURFACES",
@@ -10938,6 +11081,7 @@ __all__ = [
     "OwnershipClientFactory",
     "ReopenConversationResult",
     "accept_invite",
+    "apply_owner_reassignment",
     "archive_conversation",
     "audit_denied_approval_requires_interactive",
     "audit_denied_proposal_submission",

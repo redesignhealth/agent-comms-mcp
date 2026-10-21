@@ -1293,8 +1293,11 @@ async def request_owner_reassignment(
         "note": (
             "This changes the registered owner only. The bot's shared/private classification, "
             "scopes, key and expiry are not changed. Existing conversation history and "
-            "memberships carry over. Once approved, registry ownership propagates within "
-            "standard cache windows."
+            "memberships carry over. On approval the registry owner is committed and the "
+            "approvals service immediately updates this board's own agent row "
+            "(POST /admin/agents/{sub}/ownership), so admission checks and directory lookups "
+            "use the new owner right away; registry-backed token verification still "
+            "propagates within standard cache windows."
         ),
     }
 

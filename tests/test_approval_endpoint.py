@@ -32,7 +32,7 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 
 from exceptions import AgentRetiredError, ConversationArchivedError
-from models import ApprovalHold, AuditLog, Conversation, Participant
+from models import Agent, ApprovalHold, AuditLog, Conversation, Participant
 from service import register_agent
 
 # Real-Postgres fixtures (database_url, _migrated_schema, engine) are shared
@@ -172,6 +172,11 @@ async def client(
             Route(
                 "/admin/agents/reconcile-ownership",
                 main.reconcile_ownership,
+                methods=["POST"],
+            ),
+            Route(
+                "/admin/agents/{sub}/ownership",
+                main.set_agent_ownership,
                 methods=["POST"],
             ),
         ]
@@ -778,6 +783,299 @@ class TestReconcileOwnershipEndpoint:
             headers={"Authorization": "Bearer human-token"},
         )
         assert resp.status_code == 422
+
+
+class TestSetAgentOwnershipEndpoint:
+    """TECH-7824: ``POST /admin/agents/{sub}/ownership`` -- same auth gate as
+    ``reconcile_ownership`` (interactive OR agent-jwt ``comms:admin``)."""
+
+    _DAN = "dan.costanza@redesignhealth.com"
+    _LELAND = "leland.brewster@redesignhealth.com"
+
+    @staticmethod
+    def _body(**overrides: Any) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "new_owner_email": "leland.brewster@redesignhealth.com",
+            "new_owner_sub": None,
+            "expected_previous_owner_email": "dan.costanza@redesignhealth.com",
+            "approved_by": "approver@redesignhealth.com",
+            "source": "owner_reassignment",
+        }
+        body.update(overrides)
+        return body
+
+    async def _register_dan(self, session: AsyncSession, sub: str = "ownership-bot") -> None:
+        await register_agent(
+            session,
+            sub=sub,
+            base_sub=sub,
+            owner_sub=self._DAN,
+            owner_email=self._DAN,
+            display_name=sub,
+            accepted_types=["note"],
+        )
+
+    async def test_missing_token_returns_401(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, _provider = client
+        resp = await http_client.post("/admin/agents/ownership-bot/ownership", json=self._body())
+        assert resp.status_code == 401
+
+    async def test_unverifiable_token_returns_401(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, _provider = client
+        resp = await http_client.post(
+            "/admin/agents/ownership-bot/ownership",
+            json=self._body(),
+            headers={"Authorization": "Bearer not-a-real-token"},
+        )
+        assert resp.status_code == 401
+
+    async def test_agent_jwt_without_admin_scope_returns_403_and_changes_nothing(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        http_client, provider = client
+        await self._register_dan(session)
+        provider.tokens["agent-token"] = _agent_jwt_token(
+            "some-agent-sub", scopes=["comms:read", "comms:write"]
+        )
+        resp = await http_client.post(
+            "/admin/agents/ownership-bot/ownership",
+            json=self._body(),
+            headers={"Authorization": "Bearer agent-token"},
+        )
+        assert resp.status_code == 403
+        row = (
+            await session.execute(select(Agent).where(Agent.sub == "ownership-bot"))
+        ).scalar_one()
+        assert row.owner_email == self._DAN
+
+    async def test_agent_jwt_with_admin_scope_applies_and_audits_caller(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        http_client, provider = client
+        await self._register_dan(session)
+        provider.tokens["agent-token"] = _agent_jwt_token("approvals-svc", scopes=["comms:admin"])
+
+        resp = await http_client.post(
+            "/admin/agents/ownership-bot/ownership",
+            json=self._body(),
+            headers={"Authorization": "Bearer agent-token"},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "sub": "ownership-bot",
+            "changed": True,
+            "owner_email": self._LELAND,
+            "previous_owner_email": self._DAN,
+            "owner_sub_updated": True,
+        }
+        session.expire_all()
+        row = (
+            await session.execute(select(Agent).where(Agent.sub == "ownership-bot"))
+        ).scalar_one()
+        assert (row.owner_email, row.owner_sub) == (self._LELAND, self._LELAND)
+        audit = (
+            await session.execute(
+                select(AuditLog).where(AuditLog.action == "agent.ownership_reassigned")
+            )
+        ).scalar_one()
+        assert audit.actor_sub == "approvals-svc"
+        assert audit.agent_id == row.id
+
+        # Idempotent replay.
+        again = await http_client.post(
+            "/admin/agents/ownership-bot/ownership",
+            json=self._body(),
+            headers={"Authorization": "Bearer agent-token"},
+        )
+        assert again.status_code == 200
+        assert again.json()["changed"] is False
+
+    async def test_interactive_caller_returns_403_and_changes_nothing(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        """Unlike ``reconcile_ownership``, an employee's interactive session
+        must NOT be able to rewrite a bot's owner directly (it would bypass
+        the registry's human approval)."""
+        http_client, provider = client
+        await self._register_dan(session)
+        provider.tokens["human-token"] = _interactive_token("human@redesignhealth.com")
+        resp = await http_client.post(
+            "/admin/agents/ownership-bot/ownership",
+            json=self._body(),
+            headers={"Authorization": "Bearer human-token"},
+        )
+        assert resp.status_code == 403
+        row = (
+            await session.execute(select(Agent).where(Agent.sub == "ownership-bot"))
+        ).scalar_one()
+        assert (row.owner_email, row.owner_sub) == (self._DAN, self._DAN)
+        audits = (
+            (
+                await session.execute(
+                    select(AuditLog).where(AuditLog.action == "agent.ownership_reassigned")
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert audits == []
+
+    async def test_url_encoded_sub_is_decoded(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        http_client, provider = client
+        await self._register_dan(session, sub="bot:with colon")
+        provider.tokens["agent-token"] = _agent_jwt_token("approvals-svc", scopes=["comms:admin"])
+        resp = await http_client.post(
+            "/admin/agents/bot%3Awith%20colon/ownership",
+            json=self._body(),
+            headers={"Authorization": "Bearer agent-token"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["sub"] == "bot:with colon"
+
+    async def test_unknown_agent_returns_404(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["agent-token"] = _agent_jwt_token("approvals-svc", scopes=["comms:admin"])
+        resp = await http_client.post(
+            "/admin/agents/nobody/ownership",
+            json=self._body(),
+            headers={"Authorization": "Bearer agent-token"},
+        )
+        assert resp.status_code == 404
+        assert resp.json() == {"error": "not_found"}
+
+    async def test_suspended_agent_returns_404(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        http_client, provider = client
+        await self._register_dan(session)
+        await session.execute(text("UPDATE agents SET status = 'suspended'"))
+        await session.commit()
+        provider.tokens["agent-token"] = _agent_jwt_token("approvals-svc", scopes=["comms:admin"])
+        resp = await http_client.post(
+            "/admin/agents/ownership-bot/ownership",
+            json=self._body(),
+            headers={"Authorization": "Bearer agent-token"},
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.parametrize("sub", ["ownership-bot::keyed", "human%40redesignhealth.com"])
+    async def test_keyed_or_human_identity_returns_422(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider], sub: str
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["agent-token"] = _agent_jwt_token("approvals-svc", scopes=["comms:admin"])
+        resp = await http_client.post(
+            f"/admin/agents/{sub}/ownership",
+            json=self._body(),
+            headers={"Authorization": "Bearer agent-token"},
+        )
+        assert resp.status_code == 422
+        assert resp.json()["error"] == "invalid_owner_reassignment"
+
+    @pytest.mark.parametrize(
+        ("overrides", "error"),
+        [
+            ({"new_owner_email": "leland@example.com"}, "invalid_owner_reassignment"),
+            ({"new_owner_email": 5}, "invalid_new_owner_email"),
+            ({"new_owner_sub": 5}, "invalid_new_owner_sub"),
+            ({"expected_previous_owner_email": 5}, "invalid_expected_previous_owner_email"),
+            ({"approved_by": ""}, "invalid_approved_by"),
+            ({"source": "something_else"}, "invalid_source"),
+        ],
+    )
+    async def test_invalid_body_returns_422(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+        overrides: dict[str, Any],
+        error: str,
+    ) -> None:
+        http_client, provider = client
+        await self._register_dan(session)
+        provider.tokens["agent-token"] = _agent_jwt_token("approvals-svc", scopes=["comms:admin"])
+        resp = await http_client.post(
+            "/admin/agents/ownership-bot/ownership",
+            json=self._body(**overrides),
+            headers={"Authorization": "Bearer agent-token"},
+        )
+        assert resp.status_code == 422
+        assert resp.json()["error"] == error
+
+    async def test_non_dict_json_body_returns_422(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["agent-token"] = _agent_jwt_token("approvals-svc", scopes=["comms:admin"])
+        resp = await http_client.post(
+            "/admin/agents/ownership-bot/ownership",
+            json=["not", "a", "dict"],
+            headers={"Authorization": "Bearer agent-token"},
+        )
+        assert resp.status_code == 422
+        assert resp.json() == {"error": "invalid_body"}
+
+    async def test_non_utf8_body_returns_422_invalid_json(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["agent-token"] = _agent_jwt_token("approvals-svc", scopes=["comms:admin"])
+        resp = await http_client.post(
+            "/admin/agents/ownership-bot/ownership",
+            content=b'{"new_owner_email": "\xff\xfe"}',
+            headers={"Authorization": "Bearer agent-token"},
+        )
+        assert resp.status_code == 422
+        assert resp.json() == {"error": "invalid_json"}
+
+    async def test_missing_source_returns_422(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        http_client, provider = client
+        await self._register_dan(session)
+        provider.tokens["agent-token"] = _agent_jwt_token("approvals-svc", scopes=["comms:admin"])
+        body = self._body()
+        del body["source"]
+        resp = await http_client.post(
+            "/admin/agents/ownership-bot/ownership",
+            json=body,
+            headers={"Authorization": "Bearer agent-token"},
+        )
+        assert resp.status_code == 422
+        assert resp.json() == {"error": "invalid_source"}
+
+    async def test_non_json_body_returns_422(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["agent-token"] = _agent_jwt_token("approvals-svc", scopes=["comms:admin"])
+        resp = await http_client.post(
+            "/admin/agents/ownership-bot/ownership",
+            content=b"not json",
+            headers={"Authorization": "Bearer agent-token"},
+        )
+        assert resp.status_code == 422
+        assert resp.json() == {"error": "invalid_json"}
 
 
 class TestHoldConversationEndpoint:
