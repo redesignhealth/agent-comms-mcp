@@ -991,7 +991,7 @@ scroll-to-load-more use case.
 
 | Tool | Scope | Notes |
 |---|---|---|
-| `comms_whoami` | comms:read | caller identity/scopes; also returns `status` (one of `"active"`, `"suspended"`, `"not_registered"`) via a best-effort DB lookup, always present when the DB is reachable regardless of registration state -- omitted only if the DB is unreachable (this tool remains usable as an auth-only diagnostic either way). When registered, also returns min/max_schema_version. When sibling identities exist under the caller's base_sub, also returns `other_identities` (each sibling's `agent_key`/`sub`/`display_name`/`status`); if the caller's own `status` is `"suspended"` or `"not_registered"` and exactly one sibling is `"active"`, also returns `suggested_agent_key` naming that sibling's key, or `suggested_bare_identity: true` when that one active sibling is instead the bare base_sub identity itself (no `agent_key`). If the caller's own `status` is unusable and at least one sibling is `"active"` (not gated to exactly one, TECH-6461), also returns `active_identity_candidates` (every active sibling as `{agent_key, display_name, is_bare_identity}`) and `guidance`, an instructional string telling the caller to pick the matching candidate and retry -- with an explicit warning not to pass the literal string `"None"` for a bare-identity candidate (retry `whoami()` with no `agent_key` argument instead) |
+| `comms_whoami` | comms:read | caller identity/scopes; `agent_token_verifier` is the caller's exact server-configured verifier name/import path for service tokens, or null for interactive callers or missing/invalid/blank stamps; also returns `status` (one of `"active"`, `"suspended"`, `"not_registered"`) via a best-effort DB lookup, always present when the DB is reachable regardless of registration state -- omitted only if the DB is unreachable (this tool remains usable as an auth-only diagnostic either way). When registered, also returns min/max_schema_version. When sibling identities exist under the caller's base_sub, also returns `other_identities` (each sibling's `agent_key`/`sub`/`display_name`/`status`); if the caller's own `status` is `"suspended"` or `"not_registered"` and exactly one sibling is `"active"`, also returns `suggested_agent_key` naming that sibling's key, or `suggested_bare_identity: true` when that one active sibling is instead the bare base_sub identity itself (no `agent_key`). If the caller's own `status` is unusable and at least one sibling is `"active"` (not gated to exactly one, TECH-6461), also returns `active_identity_candidates` (every active sibling as `{agent_key, display_name, is_bare_identity}`) and `guidance`, an instructional string telling the caller to pick the matching candidate and retry -- with an explicit warning not to pass the literal string `"None"` for a bare-identity candidate (retry `whoami()` with no `agent_key` argument instead) |
 | `comms_register` | comms:write | idempotent self-provisioning: display_name, accepted_types (optional, max 20/100 chars each; `[]`/omitted-on-first-registration accepts every message type including future ones, but omitted-on-RE-registration preserves the agent's current value instead of resetting it -- see §9's "Capability gate" section for the full three-way semantics), min/max_schema_version (default 1/1, for schema-version capability negotiation); `is_shared=True` on first registration requires no additional scope, since it's the caller declaring its OWN `is_shared` (see §5); rejects a new sibling row under the same base identity (`identity_fork_detected`) unless `confirm_new_identity=True`, and rejects a new row whose `display_name` collides with an existing active agent's (`display_name_collision`, not bypassable by `confirm_new_identity` -- DB-enforced race-free via a `UNIQUE` partial index, see §5) |
 | `comms_set_agent_shared` | comms:write | admin override of an existing agent's `is_shared`, since `comms_register` freezes it against the agent's own re-registration; additionally requires comms:admin OR an interactive/Okta caller (see §5) |
 | `comms_deregister_agent` | comms:write | sets an existing agent's `status="suspended"`; additionally requires comms:admin OR an interactive/Okta caller (see §5); one-directional by design -- no reactivate tool. Because it is one-directional, suspending an identity here is exactly what makes the sibling-fork check's "all siblings count, not just active ones" condition (see §5) trigger permanently for that base identity -- there is no reactivation path to undo it. This is intentional, to prevent kill-switch bypasses |
@@ -2233,8 +2233,8 @@ approved owner reassignments, below):
    presumably-verified claim from the default verifier's caller-supplied,
    unverified one. `auth._NormalizingVerifier` stamps which configured
    verifier produced a token onto its claims (`auth.AGENT_TOKEN_VERIFIER_CLAIM`)
-   specifically so this gate has something to check. This is the one
-   sanctioned exception to `register_agent`'s freeze; it is never reachable
+   for ownership write-through and the caller's own `comms_whoami` diagnostic.
+   This is the one sanctioned exception to `register_agent`'s freeze; it is never reachable
    from an untrusted claim.
 2. **Out-of-band reconciliation** (`service.reconcile_agent_ownership`, exposed
    as `POST /admin/agents/reconcile-ownership`) for agents that make no further
@@ -2319,8 +2319,14 @@ three is required, since a verifier may rely on live revocation instead of
 expiry. Any violation is treated as verification *failure*, fail-closed:
 `scopes.is_interactive_token` is a denylist keyed on `iss != "agent-jwt"`, so
 an un-normalized issuer would make a plugin's agent tokens look interactive
-(full scope-check bypass). This makes plugin-verified tokens indistinguishable
-downstream from default-verified ones. Full design and rationale:
+(full scope-check bypass). Plugin and default verifiers share this normalized
+identity/scope contract; their server-stamped verifier provenance remains distinct.
+`comms_whoami.agent_token_verifier` exposes the caller's own configured name or
+`pkg.module:factory` path to authenticated `comms:read` callers; this limited
+configuration disclosure is intentional. Missing/invalid/blank stamps and
+interactive callers return null; nonblank names are returned unchanged. This is
+not original JWT issuer, signing-key/expiry proof, or an authorization grant.
+Full design and rationale:
 `docs/TECH-5389-APPROVAL-PIPELINE.md` §15.2–15.3.
 
 ### Capability gate: `accepted_types`

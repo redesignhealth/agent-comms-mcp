@@ -17,10 +17,10 @@ Programmatic callers (agents, services, CI jobs):
     ``AGENT_JWT_SECRET``). Every configured verifier is wrapped in
     ``_NormalizingVerifier``, which enforces the normalized-claims contract
     (``iss``/``sub``/``scopes``, optional ``owner_sub`` — see that class's
-    docstring and ``docs/TECH-5389-APPROVAL-PIPELINE.md`` §15.3) so a
-    plugin verifier's tokens are indistinguishable downstream from
-    default-verified ones. Both humans and machines POST to the same
-    ``/mcp`` endpoint.
+    docstring and ``docs/TECH-5389-APPROVAL-PIPELINE.md`` §15.3). Plugin and
+    default verifiers share downstream identity/scope semantics, while the
+    server-stamped provenance remains distinct. Both humans and machines POST
+    to the same ``/mcp`` endpoint.
 
 Health check (``/health``):
     Unauthenticated — handled by FastMCP before auth middleware runs.
@@ -338,17 +338,8 @@ DEFAULT_AGENT_TOKEN_VERIFIER = "agent_jwt_hs256"
 
 # Claim key ``_NormalizingVerifier`` stamps onto every verified token with
 # the ``AGENT_TOKEN_VERIFIERS`` name/import-path that produced it (TECH-5593).
-# Underscore-prefixed, unlike the wire claims above it, to mark it as
-# server-internal bookkeeping rather than part of the normalized-claims wire
-# contract: no verifier is expected to set it itself (and one that does gets
-# silently overwritten below, by construction -- this module is always the
-# last thing to touch ``claims`` before an ``AccessToken`` leaves the
-# verifier chain). ``scopes.is_registry_backed_agent_token`` is the intended
-# reader: it lets code elsewhere (``providers/comms.py``'s ownership
-# write-through) tell an operator-configured, presumably-registry-backed
-# plugin verifier's owner claims apart from the built-in default's, which
-# are caller-supplied and unverified (see ``service.register_agent``'s own
-# docstring on why that distinction is load-bearing there too).
+# Never trust this incoming JWT claim: the normalizer always overwrites it.
+# Read by ownership write-through and exposed by comms_whoami (docs/DESIGN.md §9).
 AGENT_TOKEN_VERIFIER_CLAIM = "_agent_token_verifier"
 
 

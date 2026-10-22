@@ -53,6 +53,7 @@ from fastmcp.server.dependencies import get_access_token
 from pydantic import Field
 from sqlalchemy.exc import InterfaceError, OperationalError
 
+import auth
 import plugins
 import service
 import subscriptions
@@ -73,7 +74,7 @@ from exceptions import (
     SiblingIdentityExistsError,
     UnknownConversationTypeError,
 )
-from identity import try_resolve_email
+from identity import AGENT_JWT_ISSUER, try_resolve_email
 from models import CONVERSATION_STATES, PARTICIPANT_ROLES, Agent, ApprovalHold
 from schemas import (
     CONVERSATION_TYPES,
@@ -546,6 +547,11 @@ async def whoami(agent_key: str | None = None) -> dict[str, Any]:
     agent-jwt Bearer JWT for agents) and scope enforcement are wired
     correctly. ``scopes`` is the agent-jwt ``scopes`` claim for service
     callers; empty for interactive Okta callers (who bypass scope checks).
+    ``agent_token_verifier`` is the exact server-configured verifier plugin
+    name stamped after verification, or null for interactive callers and
+    missing/invalid/blank stamps. Nonblank names are returned unchanged; they
+    are not original JWT issuer/key/expiry proof or permission, and
+    missing/unknown provenance is not migration-safe.
 
     When ``agent_key`` is provided, returns the composed identity
     (base_sub::agent_key) that will be used for agent lookups by other tools.
@@ -615,6 +621,13 @@ async def whoami(agent_key: str | None = None) -> dict[str, Any]:
         "issuer": token.claims.get("iss"),
         "caller_type": "interactive" if interactive else "service",
         "scopes": scopes_for_token(token),
+        "agent_token_verifier": (
+            verifier
+            if token.claims.get("iss") == AGENT_JWT_ISSUER
+            and isinstance(verifier := token.claims.get(auth.AGENT_TOKEN_VERIFIER_CLAIM), str)
+            and verifier.strip()
+            else None
+        ),
     }
     # Diagnostic tool, DB-optional (see docstring) — genuine connectivity/
     # configuration failures just omit the schema-version fields, same as
