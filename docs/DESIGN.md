@@ -2711,6 +2711,14 @@ the target. Per-submitter and per-target pending caps bound abuse
 counts, never owner identities. The apply-record read carries `cross_brain` and `approvals` so the
 approvals service can verify every required owner approved the exact target before writing.
 
+Optional, operator-controlled exception: `CROSS_BRAIN_AUTO_APPROVE_RULES` (comma-separated rule
+names, default empty). A judge verdict with `approved=True` and `rule=<name>` where the name is on
+that list stands in for the owners' approvals: the claim records `cross_brain.auto_rule` and an
+audit row (`proposal.cross_brain_auto_approved`), `decision_source` is `auto`, and `approvals`
+stays empty. The list is read live, at submit and again before the write, so removing a name stops
+a hold that has not yet applied. The criteria for a rule (who may submit, which targets, caps,
+screens) live in the judge plugin, not here; with the list empty nothing changes.
+
 ## 11. Deployment
 
 See [README.md: Deployment](../README.md#deployment) for setup and

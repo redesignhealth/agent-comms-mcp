@@ -1290,6 +1290,11 @@ class ProposalVerdict(NamedTuple):
 
     approved: bool
     decision_note: str | None
+    # Names the rule that approved. Only a cross-brain proposal looks at it: the board honours an
+    # ``approved=True`` for one only when this name is on the operator's
+    # ``CROSS_BRAIN_AUTO_APPROVE_RULES`` allowlist (default empty), in place of the required owners'
+    # approvals. Anything else stays a human decision.
+    rule: str | None = None
 
 
 class ProposalApplyOutcome(NamedTuple):

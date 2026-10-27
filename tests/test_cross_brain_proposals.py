@@ -26,6 +26,7 @@ from exceptions import (
 from models import Agent, ProposalHold
 from plugins import ProposalApplyOutcome, ProposalVerdict
 from service import (
+    CROSS_BRAIN_AUTO_RULES_ENV_VAR,
     CROSS_BRAIN_ENABLED_ENV_VAR,
     CROSS_BRAIN_MAX_PENDING_PER_SUBMITTER_ENV_VAR,
     CROSS_BRAIN_MAX_PENDING_PER_TARGET_ENV_VAR,
@@ -60,6 +61,7 @@ async def _clean_tables(engine: AsyncEngine) -> AsyncIterator[None]:
 @pytest.fixture(autouse=True)
 def _flag_on(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(CROSS_BRAIN_ENABLED_ENV_VAR, "true")
+    monkeypatch.delenv(CROSS_BRAIN_AUTO_RULES_ENV_VAR, raising=False)
     monkeypatch.delenv(CROSS_BRAIN_MAX_PENDING_PER_SUBMITTER_ENV_VAR, raising=False)
     monkeypatch.delenv(CROSS_BRAIN_MAX_PENDING_PER_TARGET_ENV_VAR, raising=False)
 
@@ -254,6 +256,137 @@ class TestDedupAndAutoApprove:
         )
         result = await _submit(session, TARGET, judge=judge)
         assert result["status"] == "pending"
+        assert judge.apply_calls == []
+
+
+class TestAutoApprovalRule:
+    """An allowlisted rule's verdict stands in for the owners' approvals; nothing else does."""
+
+    @staticmethod
+    def _judge(rule: object) -> FakeProposalJudge:
+        return FakeProposalJudge(
+            judge_result=ProposalVerdict(approved=True, decision_note="auto", rule=rule),  # type: ignore[arg-type]
+            apply_result=ProposalApplyOutcome(
+                applied=True, result=None, caller_error=None, log_detail=None
+            ),
+        )
+
+    async def test_an_allowlisted_rule_applies_without_owner_approvals(
+        self,
+        session: AsyncSession,
+        agents: tuple[Agent, Agent],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv(CROSS_BRAIN_AUTO_RULES_ENV_VAR, "other, intake_site_documents")
+        judge = self._judge("intake_site_documents")
+        result = await _submit(session, TARGET, judge=judge)
+        assert result["status"] == "applied"
+        assert [c.cross_brain_target_sub for c in judge.apply_calls] == [TARGET]
+        hold = (await session.execute(select(ProposalHold))).scalar_one()
+        assert hold.decision_source == "auto" and not hold.approvals
+        assert (hold.cross_brain or {})["auto_rule"] == "intake_site_documents"
+        audit = (
+            await session.execute(
+                text(
+                    "SELECT detail FROM audit_log "
+                    "WHERE action = 'proposal.cross_brain_auto_approved'"
+                )
+            )
+        ).scalar_one()
+        assert audit["rule"] == "intake_site_documents"
+
+    @pytest.mark.parametrize("allowlist", [None, "", "another_rule"])
+    async def test_a_rule_that_is_not_allowlisted_waits_for_the_owners(
+        self,
+        session: AsyncSession,
+        agents: tuple[Agent, Agent],
+        monkeypatch: pytest.MonkeyPatch,
+        allowlist: str | None,
+    ) -> None:
+        if allowlist is not None:
+            monkeypatch.setenv(CROSS_BRAIN_AUTO_RULES_ENV_VAR, allowlist)
+        judge = self._judge("intake_site_documents")
+        result = await _submit(session, TARGET, judge=judge)
+        assert result["status"] == "pending" and judge.apply_calls == []
+        hold = (await session.execute(select(ProposalHold))).scalar_one()
+        assert "auto_rule" not in (hold.cross_brain or {})
+
+    @pytest.mark.parametrize("rule", [None, "", 5, ["intake_site_documents"]])
+    async def test_a_verdict_without_a_usable_rule_name_waits_for_the_owners(
+        self,
+        session: AsyncSession,
+        agents: tuple[Agent, Agent],
+        monkeypatch: pytest.MonkeyPatch,
+        rule: object,
+    ) -> None:
+        monkeypatch.setenv(CROSS_BRAIN_AUTO_RULES_ENV_VAR, "intake_site_documents,")
+        result = await _submit(session, TARGET, judge=self._judge(rule))
+        assert result["status"] == "pending"
+
+    async def test_the_rule_does_not_reach_an_own_brain_or_a_declined_verdict(
+        self,
+        session: AsyncSession,
+        agents: tuple[Agent, Agent],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv(CROSS_BRAIN_AUTO_RULES_ENV_VAR, "intake_site_documents")
+        declined = FakeProposalJudge(
+            judge_result=ProposalVerdict(
+                approved=False, decision_note="held", rule="intake_site_documents"
+            )
+        )
+        assert (await _submit(session, TARGET, judge=declined))["status"] == "pending"
+
+    async def test_removing_the_rule_before_apply_stops_the_write(
+        self,
+        session: AsyncSession,
+        agents: tuple[Agent, Agent],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv(CROSS_BRAIN_AUTO_RULES_ENV_VAR, "intake_site_documents")
+        hold_id = (await _submit(session, TARGET))["proposal_id"]
+        hold = (await session.execute(select(ProposalHold))).scalar_one()
+        hold.status = "applying"
+        hold.decision_source = "auto"
+        hold.decided_by_actor_id = "judge"
+        hold.decided_at = datetime.now(UTC)
+        hold.cross_brain = {**(hold.cross_brain or {}), "auto_rule": "intake_site_documents"}
+        await session.commit()
+        monkeypatch.delenv(CROSS_BRAIN_AUTO_RULES_ENV_VAR)
+        judge = _applied_judge()
+        result = await _apply_or_finalize_proposal_hold(
+            session,
+            hold_id=uuid.UUID(hold_id),
+            expected_status="applying",
+            decided_by_actor_id="judge",
+            decision_source="auto",
+            decision_note=None,
+            judge=judge,
+        )
+        assert result is not None and result["status"] == "apply_failed"
+        assert judge.apply_calls == []
+
+    async def test_an_auto_decision_without_a_recorded_rule_never_applies(
+        self, session: AsyncSession, agents: tuple[Agent, Agent]
+    ) -> None:
+        hold_id = (await _submit(session, TARGET))["proposal_id"]
+        hold = (await session.execute(select(ProposalHold))).scalar_one()
+        hold.status = "applying"
+        hold.decision_source = "auto"
+        hold.decided_by_actor_id = "judge"
+        hold.decided_at = datetime.now(UTC)
+        await session.commit()
+        judge = _applied_judge()
+        result = await _apply_or_finalize_proposal_hold(
+            session,
+            hold_id=uuid.UUID(hold_id),
+            expected_status="applying",
+            decided_by_actor_id="judge",
+            decision_source="auto",
+            decision_note=None,
+            judge=judge,
+        )
+        assert result is not None and result["status"] == "apply_failed"
         assert judge.apply_calls == []
 
 
