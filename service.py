@@ -7642,6 +7642,9 @@ CROSS_BRAIN_KINDS = frozenset({"arcana_source_add"})
 CROSS_BRAIN_ENABLED_ENV_VAR = "CROSS_BRAIN_PROPOSALS_ENABLED"
 CROSS_BRAIN_MAX_PENDING_PER_SUBMITTER_ENV_VAR = "CROSS_BRAIN_MAX_PENDING_PER_SUBMITTER"
 CROSS_BRAIN_MAX_PENDING_PER_TARGET_ENV_VAR = "CROSS_BRAIN_MAX_PENDING_PER_TARGET"
+# Rule names (``ProposalVerdict.rule``) whose auto-approval may stand in for the owners' approvals
+# on a cross-brain proposal. Comma-separated, default empty: unset, it is always a human decision.
+CROSS_BRAIN_AUTO_RULES_ENV_VAR = "CROSS_BRAIN_AUTO_APPROVE_RULES"
 _CROSS_BRAIN_DEFAULT_MAX_PENDING_PER_SUBMITTER = 5
 _CROSS_BRAIN_DEFAULT_MAX_PENDING_PER_TARGET = 20
 _CROSS_BRAIN_MAX_TARGET_REF_LENGTH = 256
@@ -7655,6 +7658,12 @@ def cross_brain_enabled() -> bool:
         "yes",
         "on",
     }
+
+
+def cross_brain_auto_rules() -> frozenset[str]:
+    """Read live, like the kill switch, so removing a name takes effect on the next call."""
+    raw = os.environ.get(CROSS_BRAIN_AUTO_RULES_ENV_VAR, "")
+    return frozenset(name.strip() for name in raw.split(",") if name.strip())
 
 
 def _env_positive_int(name: str, default: int) -> int:
@@ -8013,10 +8022,12 @@ async def create_proposal(
     )
     is_judge_error = False
     decision_note: str | None = None
+    verdict_rule: Any = None
     try:
         verdict: Any = await judge.judge(judge_ctx)
         approved = getattr(verdict, "approved", _MISSING)
         note = getattr(verdict, "decision_note", _MISSING)
+        verdict_rule = getattr(verdict, "rule", None)
 
         if approved is _MISSING or note is _MISSING:
             logger.warning(
@@ -8136,12 +8147,17 @@ async def create_proposal(
     # would be exactly the kind of path-dependent bug this comment exists
     # to prevent a future edit from reintroducing.
     await session.refresh(hold)
+    cross_brain_auto_rule: str | None = None
     if cross_brain is not None and judged_status == "approved":
-        # TECH-7665 v1: a cross-brain proposal is NEVER auto-approved, whatever
-        # the judge plugin says (defense in depth; the approvals judge also
-        # refuses). It always waits for the required human owners.
-        judged_status = "pending"
-        decision_note = "cross-brain proposals always require human approval"
+        # TECH-7665 v1: a cross-brain proposal is never auto-approved, whatever the judge plugin
+        # says, with one operator-controlled exception: a verdict that names a rule on
+        # CROSS_BRAIN_AUTO_APPROVE_RULES (default empty) stands in for the owners' approvals, and
+        # the claim below records that rule on the hold. Everything else waits for the owners.
+        if isinstance(verdict_rule, str) and verdict_rule in cross_brain_auto_rules():
+            cross_brain_auto_rule = verdict_rule
+        else:
+            judged_status = "pending"
+            decision_note = "cross-brain proposals always require human approval"
     auto_approved = judged_status == "approved" and hold.status == "pending"
 
     if not auto_approved:
@@ -8163,6 +8179,7 @@ async def create_proposal(
         decision_source="auto",
         decision_note=decision_note,
         expected_payload=judged_payload,
+        cross_brain_auto_rule=cross_brain_auto_rule,
     )
     if not claimed:
         # Two distinct causes reach here, both meaning "do not apply this
@@ -8582,6 +8599,7 @@ async def _claim_proposal_hold_for_applying(
     decision_source: str,
     decision_note: str | None,
     expected_payload: tuple[Any, ...] | None = None,
+    cross_brain_auto_rule: str | None = None,
 ) -> bool:
     """Claims a still-``"pending"`` hold for synchronous apply by writing
     ``status="applying"`` under a fresh ``FOR UPDATE`` and committing
@@ -8635,6 +8653,15 @@ async def _claim_proposal_hold_for_applying(
     hold.decided_by_actor_id = decided_by_actor_id
     hold.decided_at = _now()
     hold.decision_note = decision_note
+    if cross_brain_auto_rule is not None and hold.cross_brain is not None:
+        # Recorded under the same lock as the claim, so the apply-record names the stand-in rule.
+        hold.cross_brain = {**hold.cross_brain, "auto_rule": cross_brain_auto_rule}
+        _audit(
+            session,
+            actor_sub=decided_by_actor_id,
+            action="proposal.cross_brain_auto_approved",
+            detail={"hold_id": str(hold_id), "rule": cross_brain_auto_rule},
+        )
     await session.commit()
     return True
 
@@ -9007,10 +9034,17 @@ async def _apply_or_finalize_proposal_hold(
     # Defense in depth (TECH-7665): a cross-brain hold never writes unless a
     # human decided it and every required owner's approval is recorded.
     cross_brain_unapproved = hold.cross_brain is not None and not (
-        decision_source == "human"
-        and all(
-            any(a.get("sub") == r for a in (hold.approvals or []))
-            for r in _cross_brain_required_owners(hold)
+        (
+            decision_source == "human"
+            and all(
+                any(a.get("sub") == r for a in (hold.approvals or []))
+                for r in _cross_brain_required_owners(hold)
+            )
+        )
+        or (
+            # An allowlisted rule's auto-approval (read live: removing the name stops it here too).
+            decision_source == "auto"
+            and (hold.cross_brain or {}).get("auto_rule") in cross_brain_auto_rules()
         )
     )
     await session.commit()
