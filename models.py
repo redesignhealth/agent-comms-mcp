@@ -954,6 +954,9 @@ class ProposalHold(Base):
     cross_brain: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     # Human owners who have approved so far: [{"sub": ..., "at": iso}, ...].
     approvals: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB, nullable=True)
+    # TECH-8080: routing and classification labels for routine decision log
+    # (lane, source_type, evidence_type).
+    labels: Mapped[dict[str, str] | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _updated_at()
 

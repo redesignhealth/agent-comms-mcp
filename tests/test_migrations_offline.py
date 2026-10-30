@@ -633,6 +633,9 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
     commit_audit_pos = result.stdout.index("COMMIT;", reason_validate_pos)
     assert commit_audit_pos < concurrent_audit_pos
 
+    # 20a7dfa60b73 (TECH-8080): labels JSONB column on proposal_holds.
+    assert "ALTER TABLE proposal_holds ADD COLUMN IF NOT EXISTS labels JSONB" in result.stdout
+
 
 def test_alembic_single_head() -> None:
     result = subprocess.run(
