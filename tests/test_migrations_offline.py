@@ -28,11 +28,15 @@ SERVICE_ROOT = Path(__file__).parent.parent
 _DEFAULT_TEST_DATABASE_URL = "postgresql://postgres:postgres@localhost:55432/agent_comms"
 
 
+def _test_database_url() -> str:
+    return os.environ.get("DATABASE_URL", _DEFAULT_TEST_DATABASE_URL)
+
+
 def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
     result = subprocess.run(
         [sys.executable, "-m", "alembic", "upgrade", "head", "--sql"],
         cwd=SERVICE_ROOT,
-        env={**os.environ, "DATABASE_URL": _DEFAULT_TEST_DATABASE_URL},
+        env={**os.environ, "DATABASE_URL": _test_database_url()},
         capture_output=True,
         text=True,
     )
@@ -514,22 +518,39 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
     fk_commit_pos = result.stdout.index("COMMIT;", fk_not_valid_pos)
     assert fk_not_valid_pos < fk_commit_pos < fk_validate_pos
     # a56cb01a3ebf (TECH-8080 PR3): rebuilds idx_proposal_holds_pending_dedup
-    # with COALESCE(action ->> 'dedup_field', '') as sixth component so date
-    # fields on the same target no longer collapse.
+    # using CONCURRENTLY build in autocommit block and atomic swap (drop old + rename).
     assert (
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_proposal_holds_pending_dedup "
+        "DROP INDEX CONCURRENTLY IF EXISTS idx_proposal_holds_pending_dedup_new;" in result.stdout
+    )
+    assert (
+        "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS idx_proposal_holds_pending_dedup_new "
         "ON proposal_holds (kind, proposed_by_bot_id, (action ->> 'target_id'), "
         "(action ->> 'action_type'), COALESCE(cross_brain ->> 'target_sub', ''), "
         "COALESCE(action ->> 'dedup_field', '')) WHERE status IN ('pending', 'applying')"
         in result.stdout
     )
+    assert (
+        "ALTER INDEX IF EXISTS idx_proposal_holds_pending_dedup_new "
+        "RENAME TO idx_proposal_holds_pending_dedup;" in result.stdout
+    )
+
+    concurrently_pos = result.stdout.index(
+        "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS idx_proposal_holds_pending_dedup_new"
+    )
+    begin_swap_pos = result.stdout.index("BEGIN;", concurrently_pos)
+    rename_sql = (
+        "ALTER INDEX IF EXISTS idx_proposal_holds_pending_dedup_new "
+        "RENAME TO idx_proposal_holds_pending_dedup;"
+    )
+    rename_pos = result.stdout.index(rename_sql, begin_swap_pos)
+    assert concurrently_pos < begin_swap_pos < rename_pos
 
 
 def test_alembic_single_head() -> None:
     result = subprocess.run(
         [sys.executable, "-m", "alembic", "heads"],
         cwd=SERVICE_ROOT,
-        env={**os.environ, "DATABASE_URL": _DEFAULT_TEST_DATABASE_URL},
+        env={**os.environ, "DATABASE_URL": _test_database_url()},
         capture_output=True,
         text=True,
     )

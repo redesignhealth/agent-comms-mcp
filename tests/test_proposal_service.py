@@ -456,6 +456,74 @@ class TestDedup:
         rows = (await session.execute(select(ProposalHold))).scalars().all()
         assert len(rows) == 1
 
+    async def test_integrity_error_race_falls_back_to_select_and_update_with_dedup_field(
+        self,
+        session: AsyncSession,
+        session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """B2's race-recovery path with a non-empty dedup_field: a concurrent bot
+        wins the INSERT for the same (dedup_field-aware) key between this session's
+        initial SELECT (miss) and its own INSERT attempt, so session.flush() raises
+        IntegrityError on idx_proposal_holds_pending_dedup. Confirms the fallback
+        re-queries with dedup_field included and performs the in-place UPDATE."""
+        winning_row_id: dict[str, Any] = {}
+
+        async def _insert_via_second_session() -> ProposalHold:
+            async with session_factory() as other:
+                winner = await create_proposal(
+                    other,
+                    kind="linear_progress_update",
+                    proposed_by_bot_id="bot-1",
+                    owner_sub="owner-a@example.com",
+                    action=_action(
+                        action_type="set_dates",
+                        target_id="proj-race",
+                        dedup_field="project:targetDate",
+                    ),
+                    rationale="winning rationale",
+                    confidence="medium",
+                    importance="medium",
+                    impact="medium",
+                    judge=_default_judge(),
+                    target_fingerprint="fp-winner",
+                )
+                return winner
+
+        real_flush = session.flush
+        call_count = {"n": 0}
+
+        async def _flush_raising_once() -> None:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                winner = await _insert_via_second_session()
+                winning_row_id["id"] = winner["proposal_id"]
+                cause = Exception()
+                cause.constraint_name = "idx_proposal_holds_pending_dedup"  # type: ignore[attr-defined]
+                orig = Exception()
+                orig.__cause__ = cause
+                raise IntegrityError("duplicate key", params=None, orig=orig)
+            await real_flush()
+
+        monkeypatch.setattr(session, "flush", AsyncMock(side_effect=_flush_raising_once))
+
+        result = await _submit(
+            session,
+            action=_action(
+                action_type="set_dates",
+                target_id="proj-race",
+                dedup_field="project:targetDate",
+            ),
+            rationale="loser rationale",
+            target_fingerprint="fp-loser",
+        )
+
+        assert result["proposal_id"] == winning_row_id["id"]
+        assert result["rationale"] == "loser rationale"
+        assert result["action"]["dedup_field"] == "project:targetDate"
+        rows = (await session.execute(select(ProposalHold))).scalars().all()
+        assert len(rows) == 1
+
     async def test_different_dedup_field_on_same_target_does_not_dedup(
         self, session: AsyncSession
     ) -> None:

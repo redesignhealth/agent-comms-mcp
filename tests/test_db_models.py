@@ -897,7 +897,7 @@ class TestProposalHoldsSchema:
         assert "idx_proposal_holds_pending_dedup" in indexes
 
     def test_proposal_holds_pending_dedup_index_matches_migration(self) -> None:
-        from migrations.versions.a56cb01a3ebf_proposal_dedup_field import _NEW_COLUMNS
+        from migrations.versions.a56cb01a3ebf_proposal_dedup_field import _NEW_COLUMNS, _WHERE
 
         dedup_indexes = [
             elem
@@ -907,6 +907,8 @@ class TestProposalHoldsSchema:
         assert len(dedup_indexes) == 1
         idx = dedup_indexes[0]
         assert idx.unique is True
+        model_where = idx.dialect_options["postgresql"]["where"]
+        assert str(model_where) == str(_WHERE)
         model_exprs = [
             expr.name if hasattr(expr, "name") else str(expr) for expr in idx.expressions
         ]
@@ -992,6 +994,128 @@ class TestProposalHoldsSchema:
             assert res_up.returncode == 0, res_up.stderr
         cols_after_up = await _columns(engine, "proposal_holds")
         assert "sender_agent_id" in cols_after_up
+
+    async def test_tech_8080_downgrade_collision_raises(
+        self, engine: AsyncEngine, database_url: str
+    ) -> None:
+        """TECH-8080 PR3: downgrade must detect collisions on the narrow key among
+        active pending/applying proposals, raise RuntimeError, and NOT delete any rows."""
+        env = {**os.environ, "DATABASE_URL": database_url.replace("+asyncpg", "")}
+        subprocess.run(
+            [sys.executable, "-m", "alembic", "upgrade", "head"],
+            cwd=SERVICE_ROOT,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        row1_id = uuid.uuid4()
+        row2_id = uuid.uuid4()
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO proposal_holds "
+                    "(id, kind, proposed_by_bot_id, owner_sub, action, rationale, "
+                    "confidence, importance, impact, priority, status, target_fingerprint) "
+                    "VALUES "
+                    "(:id1, 'linear_progress_update', 'bot-collision', 'owner-a', "
+                    '\'{"target_id": "proj-col", "action_type": "set_dates", '
+                    '"dedup_field": "project:startDate"}\'::jsonb, '
+                    "'rat1', 'medium', 'medium', 'medium', 'medium', 'pending', 'fp1'), "
+                    "(:id2, 'linear_progress_update', 'bot-collision', 'owner-a', "
+                    '\'{"target_id": "proj-col", "action_type": "set_dates", '
+                    '"dedup_field": "project:targetDate"}\'::jsonb, '
+                    "'rat2', 'medium', 'medium', 'medium', 'medium', 'pending', 'fp2')"
+                ),
+                {"id1": row1_id, "id2": row2_id},
+            )
+
+        try:
+            res = subprocess.run(
+                [sys.executable, "-m", "alembic", "downgrade", "c7665a1b2d3e"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert res.returncode != 0, "Expected downgrade to fail on collision"
+            assert "Cannot downgrade migration a56cb01a3ebf" in res.stderr
+            assert "collision(s) on the narrow proposal dedup key" in res.stderr
+            assert "An operator must manually resolve" in res.stderr
+            assert "No rows were deleted" in res.stderr
+
+            async with engine.connect() as conn:
+                count = (
+                    await conn.execute(
+                        text("SELECT count(*) FROM proposal_holds WHERE id IN (:id1, :id2)"),
+                        {"id1": row1_id, "id2": row2_id},
+                    )
+                ).scalar()
+                assert count == 2, (
+                    "Expected both rows to still exist; downgrade must not delete rows"
+                )
+        finally:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("DELETE FROM proposal_holds WHERE id IN (:id1, :id2)"),
+                    {"id1": row1_id, "id2": row2_id},
+                )
+            subprocess.run(
+                [sys.executable, "-m", "alembic", "upgrade", "head"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+    async def test_tech_8080_downgrade_and_upgrade_clean_without_collisions(
+        self, engine: AsyncEngine, database_url: str
+    ) -> None:
+        """TECH-8080 PR3: verify migration a56cb01a3ebf downgrades and upgrades cleanly
+        when no narrow key collisions exist."""
+        env = {**os.environ, "DATABASE_URL": database_url.replace("+asyncpg", "")}
+        res_down = subprocess.run(
+            [sys.executable, "-m", "alembic", "downgrade", "c7665a1b2d3e"],
+            cwd=SERVICE_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert res_down.returncode == 0, res_down.stderr
+
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                text(
+                    "SELECT indexdef FROM pg_indexes "
+                    "WHERE schemaname = 'public' AND tablename = 'proposal_holds' "
+                    "AND indexname = 'idx_proposal_holds_pending_dedup'"
+                )
+            )
+            row = result.fetchone()
+            assert row is not None
+            assert "dedup_field" not in row[0]
+
+        res_up = subprocess.run(
+            [sys.executable, "-m", "alembic", "upgrade", "head"],
+            cwd=SERVICE_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert res_up.returncode == 0, res_up.stderr
+
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                text(
+                    "SELECT indexdef FROM pg_indexes "
+                    "WHERE schemaname = 'public' AND tablename = 'proposal_holds' "
+                    "AND indexname = 'idx_proposal_holds_pending_dedup'"
+                )
+            )
+            row = result.fetchone()
+            assert row is not None
+            assert "dedup_field" in row[0]
 
     async def test_decision_consistency_check_constraint_rejects_pending_with_decision(
         self, engine: AsyncEngine

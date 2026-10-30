@@ -17,15 +17,28 @@ load-bearing). Widening a unique index's key set can only ever make rows
 more distinct -- it can never cause a new collision on existing data, so
 no row cleanup is needed on upgrade.
 
-On downgrade, two live pending/applying rows differing only by dedup_field
-could collide when narrowing the key. The downgrade resolves this by keeping
-the oldest per narrow key.
+To prevent blocking write traffic against ``proposal_holds`` during index build:
+1. Inside an ``autocommit_block()``, drop any leftover temporary index from a prior
+   failed run (e.g. an INVALID index from an aborted CONCURRENTLY build) and build
+   ``idx_proposal_holds_pending_dedup_new`` with ``CONCURRENTLY``. Uniqueness is checked
+   as rows are scanned, while live reads and writes continue unimpeded.
+2. In a brief transaction, drop the old narrower ``idx_proposal_holds_pending_dedup``
+   and rename ``idx_proposal_holds_pending_dedup_new`` to ``idx_proposal_holds_pending_dedup``.
+   Because drop and rename happen in a single transaction, uniqueness is enforced
+   continuously without a gap, and the ACCESS EXCLUSIVE lock on the table catalog is held
+   only for microseconds with zero table scan.
+
+On downgrade:
+Before attempting to restore the narrower index, the migration explicitly checks for
+collisions on the narrow key among active rows (status IN ('pending', 'applying')).
+If any collisions exist, it raises a RuntimeError instructing the operator to resolve
+the duplicate active proposals manually. It never silently deletes or merges valid rows.
 """
 
 from collections.abc import Sequence
 
 import sqlalchemy as sa
-from alembic import op
+from alembic import context, op
 
 revision: str = "a56cb01a3ebf"
 down_revision: str | None = "c7665a1b2d3e"
@@ -44,38 +57,92 @@ _WHERE = sa.text("status IN ('pending', 'applying')")
 
 
 def upgrade() -> None:
+    # 1. Build the replacement index concurrently outside a transaction so
+    # live writes to proposal_holds are never blocked.
+    with op.get_context().autocommit_block():
+        op.drop_index(
+            "idx_proposal_holds_pending_dedup_new",
+            table_name="proposal_holds",
+            if_exists=True,
+            postgresql_concurrently=True,
+        )
+        op.create_index(
+            "idx_proposal_holds_pending_dedup_new",
+            "proposal_holds",
+            list(_NEW_COLUMNS),
+            unique=True,
+            postgresql_where=_WHERE,
+            postgresql_concurrently=True,
+            if_not_exists=True,
+        )
+
+    # 2. Swap: drop the old index and rename the new one in a single transaction.
+    # Uniqueness is preserved continuously and catalog lock duration is minimal.
     op.drop_index("idx_proposal_holds_pending_dedup", table_name="proposal_holds", if_exists=True)
-    op.create_index(
-        "idx_proposal_holds_pending_dedup",
-        "proposal_holds",
-        list(_NEW_COLUMNS),
-        unique=True,
-        postgresql_where=_WHERE,
-        if_not_exists=True,
+    op.execute(
+        "ALTER INDEX IF EXISTS idx_proposal_holds_pending_dedup_new "
+        "RENAME TO idx_proposal_holds_pending_dedup"
     )
 
 
 def downgrade() -> None:
+    # Check for collisions on the narrow key first. Never delete or merge rows.
+    if not context.is_offline_mode():
+        bind = op.get_bind()
+        if bind is not None:
+            collisions = bind.execute(
+                sa.text("""
+                    SELECT
+                        kind,
+                        proposed_by_bot_id,
+                        action ->> 'target_id' AS target_id,
+                        action ->> 'action_type' AS action_type,
+                        COALESCE(cross_brain ->> 'target_sub', '') AS cross_target_sub,
+                        COUNT(*) AS count
+                    FROM proposal_holds
+                    WHERE status IN ('pending', 'applying')
+                    GROUP BY
+                        kind,
+                        proposed_by_bot_id,
+                        action ->> 'target_id',
+                        action ->> 'action_type',
+                        COALESCE(cross_brain ->> 'target_sub', '')
+                    HAVING COUNT(*) > 1
+                """)
+            ).fetchall()
+            if collisions:
+                details = [
+                    f"(kind={r[0]!r}, bot={r[1]!r}, target_id={r[2]!r}, "
+                    f"action_type={r[3]!r}, cross_target={r[4]!r}): {r[5]} rows"
+                    for r in collisions
+                ]
+                raise RuntimeError(
+                    f"Cannot downgrade migration a56cb01a3ebf: found {len(collisions)} collision(s) "
+                    f"on the narrow proposal dedup key among active pending/applying proposals: "
+                    f"{'; '.join(details)}. An operator must manually resolve (decide, withdraw, "
+                    f"or reject) duplicate proposals before the narrow unique index can be restored. "
+                    f"No rows were deleted."
+                )
+
+    with op.get_context().autocommit_block():
+        op.drop_index(
+            "idx_proposal_holds_pending_dedup_old",
+            table_name="proposal_holds",
+            if_exists=True,
+            postgresql_concurrently=True,
+        )
+        op.create_index(
+            "idx_proposal_holds_pending_dedup_old",
+            "proposal_holds",
+            list(_OLD_COLUMNS),
+            unique=True,
+            postgresql_where=_WHERE,
+            postgresql_concurrently=True,
+            if_not_exists=True,
+        )
+
     op.drop_index("idx_proposal_holds_pending_dedup", table_name="proposal_holds", if_exists=True)
-    # Narrowing CAN collide: two live rows differing only by dedup_field.
-    # Resolve by keeping the oldest per narrow key.
-    op.execute("""
-        DELETE FROM proposal_holds a USING proposal_holds b
-        WHERE a.status IN ('pending', 'applying')
-          AND b.status IN ('pending', 'applying')
-          AND a.kind = b.kind
-          AND a.proposed_by_bot_id = b.proposed_by_bot_id
-          AND a.action->>'target_id' = b.action->>'target_id'
-          AND a.action->>'action_type' = b.action->>'action_type'
-          AND COALESCE(a.cross_brain->>'target_sub', '')
-            = COALESCE(b.cross_brain->>'target_sub', '')
-          AND a.created_at > b.created_at
-    """)
-    op.create_index(
-        "idx_proposal_holds_pending_dedup",
-        "proposal_holds",
-        list(_OLD_COLUMNS),
-        unique=True,
-        postgresql_where=_WHERE,
-        if_not_exists=True,
+    op.execute(
+        "ALTER INDEX IF EXISTS idx_proposal_holds_pending_dedup_old "
+        "RENAME TO idx_proposal_holds_pending_dedup"
     )
