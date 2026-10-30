@@ -1,7 +1,7 @@
 """add decision_reason_code to proposal_holds
 
 Revision ID: 5ef4403d7f33
-Revises: c7665a1b2d3e
+Revises: a56cb01a3ebf
 Create Date: 2026-10-30 00:00:00.000000
 
 Adds a nullable decision_reason_code column to proposal_holds, with a CHECK
@@ -9,7 +9,12 @@ constraint enforcing the allowed closed vocabulary:
 'not_now', 'wrong_target', 'incorrect_facts', 'insufficient_evidence',
 'duplicate', 'policy', 'human_will_handle', 'other'.
 
-Nullable with no default, so every existing row is valid and no backfill is needed.
+LOCKING / DEPLOYMENT: added NOT VALID (postgresql_not_valid=True) so adding
+the constraint only takes a brief ACCESS EXCLUSIVE lock to record the constraint
+in the catalog without scanning existing rows under that lock (which would block
+concurrent reads and writes on proposal_holds). Validation of existing rows is
+deferred to the follow-up revision fd6d97e05ca5, which validates the constraint
+in a separate transaction under SHARE UPDATE EXCLUSIVE lock.
 """
 
 from collections.abc import Sequence
@@ -18,7 +23,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "5ef4403d7f33"
-down_revision: str | None = "c7665a1b2d3e"
+down_revision: str | None = "a56cb01a3ebf"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -47,6 +52,7 @@ def upgrade() -> None:
         _CONSTRAINT_NAME,
         "proposal_holds",
         _CONSTRAINT_CONDITION,
+        postgresql_not_valid=True,
     )
 
 

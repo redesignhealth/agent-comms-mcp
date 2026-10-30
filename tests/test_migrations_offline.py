@@ -560,6 +560,31 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
         < commit_swap_pos
     )
 
+    # 5ef4403d7f33 / fd6d97e05ca5 (TECH-8080 PR5): decision_reason_code check
+    # constraint added NOT VALID, followed by commit and out-of-transaction VALIDATE
+    # so the table scan doesn't hold ACCESS EXCLUSIVE.
+    assert (
+        "ALTER TABLE proposal_holds ADD CONSTRAINT ck_proposal_holds_decision_reason_code "
+        "CHECK (decision_reason_code IS NULL OR decision_reason_code IN "
+        "('not_now', 'wrong_target', 'incorrect_facts', 'insufficient_evidence', "
+        "'duplicate', 'policy', 'human_will_handle', 'other')) NOT VALID" in result.stdout
+    )
+    assert (
+        "ALTER TABLE proposal_holds VALIDATE CONSTRAINT ck_proposal_holds_decision_reason_code"
+        in result.stdout
+    )
+    reason_not_valid_pos = result.stdout.index(
+        "ALTER TABLE proposal_holds ADD CONSTRAINT ck_proposal_holds_decision_reason_code "
+        "CHECK (decision_reason_code IS NULL OR decision_reason_code IN "
+        "('not_now', 'wrong_target', 'incorrect_facts', 'insufficient_evidence', "
+        "'duplicate', 'policy', 'human_will_handle', 'other')) NOT VALID"
+    )
+    reason_validate_pos = result.stdout.index(
+        "ALTER TABLE proposal_holds VALIDATE CONSTRAINT ck_proposal_holds_decision_reason_code"
+    )
+    reason_commit_pos = result.stdout.index("COMMIT;", reason_not_valid_pos)
+    assert reason_not_valid_pos < reason_commit_pos < reason_validate_pos
+
 
 def test_alembic_single_head() -> None:
     result = subprocess.run(
@@ -571,5 +596,5 @@ def test_alembic_single_head() -> None:
     )
     assert result.returncode == 0, result.stderr
     heads = [line.strip() for line in result.stdout.strip().splitlines() if line.strip()]
-    assert len(heads) == 1, f"Expected exactly one alembic head, got {len(heads)}: {heads}"
-    assert heads[0], "Expected non-empty head revision"
+    assert len(heads) == 1, f"Expected single head, got: {heads}"
+    assert "fd6d97e05ca5" in heads[0]
