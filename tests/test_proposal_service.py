@@ -61,17 +61,19 @@ from service import (
     PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR,
     PROPOSAL_SUBMITTER_SURFACES,
     PROPOSAL_TERMINAL_STATUSES,
-    _log_startup_rate_limit_overrides,
     _proposal_resubmission_snapshot,
     _redact_bot_facing_dict,
     audit_denied_proposal_submission,
     create_proposal,
     decide_proposal,
     get_proposal_for_bot,
+    get_proposal_rate_limit_overrides,
     list_pending_proposal_holds,
     list_proposal_history_for_owner,
     list_proposals_for_bot,
+    log_proposal_rate_limit_overrides,
     proposal_rate_limit_for,
+    reset_proposal_rate_limit_overrides_cache,
     withdraw_proposal,
 )
 from tests.proposal_judge_fakes import (
@@ -795,6 +797,12 @@ class TestProposalResubmissionSnapshot:
 
 
 class TestRateLimit:
+    @pytest.fixture(autouse=True)
+    def _manage_rate_limit_cache(self) -> AsyncIterator[None]:
+        reset_proposal_rate_limit_overrides_cache()
+        yield
+        reset_proposal_rate_limit_overrides_cache()
+
     async def test_exceeding_per_bot_window_limit_raises(self, session: AsyncSession) -> None:
         for i in range(MAX_PROPOSALS_PER_BOT_PER_WINDOW):
             await _submit(session, action=_action(target_id=f"TECH-{i}"))
@@ -845,6 +853,7 @@ class TestRateLimit:
         self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv(PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR, '{"bot-high": 10}')
+        reset_proposal_rate_limit_overrides_cache()
         # bot-high can submit 10 proposals in the window
         for i in range(10):
             await _submit(
@@ -869,6 +878,7 @@ class TestRateLimit:
         self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv(PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR, '{"bot-strict": 1}')
+        reset_proposal_rate_limit_overrides_cache()
         await _submit(session, proposed_by_bot_id="bot-strict", action=_action(target_id="TECH-1"))
         with pytest.raises(RateLimitExceededError):
             await _submit(
@@ -879,6 +889,7 @@ class TestRateLimit:
         self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv(PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR, '{"bot-override": 2}')
+        reset_proposal_rate_limit_overrides_cache()
         # Fill quota of 2
         for i in range(2):
             await _submit(
@@ -927,6 +938,7 @@ class TestRateLimit:
     ) -> None:
         """Dedup resubmits must count as attempts -- keeping the TECH-5875 audit_log design."""
         monkeypatch.setenv(PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR, '{"bot-dedup": 3}')
+        reset_proposal_rate_limit_overrides_cache()
         # First submission inserts
         res1 = await _submit(
             session, proposed_by_bot_id="bot-dedup", action=_action(target_id="TECH-SAME")
@@ -981,6 +993,7 @@ class TestRateLimit:
     ) -> None:
         cases = [
             ("invalid JSON", "{not-valid-json"),
+            ("duplicate JSON keys", '{"bot-1": 5, "bot-1": 1000}'),
             ("JSON array instead of object", "[1, 2, 3]"),
             ("string scalar", '"just_a_string"'),
             ("limit is 0", '{"bot-1": 0}'),
@@ -997,16 +1010,64 @@ class TestRateLimit:
         for desc, env_val in cases:
             caplog.clear()
             monkeypatch.setenv(PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR, env_val)
+            reset_proposal_rate_limit_overrides_cache()
             with caplog.at_level(logging.WARNING):
                 limit = proposal_rate_limit_for("bot-1")
             assert limit == MAX_PROPOSALS_PER_BOT_PER_WINDOW, f"Case {desc} should return default"
             warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
             assert len(warnings) >= 1, f"Case {desc} should log a WARNING"
 
+    def test_duplicate_json_keys_rejected_and_falls_back_to_default_for_all(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Duplicate JSON keys must be rejected and fall back to 5 for all bots."""
+        monkeypatch.setenv(
+            PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR, '{"bot-1": 5, "bot-2": 20, "bot-1": 1000}'
+        )
+        reset_proposal_rate_limit_overrides_cache()
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            limit_bot1 = proposal_rate_limit_for("bot-1")
+            limit_bot2 = proposal_rate_limit_for("bot-2")
+        assert limit_bot1 == MAX_PROPOSALS_PER_BOT_PER_WINDOW
+        assert limit_bot2 == MAX_PROPOSALS_PER_BOT_PER_WINDOW
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) >= 1
+        assert any("duplicate key 'bot-1'" in r.message for r in warnings)
+
+    async def test_malformed_warning_emitted_only_once_across_multiple_submissions(
+        self,
+        session: AsyncSession,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Cached overrides must parse and warn only once, never per submission."""
+        monkeypatch.setenv(PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR, '{"bot-dup": 5, "bot-dup": 1000}')
+        reset_proposal_rate_limit_overrides_cache()
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            for i in range(MAX_PROPOSALS_PER_BOT_PER_WINDOW):
+                await _submit(
+                    session,
+                    proposed_by_bot_id="bot-dup",
+                    action=_action(target_id=f"TECH-DUP-{i}"),
+                )
+            with pytest.raises(RateLimitExceededError):
+                await _submit(
+                    session,
+                    proposed_by_bot_id="bot-dup",
+                    action=_action(target_id="TECH-DUP-OVER"),
+                )
+
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+        assert "duplicate key" in warnings[0].message
+
     def test_unset_env_var_returns_default_without_warning(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         monkeypatch.delenv(PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR, raising=False)
+        reset_proposal_rate_limit_overrides_cache()
         caplog.clear()
         with caplog.at_level(logging.WARNING):
             limit = proposal_rate_limit_for("bot-1")
@@ -1019,29 +1080,56 @@ class TestRateLimit:
     ) -> None:
         # 1. Unset logs info about empty map
         monkeypatch.delenv(PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR, raising=False)
+        reset_proposal_rate_limit_overrides_cache()
         caplog.clear()
         with caplog.at_level(logging.INFO):
-            _log_startup_rate_limit_overrides()
+            log_proposal_rate_limit_overrides()
         info_records = [r for r in caplog.records if r.levelno == logging.INFO]
         assert any("unset" in r.message and "empty map" in r.message for r in info_records)
 
         # 2. Configured logs info with overrides
         monkeypatch.setenv(PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR, '{"routine-bot": 100}')
+        reset_proposal_rate_limit_overrides_cache()
         caplog.clear()
         with caplog.at_level(logging.INFO):
-            _log_startup_rate_limit_overrides()
+            log_proposal_rate_limit_overrides()
         info_records = [r for r in caplog.records if r.levelno == logging.INFO]
         assert any("routine-bot" in r.message and "100" in r.message for r in info_records)
 
         # 3. Malformed logs warning and info about empty map
         monkeypatch.setenv(PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR, "{invalid")
+        reset_proposal_rate_limit_overrides_cache()
         caplog.clear()
         with caplog.at_level(logging.INFO):
-            _log_startup_rate_limit_overrides()
+            log_proposal_rate_limit_overrides()
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert len(warnings) >= 1
         info_records = [r for r in caplog.records if r.levelno == logging.INFO]
         assert any("empty override map" in r.message for r in info_records)
+
+    def test_startup_log_reflects_enforced_map(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The startup log and proposal_rate_limit_for must read the exact same cached map."""
+        monkeypatch.setenv(
+            PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR, '{"bot-alpha": 50, "bot-beta": 75}'
+        )
+        reset_proposal_rate_limit_overrides_cache()
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            logged_map = log_proposal_rate_limit_overrides()
+
+        assert logged_map == {"bot-alpha": 50, "bot-beta": 75}
+        assert proposal_rate_limit_for("bot-alpha") == 50
+        assert proposal_rate_limit_for("bot-beta") == 75
+        assert proposal_rate_limit_for("bot-unconfigured") == MAX_PROPOSALS_PER_BOT_PER_WINDOW
+        assert get_proposal_rate_limit_overrides() == logged_map
+
+        info_records = [r for r in caplog.records if r.levelno == logging.INFO]
+        assert any(
+            "bot-alpha" in r.message and "50" in r.message and "bot-beta" in r.message
+            for r in info_records
+        )
 
     async def test_concurrent_submissions_serialize_and_cap_at_override(
         self, session_factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
@@ -1051,6 +1139,7 @@ class TestRateLimit:
         monkeypatch.setenv(
             PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR, f'{{"bot-concurrent": {override_cap}}}'
         )
+        reset_proposal_rate_limit_overrides_cache()
 
         async def _submit_concurrent(idx: int) -> dict[str, Any]:
             async with session_factory() as s:

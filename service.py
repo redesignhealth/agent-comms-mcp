@@ -6574,6 +6574,15 @@ _MAX_CONFIGURABLE_RATE_LIMIT = 1000
 _PROPOSAL_SUBMISSION_ATTEMPT_ACTION = "proposal.submission_attempt"
 
 
+def _reject_duplicate_keys(pairs: list[tuple[Any, Any]]) -> dict[Any, Any]:
+    result: dict[Any, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate key {key!r} in JSON object")
+        result[key] = value
+    return result
+
+
 def _parse_proposal_rate_limit_overrides(raw: str | None) -> dict[str, int]:
     """Parse the ``PROPOSAL_RATE_LIMIT_PER_BOT`` env var into a dict of
     exact bot_sub -> integer limit.
@@ -6581,7 +6590,7 @@ def _parse_proposal_rate_limit_overrides(raw: str | None) -> dict[str, int]:
     Precedence and validation rules per TECH-8080 (PR11) / TECH-5875:
       - Unset (None): empty dict, no warning.
       - Empty or whitespace string: empty dict, logs a WARNING.
-      - Invalid JSON: empty dict, logs a WARNING.
+      - Invalid JSON or duplicate keys: empty dict, logs a WARNING.
       - Non-object JSON (array, scalar): empty dict, logs a WARNING.
       - Keys must be non-empty strings; non-string or empty keys log a WARNING.
       - Values must be integers (not bools) in [1, _MAX_CONFIGURABLE_RATE_LIMIT];
@@ -6598,11 +6607,12 @@ def _parse_proposal_rate_limit_overrides(raw: str | None) -> dict[str, int]:
         )
         return {}
     try:
-        parsed = json.loads(raw)
-    except Exception:
+        parsed = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+    except Exception as exc:
         logger.warning(
-            "%s is not valid JSON; falling back to default limit %d",
+            "%s is not valid JSON (%s); falling back to default limit %d",
             PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR,
+            exc,
             MAX_PROPOSALS_PER_BOT_PER_WINDOW,
         )
         return {}
@@ -6655,6 +6665,32 @@ def _parse_proposal_rate_limit_overrides(raw: str | None) -> dict[str, int]:
     return overrides
 
 
+_cached_proposal_rate_limit_overrides: dict[str, int] | None = None
+
+
+def get_proposal_rate_limit_overrides() -> dict[str, int]:
+    """Return the parsed per-bot proposal rate limit overrides, cached in-process.
+
+    Parsing and validation logging run once on initial load (or after cache reset).
+    """
+    global _cached_proposal_rate_limit_overrides
+    if _cached_proposal_rate_limit_overrides is None:
+        raw = os.environ.get(PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR)
+        _cached_proposal_rate_limit_overrides = _parse_proposal_rate_limit_overrides(raw)
+    return _cached_proposal_rate_limit_overrides
+
+
+def reset_proposal_rate_limit_overrides_cache() -> None:
+    """Clear the cached overrides map so subsequent calls reload and re-validate
+    from the environment. Used in tests when monkeypatching environment variables.
+    """
+    global _cached_proposal_rate_limit_overrides
+    _cached_proposal_rate_limit_overrides = None
+
+
+clear_proposal_rate_limit_cache = reset_proposal_rate_limit_overrides_cache
+
+
 def proposal_rate_limit_for(bot_id: str | None = None, *, bot_sub: str | None = None) -> int:
     """Per-bot submission limit for the global PROPOSAL_RATE_LIMIT_WINDOW.
 
@@ -6663,35 +6699,36 @@ def proposal_rate_limit_for(bot_id: str | None = None, *, bot_sub: str | None = 
          if that value is an int in [1, _MAX_CONFIGURABLE_RATE_LIMIT].
       2. Otherwise MAX_PROPOSALS_PER_BOT_PER_WINDOW (5).
 
-    Read live, matching cross_brain_enabled/cross_brain_auto_rules
-    (service.py:7653-7666), so retuning needs no code change.
+    Reads from the cached overrides map (parsed once at startup).
 
-    Fails SAFE, never open. Unset, empty, invalid JSON, a non-object, a
-    non-int value, a value <= 0, or a value above the ceiling all log a
-    WARNING and fall back to the global default. There is no syntax that
+    Fails SAFE, never open. Unset, empty, invalid JSON (including duplicate keys),
+    a non-object, a non-int value, a value <= 0, or a value above the ceiling all
+    log a WARNING once and fall back to the global default. There is no syntax that
     yields an unlimited limit.
     """
     target = bot_id if bot_id is not None else bot_sub
     if not target or not isinstance(target, str):
         return MAX_PROPOSALS_PER_BOT_PER_WINDOW
 
-    overrides = _parse_proposal_rate_limit_overrides(
-        os.environ.get(PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR)
-    )
+    overrides = get_proposal_rate_limit_overrides()
     return overrides.get(target, MAX_PROPOSALS_PER_BOT_PER_WINDOW)
 
 
-def _log_startup_rate_limit_overrides() -> None:
+def log_proposal_rate_limit_overrides() -> dict[str, int]:
+    """Log the parsed per-bot proposal rate limit overrides at INFO once at startup,
+    after logging has been configured.
+
+    Reads from the same cached overrides map enforced by ``proposal_rate_limit_for``.
+    """
     raw = os.environ.get(PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR)
+    overrides = get_proposal_rate_limit_overrides()
     if raw is None:
         logger.info(
             "%s is unset; no per-bot overrides configured (empty map, default %d/window)",
             PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR,
             MAX_PROPOSALS_PER_BOT_PER_WINDOW,
         )
-        return
-    overrides = _parse_proposal_rate_limit_overrides(raw)
-    if not overrides:
+    elif not overrides:
         logger.info(
             "%s parsed to an empty override map (default %d/window)",
             PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR,
@@ -6704,9 +6741,10 @@ def _log_startup_rate_limit_overrides() -> None:
             len(overrides),
             overrides,
         )
+    return overrides
 
 
-_log_startup_rate_limit_overrides()
+_log_startup_rate_limit_overrides = log_proposal_rate_limit_overrides
 
 
 async def _deny_rate_limited_proposals(session: AsyncSession, *, proposed_by_bot_id: str) -> None:
@@ -11260,6 +11298,7 @@ __all__ = [
     "audit_denied_proposal_submission",
     "audit_resource_subscription",
     "authorize_owner_reassignment",
+    "clear_proposal_rate_limit_cache",
     "create_proposal",
     "decide_hold",
     "decide_proposal",
@@ -11273,6 +11312,7 @@ __all__ = [
     "get_hold_status",
     "get_ownership_client_factory",
     "get_proposal_for_bot",
+    "get_proposal_rate_limit_overrides",
     "inbox",
     "invite",
     "leave",
@@ -11282,6 +11322,7 @@ __all__ = [
     "list_pending_proposal_holds",
     "list_proposal_history_for_owner",
     "list_proposals_for_bot",
+    "log_proposal_rate_limit_overrides",
     "lookup_agent_by_email",
     "max_proposal_action_bytes",
     "may_assign",
@@ -11298,6 +11339,7 @@ __all__ = [
     "rename_conversation",
     "reopen_conversation",
     "request_owner_reassignment",
+    "reset_proposal_rate_limit_overrides_cache",
     "resolve_conversation_participant",
     "resolve_inbox_target",
     "resolve_proposal_owner_sub",
