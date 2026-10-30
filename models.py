@@ -12,6 +12,10 @@ Domain invariants enforced at the schema level:
 - ``messages`` carries a per-conversation monotonic ``seq`` guarded by
   ``UNIQUE(conversation_id, seq)``; assignment is serialized via
   ``SELECT ... FOR UPDATE`` on the conversation row (see service.py).
+- ``proposal_holds`` carries a per-bot monotonic ``log_seq`` guarded by
+  ``UNIQUE(proposed_by_bot_id, log_seq)``; assignment is serialized via
+  per-bot row lock on ``proposal_bot_log_seq`` driven by database trigger
+  ``trg_proposal_holds_log_seq`` (see TECH-8080 PR10).
 - Closed status/state vocabularies get CHECK constraints. Open
   vocabularies (``conversations.type``, ``messages.type``) are validated
   against the versioned schema registry in schemas.py instead, so adding
@@ -27,6 +31,7 @@ from typing import Any
 from sqlalchemy import (
     BigInteger,
     CheckConstraint,
+    FetchedValue,
     ForeignKey,
     Index,
     Integer,
@@ -881,6 +886,23 @@ class ProposalHold(Base):
             "status",
             "created_at",
         ),
+        # Backs per-bot commit-ordered log_seq uniqueness and keyset pagination
+        # (TECH-8080 PR10) -- see migration b4a2d8e6f1c3.
+        Index(
+            "uq_proposal_holds_bot_id_log_seq",
+            "proposed_by_bot_id",
+            "log_seq",
+            unique=True,
+        ),
+        # Backs service.list_proposals_for_bot's status-filtered incremental
+        # log feed (proposals_list_pending/proposals_list_history with order='log')
+        # (TECH-8080 PR10) -- see migration b4a2d8e6f1c3.
+        Index(
+            "idx_proposal_holds_bot_id_status_log_seq",
+            "proposed_by_bot_id",
+            "status",
+            "log_seq",
+        ),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -889,6 +911,16 @@ class ProposalHold(Base):
     )
     kind: Mapped[str] = mapped_column(Text, nullable=False)
     proposed_by_bot_id: Mapped[str] = mapped_column(Text, nullable=False)
+    # DB-owned monotonic sequence assigned by database trigger
+    # trg_proposal_holds_log_seq (TECH-8080 PR10). NEVER assign or update
+    # from application code. With expire_on_commit=False, an in-memory ORM
+    # instance's log_seq is stale after a write; read it only from a fresh SELECT.
+    log_seq: Mapped[int] = mapped_column(
+        BigInteger,
+        server_default=FetchedValue(),
+        server_onupdate=FetchedValue(),
+        nullable=False,
+    )
     owner_sub: Mapped[str] = mapped_column(Text, nullable=False)
     action: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     rationale: Mapped[str] = mapped_column(Text, nullable=False)
@@ -923,6 +955,20 @@ class ProposalHold(Base):
     updated_at: Mapped[datetime] = _updated_at()
 
 
+class ProposalBotLogSeq(Base):
+    """Per-bot monotonic counter for commit-ordered proposal_holds.log_seq (TECH-8080 PR10).
+
+    A single-row-per-bot table serialising log_seq allocation via row-level locks
+    held to transaction commit. Managed entirely by the database trigger
+    trg_proposal_holds_log_seq -- not written from application code.
+    """
+
+    __tablename__ = "proposal_bot_log_seq"
+
+    bot_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    last_seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
 __all__ = [
     "AGENT_STATUSES",
     "APPROVAL_HOLD_AUTO_DECISIONS",
@@ -942,5 +988,6 @@ __all__ = [
     "Conversation",
     "Message",
     "Participant",
+    "ProposalBotLogSeq",
     "ProposalHold",
 ]

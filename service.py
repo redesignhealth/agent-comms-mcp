@@ -158,6 +158,8 @@ raised — logged, never fails the triggering call).
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import itertools
 import json
@@ -168,7 +170,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from datetime import UTC, datetime, timedelta
-from typing import Any, Final, NamedTuple, NoReturn, Protocol
+from typing import Any, Final, Literal, NamedTuple, NoReturn, Protocol
 from urllib.parse import urlsplit
 
 from sqlalchemy import ColumnElement, and_, case, func, literal, not_, or_, select, text, tuple_
@@ -7271,6 +7273,46 @@ def _proposal_projected_columns() -> tuple[
     return projected_action, elided_utf8_bytes, elided_chars
 
 
+def _encode_proposal_cursor(kind: str, seq: int) -> str:
+    """Encode log_seq keyset position into an opaque kind-bound base64 string (TECH-8080 PR10)."""
+    payload = {"v": 2, "k": kind, "s": seq}
+    return base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _decode_proposal_cursor(cursor: object, *, expected_kind: str) -> int:
+    """Decode-and-validate an opaque base64 keyset cursor defensively (TECH-8080 PR10).
+
+    Raises ValueError("invalid cursor") on any malformed, truncated, non-base64,
+    wrong-JSON, non-string, wrong-version, wrong-kind, or invalid payload.
+    Never leaks internal error details.
+    """
+    if not isinstance(cursor, str) or not cursor.strip():
+        raise ValueError("invalid cursor")
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        raw_bytes = base64.urlsafe_b64decode(padded.encode("ascii"))
+        data = json.loads(raw_bytes.decode("utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("invalid cursor")
+        if data.get("v") != 2:
+            raise ValueError("invalid cursor")
+        if data.get("k") != expected_kind:
+            raise ValueError("invalid cursor")
+        s = data.get("s")
+        if s is None or isinstance(s, bool) or not isinstance(s, int) or s < 0:
+            raise ValueError("invalid cursor")
+        return s
+    except (
+        ValueError,
+        binascii.Error,
+        UnicodeError,
+        json.JSONDecodeError,
+        TypeError,
+        KeyError,
+    ) as exc:
+        raise ValueError("invalid cursor") from exc
+
+
 async def _list_proposals_with_elision(
     session: AsyncSession,
     *,
@@ -7278,6 +7320,8 @@ async def _list_proposals_with_elision(
     order_clauses: tuple[ColumnElement[Any], ...],
     limit: int,
     to_dict: Callable[..., dict[str, Any]],
+    cursor_kind: str | None = None,
+    since: str | None = None,
 ) -> dict[str, Any]:
     """Shared body of the three proposal list queries (TECH-7720).
 
@@ -7286,7 +7330,7 @@ async def _list_proposals_with_elision(
     second query); the outer query joins it back, re-applies the SAME order,
     and projects ``action`` through ``_proposal_projected_columns`` so oversize
     Arcana ``content`` never leaves Postgres. ``order_clauses`` must end in a
-    unique tie-breaker (``ProposalHold.id``) so rows sharing a ``created_at``
+    unique tie-breaker (``ProposalHold.id`` or unique ``log_seq``) so rows
     page and ``has_more`` deterministically.
     """
     subq = (
@@ -7305,15 +7349,28 @@ async def _list_proposals_with_elision(
     )
     rows = (await session.execute(stmt)).all()
     has_more = len(rows) > limit
+    returned_rows = rows[:limit]
     proposals = []
-    for hold, action_val, utf8_bytes, chars in rows[:limit]:
+    for hold, action_val, utf8_bytes, chars in returned_rows:
         elided = (
             {"content": {"utf8_bytes": utf8_bytes, "chars": chars}}
             if utf8_bytes is not None
             else None
         )
         proposals.append(to_dict(hold, action_override=action_val, elided_action_fields=elided))
-    return {"proposals": proposals, "has_more": has_more}
+
+    if cursor_kind is None:
+        return {"proposals": proposals, "has_more": has_more}
+
+    if returned_rows:
+        last_hold = returned_rows[-1][0]
+        next_cursor = _encode_proposal_cursor(cursor_kind, last_hold.log_seq)
+    elif since is not None:
+        next_cursor = since
+    else:
+        next_cursor = None
+
+    return {"proposals": proposals, "has_more": has_more, "next_cursor": next_cursor}
 
 
 MAX_PROPOSAL_ACTION_FIELD_LENGTH = 500
@@ -8573,7 +8630,13 @@ async def withdraw_proposal(
 
 
 async def list_proposals_for_bot(
-    session: AsyncSession, *, requesting_bot_sub: str, statuses: Sequence[str], limit: int = 50
+    session: AsyncSession,
+    *,
+    requesting_bot_sub: str,
+    statuses: Sequence[str],
+    limit: int = 50,
+    order: Literal["created_at", "log"] = "created_at",
+    since: str | None = None,
 ) -> dict[str, Any]:
     """Sender-only list of the SUBMITTING bot's own proposals, filtered to
     ``statuses`` (``providers.proposals``'s ``proposals_list_pending``/
@@ -8595,17 +8658,53 @@ async def list_proposals_for_bot(
     ``decision_source == "human"`` (a decided one, surfaced by the history
     tool), so this list is exactly as exposed to a human reviewer's
     identity leaking to the bot as any single-id lookup is.
+
+    Ordering modes:
+    - ``order="created_at"``: Default. Ordered oldest-first by ``created_at ASC, id ASC``.
+      No ``next_cursor`` field is returned in the response dictionary (byte-identical to
+      legacy behavior). ``since`` cannot be used with this mode.
+    - ``order="log"``: Incremental feed ordered strictly by ``log_seq ASC``.
+      ``log_seq`` is a commit-ordered, per-bot monotonic sequence assigned by database
+      trigger ``trg_proposal_holds_log_seq`` under a row-level lock on ``proposal_bot_log_seq``.
+      Returns ``next_cursor`` representing a persistable watermark. When supplied with ``since``,
+      resumes iteration strictly after the watermark. Guaranteed at-least-once: a writer
+      committed after a watermark will always receive a strictly higher ``log_seq`` and will
+      never be missed.
     """
     limit = max(1, min(limit, 200))
+    if order not in ("created_at", "log"):
+        raise ValueError("invalid order: must be 'created_at' or 'log'")
+    if since is not None and order != "log":
+        raise ValueError("since requires order='log'")
+
+    expected_kind = "pending" if set(statuses) == {"pending"} else "history"
+
+    where_conditions = [
+        ProposalHold.proposed_by_bot_id == requesting_bot_sub,
+        ProposalHold.status.in_(statuses),
+    ]
+
+    if order == "created_at":
+        order_clauses: tuple[ColumnElement[Any], ...] = (
+            ProposalHold.created_at.asc(),
+            ProposalHold.id.asc(),
+        )
+        cursor_kind = None
+    else:
+        order_clauses = (ProposalHold.log_seq.asc(),)
+        if since is not None:
+            last_seq = _decode_proposal_cursor(since, expected_kind=expected_kind)
+            where_conditions.append(ProposalHold.log_seq > last_seq)
+        cursor_kind = expected_kind
+
     return await _list_proposals_with_elision(
         session,
-        where_clause=and_(
-            ProposalHold.proposed_by_bot_id == requesting_bot_sub,
-            ProposalHold.status.in_(statuses),
-        ),
-        order_clauses=(ProposalHold.created_at.asc(), ProposalHold.id.asc()),
+        where_clause=and_(*where_conditions),
+        order_clauses=order_clauses,
         limit=limit,
         to_dict=_bot_facing_proposal_dict,
+        cursor_kind=cursor_kind,
+        since=since,
     )
 
 
@@ -9183,6 +9282,8 @@ async def _apply_or_finalize_proposal_hold(
             raise cancelled_exc
         return None
 
+    # TECH-8080 PR10: Never perform slow I/O between proposal_holds writes and commit;
+    # the per-bot counter row lock in proposal_bot_log_seq is held until commit.
     hold.decision_source = decision_source
     hold.decided_by_actor_id = decided_by_actor_id
     hold.decided_at = _now()
@@ -9752,6 +9853,8 @@ async def decide_proposal(
     # releasing the lock -- this is what stops a second concurrent
     # decide call (or the auto-judge, in principle) for this SAME hold
     # from also reaching the applier before either call's terminal write.
+    # TECH-8080 PR10: Never perform slow I/O between proposal_holds writes and commit;
+    # the per-bot counter row lock in proposal_bot_log_seq is held until commit.
     hold.status = "applying"
     hold.decision_source = "human"
     hold.decided_by_actor_id = approver_sub

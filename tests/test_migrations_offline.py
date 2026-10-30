@@ -585,6 +585,20 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
     reason_commit_pos = result.stdout.index("COMMIT;", reason_not_valid_pos)
     assert reason_not_valid_pos < reason_commit_pos < reason_validate_pos
 
+    # b4a2d8e6f1c3 (TECH-8080 PR10): log_seq column, counter table, trigger, and indexes
+    assert "ALTER TABLE proposal_holds ADD COLUMN log_seq BIGINT;" in result.stdout
+    assert "CREATE TABLE proposal_bot_log_seq (" in result.stdout
+    assert "CREATE OR REPLACE FUNCTION proposal_holds_assign_log_seq()" in result.stdout
+    assert "CREATE TRIGGER trg_proposal_holds_log_seq" in result.stdout
+    assert (
+        "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS uq_proposal_holds_bot_id_log_seq "
+        "ON proposal_holds (proposed_by_bot_id, log_seq)" in result.stdout
+    )
+    assert (
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_proposal_holds_bot_id_status_log_seq "
+        "ON proposal_holds (proposed_by_bot_id, status, log_seq)" in result.stdout
+    )
+
 
 def test_alembic_single_head() -> None:
     result = subprocess.run(
@@ -597,4 +611,4 @@ def test_alembic_single_head() -> None:
     assert result.returncode == 0, result.stderr
     heads = [line.strip() for line in result.stdout.strip().splitlines() if line.strip()]
     assert len(heads) == 1, f"Expected single head, got: {heads}"
-    assert "fd6d97e05ca5" in heads[0]
+    assert "b4a2d8e6f1c3" in heads[0]

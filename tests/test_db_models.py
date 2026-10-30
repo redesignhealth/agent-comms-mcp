@@ -689,12 +689,14 @@ class TestProposalHoldsSchema:
             "apply_error",
             "apply_result",
             "decision_reason_code",
+            "log_seq",
             "created_at",
             "updated_at",
         ):
             assert expected in cols, f"proposal_holds.{expected} missing"
         assert cols["action"] == "jsonb"
         assert cols["sender_agent_id"] == "uuid"
+        assert cols["log_seq"] == "bigint"
         # migration d88cc7e6e21b (TECH-5873 follow-up: open_ticket creates
         # a real Linear issue) -- apply_result is nullable JSONB, same
         # column type/nullability as `action`, just nullable.
@@ -718,8 +720,18 @@ class TestProposalHoldsSchema:
                     )
                 )
             ).scalar_one()
+            log_seq_nullable = (
+                await conn.execute(
+                    text(
+                        "SELECT is_nullable FROM information_schema.columns "
+                        "WHERE table_schema = 'public' AND table_name = 'proposal_holds' "
+                        "AND column_name = 'log_seq'"
+                    )
+                )
+            ).scalar_one()
         assert nullable == "YES"
         assert sender_agent_id_nullable == "YES"
+        assert log_seq_nullable == "NO"
 
     async def test_status_defaults_to_pending(self, engine: AsyncEngine) -> None:
         async with engine.connect() as conn:
@@ -974,6 +986,35 @@ class TestProposalHoldsSchema:
         assert "idx_proposal_holds_status_created_at" in indexes
         assert "idx_proposal_holds_owner_sub_status_created_at" in indexes
         assert "idx_proposal_holds_pending_dedup" in indexes
+        assert "uq_proposal_holds_bot_id_log_seq" in indexes
+        assert "idx_proposal_holds_bot_id_status_log_seq" in indexes
+        assert "idx_proposal_holds_bot_id_decided_at" not in indexes
+
+    async def test_proposal_bot_log_seq_table_and_trigger(self, engine: AsyncEngine) -> None:
+        cols = await _columns(engine, "proposal_bot_log_seq")
+        assert "bot_id" in cols
+        assert "last_seq" in cols
+        assert cols["last_seq"] == "bigint"
+
+        async with engine.connect() as conn:
+            # Trigger exists and is enabled ('O')
+            tgenabled = (
+                await conn.execute(
+                    text(
+                        "SELECT tgenabled FROM pg_trigger "
+                        "WHERE tgname = 'trg_proposal_holds_log_seq'"
+                    )
+                )
+            ).scalar_one_or_none()
+            assert tgenabled in ("O", b"O")
+
+            # No proposal_holds row has NULL log_seq
+            null_count = (
+                await conn.execute(
+                    text("SELECT count(*) FROM proposal_holds WHERE log_seq IS NULL")
+                )
+            ).scalar_one()
+            assert null_count == 0
 
     def test_proposal_holds_pending_dedup_index_matches_migration(self) -> None:
         from migrations.versions.a56cb01a3ebf_proposal_dedup_field import _NEW_COLUMNS, _WHERE
