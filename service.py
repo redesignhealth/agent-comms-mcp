@@ -7405,6 +7405,8 @@ def _proposal_dict(
     if hold.cross_brain is not None:
         result["cross_brain"] = hold.cross_brain
         result["approvals"] = hold.approvals or []
+    if hold.labels is not None:
+        result["labels"] = hold.labels
     return result
 
 
@@ -7481,6 +7483,43 @@ def validate_hold_level(value: str, name: str) -> str:
     if value not in PROPOSAL_HOLD_LEVELS:
         raise ValueError(f"{name} must be one of {PROPOSAL_HOLD_LEVELS!r}")
     return value
+
+
+ALLOWED_PROPOSAL_LABEL_KEYS: frozenset[str] = frozenset({"lane", "source_type", "evidence_type"})
+_PROPOSAL_LABEL_VALUE_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+
+
+def validate_proposal_labels(labels: Any) -> dict[str, str] | None:
+    """Validate proposal routing/classification labels (TECH-8080 PR9).
+
+    Schema:
+      - Optional object / mapping
+      - At most 3 keys total from the closed set:
+        {"lane", "source_type", "evidence_type"}
+      - String values only matching ^[a-z][a-z0-9_]{0,31}$ (1-32 chars, no nesting)
+      - Unknown keys are rejected with ValueError (mapped to 422, not silently dropped)
+      - Empty mapping or None normalizes to None (NULL in the DB; omitted from response)
+    """
+    if labels is None:
+        return None
+    if not isinstance(labels, dict):
+        raise ValueError("labels must be an object")
+    if not labels:
+        return None
+    if len(labels) > 3:
+        raise ValueError("labels may contain at most 3 entries")
+    for k, v in labels.items():
+        if not isinstance(k, str) or k not in ALLOWED_PROPOSAL_LABEL_KEYS:
+            raise ValueError(
+                f"unknown label key: {k!r} (allowed keys: {sorted(ALLOWED_PROPOSAL_LABEL_KEYS)!r})"
+            )
+        if not isinstance(v, str):
+            raise ValueError(f"label value for {k!r} must be a string")
+        if not _PROPOSAL_LABEL_VALUE_RE.fullmatch(v):
+            raise ValueError(
+                f"label value for {k!r} is invalid: must match ^[a-z][a-z0-9_]{{0,31}}$ (got {v!r})"
+            )
+    return dict(labels)
 
 
 MAX_PROPOSAL_STRING_FIELD_LENGTH = 4000
@@ -7825,6 +7864,7 @@ def _apply_proposal_resubmission(
     target_fingerprint: str,
     sender_agent_id: uuid.UUID | None = None,
     cross_brain: dict[str, Any] | None = None,
+    labels: dict[str, str] | None = None,
 ) -> None:
     """Mutate an existing pending ``ProposalHold`` in place for a dedup
     match. Deliberately does NOT set ``hold.updated_at`` itself (Argus
@@ -7845,6 +7885,7 @@ def _apply_proposal_resubmission(
     # recorded against the old one; a cross-brain hold starts its approvals over.
     hold.cross_brain = cross_brain
     hold.approvals = None
+    hold.labels = labels
 
 
 def _proposal_resubmission_snapshot(hold: ProposalHold) -> tuple[Any, ...]:
@@ -7875,6 +7916,7 @@ def _proposal_resubmission_snapshot(hold: ProposalHold) -> tuple[Any, ...]:
         hold.impact,
         hold.priority,
         hold.target_fingerprint,
+        json.loads(json.dumps(hold.labels)) if hold.labels is not None else None,
     )
 
 
@@ -7896,6 +7938,7 @@ async def _dedup_or_insert_proposal(
     target_fingerprint: str,
     sender_agent_id: uuid.UUID | None = None,
     cross_brain: dict[str, Any] | None = None,
+    labels: dict[str, str] | None = None,
 ) -> ProposalHold:
     """INSERT a new ``proposal_holds`` row, or UPDATE an existing pending
     dedup match in place (TECH-5872 B1/B2).
@@ -7944,6 +7987,7 @@ async def _dedup_or_insert_proposal(
                 target_fingerprint=target_fingerprint,
                 sender_agent_id=sender_agent_id,
                 cross_brain=cross_brain,
+                labels=labels,
             )
         return existing
 
@@ -7961,6 +8005,7 @@ async def _dedup_or_insert_proposal(
         target_fingerprint=target_fingerprint,
         sender_agent_id=sender_agent_id,
         cross_brain=cross_brain,
+        labels=labels,
     )
     session.add(hold)
     try:
@@ -7995,6 +8040,7 @@ async def _dedup_or_insert_proposal(
                 target_fingerprint=target_fingerprint,
                 sender_agent_id=sender_agent_id,
                 cross_brain=cross_brain,
+                labels=labels,
             )
         return existing_after_race
     return hold
@@ -8163,6 +8209,7 @@ async def create_proposal(
     judge: ProposalJudge,
     target_fingerprint: str,
     sender_agent_id: uuid.UUID | None = None,
+    labels: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """``POST /proposals`` (main.py, non-MCP, bot-submission-gated).
 
@@ -8264,6 +8311,7 @@ async def create_proposal(
     validate_hold_level(confidence, "confidence")
     validate_hold_level(importance, "importance")
     validate_hold_level(impact, "impact")
+    validated_labels = validate_proposal_labels(labels)
     # Argus review S3: pure validation must happen BEFORE the rate-limit
     # attempt marker is audited + committed below -- otherwise a malformed
     # (but authenticated) request that fails here still burns a rate-limit
@@ -8348,6 +8396,7 @@ async def create_proposal(
         target_fingerprint=target_fingerprint,
         sender_agent_id=sender_agent_id,
         cross_brain=cross_brain,
+        labels=validated_labels,
     )
 
     # Commit the pending row and release this session's DB connection
@@ -11696,6 +11745,7 @@ async def reconcile_agent_ownership(
 
 __all__ = [
     "ALLOWED_DENIAL_REASONS",
+    "ALLOWED_PROPOSAL_LABEL_KEYS",
     "ALLOWED_SURFACES",
     "APPROVAL_HOLD_TTL",
     "CONVERSATION_TTL",
@@ -11787,6 +11837,7 @@ __all__ = [
     "validate_conversation_name",
     "validate_hold_level",
     "validate_ownership_client_configuration",
+    "validate_proposal_labels",
     "validate_proposal_string_field",
     "withdraw_proposal",
     "write_through_ownership",

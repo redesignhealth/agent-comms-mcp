@@ -691,6 +691,7 @@ class TestProposalHoldsSchema:
             "apply_result",
             "decision_reason_code",
             "log_seq",
+            "labels",
             "created_at",
             "updated_at",
         ):
@@ -702,6 +703,7 @@ class TestProposalHoldsSchema:
         # a real Linear issue) -- apply_result is nullable JSONB, same
         # column type/nullability as `action`, just nullable.
         assert cols["apply_result"] == "jsonb"
+        assert cols["labels"] == "jsonb"
         async with engine.connect() as conn:
             nullable = (
                 await conn.execute(
@@ -709,6 +711,15 @@ class TestProposalHoldsSchema:
                         "SELECT is_nullable FROM information_schema.columns "
                         "WHERE table_schema = 'public' AND table_name = 'proposal_holds' "
                         "AND column_name = 'apply_result'"
+                    )
+                )
+            ).scalar_one()
+            labels_nullable = (
+                await conn.execute(
+                    text(
+                        "SELECT is_nullable FROM information_schema.columns "
+                        "WHERE table_schema = 'public' AND table_name = 'proposal_holds' "
+                        "AND column_name = 'labels'"
                     )
                 )
             ).scalar_one()
@@ -731,6 +742,7 @@ class TestProposalHoldsSchema:
                 )
             ).scalar_one()
         assert nullable == "YES"
+        assert labels_nullable == "YES"
         assert sender_agent_id_nullable == "YES"
         assert log_seq_nullable == "NO"
 
@@ -1632,6 +1644,7 @@ class TestProposalHoldsSchema:
                 impact="low",
                 priority="high",
                 target_fingerprint="deadbeef",
+                labels={"lane": "p1", "source_type": "sweep", "evidence_type": "merged_pr"},
             )
             session.add(hold)
             await session.commit()
@@ -1640,6 +1653,11 @@ class TestProposalHoldsSchema:
                 assert hold.status == "pending"
                 assert hold.decided_at is None
                 assert hold.applied_at is None
+                assert hold.labels == {
+                    "lane": "p1",
+                    "source_type": "sweep",
+                    "evidence_type": "merged_pr",
+                }
 
                 # pending -> approved (decision fields stamped together).
                 hold.status = "approved"

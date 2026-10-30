@@ -184,6 +184,7 @@ async def submit(
     impact: str,
     target_fingerprint: str = "",
     agent_key: str | None = None,
+    labels: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Submit a proposal for a bot-initiated action needing human (or
     TECH-5877 auto-judge) approval before it takes effect. Same body shape
@@ -217,6 +218,12 @@ async def submit(
     call's own response (``status`` will already be a terminal one, e.g.
     ``"applied"``), not left sitting at ``"pending"``.
 
+    ``labels``: optional small mapping (TECH-8080 PR9) for the routine's
+    decision log. Supported keys: ``lane``, ``source_type``, ``evidence_type``.
+    Values must be strings matching ``^[a-z][a-z0-9_]{0,31}$`` (1-32 chars,
+    no nesting). Unknown keys are rejected with 422. Absent labels are omitted
+    from responses.
+
     ``target_fingerprint`` is DEPRECATED, OPTIONAL, and ignored (bug
     fix): the value actually stored is computed server-side, by
     re-fetching the target's current fingerprint at submission time --
@@ -248,6 +255,7 @@ async def submit(
         target_fingerprint = service.validate_proposal_string_field(
             "target_fingerprint", target_fingerprint, required=False
         )
+        labels = service.validate_proposal_labels(labels)
         for action_field in ("target_id", "action_type"):
             if action_field in action:
                 service.validate_proposal_string_field(
@@ -308,6 +316,7 @@ async def submit(
             judge=plugins.get_proposal_judge(),
             target_fingerprint=target_fingerprint,
             sender_agent_id=agent.id if agent else None,
+            labels=labels,
         )
 
 

@@ -991,6 +991,7 @@ async def submit_proposal(request: Request) -> Response:
     ``{"kind": str, "action": {..., "target_id": str, "action_type": str},
     "rationale": str, "confidence": "low"|"medium"|"high",
     "importance": "low"|"medium"|"high", "impact": "low"|"medium"|"high",
+    "labels": {"lane"?, "source_type"?, "evidence_type"?} (optional),
     "target_fingerprint": str (optional, deprecated -- see below)}``.
 
     Auth: agent-jwt bearer token carrying ``comms:proposals:write`` (see
@@ -1076,6 +1077,7 @@ async def submit_proposal(request: Request) -> Response:
         target_fingerprint = service.validate_proposal_string_field(
             "target_fingerprint", body.get("target_fingerprint"), required=False
         )
+        labels = service.validate_proposal_labels(body.get("labels"))
         for action_field in ("target_id", "action_type"):
             if action_field in action:
                 service.validate_proposal_string_field(
@@ -1147,6 +1149,7 @@ async def submit_proposal(request: Request) -> Response:
                 judge=plugins.get_proposal_judge(),
                 target_fingerprint=target_fingerprint,
                 sender_agent_id=agent.id if agent else None,
+                labels=labels,
             )
         except RateLimitExceededError as exc:
             # TECH-5875: rejection is operationally visible via this WARNING
