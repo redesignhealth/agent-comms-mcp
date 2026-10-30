@@ -1576,6 +1576,107 @@ class TestDecideProposalEndpoint:
         body = resp.json()
         assert body["status"] == "rejected"
         assert body["decision_note"] == "not needed"
+        assert "decision_reason_code" not in body
+
+    async def test_reject_with_reason_code_only_returns_200(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider, owner_sub="owner-a@example.com")
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+
+        resp = await http_client.post(
+            f"/proposals/{proposal_id}/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={"decision": "reject", "decision_reason_code": "not_now"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "rejected"
+        assert body["decision_reason_code"] == "not_now"
+        assert "decision_note" not in body
+
+    async def test_reject_with_other_and_no_note_returns_400(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider, owner_sub="owner-a@example.com")
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+
+        resp = await http_client.post(
+            f"/proposals/{proposal_id}/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={"decision": "reject", "decision_reason_code": "other"},
+        )
+        assert resp.status_code == 400
+        assert resp.json()["error"] == "decision_note_required"
+
+    async def test_reject_with_other_and_note_returns_200(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider, owner_sub="owner-a@example.com")
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+
+        resp = await http_client.post(
+            f"/proposals/{proposal_id}/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={
+                "decision": "reject",
+                "decision_reason_code": "other",
+                "decision_note": "custom reason",
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "rejected"
+        assert body["decision_reason_code"] == "other"
+        assert body["decision_note"] == "custom reason"
+
+    async def test_decide_unknown_reason_code_returns_400(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider, owner_sub="owner-a@example.com")
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+
+        resp = await http_client.post(
+            f"/proposals/{proposal_id}/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={"decision": "reject", "decision_reason_code": "bogus_code"},
+        )
+        assert resp.status_code == 400
+        assert resp.json()["error"] == "invalid_decision_reason_code"
+
+        resp_approve = await http_client.post(
+            f"/proposals/{proposal_id}/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={"decision": "approve", "decision_reason_code": "bogus_code"},
+        )
+        assert resp_approve.status_code == 400
+        assert resp_approve.json()["error"] == "invalid_decision_reason_code"
+
+    async def test_approve_with_reason_code_returns_200_and_persists(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        _default_proposal_judge: FakeProposalJudge,
+    ) -> None:
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider, owner_sub="owner-a@example.com")
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+        _default_proposal_judge.apply_result = ProposalApplyOutcome(
+            applied=True, result=None, caller_error=None, log_detail=None
+        )
+
+        resp = await http_client.post(
+            f"/proposals/{proposal_id}/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={"decision": "approve", "decision_reason_code": "policy"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "applied"
+        assert body["decision_reason_code"] == "policy"
 
     async def test_approve_matching_fingerprint_applies(
         self,
@@ -1911,6 +2012,27 @@ class TestGetProposalEndpoint:
         # Privacy redaction (Argus review round-2 BLOCKING): the human
         # reviewer's own identity must never reach the submitting bot.
         assert "decided_by_actor_id" not in resp.json()
+
+    async def test_submitting_bot_can_read_decision_reason_code(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        proposal_id = await _submit_via_http(http_client, provider, owner_sub="owner-a@example.com")
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+        decide_resp = await http_client.post(
+            f"/proposals/{proposal_id}/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={"decision": "reject", "decision_reason_code": "not_now"},
+        )
+        assert decide_resp.status_code == 200
+
+        resp = await http_client.get(
+            f"/proposals/{proposal_id}", headers={"Authorization": "Bearer bot-token"}
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "rejected"
+        assert body["decision_reason_code"] == "not_now"
 
 
 class TestWithdrawProposalEndpoint:
