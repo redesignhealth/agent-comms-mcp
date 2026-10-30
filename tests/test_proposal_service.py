@@ -19,6 +19,7 @@ principle" section for why).
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import uuid
 from collections.abc import AsyncIterator
@@ -55,9 +56,12 @@ from service import (
     _APPLY_ERROR_BOARD_COMMIT_FAILURE_MESSAGE,
     _APPLY_ERROR_CANCELLED_MESSAGE,
     _APPLY_ERROR_INDETERMINATE_MESSAGE,
+    _MAX_CONFIGURABLE_RATE_LIMIT,
     MAX_PROPOSALS_PER_BOT_PER_WINDOW,
+    PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR,
     PROPOSAL_SUBMITTER_SURFACES,
     PROPOSAL_TERMINAL_STATUSES,
+    _log_startup_rate_limit_overrides,
     _proposal_resubmission_snapshot,
     _redact_bot_facing_dict,
     audit_denied_proposal_submission,
@@ -67,6 +71,7 @@ from service import (
     list_pending_proposal_holds,
     list_proposal_history_for_owner,
     list_proposals_for_bot,
+    proposal_rate_limit_for,
     withdraw_proposal,
 )
 from tests.proposal_judge_fakes import (
@@ -835,6 +840,236 @@ class TestRateLimit:
 
         result = await _submit(session, action=_action(target_id="TECH-ok"))
         assert result["proposed_by_bot_id"] == "bot-1"
+
+    async def test_override_increases_limit_for_configured_bot_only(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR, '{"bot-high": 10}')
+        # bot-high can submit 10 proposals in the window
+        for i in range(10):
+            await _submit(
+                session, proposed_by_bot_id="bot-high", action=_action(target_id=f"TECH-H{i}")
+            )
+        with pytest.raises(RateLimitExceededError):
+            await _submit(
+                session, proposed_by_bot_id="bot-high", action=_action(target_id="TECH-H10")
+            )
+
+        # bot-other in the same test still gets global default of 5
+        for i in range(MAX_PROPOSALS_PER_BOT_PER_WINDOW):
+            await _submit(
+                session, proposed_by_bot_id="bot-other", action=_action(target_id=f"TECH-O{i}")
+            )
+        with pytest.raises(RateLimitExceededError):
+            await _submit(
+                session, proposed_by_bot_id="bot-other", action=_action(target_id="TECH-O5")
+            )
+
+    async def test_override_precedence_lower_limit_honored(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR, '{"bot-strict": 1}')
+        await _submit(session, proposed_by_bot_id="bot-strict", action=_action(target_id="TECH-1"))
+        with pytest.raises(RateLimitExceededError):
+            await _submit(
+                session, proposed_by_bot_id="bot-strict", action=_action(target_id="TECH-2")
+            )
+
+    async def test_denial_audit_row_records_effective_max(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR, '{"bot-override": 2}')
+        # Fill quota of 2
+        for i in range(2):
+            await _submit(
+                session, proposed_by_bot_id="bot-override", action=_action(target_id=f"TECH-O{i}")
+            )
+        with pytest.raises(RateLimitExceededError):
+            await _submit(
+                session, proposed_by_bot_id="bot-override", action=_action(target_id="TECH-O2")
+            )
+
+        row_override = (
+            await session.execute(
+                select(AuditLog).where(
+                    AuditLog.actor_sub == "bot-override",
+                    AuditLog.action == "denied.proposal_rate_limited",
+                )
+            )
+        ).scalar_one()
+        assert row_override.detail == {"limit": "proposals_per_bot_per_window", "max": 2}
+
+        # Check default bot records max: 5
+        for i in range(MAX_PROPOSALS_PER_BOT_PER_WINDOW):
+            await _submit(
+                session, proposed_by_bot_id="bot-default", action=_action(target_id=f"TECH-D{i}")
+            )
+        with pytest.raises(RateLimitExceededError):
+            await _submit(
+                session, proposed_by_bot_id="bot-default", action=_action(target_id="TECH-D5")
+            )
+
+        row_default = (
+            await session.execute(
+                select(AuditLog).where(
+                    AuditLog.actor_sub == "bot-default",
+                    AuditLog.action == "denied.proposal_rate_limited",
+                )
+            )
+        ).scalar_one()
+        assert row_default.detail == {
+            "limit": "proposals_per_bot_per_window",
+            "max": MAX_PROPOSALS_PER_BOT_PER_WINDOW,
+        }
+
+    async def test_dedup_resubmissions_consume_rate_limit_budget(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Dedup resubmits must count as attempts -- keeping the TECH-5875 audit_log design."""
+        monkeypatch.setenv(PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR, '{"bot-dedup": 3}')
+        # First submission inserts
+        res1 = await _submit(
+            session, proposed_by_bot_id="bot-dedup", action=_action(target_id="TECH-SAME")
+        )
+        hold_id = res1["proposal_id"]
+
+        # Resubmissions 2 and 3 match pending dedup key (in-place update)
+        res2 = await _submit(
+            session, proposed_by_bot_id="bot-dedup", action=_action(target_id="TECH-SAME")
+        )
+        assert res2["proposal_id"] == hold_id
+        res3 = await _submit(
+            session, proposed_by_bot_id="bot-dedup", action=_action(target_id="TECH-SAME")
+        )
+        assert res3["proposal_id"] == hold_id
+
+        # 4th submission exceeds limit of 3
+        with pytest.raises(RateLimitExceededError):
+            await _submit(
+                session, proposed_by_bot_id="bot-dedup", action=_action(target_id="TECH-SAME")
+            )
+
+        # Still only 1 pending row in proposal_holds
+        holds = (
+            (
+                await session.execute(
+                    select(ProposalHold).where(ProposalHold.proposed_by_bot_id == "bot-dedup")
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(holds) == 1
+
+        # But 3 attempt markers + 1 denial in audit_log
+        attempts = (
+            (
+                await session.execute(
+                    select(AuditLog).where(
+                        AuditLog.actor_sub == "bot-dedup",
+                        AuditLog.action == "proposal.submission_attempt",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(attempts) == 3
+
+    def test_failsafe_matrix_falls_back_to_default_with_warning(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        cases = [
+            ("invalid JSON", "{not-valid-json"),
+            ("JSON array instead of object", "[1, 2, 3]"),
+            ("string scalar", '"just_a_string"'),
+            ("limit is 0", '{"bot-1": 0}'),
+            ("limit is -1", '{"bot-1": -1}'),
+            ("limit is 1001 (above ceiling)", f'{{"bot-1": {_MAX_CONFIGURABLE_RATE_LIMIT + 1}}}'),
+            ("empty string", ""),
+            ("whitespace string", "   \t\n  "),
+            ("null limit value", '{"bot-1": null}'),
+            ("string limit value", '{"bot-1": "100"}'),
+            ("float limit value", '{"bot-1": 10.5}'),
+            ("bool limit value", '{"bot-1": true}'),
+            ("empty key in map", '{"": 100}'),
+        ]
+        for desc, env_val in cases:
+            caplog.clear()
+            monkeypatch.setenv(PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR, env_val)
+            with caplog.at_level(logging.WARNING):
+                limit = proposal_rate_limit_for("bot-1")
+            assert limit == MAX_PROPOSALS_PER_BOT_PER_WINDOW, f"Case {desc} should return default"
+            warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+            assert len(warnings) >= 1, f"Case {desc} should log a WARNING"
+
+    def test_unset_env_var_returns_default_without_warning(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.delenv(PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR, raising=False)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            limit = proposal_rate_limit_for("bot-1")
+        assert limit == MAX_PROPOSALS_PER_BOT_PER_WINDOW
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 0
+
+    def test_startup_info_logging(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # 1. Unset logs info about empty map
+        monkeypatch.delenv(PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR, raising=False)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            _log_startup_rate_limit_overrides()
+        info_records = [r for r in caplog.records if r.levelno == logging.INFO]
+        assert any("unset" in r.message and "empty map" in r.message for r in info_records)
+
+        # 2. Configured logs info with overrides
+        monkeypatch.setenv(PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR, '{"routine-bot": 100}')
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            _log_startup_rate_limit_overrides()
+        info_records = [r for r in caplog.records if r.levelno == logging.INFO]
+        assert any("routine-bot" in r.message and "100" in r.message for r in info_records)
+
+        # 3. Malformed logs warning and info about empty map
+        monkeypatch.setenv(PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR, "{invalid")
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            _log_startup_rate_limit_overrides()
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) >= 1
+        info_records = [r for r in caplog.records if r.levelno == logging.INFO]
+        assert any("empty override map" in r.message for r in info_records)
+
+    async def test_concurrent_submissions_serialize_and_cap_at_override(
+        self, session_factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        override_cap = 4
+        burst_size = 10
+        monkeypatch.setenv(
+            PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR, f'{{"bot-concurrent": {override_cap}}}'
+        )
+
+        async def _submit_concurrent(idx: int) -> dict[str, Any]:
+            async with session_factory() as s:
+                return await _submit(
+                    s,
+                    proposed_by_bot_id="bot-concurrent",
+                    action=_action(target_id=f"TECH-CONCURRENT-{idx}"),
+                )
+
+        results = await asyncio.gather(
+            *[_submit_concurrent(i) for i in range(burst_size)],
+            return_exceptions=True,
+        )
+
+        successes = [r for r in results if isinstance(r, dict)]
+        denials = [r for r in results if isinstance(r, RateLimitExceededError)]
+
+        assert len(successes) == override_cap
+        assert len(denials) == burst_size - override_cap
 
 
 class TestOwnerSubVisibility:

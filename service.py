@@ -6569,7 +6569,144 @@ async def decide_hold(
 # unique-index race below).
 PROPOSAL_RATE_LIMIT_WINDOW = timedelta(minutes=1)
 MAX_PROPOSALS_PER_BOT_PER_WINDOW = 5
+PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR = "PROPOSAL_RATE_LIMIT_PER_BOT"
+_MAX_CONFIGURABLE_RATE_LIMIT = 1000
 _PROPOSAL_SUBMISSION_ATTEMPT_ACTION = "proposal.submission_attempt"
+
+
+def _parse_proposal_rate_limit_overrides(raw: str | None) -> dict[str, int]:
+    """Parse the ``PROPOSAL_RATE_LIMIT_PER_BOT`` env var into a dict of
+    exact bot_sub -> integer limit.
+
+    Precedence and validation rules per TECH-8080 (PR11) / TECH-5875:
+      - Unset (None): empty dict, no warning.
+      - Empty or whitespace string: empty dict, logs a WARNING.
+      - Invalid JSON: empty dict, logs a WARNING.
+      - Non-object JSON (array, scalar): empty dict, logs a WARNING.
+      - Keys must be non-empty strings; non-string or empty keys log a WARNING.
+      - Values must be integers (not bools) in [1, _MAX_CONFIGURABLE_RATE_LIMIT];
+        <= 0, non-int, > ceiling, or null all log a WARNING and fall back to the
+        default (skipped from the returned map).
+    """
+    if raw is None:
+        return {}
+    if not raw.strip():
+        logger.warning(
+            "%s is empty; falling back to default limit %d",
+            PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR,
+            MAX_PROPOSALS_PER_BOT_PER_WINDOW,
+        )
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        logger.warning(
+            "%s is not valid JSON; falling back to default limit %d",
+            PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR,
+            MAX_PROPOSALS_PER_BOT_PER_WINDOW,
+        )
+        return {}
+    if not isinstance(parsed, dict):
+        logger.warning(
+            "%s must be a JSON object; falling back to default limit %d",
+            PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR,
+            MAX_PROPOSALS_PER_BOT_PER_WINDOW,
+        )
+        return {}
+
+    overrides: dict[str, int] = {}
+    for k, v in parsed.items():
+        if not isinstance(k, str) or not k:
+            logger.warning(
+                "%s has invalid key %r (must be non-empty string); skipping",
+                PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR,
+                k,
+            )
+            continue
+        if isinstance(v, bool) or not isinstance(v, int):
+            logger.warning(
+                "%s: limit for bot %r must be an integer, got %r; falling back to default %d",
+                PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR,
+                k,
+                v,
+                MAX_PROPOSALS_PER_BOT_PER_WINDOW,
+            )
+            continue
+        if v <= 0:
+            logger.warning(
+                "%s: limit for bot %r must be positive (> 0), got %r; falling back to default %d",
+                PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR,
+                k,
+                v,
+                MAX_PROPOSALS_PER_BOT_PER_WINDOW,
+            )
+            continue
+        if v > _MAX_CONFIGURABLE_RATE_LIMIT:
+            logger.warning(
+                "%s: limit for bot %r exceeds ceiling of %d, got %r; falling back to default %d",
+                PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR,
+                k,
+                _MAX_CONFIGURABLE_RATE_LIMIT,
+                v,
+                MAX_PROPOSALS_PER_BOT_PER_WINDOW,
+            )
+            continue
+        overrides[k] = v
+    return overrides
+
+
+def proposal_rate_limit_for(bot_id: str | None = None, *, bot_sub: str | None = None) -> int:
+    """Per-bot submission limit for the global PROPOSAL_RATE_LIMIT_WINDOW.
+
+    Precedence:
+      1. An exact match on ``bot_id`` (or ``bot_sub``) in PROPOSAL_RATE_LIMIT_PER_BOT,
+         if that value is an int in [1, _MAX_CONFIGURABLE_RATE_LIMIT].
+      2. Otherwise MAX_PROPOSALS_PER_BOT_PER_WINDOW (5).
+
+    Read live, matching cross_brain_enabled/cross_brain_auto_rules
+    (service.py:7653-7666), so retuning needs no code change.
+
+    Fails SAFE, never open. Unset, empty, invalid JSON, a non-object, a
+    non-int value, a value <= 0, or a value above the ceiling all log a
+    WARNING and fall back to the global default. There is no syntax that
+    yields an unlimited limit.
+    """
+    target = bot_id if bot_id is not None else bot_sub
+    if not target or not isinstance(target, str):
+        return MAX_PROPOSALS_PER_BOT_PER_WINDOW
+
+    overrides = _parse_proposal_rate_limit_overrides(
+        os.environ.get(PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR)
+    )
+    return overrides.get(target, MAX_PROPOSALS_PER_BOT_PER_WINDOW)
+
+
+def _log_startup_rate_limit_overrides() -> None:
+    raw = os.environ.get(PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR)
+    if raw is None:
+        logger.info(
+            "%s is unset; no per-bot overrides configured (empty map, default %d/window)",
+            PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR,
+            MAX_PROPOSALS_PER_BOT_PER_WINDOW,
+        )
+        return
+    overrides = _parse_proposal_rate_limit_overrides(raw)
+    if not overrides:
+        logger.info(
+            "%s parsed to an empty override map (default %d/window)",
+            PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR,
+            MAX_PROPOSALS_PER_BOT_PER_WINDOW,
+        )
+    else:
+        logger.info(
+            "%s loaded %d per-bot override(s): %s",
+            PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR,
+            len(overrides),
+            overrides,
+        )
+
+
+_log_startup_rate_limit_overrides()
 
 
 async def _deny_rate_limited_proposals(session: AsyncSession, *, proposed_by_bot_id: str) -> None:
@@ -6612,6 +6749,7 @@ async def _deny_rate_limited_proposals(session: AsyncSession, *, proposed_by_bot
         text("SELECT pg_advisory_xact_lock(hashtext('proposal_rate_limit:' || :bot_id))"),
         {"bot_id": proposed_by_bot_id},
     )
+    limit = proposal_rate_limit_for(proposed_by_bot_id)
     window_start = _now() - PROPOSAL_RATE_LIMIT_WINDOW
     count = (
         await session.execute(
@@ -6624,16 +6762,16 @@ async def _deny_rate_limited_proposals(session: AsyncSession, *, proposed_by_bot
             )
         )
     ).scalar_one()
-    if count >= MAX_PROPOSALS_PER_BOT_PER_WINDOW:
+    if count >= limit:
         _audit(
             session,
             actor_sub=proposed_by_bot_id,
             action="denied.proposal_rate_limited",
-            detail={"limit": "proposals_per_bot_per_window"},
+            detail={"limit": "proposals_per_bot_per_window", "max": limit},
         )
         await session.commit()
         raise RateLimitExceededError(
-            f"rate_limited: at most {MAX_PROPOSALS_PER_BOT_PER_WINDOW} proposals per "
+            f"rate_limited: at most {limit} proposals per "
             f"{int(PROPOSAL_RATE_LIMIT_WINDOW.total_seconds())}s per bot",
             reason="proposals_per_bot_per_window",
         )
@@ -11106,6 +11244,7 @@ __all__ = [
     "OWNERSHIP_CLIENT_ENV_VAR",
     "OWNER_REASSIGNMENT_SOURCE",
     "PROPOSAL_HOLD_LEVELS",
+    "PROPOSAL_RATE_LIMIT_OVERRIDES_ENV_VAR",
     "PROPOSAL_RATE_LIMIT_WINDOW",
     "PROPOSAL_SUBMITTER_SURFACES",
     "PROPOSAL_TERMINAL_STATUSES",
@@ -11153,6 +11292,7 @@ __all__ = [
     "parse_decision_page_base_url",
     "post_message",
     "proposal_action_serialized_bytes",
+    "proposal_rate_limit_for",
     "reconcile_agent_ownership",
     "register_agent",
     "rename_conversation",
