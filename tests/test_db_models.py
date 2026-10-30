@@ -448,6 +448,7 @@ class TestSchema:
         audit_indexes = await _indexes(engine, "audit_log")
         assert "idx_audit_log_conversation_id" in audit_indexes
         assert "idx_audit_log_at" in audit_indexes
+        assert "idx_audit_log_action_at" in audit_indexes
         assert "idx_audit_log_task_id" not in audit_indexes
 
         message_indexes = await _indexes(engine, "messages")
@@ -1417,6 +1418,74 @@ class TestProposalHoldsSchema:
                 capture_output=True,
                 text=True,
             )
+
+    async def test_tech_8080_pr13_audit_log_index_valid_and_ready_guard(
+        self, engine: AsyncEngine
+    ) -> None:
+        """TECH-8080 PR13: _assert_audit_log_index_valid_and_ready validates both
+        indisvalid and indisready on idx_audit_log_action_at, raising RuntimeError if
+        missing, invalid, or unready."""
+        import importlib
+        migration_mod = importlib.import_module(
+            "migrations.versions.58dd9bd941a6_add_idx_audit_log_action_at"
+        )
+        _assert_audit_log_index_valid_and_ready = (
+            migration_mod._assert_audit_log_index_valid_and_ready
+        )
+
+        async with engine.connect() as conn:
+            # 1. Missing index raises RuntimeError
+            def _check_missing(sync_conn):
+                with pytest.raises(RuntimeError, match="not found in pg_index"):
+                    _assert_audit_log_index_valid_and_ready(
+                        "idx_missing_audit_log_test", bind=sync_conn
+                    )
+
+            await conn.run_sync(_check_missing)
+
+            # 2. Existing valid index passes
+            def _check_valid(sync_conn):
+                _assert_audit_log_index_valid_and_ready("idx_audit_log_action_at", bind=sync_conn)
+
+            await conn.run_sync(_check_valid)
+
+            # 3. Invalid (indisvalid=false) raises
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_audit_guard_test ON audit_log (id)")
+            )
+            try:
+                await conn.execute(
+                    text(
+                        "UPDATE pg_index SET indisvalid = false "
+                        "WHERE indexrelid = 'idx_audit_guard_test'::regclass"
+                    )
+                )
+
+                def _check_invalid(sync_conn):
+                    with pytest.raises(RuntimeError, match="not valid and ready"):
+                        _assert_audit_log_index_valid_and_ready(
+                            "idx_audit_guard_test", bind=sync_conn
+                        )
+
+                await conn.run_sync(_check_invalid)
+
+                # 4. Unready (indisready=false) raises
+                await conn.execute(
+                    text(
+                        "UPDATE pg_index SET indisvalid = true, indisready = false "
+                        "WHERE indexrelid = 'idx_audit_guard_test'::regclass"
+                    )
+                )
+
+                def _check_unready(sync_conn):
+                    with pytest.raises(RuntimeError, match="not valid and ready"):
+                        _assert_audit_log_index_valid_and_ready(
+                            "idx_audit_guard_test", bind=sync_conn
+                        )
+
+                await conn.run_sync(_check_unready)
+            finally:
+                await conn.execute(text("DROP INDEX IF EXISTS idx_audit_guard_test"))
 
     async def test_decision_consistency_check_constraint_rejects_pending_with_decision(
         self, engine: AsyncEngine

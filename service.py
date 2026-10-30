@@ -6643,6 +6643,261 @@ async def _deny_rate_limited_proposals(session: AsyncSession, *, proposed_by_bot
         )
 
 
+# --- Auto-approval kill switch & daily caps (TECH-8080 PR13) -----------------
+#
+# NOTE ON RELATIONSHIP WITH APPROVALS-SERVICE CONFIG (PR12):
+# In the approvals service (agent-comms-approvals), PROPOSAL_AUTO_APPROVE_CONFIG
+# holds static per-action-type configuration and metadata. In approvals, a daily_cap
+# of 0 disables auto-approval locally (fail closed), but positive daily_cap values are
+# purely advisory metadata because the approvals service has no database or counter.
+#
+# By contrast, the board service (agent-comms-mcp) is the sole authority for positive
+# daily auto-approval quota enforcement. PROPOSAL_AUTO_APPROVE_DAILY_CAPS on the board
+# enforces daily caps via PostgreSQL advisory transaction locks and durable audit_log
+# counts across all bot submissions and instances.
+#
+# Setting daily_cap metadata in approvals does NOT automatically configure the board's
+# PROPOSAL_AUTO_APPROVE_DAILY_CAPS, and vice versa. Operators must explicitly set
+# PROPOSAL_AUTO_APPROVE_DAILY_CAPS on the board task definition.
+# ------------------------------------------------------------------------------
+
+PROPOSAL_AUTO_APPROVE_KILL_SWITCH_ENV_VAR = "PROPOSAL_AUTO_APPROVE_KILL_SWITCH"
+PROPOSAL_AUTO_APPROVE_DAILY_CAPS_ENV_VAR = "PROPOSAL_AUTO_APPROVE_DAILY_CAPS"
+_AUTO_APPROVED_AUDIT_ACTION = "proposal.auto_approved"
+_AUTO_APPROVE_DENIED_AUDIT_ACTION = "denied.proposal_auto_approve"
+
+
+def _parse_proposal_auto_approve_kill_switch(raw: str | None) -> bool:
+    """Parse PROPOSAL_AUTO_APPROVE_KILL_SWITCH into a boolean.
+
+    Rules:
+      - Unset (None): returns False (kill switch OFF, auto-approval allowed as today).
+      - Empty or whitespace string: returns False (kill switch OFF).
+      - Strictly truthy ("true", "1", "yes", case-insensitive, stripped):
+        returns True (kill switch ON).
+      - Strictly falsy ("false", "0", "no", case-insensitive, stripped):
+        returns False (kill switch OFF).
+      - Unrecognized values: returns False (kill switch OFF) with a WARNING.
+
+    Failure direction rationale:
+      The kill switch defaults OFF to preserve existing live behavior. Unrecognized values
+      count as OFF (auto-approval allowed) so an unexpected string does not accidentally disable
+      auto-approval in production. A WARNING is logged so operators are alerted that the kill
+      switch was not engaged despite non-empty configuration. The switch never blocks human
+      approvals or decisions.
+    """
+    if raw is None:
+        return False
+    cleaned = raw.strip().lower()
+    if not cleaned:
+        return False
+    if cleaned in ("true", "1", "yes"):
+        return True
+    if cleaned in ("false", "0", "no"):
+        return False
+    logger.warning(
+        "%s has unrecognized value %r; falling back to OFF (kill switch inactive)",
+        PROPOSAL_AUTO_APPROVE_KILL_SWITCH_ENV_VAR,
+        raw,
+    )
+    return False
+
+
+_cached_proposal_auto_approve_kill_switch: bool | None = None
+
+
+def get_proposal_auto_approve_kill_switch() -> bool:
+    """Return whether the global proposal auto-approval kill switch is active (cached)."""
+    global _cached_proposal_auto_approve_kill_switch
+    if _cached_proposal_auto_approve_kill_switch is None:
+        raw = os.environ.get(PROPOSAL_AUTO_APPROVE_KILL_SWITCH_ENV_VAR)
+        _cached_proposal_auto_approve_kill_switch = _parse_proposal_auto_approve_kill_switch(raw)
+    return _cached_proposal_auto_approve_kill_switch
+
+
+def reset_proposal_auto_approve_kill_switch_cache() -> None:
+    """Clear cached kill switch state so subsequent calls reload from env."""
+    global _cached_proposal_auto_approve_kill_switch
+    _cached_proposal_auto_approve_kill_switch = None
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[Any, Any]]) -> dict[Any, Any]:
+    result: dict[Any, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate key {key!r} in JSON object")
+        result[key] = value
+    return result
+
+
+class _AllClosedMap(dict[str, int]):
+    """Marker dict indicating all action types have a cap of 0
+    (fail-closed due to malformed map).
+    """
+
+    def __getitem__(self, key: str) -> int:
+        return 0
+
+    def get(self, key: str, default: Any = None) -> int:
+        return 0
+
+
+_ALL_AUTO_APPROVE_CAPS_CLOSED = _AllClosedMap()
+_UNSET_CAPS: Any = object()
+
+
+def _parse_proposal_auto_approve_daily_caps(raw: str | None) -> dict[str, int] | None:
+    """Parse PROPOSAL_AUTO_APPROVE_DAILY_CAPS JSON into a map of action_type -> non-negative int.
+
+    Rules:
+      - Unset (None): returns None (no cap configured, preserving live behavior).
+      - Invalid JSON, non-object, duplicate keys, or empty/whitespace string:
+        logs a WARNING and fails closed (_ALL_AUTO_APPROVE_CAPS_CLOSED with cap 0 for all actions).
+        Never raises at import.
+      - Non-empty dict:
+        - Non-string or empty keys: logs a WARNING and skipped.
+        - Values must be non-negative integers (not bools). Invalid values log a WARNING
+          and fail closed for that action_type with cap 0.
+    """
+    if raw is None:
+        return None
+    if not raw.strip():
+        logger.warning(
+            "%s is empty or whitespace; failing closed with all auto-approvals closed (cap 0)",
+            PROPOSAL_AUTO_APPROVE_DAILY_CAPS_ENV_VAR,
+        )
+        return _ALL_AUTO_APPROVE_CAPS_CLOSED
+    try:
+        parsed = json.loads(raw, object_pairs_hook=_reject_duplicate_json_keys)
+    except Exception as exc:
+        logger.warning(
+            "%s is not valid JSON (%s); failing closed with all auto-approvals closed (cap 0)",
+            PROPOSAL_AUTO_APPROVE_DAILY_CAPS_ENV_VAR,
+            exc,
+        )
+        return _ALL_AUTO_APPROVE_CAPS_CLOSED
+
+    if not isinstance(parsed, dict):
+        logger.warning(
+            "%s must be a JSON object, got %s; failing closed with all auto-approvals closed "
+            "(cap 0)",
+            PROPOSAL_AUTO_APPROVE_DAILY_CAPS_ENV_VAR,
+            type(parsed).__name__,
+        )
+        return _ALL_AUTO_APPROVE_CAPS_CLOSED
+
+    caps: dict[str, int] = {}
+    for key, val in parsed.items():
+        if not isinstance(key, str) or not key.strip():
+            logger.warning(
+                "%s contains a non-string or empty key %r; skipping this entry",
+                PROPOSAL_AUTO_APPROVE_DAILY_CAPS_ENV_VAR,
+                key,
+            )
+            continue
+        if type(val) is not int or val < 0:
+            logger.warning(
+                "%s value for key %r must be a non-negative integer, got %r (%s); "
+                "failing closed with cap 0 for %s",
+                PROPOSAL_AUTO_APPROVE_DAILY_CAPS_ENV_VAR,
+                key,
+                val,
+                type(val).__name__,
+                key,
+            )
+            caps[key] = 0
+        else:
+            caps[key] = val
+    return caps
+
+
+_cached_proposal_auto_approve_daily_caps: dict[str, int] | None = _UNSET_CAPS
+
+
+def get_proposal_auto_approve_daily_caps() -> dict[str, int] | None:
+    """Return the parsed daily caps map, cached in-process."""
+    global _cached_proposal_auto_approve_daily_caps
+    if _cached_proposal_auto_approve_daily_caps is _UNSET_CAPS:
+        raw = os.environ.get(PROPOSAL_AUTO_APPROVE_DAILY_CAPS_ENV_VAR)
+        _cached_proposal_auto_approve_daily_caps = _parse_proposal_auto_approve_daily_caps(raw)
+    return _cached_proposal_auto_approve_daily_caps
+
+
+def proposal_auto_approve_daily_cap_for(action_type: str) -> int | None:
+    """Return the configured daily auto-approval cap for action_type, or None if uncapped.
+
+    Scope:
+      Counted globally per action_type across all bots. Daily caps bound organizational
+      risk for sensitive action types platform-wide, preventing bot proliferation from
+      circumventing safety ceilings.
+    """
+    caps = get_proposal_auto_approve_daily_caps()
+    if caps is None:
+        return None
+    if isinstance(caps, _AllClosedMap):
+        return 0
+    return caps.get(action_type)
+
+
+def reset_proposal_auto_approve_daily_caps_cache() -> None:
+    """Clear cached daily caps map so subsequent calls reload from env."""
+    global _cached_proposal_auto_approve_daily_caps
+    _cached_proposal_auto_approve_daily_caps = _UNSET_CAPS
+
+
+def reset_proposal_auto_approve_cache() -> None:
+    """Clear all auto-approval configuration caches (kill switch and daily caps)."""
+    reset_proposal_auto_approve_kill_switch_cache()
+    reset_proposal_auto_approve_daily_caps_cache()
+
+
+def _utc_day_start(now: datetime | None = None) -> datetime:
+    """Return midnight UTC (00:00:00.000000+00:00) for the current day.
+
+    Daily auto-approval caps are scoped to the UTC calendar day.
+    """
+    current = now if now is not None else _now()
+    return current.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def log_proposal_auto_approve_config() -> None:
+    """Log effective auto-approval kill switch and daily caps at INFO on startup.
+    Called from main.py after logging is configured. Emits no secrets.
+    """
+    kill_switch = get_proposal_auto_approve_kill_switch()
+    raw_caps = os.environ.get(PROPOSAL_AUTO_APPROVE_DAILY_CAPS_ENV_VAR)
+    caps = get_proposal_auto_approve_daily_caps()
+
+    logger.info(
+        "Proposal auto-approval config: kill_switch=%s (%s=%r)",
+        "ACTIVE (auto-approval disabled)" if kill_switch else "OFF (auto-approval allowed)",
+        PROPOSAL_AUTO_APPROVE_KILL_SWITCH_ENV_VAR,
+        os.environ.get(PROPOSAL_AUTO_APPROVE_KILL_SWITCH_ENV_VAR),
+    )
+    if raw_caps is None:
+        logger.info(
+            "%s is unset; daily auto-approval caps: uncapped",
+            PROPOSAL_AUTO_APPROVE_DAILY_CAPS_ENV_VAR,
+        )
+    elif isinstance(caps, _AllClosedMap):
+        logger.info(
+            "%s is malformed; all daily auto-approval caps closed (cap=0)",
+            PROPOSAL_AUTO_APPROVE_DAILY_CAPS_ENV_VAR,
+        )
+    elif not caps:
+        logger.info(
+            "%s parsed to an empty caps map (unlimited for unlisted action types)",
+            PROPOSAL_AUTO_APPROVE_DAILY_CAPS_ENV_VAR,
+        )
+    else:
+        logger.info(
+            "%s configured %d daily cap(s): %s",
+            PROPOSAL_AUTO_APPROVE_DAILY_CAPS_ENV_VAR,
+            len(caps),
+            caps,
+        )
+
+
 def _extract_proposal_target(action: dict[str, Any]) -> tuple[str, str]:
     """Derive ``(target_id, action_type)`` from a proposal's free-form
     ``action`` JSONB payload (TECH-5872 create-time dedup key).
@@ -8258,6 +8513,76 @@ async def create_proposal(
         else:
             judged_status = "pending"
             decision_note = "cross-brain proposals always require human approval"
+
+    if judged_status == "approved":
+        # TECH-8080 PR13: Emergency kill switch & daily auto-approval cap guards.
+        # Metering is strictly by validated action_type (not parsed verdict_rule, which
+        # may be None for legacy progress update actions per PR12).
+        if get_proposal_auto_approve_kill_switch():
+            judged_status = "pending"
+            decision_note = "auto-approval is globally disabled; held for human review"
+            _audit(
+                session,
+                actor_sub=proposed_by_bot_id,
+                action=_AUTO_APPROVE_DENIED_AUDIT_ACTION,
+                detail={
+                    "rule": "auto_approve.kill_switch",
+                    "original_rule": verdict_rule,
+                    "action_type": action_type,
+                    "hold_id": str(hold.id),
+                    "reason": "kill_switch",
+                },
+            )
+            hold.decision_note = decision_note
+            await session.commit()
+            await session.refresh(hold)
+        else:
+            cap = proposal_auto_approve_daily_cap_for(action_type)
+            if cap is not None:
+                # Race-safe advisory transaction lock serialized per action_type
+                await session.execute(
+                    text(
+                        "SELECT pg_advisory_xact_lock("
+                        "hashtext('proposal_auto_approve_cap:' || :action_type))"
+                    ),
+                    {"action_type": action_type},
+                )
+                day_start = _utc_day_start()
+                count = (
+                    await session.execute(
+                        select(func.count())
+                        .select_from(AuditLog)
+                        .where(
+                            AuditLog.action == _AUTO_APPROVED_AUDIT_ACTION,
+                            AuditLog.detail.op("->>")("action_type") == action_type,
+                            AuditLog.at >= day_start,
+                        )
+                    )
+                ).scalar_one()
+                if count >= cap:
+                    judged_status = "pending"
+                    decision_note = (
+                        f"daily auto-approval cap reached for {action_type}; "
+                        "held for human review"
+                    )
+                    _audit(
+                        session,
+                        actor_sub=proposed_by_bot_id,
+                        action=_AUTO_APPROVE_DENIED_AUDIT_ACTION,
+                        detail={
+                            "rule": f"auto_approve.cap_exhausted.{action_type}",
+                            "original_rule": verdict_rule,
+                            "action_type": action_type,
+                            "hold_id": str(hold.id),
+                            "cap": cap,
+                            "count": count,
+                            "reason": "cap_exhausted",
+                        },
+                    )
+                    hold.decision_note = decision_note
+                    await session.commit()
+                    await session.refresh(hold)
+
     auto_approved = judged_status == "approved" and hold.status == "pending"
 
     if not auto_approved:
@@ -8280,6 +8605,8 @@ async def create_proposal(
         decision_note=decision_note,
         expected_payload=judged_payload,
         cross_brain_auto_rule=cross_brain_auto_rule,
+        auto_approved_action_type=action_type,
+        auto_approved_verdict_rule=verdict_rule,
     )
     if not claimed:
         # Two distinct causes reach here, both meaning "do not apply this
@@ -8742,6 +9069,8 @@ async def _claim_proposal_hold_for_applying(
     decision_note: str | None,
     expected_payload: tuple[Any, ...] | None = None,
     cross_brain_auto_rule: str | None = None,
+    auto_approved_action_type: str | None = None,
+    auto_approved_verdict_rule: str | None = None,
 ) -> bool:
     """Claims a still-``"pending"`` hold for synchronous apply by writing
     ``status="applying"`` under a fresh ``FOR UPDATE`` and committing
@@ -8803,6 +9132,18 @@ async def _claim_proposal_hold_for_applying(
             actor_sub=decided_by_actor_id,
             action="proposal.cross_brain_auto_approved",
             detail={"hold_id": str(hold_id), "rule": cross_brain_auto_rule},
+        )
+    if decision_source == "auto" and auto_approved_action_type is not None:
+        # Audited in the same transaction as the claim under the advisory lock (TECH-8080 PR13).
+        _audit(
+            session,
+            actor_sub=decided_by_actor_id,
+            action=_AUTO_APPROVED_AUDIT_ACTION,
+            detail={
+                "action_type": auto_approved_action_type,
+                "rule": auto_approved_verdict_rule,
+                "hold_id": str(hold_id),
+            },
         )
     await session.commit()
     return True
@@ -11310,6 +11651,8 @@ __all__ = [
     "OWNERSHIP_CLIENTS",
     "OWNERSHIP_CLIENT_ENV_VAR",
     "OWNER_REASSIGNMENT_SOURCE",
+    "PROPOSAL_AUTO_APPROVE_DAILY_CAPS_ENV_VAR",
+    "PROPOSAL_AUTO_APPROVE_KILL_SWITCH_ENV_VAR",
     "PROPOSAL_HOLD_LEVELS",
     "PROPOSAL_RATE_LIMIT_WINDOW",
     "PROPOSAL_SUBMITTER_SURFACES",
@@ -11338,6 +11681,8 @@ __all__ = [
     "get_conversation",
     "get_hold_status",
     "get_ownership_client_factory",
+    "get_proposal_auto_approve_daily_caps",
+    "get_proposal_auto_approve_kill_switch",
     "get_proposal_for_bot",
     "inbox",
     "invite",
@@ -11348,6 +11693,7 @@ __all__ = [
     "list_pending_proposal_holds",
     "list_proposal_history_for_owner",
     "list_proposals_for_bot",
+    "log_proposal_auto_approve_config",
     "lookup_agent_by_email",
     "max_proposal_action_bytes",
     "may_assign",
@@ -11358,11 +11704,15 @@ __all__ = [
     "parse_decision_page_base_url",
     "post_message",
     "proposal_action_serialized_bytes",
+    "proposal_auto_approve_daily_cap_for",
     "reconcile_agent_ownership",
     "register_agent",
     "rename_conversation",
     "reopen_conversation",
     "request_owner_reassignment",
+    "reset_proposal_auto_approve_cache",
+    "reset_proposal_auto_approve_daily_caps_cache",
+    "reset_proposal_auto_approve_kill_switch_cache",
     "resolve_conversation_participant",
     "resolve_inbox_target",
     "resolve_proposal_owner_sub",

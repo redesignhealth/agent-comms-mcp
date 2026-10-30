@@ -599,6 +599,19 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
         "ON proposal_holds (proposed_by_bot_id, status, log_seq)" in result.stdout
     )
 
+    # 58dd9bd941a6 (TECH-8080 PR13): idx_audit_log_action_at on audit_log (action, at)
+    # built CONCURRENTLY in an autocommit block.
+    assert (
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_audit_log_action_at "
+        "ON audit_log (action, at);" in result.stdout
+    )
+    concurrent_audit_pos = result.stdout.index(
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_audit_log_action_at "
+        "ON audit_log (action, at);"
+    )
+    commit_audit_pos = result.stdout.index("COMMIT;", reason_validate_pos)
+    assert commit_audit_pos < concurrent_audit_pos
+
 
 def test_alembic_single_head() -> None:
     result = subprocess.run(
@@ -611,4 +624,4 @@ def test_alembic_single_head() -> None:
     assert result.returncode == 0, result.stderr
     heads = [line.strip() for line in result.stdout.strip().splitlines() if line.strip()]
     assert len(heads) == 1, f"Expected single head, got: {heads}"
-    assert "b4a2d8e6f1c3" in heads[0]
+    assert "58dd9bd941a6" in heads[0]

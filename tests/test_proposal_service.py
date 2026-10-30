@@ -19,16 +19,17 @@ principle" section for why).
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import uuid
-from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from collections.abc import AsyncIterator, Iterator
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import select, text, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -55,20 +56,30 @@ from service import (
     _APPLY_ERROR_BOARD_COMMIT_FAILURE_MESSAGE,
     _APPLY_ERROR_CANCELLED_MESSAGE,
     _APPLY_ERROR_INDETERMINATE_MESSAGE,
+    _AUTO_APPROVE_DENIED_AUDIT_ACTION,
+    _AUTO_APPROVED_AUDIT_ACTION,
     MAX_PROPOSALS_PER_BOT_PER_WINDOW,
+    PROPOSAL_AUTO_APPROVE_DAILY_CAPS_ENV_VAR,
+    PROPOSAL_AUTO_APPROVE_KILL_SWITCH_ENV_VAR,
     PROPOSAL_SUBMITTER_SURFACES,
     PROPOSAL_TERMINAL_STATUSES,
     _decode_proposal_cursor,
     _encode_proposal_cursor,
     _proposal_resubmission_snapshot,
     _redact_bot_facing_dict,
+    _utc_day_start,
     audit_denied_proposal_submission,
     create_proposal,
     decide_proposal,
+    get_proposal_auto_approve_daily_caps,
+    get_proposal_auto_approve_kill_switch,
     get_proposal_for_bot,
     list_pending_proposal_holds,
     list_proposal_history_for_owner,
     list_proposals_for_bot,
+    log_proposal_auto_approve_config,
+    proposal_auto_approve_daily_cap_for,
+    reset_proposal_auto_approve_cache,
     withdraw_proposal,
 )
 from tests.proposal_judge_fakes import (
@@ -1097,6 +1108,625 @@ class TestJudgeApplyBoardMechanics:
         second = await _submit(session, action=_action(target_id=target_id), judge=approving_judge)
         assert second["proposal_id"] == first["proposal_id"]
         assert second["status"] == "applied"
+
+
+class TestProposalAutoApproveKillSwitchAndDailyCaps:
+    @pytest.fixture(autouse=True)
+    def _manage_cache(self) -> Iterator[None]:
+        reset_proposal_auto_approve_cache()
+        yield
+        reset_proposal_auto_approve_cache()
+
+    async def test_kill_switch_off_allows_auto_approval(self, session: AsyncSession) -> None:
+        judge = FakeProposalJudge(
+            judge_result=ProposalVerdict(
+                approved=True,
+                decision_note="looks good",
+                rule="linear_progress_update:open_ticket",
+            ),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result={"applied": True}, caller_error=None, log_detail=None
+            ),
+        )
+        res = await _submit(session, action=_action(action_type="open_ticket"), judge=judge)
+        assert res["status"] == "applied"
+        assert len(judge.apply_calls) == 1
+
+        # Exactly one proposal.auto_approved audit row
+        audits = (
+            await session.execute(
+                select(AuditLog).where(AuditLog.action == _AUTO_APPROVED_AUDIT_ACTION)
+            )
+        ).scalars().all()
+        assert len(audits) == 1
+        assert audits[0].detail is not None
+        assert audits[0].detail["action_type"] == "open_ticket"
+        assert audits[0].detail["rule"] == "linear_progress_update:open_ticket"
+
+    async def test_kill_switch_on_downgrades_to_pending_and_preserves_rule(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(PROPOSAL_AUTO_APPROVE_KILL_SWITCH_ENV_VAR, "true")
+        reset_proposal_auto_approve_cache()
+
+        judge = FakeProposalJudge(
+            judge_result=ProposalVerdict(
+                approved=True,
+                decision_note="looks good",
+                rule="linear_progress_update:open_ticket",
+            ),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result={"applied": True}, caller_error=None, log_detail=None
+            ),
+        )
+        res = await _submit(session, action=_action(action_type="open_ticket"), judge=judge)
+        assert res["status"] == "pending"
+        assert res["decision_note"] == "auto-approval is globally disabled; held for human review"
+        # Fake judge applier never called
+        assert len(judge.apply_calls) == 0
+
+        # No proposal.auto_approved audit rows
+        approved_audits = (
+            await session.execute(
+                select(AuditLog).where(AuditLog.action == _AUTO_APPROVED_AUDIT_ACTION)
+            )
+        ).scalars().all()
+        assert len(approved_audits) == 0
+
+        # Exactly one denial audit row with rule auto_approve.kill_switch
+        denial_audits = (
+            await session.execute(
+                select(AuditLog).where(AuditLog.action == _AUTO_APPROVE_DENIED_AUDIT_ACTION)
+            )
+        ).scalars().all()
+        assert len(denial_audits) == 1
+        assert denial_audits[0].detail is not None
+        assert denial_audits[0].detail["rule"] == "auto_approve.kill_switch"
+        assert denial_audits[0].detail["original_rule"] == "linear_progress_update:open_ticket"
+        assert denial_audits[0].detail["action_type"] == "open_ticket"
+
+    async def test_kill_switch_on_with_none_rule_preserves_none_original_rule(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """PR12 review note: preserve rule=None for legacy actions;
+        original_rule in audit is None.
+        """
+        monkeypatch.setenv(PROPOSAL_AUTO_APPROVE_KILL_SWITCH_ENV_VAR, "1")
+        reset_proposal_auto_approve_cache()
+
+        judge = FakeProposalJudge(
+            judge_result=ProposalVerdict(
+                approved=True,
+                decision_note="legacy approve",
+                rule=None,
+            )
+        )
+        res = await _submit(session, action=_action(action_type="close_ticket"), judge=judge)
+        assert res["status"] == "pending"
+        assert len(judge.apply_calls) == 0
+
+        denial_audits = (
+            await session.execute(
+                select(AuditLog).where(AuditLog.action == _AUTO_APPROVE_DENIED_AUDIT_ACTION)
+            )
+        ).scalars().all()
+        assert len(denial_audits) == 1
+        assert denial_audits[0].detail is not None
+        assert denial_audits[0].detail["rule"] == "auto_approve.kill_switch"
+        assert denial_audits[0].detail["original_rule"] is None
+        assert denial_audits[0].detail["action_type"] == "close_ticket"
+
+    def test_kill_switch_parsing_strict_and_warnings(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Strict truthy
+        for val in ("true", "True", "TRUE", "1", "yes", "YES", "  true  "):
+            monkeypatch.setenv(PROPOSAL_AUTO_APPROVE_KILL_SWITCH_ENV_VAR, val)
+            reset_proposal_auto_approve_cache()
+            assert get_proposal_auto_approve_kill_switch() is True
+
+        # Recognized falsy (no warning)
+        for val in ("false", "False", "0", "no", "NO", "   "):
+            caplog.clear()
+            monkeypatch.setenv(PROPOSAL_AUTO_APPROVE_KILL_SWITCH_ENV_VAR, val)
+            reset_proposal_auto_approve_cache()
+            with caplog.at_level(logging.WARNING):
+                assert get_proposal_auto_approve_kill_switch() is False
+            warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+            assert len(warnings) == 0
+
+        # Unset (no warning)
+        caplog.clear()
+        monkeypatch.delenv(PROPOSAL_AUTO_APPROVE_KILL_SWITCH_ENV_VAR, raising=False)
+        reset_proposal_auto_approve_cache()
+        with caplog.at_level(logging.WARNING):
+            assert get_proposal_auto_approve_kill_switch() is False
+        assert len(caplog.records) == 0
+
+        # Unrecognized values: count as False (OFF), log WARNING
+        for val in ("foo", "on", "disabled", "enabled", "2", "-1"):
+            caplog.clear()
+            monkeypatch.setenv(PROPOSAL_AUTO_APPROVE_KILL_SWITCH_ENV_VAR, val)
+            reset_proposal_auto_approve_cache()
+            with caplog.at_level(logging.WARNING):
+                assert get_proposal_auto_approve_kill_switch() is False
+            warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+            assert len(warnings) == 1
+            assert "unrecognized value" in warnings[0].message
+
+    async def test_kill_switch_never_blocks_human_decide(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(PROPOSAL_AUTO_APPROVE_KILL_SWITCH_ENV_VAR, "true")
+        reset_proposal_auto_approve_cache()
+
+        # Submit creates a pending proposal
+        judge = FakeProposalJudge(
+            judge_result=ProposalVerdict(approved=False, decision_note=None),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result={"applied": True}, caller_error=None, log_detail=None
+            ),
+        )
+        res = await _submit(session, action=_action(action_type="open_ticket"), judge=judge)
+        assert res["status"] == "pending"
+
+        # Human decides to approve -> must succeed and apply
+        decided = await _decide(
+            session,
+            hold_id=uuid.UUID(res["proposal_id"]),
+            decision="approve",
+            judge=judge,
+        )
+        assert decided["status"] == "applied"
+
+    async def test_daily_cap_allows_n_then_downgrades(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(PROPOSAL_AUTO_APPROVE_DAILY_CAPS_ENV_VAR, '{"open_ticket": 2}')
+        reset_proposal_auto_approve_cache()
+
+        judge = FakeProposalJudge(
+            judge_result=ProposalVerdict(
+                approved=True,
+                decision_note="looks good",
+                rule="linear_progress_update:open_ticket",
+            ),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result={"applied": True}, caller_error=None, log_detail=None
+            ),
+        )
+
+        # 1st allowed
+        res1 = await _submit(
+            session, action=_action(action_type="open_ticket", target_id="T1"), judge=judge
+        )
+        assert res1["status"] == "applied"
+
+        # 2nd allowed
+        res2 = await _submit(
+            session, action=_action(action_type="open_ticket", target_id="T2"), judge=judge
+        )
+        assert res2["status"] == "applied"
+
+        # 3rd reaches cap -> downgraded to pending
+        res3 = await _submit(
+            session, action=_action(action_type="open_ticket", target_id="T3"), judge=judge
+        )
+        assert res3["status"] == "pending"
+        assert (
+            res3["decision_note"]
+            == "daily auto-approval cap reached for open_ticket; held for human review"
+        )
+
+        # Fake judge apply_calls was 2, not 3
+        assert len(judge.apply_calls) == 2
+
+        # Verify audit logs
+        approved_audits = (
+            await session.execute(
+                select(AuditLog).where(AuditLog.action == _AUTO_APPROVED_AUDIT_ACTION)
+            )
+        ).scalars().all()
+        assert len(approved_audits) == 2
+
+        denial_audits = (
+            await session.execute(
+                select(AuditLog).where(AuditLog.action == _AUTO_APPROVE_DENIED_AUDIT_ACTION)
+            )
+        ).scalars().all()
+        assert len(denial_audits) == 1
+        assert denial_audits[0].detail is not None
+        assert denial_audits[0].detail["rule"] == "auto_approve.cap_exhausted.open_ticket"
+        assert denial_audits[0].detail["original_rule"] == "linear_progress_update:open_ticket"
+        assert denial_audits[0].detail["action_type"] == "open_ticket"
+        assert denial_audits[0].detail["cap"] == 2
+        assert denial_audits[0].detail["count"] == 2
+
+    async def test_daily_cap_is_per_action_type(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(
+            PROPOSAL_AUTO_APPROVE_DAILY_CAPS_ENV_VAR,
+            '{"open_ticket": 1, "complete_ticket": 2}',
+        )
+        reset_proposal_auto_approve_cache()
+
+        judge = FakeProposalJudge(
+            judge_result=ProposalVerdict(approved=True, decision_note="ok"),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result={"applied": True}, caller_error=None, log_detail=None
+            ),
+        )
+
+        # open_ticket #1: applied
+        r1 = await _submit(
+            session,
+            proposed_by_bot_id="bot-open",
+            action=_action(action_type="open_ticket", target_id="O1"),
+            judge=judge,
+        )
+        assert r1["status"] == "applied"
+
+        # open_ticket #2: cap exhausted (pending)
+        r2 = await _submit(
+            session,
+            proposed_by_bot_id="bot-open",
+            action=_action(action_type="open_ticket", target_id="O2"),
+            judge=judge,
+        )
+        assert r2["status"] == "pending"
+
+        # complete_ticket #1: applied (not blocked by open_ticket)
+        c1 = await _submit(
+            session,
+            proposed_by_bot_id="bot-complete",
+            action=_action(action_type="complete_ticket", target_id="C1"),
+            judge=judge,
+        )
+        assert c1["status"] == "applied"
+
+        # complete_ticket #2: applied
+        c2 = await _submit(
+            session,
+            proposed_by_bot_id="bot-complete",
+            action=_action(action_type="complete_ticket", target_id="C2"),
+            judge=judge,
+        )
+        assert c2["status"] == "applied"
+
+        # complete_ticket #3: cap exhausted
+        c3 = await _submit(
+            session,
+            proposed_by_bot_id="bot-complete",
+            action=_action(action_type="complete_ticket", target_id="C3"),
+            judge=judge,
+        )
+        assert c3["status"] == "pending"
+
+        # close_ticket: not in map -> uncapped
+        cl1 = await _submit(
+            session,
+            proposed_by_bot_id="bot-close",
+            action=_action(action_type="close_ticket", target_id="CL1"),
+            judge=judge,
+        )
+        assert cl1["status"] == "applied"
+        cl2 = await _submit(
+            session,
+            proposed_by_bot_id="bot-close",
+            action=_action(action_type="close_ticket", target_id="CL2"),
+            judge=judge,
+        )
+        assert cl2["status"] == "applied"
+
+    async def test_daily_cap_global_across_all_bots(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(PROPOSAL_AUTO_APPROVE_DAILY_CAPS_ENV_VAR, '{"open_ticket": 2}')
+        reset_proposal_auto_approve_cache()
+
+        judge = FakeProposalJudge(
+            judge_result=ProposalVerdict(approved=True, decision_note="ok"),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result={"applied": True}, caller_error=None, log_detail=None
+            ),
+        )
+
+        # Bot A
+        r1 = await _submit(
+            session,
+            proposed_by_bot_id="bot-a",
+            action=_action(action_type="open_ticket", target_id="T1"),
+            judge=judge,
+        )
+        assert r1["status"] == "applied"
+
+        # Bot B
+        r2 = await _submit(
+            session,
+            proposed_by_bot_id="bot-b",
+            action=_action(action_type="open_ticket", target_id="T2"),
+            judge=judge,
+        )
+        assert r2["status"] == "applied"
+
+        # Bot C: cap reached across bots!
+        r3 = await _submit(
+            session,
+            proposed_by_bot_id="bot-c",
+            action=_action(action_type="open_ticket", target_id="T3"),
+            judge=judge,
+        )
+        assert r3["status"] == "pending"
+
+    async def test_daily_cap_utc_day_rollover(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(PROPOSAL_AUTO_APPROVE_DAILY_CAPS_ENV_VAR, '{"open_ticket": 1}')
+        reset_proposal_auto_approve_cache()
+
+        judge = FakeProposalJudge(
+            judge_result=ProposalVerdict(approved=True, decision_note="ok"),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result={"applied": True}, caller_error=None, log_detail=None
+            ),
+        )
+
+        # 1. Day 1: First submission auto-approves
+        r1 = await _submit(
+            session,
+            proposed_by_bot_id="bot-roll-1",
+            action=_action(action_type="open_ticket", target_id="T1"),
+            judge=judge,
+        )
+        assert r1["status"] == "applied"
+
+        # Second submission reaches cap on Day 1
+        r2 = await _submit(
+            session,
+            proposed_by_bot_id="bot-roll-1",
+            action=_action(action_type="open_ticket", target_id="T2"),
+            judge=judge,
+        )
+        assert r2["status"] == "pending"
+
+        # 2. Advance Day 1's auto-approved audit rows into yesterday (past UTC midnight)
+        today_start = _utc_day_start()
+        yesterday = today_start - timedelta(hours=2)
+        await session.execute(
+            update(AuditLog)
+            .where(AuditLog.action == _AUTO_APPROVED_AUDIT_ACTION)
+            .values(at=yesterday)
+        )
+        await session.commit()
+
+        # 3. New submission today (after rollover) succeeds because yesterday's row is excluded
+        r3 = await _submit(
+            session,
+            proposed_by_bot_id="bot-roll-2",
+            action=_action(action_type="open_ticket", target_id="T3"),
+            judge=judge,
+        )
+        assert r3["status"] == "applied"
+
+        # 4. Next submission today reaches today's cap
+        r4 = await _submit(
+            session,
+            proposed_by_bot_id="bot-roll-2",
+            action=_action(action_type="open_ticket", target_id="T4"),
+            judge=judge,
+        )
+        assert r4["status"] == "pending"
+
+        # 5. Exact boundary test: row 1 second before midnight UTC is excluded;
+        # row at midnight UTC is included
+        before_midnight = today_start - timedelta(seconds=1)
+        at_midnight = today_start
+
+        # Fetch an audit row id to test
+        audit_id = (
+            await session.execute(
+                select(AuditLog.id).where(AuditLog.action == _AUTO_APPROVED_AUDIT_ACTION).limit(1)
+            )
+        ).scalar_one()
+
+        await session.execute(
+            update(AuditLog)
+            .where(AuditLog.id == audit_id)
+            .values(at=before_midnight)
+        )
+        await session.commit()
+
+        count_excluded = (
+            await session.execute(
+                select(func.count())
+                .select_from(AuditLog)
+                .where(
+                    AuditLog.id == audit_id,
+                    AuditLog.at >= today_start,
+                )
+            )
+        ).scalar_one()
+        assert count_excluded == 0
+
+        await session.execute(
+            update(AuditLog)
+            .where(AuditLog.id == audit_id)
+            .values(at=at_midnight)
+        )
+        await session.commit()
+
+        count_included = (
+            await session.execute(
+                select(func.count())
+                .select_from(AuditLog)
+                .where(
+                    AuditLog.id == audit_id,
+                    AuditLog.at >= today_start,
+                )
+            )
+        ).scalar_one()
+        assert count_included == 1
+
+    async def test_malformed_config_whole_map_closed(
+        self,
+        session: AsyncSession,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        cases = [
+            ("invalid JSON", "{invalid-json"),
+            ("duplicate keys", '{"open_ticket": 1, "open_ticket": 2}'),
+            ("JSON array", "[1, 2, 3]"),
+            ("scalar string", '"not_a_map"'),
+            ("empty string", ""),
+        ]
+
+        judge = FakeProposalJudge(
+            judge_result=ProposalVerdict(approved=True, decision_note="ok"),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result={"applied": True}, caller_error=None, log_detail=None
+            ),
+        )
+
+        for desc, env_val in cases:
+            caplog.clear()
+            monkeypatch.setenv(PROPOSAL_AUTO_APPROVE_DAILY_CAPS_ENV_VAR, env_val)
+            reset_proposal_auto_approve_cache()
+
+            with caplog.at_level(logging.WARNING):
+                r = await _submit(
+                    session,
+                    action=_action(action_type="open_ticket", target_id=f"TECH-{desc[:4]}"),
+                    judge=judge,
+                )
+            assert r["status"] == "pending", f"Case {desc} must downgrade to pending"
+            warnings = [rec for rec in caplog.records if rec.levelno >= logging.WARNING]
+            assert len(warnings) >= 1, f"Case {desc} must log WARNING"
+
+    async def test_malformed_config_per_action_type_closed(
+        self,
+        session: AsyncSession,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        monkeypatch.setenv(
+            PROPOSAL_AUTO_APPROVE_DAILY_CAPS_ENV_VAR,
+            '{"negative_type": -5, "bool_type": true, "valid_type": 1}',
+        )
+        reset_proposal_auto_approve_cache()
+
+        judge = FakeProposalJudge(
+            judge_result=ProposalVerdict(approved=True, decision_note="ok"),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result={"applied": True}, caller_error=None, log_detail=None
+            ),
+        )
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            r_neg = await _submit(
+                session, action=_action(action_type="negative_type", target_id="T_NEG"), judge=judge
+            )
+        assert r_neg["status"] == "pending"
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            r_bool = await _submit(
+                session, action=_action(action_type="bool_type", target_id="T_BOOL"), judge=judge
+            )
+        assert r_bool["status"] == "pending"
+
+        # valid_type has cap 1 -> first is applied
+        r_valid = await _submit(
+            session, action=_action(action_type="valid_type", target_id="T_VAL1"), judge=judge
+        )
+        assert r_valid["status"] == "applied"
+        # second is pending
+        r_valid2 = await _submit(
+            session, action=_action(action_type="valid_type", target_id="T_VAL2"), judge=judge
+        )
+        assert r_valid2["status"] == "pending"
+
+    def test_startup_logging(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Unset
+        monkeypatch.delenv(PROPOSAL_AUTO_APPROVE_KILL_SWITCH_ENV_VAR, raising=False)
+        monkeypatch.delenv(PROPOSAL_AUTO_APPROVE_DAILY_CAPS_ENV_VAR, raising=False)
+        reset_proposal_auto_approve_cache()
+        assert get_proposal_auto_approve_daily_caps() is None
+        assert proposal_auto_approve_daily_cap_for("open_ticket") is None
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            log_proposal_auto_approve_config()
+        info_msgs = [r.message for r in caplog.records if r.levelno == logging.INFO]
+        assert any("kill_switch=OFF" in m for m in info_msgs)
+        assert any("daily auto-approval caps: uncapped" in m for m in info_msgs)
+
+        # Configured
+        monkeypatch.setenv(PROPOSAL_AUTO_APPROVE_KILL_SWITCH_ENV_VAR, "true")
+        monkeypatch.setenv(PROPOSAL_AUTO_APPROVE_DAILY_CAPS_ENV_VAR, '{"open_ticket": 10}')
+        reset_proposal_auto_approve_cache()
+        assert get_proposal_auto_approve_daily_caps() == {"open_ticket": 10}
+        assert proposal_auto_approve_daily_cap_for("open_ticket") == 10
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            log_proposal_auto_approve_config()
+        info_msgs = [r.message for r in caplog.records if r.levelno == logging.INFO]
+        assert any("kill_switch=ACTIVE" in m for m in info_msgs)
+        assert any("open_ticket" in m and "10" in m for m in info_msgs)
+
+    async def test_concurrent_submissions_serialize_and_cap_at_boundary(
+        self, session_factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cap_val = 3
+        burst_size = 8
+        monkeypatch.setenv(
+            PROPOSAL_AUTO_APPROVE_DAILY_CAPS_ENV_VAR,
+            f'{{"concurrent_ticket": {cap_val}}}',
+        )
+        reset_proposal_auto_approve_cache()
+
+        judge = FakeProposalJudge(
+            judge_result=ProposalVerdict(approved=True, decision_note="ok"),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result={"applied": True}, caller_error=None, log_detail=None
+            ),
+        )
+
+        async def _submit_concurrent(idx: int) -> dict[str, Any]:
+            async with session_factory() as s:
+                return await _submit(
+                    s,
+                    proposed_by_bot_id=f"bot-{idx}",
+                    action=_action(action_type="concurrent_ticket", target_id=f"TECH-CONC-{idx}"),
+                    judge=judge,
+                )
+
+        results = await asyncio.gather(
+            *[_submit_concurrent(i) for i in range(burst_size)],
+            return_exceptions=True,
+        )
+
+        applied = [r for r in results if isinstance(r, dict) and r["status"] == "applied"]
+        pending = [r for r in results if isinstance(r, dict) and r["status"] == "pending"]
+
+        assert len(applied) == cap_val
+        assert len(pending) == burst_size - cap_val
+        assert len(judge.apply_calls) == cap_val
+
+        # Verify exact audit count in the database
+        async with session_factory() as check_session:
+            audits = (
+                await check_session.execute(
+                    select(AuditLog).where(
+                        AuditLog.action == _AUTO_APPROVED_AUDIT_ACTION,
+                        AuditLog.detail.op("->>")("action_type") == "concurrent_ticket",
+                    )
+                )
+            ).scalars().all()
+            assert len(audits) == cap_val
 
 
 class TestProposalResubmissionSnapshot:
