@@ -174,7 +174,7 @@ from typing import Any, Final, Literal, NamedTuple, NoReturn, Protocol
 from urllib.parse import urlsplit
 
 from sqlalchemy import ColumnElement, and_, case, func, literal, not_, or_, select, text, tuple_
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import defer
 
@@ -460,18 +460,20 @@ def _audit(
     conversation_id: uuid.UUID | None = None,
     message_id: uuid.UUID | None = None,
     detail: dict[str, Any] | None = None,
+    at: datetime | None = None,
 ) -> None:
     """Stage an append-only audit row (committed by the caller)."""
-    session.add(
-        AuditLog(
-            actor_sub=actor_sub,
-            action=action,
-            agent_id=agent_id,
-            conversation_id=conversation_id,
-            message_id=message_id,
-            detail=detail,
-        )
-    )
+    kwargs: dict[str, Any] = {
+        "actor_sub": actor_sub,
+        "action": action,
+        "agent_id": agent_id,
+        "conversation_id": conversation_id,
+        "message_id": message_id,
+        "detail": detail,
+    }
+    if at is not None:
+        kwargs["at"] = at
+    session.add(AuditLog(**kwargs))
 
 
 async def _deny(
@@ -6673,34 +6675,35 @@ def _parse_proposal_auto_approve_kill_switch(raw: str | None) -> bool:
     Rules:
       - Unset (None): returns False (kill switch OFF, auto-approval allowed as today).
       - Empty or whitespace string: returns False (kill switch OFF).
-      - Strictly truthy ("true", "1", "yes", case-insensitive, stripped):
+      - Strictly truthy ("true", "1", "yes", "on", case-insensitive, stripped):
         returns True (kill switch ON).
-      - Strictly falsy ("false", "0", "no", case-insensitive, stripped):
+      - Strictly falsy ("false", "0", "no", "off", case-insensitive, stripped):
         returns False (kill switch OFF).
-      - Unrecognized values: returns False (kill switch OFF) with a WARNING.
+      - Any other non-empty value: returns True (kill switch ON, fail closed) with a WARNING.
 
     Failure direction rationale:
-      The kill switch defaults OFF to preserve existing live behavior. Unrecognized values
-      count as OFF (auto-approval allowed) so an unexpected string does not accidentally disable
-      auto-approval in production. A WARNING is logged so operators are alerted that the kill
-      switch was not engaged despite non-empty configuration. The switch never blocks human
-      approvals or decisions.
+      Unset or empty strings default OFF to preserve existing live behavior. Any unrecognized
+      non-empty value fails closed (kill switch ACTIVE / True) to protect against accidental
+      auto-approvals when an operator attempts to activate the kill switch with misspelled or
+      ambiguous configuration. A WARNING is logged naming the env var and reporting the length of
+      the unrecognized string without leaking raw input. The switch never blocks human approvals or
+      decisions.
     """
     if raw is None:
         return False
     cleaned = raw.strip().lower()
     if not cleaned:
         return False
-    if cleaned in ("true", "1", "yes"):
+    if cleaned in ("true", "1", "yes", "on"):
         return True
-    if cleaned in ("false", "0", "no"):
+    if cleaned in ("false", "0", "no", "off"):
         return False
     logger.warning(
-        "%s has unrecognized value %r; falling back to OFF (kill switch inactive)",
+        "%s has unrecognized non-empty value (length=%d); failing closed with kill switch ACTIVE",
         PROPOSAL_AUTO_APPROVE_KILL_SWITCH_ENV_VAR,
-        raw,
+        len(raw),
     )
-    return False
+    return True
 
 
 _cached_proposal_auto_approve_kill_switch: bool | None = None
@@ -6858,6 +6861,18 @@ def _utc_day_start(now: datetime | None = None) -> datetime:
     """
     current = now if now is not None else _now()
     return current.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+async def _fetch_db_timestamp(session: AsyncSession) -> datetime:
+    """Fetch an authoritative database clock_timestamp() under PostgreSQL.
+
+    Can be monkeypatched in tests to deterministically test midnight-boundary rollover.
+    """
+    res = await session.execute(text("SELECT clock_timestamp()"))
+    db_now = res.scalar_one()
+    if isinstance(db_now, datetime):
+        return db_now.astimezone(UTC)
+    return _now()
 
 
 def log_proposal_auto_approve_config() -> None:
@@ -8514,6 +8529,7 @@ async def create_proposal(
             judged_status = "pending"
             decision_note = "cross-brain proposals always require human approval"
 
+    auto_approved_at: datetime | None = None
     if judged_status == "approved":
         # TECH-8080 PR13: Emergency kill switch & daily auto-approval cap guards.
         # Metering is strictly by validated action_type (not parsed verdict_rule, which
@@ -8539,49 +8555,96 @@ async def create_proposal(
         else:
             cap = proposal_auto_approve_daily_cap_for(action_type)
             if cap is not None:
-                # Race-safe advisory transaction lock serialized per action_type
-                await session.execute(
-                    text(
-                        "SELECT pg_advisory_xact_lock("
-                        "hashtext('proposal_auto_approve_cap:' || :action_type))"
-                    ),
-                    {"action_type": action_type},
-                )
-                day_start = _utc_day_start()
-                count = (
+                hold_id = hold.id
+                try:
+                    # Race-safe advisory transaction lock serialized per action_type
                     await session.execute(
-                        select(func.count())
-                        .select_from(AuditLog)
-                        .where(
-                            AuditLog.action == _AUTO_APPROVED_AUDIT_ACTION,
-                            AuditLog.detail.op("->>")("action_type") == action_type,
-                            AuditLog.at >= day_start,
-                        )
+                        text(
+                            "SELECT pg_advisory_xact_lock("
+                            "hashtext('proposal_auto_approve_cap:' || :action_type))"
+                        ),
+                        {"action_type": action_type},
                     )
-                ).scalar_one()
-                if count >= cap:
+                    db_now = await _fetch_db_timestamp(session)
+                    auto_approved_at = db_now
+                    day_start = db_now.astimezone(UTC).replace(
+                        hour=0, minute=0, second=0, microsecond=0
+                    )
+                    count = (
+                        await session.execute(
+                            select(func.count())
+                            .select_from(AuditLog)
+                            .where(
+                                AuditLog.action == _AUTO_APPROVED_AUDIT_ACTION,
+                                AuditLog.detail.op("->>")("action_type") == action_type,
+                                AuditLog.at >= day_start,
+                            )
+                        )
+                    ).scalar_one()
+                    if count >= cap:
+                        judged_status = "pending"
+                        decision_note = (
+                            f"daily auto-approval cap reached for {action_type}; "
+                            "held for human review"
+                        )
+                        _audit(
+                            session,
+                            actor_sub=proposed_by_bot_id,
+                            action=_AUTO_APPROVE_DENIED_AUDIT_ACTION,
+                            detail={
+                                "rule": f"auto_approve.cap_exhausted.{action_type}",
+                                "original_rule": verdict_rule,
+                                "action_type": action_type,
+                                "hold_id": str(hold.id),
+                                "cap": cap,
+                                "count": count,
+                                "reason": "cap_exhausted",
+                            },
+                        )
+                        hold.decision_note = decision_note
+                        await session.commit()
+                        await session.refresh(hold)
+                except (DBAPIError, OperationalError) as exc:
+                    logger.warning(
+                        "daily auto-approval cap check failed for hold %s (action_type=%r): %s; "
+                        "rolling back and downgrading to pending for human review",
+                        hold_id,
+                        action_type,
+                        exc,
+                        exc_info=True,
+                    )
+                    await session.rollback()
                     judged_status = "pending"
                     decision_note = (
-                        f"daily auto-approval cap reached for {action_type}; "
+                        f"daily auto-approval cap check failed for {action_type}; "
                         "held for human review"
                     )
+                    hold_refetched = await _find_proposal_hold(session, hold_id)
+                    if hold_refetched is None:
+                        raise AssertionError(
+                            "invariant violation: hold vanished after rollback"
+                        ) from exc
+                    hold = hold_refetched
+                    hold.decision_note = decision_note
                     _audit(
                         session,
                         actor_sub=proposed_by_bot_id,
                         action=_AUTO_APPROVE_DENIED_AUDIT_ACTION,
                         detail={
-                            "rule": f"auto_approve.cap_exhausted.{action_type}",
+                            "rule": "auto_approve.cap_check_failed",
                             "original_rule": verdict_rule,
                             "action_type": action_type,
-                            "hold_id": str(hold.id),
-                            "cap": cap,
-                            "count": count,
-                            "reason": "cap_exhausted",
+                            "hold_id": str(hold_id),
+                            "reason": "cap_check_failed",
                         },
                     )
-                    hold.decision_note = decision_note
                     await session.commit()
                     await session.refresh(hold)
+            else:
+                try:
+                    auto_approved_at = await _fetch_db_timestamp(session)
+                except (DBAPIError, OperationalError):
+                    auto_approved_at = _now()
 
     auto_approved = judged_status == "approved" and hold.status == "pending"
 
@@ -8607,6 +8670,7 @@ async def create_proposal(
         cross_brain_auto_rule=cross_brain_auto_rule,
         auto_approved_action_type=action_type,
         auto_approved_verdict_rule=verdict_rule,
+        auto_approved_at=auto_approved_at,
     )
     if not claimed:
         # Two distinct causes reach here, both meaning "do not apply this
@@ -9071,6 +9135,7 @@ async def _claim_proposal_hold_for_applying(
     cross_brain_auto_rule: str | None = None,
     auto_approved_action_type: str | None = None,
     auto_approved_verdict_rule: str | None = None,
+    auto_approved_at: datetime | None = None,
 ) -> bool:
     """Claims a still-``"pending"`` hold for synchronous apply by writing
     ``status="applying"`` under a fresh ``FOR UPDATE`` and committing
@@ -9122,7 +9187,7 @@ async def _claim_proposal_hold_for_applying(
     hold.status = "applying"
     hold.decision_source = decision_source
     hold.decided_by_actor_id = decided_by_actor_id
-    hold.decided_at = _now()
+    hold.decided_at = auto_approved_at if auto_approved_at is not None else _now()
     hold.decision_note = decision_note
     if cross_brain_auto_rule is not None and hold.cross_brain is not None:
         # Recorded under the same lock as the claim, so the apply-record names the stand-in rule.
@@ -9132,6 +9197,7 @@ async def _claim_proposal_hold_for_applying(
             actor_sub=decided_by_actor_id,
             action="proposal.cross_brain_auto_approved",
             detail={"hold_id": str(hold_id), "rule": cross_brain_auto_rule},
+            at=auto_approved_at,
         )
     if decision_source == "auto" and auto_approved_action_type is not None:
         # Audited in the same transaction as the claim under the advisory lock (TECH-8080 PR13).
@@ -9139,6 +9205,7 @@ async def _claim_proposal_hold_for_applying(
             session,
             actor_sub=decided_by_actor_id,
             action=_AUTO_APPROVED_AUDIT_ACTION,
+            at=auto_approved_at,
             detail={
                 "action_type": auto_approved_action_type,
                 "rule": auto_approved_verdict_rule,

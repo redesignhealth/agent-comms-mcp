@@ -23,13 +23,13 @@ import logging
 import re
 import uuid
 from collections.abc import AsyncIterator, Iterator
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import func, select, text, update
+from sqlalchemy import select, text, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -67,7 +67,6 @@ from service import (
     _encode_proposal_cursor,
     _proposal_resubmission_snapshot,
     _redact_bot_facing_dict,
-    _utc_day_start,
     audit_denied_proposal_submission,
     create_proposal,
     decide_proposal,
@@ -1220,13 +1219,13 @@ class TestProposalAutoApproveKillSwitchAndDailyCaps:
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         # Strict truthy
-        for val in ("true", "True", "TRUE", "1", "yes", "YES", "  true  "):
+        for val in ("true", "True", "TRUE", "1", "yes", "YES", "on", "ON", "  true  "):
             monkeypatch.setenv(PROPOSAL_AUTO_APPROVE_KILL_SWITCH_ENV_VAR, val)
             reset_proposal_auto_approve_cache()
             assert get_proposal_auto_approve_kill_switch() is True
 
         # Recognized falsy (no warning)
-        for val in ("false", "False", "0", "no", "NO", "   "):
+        for val in ("false", "False", "0", "no", "NO", "off", "OFF", "   "):
             caplog.clear()
             monkeypatch.setenv(PROPOSAL_AUTO_APPROVE_KILL_SWITCH_ENV_VAR, val)
             reset_proposal_auto_approve_cache()
@@ -1243,16 +1242,17 @@ class TestProposalAutoApproveKillSwitchAndDailyCaps:
             assert get_proposal_auto_approve_kill_switch() is False
         assert len(caplog.records) == 0
 
-        # Unrecognized values: count as False (OFF), log WARNING
-        for val in ("foo", "on", "disabled", "enabled", "2", "-1"):
+        # Unrecognized non-empty values: count as True (ON / fail closed), log WARNING
+        for val in ("foo", "disabled", "enabled", "2", "-1"):
             caplog.clear()
             monkeypatch.setenv(PROPOSAL_AUTO_APPROVE_KILL_SWITCH_ENV_VAR, val)
             reset_proposal_auto_approve_cache()
             with caplog.at_level(logging.WARNING):
-                assert get_proposal_auto_approve_kill_switch() is False
+                assert get_proposal_auto_approve_kill_switch() is True
             warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
             assert len(warnings) == 1
-            assert "unrecognized value" in warnings[0].message
+            assert "unrecognized non-empty value" in warnings[0].message
+            assert PROPOSAL_AUTO_APPROVE_KILL_SWITCH_ENV_VAR in warnings[0].message
 
     async def test_kill_switch_never_blocks_human_decide(
         self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
@@ -1472,7 +1472,14 @@ class TestProposalAutoApproveKillSwitchAndDailyCaps:
             ),
         )
 
-        # 1. Day 1: First submission auto-approves
+        # 1. Day 1: 1 second before midnight UTC (2026-10-30 23:59:59 UTC)
+        t_day1 = datetime(2026, 10, 30, 23, 59, 59, tzinfo=UTC)
+
+        async def _mock_db_time_day1(sess: AsyncSession) -> datetime:
+            return t_day1
+
+        monkeypatch.setattr(service, "_fetch_db_timestamp", _mock_db_time_day1)
+
         r1 = await _submit(
             session,
             proposed_by_bot_id="bot-roll-1",
@@ -1481,7 +1488,6 @@ class TestProposalAutoApproveKillSwitchAndDailyCaps:
         )
         assert r1["status"] == "applied"
 
-        # Second submission reaches cap on Day 1
         r2 = await _submit(
             session,
             proposed_by_bot_id="bot-roll-1",
@@ -1490,17 +1496,15 @@ class TestProposalAutoApproveKillSwitchAndDailyCaps:
         )
         assert r2["status"] == "pending"
 
-        # 2. Advance Day 1's auto-approved audit rows into yesterday (past UTC midnight)
-        today_start = _utc_day_start()
-        yesterday = today_start - timedelta(hours=2)
-        await session.execute(
-            update(AuditLog)
-            .where(AuditLog.action == _AUTO_APPROVED_AUDIT_ACTION)
-            .values(at=yesterday)
-        )
-        await session.commit()
+        # 2. Rollover to Day 2: 1 second after midnight UTC (2026-10-31 00:00:01 UTC)
+        t_day2 = datetime(2026, 10, 31, 0, 0, 1, tzinfo=UTC)
 
-        # 3. New submission today (after rollover) succeeds because yesterday's row is excluded
+        async def _mock_db_time_day2(sess: AsyncSession) -> datetime:
+            return t_day2
+
+        monkeypatch.setattr(service, "_fetch_db_timestamp", _mock_db_time_day2)
+
+        # 3. New submission on Day 2 succeeds because Day 1 row is prior to 2026-10-31 00:00:00 UTC
         r3 = await _submit(
             session,
             proposed_by_bot_id="bot-roll-2",
@@ -1509,7 +1513,7 @@ class TestProposalAutoApproveKillSwitchAndDailyCaps:
         )
         assert r3["status"] == "applied"
 
-        # 4. Next submission today reaches today's cap
+        # 4. Next submission on Day 2 reaches Day 2 cap
         r4 = await _submit(
             session,
             proposed_by_bot_id="bot-roll-2",
@@ -1518,55 +1522,82 @@ class TestProposalAutoApproveKillSwitchAndDailyCaps:
         )
         assert r4["status"] == "pending"
 
-        # 5. Exact boundary test: row 1 second before midnight UTC is excluded;
-        # row at midnight UTC is included
-        before_midnight = today_start - timedelta(seconds=1)
-        at_midnight = today_start
-
-        # Fetch an audit row id to test
-        audit_id = (
+        # 5. Verify audit rows recorded the exact DB timestamp injected
+        audits = (
             await session.execute(
-                select(AuditLog.id).where(AuditLog.action == _AUTO_APPROVED_AUDIT_ACTION).limit(1)
+                select(AuditLog)
+                .where(AuditLog.action == _AUTO_APPROVED_AUDIT_ACTION)
+                .order_by(AuditLog.id.asc())
             )
-        ).scalar_one()
+        ).scalars().all()
+        assert len(audits) == 2
+        assert audits[0].at == t_day1
+        assert audits[1].at == t_day2
 
-        await session.execute(
-            update(AuditLog)
-            .where(AuditLog.id == audit_id)
-            .values(at=before_midnight)
+    async def test_daily_cap_db_error_rolls_back_and_downgrades_to_pending(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Finding 3: DB error (OperationalError/DBAPIError) during advisory lock or count query
+        must roll back, persist hold as pending, audit auto_approve.cap_check_failed, and return
+        normal pending response rather than 500. Never auto-approve on error."""
+        monkeypatch.setenv(PROPOSAL_AUTO_APPROVE_DAILY_CAPS_ENV_VAR, '{"open_ticket": 5}')
+        reset_proposal_auto_approve_cache()
+
+        judge = FakeProposalJudge(
+            judge_result=ProposalVerdict(
+                approved=True,
+                decision_note="looks good",
+                rule="linear_progress_update:open_ticket",
+            ),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result={"applied": True}, caller_error=None, log_detail=None
+            ),
         )
-        await session.commit()
 
-        count_excluded = (
-            await session.execute(
-                select(func.count())
-                .select_from(AuditLog)
-                .where(
-                    AuditLog.id == audit_id,
-                    AuditLog.at >= today_start,
+        orig_execute = session.execute
+
+        async def _failing_execute(stmt, *args, **kwargs):
+            if "proposal_auto_approve_cap:" in str(stmt):
+                raise OperationalError(
+                    "simulated deadlock on advisory lock",
+                    params=None,
+                    orig=Exception("deadlock detected"),
                 )
-            )
-        ).scalar_one()
-        assert count_excluded == 0
+            return await orig_execute(stmt, *args, **kwargs)
 
-        await session.execute(
-            update(AuditLog)
-            .where(AuditLog.id == audit_id)
-            .values(at=at_midnight)
+        monkeypatch.setattr(session, "execute", _failing_execute)
+
+        res = await _submit(
+            session, action=_action(action_type="open_ticket", target_id="T_FAIL"), judge=judge
         )
-        await session.commit()
+        assert res["status"] == "pending"
+        assert (
+            res["decision_note"]
+            == "daily auto-approval cap check failed for open_ticket; held for human review"
+        )
+        # Fake judge applier never called
+        assert len(judge.apply_calls) == 0
 
-        count_included = (
+        # No proposal.auto_approved audit row
+        approved_audits = (
             await session.execute(
-                select(func.count())
-                .select_from(AuditLog)
-                .where(
-                    AuditLog.id == audit_id,
-                    AuditLog.at >= today_start,
-                )
+                select(AuditLog).where(AuditLog.action == _AUTO_APPROVED_AUDIT_ACTION)
             )
-        ).scalar_one()
-        assert count_included == 1
+        ).scalars().all()
+        assert len(approved_audits) == 0
+
+        # Exactly one denial audit row with rule auto_approve.cap_check_failed
+        denial_audits = (
+            await session.execute(
+                select(AuditLog).where(AuditLog.action == _AUTO_APPROVE_DENIED_AUDIT_ACTION)
+            )
+        ).scalars().all()
+        assert len(denial_audits) == 1
+        assert denial_audits[0].detail is not None
+        assert denial_audits[0].detail["rule"] == "auto_approve.cap_check_failed"
+        assert denial_audits[0].detail["original_rule"] == "linear_progress_update:open_ticket"
+        assert denial_audits[0].detail["action_type"] == "open_ticket"
+        assert denial_audits[0].detail["reason"] == "cap_check_failed"
 
     async def test_malformed_config_whole_map_closed(
         self,
