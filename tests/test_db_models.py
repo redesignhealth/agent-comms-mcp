@@ -1117,6 +1117,147 @@ class TestProposalHoldsSchema:
             assert row is not None
             assert "dedup_field" in row[0]
 
+    async def test_tech_8080_scratch_index_valid_and_ready_guard(self, engine: AsyncEngine) -> None:
+        """TECH-8080 PR3: _assert_scratch_index_valid_and_ready validates both indisvalid
+        and indisready, and raises RuntimeError when missing, invalid, or unready."""
+        from migrations.versions.a56cb01a3ebf_proposal_dedup_field import (
+            _assert_scratch_index_valid_and_ready,
+        )
+
+        async with engine.connect() as conn:
+            # 1. Missing index raises RuntimeError
+            def _check_missing(sync_conn):
+                with pytest.raises(RuntimeError, match="not found in pg_index"):
+                    _assert_scratch_index_valid_and_ready(
+                        "idx_missing_scratch_test", bind=sync_conn
+                    )
+
+            await conn.run_sync(_check_missing)
+
+            # 2. Valid index passes
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_scratch_guard_test ON proposal_holds (id)")
+            )
+            try:
+
+                def _check_valid(sync_conn):
+                    _assert_scratch_index_valid_and_ready("idx_scratch_guard_test", bind=sync_conn)
+
+                await conn.run_sync(_check_valid)
+
+                # 3. Invalid (indisvalid=false) raises
+                await conn.execute(
+                    text(
+                        "UPDATE pg_index SET indisvalid = false "
+                        "WHERE indexrelid = 'idx_scratch_guard_test'::regclass"
+                    )
+                )
+
+                def _check_invalid(sync_conn):
+                    with pytest.raises(RuntimeError, match="not valid and ready"):
+                        _assert_scratch_index_valid_and_ready(
+                            "idx_scratch_guard_test", bind=sync_conn
+                        )
+
+                await conn.run_sync(_check_invalid)
+
+                # 4. Unready (indisready=false) raises
+                await conn.execute(
+                    text(
+                        "UPDATE pg_index SET indisvalid = true, indisready = false "
+                        "WHERE indexrelid = 'idx_scratch_guard_test'::regclass"
+                    )
+                )
+
+                def _check_unready(sync_conn):
+                    with pytest.raises(RuntimeError, match="not valid and ready"):
+                        _assert_scratch_index_valid_and_ready(
+                            "idx_scratch_guard_test", bind=sync_conn
+                        )
+
+                await conn.run_sync(_check_unready)
+            finally:
+                await conn.execute(text("DROP INDEX IF EXISTS idx_scratch_guard_test"))
+
+    async def test_tech_8080_upgrade_invalid_scratch_index_leaves_original_intact(
+        self, engine: AsyncEngine, database_url: str
+    ) -> None:
+        """TECH-8080 PR3: if the scratch index check fails during upgrade, the original
+        idx_proposal_holds_pending_dedup index is left completely untouched."""
+        env = {**os.environ, "DATABASE_URL": database_url.replace("+asyncpg", "")}
+        # 1. Downgrade to c7665a1b2d3e
+        subprocess.run(
+            [sys.executable, "-m", "alembic", "downgrade", "c7665a1b2d3e"],
+            cwd=SERVICE_ROOT,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        # 2. Record original index definition and OID
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                text(
+                    "SELECT c.oid, pg_get_indexdef(c.oid) "
+                    "FROM pg_class c "
+                    "WHERE c.relname = 'idx_proposal_holds_pending_dedup'"
+                )
+            )
+            orig_row = result.fetchone()
+            assert orig_row is not None
+            orig_oid, orig_indexdef = orig_row[0], orig_row[1]
+
+        # 3. Run upgrade with simulated invalid scratch index
+        res_failed = subprocess.run(
+            [sys.executable, "-m", "alembic", "upgrade", "head"],
+            cwd=SERVICE_ROOT,
+            env={**env, "_TEST_FORCE_INVALID_SCRATCH_INDEX": "1"},
+            capture_output=True,
+            text=True,
+        )
+        assert res_failed.returncode != 0
+        assert "is not valid and ready (simulated failure for test)" in res_failed.stderr
+        assert "Aborting swap to keep existing index intact" in res_failed.stderr
+
+        # 4. Verify original index was NOT dropped and still has same OID and definition
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                text(
+                    "SELECT c.oid, pg_get_indexdef(c.oid) "
+                    "FROM pg_class c "
+                    "WHERE c.relname = 'idx_proposal_holds_pending_dedup'"
+                )
+            )
+            after_row = result.fetchone()
+            assert after_row is not None
+            assert after_row[0] == orig_oid
+            assert after_row[1] == orig_indexdef
+
+        # 5. Clean upgrade without simulated failure succeeds and cleans up scratch index
+        res_ok = subprocess.run(
+            [sys.executable, "-m", "alembic", "upgrade", "head"],
+            cwd=SERVICE_ROOT,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert res_ok.returncode == 0, res_ok.stderr
+
+        # 6. Verify upgraded index has dedup_field
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                text(
+                    "SELECT pg_get_indexdef(c.oid) "
+                    "FROM pg_class c "
+                    "WHERE c.relname = 'idx_proposal_holds_pending_dedup'"
+                )
+            )
+            upgraded_row = result.fetchone()
+            assert upgraded_row is not None
+            assert "dedup_field" in upgraded_row[0]
+
     async def test_decision_consistency_check_constraint_rejects_pending_with_decision(
         self, engine: AsyncEngine
     ) -> None:

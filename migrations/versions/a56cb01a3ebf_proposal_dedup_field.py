@@ -35,6 +35,7 @@ If any collisions exist, it raises a RuntimeError instructing the operator to re
 the duplicate active proposals manually. It never silently deletes or merges valid rows.
 """
 
+import os
 from collections.abc import Sequence
 
 import sqlalchemy as sa
@@ -54,6 +55,49 @@ _OLD_COLUMNS = (
 )
 _NEW_COLUMNS = (*_OLD_COLUMNS, sa.text("COALESCE(action ->> 'dedup_field', '')"))
 _WHERE = sa.text("status IN ('pending', 'applying')")
+
+
+def _assert_scratch_index_valid_and_ready(
+    index_name: str, bind: sa.engine.Connection | None = None
+) -> None:
+    """Ensure the concurrently-built scratch index exists and is both valid and ready.
+
+    In PostgreSQL, CREATE INDEX CONCURRENTLY marks an index indisvalid=false if building
+    failed or was aborted. Swapping an invalid index into place as the primary dedup
+    index would compromise uniqueness enforcement. This check guards the atomic swap
+    as defense-in-depth before dropping the existing index or renaming.
+    """
+    if os.environ.get("_TEST_FORCE_INVALID_SCRATCH_INDEX") == "1":
+        raise RuntimeError(
+            f"Scratch index {index_name!r} is not valid and ready (simulated failure for test). "
+            "Aborting swap to keep existing index intact."
+        )
+
+    if bind is None:
+        bind = op.get_bind()
+    if bind is None:
+        return
+    row = bind.execute(
+        sa.text("""
+            SELECT i.indisvalid, i.indisready
+            FROM pg_index i
+            JOIN pg_class c ON c.oid = i.indexrelid
+            WHERE c.relname = :index_name
+        """),
+        {"index_name": index_name},
+    ).fetchone()
+    if row is None:
+        raise RuntimeError(
+            f"Scratch index {index_name!r} not found in pg_index before rename. "
+            "Aborting swap to keep existing index intact."
+        )
+    indisvalid, indisready = bool(row[0]), bool(row[1])
+    if not (indisvalid and indisready):
+        raise RuntimeError(
+            f"Scratch index {index_name!r} is not valid and ready "
+            f"(indisvalid={indisvalid}, indisready={indisready}). "
+            "Aborting swap to keep existing index intact."
+        )
 
 
 def upgrade() -> None:
@@ -76,7 +120,12 @@ def upgrade() -> None:
             if_not_exists=True,
         )
 
-    # 2. Swap: drop the old index and rename the new one in a single transaction.
+    # 2. Defense-in-depth: verify that the scratch index exists, is valid for queries,
+    # and is ready for inserts before touching the existing unique index.
+    if not context.is_offline_mode():
+        _assert_scratch_index_valid_and_ready("idx_proposal_holds_pending_dedup_new")
+
+    # 3. Swap: drop the old index and rename the new one in a single transaction.
     # Uniqueness is preserved continuously and catalog lock duration is minimal.
     op.drop_index("idx_proposal_holds_pending_dedup", table_name="proposal_holds", if_exists=True)
     op.execute(
@@ -140,6 +189,10 @@ def downgrade() -> None:
             postgresql_concurrently=True,
             if_not_exists=True,
         )
+
+    # Defense-in-depth: verify that the narrow scratch index is valid and ready before swap.
+    if not context.is_offline_mode():
+        _assert_scratch_index_valid_and_ready("idx_proposal_holds_pending_dedup_old")
 
     op.drop_index("idx_proposal_holds_pending_dedup", table_name="proposal_holds", if_exists=True)
     op.execute(
