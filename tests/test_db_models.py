@@ -26,7 +26,7 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import text
+from sqlalchemy import Index, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -894,6 +894,24 @@ class TestProposalHoldsSchema:
         indexes = await _indexes(engine, "proposal_holds")
         assert "idx_proposal_holds_status_created_at" in indexes
         assert "idx_proposal_holds_owner_sub_status_created_at" in indexes
+        assert "idx_proposal_holds_pending_dedup" in indexes
+
+    def test_proposal_holds_pending_dedup_index_matches_migration(self) -> None:
+        from migrations.versions.a56cb01a3ebf_proposal_dedup_field import _NEW_COLUMNS
+
+        dedup_indexes = [
+            elem
+            for elem in ProposalHold.__table_args__
+            if isinstance(elem, Index) and elem.name == "idx_proposal_holds_pending_dedup"
+        ]
+        assert len(dedup_indexes) == 1
+        idx = dedup_indexes[0]
+        assert idx.unique is True
+        model_exprs = [
+            expr.name if hasattr(expr, "name") else str(expr) for expr in idx.expressions
+        ]
+        migration_exprs = [str(expr) for expr in _NEW_COLUMNS]
+        assert model_exprs == migration_exprs
 
     async def test_sender_agent_id_fk(self, engine: AsyncEngine) -> None:
         async with engine.connect() as conn:

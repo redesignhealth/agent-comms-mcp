@@ -513,3 +513,27 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
     )
     fk_commit_pos = result.stdout.index("COMMIT;", fk_not_valid_pos)
     assert fk_not_valid_pos < fk_commit_pos < fk_validate_pos
+    # a56cb01a3ebf (TECH-8080 PR3): rebuilds idx_proposal_holds_pending_dedup
+    # with COALESCE(action ->> 'dedup_field', '') as sixth component so date
+    # fields on the same target no longer collapse.
+    assert (
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_proposal_holds_pending_dedup "
+        "ON proposal_holds (kind, proposed_by_bot_id, (action ->> 'target_id'), "
+        "(action ->> 'action_type'), COALESCE(cross_brain ->> 'target_sub', ''), "
+        "COALESCE(action ->> 'dedup_field', '')) WHERE status IN ('pending', 'applying')"
+        in result.stdout
+    )
+
+
+def test_alembic_single_head() -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "alembic", "heads"],
+        cwd=SERVICE_ROOT,
+        env={**os.environ, "DATABASE_URL": _DEFAULT_TEST_DATABASE_URL},
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    heads = [line.strip() for line in result.stdout.strip().splitlines() if line.strip()]
+    assert len(heads) == 1, f"Expected single head, got: {heads}"
+    assert "a56cb01a3ebf" in heads[0]

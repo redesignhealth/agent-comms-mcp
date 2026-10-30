@@ -456,6 +456,192 @@ class TestDedup:
         rows = (await session.execute(select(ProposalHold))).scalars().all()
         assert len(rows) == 1
 
+    async def test_different_dedup_field_on_same_target_does_not_dedup(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-8080 PR3: two set_dates proposals on the same project (target_id)
+        with different dedup_field (e.g. 'project:startDate' and 'project:targetDate')
+        must produce two distinct pending rows rather than overwriting in place."""
+        first = await _submit(
+            session,
+            action=_action(
+                action_type="set_dates",
+                target_id="proj-123",
+                dedup_field="project:startDate",
+            ),
+            rationale="set start date",
+        )
+        second = await _submit(
+            session,
+            action=_action(
+                action_type="set_dates",
+                target_id="proj-123",
+                dedup_field="project:targetDate",
+            ),
+            rationale="set target date",
+        )
+
+        assert first["proposal_id"] != second["proposal_id"]
+        rows = (await session.execute(select(ProposalHold))).scalars().all()
+        assert len(rows) == 2
+        assert {row.action["dedup_field"] for row in rows} == {
+            "project:startDate",
+            "project:targetDate",
+        }
+        assert all(row.status == "pending" for row in rows)
+
+    async def test_same_dedup_field_updates_in_place(self, session: AsyncSession) -> None:
+        """A resubmission with the same dedup_field updates the existing pending row."""
+        first = await _submit(
+            session,
+            action=_action(
+                action_type="set_dates",
+                target_id="proj-123",
+                dedup_field="project:targetDate",
+            ),
+            rationale="initial target date",
+        )
+        second = await _submit(
+            session,
+            action=_action(
+                action_type="set_dates",
+                target_id="proj-123",
+                dedup_field="project:targetDate",
+            ),
+            rationale="updated target date",
+        )
+
+        assert first["proposal_id"] == second["proposal_id"]
+        rows = (await session.execute(select(ProposalHold))).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].rationale == "updated target date"
+        assert rows[0].action["dedup_field"] == "project:targetDate"
+
+    async def test_absent_dedup_field_does_not_dedup_against_present_dedup_field(
+        self, session: AsyncSession
+    ) -> None:
+        """A proposal with no dedup_field and one with a dedup_field on the same target
+        are distinct rows."""
+        first = await _submit(
+            session,
+            action=_action(target_id="proj-123"),
+            rationale="no dedup_field",
+        )
+        second = await _submit(
+            session,
+            action=_action(target_id="proj-123", dedup_field="project:targetDate"),
+            rationale="with dedup_field",
+        )
+
+        assert first["proposal_id"] != second["proposal_id"]
+        rows = (await session.execute(select(ProposalHold))).scalars().all()
+        assert len(rows) == 2
+
+    async def test_applying_row_with_different_dedup_field_does_not_block_insert(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-8080 PR3 §3.4: a proposal with dedup_field=A in 'applying' status
+        does not block a new submission with dedup_field=B on the same target."""
+        applying_hold = ProposalHold(
+            kind="linear_progress_update",
+            proposed_by_bot_id="bot-1",
+            owner_sub="owner-a@example.com",
+            action=_action(
+                action_type="set_dates",
+                target_id="proj-123",
+                dedup_field="project:startDate",
+            ),
+            rationale="applying start date",
+            confidence="medium",
+            importance="medium",
+            impact="medium",
+            priority="medium",
+            target_fingerprint="deadbeef",
+            status="applying",
+            decision_source="human",
+            decided_by_actor_id="owner-a@example.com",
+            decided_at=datetime.now(UTC),
+        )
+        session.add(applying_hold)
+        await session.commit()
+
+        result = await _submit(
+            session,
+            action=_action(
+                action_type="set_dates",
+                target_id="proj-123",
+                dedup_field="project:targetDate",
+            ),
+            rationale="pending target date",
+        )
+
+        assert result["status"] == "pending"
+        assert result["proposal_id"] != str(applying_hold.id)
+        rows = (await session.execute(select(ProposalHold))).scalars().all()
+        assert len(rows) == 2
+
+    async def test_applying_row_with_same_dedup_field_returns_as_is(
+        self, session: AsyncSession
+    ) -> None:
+        """A resubmission against an 'applying' row with the SAME dedup_field
+        is dedup-blocked, returning the applying row unmodified."""
+        action = _action(
+            action_type="set_dates",
+            target_id="proj-123",
+            dedup_field="project:targetDate",
+        )
+        applying_hold = ProposalHold(
+            kind="linear_progress_update",
+            proposed_by_bot_id="bot-1",
+            owner_sub="owner-a@example.com",
+            action=action,
+            rationale="applying target date",
+            confidence="medium",
+            importance="medium",
+            impact="medium",
+            priority="medium",
+            target_fingerprint="deadbeef",
+            status="applying",
+            decision_source="human",
+            decided_by_actor_id="owner-a@example.com",
+            decided_at=datetime.now(UTC),
+        )
+        session.add(applying_hold)
+        await session.commit()
+
+        result = await _submit(
+            session,
+            action=action,
+            rationale="resubmitted target date",
+        )
+
+        assert result["status"] == "applying"
+        assert result["proposal_id"] == str(applying_hold.id)
+        # Did not mutate
+        await session.refresh(applying_hold)
+        assert applying_hold.rationale == "applying target date"
+
+    @pytest.mark.parametrize(
+        "bad_dedup_field",
+        [
+            "",
+            123,
+            None,
+            "a" * 100,
+            "a b",
+            "1abc",
+            "a@b",
+        ],
+    )
+    async def test_malformed_dedup_field_raises_value_error(
+        self, session: AsyncSession, bad_dedup_field: Any
+    ) -> None:
+        with pytest.raises(ValueError, match=r"action\.dedup_field"):
+            await _submit(
+                session,
+                action=_action(dedup_field=bad_dedup_field),
+            )
+
 
 class TestClassifyDispatch:
     """Board-side coverage of the ``judge.classify()`` call site in
