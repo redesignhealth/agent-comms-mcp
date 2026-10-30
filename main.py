@@ -28,6 +28,7 @@ from pydantic import AnyUrl
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 
+import models
 import plugins
 import service
 import subscriptions
@@ -1439,14 +1440,33 @@ async def decide_proposal_route(request: Request) -> Response:
                 },
                 status_code=422,
             )
-    if decision == "reject" and (not isinstance(decision_note, str) or not decision_note.strip()):
+    decision_reason_code = body.get("decision_reason_code")
+    if decision_reason_code is not None and (
+        not isinstance(decision_reason_code, str)
+        or decision_reason_code not in models.DECISION_REASON_CODES
+    ):
+        codes = models.DECISION_REASON_CODES
         return JSONResponse(
             {
-                "error": "decision_note_required",
-                "detail": "decision_note is required and must be non-empty to reject",
+                "error": "invalid_decision_reason_code",
+                "detail": f"decision_reason_code must be one of {codes!r}",
             },
             status_code=400,
         )
+    if decision == "reject":
+        has_note = isinstance(decision_note, str) and bool(decision_note.strip())
+        has_code = decision_reason_code is not None and decision_reason_code != "other"
+        if not (has_note or has_code):
+            return JSONResponse(
+                {
+                    "error": "decision_note_required",
+                    "detail": (
+                        "decision_note is required and must be non-empty to reject "
+                        "unless a decision_reason_code other than 'other' is supplied"
+                    ),
+                },
+                status_code=400,
+            )
 
     async with get_session_factory()() as session:
         try:
@@ -1456,12 +1476,15 @@ async def decide_proposal_route(request: Request) -> Response:
                 hold_id=hold_id,
                 decision=decision,
                 decision_note=decision_note,
+                decision_reason_code=decision_reason_code,
                 judge=plugins.get_proposal_judge(),
             )
         except AccessDeniedError:
             return JSONResponse(_UNIFORM_HOLD_NOT_FOUND, status_code=404)
         except HoldAlreadyDecidedError as exc:
             return JSONResponse({"error": "already_decided", "status": exc.status}, status_code=409)
+        except ValueError as exc:
+            return JSONResponse({"error": "invalid_request", "detail": str(exc)}, status_code=400)
         except Exception:
             logger.exception("decide_proposal invariant violation for hold_id=%s", hold_id)
             return JSONResponse({"error": "internal_error"}, status_code=500)

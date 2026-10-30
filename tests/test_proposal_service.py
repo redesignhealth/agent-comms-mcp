@@ -157,6 +157,7 @@ async def _decide(
     hold_id: uuid.UUID,
     decision: str = "approve",
     decision_note: str | None = None,
+    decision_reason_code: str | None = None,
     judge: ProposalJudge | None = None,
 ) -> dict[str, Any]:
     return await decide_proposal(
@@ -165,6 +166,7 @@ async def _decide(
         hold_id=hold_id,
         decision=decision,
         decision_note=decision_note,
+        decision_reason_code=decision_reason_code,
         judge=judge if judge is not None else _default_judge(),
     )
 
@@ -1469,7 +1471,7 @@ class TestDecideProposal:
         self, session: AsyncSession
     ) -> None:
         submitted = await _submit(session)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="decision_note is required"):
             await _decide(session, hold_id=uuid.UUID(submitted["proposal_id"]), decision="reject")
 
     async def test_reject_with_note_sets_rejected(self, session: AsyncSession) -> None:
@@ -1482,8 +1484,114 @@ class TestDecideProposal:
         )
         assert decided["status"] == "rejected"
         assert decided["decision_note"] == "not appropriate"
+        assert decided.get("decision_reason_code") is None
         assert decided["decision_source"] == "human"
         assert decided["decided_by_actor_id"] == "owner-a@example.com"
+
+    async def test_reject_with_reason_code_only_sets_rejected(self, session: AsyncSession) -> None:
+        submitted = await _submit(session)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        decided = await _decide(
+            session,
+            hold_id=hold_id,
+            decision="reject",
+            decision_reason_code="not_now",
+        )
+        assert decided["status"] == "rejected"
+        assert decided["decision_reason_code"] == "not_now"
+        assert decided.get("decision_note") is None
+        assert decided["decision_source"] == "human"
+        assert decided["decided_by_actor_id"] == "owner-a@example.com"
+
+        hold = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        assert hold.decision_reason_code == "not_now"
+        assert hold.decision_note is None
+
+        audit = (
+            await session.execute(
+                select(AuditLog).where(
+                    AuditLog.action == "proposal.reject",
+                    AuditLog.detail["hold_id"].astext == str(hold_id),
+                )
+            )
+        ).scalar_one()
+        assert audit.detail.get("decision_reason_code") == "not_now"
+
+    async def test_reject_with_other_and_no_note_raises_value_error(
+        self, session: AsyncSession
+    ) -> None:
+        submitted = await _submit(session)
+        with pytest.raises(ValueError, match="decision_note is required"):
+            await _decide(
+                session,
+                hold_id=uuid.UUID(submitted["proposal_id"]),
+                decision="reject",
+                decision_reason_code="other",
+            )
+
+    async def test_reject_with_other_and_note_sets_rejected(self, session: AsyncSession) -> None:
+        submitted = await _submit(session)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        decided = await _decide(
+            session,
+            hold_id=hold_id,
+            decision="reject",
+            decision_reason_code="other",
+            decision_note="detailed reason here",
+        )
+        assert decided["status"] == "rejected"
+        assert decided["decision_reason_code"] == "other"
+        assert decided["decision_note"] == "detailed reason here"
+
+    async def test_reject_unknown_reason_code_raises_value_error(
+        self, session: AsyncSession
+    ) -> None:
+        submitted = await _submit(session)
+        with pytest.raises(ValueError, match="decision_reason_code must be one of"):
+            await _decide(
+                session,
+                hold_id=uuid.UUID(submitted["proposal_id"]),
+                decision="reject",
+                decision_reason_code="bogus_code",
+            )
+
+    async def test_approve_with_reason_code_persisted(self, session: AsyncSession) -> None:
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result=None, caller_error=None, log_detail=None
+            ),
+        )
+        submitted = await _submit(session, judge=judge)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        decided = await _decide(
+            session,
+            hold_id=hold_id,
+            decision="approve",
+            decision_reason_code="duplicate",
+            judge=judge,
+        )
+        assert decided["status"] == "applied"
+        assert decided["decision_reason_code"] == "duplicate"
+
+        hold = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        assert hold.decision_reason_code == "duplicate"
+
+    async def test_approve_unknown_reason_code_raises_value_error(
+        self, session: AsyncSession
+    ) -> None:
+        submitted = await _submit(session)
+        with pytest.raises(ValueError, match="decision_reason_code must be one of"):
+            await _decide(
+                session,
+                hold_id=uuid.UUID(submitted["proposal_id"]),
+                decision="approve",
+                decision_reason_code="bogus_code",
+            )
 
     async def test_approve_matching_fingerprint_applies_and_calls_apply_once(
         self, session: AsyncSession

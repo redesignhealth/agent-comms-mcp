@@ -688,6 +688,7 @@ class TestProposalHoldsSchema:
             "applied_at",
             "apply_error",
             "apply_result",
+            "decision_reason_code",
             "created_at",
             "updated_at",
         ):
@@ -888,6 +889,49 @@ class TestProposalHoldsSchema:
                             "VALUES ('linear_progress_update', 'test-bot', 'test-owner', "
                             "'{}'::jsonb, 'rationale', 'low', 'low', 'low', 'low', 'approved', "
                             "'bogus_source', 'test-actor', now(), 'deadbeef')"
+                        )
+                    )
+
+    async def test_decision_reason_code_check_constraint(self, engine: AsyncEngine) -> None:
+        async with engine.connect() as conn:
+            constraint_def = (
+                await conn.execute(
+                    text(
+                        "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                        "WHERE conrelid = 'proposal_holds'::regclass "
+                        "AND conname = 'ck_proposal_holds_decision_reason_code'"
+                    )
+                )
+            ).scalar_one_or_none()
+        assert constraint_def is not None
+        for code in (
+            "not_now",
+            "wrong_target",
+            "incorrect_facts",
+            "insufficient_evidence",
+            "duplicate",
+            "policy",
+            "human_will_handle",
+            "other",
+        ):
+            assert code in constraint_def
+
+    async def test_decision_reason_code_check_constraint_rejects_invalid_value(
+        self, engine: AsyncEngine
+    ) -> None:
+        async with engine.connect() as conn:
+            with pytest.raises(IntegrityError, match="ck_proposal_holds_decision_reason_code"):
+                async with conn.begin():
+                    await conn.execute(
+                        text(
+                            "INSERT INTO proposal_holds "
+                            "(kind, proposed_by_bot_id, owner_sub, action, rationale, "
+                            "confidence, importance, impact, priority, status, "
+                            "decision_source, decided_by_actor_id, decided_at, "
+                            "decision_reason_code, target_fingerprint) "
+                            "VALUES ('linear_progress_update', 'test-bot', 'test-owner', "
+                            "'{}'::jsonb, 'rationale', 'low', 'low', 'low', 'low', 'rejected', "
+                            "'human', 'test-actor', now(), 'bogus_code', 'deadbeef')"
                         )
                     )
 
