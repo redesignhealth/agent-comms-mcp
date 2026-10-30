@@ -583,6 +583,9 @@ class AuditLog(Base):
         # migration-time build detail, not part of the index's identity
         # that autogenerate compares on.
         Index("idx_audit_log_actor_sub_action_at", "actor_sub", "action", "at"),
+        # Backs service daily auto-approval cap COUNT queries (TECH-8080 PR13).
+        # Built CONCURRENTLY in migration 58dd9bd941a6.
+        Index("idx_audit_log_action_at", "action", "at"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
