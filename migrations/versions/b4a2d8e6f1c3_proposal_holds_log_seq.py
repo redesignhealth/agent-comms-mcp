@@ -222,19 +222,17 @@ def upgrade() -> None:
                 "backfill runbook documented in this migration's docstring before re-running."
             )
 
-    # 4. Deterministic backfill (only populate rows where log_seq IS NULL)
+    # 4. Deterministic backfill (single window-function pass, no correlated subquery)
     op.execute("""
         WITH ranked AS (
             SELECT id,
-                   COALESCE(
-                       (SELECT MAX(h2.log_seq) FROM proposal_holds h2 WHERE h2.proposed_by_bot_id = proposal_holds.proposed_by_bot_id),
-                       0
-                   ) + row_number() OVER (
-                       PARTITION BY proposed_by_bot_id
+                   COALESCE(MAX(log_seq) OVER (PARTITION BY proposed_by_bot_id), 0)
+                   + row_number() OVER (
+                       PARTITION BY proposed_by_bot_id, (log_seq IS NULL)
                        ORDER BY COALESCE(decided_at, created_at), created_at, id
-                   ) AS rn
+                   ) AS rn,
+                   log_seq
             FROM proposal_holds
-            WHERE log_seq IS NULL
         )
         UPDATE proposal_holds h
         SET log_seq = r.rn
