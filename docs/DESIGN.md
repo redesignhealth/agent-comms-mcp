@@ -1851,14 +1851,28 @@ DB-level partial UNIQUE index, `idx_proposal_holds_pending_dedup` (`(kind,
 proposed_by_bot_id, (action ->> 'target_id'), (action ->> 'action_type'),
 COALESCE(cross_brain ->> 'target_sub', ''), COALESCE(action ->> 'dedup_field', ''))
 WHERE status IN ('pending', 'applying')`), enforce this dedup boundary continuously.
-The application predicate matches the index's six expressions (using `COALESCE(..., '')`
-for optional `cross_brain.target_sub` and `action.dedup_field` so unpopulated fields evaluate
-identically to the empty string) while evaluating `status IN ('pending', 'applying')` as an
-application WHERE clause condition matching the partial index's filter predicate.
+The application predicate (`service._proposal_dedup_where`) always evaluates all
+six key expressions: `kind`, `proposed_by_bot_id`, `action->>'target_id'`,
+`action->>'action_type'`, `COALESCE(cross_brain->>'target_sub', '')`, and
+`COALESCE(action->>'dedup_field', '') == dedup_field` (defaulting `dedup_field` to `""`
+for proposals without an explicit field, matching the index expression's `COALESCE`),
+while evaluating `status IN ('pending', 'applying')` as an application WHERE clause
+condition matching the partial index's filter predicate.
 The index is also the race-closing backstop for two concurrent submissions
 that both miss the SELECT and both attempt an INSERT: the loser's INSERT
 raises `IntegrityError`, which `service._dedup_or_insert_proposal` catches
 and turns into the UPDATE path instead.
+
+*Mixed-deploy compatibility window*: During a rolling deploy, old pods running
+pre-TECH-8080 code still query using the five-key predicate without `dedup_field` via
+`scalar_one_or_none()`. If new pods create multiple pending rows on the same target
+that differ only by `dedup_field` (e.g. `startDate` and `targetDate`), an old pod
+receiving a resubmission for that target will match multiple rows and raise
+`MultipleResultsFound` (HTTP 500). This transient window is accepted and resolves
+automatically once the rollout finishes replacing all old pods with new code.
+Rollback safety is not claimed while multiple active rows differing only by `dedup_field`
+remain on the same target (the migration's downgrade check explicitly forbids downgrading
+while any such collisions exist).
 
 **Per-bot rate limit** (TECH-5875, `MAX_PROPOSALS_PER_BOT_PER_WINDOW=5` per
 `PROPOSAL_RATE_LIMIT_WINDOW=1 minute`) counts `audit_log` rows tagged

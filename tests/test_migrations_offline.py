@@ -547,7 +547,18 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
         "RENAME TO idx_proposal_holds_pending_dedup;"
     )
     rename_pos = result.stdout.index(rename_sql, drop_old_pos)
-    assert concurrently_pos < begin_swap_pos < lock_timeout_pos < drop_old_pos < rename_pos
+    lock_timeout_reset_sql = "SET LOCAL lock_timeout = DEFAULT;"
+    lock_timeout_reset_pos = result.stdout.index(lock_timeout_reset_sql, rename_pos)
+    commit_swap_pos = result.stdout.index("COMMIT;", lock_timeout_reset_pos)
+    assert (
+        concurrently_pos
+        < begin_swap_pos
+        < lock_timeout_pos
+        < drop_old_pos
+        < rename_pos
+        < lock_timeout_reset_pos
+        < commit_swap_pos
+    )
 
 
 def test_alembic_single_head() -> None:

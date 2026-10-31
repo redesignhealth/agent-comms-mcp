@@ -710,78 +710,84 @@ class TestDedup:
                 action=_action(dedup_field=bad_dedup_field),
             )
 
-    async def test_rolling_deploy_five_key_dedup_lookup_returns_oldest_without_raising(
+    async def test_six_key_resubmission_never_matches_different_dedup_field_and_legacy_matches_own(
         self, session: AsyncSession
     ) -> None:
-        """During a rolling deploy or code-only rollback, tasks query using the 5-key
-        dedup predicate. When multiple pending rows differ only by dedup_field,
-        the bounded query (order_by created_at.asc, id.asc + limit(1)) must return
-        the oldest row rather than raising MultipleResultsFound (HTTP 500)."""
-        first = await _submit(
+        """Regression test for Argus round 2 on TECH-8080 PR3:
+        1. A six-key submission with dedup_field='project:startDate' never matches a legacy
+           pending row without dedup_field.
+        2. A legacy five-key submission (dedup_field='') matches only its own pending row,
+           never any row that has an explicit dedup_field.
+        3. A submission with a different dedup_field ('project:targetDate') creates a new row
+           instead of matching either existing row.
+        """
+        # 1. Seed a legacy proposal (no dedup_field)
+        legacy = await _submit(
+            session,
+            action=_action(action_type="set_dates", target_id="proj-123"),
+            rationale="legacy proposal",
+        )
+        # 2. Seed a six-key proposal on the same target with dedup_field='project:startDate'
+        start_date = await _submit(
             session,
             action=_action(
                 action_type="set_dates",
                 target_id="proj-123",
                 dedup_field="project:startDate",
             ),
-            rationale="oldest proposal",
+            rationale="start date proposal",
         )
-        second = await _submit(
-            session,
-            action=_action(
-                action_type="set_dates",
-                target_id="proj-123",
-                dedup_field="project:targetDate",
-            ),
-            rationale="newer proposal",
-        )
-        assert first["proposal_id"] != second["proposal_id"]
+        assert legacy["proposal_id"] != start_date["proposal_id"]
 
-        # 1. Exercise the 5-key lookup (dedup_field omitted/None) via _dedup_or_insert_proposal
-        # Simulates an old task or rollback querying against rows seeded with distinct dedup_fields
-        existing = await service._dedup_or_insert_proposal(
+        # 3. Resubmit legacy -> updates only the legacy row in place
+        resub_legacy = await _submit(
             session,
-            kind="linear_progress_update",
-            proposed_by_bot_id="bot-1",
-            owner_sub="owner-a@example.com",
             action=_action(action_type="set_dates", target_id="proj-123"),
-            rationale="resubmitted from old task",
-            confidence="medium",
-            importance="medium",
-            impact="medium",
-            target_id="proj-123",
-            action_type="set_dates",
-            dedup_field=None,
-            priority="medium",
-            target_fingerprint="deadbeef",
+            rationale="legacy updated",
         )
-        # Bounded lookup returns the oldest row without raising MultipleResultsFound
-        assert str(existing.id) == first["proposal_id"]
-        assert existing.rationale == "resubmitted from old task"
+        assert resub_legacy["proposal_id"] == legacy["proposal_id"]
 
-        # 2. Normal single-row path remains identical when dedup_field is provided
-        single_row = await service._dedup_or_insert_proposal(
+        # 4. Resubmit six-key (startDate) -> updates only the startDate row in place
+        resub_start = await _submit(
             session,
-            kind="linear_progress_update",
-            proposed_by_bot_id="bot-1",
-            owner_sub="owner-a@example.com",
+            action=_action(
+                action_type="set_dates",
+                target_id="proj-123",
+                dedup_field="project:startDate",
+            ),
+            rationale="start date updated",
+        )
+        assert resub_start["proposal_id"] == start_date["proposal_id"]
+
+        # 5. Submit with different dedup_field ('project:targetDate') -> creates a distinct 3rd row
+        target_date = await _submit(
+            session,
             action=_action(
                 action_type="set_dates",
                 target_id="proj-123",
                 dedup_field="project:targetDate",
             ),
-            rationale="updated newer proposal",
-            confidence="medium",
-            importance="medium",
-            impact="medium",
-            target_id="proj-123",
-            action_type="set_dates",
-            dedup_field="project:targetDate",
-            priority="medium",
-            target_fingerprint="deadbeef",
+            rationale="target date proposal",
         )
-        assert str(single_row.id) == second["proposal_id"]
-        assert single_row.rationale == "updated newer proposal"
+        assert target_date["proposal_id"] not in (legacy["proposal_id"], start_date["proposal_id"])
+
+        # Verify all 3 rows exist and their rationales/fields are untouched by cross-resubmission
+        rows = (
+            (
+                await session.execute(
+                    select(ProposalHold).order_by(
+                        ProposalHold.created_at.asc(), ProposalHold.id.asc()
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 3
+        row_map = {row.action.get("dedup_field", ""): row for row in rows}
+        assert row_map[""].rationale == "legacy updated"
+        assert row_map["project:startDate"].rationale == "start date updated"
+        assert row_map["project:targetDate"].rationale == "target date proposal"
 
 
 class TestClassifyDispatch:

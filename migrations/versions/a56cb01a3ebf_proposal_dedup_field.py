@@ -142,12 +142,15 @@ def upgrade() -> None:
     # Uniqueness is preserved continuously and catalog lock duration is minimal.
     # Set a bounded lock_timeout so waiting for ACCESS EXCLUSIVE fails fast
     # rather than queueing and blocking reads/writes on proposal_holds.
+    # Reset lock_timeout back to DEFAULT immediately after the swap so the 5s
+    # limit does not leak into subsequent migrations in the same Alembic transaction.
     op.execute("SET LOCAL lock_timeout = '5s'")
     op.drop_index("idx_proposal_holds_pending_dedup", table_name="proposal_holds", if_exists=True)
     op.execute(
         "ALTER INDEX IF EXISTS idx_proposal_holds_pending_dedup_new "
         "RENAME TO idx_proposal_holds_pending_dedup"
     )
+    op.execute("SET LOCAL lock_timeout = DEFAULT")
 
 
 def downgrade() -> None:
@@ -220,3 +223,4 @@ def downgrade() -> None:
         "ALTER INDEX IF EXISTS idx_proposal_holds_pending_dedup_old "
         "RENAME TO idx_proposal_holds_pending_dedup"
     )
+    op.execute("SET LOCAL lock_timeout = DEFAULT")

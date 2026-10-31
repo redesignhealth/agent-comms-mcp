@@ -7438,7 +7438,7 @@ def _proposal_dedup_where(
     target_id: str,
     action_type: str,
     cross_target_sub: str = "",
-    dedup_field: str | None = None,
+    dedup_field: str = "",
 ) -> tuple[Any, ...]:
     """Shared create-time dedup predicate (TECH-5872, Argus review B1 fix):
     ``(kind, proposed_by_bot_id, target_id, action_type)`` against any
@@ -7467,7 +7467,7 @@ def _proposal_dedup_where(
     ``target_fingerprint`` out from under that would desync what
     actually got applied to Linear from what the row claims was
     submitted."""
-    clauses: list[Any] = [
+    return (
         ProposalHold.kind == kind,
         ProposalHold.proposed_by_bot_id == proposed_by_bot_id,
         ProposalHold.status.in_(("pending", "applying")),
@@ -7476,13 +7476,10 @@ def _proposal_dedup_where(
         # TECH-7665: same key as the COALESCE(...) term in the unique index
         # (migration c7665a1b2d3e); '' for every non-cross-brain hold.
         func.coalesce(ProposalHold.cross_brain["target_sub"].astext, "") == cross_target_sub,
-    ]
-    # TECH-8080 (PR3): field-aware proposal dedup; same key as the COALESCE(...)
-    # term in the unique index (migration a56cb01a3ebf); '' for every hold without dedup_field.
-    # When omitted (None), matches the legacy 5-key predicate for rolling deploys / rollbacks.
-    if dedup_field is not None:
-        clauses.append(func.coalesce(ProposalHold.action["dedup_field"].astext, "") == dedup_field)
-    return tuple(clauses)
+        # TECH-8080 (PR3): field-aware proposal dedup; same key as the COALESCE(...)
+        # term in the unique index (migration a56cb01a3ebf); '' for every hold without dedup_field.
+        func.coalesce(ProposalHold.action["dedup_field"].astext, "") == dedup_field,
+    )
 
 
 def _apply_proposal_resubmission(
@@ -7563,7 +7560,7 @@ async def _dedup_or_insert_proposal(
     impact: str,
     target_id: str,
     action_type: str,
-    dedup_field: str | None = "",
+    dedup_field: str = "",
     priority: str,
     target_fingerprint: str,
     sender_agent_id: uuid.UUID | None = None,
