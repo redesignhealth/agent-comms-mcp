@@ -935,6 +935,40 @@ class TestProposalHoldsSchema:
                         )
                     )
 
+    async def test_decision_reason_code_migration_upgrade_idempotent(
+        self, engine: AsyncEngine, database_url: str
+    ) -> None:
+        """Item 4: second upgrade attempt of 5ef4403d7f33 after constraint exists succeeds."""
+        env = {**os.environ, "DATABASE_URL": database_url.replace("+asyncpg", "")}
+        subprocess.run(
+            [sys.executable, "-m", "alembic", "upgrade", "head"],
+            cwd=SERVICE_ROOT,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text("UPDATE alembic_version SET version_num = 'a56cb01a3ebf'"))
+            res = subprocess.run(
+                [sys.executable, "-m", "alembic", "upgrade", "5ef4403d7f33"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert res.returncode == 0, res.stderr
+        finally:
+            subprocess.run(
+                [sys.executable, "-m", "alembic", "upgrade", "head"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
     async def test_indexes_exist(self, engine: AsyncEngine) -> None:
         indexes = await _indexes(engine, "proposal_holds")
         assert "idx_proposal_holds_status_created_at" in indexes

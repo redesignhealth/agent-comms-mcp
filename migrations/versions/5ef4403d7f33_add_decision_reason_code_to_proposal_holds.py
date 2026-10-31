@@ -20,7 +20,7 @@ in a separate transaction under SHARE UPDATE EXCLUSIVE lock.
 from collections.abc import Sequence
 
 import sqlalchemy as sa
-from alembic import op
+from alembic import context, op
 
 revision: str = "5ef4403d7f33"
 down_revision: str | None = "a56cb01a3ebf"
@@ -48,6 +48,23 @@ def upgrade() -> None:
         sa.Column("decision_reason_code", sa.Text(), nullable=True),
         if_not_exists=True,
     )
+    if not context.is_offline_mode():
+        bind = op.get_bind()
+        row = bind.execute(
+            sa.text("""
+                SELECT 1
+                FROM pg_constraint con
+                JOIN pg_class rel ON rel.oid = con.conrelid
+                JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace
+                WHERE con.conname = :constraint_name
+                  AND rel.relname = 'proposal_holds'
+                  AND nsp.nspname = current_schema()
+            """),
+            {"constraint_name": _CONSTRAINT_NAME},
+        ).fetchone()
+        if row is not None:
+            return
+
     op.create_check_constraint(
         _CONSTRAINT_NAME,
         "proposal_holds",

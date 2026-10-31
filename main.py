@@ -44,6 +44,7 @@ from exceptions import (
     InvalidConversationStateError,
     InvalidOwnerReassignmentError,
     InvalidProposalActionError,
+    ProposalDecisionValidationError,
     ProposalTargetUnavailableError,
     RateLimitExceededError,
 )
@@ -1388,8 +1389,11 @@ async def get_proposal_apply_record_route(request: Request) -> Response:
 async def decide_proposal_route(request: Request) -> Response:
     """Human decide endpoint for a pending proposal hold (TECH-5873).
 
-    Body: ``{"decision": "approve" | "reject", "decision_note": "<required
-    for reject, optional for approve, max 2000 chars>"}``. Same hard
+    Body: ``{"decision": "approve" | "reject", "decision_note": "<optional,
+    max 2000 chars; required for reject unless non-'other' decision_reason_code supplied>",
+    "decision_reason_code": "<optional, closed vocabulary: not_now, wrong_target,
+    incorrect_facts, insufficient_evidence, duplicate, policy, human_will_handle,
+    other>"}``. Same hard
     interactive-token gate as ``/approvals/{hold_id}/decide``
     (``_authenticate_approval_caller``) -- a bot can never reach this
     route at all, which is what makes a bot self-approving its own
@@ -1483,7 +1487,7 @@ async def decide_proposal_route(request: Request) -> Response:
             return JSONResponse(_UNIFORM_HOLD_NOT_FOUND, status_code=404)
         except HoldAlreadyDecidedError as exc:
             return JSONResponse({"error": "already_decided", "status": exc.status}, status_code=409)
-        except ValueError as exc:
+        except ProposalDecisionValidationError as exc:
             return JSONResponse({"error": "invalid_request", "detail": str(exc)}, status_code=400)
         except Exception:
             logger.exception("decide_proposal invariant violation for hold_id=%s", hold_id)
