@@ -606,8 +606,7 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
         "ON audit_log (action, at);" in result.stdout
     )
     concurrent_audit_pos = result.stdout.index(
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_audit_log_action_at "
-        "ON audit_log (action, at);"
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_audit_log_action_at ON audit_log (action, at);"
     )
     commit_audit_pos = result.stdout.index("COMMIT;", reason_validate_pos)
     assert commit_audit_pos < concurrent_audit_pos

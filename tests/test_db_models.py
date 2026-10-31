@@ -1426,6 +1426,7 @@ class TestProposalHoldsSchema:
         indisvalid and indisready on idx_audit_log_action_at, raising RuntimeError if
         missing, invalid, or unready."""
         import importlib
+
         migration_mod = importlib.import_module(
             "migrations.versions.58dd9bd941a6_add_idx_audit_log_action_at"
         )

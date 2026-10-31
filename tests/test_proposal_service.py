@@ -1133,10 +1133,14 @@ class TestProposalAutoApproveKillSwitchAndDailyCaps:
 
         # Exactly one proposal.auto_approved audit row
         audits = (
-            await session.execute(
-                select(AuditLog).where(AuditLog.action == _AUTO_APPROVED_AUDIT_ACTION)
+            (
+                await session.execute(
+                    select(AuditLog).where(AuditLog.action == _AUTO_APPROVED_AUDIT_ACTION)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(audits) == 1
         assert audits[0].detail is not None
         assert audits[0].detail["action_type"] == "open_ticket"
@@ -1166,18 +1170,26 @@ class TestProposalAutoApproveKillSwitchAndDailyCaps:
 
         # No proposal.auto_approved audit rows
         approved_audits = (
-            await session.execute(
-                select(AuditLog).where(AuditLog.action == _AUTO_APPROVED_AUDIT_ACTION)
+            (
+                await session.execute(
+                    select(AuditLog).where(AuditLog.action == _AUTO_APPROVED_AUDIT_ACTION)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(approved_audits) == 0
 
         # Exactly one denial audit row with rule auto_approve.kill_switch
         denial_audits = (
-            await session.execute(
-                select(AuditLog).where(AuditLog.action == _AUTO_APPROVE_DENIED_AUDIT_ACTION)
+            (
+                await session.execute(
+                    select(AuditLog).where(AuditLog.action == _AUTO_APPROVE_DENIED_AUDIT_ACTION)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(denial_audits) == 1
         assert denial_audits[0].detail is not None
         assert denial_audits[0].detail["rule"] == "auto_approve.kill_switch"
@@ -1205,10 +1217,14 @@ class TestProposalAutoApproveKillSwitchAndDailyCaps:
         assert len(judge.apply_calls) == 0
 
         denial_audits = (
-            await session.execute(
-                select(AuditLog).where(AuditLog.action == _AUTO_APPROVE_DENIED_AUDIT_ACTION)
+            (
+                await session.execute(
+                    select(AuditLog).where(AuditLog.action == _AUTO_APPROVE_DENIED_AUDIT_ACTION)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(denial_audits) == 1
         assert denial_audits[0].detail is not None
         assert denial_audits[0].detail["rule"] == "auto_approve.kill_switch"
@@ -1323,17 +1339,25 @@ class TestProposalAutoApproveKillSwitchAndDailyCaps:
 
         # Verify audit logs
         approved_audits = (
-            await session.execute(
-                select(AuditLog).where(AuditLog.action == _AUTO_APPROVED_AUDIT_ACTION)
+            (
+                await session.execute(
+                    select(AuditLog).where(AuditLog.action == _AUTO_APPROVED_AUDIT_ACTION)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(approved_audits) == 2
 
         denial_audits = (
-            await session.execute(
-                select(AuditLog).where(AuditLog.action == _AUTO_APPROVE_DENIED_AUDIT_ACTION)
+            (
+                await session.execute(
+                    select(AuditLog).where(AuditLog.action == _AUTO_APPROVE_DENIED_AUDIT_ACTION)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(denial_audits) == 1
         assert denial_audits[0].detail is not None
         assert denial_audits[0].detail["rule"] == "auto_approve.cap_exhausted.open_ticket"
@@ -1524,12 +1548,16 @@ class TestProposalAutoApproveKillSwitchAndDailyCaps:
 
         # 5. Verify audit rows recorded the exact DB timestamp injected
         audits = (
-            await session.execute(
-                select(AuditLog)
-                .where(AuditLog.action == _AUTO_APPROVED_AUDIT_ACTION)
-                .order_by(AuditLog.id.asc())
+            (
+                await session.execute(
+                    select(AuditLog)
+                    .where(AuditLog.action == _AUTO_APPROVED_AUDIT_ACTION)
+                    .order_by(AuditLog.id.asc())
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(audits) == 2
         assert audits[0].at == t_day1
         assert audits[1].at == t_day2
@@ -1580,18 +1608,26 @@ class TestProposalAutoApproveKillSwitchAndDailyCaps:
 
         # No proposal.auto_approved audit row
         approved_audits = (
-            await session.execute(
-                select(AuditLog).where(AuditLog.action == _AUTO_APPROVED_AUDIT_ACTION)
+            (
+                await session.execute(
+                    select(AuditLog).where(AuditLog.action == _AUTO_APPROVED_AUDIT_ACTION)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(approved_audits) == 0
 
         # Exactly one denial audit row with rule auto_approve.cap_check_failed
         denial_audits = (
-            await session.execute(
-                select(AuditLog).where(AuditLog.action == _AUTO_APPROVE_DENIED_AUDIT_ACTION)
+            (
+                await session.execute(
+                    select(AuditLog).where(AuditLog.action == _AUTO_APPROVE_DENIED_AUDIT_ACTION)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert len(denial_audits) == 1
         assert denial_audits[0].detail is not None
         assert denial_audits[0].detail["rule"] == "auto_approve.cap_check_failed"
@@ -1750,13 +1786,17 @@ class TestProposalAutoApproveKillSwitchAndDailyCaps:
         # Verify exact audit count in the database
         async with session_factory() as check_session:
             audits = (
-                await check_session.execute(
-                    select(AuditLog).where(
-                        AuditLog.action == _AUTO_APPROVED_AUDIT_ACTION,
-                        AuditLog.detail.op("->>")("action_type") == "concurrent_ticket",
+                (
+                    await check_session.execute(
+                        select(AuditLog).where(
+                            AuditLog.action == _AUTO_APPROVED_AUDIT_ACTION,
+                            AuditLog.detail.op("->>")("action_type") == "concurrent_ticket",
+                        )
                     )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             assert len(audits) == cap_val
 
 
