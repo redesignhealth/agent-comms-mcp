@@ -36,22 +36,15 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
-    Table,
     Text,
     UniqueConstraint,
     column,
     text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TIMESTAMP, UUID
-from sqlalchemy.dialects.postgresql.base import PGDialect
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from schemas import MAX_CONVERSATION_NAME_LENGTH, MAX_DISPLAY_NAME_LENGTH
-
-# Enable postgresql_with dialect options on Table (SQLAlchemy default only registers it on Index)
-for _target, _args in PGDialect.construct_arguments:
-    if _target is Table and isinstance(_args, dict):
-        _args.setdefault("with", {})
 
 # Closed vocabularies (CHECK-constrained). Conversation/message *types* are
 # open vocabularies owned by schemas.py.
@@ -968,18 +961,11 @@ class ProposalBotLogSeq(Base):
     A single-row-per-bot table serialising log_seq allocation via row-level locks
     held to transaction commit. Managed entirely by the database trigger
     trg_proposal_holds_log_seq -- not written from application code.
+    Storage parameters (fillfactor = 70, autovacuum_vacuum_scale_factor = 0.0,
+    autovacuum_vacuum_threshold = 1000) are set in migration b4a2d8e6f1c3.
     """
 
     __tablename__ = "proposal_bot_log_seq"
-    __table_args__ = (
-        {
-            "postgresql_with": {
-                "fillfactor": 70,
-                "autovacuum_vacuum_scale_factor": 0.0,
-                "autovacuum_vacuum_threshold": 1000,
-            }
-        },
-    )
 
     bot_id: Mapped[str] = mapped_column(Text, primary_key=True)
     last_seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
