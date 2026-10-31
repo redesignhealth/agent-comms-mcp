@@ -981,9 +981,7 @@ class TestSubmitProposal:
         _default_proposal_judge: FakeProposalJudge,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setenv(
-            service.PROPOSAL_AUTO_APPROVE_DAILY_CAPS_ENV_VAR, '{"close_ticket": 1}'
-        )
+        monkeypatch.setenv(service.PROPOSAL_AUTO_APPROVE_DAILY_CAPS_ENV_VAR, '{"close_ticket": 1}')
         service.reset_proposal_auto_approve_cache()
 
         _default_proposal_judge.judge_result = ProposalVerdict(

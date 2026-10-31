@@ -57,9 +57,7 @@ def _assert_audit_log_index_valid_and_ready(
         {"index_name": index_name},
     ).fetchone()
     if row is None:
-        raise RuntimeError(
-            f"Index {index_name!r} not found in pg_index after concurrent build."
-        )
+        raise RuntimeError(f"Index {index_name!r} not found in pg_index after concurrent build.")
     indisvalid, indisready = bool(row[0]), bool(row[1])
     if not (indisvalid and indisready):
         raise RuntimeError(
