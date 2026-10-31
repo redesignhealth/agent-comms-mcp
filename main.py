@@ -77,6 +77,9 @@ configure_logging()
 
 logger = logging.getLogger(__name__)
 
+# Log configured proposal auto-approval kill switch and daily caps once at startup (TECH-8080 PR13).
+service.log_proposal_auto_approve_config()
+
 
 # Uniform denial messages — identical across denial categories so the scope
 # registry cannot be enumerated by probing denial messages. The missing

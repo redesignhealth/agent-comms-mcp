@@ -946,6 +946,83 @@ class TestSubmitProposal:
         assert resp.json()["error"] == "not_found"
         assert resp.json()["detail"] == "Arcana resource not found"
 
+    async def test_submit_proposal_auto_approve_kill_switch_active_downgrades_to_pending(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        _default_proposal_judge: FakeProposalJudge,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv(service.PROPOSAL_AUTO_APPROVE_KILL_SWITCH_ENV_VAR, "true")
+        service.reset_proposal_auto_approve_cache()
+
+        _default_proposal_judge.judge_result = ProposalVerdict(
+            approved=True, decision_note="looks good", rule="linear_progress_update:open_ticket"
+        )
+        _default_proposal_judge.apply_result = ProposalApplyOutcome(
+            applied=True, result={"applied": True}, caller_error=None, log_detail=None
+        )
+
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-kill", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        resp = await http_client.post(
+            "/proposals", json=_PROPOSAL_BODY, headers={"Authorization": "Bearer bot-token"}
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "pending"
+        assert data["decision_note"] == "auto-approval is globally disabled; held for human review"
+        assert len(_default_proposal_judge.apply_calls) == 0
+
+    async def test_submit_proposal_auto_approve_daily_cap_exhausted_downgrades_to_pending(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        _default_proposal_judge: FakeProposalJudge,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv(service.PROPOSAL_AUTO_APPROVE_DAILY_CAPS_ENV_VAR, '{"close_ticket": 1}')
+        service.reset_proposal_auto_approve_cache()
+
+        _default_proposal_judge.judge_result = ProposalVerdict(
+            approved=True, decision_note="looks good", rule="linear_progress_update:close_ticket"
+        )
+        _default_proposal_judge.apply_result = ProposalApplyOutcome(
+            applied=True, result={"applied": True}, caller_error=None, log_detail=None
+        )
+
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-cap", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        # 1st: applied (cap 1)
+        resp1 = await http_client.post(
+            "/proposals",
+            json={
+                **_PROPOSAL_BODY,
+                "action": {"target_id": "TECH-CAP-1", "action_type": "close_ticket"},
+            },
+            headers={"Authorization": "Bearer bot-token"},
+        )
+        assert resp1.status_code == 200
+        assert resp1.json()["status"] == "applied"
+
+        # 2nd: pending (cap exhausted)
+        resp2 = await http_client.post(
+            "/proposals",
+            json={
+                **_PROPOSAL_BODY,
+                "action": {"target_id": "TECH-CAP-2", "action_type": "close_ticket"},
+            },
+            headers={"Authorization": "Bearer bot-token"},
+        )
+        assert resp2.status_code == 200
+        assert resp2.json()["status"] == "pending"
+        assert (
+            resp2.json()["decision_note"]
+            == "daily auto-approval cap reached for close_ticket; held for human review"
+        )
+
 
 class TestListPendingAuthGate:
     async def test_missing_token_returns_401(
