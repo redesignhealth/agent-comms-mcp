@@ -6668,6 +6668,27 @@ def _extract_proposal_target(action: dict[str, Any]) -> tuple[str, str]:
     return target_id, action_type
 
 
+_DEDUP_FIELD_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9_:]{0,63}")
+
+
+def _extract_proposal_dedup_field(action: dict[str, Any]) -> str:
+    """Derive and validate optional ``action.dedup_field`` (TECH-8080 PR3).
+
+    If absent from ``action``, defaults to ``""`` (preserving legacy dedup
+    behavior for all existing proposals). If present, it must be a non-empty
+    string of at most 64 characters matching ``^[a-zA-Z][a-zA-Z0-9_:]{0,63}$``;
+    any non-string, empty string, or non-matching value raises ValueError (mapped to 422).
+    """
+    if "dedup_field" not in action:
+        return ""
+    val = action["dedup_field"]
+    if not isinstance(val, str) or not _DEDUP_FIELD_RE.fullmatch(val):
+        raise ValueError(
+            "action.dedup_field must be a string matching ^[a-zA-Z][a-zA-Z0-9_:]{0,63}$"
+        )
+    return val
+
+
 # Fixed, self-documenting sentinel stored as target_fingerprint for any
 # proposal whose configured plugins.ProposalJudge reports
 # plugins.FINGERPRINT_NO_TARGET (TECH-5873 redefinition -- today, just
@@ -7417,6 +7438,7 @@ def _proposal_dedup_where(
     target_id: str,
     action_type: str,
     cross_target_sub: str = "",
+    dedup_field: str = "",
 ) -> tuple[Any, ...]:
     """Shared create-time dedup predicate (TECH-5872, Argus review B1 fix):
     ``(kind, proposed_by_bot_id, target_id, action_type)`` against any
@@ -7429,9 +7451,9 @@ def _proposal_dedup_where(
     common case and to re-query after losing the B2 race below) and must
     use the SAME key/status set as the DB-level partial unique index
     backing it, ``idx_proposal_holds_pending_dedup`` (migration
-    9a1c2d3e4f5b, predicate widened in e2f7a91c5b34) -- the two must
-    never drift onto different keys/predicates, or they will fight each
-    other.
+    9a1c2d3e4f5b, predicate widened in e2f7a91c5b34, cross-brain in
+    c7665a1b2d3e, dedup_field in a56cb01a3ebf) -- the two must never
+    drift onto different keys/predicates, or they will fight each other.
 
     ``'applying'`` is included (Argus review round-3 B1) so a
     resubmission during the brief claimed-but-not-yet-terminal window
@@ -7454,6 +7476,9 @@ def _proposal_dedup_where(
         # TECH-7665: same key as the COALESCE(...) term in the unique index
         # (migration c7665a1b2d3e); '' for every non-cross-brain hold.
         func.coalesce(ProposalHold.cross_brain["target_sub"].astext, "") == cross_target_sub,
+        # TECH-8080 (PR3): field-aware proposal dedup; same key as the COALESCE(...)
+        # term in the unique index (migration a56cb01a3ebf); '' for every hold without dedup_field.
+        func.coalesce(ProposalHold.action["dedup_field"].astext, "") == dedup_field,
     )
 
 
@@ -7535,6 +7560,7 @@ async def _dedup_or_insert_proposal(
     impact: str,
     target_id: str,
     action_type: str,
+    dedup_field: str = "",
     priority: str,
     target_fingerprint: str,
     sender_agent_id: uuid.UUID | None = None,
@@ -7557,8 +7583,15 @@ async def _dedup_or_insert_proposal(
         target_id=target_id,
         action_type=action_type,
         cross_target_sub=cross_brain["target_sub"] if cross_brain else "",
+        dedup_field=dedup_field,
     )
-    existing = (await session.execute(select(ProposalHold).where(*where))).scalar_one_or_none()
+    stmt = (
+        select(ProposalHold)
+        .where(*where)
+        .order_by(ProposalHold.created_at.asc(), ProposalHold.id.asc())
+        .limit(1)
+    )
+    existing = (await session.execute(stmt)).scalars().first()
     if existing is not None:
         # Argus review round-3 B1: an 'applying' match is mid-flight under
         # a concurrent _apply_or_finalize_proposal_hold -- mutating its
@@ -7605,9 +7638,13 @@ async def _dedup_or_insert_proposal(
         await session.rollback()
         if not _is_constraint_violation(exc, "idx_proposal_holds_pending_dedup"):
             raise
-        existing_after_race = (
-            await session.execute(select(ProposalHold).where(*where))
-        ).scalar_one_or_none()
+        race_stmt = (
+            select(ProposalHold)
+            .where(*where)
+            .order_by(ProposalHold.created_at.asc(), ProposalHold.id.asc())
+            .limit(1)
+        )
+        existing_after_race = (await session.execute(race_stmt)).scalars().first()
         if existing_after_race is None:
             # Vanishingly unlikely (the race winner's row was deleted again
             # before this re-read) -- nothing sane to update; surface the
@@ -7908,6 +7945,7 @@ async def create_proposal(
         owner_sub=owner_sub,
     )
     target_id, action_type = _extract_proposal_target(action)
+    dedup_field = _extract_proposal_dedup_field(action)
     priority = _classify_proposal(judge, kind, action)
 
     # Bug fix: server-compute target_fingerprint here instead of trusting
@@ -7974,6 +8012,7 @@ async def create_proposal(
         impact=impact,
         target_id=target_id,
         action_type=action_type,
+        dedup_field=dedup_field,
         priority=priority,
         target_fingerprint=target_fingerprint,
         sender_agent_id=sender_agent_id,

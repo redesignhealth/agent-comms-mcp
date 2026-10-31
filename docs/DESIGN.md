@@ -1841,19 +1841,38 @@ stays human-only and HTTP-only.
     would fail during validation or apply.
 
 **Create-time dedup key: `(kind, proposed_by_bot_id, target_id,
-action_type)`** -- scoped to the SUBMITTING BOT. A resubmission matching an
+action_type, cross_target_sub, dedup_field)`** -- scoped to the SUBMITTING BOT. A resubmission matching an
 existing `status='pending'` row under this key UPDATEs it in place instead
 of inserting a duplicate; a DIFFERENT bot proposing the same
-`(kind, target_id, action_type)` always gets its own fresh row, never a
+target always gets its own fresh row, never a
 silent overwrite of (and potential auto-approval under) another bot's
 identity. The app-level SELECT (`service._proposal_dedup_where`) and a
 DB-level partial UNIQUE index, `idx_proposal_holds_pending_dedup` (`(kind,
-proposed_by_bot_id, action->>'target_id', action->>'action_type') WHERE
-status IN ('pending', 'applying')`), share this exact key so the two cannot drift apart.
+proposed_by_bot_id, (action ->> 'target_id'), (action ->> 'action_type'),
+COALESCE(cross_brain ->> 'target_sub', ''), COALESCE(action ->> 'dedup_field', ''))
+WHERE status IN ('pending', 'applying')`), enforce this dedup boundary continuously.
+The application predicate (`service._proposal_dedup_where`) always evaluates all
+six key expressions: `kind`, `proposed_by_bot_id`, `action->>'target_id'`,
+`action->>'action_type'`, `COALESCE(cross_brain->>'target_sub', '')`, and
+`COALESCE(action->>'dedup_field', '') == dedup_field` (defaulting `dedup_field` to `""`
+for proposals without an explicit field, matching the index expression's `COALESCE`),
+while evaluating `status IN ('pending', 'applying')` as an application WHERE clause
+condition matching the partial index's filter predicate.
 The index is also the race-closing backstop for two concurrent submissions
 that both miss the SELECT and both attempt an INSERT: the loser's INSERT
 raises `IntegrityError`, which `service._dedup_or_insert_proposal` catches
 and turns into the UPDATE path instead.
+
+*Mixed-deploy compatibility window*: During a rolling deploy, old pods running
+pre-TECH-8080 code still query using the five-key predicate without `dedup_field` via
+`scalar_one_or_none()`. If new pods create multiple pending rows on the same target
+that differ only by `dedup_field` (e.g. `startDate` and `targetDate`), an old pod
+receiving a resubmission for that target will match multiple rows and raise
+`MultipleResultsFound` (HTTP 500). This transient window is accepted and resolves
+automatically once the rollout finishes replacing all old pods with new code.
+Rollback safety is not claimed while multiple active rows differing only by `dedup_field`
+remain on the same target (the migration's downgrade check explicitly forbids downgrading
+while any such collisions exist).
 
 **Per-bot rate limit** (TECH-5875, `MAX_PROPOSALS_PER_BOT_PER_WINDOW=5` per
 `PROPOSAL_RATE_LIMIT_WINDOW=1 minute`) counts `audit_log` rows tagged
