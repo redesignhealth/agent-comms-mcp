@@ -1284,7 +1284,9 @@ class TestProposalHoldsSchema:
                 await conn.execute(
                     text(
                         "WITH numbered AS ("
-                        "  SELECT id, row_number() OVER () AS rn FROM proposal_holds LIMIT 4"
+                        "  SELECT id, row_number() OVER ("
+                        "    PARTITION BY proposed_by_bot_id ORDER BY id"
+                        "  ) AS rn FROM proposal_holds LIMIT 4"
                         ") "
                         "UPDATE proposal_holds h SET log_seq = n.rn "
                         "FROM numbered n WHERE h.id = n.id"
@@ -1300,6 +1302,61 @@ class TestProposalHoldsSchema:
                 text=True,
             )
             assert res_rerun_ok.returncode == 0, res_rerun_ok.stderr
+
+            async with engine.connect() as conn:
+                # 1. No log_seq IS NULL rows remain
+                null_count = (
+                    await conn.execute(
+                        text("SELECT count(*) FROM proposal_holds WHERE log_seq IS NULL")
+                    )
+                ).scalar_one()
+                assert null_count == 0
+
+                # 2. log_seq is contiguous per bot (1..count with no gaps)
+                bot_rows = (
+                    await conn.execute(
+                        text(
+                            "SELECT proposed_by_bot_id, log_seq FROM proposal_holds "
+                            "ORDER BY proposed_by_bot_id, log_seq"
+                        )
+                    )
+                ).all()
+                from itertools import groupby
+
+                for _bot_id, group in groupby(bot_rows, key=lambda r: r[0]):
+                    seqs = [r[1] for r in group]
+                    assert seqs == list(range(1, len(seqs) + 1))
+
+                # 3. proposal_bot_log_seq matches each bot's max
+                counters = dict(
+                    (
+                        await conn.execute(
+                            text("SELECT bot_id, last_seq FROM proposal_bot_log_seq")
+                        )
+                    ).all()
+                )
+                for _bot_id, group in groupby(bot_rows, key=lambda r: r[0]):
+                    seqs = [r[1] for r in group]
+                    assert counters[_bot_id] == max(seqs)
+
+                # 4. Both indexes are valid and ready
+                index_rows = (
+                    await conn.execute(
+                        text("""
+                            SELECT c.relname, i.indisvalid, i.indisready
+                            FROM pg_index i
+                            JOIN pg_class c ON c.oid = i.indexrelid
+                            WHERE c.relname IN (
+                                'uq_proposal_holds_bot_id_log_seq',
+                                'idx_proposal_holds_bot_id_status_log_seq'
+                            )
+                        """)
+                    )
+                ).all()
+                assert len(index_rows) == 2
+                for idx_name, is_valid, is_ready in index_rows:
+                    assert is_valid is True, f"{idx_name} is not valid"
+                    assert is_ready is True, f"{idx_name} is not ready"
         finally:
             async with engine.begin() as conn:
                 await conn.execute(

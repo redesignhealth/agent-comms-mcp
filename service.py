@@ -176,7 +176,6 @@ from urllib.parse import urlsplit
 from sqlalchemy import ColumnElement, and_, case, func, literal, not_, or_, select, text, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import defer
 
 from exceptions import (
     AccessDeniedError,
@@ -7092,7 +7091,7 @@ _DEFAULT_ACTION: Final[object] = object()
 
 
 def _proposal_dict(
-    hold: ProposalHold,
+    hold: Any,
     *,
     action_override: Any = _DEFAULT_ACTION,
     elided_action_fields: dict[str, Any] | None = None,
@@ -7139,7 +7138,7 @@ def _proposal_dict(
 
 
 def _bot_facing_proposal_dict(
-    hold: ProposalHold,
+    hold: Any,
     *,
     action_override: Any = _DEFAULT_ACTION,
     elided_action_fields: dict[str, Any] | None = None,
@@ -7343,35 +7342,57 @@ async def _list_proposals_with_elision(
     )
     projected_action, elided_utf8_bytes, elided_chars = _proposal_projected_columns()
     stmt = (
-        select(ProposalHold, projected_action, elided_utf8_bytes, elided_chars)
-        .options(defer(ProposalHold.action, raiseload=True))
+        select(
+            ProposalHold.id,
+            ProposalHold.kind,
+            ProposalHold.proposed_by_bot_id,
+            ProposalHold.rationale,
+            ProposalHold.confidence,
+            ProposalHold.importance,
+            ProposalHold.impact,
+            ProposalHold.priority,
+            ProposalHold.status,
+            ProposalHold.created_at,
+            ProposalHold.updated_at,
+            ProposalHold.decision_source,
+            ProposalHold.decided_by_actor_id,
+            ProposalHold.decided_at,
+            ProposalHold.decision_note,
+            ProposalHold.decision_reason_code,
+            ProposalHold.applied_at,
+            ProposalHold.apply_error,
+            ProposalHold.apply_result,
+            ProposalHold.sender_agent_id,
+            ProposalHold.cross_brain,
+            ProposalHold.approvals,
+            ProposalHold.log_seq,
+            projected_action,
+            elided_utf8_bytes,
+            elided_chars,
+        )
         .join(subq, ProposalHold.id == subq.c.id)
         .order_by(*order_clauses)
     )
-    # Argus round 2: populate_existing ensures next_cursor is not encoded from a stale
-    # in-memory log_seq, but must not clobber a caller's unflushed in-memory changes.
-    # Scope it to log-order listings only when the session has no dirty ProposalHold instances.
-    has_dirty_holds = any(isinstance(obj, ProposalHold) for obj in session.dirty)
-    if cursor_kind is not None and not has_dirty_holds:
-        stmt = stmt.execution_options(populate_existing=True)
     rows = (await session.execute(stmt)).all()
     has_more = len(rows) > limit
     returned_rows = rows[:limit]
     proposals = []
-    for hold, action_val, utf8_bytes, chars in returned_rows:
+    for row in returned_rows:
         elided = (
-            {"content": {"utf8_bytes": utf8_bytes, "chars": chars}}
-            if utf8_bytes is not None
+            {"content": {"utf8_bytes": row.elided_utf8_bytes, "chars": row.elided_chars}}
+            if row.elided_utf8_bytes is not None
             else None
         )
-        proposals.append(to_dict(hold, action_override=action_val, elided_action_fields=elided))
+        proposals.append(
+            to_dict(row, action_override=row.projected_action, elided_action_fields=elided)
+        )
 
     if cursor_kind is None:
         return {"proposals": proposals, "has_more": has_more}
 
     if returned_rows:
-        last_hold = returned_rows[-1][0]
-        next_cursor = _encode_proposal_cursor(cursor_kind, last_hold.log_seq)
+        last_row = returned_rows[-1]
+        next_cursor = _encode_proposal_cursor(cursor_kind, last_row.log_seq)
     elif since is not None:
         next_cursor = since
     else:

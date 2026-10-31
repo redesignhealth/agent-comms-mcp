@@ -609,6 +609,11 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
     trigger_pos = result.stdout.index("CREATE TRIGGER trg_proposal_holds_log_seq")
     assert backfill_pos < trigger_pos
 
+    # Assert backfill uses window function and contains no correlated MAX subquery per row
+    assert "COALESCE(MAX(log_seq) OVER (PARTITION BY proposed_by_bot_id), 0)" in result.stdout
+    assert "row_number() OVER (" in result.stdout
+    assert "SELECT MAX(h2.log_seq)" not in result.stdout
+
     commit_pos = result.stdout.index("COMMIT;", trigger_pos)
     idx_concurrent_pos = result.stdout.index(
         "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS uq_proposal_holds_bot_id_log_seq"
