@@ -585,6 +585,41 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
     reason_commit_pos = result.stdout.index("COMMIT;", reason_not_valid_pos)
     assert reason_not_valid_pos < reason_commit_pos < reason_validate_pos
 
+    # b4a2d8e6f1c3 (TECH-8080 PR10): log_seq column, counter table, trigger, and indexes
+    assert "SET LOCAL lock_timeout = '5s';" in result.stdout
+    assert "SET LOCAL statement_timeout = '120s';" in result.stdout
+    assert "ALTER TABLE proposal_holds ADD COLUMN log_seq BIGINT;" in result.stdout
+    assert "CREATE TABLE IF NOT EXISTS proposal_bot_log_seq (" in result.stdout
+    assert "CREATE OR REPLACE FUNCTION proposal_holds_assign_log_seq()" in result.stdout
+    assert "CREATE TRIGGER trg_proposal_holds_log_seq" in result.stdout
+    assert "RESET lock_timeout;" in result.stdout
+    assert "RESET statement_timeout;" in result.stdout
+    assert (
+        "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS uq_proposal_holds_bot_id_log_seq "
+        "ON proposal_holds (proposed_by_bot_id, log_seq)" in result.stdout
+    )
+    assert (
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_proposal_holds_bot_id_status_log_seq "
+        "ON proposal_holds (proposed_by_bot_id, status, log_seq)" in result.stdout
+    )
+
+    # S18: Assert order: backfill comes before trigger creation,
+    # and COMMIT comes before CREATE INDEX CONCURRENTLY
+    backfill_pos = result.stdout.index("UPDATE proposal_holds h")
+    trigger_pos = result.stdout.index("CREATE TRIGGER trg_proposal_holds_log_seq")
+    assert backfill_pos < trigger_pos
+
+    # Assert backfill uses window function and contains no correlated MAX subquery per row
+    assert "COALESCE(MAX(log_seq) OVER (PARTITION BY proposed_by_bot_id), 0)" in result.stdout
+    assert "row_number() OVER (" in result.stdout
+    assert "SELECT MAX(h2.log_seq)" not in result.stdout
+
+    commit_pos = result.stdout.index("COMMIT;", trigger_pos)
+    idx_concurrent_pos = result.stdout.index(
+        "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS uq_proposal_holds_bot_id_log_seq"
+    )
+    assert trigger_pos < commit_pos < idx_concurrent_pos
+
 
 def test_alembic_single_head() -> None:
     result = subprocess.run(
@@ -597,4 +632,4 @@ def test_alembic_single_head() -> None:
     assert result.returncode == 0, result.stderr
     heads = [line.strip() for line in result.stdout.strip().splitlines() if line.strip()]
     assert len(heads) == 1, f"Expected single head, got: {heads}"
-    assert "fd6d97e05ca5" in heads[0]
+    assert "b4a2d8e6f1c3" in heads[0]

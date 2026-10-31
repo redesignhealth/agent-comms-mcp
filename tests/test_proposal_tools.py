@@ -149,7 +149,10 @@ async def engine(database_url: str) -> AsyncIterator[AsyncEngine]:
 async def _clean_tables(engine: AsyncEngine) -> AsyncIterator[None]:
     async with engine.begin() as conn:
         await conn.execute(
-            text("TRUNCATE TABLE proposal_holds, audit_log, agents RESTART IDENTITY CASCADE")
+            text(
+                "TRUNCATE TABLE proposal_holds, proposal_bot_log_seq, audit_log, agents "
+                "RESTART IDENTITY CASCADE"
+            )
         )
     yield
 
@@ -817,6 +820,257 @@ class TestListPendingAndHistory:
         )
         assert result["has_more"] is False
         assert len(result["proposals"]) == 1
+
+    async def test_list_pending_default_order_omits_next_cursor(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        bot_sub = "bot-tool-default"
+        await _submit(
+            main, test_session_factory, bot_sub=bot_sub, action=_action(target_id="DEF-1")
+        )
+        token = _token(bot_sub)
+        res = await _call(main, test_session_factory, token, "proposals_list_pending")
+        assert "proposals" in res
+        assert "has_more" in res
+        assert "next_cursor" not in res
+
+    async def test_list_history_default_order_omits_next_cursor(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        bot_sub = "bot-tool-default-hist"
+        token = _token(bot_sub)
+        res = await _call(main, test_session_factory, token, "proposals_list_history")
+        assert "proposals" in res
+        assert "has_more" in res
+        assert "next_cursor" not in res
+
+    async def test_order_validation_and_since_rules(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        token = _token("bot-tool-rules")
+        for tool_name in ("proposals_list_pending", "proposals_list_history"):
+            with pytest.raises(ToolError, match="'created_at' or 'log'"):
+                await _call(
+                    main,
+                    test_session_factory,
+                    token,
+                    tool_name,
+                    {"order": "bogus"},
+                )
+
+            with pytest.raises(ToolError, match="since requires order='log'"):
+                await _call(
+                    main,
+                    test_session_factory,
+                    token,
+                    tool_name,
+                    {"since": "any_cursor"},
+                )
+
+    async def test_list_pending_since_cursor_pagination(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        bot_sub = "bot-tool-cursor"
+        ids = []
+        for i in range(3):
+            res = await _submit(
+                main,
+                test_session_factory,
+                bot_sub=bot_sub,
+                action=_action(target_id=f"TOOL-PAGE-{i}"),
+            )
+            ids.append(res["proposal_id"])
+
+        token = _token(bot_sub)
+        # Page 1
+        p1 = await _call(
+            main,
+            test_session_factory,
+            token,
+            "proposals_list_pending",
+            {"limit": 2, "order": "log"},
+        )
+        assert len(p1["proposals"]) == 2
+        assert p1["has_more"] is True
+        assert p1["next_cursor"] is not None
+        p1_ids = [p["proposal_id"] for p in p1["proposals"]]
+        assert p1_ids == ids[:2]
+
+        # Page 2
+        p2 = await _call(
+            main,
+            test_session_factory,
+            token,
+            "proposals_list_pending",
+            {"limit": 2, "order": "log", "since": p1["next_cursor"]},
+        )
+        assert len(p2["proposals"]) == 1
+        assert p2["has_more"] is False
+        # Next cursor is persistable even on the last page
+        assert p2["next_cursor"] is not None
+        p2_ids = [p["proposal_id"] for p in p2["proposals"]]
+        assert p2_ids == ids[2:]
+        assert p1_ids + p2_ids == ids
+
+        # Page 3 (empty page with since echoes since)
+        p3 = await _call(
+            main,
+            test_session_factory,
+            token,
+            "proposals_list_pending",
+            {"limit": 2, "order": "log", "since": p2["next_cursor"]},
+        )
+        assert len(p3["proposals"]) == 0
+        assert p3["has_more"] is False
+        assert p3["next_cursor"] == p2["next_cursor"]
+
+    async def test_list_history_since_cursor_pagination(
+        self,
+        main: Any,
+        test_session_factory: async_sessionmaker[AsyncSession],
+        session: AsyncSession,
+    ) -> None:
+        bot_sub = "bot-tool-hist-cursor"
+        owner_sub = "owner-tool-hist@example.com"
+        submitted = []
+        for i in range(3):
+            res = await _submit(
+                main,
+                test_session_factory,
+                bot_sub=bot_sub,
+                owner_sub=owner_sub,
+                action=_action(target_id=f"TOOL-HIST-{i}"),
+            )
+            submitted.append(res["proposal_id"])
+
+        for pid in submitted:
+            await decide_proposal(
+                session,
+                approver_sub=owner_sub,
+                hold_id=uuid.UUID(pid),
+                decision="reject",
+                decision_note="reject reason",
+                judge=FakeProposalJudge(),
+            )
+
+        token = _token(bot_sub)
+        h1 = await _call(
+            main,
+            test_session_factory,
+            token,
+            "proposals_list_history",
+            {"limit": 2, "order": "log"},
+        )
+        assert len(h1["proposals"]) == 2
+        assert h1["has_more"] is True
+        assert h1["next_cursor"] is not None
+
+        h2 = await _call(
+            main,
+            test_session_factory,
+            token,
+            "proposals_list_history",
+            {"limit": 2, "order": "log", "since": h1["next_cursor"]},
+        )
+        assert len(h2["proposals"]) == 1
+        assert h2["has_more"] is False
+        assert h2["next_cursor"] is not None
+
+        all_ids = [p["proposal_id"] for p in h1["proposals"]] + [
+            p["proposal_id"] for p in h2["proposals"]
+        ]
+        assert all_ids == submitted
+
+    async def test_list_pending_and_history_malformed_cursor_raises_tool_error(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        bot_sub = "bot-tool-malformed"
+        token = _token(bot_sub)
+
+        for tool_name in ("proposals_list_pending", "proposals_list_history"):
+            with pytest.raises(ToolError, match=r"^invalid cursor$"):
+                await _call(
+                    main,
+                    test_session_factory,
+                    token,
+                    tool_name,
+                    {"order": "log", "since": "malformed_not_b64!!!"},
+                )
+
+    async def test_cross_kind_cursor_rejection(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        bot_sub = "bot-tool-kind"
+        await _submit(main, test_session_factory, bot_sub=bot_sub, action=_action(target_id="K-1"))
+        token = _token(bot_sub)
+
+        pending_res = await _call(
+            main,
+            test_session_factory,
+            token,
+            "proposals_list_pending",
+            {"order": "log", "limit": 1},
+        )
+        pending_cursor = pending_res["next_cursor"]
+        assert pending_cursor is not None
+
+        # Passing pending cursor to history raises invalid cursor
+        with pytest.raises(ToolError, match=r"^invalid cursor$"):
+            await _call(
+                main,
+                test_session_factory,
+                token,
+                "proposals_list_history",
+                {"order": "log", "since": pending_cursor},
+            )
+
+    async def test_list_pending_cursor_from_other_bot_does_not_leak(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        sub_a1 = await _submit(
+            main, test_session_factory, bot_sub="bot-tool-a", action=_action(target_id="T-A-1")
+        )
+        sub_a2 = await _submit(
+            main, test_session_factory, bot_sub="bot-tool-a", action=_action(target_id="T-A-2")
+        )
+        # Give bot-b rows with log_seq above cursor_a's seq (seq=1)
+        sub_b1 = await _submit(
+            main, test_session_factory, bot_sub="bot-tool-b", action=_action(target_id="T-B-1")
+        )
+        sub_b2 = await _submit(
+            main, test_session_factory, bot_sub="bot-tool-b", action=_action(target_id="T-B-2")
+        )
+        sub_b3 = await _submit(
+            main, test_session_factory, bot_sub="bot-tool-b", action=_action(target_id="T-B-3")
+        )
+
+        token_a = _token("bot-tool-a")
+        p_a = await _call(
+            main,
+            test_session_factory,
+            token_a,
+            "proposals_list_pending",
+            {"order": "log", "limit": 1},
+        )
+        cursor_a = p_a["next_cursor"]
+        assert cursor_a is not None
+
+        token_b = _token("bot-tool-b")
+        p_b = await _call(
+            main,
+            test_session_factory,
+            token_b,
+            "proposals_list_pending",
+            {"order": "log", "limit": 10, "since": cursor_a},
+        )
+        # Non-vacuous: bot-b rows with seq > 1 are returned
+        assert len(p_b["proposals"]) == 2
+        delivered_b_ids = {p["proposal_id"] for p in p_b["proposals"]}
+        assert delivered_b_ids == {sub_b2["proposal_id"], sub_b3["proposal_id"]}
+        assert sub_b1["proposal_id"] not in delivered_b_ids
+        for p in p_b["proposals"]:
+            assert p["proposed_by_bot_id"] == "bot-tool-b"
+            assert p["proposal_id"] not in {sub_a1["proposal_id"], sub_a2["proposal_id"]}
 
 
 class TestProposalToolsSenderAgentId:
