@@ -23,6 +23,7 @@ import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 import pytest_asyncio
@@ -1084,38 +1085,48 @@ class TestProposalHoldsSchema:
         )
         assert res_down.returncode == 0, res_down.stderr
 
-        async with engine.connect() as conn:
-            result = await conn.execute(
-                text(
-                    "SELECT indexdef FROM pg_indexes "
-                    "WHERE schemaname = 'public' AND tablename = 'proposal_holds' "
-                    "AND indexname = 'idx_proposal_holds_pending_dedup'"
+        try:
+            async with engine.connect() as conn:
+                result = await conn.execute(
+                    text(
+                        "SELECT indexdef FROM pg_indexes "
+                        "WHERE schemaname = 'public' AND tablename = 'proposal_holds' "
+                        "AND indexname = 'idx_proposal_holds_pending_dedup'"
+                    )
                 )
+                row = result.fetchone()
+                assert row is not None
+                assert "dedup_field" not in row[0]
+
+            res_up = subprocess.run(
+                [sys.executable, "-m", "alembic", "upgrade", "head"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
             )
-            row = result.fetchone()
-            assert row is not None
-            assert "dedup_field" not in row[0]
+            assert res_up.returncode == 0, res_up.stderr
 
-        res_up = subprocess.run(
-            [sys.executable, "-m", "alembic", "upgrade", "head"],
-            cwd=SERVICE_ROOT,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
-        assert res_up.returncode == 0, res_up.stderr
-
-        async with engine.connect() as conn:
-            result = await conn.execute(
-                text(
-                    "SELECT indexdef FROM pg_indexes "
-                    "WHERE schemaname = 'public' AND tablename = 'proposal_holds' "
-                    "AND indexname = 'idx_proposal_holds_pending_dedup'"
+            async with engine.connect() as conn:
+                result = await conn.execute(
+                    text(
+                        "SELECT indexdef FROM pg_indexes "
+                        "WHERE schemaname = 'public' AND tablename = 'proposal_holds' "
+                        "AND indexname = 'idx_proposal_holds_pending_dedup'"
+                    )
                 )
+                row = result.fetchone()
+                assert row is not None
+                assert "dedup_field" in row[0]
+        finally:
+            subprocess.run(
+                [sys.executable, "-m", "alembic", "upgrade", "head"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
             )
-            row = result.fetchone()
-            assert row is not None
-            assert "dedup_field" in row[0]
 
     async def test_tech_8080_scratch_index_valid_and_ready_guard(self, engine: AsyncEngine) -> None:
         """TECH-8080 PR3: _assert_scratch_index_valid_and_ready validates both indisvalid
@@ -1125,7 +1136,7 @@ class TestProposalHoldsSchema:
         )
 
         async with engine.connect() as conn:
-            # 1. Missing index raises RuntimeError
+            # 1. Missing index raises RuntimeError against real pg_index
             def _check_missing(sync_conn):
                 with pytest.raises(RuntimeError, match="not found in pg_index"):
                     _assert_scratch_index_valid_and_ready(
@@ -1134,7 +1145,7 @@ class TestProposalHoldsSchema:
 
             await conn.run_sync(_check_missing)
 
-            # 2. Valid index passes
+            # 2. Valid index passes against real pg_index
             await conn.execute(
                 text("CREATE INDEX IF NOT EXISTS idx_scratch_guard_test ON proposal_holds (id)")
             )
@@ -1145,37 +1156,48 @@ class TestProposalHoldsSchema:
 
                 await conn.run_sync(_check_valid)
 
-                # 3. Invalid (indisvalid=false) raises
-                await conn.execute(
-                    text(
-                        "UPDATE pg_index SET indisvalid = false "
-                        "WHERE indexrelid = 'idx_scratch_guard_test'::regclass"
+                # 3 & 4. Invalid (indisvalid=false) and unready (indisready=false) guards:
+                # Direct UPDATE pg_index requires PostgreSQL superuser privileges which are
+                # not available in CI/RDS. We exercise the guard logic by monkeypatching the
+                # query execution on the connection, asserting the exact RuntimeError behavior.
+                class _MockRow:
+                    def __init__(self, indisvalid: bool, indisready: bool) -> None:
+                        self._row = (indisvalid, indisready)
+
+                    def __getitem__(self, idx: int) -> bool:
+                        return self._row[idx]
+
+                class _MockQueryResult:
+                    def __init__(self, row: _MockRow | None) -> None:
+                        self._row = row
+
+                    def fetchone(self) -> _MockRow | None:
+                        return self._row
+
+                class _MockBind:
+                    def __init__(self, row: _MockRow | None) -> None:
+                        self._row = row
+
+                    def execute(self, statement: Any, parameters: Any = None) -> _MockQueryResult:
+                        return _MockQueryResult(self._row)
+
+                # indisvalid=False, indisready=True raises
+                with pytest.raises(RuntimeError, match="not valid and ready"):
+                    _assert_scratch_index_valid_and_ready(
+                        "idx_scratch_guard_test", bind=_MockBind(_MockRow(False, True))
                     )
-                )
 
-                def _check_invalid(sync_conn):
-                    with pytest.raises(RuntimeError, match="not valid and ready"):
-                        _assert_scratch_index_valid_and_ready(
-                            "idx_scratch_guard_test", bind=sync_conn
-                        )
-
-                await conn.run_sync(_check_invalid)
-
-                # 4. Unready (indisready=false) raises
-                await conn.execute(
-                    text(
-                        "UPDATE pg_index SET indisvalid = true, indisready = false "
-                        "WHERE indexrelid = 'idx_scratch_guard_test'::regclass"
+                # indisvalid=True, indisready=False raises
+                with pytest.raises(RuntimeError, match="not valid and ready"):
+                    _assert_scratch_index_valid_and_ready(
+                        "idx_scratch_guard_test", bind=_MockBind(_MockRow(True, False))
                     )
-                )
 
-                def _check_unready(sync_conn):
-                    with pytest.raises(RuntimeError, match="not valid and ready"):
-                        _assert_scratch_index_valid_and_ready(
-                            "idx_scratch_guard_test", bind=sync_conn
-                        )
-
-                await conn.run_sync(_check_unready)
+                # indisvalid=False, indisready=False raises
+                with pytest.raises(RuntimeError, match="not valid and ready"):
+                    _assert_scratch_index_valid_and_ready(
+                        "idx_scratch_guard_test", bind=_MockBind(_MockRow(False, False))
+                    )
             finally:
                 await conn.execute(text("DROP INDEX IF EXISTS idx_scratch_guard_test"))
 
@@ -1195,68 +1217,78 @@ class TestProposalHoldsSchema:
             text=True,
         )
 
-        # 2. Record original index definition and OID
-        async with engine.connect() as conn:
-            result = await conn.execute(
-                text(
-                    "SELECT c.oid, pg_get_indexdef(c.oid) "
-                    "FROM pg_class c "
-                    "WHERE c.relname = 'idx_proposal_holds_pending_dedup'"
+        try:
+            # 2. Record original index definition and OID
+            async with engine.connect() as conn:
+                result = await conn.execute(
+                    text(
+                        "SELECT c.oid, pg_get_indexdef(c.oid) "
+                        "FROM pg_class c "
+                        "WHERE c.relname = 'idx_proposal_holds_pending_dedup'"
+                    )
                 )
+                orig_row = result.fetchone()
+                assert orig_row is not None
+                orig_oid, orig_indexdef = orig_row[0], orig_row[1]
+
+            # 3. Run upgrade with simulated invalid scratch index
+            res_failed = subprocess.run(
+                [sys.executable, "-m", "alembic", "upgrade", "head"],
+                cwd=SERVICE_ROOT,
+                env={**env, "_TEST_FORCE_INVALID_SCRATCH_INDEX": "1"},
+                capture_output=True,
+                text=True,
             )
-            orig_row = result.fetchone()
-            assert orig_row is not None
-            orig_oid, orig_indexdef = orig_row[0], orig_row[1]
+            assert res_failed.returncode != 0
+            assert "is not valid and ready (simulated failure for test)" in res_failed.stderr
+            assert "Aborting swap to keep existing index intact" in res_failed.stderr
 
-        # 3. Run upgrade with simulated invalid scratch index
-        res_failed = subprocess.run(
-            [sys.executable, "-m", "alembic", "upgrade", "head"],
-            cwd=SERVICE_ROOT,
-            env={**env, "_TEST_FORCE_INVALID_SCRATCH_INDEX": "1"},
-            capture_output=True,
-            text=True,
-        )
-        assert res_failed.returncode != 0
-        assert "is not valid and ready (simulated failure for test)" in res_failed.stderr
-        assert "Aborting swap to keep existing index intact" in res_failed.stderr
-
-        # 4. Verify original index was NOT dropped and still has same OID and definition
-        async with engine.connect() as conn:
-            result = await conn.execute(
-                text(
-                    "SELECT c.oid, pg_get_indexdef(c.oid) "
-                    "FROM pg_class c "
-                    "WHERE c.relname = 'idx_proposal_holds_pending_dedup'"
+            # 4. Verify original index was NOT dropped and still has same OID and definition
+            async with engine.connect() as conn:
+                result = await conn.execute(
+                    text(
+                        "SELECT c.oid, pg_get_indexdef(c.oid) "
+                        "FROM pg_class c "
+                        "WHERE c.relname = 'idx_proposal_holds_pending_dedup'"
+                    )
                 )
+                after_row = result.fetchone()
+                assert after_row is not None
+                assert after_row[0] == orig_oid
+                assert after_row[1] == orig_indexdef
+
+            # 5. Clean upgrade without simulated failure succeeds and cleans up scratch index
+            res_ok = subprocess.run(
+                [sys.executable, "-m", "alembic", "upgrade", "head"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
             )
-            after_row = result.fetchone()
-            assert after_row is not None
-            assert after_row[0] == orig_oid
-            assert after_row[1] == orig_indexdef
+            assert res_ok.returncode == 0, res_ok.stderr
 
-        # 5. Clean upgrade without simulated failure succeeds and cleans up scratch index
-        res_ok = subprocess.run(
-            [sys.executable, "-m", "alembic", "upgrade", "head"],
-            cwd=SERVICE_ROOT,
-            env=env,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        assert res_ok.returncode == 0, res_ok.stderr
-
-        # 6. Verify upgraded index has dedup_field
-        async with engine.connect() as conn:
-            result = await conn.execute(
-                text(
-                    "SELECT pg_get_indexdef(c.oid) "
-                    "FROM pg_class c "
-                    "WHERE c.relname = 'idx_proposal_holds_pending_dedup'"
+            # 6. Verify upgraded index has dedup_field
+            async with engine.connect() as conn:
+                result = await conn.execute(
+                    text(
+                        "SELECT pg_get_indexdef(c.oid) "
+                        "FROM pg_class c "
+                        "WHERE c.relname = 'idx_proposal_holds_pending_dedup'"
+                    )
                 )
+                upgraded_row = result.fetchone()
+                assert upgraded_row is not None
+                assert "dedup_field" in upgraded_row[0]
+        finally:
+            subprocess.run(
+                [sys.executable, "-m", "alembic", "upgrade", "head"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
             )
-            upgraded_row = result.fetchone()
-            assert upgraded_row is not None
-            assert "dedup_field" in upgraded_row[0]
 
     async def test_decision_consistency_check_constraint_rejects_pending_with_decision(
         self, engine: AsyncEngine

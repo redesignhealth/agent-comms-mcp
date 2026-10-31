@@ -1841,15 +1841,20 @@ stays human-only and HTTP-only.
     would fail during validation or apply.
 
 **Create-time dedup key: `(kind, proposed_by_bot_id, target_id,
-action_type)`** -- scoped to the SUBMITTING BOT. A resubmission matching an
+action_type, cross_target_sub, dedup_field)`** -- scoped to the SUBMITTING BOT. A resubmission matching an
 existing `status='pending'` row under this key UPDATEs it in place instead
 of inserting a duplicate; a DIFFERENT bot proposing the same
-`(kind, target_id, action_type)` always gets its own fresh row, never a
+target always gets its own fresh row, never a
 silent overwrite of (and potential auto-approval under) another bot's
 identity. The app-level SELECT (`service._proposal_dedup_where`) and a
 DB-level partial UNIQUE index, `idx_proposal_holds_pending_dedup` (`(kind,
-proposed_by_bot_id, action->>'target_id', action->>'action_type') WHERE
-status IN ('pending', 'applying')`), share this exact key so the two cannot drift apart.
+proposed_by_bot_id, (action ->> 'target_id'), (action ->> 'action_type'),
+COALESCE(cross_brain ->> 'target_sub', ''), COALESCE(action ->> 'dedup_field', ''))
+WHERE status IN ('pending', 'applying')`), enforce this dedup boundary continuously.
+The application predicate matches the index's six expressions (using `COALESCE(..., '')`
+for optional `cross_brain.target_sub` and `action.dedup_field` so unpopulated fields evaluate
+identically to the empty string) while evaluating `status IN ('pending', 'applying')` as an
+application WHERE clause condition matching the partial index's filter predicate.
 The index is also the race-closing backstop for two concurrent submissions
 that both miss the SELECT and both attempt an INSERT: the loser's INSERT
 raises `IntegrityError`, which `service._dedup_or_insert_proposal` catches

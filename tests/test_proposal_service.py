@@ -710,6 +710,79 @@ class TestDedup:
                 action=_action(dedup_field=bad_dedup_field),
             )
 
+    async def test_rolling_deploy_five_key_dedup_lookup_returns_oldest_without_raising(
+        self, session: AsyncSession
+    ) -> None:
+        """During a rolling deploy or code-only rollback, tasks query using the 5-key
+        dedup predicate. When multiple pending rows differ only by dedup_field,
+        the bounded query (order_by created_at.asc, id.asc + limit(1)) must return
+        the oldest row rather than raising MultipleResultsFound (HTTP 500)."""
+        first = await _submit(
+            session,
+            action=_action(
+                action_type="set_dates",
+                target_id="proj-123",
+                dedup_field="project:startDate",
+            ),
+            rationale="oldest proposal",
+        )
+        second = await _submit(
+            session,
+            action=_action(
+                action_type="set_dates",
+                target_id="proj-123",
+                dedup_field="project:targetDate",
+            ),
+            rationale="newer proposal",
+        )
+        assert first["proposal_id"] != second["proposal_id"]
+
+        # 1. Exercise the 5-key lookup (dedup_field omitted/None) via _dedup_or_insert_proposal
+        # Simulates an old task or rollback querying against rows seeded with distinct dedup_fields
+        existing = await service._dedup_or_insert_proposal(
+            session,
+            kind="linear_progress_update",
+            proposed_by_bot_id="bot-1",
+            owner_sub="owner-a@example.com",
+            action=_action(action_type="set_dates", target_id="proj-123"),
+            rationale="resubmitted from old task",
+            confidence="medium",
+            importance="medium",
+            impact="medium",
+            target_id="proj-123",
+            action_type="set_dates",
+            dedup_field=None,
+            priority="medium",
+            target_fingerprint="deadbeef",
+        )
+        # Bounded lookup returns the oldest row without raising MultipleResultsFound
+        assert str(existing.id) == first["proposal_id"]
+        assert existing.rationale == "resubmitted from old task"
+
+        # 2. Normal single-row path remains identical when dedup_field is provided
+        single_row = await service._dedup_or_insert_proposal(
+            session,
+            kind="linear_progress_update",
+            proposed_by_bot_id="bot-1",
+            owner_sub="owner-a@example.com",
+            action=_action(
+                action_type="set_dates",
+                target_id="proj-123",
+                dedup_field="project:targetDate",
+            ),
+            rationale="updated newer proposal",
+            confidence="medium",
+            importance="medium",
+            impact="medium",
+            target_id="proj-123",
+            action_type="set_dates",
+            dedup_field="project:targetDate",
+            priority="medium",
+            target_fingerprint="deadbeef",
+        )
+        assert str(single_row.id) == second["proposal_id"]
+        assert single_row.rationale == "updated newer proposal"
+
 
 class TestClassifyDispatch:
     """Board-side coverage of the ``judge.classify()`` call site in

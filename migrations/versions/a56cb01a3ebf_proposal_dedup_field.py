@@ -22,11 +22,14 @@ To prevent blocking write traffic against ``proposal_holds`` during index build:
    failed run (e.g. an INVALID index from an aborted CONCURRENTLY build) and build
    ``idx_proposal_holds_pending_dedup_new`` with ``CONCURRENTLY``. Uniqueness is checked
    as rows are scanned, while live reads and writes continue unimpeded.
-2. In a brief transaction, drop the old narrower ``idx_proposal_holds_pending_dedup``
-   and rename ``idx_proposal_holds_pending_dedup_new`` to ``idx_proposal_holds_pending_dedup``.
-   Because drop and rename happen in a single transaction, uniqueness is enforced
-   continuously without a gap, and the ACCESS EXCLUSIVE lock on the table catalog is held
-   only for microseconds with zero table scan.
+2. In a brief transaction, set a bounded ``lock_timeout`` ('5s'), drop the old narrower
+   ``idx_proposal_holds_pending_dedup``, and rename ``idx_proposal_holds_pending_dedup_new``
+   to ``idx_proposal_holds_pending_dedup``. Because drop and rename happen in a single
+   transaction, uniqueness is enforced continuously without a gap. The bounded
+   ``lock_timeout`` ensures that if the ACCESS EXCLUSIVE lock queues behind a long transaction,
+   it fails fast instead of blocking reads/writes on ``proposal_holds``. The migration can
+   safely be retried if it times out; step 1 automatically cleans up any leftover temporary
+   index before re-attempting.
 
 On downgrade:
 Before attempting to restore the narrower index, the migration explicitly checks for
@@ -74,15 +77,25 @@ def _assert_scratch_index_valid_and_ready(
         )
 
     if bind is None:
+        try:
+            if context.is_offline_mode():
+                return
+        except (NameError, AttributeError):
+            pass
         bind = op.get_bind()
     if bind is None:
-        return
+        raise RuntimeError(
+            f"Cannot verify scratch index {index_name!r}: database connection (bind) is None "
+            "outside of offline mode."
+        )
     row = bind.execute(
         sa.text("""
             SELECT i.indisvalid, i.indisready
             FROM pg_index i
             JOIN pg_class c ON c.oid = i.indexrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
             WHERE c.relname = :index_name
+              AND n.nspname = current_schema()
         """),
         {"index_name": index_name},
     ).fetchone()
@@ -127,6 +140,9 @@ def upgrade() -> None:
 
     # 3. Swap: drop the old index and rename the new one in a single transaction.
     # Uniqueness is preserved continuously and catalog lock duration is minimal.
+    # Set a bounded lock_timeout so waiting for ACCESS EXCLUSIVE fails fast
+    # rather than queueing and blocking reads/writes on proposal_holds.
+    op.execute("SET LOCAL lock_timeout = '5s'")
     op.drop_index("idx_proposal_holds_pending_dedup", table_name="proposal_holds", if_exists=True)
     op.execute(
         "ALTER INDEX IF EXISTS idx_proposal_holds_pending_dedup_new "
@@ -138,40 +154,44 @@ def downgrade() -> None:
     # Check for collisions on the narrow key first. Never delete or merge rows.
     if not context.is_offline_mode():
         bind = op.get_bind()
-        if bind is not None:
-            collisions = bind.execute(
-                sa.text("""
-                    SELECT
-                        kind,
-                        proposed_by_bot_id,
-                        action ->> 'target_id' AS target_id,
-                        action ->> 'action_type' AS action_type,
-                        COALESCE(cross_brain ->> 'target_sub', '') AS cross_target_sub,
-                        COUNT(*) AS count
-                    FROM proposal_holds
-                    WHERE status IN ('pending', 'applying')
-                    GROUP BY
-                        kind,
-                        proposed_by_bot_id,
-                        action ->> 'target_id',
-                        action ->> 'action_type',
-                        COALESCE(cross_brain ->> 'target_sub', '')
-                    HAVING COUNT(*) > 1
-                """)
-            ).fetchall()
-            if collisions:
-                details = [
-                    f"(kind={r[0]!r}, bot={r[1]!r}, target_id={r[2]!r}, "
-                    f"action_type={r[3]!r}, cross_target={r[4]!r}): {r[5]} rows"
-                    for r in collisions
-                ]
-                raise RuntimeError(
-                    f"Cannot downgrade migration a56cb01a3ebf: found {len(collisions)} collision(s) "
-                    f"on the narrow proposal dedup key among active pending/applying proposals: "
-                    f"{'; '.join(details)}. An operator must manually resolve (decide, withdraw, "
-                    f"or reject) duplicate proposals before the narrow unique index can be restored. "
-                    f"No rows were deleted."
-                )
+        if bind is None:
+            raise RuntimeError(
+                "Cannot perform downgrade collision check: database connection (bind) is None "
+                "outside of offline mode."
+            )
+        collisions = bind.execute(
+            sa.text("""
+                SELECT
+                    kind,
+                    proposed_by_bot_id,
+                    action ->> 'target_id' AS target_id,
+                    action ->> 'action_type' AS action_type,
+                    COALESCE(cross_brain ->> 'target_sub', '') AS cross_target_sub,
+                    COUNT(*) AS count
+                FROM proposal_holds
+                WHERE status IN ('pending', 'applying')
+                GROUP BY
+                    kind,
+                    proposed_by_bot_id,
+                    action ->> 'target_id',
+                    action ->> 'action_type',
+                    COALESCE(cross_brain ->> 'target_sub', '')
+                HAVING COUNT(*) > 1
+            """)
+        ).fetchall()
+        if collisions:
+            details = [
+                f"(kind={r[0]!r}, bot={r[1]!r}, target_id={r[2]!r}, "
+                f"action_type={r[3]!r}, cross_target={r[4]!r}): {r[5]} rows"
+                for r in collisions
+            ]
+            raise RuntimeError(
+                f"Cannot downgrade migration a56cb01a3ebf: found {len(collisions)} collision(s) "
+                f"on the narrow proposal dedup key among active pending/applying proposals: "
+                f"{'; '.join(details)}. An operator must manually resolve (decide, withdraw, "
+                f"or reject) duplicate proposals before the narrow unique index can be restored. "
+                f"No rows were deleted."
+            )
 
     with op.get_context().autocommit_block():
         op.drop_index(
@@ -194,6 +214,7 @@ def downgrade() -> None:
     if not context.is_offline_mode():
         _assert_scratch_index_valid_and_ready("idx_proposal_holds_pending_dedup_old")
 
+    op.execute("SET LOCAL lock_timeout = '5s'")
     op.drop_index("idx_proposal_holds_pending_dedup", table_name="proposal_holds", if_exists=True)
     op.execute(
         "ALTER INDEX IF EXISTS idx_proposal_holds_pending_dedup_old "

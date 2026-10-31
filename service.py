@@ -7438,7 +7438,7 @@ def _proposal_dedup_where(
     target_id: str,
     action_type: str,
     cross_target_sub: str = "",
-    dedup_field: str = "",
+    dedup_field: str | None = None,
 ) -> tuple[Any, ...]:
     """Shared create-time dedup predicate (TECH-5872, Argus review B1 fix):
     ``(kind, proposed_by_bot_id, target_id, action_type)`` against any
@@ -7467,7 +7467,7 @@ def _proposal_dedup_where(
     ``target_fingerprint`` out from under that would desync what
     actually got applied to Linear from what the row claims was
     submitted."""
-    return (
+    clauses: list[Any] = [
         ProposalHold.kind == kind,
         ProposalHold.proposed_by_bot_id == proposed_by_bot_id,
         ProposalHold.status.in_(("pending", "applying")),
@@ -7476,10 +7476,13 @@ def _proposal_dedup_where(
         # TECH-7665: same key as the COALESCE(...) term in the unique index
         # (migration c7665a1b2d3e); '' for every non-cross-brain hold.
         func.coalesce(ProposalHold.cross_brain["target_sub"].astext, "") == cross_target_sub,
-        # TECH-8080 (PR3): field-aware proposal dedup; same key as the COALESCE(...)
-        # term in the unique index (migration a56cb01a3ebf); '' for every hold without dedup_field.
-        func.coalesce(ProposalHold.action["dedup_field"].astext, "") == dedup_field,
-    )
+    ]
+    # TECH-8080 (PR3): field-aware proposal dedup; same key as the COALESCE(...)
+    # term in the unique index (migration a56cb01a3ebf); '' for every hold without dedup_field.
+    # When omitted (None), matches the legacy 5-key predicate for rolling deploys / rollbacks.
+    if dedup_field is not None:
+        clauses.append(func.coalesce(ProposalHold.action["dedup_field"].astext, "") == dedup_field)
+    return tuple(clauses)
 
 
 def _apply_proposal_resubmission(
@@ -7560,7 +7563,7 @@ async def _dedup_or_insert_proposal(
     impact: str,
     target_id: str,
     action_type: str,
-    dedup_field: str = "",
+    dedup_field: str | None = "",
     priority: str,
     target_fingerprint: str,
     sender_agent_id: uuid.UUID | None = None,
@@ -7585,7 +7588,13 @@ async def _dedup_or_insert_proposal(
         cross_target_sub=cross_brain["target_sub"] if cross_brain else "",
         dedup_field=dedup_field,
     )
-    existing = (await session.execute(select(ProposalHold).where(*where))).scalar_one_or_none()
+    stmt = (
+        select(ProposalHold)
+        .where(*where)
+        .order_by(ProposalHold.created_at.asc(), ProposalHold.id.asc())
+        .limit(1)
+    )
+    existing = (await session.execute(stmt)).scalars().first()
     if existing is not None:
         # Argus review round-3 B1: an 'applying' match is mid-flight under
         # a concurrent _apply_or_finalize_proposal_hold -- mutating its
@@ -7632,9 +7641,13 @@ async def _dedup_or_insert_proposal(
         await session.rollback()
         if not _is_constraint_violation(exc, "idx_proposal_holds_pending_dedup"):
             raise
-        existing_after_race = (
-            await session.execute(select(ProposalHold).where(*where))
-        ).scalar_one_or_none()
+        race_stmt = (
+            select(ProposalHold)
+            .where(*where)
+            .order_by(ProposalHold.created_at.asc(), ProposalHold.id.asc())
+            .limit(1)
+        )
+        existing_after_race = (await session.execute(race_stmt)).scalars().first()
         if existing_after_race is None:
             # Vanishingly unlikely (the race winner's row was deleted again
             # before this re-read) -- nothing sane to update; surface the

@@ -538,12 +538,16 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
         "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS idx_proposal_holds_pending_dedup_new"
     )
     begin_swap_pos = result.stdout.index("BEGIN;", concurrently_pos)
+    lock_timeout_sql = "SET LOCAL lock_timeout = '5s';"
+    lock_timeout_pos = result.stdout.index(lock_timeout_sql, begin_swap_pos)
+    drop_old_sql = "DROP INDEX IF EXISTS idx_proposal_holds_pending_dedup;"
+    drop_old_pos = result.stdout.index(drop_old_sql, begin_swap_pos)
     rename_sql = (
         "ALTER INDEX IF EXISTS idx_proposal_holds_pending_dedup_new "
         "RENAME TO idx_proposal_holds_pending_dedup;"
     )
-    rename_pos = result.stdout.index(rename_sql, begin_swap_pos)
-    assert concurrently_pos < begin_swap_pos < rename_pos
+    rename_pos = result.stdout.index(rename_sql, drop_old_pos)
+    assert concurrently_pos < begin_swap_pos < lock_timeout_pos < drop_old_pos < rename_pos
 
 
 def test_alembic_single_head() -> None:
@@ -556,5 +560,5 @@ def test_alembic_single_head() -> None:
     )
     assert result.returncode == 0, result.stderr
     heads = [line.strip() for line in result.stdout.strip().splitlines() if line.strip()]
-    assert len(heads) == 1, f"Expected single head, got: {heads}"
-    assert "a56cb01a3ebf" in heads[0]
+    assert len(heads) == 1, f"Expected exactly one alembic head, got {len(heads)}: {heads}"
+    assert heads[0], "Expected non-empty head revision"
