@@ -7474,8 +7474,9 @@ def _decode_proposal_cursor(cursor: object, *, expected_kind: str) -> int:
             raise ValueError("invalid cursor")
         if data.get("k") != expected_kind:
             raise ValueError("invalid cursor")
+        max_bigint = (1 << 63) - 1
         s = data.get("s")
-        if s is None or isinstance(s, bool) or not isinstance(s, int) or s < 0:
+        if s is None or isinstance(s, bool) or not isinstance(s, int) or s < 0 or s > max_bigint:
             raise ValueError("invalid cursor")
         return s
     except (
@@ -7522,6 +7523,7 @@ async def _list_proposals_with_elision(
         .options(defer(ProposalHold.action, raiseload=True))
         .join(subq, ProposalHold.id == subq.c.id)
         .order_by(*order_clauses)
+        .execution_options(populate_existing=True)
     )
     rows = (await session.execute(stmt)).all()
     has_more = len(rows) > limit
@@ -8813,6 +8815,7 @@ async def list_proposals_for_bot(
     limit: int = 50,
     order: Literal["created_at", "log"] = "created_at",
     since: str | None = None,
+    cursor_kind: Literal["pending", "history"] | None = None,
 ) -> dict[str, Any]:
     """Sender-only list of the SUBMITTING bot's own proposals, filtered to
     ``statuses`` (``providers.proposals``'s ``proposals_list_pending``/
@@ -8846,14 +8849,15 @@ async def list_proposals_for_bot(
       resumes iteration strictly after the watermark. Guaranteed at-least-once: a writer
       committed after a watermark will always receive a strictly higher ``log_seq`` and will
       never be missed.
+      Every UPDATE to a proposal_holds row re-assigns log_seq via the database trigger
+      and re-delivers the row. Delivery contract is at-least-once; consumers must
+      deduplicate by proposal_id.
     """
     limit = max(1, min(limit, 200))
     if order not in ("created_at", "log"):
         raise ValueError("invalid order: must be 'created_at' or 'log'")
     if since is not None and order != "log":
         raise ValueError("since requires order='log'")
-
-    expected_kind = "pending" if set(statuses) == {"pending"} else "history"
 
     where_conditions = [
         ProposalHold.proposed_by_bot_id == requesting_bot_sub,
@@ -8865,13 +8869,24 @@ async def list_proposals_for_bot(
             ProposalHold.created_at.asc(),
             ProposalHold.id.asc(),
         )
-        cursor_kind = None
+        effective_cursor_kind = None
     else:
+        if cursor_kind is not None:
+            effective_cursor_kind = cursor_kind
+        elif tuple(statuses) == ("pending",):
+            effective_cursor_kind = "pending"
+        elif set(statuses) == set(PROPOSAL_TERMINAL_STATUSES):
+            effective_cursor_kind = "history"
+        else:
+            raise ValueError(
+                "unsupported status combination for log cursor without explicit cursor_kind: "
+                f"{statuses!r}"
+            )
+
         order_clauses = (ProposalHold.log_seq.asc(),)
         if since is not None:
-            last_seq = _decode_proposal_cursor(since, expected_kind=expected_kind)
+            last_seq = _decode_proposal_cursor(since, expected_kind=effective_cursor_kind)
             where_conditions.append(ProposalHold.log_seq > last_seq)
-        cursor_kind = expected_kind
 
     return await _list_proposals_with_elision(
         session,
@@ -8879,7 +8894,7 @@ async def list_proposals_for_bot(
         order_clauses=order_clauses,
         limit=limit,
         to_dict=_bot_facing_proposal_dict,
-        cursor_kind=cursor_kind,
+        cursor_kind=effective_cursor_kind,
         since=since,
     )
 

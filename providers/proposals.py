@@ -67,7 +67,7 @@ import logging
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Literal
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -332,7 +332,7 @@ async def get(proposal_id: str) -> dict[str, Any]:
 
 @proposals_server.tool
 async def list_pending(
-    limit: int = 50, order: str = "created_at", since: str | None = None
+    limit: int = 50, order: Literal["created_at", "log"] = "created_at", since: str | None = None
 ) -> dict[str, Any]:
     """List the calling bot's OWN still-``pending`` proposals. Scoped to proposals
     THIS bot submitted -- never another bot's. ``limit`` is clamped to [1, 200];
@@ -369,20 +369,23 @@ async def list_pending(
     bot_sub = _require_bot_sub()
     if order not in ("created_at", "log"):
         raise ToolError("invalid order: must be 'created_at' or 'log'")
+    if since is not None and order != "log":
+        raise ToolError("since requires order='log'")
     async with get_session_factory()() as session, _map_proposal_errors():
         return await service.list_proposals_for_bot(
             session,
             requesting_bot_sub=bot_sub,
             statuses=("pending",),
             limit=limit,
-            order=order,  # type: ignore[arg-type]
+            order=order,
             since=since,
+            cursor_kind="pending",
         )
 
 
 @proposals_server.tool
 async def list_history(
-    limit: int = 50, order: str = "created_at", since: str | None = None
+    limit: int = 50, order: Literal["created_at", "log"] = "created_at", since: str | None = None
 ) -> dict[str, Any]:
     """List the calling bot's OWN already-actioned proposals -- every one
     that has left ``pending``/the transient ``applying`` state for good
@@ -421,14 +424,17 @@ async def list_history(
     bot_sub = _require_bot_sub()
     if order not in ("created_at", "log"):
         raise ToolError("invalid order: must be 'created_at' or 'log'")
+    if since is not None and order != "log":
+        raise ToolError("since requires order='log'")
     async with get_session_factory()() as session, _map_proposal_errors():
         return await service.list_proposals_for_bot(
             session,
             requesting_bot_sub=bot_sub,
             statuses=service.PROPOSAL_TERMINAL_STATUSES,
             limit=limit,
-            order=order,  # type: ignore[arg-type]
+            order=order,
             since=since,
+            cursor_kind="history",
         )
 
 

@@ -848,23 +848,24 @@ class TestListPendingAndHistory:
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
         token = _token("bot-tool-rules")
-        with pytest.raises(ToolError, match="invalid order: must be 'created_at' or 'log'"):
-            await _call(
-                main,
-                test_session_factory,
-                token,
-                "proposals_list_pending",
-                {"order": "bogus"},
-            )
+        for tool_name in ("proposals_list_pending", "proposals_list_history"):
+            with pytest.raises(ToolError, match="'created_at' or 'log'"):
+                await _call(
+                    main,
+                    test_session_factory,
+                    token,
+                    tool_name,
+                    {"order": "bogus"},
+                )
 
-        with pytest.raises(ToolError, match="since requires order='log'"):
-            await _call(
-                main,
-                test_session_factory,
-                token,
-                "proposals_list_pending",
-                {"since": "any_cursor"},
-            )
+            with pytest.raises(ToolError, match="since requires order='log'"):
+                await _call(
+                    main,
+                    test_session_factory,
+                    token,
+                    tool_name,
+                    {"since": "any_cursor"},
+                )
 
     async def test_list_pending_since_cursor_pagination(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
@@ -1026,14 +1027,21 @@ class TestListPendingAndHistory:
     async def test_list_pending_cursor_from_other_bot_does_not_leak(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
-        await _submit(
+        sub_a1 = await _submit(
             main, test_session_factory, bot_sub="bot-tool-a", action=_action(target_id="T-A-1")
         )
-        await _submit(
+        sub_a2 = await _submit(
             main, test_session_factory, bot_sub="bot-tool-a", action=_action(target_id="T-A-2")
         )
-        await _submit(
+        # Give bot-b rows with log_seq above cursor_a's seq (seq=1)
+        sub_b1 = await _submit(
             main, test_session_factory, bot_sub="bot-tool-b", action=_action(target_id="T-B-1")
+        )
+        sub_b2 = await _submit(
+            main, test_session_factory, bot_sub="bot-tool-b", action=_action(target_id="T-B-2")
+        )
+        sub_b3 = await _submit(
+            main, test_session_factory, bot_sub="bot-tool-b", action=_action(target_id="T-B-3")
         )
 
         token_a = _token("bot-tool-a")
@@ -1055,8 +1063,14 @@ class TestListPendingAndHistory:
             "proposals_list_pending",
             {"order": "log", "limit": 10, "since": cursor_a},
         )
+        # Non-vacuous: bot-b rows with seq > 1 are returned
+        assert len(p_b["proposals"]) == 2
+        delivered_b_ids = {p["proposal_id"] for p in p_b["proposals"]}
+        assert delivered_b_ids == {sub_b2["proposal_id"], sub_b3["proposal_id"]}
+        assert sub_b1["proposal_id"] not in delivered_b_ids
         for p in p_b["proposals"]:
             assert p["proposed_by_bot_id"] == "bot-tool-b"
+            assert p["proposal_id"] not in {sub_a1["proposal_id"], sub_a2["proposal_id"]}
 
 
 class TestProposalToolsSenderAgentId:
