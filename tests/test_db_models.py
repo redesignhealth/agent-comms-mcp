@@ -21,7 +21,7 @@ import subprocess
 import sys
 import uuid
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -1017,6 +1017,23 @@ class TestProposalHoldsSchema:
             ).scalar_one_or_none()
             assert tgenabled in ("O", b"O")
 
+            # Verify reloptions storage params match models.py ProposalBotLogSeq.__table_args__
+            reloptions = (
+                await conn.execute(
+                    text("SELECT reloptions FROM pg_class WHERE relname = 'proposal_bot_log_seq'")
+                )
+            ).scalar_one()
+            assert "fillfactor=70" in reloptions
+            assert "autovacuum_vacuum_scale_factor=0.0" in reloptions
+            assert "autovacuum_vacuum_threshold=1000" in reloptions
+
+            from models import ProposalBotLogSeq
+
+            table_with = ProposalBotLogSeq.__table__.dialect_options["postgresql"]["with"]
+            assert table_with["fillfactor"] == 70
+            assert table_with["autovacuum_vacuum_scale_factor"] == 0.0
+            assert table_with["autovacuum_vacuum_threshold"] == 1000
+
             # No proposal_holds row has NULL log_seq
             null_count = (
                 await conn.execute(
@@ -1024,6 +1041,269 @@ class TestProposalHoldsSchema:
                 )
             ).scalar_one()
             assert null_count == 0
+
+    async def test_tech_8080_downgrade_and_upgrade_b4a2d8e6f1c3_round_trip(
+        self, engine: AsyncEngine, database_url: str
+    ) -> None:
+        """B1 & S16: verify migration b4a2d8e6f1c3 downgrades to fd6d97e05ca5 and upgrades back."""
+        env = {**os.environ, "DATABASE_URL": database_url.replace("+asyncpg", "")}
+        try:
+            res_down = subprocess.run(
+                [sys.executable, "-m", "alembic", "downgrade", "fd6d97e05ca5"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert res_down.returncode == 0, res_down.stderr
+
+            async with engine.connect() as conn:
+                # Column dropped
+                has_col = (
+                    await conn.execute(
+                        text(
+                            "SELECT 1 FROM information_schema.columns "
+                            "WHERE table_schema = 'public' AND table_name = 'proposal_holds' "
+                            "AND column_name = 'log_seq'"
+                        )
+                    )
+                ).scalar()
+                assert not has_col
+
+                # Counter table dropped
+                has_table = (
+                    await conn.execute(
+                        text(
+                            "SELECT 1 FROM information_schema.tables "
+                            "WHERE table_schema = 'public' AND table_name = 'proposal_bot_log_seq'"
+                        )
+                    )
+                ).scalar()
+                assert not has_table
+
+                # Trigger dropped
+                has_trg = (
+                    await conn.execute(
+                        text("SELECT 1 FROM pg_trigger WHERE tgname = 'trg_proposal_holds_log_seq'")
+                    )
+                ).scalar()
+                assert not has_trg
+
+            # Upgrade back to head
+            res_up = subprocess.run(
+                [sys.executable, "-m", "alembic", "upgrade", "head"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert res_up.returncode == 0, res_up.stderr
+
+            async with engine.connect() as conn:
+                indexes = await _indexes(engine, "proposal_holds")
+                assert "uq_proposal_holds_bot_id_log_seq" in indexes
+                assert "idx_proposal_holds_bot_id_status_log_seq" in indexes
+        finally:
+            subprocess.run(
+                [sys.executable, "-m", "alembic", "upgrade", "head"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+    async def test_tech_8080_migration_live_backfill_and_counter_seed_multibot(
+        self, engine: AsyncEngine, database_url: str
+    ) -> None:
+        """S16: verify live backfill and counter seed correctly partitions by bot and seeds."""
+        env = {**os.environ, "DATABASE_URL": database_url.replace("+asyncpg", "")}
+        try:
+            # Downgrade to parent
+            subprocess.run(
+                [sys.executable, "-m", "alembic", "downgrade", "fd6d97e05ca5"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            # Insert pre-existing rows across two bots with distinct created_at
+            now = datetime.now(UTC)
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("TRUNCATE TABLE proposal_holds, audit_log RESTART IDENTITY CASCADE")
+                )
+                insert_sql = (
+                    "INSERT INTO proposal_holds (kind, proposed_by_bot_id, owner_sub, action, "
+                    "rationale, confidence, importance, impact, priority, status, "
+                    "target_fingerprint, created_at, updated_at) "
+                    "VALUES ('linear_progress_update', :bot, :owner, '{}'::jsonb, "
+                    "'r', 'low', 'low', 'low', 'low', 'pending', 'fprint', :ts, :ts)"
+                )
+                # bot-alpha: 3 rows
+                for i in range(3):
+                    await conn.execute(
+                        text(insert_sql),
+                        {"bot": "bot-alpha", "owner": "owner-a", "ts": now + timedelta(seconds=i)},
+                    )
+                # bot-beta: 2 rows
+                for i in range(2):
+                    await conn.execute(
+                        text(insert_sql),
+                        {"bot": "bot-beta", "owner": "owner-b", "ts": now + timedelta(seconds=i)},
+                    )
+
+            # Upgrade to head
+            res_up = subprocess.run(
+                [sys.executable, "-m", "alembic", "upgrade", "head"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert res_up.returncode == 0, res_up.stderr
+
+            async with engine.connect() as conn:
+                alpha_seqs = (
+                    (
+                        await conn.execute(
+                            text(
+                                "SELECT log_seq FROM proposal_holds "
+                                "WHERE proposed_by_bot_id = 'bot-alpha' ORDER BY log_seq"
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                assert alpha_seqs == [1, 2, 3]
+
+                beta_seqs = (
+                    (
+                        await conn.execute(
+                            text(
+                                "SELECT log_seq FROM proposal_holds "
+                                "WHERE proposed_by_bot_id = 'bot-beta' ORDER BY log_seq"
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                assert beta_seqs == [1, 2]
+
+                counters = dict(
+                    (
+                        await conn.execute(
+                            text("SELECT bot_id, last_seq FROM proposal_bot_log_seq")
+                        )
+                    ).all()
+                )
+                assert counters["bot-alpha"] == 3
+                assert counters["bot-beta"] == 2
+
+            # Live insert after migration: trigger increments counter
+            async with engine.begin() as conn:
+                post_insert_sql = (
+                    "INSERT INTO proposal_holds (kind, proposed_by_bot_id, owner_sub, action, "
+                    "rationale, confidence, importance, impact, priority, status, "
+                    "target_fingerprint) "
+                    "VALUES ('linear_progress_update', 'bot-alpha', 'owner-a', '{}'::jsonb, "
+                    "'r', 'low', 'low', 'low', 'low', 'pending', 'fprint') RETURNING log_seq"
+                )
+                row_id = (await conn.execute(text(post_insert_sql))).scalar_one()
+                assert row_id == 4
+
+            async with engine.connect() as conn:
+                new_counter = (
+                    await conn.execute(
+                        text("SELECT last_seq FROM proposal_bot_log_seq WHERE bot_id = 'bot-alpha'")
+                    )
+                ).scalar_one()
+                assert new_counter == 4
+        finally:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("TRUNCATE TABLE proposal_holds, audit_log RESTART IDENTITY CASCADE")
+                )
+            subprocess.run(
+                [sys.executable, "-m", "alembic", "upgrade", "head"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+    async def test_tech_8080_migration_size_guard(
+        self, engine: AsyncEngine, database_url: str
+    ) -> None:
+        """S16: verify size-guard aborts migration with error when threshold exceeded."""
+        env = {**os.environ, "DATABASE_URL": database_url.replace("+asyncpg", "")}
+        try:
+            # Downgrade to parent
+            subprocess.run(
+                [sys.executable, "-m", "alembic", "downgrade", "fd6d97e05ca5"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            # Insert 5 rows
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("TRUNCATE TABLE proposal_holds, audit_log RESTART IDENTITY CASCADE")
+                )
+                guard_sql = (
+                    "INSERT INTO proposal_holds (kind, proposed_by_bot_id, owner_sub, action, "
+                    "rationale, confidence, importance, impact, priority, status, "
+                    "target_fingerprint) "
+                    "VALUES ('linear_progress_update', 'bot-guard', 'owner-g', '{}'::jsonb, "
+                    "'r', 'low', 'low', 'low', 'low', 'pending', 'fprint')"
+                )
+                for _i in range(5):
+                    await conn.execute(text(guard_sql))
+
+            # Attempt upgrade with threshold=3 -> should fail
+            res_fail = subprocess.run(
+                [sys.executable, "-m", "alembic", "upgrade", "head"],
+                cwd=SERVICE_ROOT,
+                env={**env, "_TEST_SIZE_GUARD_THRESHOLD": "3"},
+                capture_output=True,
+                text=True,
+            )
+            assert res_fail.returncode != 0
+            err_msg = (
+                "the single-statement log_seq backfill would hold ACCESS EXCLUSIVE for too long"
+            )
+            assert err_msg in res_fail.stderr
+
+            # Upgrade with threshold=10 -> should succeed
+            res_ok = subprocess.run(
+                [sys.executable, "-m", "alembic", "upgrade", "head"],
+                cwd=SERVICE_ROOT,
+                env={**env, "_TEST_SIZE_GUARD_THRESHOLD": "10"},
+                capture_output=True,
+                text=True,
+            )
+            assert res_ok.returncode == 0, res_ok.stderr
+        finally:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("TRUNCATE TABLE proposal_holds, audit_log RESTART IDENTITY CASCADE")
+                )
+            subprocess.run(
+                [sys.executable, "-m", "alembic", "upgrade", "head"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
 
     def test_proposal_holds_pending_dedup_index_matches_migration(self) -> None:
         from migrations.versions.a56cb01a3ebf_proposal_dedup_field import _NEW_COLUMNS, _WHERE

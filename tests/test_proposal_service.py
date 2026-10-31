@@ -3560,6 +3560,12 @@ class TestListProposalsForBot:
             base64.urlsafe_b64encode(
                 json.dumps({"v": 2, "k": "history", "s": -1}).encode()
             ).decode(),  # s is negative
+            base64.urlsafe_b64encode(
+                json.dumps({"v": 2, "k": "history", "s": 1 << 63}).encode()
+            ).decode(),  # s > 2**63 - 1 (overflow)
+            base64.urlsafe_b64encode(
+                json.dumps({"v": 2, "k": "history", "s": 1 << 64}).encode()
+            ).decode(),
             123,
             None,
         ]
@@ -3771,6 +3777,20 @@ class TestListProposalsForBot:
             ).scalar_one()
             assert counter_seq == 1
 
+    @staticmethod
+    async def _wait_for_blocked_backend(engine: AsyncEngine, timeout: float = 5.0) -> None:
+        """Poll pg_locks until at least one lock request is waiting (NOT granted)."""
+        deadline = asyncio.get_running_loop().time() + timeout
+        while asyncio.get_running_loop().time() < deadline:
+            async with engine.connect() as conn:
+                blocked = (
+                    await conn.execute(text("SELECT count(*) FROM pg_locks WHERE NOT granted"))
+                ).scalar_one()
+                if blocked > 0:
+                    return
+            await asyncio.sleep(0.01)
+        raise TimeoutError("timed out waiting for blocked backend lock in pg_locks")
+
     async def test_late_commit_is_not_skipped_by_history_cursor(self, engine: AsyncEngine) -> None:
         bot = "bot-late-commit-h"
         owner = "owner-late-h@example.com"
@@ -3821,7 +3841,7 @@ class TestListProposalsForBot:
             evt_a_flushed.set()
 
             await evt_b_started.wait()
-            await asyncio.sleep(0.05)
+            await self._wait_for_blocked_backend(engine)
             # Worker B must be blocked waiting on the lock
             assert not task_b.done()
 
@@ -3908,7 +3928,7 @@ class TestListProposalsForBot:
             evt_a_flushed.set()
 
             await evt_b_started.wait()
-            await asyncio.sleep(0.05)
+            await self._wait_for_blocked_backend(engine)
             assert not task_b.done()
 
             # Session C reads pending before either commits
@@ -4092,25 +4112,36 @@ class TestListProposalsForBot:
                 owner_sub=owner,
                 action=_action(target_id="TR-REC"),
             )
-            # Use TestTerminalCommitFailureRecovery._fail_nth_commit on the session
-            # to fail on terminal commit (call 3 in decide_proposal)
+            # S15: Match the exact commit that attempts to write the terminal status
             real_commit = session.commit
-            monkeypatch.setattr(
-                session,
-                "commit",
-                TestTerminalCommitFailureRecovery._fail_nth_commit(
-                    session, 3, OperationalError("simulated terminal commit failure", None, None)
-                ),
-            )
-            await decide_proposal(
-                session,
-                approver_sub=owner,
-                hold_id=uuid.UUID(sub_rec["proposal_id"]),
-                decision="approve",
-                decision_note=None,
-                judge=FakeProposalJudge(),
-            )
-            monkeypatch.setattr(session, "commit", real_commit)
+            failed_terminal = False
+
+            async def _commit_failing_terminal() -> None:
+                nonlocal failed_terminal
+                if not failed_terminal:
+                    for obj in session.identity_map.values():
+                        if (
+                            isinstance(obj, ProposalHold)
+                            and obj.id == uuid.UUID(sub_rec["proposal_id"])
+                            and obj.status in PROPOSAL_TERMINAL_STATUSES
+                        ):
+                            failed_terminal = True
+                            raise OperationalError("simulated terminal commit failure", None, None)
+                await real_commit()
+
+            try:
+                monkeypatch.setattr(session, "commit", _commit_failing_terminal)
+                await decide_proposal(
+                    session,
+                    approver_sub=owner,
+                    hold_id=uuid.UUID(sub_rec["proposal_id"]),
+                    decision="approve",
+                    decision_note=None,
+                    judge=FakeProposalJudge(),
+                )
+            finally:
+                monkeypatch.setattr(session, "commit", real_commit)
+            assert failed_terminal, "Expected terminal commit failure was not triggered"
 
             # Poll history since watermark: the recovered proposal is delivered!
             h_rec_res = await list_proposals_for_bot(
@@ -4154,6 +4185,92 @@ class TestListProposalsForBot:
             )
             assert len(p_updated["proposals"]) == 1
             assert p_updated["proposals"][0]["proposal_id"] == sub_resub["proposal_id"]
+
+    async def test_multi_bot_log_seq_isolation(self, session: AsyncSession) -> None:
+        """S17: Interleaved sequence advancement and reads across bots remain isolated."""
+        bot_a = "bot-iso-a"
+        bot_b = "bot-iso-b"
+
+        # Both bots submit 3 proposals
+        for i in range(3):
+            await _submit(session, proposed_by_bot_id=bot_a, action=_action(target_id=f"A-{i}"))
+            await _submit(session, proposed_by_bot_id=bot_b, action=_action(target_id=f"B-{i}"))
+
+        # Bot A reads page 1
+        p_a1 = await list_proposals_for_bot(
+            session, requesting_bot_sub=bot_a, statuses=("pending",), limit=2, order="log"
+        )
+        assert len(p_a1["proposals"]) == 2
+        for p in p_a1["proposals"]:
+            assert p["proposed_by_bot_id"] == bot_a
+
+        # Bot B reads page 1
+        p_b1 = await list_proposals_for_bot(
+            session, requesting_bot_sub=bot_b, statuses=("pending",), limit=2, order="log"
+        )
+        assert len(p_b1["proposals"]) == 2
+        for p in p_b1["proposals"]:
+            assert p["proposed_by_bot_id"] == bot_b
+
+        # Bot A reads page 2 with its cursor
+        p_a2 = await list_proposals_for_bot(
+            session,
+            requesting_bot_sub=bot_a,
+            statuses=("pending",),
+            limit=2,
+            order="log",
+            since=p_a1["next_cursor"],
+        )
+        assert len(p_a2["proposals"]) == 1
+        assert p_a2["proposals"][0]["proposed_by_bot_id"] == bot_a
+
+        # Bot B reads page 2 with its cursor
+        p_b2 = await list_proposals_for_bot(
+            session,
+            requesting_bot_sub=bot_b,
+            statuses=("pending",),
+            limit=2,
+            order="log",
+            since=p_b1["next_cursor"],
+        )
+        assert len(p_b2["proposals"]) == 1
+        assert p_b2["proposals"][0]["proposed_by_bot_id"] == bot_b
+
+    async def test_non_status_update_resequences_row(self, session: AsyncSession) -> None:
+        """S17: Non-status update fires trigger, increments log_seq, and re-delivers row."""
+        bot = "bot-resequence"
+        sub = await _submit(session, proposed_by_bot_id=bot, action=_action(target_id="RESEQ-1"))
+        hold_id = uuid.UUID(sub["proposal_id"])
+
+        # Initial read
+        res1 = await list_proposals_for_bot(
+            session, requesting_bot_sub=bot, statuses=("pending",), order="log"
+        )
+        assert len(res1["proposals"]) == 1
+        assert res1["proposals"][0]["rationale"] == "because reasons"
+        watermark = res1["next_cursor"]
+        assert watermark is not None
+
+        # Next read with since=watermark is empty
+        res2 = await list_proposals_for_bot(
+            session, requesting_bot_sub=bot, statuses=("pending",), order="log", since=watermark
+        )
+        assert len(res2["proposals"]) == 0
+
+        # Non-status update: update rationale
+        hold = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        hold.rationale = "updated rationale without status change"
+        await session.commit()
+
+        # Poll again with since=watermark: row is re-delivered with new rationale!
+        res3 = await list_proposals_for_bot(
+            session, requesting_bot_sub=bot, statuses=("pending",), order="log", since=watermark
+        )
+        assert len(res3["proposals"]) == 1
+        assert res3["proposals"][0]["proposal_id"] == str(hold_id)
+        assert res3["proposals"][0]["rationale"] == "updated rationale without status change"
 
 
 class TestResolveAttributionAndOwner:
