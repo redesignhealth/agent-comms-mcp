@@ -191,6 +191,7 @@ from exceptions import (
     InvalidExtendError,
     InvalidOwnerReassignmentError,
     InvalidProposalActionError,
+    ProposalDecisionValidationError,
     ProposalTargetUnavailableError,
     RateLimitExceededError,
     SchemaVersionMismatchError,
@@ -198,6 +199,7 @@ from exceptions import (
     UnknownConversationTypeError,
 )
 from models import (
+    DECISION_REASON_CODES,
     PROPOSAL_HOLD_LEVELS,
     PROPOSAL_HOLD_STATUSES,
     Agent,
@@ -7118,6 +7120,8 @@ def _proposal_dict(
         result["decided_at"] = _iso(hold.decided_at)
     if hold.decision_note is not None:
         result["decision_note"] = hold.decision_note
+    if hold.decision_reason_code is not None:
+        result["decision_reason_code"] = hold.decision_reason_code
     if hold.applied_at is not None:
         result["applied_at"] = _iso(hold.applied_at)
     if hold.apply_error is not None:
@@ -8985,6 +8989,7 @@ async def _apply_or_finalize_proposal_hold(
     decided_by_actor_id: str,
     decision_source: str,
     decision_note: str | None,
+    decision_reason_code: str | None = None,
     judge: ProposalJudge,
 ) -> dict[str, Any] | None:
     """Shared fingerprint-check-then-apply-or-stale logic for a hold
@@ -9182,6 +9187,7 @@ async def _apply_or_finalize_proposal_hold(
     hold.decided_by_actor_id = decided_by_actor_id
     hold.decided_at = _now()
     hold.decision_note = decision_note
+    hold.decision_reason_code = decision_reason_code
 
     if is_indeterminate:
         # TECH-6213 PR-B1 (FIX 4): an indeterminate outcome means the external
@@ -9265,11 +9271,14 @@ async def _apply_or_finalize_proposal_hold(
     elif is_stale:
         hold.status = "stale"
         hold.decision_note = _stale_decision_note(decision_note)
+        stale_detail: dict[str, Any] = {"hold_id": str(hold_id), "target_id": target_id}
+        if decision_reason_code is not None:
+            stale_detail["decision_reason_code"] = decision_reason_code
         _audit(
             session,
             actor_sub=decided_by_actor_id,
             action="proposal.stale",
-            detail={"hold_id": str(hold_id), "target_id": target_id},
+            detail=stale_detail,
         )
     elif apply_error is not None:
         hold.status = "apply_failed"
@@ -9287,6 +9296,13 @@ async def _apply_or_finalize_proposal_hold(
             target_id,
             raw_apply_error,
         )
+        apply_failed_detail: dict[str, Any] = {
+            "hold_id": str(hold_id),
+            "target_id": target_id,
+            "error": raw_apply_error,
+        }
+        if decision_reason_code is not None:
+            apply_failed_detail["decision_reason_code"] = decision_reason_code
         _audit(
             session,
             actor_sub=decided_by_actor_id,
@@ -9296,7 +9312,7 @@ async def _apply_or_finalize_proposal_hold(
             # narrowing the API response -- record raw_apply_error here,
             # not the sanitized constant, or this internal record loses
             # the same debugging detail the round-6 B1 fix was about.
-            detail={"hold_id": str(hold_id), "target_id": target_id, "error": raw_apply_error},
+            detail=apply_failed_detail,
         )
     else:
         hold.status = "applied"
@@ -9310,11 +9326,14 @@ async def _apply_or_finalize_proposal_hold(
         # uses for applied_at/apply_error).
         if apply_result is not None:
             hold.apply_result = apply_result
+        applied_detail: dict[str, Any] = {"hold_id": str(hold_id), "target_id": target_id}
+        if decision_reason_code is not None:
+            applied_detail["decision_reason_code"] = decision_reason_code
         _audit(
             session,
             actor_sub=decided_by_actor_id,
             action="proposal.applied",
-            detail={"hold_id": str(hold_id), "target_id": target_id},
+            detail=applied_detail,
         )
     # Argus review round-9 B1: capture the terminal state this branch just
     # computed into local variables BEFORE the commit below, so the
@@ -9328,6 +9347,7 @@ async def _apply_or_finalize_proposal_hold(
     terminal_raw_apply_error = raw_apply_error
     terminal_applied_at = hold.applied_at
     terminal_decision_note = hold.decision_note
+    terminal_decision_reason_code = hold.decision_reason_code
     terminal_decided_at = hold.decided_at
     # Argus review round-6 suggestion: a SECOND cancellation delivered while
     # this terminal write (re-fetch through commit/refresh above and below)
@@ -9386,6 +9406,7 @@ async def _apply_or_finalize_proposal_hold(
                 recovery_hold.decided_by_actor_id = decided_by_actor_id
                 recovery_hold.decided_at = terminal_decided_at
                 recovery_hold.decision_note = terminal_decision_note
+                recovery_hold.decision_reason_code = terminal_decision_reason_code
                 audit_action = {
                     "applied": "proposal.applied",
                     "stale": "proposal.stale",
@@ -9396,6 +9417,8 @@ async def _apply_or_finalize_proposal_hold(
                 }
                 if terminal_status == "apply_failed":
                     audit_detail["error"] = terminal_raw_apply_error
+                if terminal_decision_reason_code is not None:
+                    audit_detail["decision_reason_code"] = terminal_decision_reason_code
                 _audit(
                     session,
                     actor_sub=decided_by_actor_id,
@@ -9446,6 +9469,10 @@ async def _apply_or_finalize_proposal_hold(
                             "target_id": target_id,
                             "error": _APPLY_ERROR_BOARD_COMMIT_FAILURE_MESSAGE,
                         }
+                        if terminal_decision_reason_code is not None:
+                            last_ditch_audit_detail["decision_reason_code"] = (
+                                terminal_decision_reason_code
+                            )
                     else:
                         # Argus review round-4 B2: `terminal_status` is
                         # "applied" or "stale" here -- judge.apply() (or
@@ -9468,11 +9495,16 @@ async def _apply_or_finalize_proposal_hold(
                         last_ditch_hold.decided_by_actor_id = decided_by_actor_id
                         last_ditch_hold.decided_at = terminal_decided_at
                         last_ditch_hold.decision_note = terminal_decision_note
+                        last_ditch_hold.decision_reason_code = terminal_decision_reason_code
                         last_ditch_audit_action = {
                             "applied": "proposal.applied",
                             "stale": "proposal.stale",
                         }.get(terminal_status, "proposal.apply_failed")
                         last_ditch_audit_detail = {"hold_id": str(hold_id), "target_id": target_id}
+                        if terminal_decision_reason_code is not None:
+                            last_ditch_audit_detail["decision_reason_code"] = (
+                                terminal_decision_reason_code
+                            )
                     _audit(
                         session,
                         actor_sub=decided_by_actor_id,
@@ -9538,6 +9570,7 @@ async def decide_proposal(
     hold_id: uuid.UUID,
     decision: str,
     decision_note: str | None,
+    decision_reason_code: str | None = None,
     judge: ProposalJudge,
 ) -> dict[str, Any]:
     """``POST /proposals/{hold_id}/decide`` (main.py, non-MCP,
@@ -9583,8 +9616,9 @@ async def decide_proposal(
     is never itself persisted (see ``PROPOSAL_HOLD_STATUSES``'s
     state-machine comment in ``models.py``, Argus review B1/B6).
 
-    ``reject`` requires a non-empty ``decision_note`` (enforced here too,
-    defense-in-depth against the HTTP-layer check in
+    ``reject`` requires a non-empty ``decision_note`` unless a
+    ``decision_reason_code`` other than ``"other"`` is supplied (enforced
+    here too, defense-in-depth against the HTTP-layer check in
     ``main.decide_proposal_route``) and never touches the target system.
 
     ``approve`` first CLAIMS the row by writing ``status="applying"``
@@ -9638,19 +9672,36 @@ async def decide_proposal(
         await session.commit()
         raise HoldAlreadyDecidedError(hold.status)
 
+    if decision_reason_code is not None and (
+        not isinstance(decision_reason_code, str)
+        or decision_reason_code not in DECISION_REASON_CODES
+    ):
+        raise ProposalDecisionValidationError(
+            f"decision_reason_code must be one of {DECISION_REASON_CODES!r}"
+        )
+
     if decision == "reject":
-        if not isinstance(decision_note, str) or not decision_note.strip():
-            raise ValueError("decision_note is required and must be non-empty to reject")
+        has_note = isinstance(decision_note, str) and bool(decision_note.strip())
+        has_code = decision_reason_code is not None and decision_reason_code != "other"
+        if not (has_note or has_code):
+            raise ProposalDecisionValidationError(
+                "decision_note is required and must be non-empty to reject "
+                "unless a decision_reason_code other than 'other' is supplied"
+            )
         hold.status = "rejected"
         hold.decision_source = "human"
         hold.decided_by_actor_id = approver_sub
         hold.decided_at = _now()
         hold.decision_note = decision_note
+        hold.decision_reason_code = decision_reason_code
+        reject_detail: dict[str, Any] = {"hold_id": str(hold_id)}
+        if decision_reason_code is not None:
+            reject_detail["decision_reason_code"] = decision_reason_code
         _audit(
             session,
             actor_sub=approver_sub,
             action="proposal.reject",
-            detail={"hold_id": str(hold_id)},
+            detail=reject_detail,
         )
         await session.commit()
         # `updated_at`'s onupdate=text("now()") (models.py) means the ORM
@@ -9669,13 +9720,23 @@ async def decide_proposal(
         # only the last outstanding approval falls through to the claim below.
         approvals = list(hold.approvals or [])
         if not any(a.get("sub") == approver_sub for a in approvals):
-            approvals.append({"sub": approver_sub, "at": _now().isoformat(), "note": decision_note})
+            approval_entry: dict[str, Any] = {
+                "sub": approver_sub,
+                "at": _now().isoformat(),
+                "note": decision_note,
+            }
+            if decision_reason_code is not None:
+                approval_entry["reason_code"] = decision_reason_code
+            approvals.append(approval_entry)
             hold.approvals = approvals
+            partial_detail: dict[str, Any] = {"hold_id": str(hold_id)}
+            if decision_reason_code is not None:
+                partial_detail["decision_reason_code"] = decision_reason_code
             _audit(
                 session,
                 actor_sub=approver_sub,
                 action="proposal.approve_partial",
-                detail={"hold_id": str(hold_id)},
+                detail=partial_detail,
             )
         if not all(any(a.get("sub") == r for a in approvals) for r in required_owners):
             await session.commit()
@@ -9696,6 +9757,7 @@ async def decide_proposal(
     hold.decided_by_actor_id = approver_sub
     hold.decided_at = _now()
     hold.decision_note = decision_note
+    hold.decision_reason_code = decision_reason_code
     await session.commit()
     # By design: this dispatches straight to ``judge.apply()`` and never
     # re-runs ``judge.judge()`` -- the plugin-owned auto-approval
@@ -9714,6 +9776,7 @@ async def decide_proposal(
         decided_by_actor_id=approver_sub,
         decision_source="human",
         decision_note=decision_note,
+        decision_reason_code=decision_reason_code,
         judge=judge,
     )
     if result is not None:

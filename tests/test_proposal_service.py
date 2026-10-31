@@ -157,6 +157,7 @@ async def _decide(
     hold_id: uuid.UUID,
     decision: str = "approve",
     decision_note: str | None = None,
+    decision_reason_code: str | None = None,
     judge: ProposalJudge | None = None,
 ) -> dict[str, Any]:
     return await decide_proposal(
@@ -165,6 +166,7 @@ async def _decide(
         hold_id=hold_id,
         decision=decision,
         decision_note=decision_note,
+        decision_reason_code=decision_reason_code,
         judge=judge if judge is not None else _default_judge(),
     )
 
@@ -1469,7 +1471,7 @@ class TestDecideProposal:
         self, session: AsyncSession
     ) -> None:
         submitted = await _submit(session)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="decision_note is required"):
             await _decide(session, hold_id=uuid.UUID(submitted["proposal_id"]), decision="reject")
 
     async def test_reject_with_note_sets_rejected(self, session: AsyncSession) -> None:
@@ -1482,8 +1484,355 @@ class TestDecideProposal:
         )
         assert decided["status"] == "rejected"
         assert decided["decision_note"] == "not appropriate"
+        assert decided.get("decision_reason_code") is None
         assert decided["decision_source"] == "human"
         assert decided["decided_by_actor_id"] == "owner-a@example.com"
+
+    async def test_reject_with_reason_code_only_sets_rejected(self, session: AsyncSession) -> None:
+        submitted = await _submit(session)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        decided = await _decide(
+            session,
+            hold_id=hold_id,
+            decision="reject",
+            decision_reason_code="not_now",
+        )
+        assert decided["status"] == "rejected"
+        assert decided["decision_reason_code"] == "not_now"
+        assert decided.get("decision_note") is None
+        assert decided["decision_source"] == "human"
+        assert decided["decided_by_actor_id"] == "owner-a@example.com"
+
+        hold = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        assert hold.decision_reason_code == "not_now"
+        assert hold.decision_note is None
+
+        audit = (
+            await session.execute(
+                select(AuditLog).where(
+                    AuditLog.action == "proposal.reject",
+                    AuditLog.detail["hold_id"].astext == str(hold_id),
+                )
+            )
+        ).scalar_one()
+        assert audit.detail.get("decision_reason_code") == "not_now"
+
+    async def test_reject_with_other_and_no_note_raises_value_error(
+        self, session: AsyncSession
+    ) -> None:
+        submitted = await _submit(session)
+        with pytest.raises(ValueError, match="decision_note is required"):
+            await _decide(
+                session,
+                hold_id=uuid.UUID(submitted["proposal_id"]),
+                decision="reject",
+                decision_reason_code="other",
+            )
+
+    async def test_reject_with_other_and_note_sets_rejected(self, session: AsyncSession) -> None:
+        submitted = await _submit(session)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        decided = await _decide(
+            session,
+            hold_id=hold_id,
+            decision="reject",
+            decision_reason_code="other",
+            decision_note="detailed reason here",
+        )
+        assert decided["status"] == "rejected"
+        assert decided["decision_reason_code"] == "other"
+        assert decided["decision_note"] == "detailed reason here"
+
+    async def test_reject_unknown_reason_code_raises_value_error(
+        self, session: AsyncSession
+    ) -> None:
+        submitted = await _submit(session)
+        with pytest.raises(ValueError, match="decision_reason_code must be one of"):
+            await _decide(
+                session,
+                hold_id=uuid.UUID(submitted["proposal_id"]),
+                decision="reject",
+                decision_reason_code="bogus_code",
+            )
+
+    async def test_approve_with_reason_code_persisted(self, session: AsyncSession) -> None:
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result=None, caller_error=None, log_detail=None
+            ),
+        )
+        submitted = await _submit(session, judge=judge)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        decided = await _decide(
+            session,
+            hold_id=hold_id,
+            decision="approve",
+            decision_reason_code="duplicate",
+            judge=judge,
+        )
+        assert decided["status"] == "applied"
+        assert decided["decision_reason_code"] == "duplicate"
+
+        hold = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        assert hold.decision_reason_code == "duplicate"
+
+    async def test_approve_unknown_reason_code_raises_value_error(
+        self, session: AsyncSession
+    ) -> None:
+        submitted = await _submit(session)
+        with pytest.raises(ValueError, match="decision_reason_code must be one of"):
+            await _decide(
+                session,
+                hold_id=uuid.UUID(submitted["proposal_id"]),
+                decision="approve",
+                decision_reason_code="bogus_code",
+            )
+
+    async def test_partial_approval_with_reason_code_leaves_hold_level_unset(
+        self, session: AsyncSession
+    ) -> None:
+        """Item 2: partial cross-brain approval records code in approvals list,
+        but does not persist decision fields or code at hold level while still pending."""
+        submitted = await _submit(session)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        hold = await session.get(ProposalHold, hold_id)
+        assert hold is not None
+        hold.cross_brain = {
+            "target_sub": "target-agent@example.com",
+            "required_owner_subs": ["owner-a@example.com", "owner-b@example.com"],
+        }
+        await session.commit()
+
+        partial = await _decide(
+            session,
+            approver_sub="owner-a@example.com",
+            hold_id=hold_id,
+            decision="approve",
+            decision_reason_code="policy",
+            decision_note="partial note",
+        )
+        assert partial["status"] == "pending"
+        assert "decision_reason_code" not in partial
+        assert "decision_note" not in partial
+        assert len(partial["approvals"]) == 1
+        assert partial["approvals"][0]["sub"] == "owner-a@example.com"
+        assert partial["approvals"][0]["reason_code"] == "policy"
+        assert partial["approvals"][0]["note"] == "partial note"
+
+        db_hold = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        assert db_hold.status == "pending"
+        assert db_hold.decision_reason_code is None
+        assert db_hold.decision_note is None
+
+        audit = (
+            await session.execute(
+                select(AuditLog).where(
+                    AuditLog.action == "proposal.approve_partial",
+                    AuditLog.detail["hold_id"].astext == str(hold_id),
+                )
+            )
+        ).scalar_one()
+        assert audit.detail.get("decision_reason_code") == "policy"
+
+    async def test_final_approval_overwrites_reason_code_consistently(
+        self, session: AsyncSession
+    ) -> None:
+        """Item 2: final approval after partial with different or no code
+        reflects the final decider's code (or None) and does not retain stale partial code."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result=None, caller_error=None, log_detail=None
+            ),
+        )
+        # 1. Final approval with different code
+        submitted = await _submit(session, judge=judge)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        hold = await session.get(ProposalHold, hold_id)
+        assert hold is not None
+        hold.cross_brain = {
+            "target_sub": "target-agent@example.com",
+            "required_owner_subs": ["owner-a@example.com", "owner-b@example.com"],
+        }
+        await session.commit()
+
+        await _decide(
+            session,
+            approver_sub="owner-a@example.com",
+            hold_id=hold_id,
+            decision="approve",
+            decision_reason_code="policy",
+            judge=judge,
+        )
+        final_diff = await _decide(
+            session,
+            approver_sub="owner-b@example.com",
+            hold_id=hold_id,
+            decision="approve",
+            decision_reason_code="not_now",
+            judge=judge,
+        )
+        assert final_diff["status"] == "applied"
+        assert final_diff["decision_reason_code"] == "not_now"
+        db_hold = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        assert db_hold.decision_reason_code == "not_now"
+
+        # 2. Final approval with NO code (None)
+        judge2 = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result=None, caller_error=None, log_detail=None
+            ),
+        )
+        submitted2 = await _submit(session, judge=judge2)
+        hold_id2 = uuid.UUID(submitted2["proposal_id"])
+        hold2 = await session.get(ProposalHold, hold_id2)
+        assert hold2 is not None
+        hold2.cross_brain = {
+            "target_sub": "target-agent@example.com",
+            "required_owner_subs": ["owner-a@example.com", "owner-b@example.com"],
+        }
+        await session.commit()
+
+        await _decide(
+            session,
+            approver_sub="owner-a@example.com",
+            hold_id=hold_id2,
+            decision="approve",
+            decision_reason_code="policy",
+            judge=judge2,
+        )
+        final_none = await _decide(
+            session,
+            approver_sub="owner-b@example.com",
+            hold_id=hold_id2,
+            decision="approve",
+            decision_reason_code=None,
+            judge=judge2,
+        )
+        assert final_none["status"] == "applied"
+        assert "decision_reason_code" not in final_none
+        db_hold2 = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id2))
+        ).scalar_one()
+        assert db_hold2.decision_reason_code is None
+
+    async def test_audit_detail_contains_decision_reason_code_when_present(
+        self, session: AsyncSession
+    ) -> None:
+        """Item 5: audit details carry decision_reason_code when supplied across
+        applied, stale, and apply_failed."""
+        # 1. applied
+        judge_applied = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result=None, caller_error=None, log_detail=None
+            ),
+        )
+        sub1 = await _submit(session, judge=judge_applied)
+        hid1 = uuid.UUID(sub1["proposal_id"])
+        await _decide(
+            session,
+            hold_id=hid1,
+            decision="approve",
+            decision_reason_code="policy",
+            judge=judge_applied,
+        )
+        audit1 = (
+            await session.execute(
+                select(AuditLog).where(
+                    AuditLog.action == "proposal.applied",
+                    AuditLog.detail["hold_id"].astext == str(hid1),
+                )
+            )
+        ).scalar_one()
+        assert audit1.detail.get("decision_reason_code") == "policy"
+
+        # 2. stale
+        judge_stale = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+        )
+        sub2 = await _submit(session, judge=judge_stale)
+        hid2 = uuid.UUID(sub2["proposal_id"])
+        judge_stale.fingerprint_result = ProposalFingerprint(
+            status=FINGERPRINT_DIGEST, digest="fp-drift"
+        )
+        await _decide(
+            session,
+            hold_id=hid2,
+            decision="approve",
+            decision_reason_code="not_now",
+            judge=judge_stale,
+        )
+        audit2 = (
+            await session.execute(
+                select(AuditLog).where(
+                    AuditLog.action == "proposal.stale",
+                    AuditLog.detail["hold_id"].astext == str(hid2),
+                )
+            )
+        ).scalar_one()
+        assert audit2.detail.get("decision_reason_code") == "not_now"
+
+        # 3. apply_failed
+        judge_failed = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_result=ProposalApplyOutcome(
+                applied=False, result=None, caller_error="failed", log_detail=None
+            ),
+        )
+        sub3 = await _submit(session, judge=judge_failed)
+        hid3 = uuid.UUID(sub3["proposal_id"])
+        await _decide(
+            session,
+            hold_id=hid3,
+            decision="approve",
+            decision_reason_code="wrong_target",
+            judge=judge_failed,
+        )
+        audit3 = (
+            await session.execute(
+                select(AuditLog).where(
+                    AuditLog.action == "proposal.apply_failed",
+                    AuditLog.detail["hold_id"].astext == str(hid3),
+                )
+            )
+        ).scalar_one()
+        assert audit3.detail.get("decision_reason_code") == "wrong_target"
+
+    async def test_audit_detail_omits_decision_reason_code_when_absent(
+        self, session: AsyncSession
+    ) -> None:
+        """Item 5: audit details omit decision_reason_code when no code was supplied."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result=None, caller_error=None, log_detail=None
+            ),
+        )
+        sub = await _submit(session, judge=judge)
+        hid = uuid.UUID(sub["proposal_id"])
+        await _decide(
+            session, hold_id=hid, decision="approve", decision_reason_code=None, judge=judge
+        )
+        audit = (
+            await session.execute(
+                select(AuditLog).where(
+                    AuditLog.action == "proposal.applied",
+                    AuditLog.detail["hold_id"].astext == str(hid),
+                )
+            )
+        ).scalar_one()
+        assert "decision_reason_code" not in audit.detail
 
     async def test_approve_matching_fingerprint_applies_and_calls_apply_once(
         self, session: AsyncSession
@@ -2051,6 +2400,54 @@ class TestTerminalCommitFailureRecovery:
         )
         assert audit_row is not None
         assert "error" not in audit_row.detail
+
+    async def test_recovery_after_commit_failure_restores_decision_reason_code(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Item 1: when the primary terminal commit fails and recovery succeeds,
+        the recovered hold must still carry decision_reason_code."""
+        judge = FakeProposalJudge(
+            fingerprint_result=ProposalFingerprint(status=FINGERPRINT_DIGEST, digest="fp-match"),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result={"ticket": "TECH-1"}, caller_error=None, log_detail=None
+            ),
+        )
+        submitted = await _submit(session, judge=judge)
+        hold_id = uuid.UUID(submitted["proposal_id"])
+        commit_mock = self._fail_nth_commit(
+            session, 3, OperationalError("boom", {}, Exception("db down"))
+        )
+        monkeypatch.setattr(session, "commit", commit_mock)
+
+        decided = await _decide(
+            session,
+            hold_id=hold_id,
+            decision="approve",
+            decision_reason_code="policy",
+            judge=judge,
+        )
+
+        assert commit_mock.call_count == 4
+        assert decided["status"] == "applied"
+        assert decided["decision_reason_code"] == "policy"
+        row = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        assert row.status == "applied"
+        assert row.decision_reason_code == "policy"
+        audit_row = (
+            (
+                await session.execute(
+                    select(AuditLog).where(
+                        AuditLog.action == "proposal.applied",
+                        AuditLog.detail["hold_id"].astext == str(hold_id),
+                    )
+                )
+            )
+            .scalars()
+            .one()
+        )
+        assert audit_row.detail.get("decision_reason_code") == "policy"
 
     async def test_recovery_after_commit_failure_recovers_to_stale(
         self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch

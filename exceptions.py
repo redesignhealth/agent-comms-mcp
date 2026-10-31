@@ -257,6 +257,10 @@ class HoldAlreadyDecidedError(Exception):
         super().__init__(f"hold is no longer decidable (status={status!r})")
 
 
+class ProposalDecisionValidationError(ValueError):
+    """Validation error for proposal decision_note or decision_reason_code (HTTP 400)."""
+
+
 class HoldAwaitingAutoReviewError(Exception):
     """The decide endpoint targeted a hold still ``pending_auto`` —
     unreachable in v1 (``EscalateAllAutoApprover`` always transitions

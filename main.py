@@ -28,6 +28,7 @@ from pydantic import AnyUrl
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 
+import models
 import plugins
 import service
 import subscriptions
@@ -43,6 +44,7 @@ from exceptions import (
     InvalidConversationStateError,
     InvalidOwnerReassignmentError,
     InvalidProposalActionError,
+    ProposalDecisionValidationError,
     ProposalTargetUnavailableError,
     RateLimitExceededError,
 )
@@ -1387,8 +1389,11 @@ async def get_proposal_apply_record_route(request: Request) -> Response:
 async def decide_proposal_route(request: Request) -> Response:
     """Human decide endpoint for a pending proposal hold (TECH-5873).
 
-    Body: ``{"decision": "approve" | "reject", "decision_note": "<required
-    for reject, optional for approve, max 2000 chars>"}``. Same hard
+    Body: ``{"decision": "approve" | "reject", "decision_note": "<optional,
+    max 2000 chars; required for reject unless non-'other' decision_reason_code supplied>",
+    "decision_reason_code": "<optional, closed vocabulary: not_now, wrong_target,
+    incorrect_facts, insufficient_evidence, duplicate, policy, human_will_handle,
+    other>"}``. Same hard
     interactive-token gate as ``/approvals/{hold_id}/decide``
     (``_authenticate_approval_caller``) -- a bot can never reach this
     route at all, which is what makes a bot self-approving its own
@@ -1439,14 +1444,33 @@ async def decide_proposal_route(request: Request) -> Response:
                 },
                 status_code=422,
             )
-    if decision == "reject" and (not isinstance(decision_note, str) or not decision_note.strip()):
+    decision_reason_code = body.get("decision_reason_code")
+    if decision_reason_code is not None and (
+        not isinstance(decision_reason_code, str)
+        or decision_reason_code not in models.DECISION_REASON_CODES
+    ):
+        codes = models.DECISION_REASON_CODES
         return JSONResponse(
             {
-                "error": "decision_note_required",
-                "detail": "decision_note is required and must be non-empty to reject",
+                "error": "invalid_decision_reason_code",
+                "detail": f"decision_reason_code must be one of {codes!r}",
             },
             status_code=400,
         )
+    if decision == "reject":
+        has_note = isinstance(decision_note, str) and bool(decision_note.strip())
+        has_code = decision_reason_code is not None and decision_reason_code != "other"
+        if not (has_note or has_code):
+            return JSONResponse(
+                {
+                    "error": "decision_note_required",
+                    "detail": (
+                        "decision_note is required and must be non-empty to reject "
+                        "unless a decision_reason_code other than 'other' is supplied"
+                    ),
+                },
+                status_code=400,
+            )
 
     async with get_session_factory()() as session:
         try:
@@ -1456,12 +1480,15 @@ async def decide_proposal_route(request: Request) -> Response:
                 hold_id=hold_id,
                 decision=decision,
                 decision_note=decision_note,
+                decision_reason_code=decision_reason_code,
                 judge=plugins.get_proposal_judge(),
             )
         except AccessDeniedError:
             return JSONResponse(_UNIFORM_HOLD_NOT_FOUND, status_code=404)
         except HoldAlreadyDecidedError as exc:
             return JSONResponse({"error": "already_decided", "status": exc.status}, status_code=409)
+        except ProposalDecisionValidationError as exc:
+            return JSONResponse({"error": "invalid_request", "detail": str(exc)}, status_code=400)
         except Exception:
             logger.exception("decide_proposal invariant violation for hold_id=%s", hold_id)
             return JSONResponse({"error": "internal_error"}, status_code=500)

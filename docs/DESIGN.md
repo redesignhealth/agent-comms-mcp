@@ -460,7 +460,10 @@ rejected|applied|apply_failed|stale|withdrawn), decision_source(human|
 auto|bot -- `bot` added TECH-6018, marking a decision made by the
 SUBMITTING bot itself; reachable only via withdraw, since a bot can
 never reach `decide_proposal` at all),
- decided_by_actor_id, decided_at, decision_note, target_fingerprint
+ decided_by_actor_id, decided_at, decision_note,
+ decision_reason_code(nullable, check-constrained closed vocabulary:
+ not_now|wrong_target|incorrect_facts|insufficient_evidence|duplicate|
+ policy|human_will_handle|other), target_fingerprint
    (sha256 hex digest computed at proposal submission time from the
    target's current state, for detecting staleness at apply time),
    applied_at, apply_error, apply_result (nullable JSONB carrying the
@@ -1942,8 +1945,14 @@ can never reach this route at all regardless of scope, which is what makes a
 bot self-approving its own proposal structurally impossible here too.
 
 Status transitions from `"pending"`: `"rejected"` (requires a non-empty
-`decision_note`, 400/`ValueError` otherwise, never touches the target
-system), or on `"approve"` the shared helper re-fetches the current target
+`decision_note` unless a `decision_reason_code` other than `'other'` is
+supplied; never touches the target system). The optional `decision_reason_code`
+is accepted and persisted on `"approve"` as well. Validation failures return 400:
+`"invalid_decision_reason_code"` for unknown codes, `"decision_note_required"`
+when reject note/code rules are violated, or `"invalid_request"` if
+`ProposalDecisionValidationError` is raised by the service layer; any other
+`ValueError` from the service/plugin layer propagates as a logged 500
+(`"internal_error"`). On `"approve"`, the shared helper re-fetches the current target
 state via `judge.fingerprint()`, compares it to `hold.target_fingerprint`,
 and either marks the hold `"stale"` or calls `judge.apply()`. What
 `apply()` actually does -- which mutation, against which system -- is
