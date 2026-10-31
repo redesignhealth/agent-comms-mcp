@@ -960,6 +960,10 @@ class TestProposalHoldsSchema:
             capture_output=True,
             text=True,
         )
+        async with engine.connect() as conn:
+            orig_head = (
+                await conn.execute(text("SELECT version_num FROM alembic_version"))
+            ).scalar_one()
         try:
             async with engine.begin() as conn:
                 await conn.execute(text("UPDATE alembic_version SET version_num = 'a56cb01a3ebf'"))
@@ -972,6 +976,11 @@ class TestProposalHoldsSchema:
             )
             assert res.returncode == 0, res.stderr
         finally:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("UPDATE alembic_version SET version_num = :v"),
+                    {"v": orig_head},
+                )
             subprocess.run(
                 [sys.executable, "-m", "alembic", "upgrade", "head"],
                 cwd=SERVICE_ROOT,
