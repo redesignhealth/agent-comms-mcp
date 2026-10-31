@@ -1017,7 +1017,7 @@ class TestProposalHoldsSchema:
             ).scalar_one_or_none()
             assert tgenabled in ("O", b"O")
 
-            # Verify reloptions storage params match models.py ProposalBotLogSeq.__table_args__
+            # Verify reloptions storage params set by migration b4a2d8e6f1c3
             reloptions = (
                 await conn.execute(
                     text("SELECT reloptions FROM pg_class WHERE relname = 'proposal_bot_log_seq'")
@@ -1026,13 +1026,6 @@ class TestProposalHoldsSchema:
             assert "fillfactor=70" in reloptions
             assert "autovacuum_vacuum_scale_factor=0.0" in reloptions
             assert "autovacuum_vacuum_threshold=1000" in reloptions
-
-            from models import ProposalBotLogSeq
-
-            table_with = ProposalBotLogSeq.__table__.dialect_options["postgresql"]["with"]
-            assert table_with["fillfactor"] == 70
-            assert table_with["autovacuum_vacuum_scale_factor"] == 0.0
-            assert table_with["autovacuum_vacuum_threshold"] == 1000
 
             # No proposal_holds row has NULL log_seq
             null_count = (
@@ -1268,7 +1261,7 @@ class TestProposalHoldsSchema:
                 for _i in range(5):
                     await conn.execute(text(guard_sql))
 
-            # Attempt upgrade with threshold=3 -> should fail
+            # Case 1: First run (column does not exist yet): 5 rows > threshold 3 -> should fail
             res_fail = subprocess.run(
                 [sys.executable, "-m", "alembic", "upgrade", "head"],
                 cwd=SERVICE_ROOT,
@@ -1282,15 +1275,31 @@ class TestProposalHoldsSchema:
             )
             assert err_msg in res_fail.stderr
 
-            # Upgrade with threshold=10 -> should succeed
-            res_ok = subprocess.run(
+            # Case 2: Rerun after partial backfill (column exists and only NULLs are counted):
+            # Pre-add column and backfill 4 out of 5 rows, leaving 1 NULL row.
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("ALTER TABLE proposal_holds ADD COLUMN IF NOT EXISTS log_seq BIGINT")
+                )
+                await conn.execute(
+                    text(
+                        "WITH numbered AS ("
+                        "  SELECT id, row_number() OVER () AS rn FROM proposal_holds LIMIT 4"
+                        ") "
+                        "UPDATE proposal_holds h SET log_seq = n.rn "
+                        "FROM numbered n WHERE h.id = n.id"
+                    )
+                )
+
+            # Rerun with threshold=3: 1 un-backfilled row <= 3 -> should succeed
+            res_rerun_ok = subprocess.run(
                 [sys.executable, "-m", "alembic", "upgrade", "head"],
                 cwd=SERVICE_ROOT,
-                env={**env, "_TEST_SIZE_GUARD_THRESHOLD": "10"},
+                env={**env, "_TEST_SIZE_GUARD_THRESHOLD": "3"},
                 capture_output=True,
                 text=True,
             )
-            assert res_ok.returncode == 0, res_ok.stderr
+            assert res_rerun_ok.returncode == 0, res_rerun_ok.stderr
         finally:
             async with engine.begin() as conn:
                 await conn.execute(

@@ -7347,8 +7347,13 @@ async def _list_proposals_with_elision(
         .options(defer(ProposalHold.action, raiseload=True))
         .join(subq, ProposalHold.id == subq.c.id)
         .order_by(*order_clauses)
-        .execution_options(populate_existing=True)
     )
+    # Argus round 2: populate_existing ensures next_cursor is not encoded from a stale
+    # in-memory log_seq, but must not clobber a caller's unflushed in-memory changes.
+    # Scope it to log-order listings only when the session has no dirty ProposalHold instances.
+    has_dirty_holds = any(isinstance(obj, ProposalHold) for obj in session.dirty)
+    if cursor_kind is not None and not has_dirty_holds:
+        stmt = stmt.execution_options(populate_existing=True)
     rows = (await session.execute(stmt)).all()
     has_more = len(rows) > limit
     returned_rows = rows[:limit]

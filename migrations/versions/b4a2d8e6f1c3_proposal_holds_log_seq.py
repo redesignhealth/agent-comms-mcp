@@ -42,32 +42,40 @@ Mitigation: bulk operations should either:
 2. Order touched rows deterministically by proposed_by_bot_id before performing updates.
 
 BATCHED BACKFILL RUNBOOK (if table exceeds 100,000 rows):
-If proposal_holds has > 100,000 rows, the single-statement UPDATE backfill is aborted to avoid
-holding ACCESS EXCLUSIVE for too long. To backfill manually prior to re-running the migration:
-1. Add the column without locking:
+If proposal_holds has > 100,000 un-backfilled rows, the single-statement UPDATE is aborted
+to avoid holding ACCESS EXCLUSIVE for too long. To backfill manually prior to re-running:
+1. Add the nullable column and create the counter table explicitly if missing:
    ALTER TABLE proposal_holds ADD COLUMN IF NOT EXISTS log_seq BIGINT;
-2. Run batched updates in chunks (e.g. 10,000 rows per transaction):
+   CREATE TABLE IF NOT EXISTS proposal_bot_log_seq (
+       bot_id TEXT PRIMARY KEY,
+       last_seq BIGINT NOT NULL
+   );
+   ALTER TABLE proposal_bot_log_seq SET (
+       fillfactor = 70, autovacuum_vacuum_scale_factor = 0.0, autovacuum_vacuum_threshold = 1000
+   );
+2. Run per-bot batched updates in chunks (e.g. 10,000 rows), starting from COALESCE(MAX(log_seq), 0):
    DO $$
    DECLARE
-       r RECORD;
        b TEXT;
-       max_seq BIGINT;
+       r RECORD;
+       curr_seq BIGINT;
    BEGIN
-       FOR b IN SELECT DISTINCT proposed_by_bot_id FROM proposal_holds LOOP
-           max_seq := 0;
+       FOR b IN SELECT DISTINCT proposed_by_bot_id FROM proposal_holds WHERE log_seq IS NULL LOOP
+           SELECT COALESCE(MAX(log_seq), 0) INTO curr_seq
+           FROM proposal_holds WHERE proposed_by_bot_id = b;
            FOR r IN SELECT id FROM proposal_holds WHERE proposed_by_bot_id = b AND log_seq IS NULL
                     ORDER BY COALESCE(decided_at, created_at), created_at, id LOOP
-               max_seq := max_seq + 1;
-               UPDATE proposal_holds SET log_seq = max_seq WHERE id = r.id;
-               IF max_seq % 10000 = 0 THEN COMMIT; END IF;
+               curr_seq := curr_seq + 1;
+               UPDATE proposal_holds SET log_seq = curr_seq WHERE id = r.id;
+               IF curr_seq % 10000 = 0 THEN COMMIT; END IF;
            END LOOP;
-           INSERT INTO proposal_bot_log_seq (bot_id, last_seq) VALUES (b, max_seq)
+           INSERT INTO proposal_bot_log_seq (bot_id, last_seq) VALUES (b, curr_seq)
            ON CONFLICT (bot_id) DO UPDATE SET last_seq = GREATEST(proposal_bot_log_seq.last_seq, EXCLUDED.last_seq);
            COMMIT;
        END LOOP;
    END $$;
-3. Re-run `alembic upgrade head`. The migration will skip backfilled rows, enforce NOT NULL,
-   install the trigger, and build concurrent indexes.
+3. Re-run `alembic upgrade head`. The migration will observe 0 NULL rows, skip the backfill,
+   enforce NOT NULL, install the trigger, and build concurrent indexes.
 """
 
 from __future__ import annotations
@@ -201,13 +209,17 @@ def upgrade() -> None:
 
     # 3. Size guard -- fail explicitly rather than lock the table for minutes
     if not context.is_offline_mode():
-        n = op.get_bind().execute(sa.text("SELECT count(*) FROM proposal_holds")).scalar_one()
+        if col_exists:
+            count_sql = "SELECT count(*) FROM proposal_holds WHERE log_seq IS NULL"
+        else:
+            count_sql = "SELECT count(*) FROM proposal_holds"
+        n = op.get_bind().execute(sa.text(count_sql)).scalar_one()
         threshold = int(os.environ.get("_TEST_SIZE_GUARD_THRESHOLD", _SIZE_GUARD_THRESHOLD))
         if n > threshold:
             raise RuntimeError(
-                f"proposal_holds has {n} rows (> {threshold}); the single-statement log_seq "
-                "backfill would hold ACCESS EXCLUSIVE for too long. Follow the batched backfill "
-                "runbook documented in this migration's docstring before re-running."
+                f"proposal_holds has {n} un-backfilled rows (> {threshold}); the single-statement "
+                "log_seq backfill would hold ACCESS EXCLUSIVE for too long. Follow the batched "
+                "backfill runbook documented in this migration's docstring before re-running."
             )
 
     # 4. Deterministic backfill (only populate rows where log_seq IS NULL)
@@ -215,7 +227,7 @@ def upgrade() -> None:
         WITH ranked AS (
             SELECT id,
                    COALESCE(
-                       (SELECT last_seq FROM proposal_bot_log_seq WHERE bot_id = proposal_holds.proposed_by_bot_id),
+                       (SELECT MAX(h2.log_seq) FROM proposal_holds h2 WHERE h2.proposed_by_bot_id = proposal_holds.proposed_by_bot_id),
                        0
                    ) + row_number() OVER (
                        PARTITION BY proposed_by_bot_id

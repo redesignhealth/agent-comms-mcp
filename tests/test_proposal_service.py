@@ -4272,6 +4272,35 @@ class TestListProposalsForBot:
         assert res3["proposals"][0]["proposal_id"] == str(hold_id)
         assert res3["proposals"][0]["rationale"] == "updated rationale without status change"
 
+    async def test_unflushed_change_in_same_session_not_overwritten(
+        self, session: AsyncSession
+    ) -> None:
+        """Argus round 2: an unflushed in-memory change on a ProposalHold in the same
+        session must not be clobbered by populate_existing during list_proposals_for_bot."""
+        bot = "bot-dirty-hold"
+        sub = await _submit(session, proposed_by_bot_id=bot, action=_action(target_id="DIRTY-1"))
+        hold_id = uuid.UUID(sub["proposal_id"])
+
+        # Load the hold into the session's identity map
+        hold = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+
+        # Mutate in memory without flushing or committing
+        hold.rationale = "unflushed in-memory modification"
+        assert hold in session.dirty
+
+        # Listing in the same session under order="log" with no_autoflush
+        with session.no_autoflush:
+            res = await list_proposals_for_bot(
+                session, requesting_bot_sub=bot, statuses=("pending",), order="log"
+            )
+            assert len(res["proposals"]) == 1
+
+            # The in-memory hold must NOT have been overwritten by populate_existing
+            assert hold.rationale == "unflushed in-memory modification"
+            assert hold in session.dirty
+
 
 class TestResolveAttributionAndOwner:
     """Direct unit tests for service.resolve_attribution_sub and
