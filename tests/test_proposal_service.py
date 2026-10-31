@@ -149,6 +149,7 @@ async def _submit(
     impact: str = "medium",
     target_fingerprint: str = "deadbeef",
     judge: ProposalJudge | None = None,
+    labels: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     return await create_proposal(
         session,
@@ -162,6 +163,7 @@ async def _submit(
         impact=impact,
         judge=judge if judge is not None else _default_judge(),
         target_fingerprint=target_fingerprint,
+        labels=labels,
     )
 
 
@@ -4977,3 +4979,273 @@ class TestResolveAttributionAndOwner:
         assert resolved_agent is not None
         assert resolved_agent.id == colon_agent.id
         assert owner_sub == "colon-owner@example.com"
+
+
+class TestProposalLabels:
+    """TECH-8080 PR9: proposal routing and classification labels."""
+
+    def test_validate_proposal_labels_valid(self) -> None:
+        assert service.validate_proposal_labels(None) is None
+        assert service.validate_proposal_labels({}) is None
+        assert service.validate_proposal_labels({"lane": "p1"}) == {"lane": "p1"}
+        full = {
+            "lane": "main",
+            "source_type": "pr_merged",
+            "evidence_type": "merged_pr",
+        }
+        assert service.validate_proposal_labels(full) == full
+
+    def test_validate_proposal_labels_unknown_key_raises(self) -> None:
+        with pytest.raises(ValueError, match="unknown label key: 'extra'"):
+            service.validate_proposal_labels({"lane": "p1", "extra": "foo"})
+
+    def test_validate_proposal_labels_non_dict_raises(self) -> None:
+        for invalid in ("lane", 123, True, ["lane"]):
+            with pytest.raises(ValueError, match="labels must be an object"):
+                service.validate_proposal_labels(invalid)
+
+    def test_validate_proposal_labels_non_string_value_raises(self) -> None:
+        for val in (123, True, ["val"], {"nested": "dict"}):
+            with pytest.raises(ValueError, match="label value for 'lane' must be a string"):
+                service.validate_proposal_labels({"lane": val})
+
+    def test_validate_proposal_labels_bad_charset_raises(self) -> None:
+        for val in ("LANE", "p 1", "p-1", "", "1lane", "_lane"):
+            with pytest.raises(ValueError, match=r"label value for 'lane' is invalid"):
+                service.validate_proposal_labels({"lane": val})
+
+    def test_validate_proposal_labels_length_caps(self) -> None:
+        valid_32 = "a" * 32
+        assert service.validate_proposal_labels({"lane": valid_32}) == {"lane": valid_32}
+        invalid_33 = "a" * 33
+        with pytest.raises(ValueError, match=r"label value for 'lane' is invalid"):
+            service.validate_proposal_labels({"lane": invalid_33})
+
+    async def test_submit_with_labels_persists_and_echoes(self, session: AsyncSession) -> None:
+        labels = {"lane": "p1", "source_type": "sweep", "evidence_type": "none"}
+        result = await _submit(
+            session,
+            action=_action(target_id="TECH-LABEL-1"),
+            labels=labels,
+        )
+        assert result["labels"] == labels
+
+        # Check DB row directly
+        hold_id = uuid.UUID(result["proposal_id"])
+        hold = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        assert hold.labels == labels
+
+        # proposals_get echoes it
+        fetched = await get_proposal_for_bot(session, hold_id=hold_id, requesting_bot_sub="bot-1")
+        assert fetched["labels"] == labels
+
+    async def test_submit_without_labels_omits_labels_consistently(
+        self, session: AsyncSession
+    ) -> None:
+        result = await _submit(
+            session,
+            action=_action(target_id="TECH-LABEL-2"),
+            labels=None,
+        )
+        assert "labels" not in result
+
+        hold_id = uuid.UUID(result["proposal_id"])
+        hold = (
+            await session.execute(select(ProposalHold).where(ProposalHold.id == hold_id))
+        ).scalar_one()
+        assert hold.labels is None
+
+        fetched = await get_proposal_for_bot(session, hold_id=hold_id, requesting_bot_sub="bot-1")
+        assert "labels" not in fetched
+
+    async def test_list_proposals_echoes_labels_when_present_and_omits_when_absent(
+        self, session: AsyncSession
+    ) -> None:
+        with_labels = await _submit(
+            session,
+            proposed_by_bot_id="bot-labels",
+            action=_action(target_id="TECH-L-1"),
+            labels={"lane": "p1"},
+        )
+        without_labels = await _submit(
+            session,
+            proposed_by_bot_id="bot-labels",
+            action=_action(target_id="TECH-L-2"),
+            labels=None,
+        )
+
+        # list_pending
+        pending = await list_proposals_for_bot(
+            session, requesting_bot_sub="bot-labels", statuses=("pending",)
+        )
+        by_id = {p["proposal_id"]: p for p in pending["proposals"]}
+        assert by_id[with_labels["proposal_id"]]["labels"] == {"lane": "p1"}
+        assert "labels" not in by_id[without_labels["proposal_id"]]
+
+        # withdraw both and verify list_history
+        await withdraw_proposal(
+            session,
+            hold_id=uuid.UUID(with_labels["proposal_id"]),
+            requesting_bot_sub="bot-labels",
+            reason=None,
+        )
+        await withdraw_proposal(
+            session,
+            hold_id=uuid.UUID(without_labels["proposal_id"]),
+            requesting_bot_sub="bot-labels",
+            reason=None,
+        )
+
+        history = await list_proposals_for_bot(
+            session, requesting_bot_sub="bot-labels", statuses=PROPOSAL_TERMINAL_STATUSES
+        )
+        history_by_id = {p["proposal_id"]: p for p in history["proposals"]}
+        assert history_by_id[with_labels["proposal_id"]]["labels"] == {"lane": "p1"}
+        assert "labels" not in history_by_id[without_labels["proposal_id"]]
+
+    async def test_dedup_resubmission_updates_labels(self, session: AsyncSession) -> None:
+        initial = await _submit(
+            session,
+            action=_action(target_id="TECH-DEDUP-LABELS"),
+            labels={"lane": "p1"},
+        )
+        assert initial["labels"] == {"lane": "p1"}
+
+        # Resubmit with new labels updates in place
+        resubmitted = await _submit(
+            session,
+            action=_action(target_id="TECH-DEDUP-LABELS"),
+            labels={"lane": "p2", "source_type": "standup"},
+        )
+        assert resubmitted["proposal_id"] == initial["proposal_id"]
+        assert resubmitted["labels"] == {"lane": "p2", "source_type": "standup"}
+
+        hold = (
+            await session.execute(
+                select(ProposalHold).where(ProposalHold.id == uuid.UUID(initial["proposal_id"]))
+            )
+        ).scalar_one()
+        assert hold.labels == {"lane": "p2", "source_type": "standup"}
+
+    async def test_dedup_resubmission_without_labels_clears_labels(
+        self, session: AsyncSession
+    ) -> None:
+        initial = await _submit(
+            session,
+            action=_action(target_id="TECH-DEDUP-NOLABELS"),
+            labels={"lane": "p1"},
+        )
+        assert initial["labels"] == {"lane": "p1"}
+
+        # Resubmit without labels clears labels
+        resubmitted = await _submit(
+            session,
+            action=_action(target_id="TECH-DEDUP-NOLABELS"),
+            labels=None,
+        )
+        assert resubmitted["proposal_id"] == initial["proposal_id"]
+        assert "labels" not in resubmitted
+
+        hold = (
+            await session.execute(
+                select(ProposalHold).where(ProposalHold.id == uuid.UUID(initial["proposal_id"]))
+            )
+        ).scalar_one()
+        assert hold.labels is None
+
+    async def test_dedup_resubmission_with_empty_labels_clears_labels(
+        self, session: AsyncSession
+    ) -> None:
+        initial = await _submit(
+            session,
+            action=_action(target_id="TECH-DEDUP-EMPTYLABELS"),
+            labels={"lane": "p1"},
+        )
+        assert initial["labels"] == {"lane": "p1"}
+
+        resubmitted = await _submit(
+            session,
+            action=_action(target_id="TECH-DEDUP-EMPTYLABELS"),
+            labels={},
+        )
+        assert resubmitted["proposal_id"] == initial["proposal_id"]
+        assert "labels" not in resubmitted
+
+        hold = (
+            await session.execute(
+                select(ProposalHold).where(ProposalHold.id == uuid.UUID(initial["proposal_id"]))
+            )
+        ).scalar_one()
+        assert hold.labels is None
+
+    async def test_resubmission_changing_only_labels_trips_cas_snapshot(
+        self, session: AsyncSession, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Regression test for the snapshot trap: a concurrent resubmission that
+        changes ONLY labels must trip the CAS in _claim_proposal_hold_for_applying,
+        so an in-flight verdict is abandoned rather than misapplied.
+        """
+        target_id = "TECH-CAS-LABELS"
+
+        class _MutatingLabelsJudge(FakeProposalJudge):
+            def __init__(self, other_session: AsyncSession) -> None:
+                super().__init__(
+                    judge_result=ProposalVerdict(approved=True, decision_note="auto-approved")
+                )
+                self._other_session = other_session
+
+            async def judge(self, ctx: Any) -> ProposalVerdict:
+                self.judge_calls.append(ctx)
+                async with self._other_session() as other:
+                    # Superseding resubmission with ONLY labels changed
+                    await _submit(
+                        other,
+                        action=_action(target_id=target_id),
+                        labels={"lane": "superseding_lane"},
+                        judge=FakeProposalJudge(),
+                    )
+                return self.judge_result
+
+        judge = _MutatingLabelsJudge(session_factory)
+        result = await _submit(
+            session,
+            action=_action(target_id=target_id),
+            labels={"lane": "initial_lane"},
+            judge=judge,
+        )
+
+        # The in-flight approval verdict was abandoned because the snapshot changed
+        assert judge.apply_calls == []
+        assert result["status"] == "pending"
+        assert result["labels"] == {"lane": "superseding_lane"}
+
+    def test_bot_facing_redaction_preserves_labels_without_leaks(self) -> None:
+        hold = ProposalHold(
+            id=uuid.uuid4(),
+            kind="linear_progress_update",
+            proposed_by_bot_id="bot-1",
+            owner_sub="owner-sub@example.com",
+            action=_action(),
+            rationale="rationale",
+            confidence="high",
+            importance="high",
+            impact="high",
+            priority="high",
+            status="rejected",
+            decision_source="human",
+            decided_by_actor_id="human-reviewer@example.com",
+            decided_at=datetime.now(UTC),
+            decision_note="rejected note",
+            target_fingerprint="fingerprint",
+            labels={"lane": "p1", "source_type": "sweep"},
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+        redacted = service._bot_facing_proposal_dict(hold)
+        # Human decider Okta sub is redacted
+        assert "decided_by_actor_id" not in redacted
+        assert redacted["decision_source"] == "human"
+        # Labels are preserved intact
+        assert redacted["labels"] == {"lane": "p1", "source_type": "sweep"}

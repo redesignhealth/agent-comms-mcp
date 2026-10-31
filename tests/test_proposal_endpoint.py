@@ -669,6 +669,61 @@ class TestSubmitProposal:
         )
         assert resp.status_code == 403
 
+    async def test_submit_with_labels_persists_and_echoes(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        labels = {"lane": "p1", "source_type": "sweep", "evidence_type": "open_pr"}
+        body = {**_PROPOSAL_BODY, "labels": labels}
+        resp = await http_client.post(
+            "/proposals", json=body, headers={"Authorization": "Bearer bot-token"}
+        )
+        assert resp.status_code == 200
+        res_json = resp.json()
+        assert res_json["labels"] == labels
+
+    async def test_submit_without_labels_omits_labels(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        resp = await http_client.post(
+            "/proposals", json=_PROPOSAL_BODY, headers={"Authorization": "Bearer bot-token"}
+        )
+        assert resp.status_code == 200
+        res_json = resp.json()
+        assert "labels" not in res_json
+
+    async def test_submit_with_invalid_labels_returns_422(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        # Unknown key
+        body = {**_PROPOSAL_BODY, "labels": {"lane": "p1", "extra": "foo"}}
+        resp = await http_client.post(
+            "/proposals", json=body, headers={"Authorization": "Bearer bot-token"}
+        )
+        assert resp.status_code == 422
+        assert resp.json()["error"] == "invalid_request"
+        assert "unknown label key" in resp.json()["detail"]
+
+        # Bad charset
+        body = {**_PROPOSAL_BODY, "labels": {"lane": "UPPER"}}
+        resp = await http_client.post(
+            "/proposals", json=body, headers={"Authorization": "Bearer bot-token"}
+        )
+        assert resp.status_code == 422
+        assert resp.json()["error"] == "invalid_request"
+        assert "label value for 'lane' is invalid" in resp.json()["detail"]
+
     async def test_priority_in_body_is_ignored(
         self,
         client: tuple[httpx.AsyncClient, _FakeAuthProvider],

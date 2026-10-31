@@ -253,22 +253,26 @@ async def _submit(
     owner_sub: str = "owner-a@example.com",
     action: dict[str, Any] | None = None,
     target_fingerprint: str = "deadbeef",
+    labels: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     token = _token(bot_sub, owner_sub=owner_sub)
+    args: dict[str, Any] = {
+        "kind": "linear_progress_update",
+        "action": action if action is not None else _action(),
+        "rationale": "because reasons",
+        "confidence": "medium",
+        "importance": "medium",
+        "impact": "medium",
+        "target_fingerprint": target_fingerprint,
+    }
+    if labels is not None:
+        args["labels"] = labels
     result: dict[str, Any] = await _call(
         main,
         test_session_factory,
         token,
         "proposals_submit",
-        {
-            "kind": "linear_progress_update",
-            "action": action if action is not None else _action(),
-            "rationale": "because reasons",
-            "confidence": "medium",
-            "importance": "medium",
-            "impact": "medium",
-            "target_fingerprint": target_fingerprint,
-        },
+        args,
     )
     return result
 
@@ -1603,3 +1607,137 @@ class TestSubmitInvalidAction:
         assert len(holds) == 1
         assert str(holds[0].id) == proposal_id
         assert holds[0].rationale == "original rationale"
+
+
+class TestProposalToolsLabels:
+    """TECH-8080 PR9: proposals_* tools labels support."""
+
+    async def test_submit_and_get_with_labels_round_trip(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        labels = {"lane": "p1", "source_type": "sweep", "evidence_type": "merged_pr"}
+        submitted = await _submit(
+            main,
+            test_session_factory,
+            bot_sub="bot-labels-tool",
+            action=_action(target_id="TOOL-LBL-1"),
+            labels=labels,
+        )
+        assert submitted["labels"] == labels
+
+        token = _token("bot-labels-tool")
+        fetched = await _call(
+            main,
+            test_session_factory,
+            token,
+            "proposals_get",
+            {"proposal_id": submitted["proposal_id"]},
+        )
+        assert fetched["labels"] == labels
+
+    async def test_submit_without_labels_omits_labels(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        submitted = await _submit(
+            main,
+            test_session_factory,
+            bot_sub="bot-labels-tool",
+            action=_action(target_id="TOOL-LBL-2"),
+            labels=None,
+        )
+        assert "labels" not in submitted
+
+        token = _token("bot-labels-tool")
+        fetched = await _call(
+            main,
+            test_session_factory,
+            token,
+            "proposals_get",
+            {"proposal_id": submitted["proposal_id"]},
+        )
+        assert "labels" not in fetched
+
+    async def test_submit_invalid_labels_raises_tool_error(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        token = _token("bot-labels-tool")
+        # Unknown key
+        with pytest.raises(ToolError, match="invalid_request: unknown label key: 'bad'"):
+            await _call(
+                main,
+                test_session_factory,
+                token,
+                "proposals_submit",
+                {
+                    "kind": "linear_progress_update",
+                    "action": _action(target_id="TOOL-ERR-1"),
+                    "rationale": "r",
+                    "confidence": "low",
+                    "importance": "low",
+                    "impact": "low",
+                    "labels": {"lane": "p1", "bad": "key"},
+                },
+            )
+
+        # Bad charset
+        with pytest.raises(ToolError, match="invalid_request: label value for 'lane' is invalid"):
+            await _call(
+                main,
+                test_session_factory,
+                token,
+                "proposals_submit",
+                {
+                    "kind": "linear_progress_update",
+                    "action": _action(target_id="TOOL-ERR-2"),
+                    "rationale": "r",
+                    "confidence": "low",
+                    "importance": "low",
+                    "impact": "low",
+                    "labels": {"lane": "UPPER"},
+                },
+            )
+
+    async def test_list_pending_and_history_echo_labels(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        token = _token("bot-list-labels")
+        h1 = await _submit(
+            main,
+            test_session_factory,
+            bot_sub="bot-list-labels",
+            action=_action(target_id="LIST-LBL-1"),
+            labels={"lane": "p1"},
+        )
+        h2 = await _submit(
+            main,
+            test_session_factory,
+            bot_sub="bot-list-labels",
+            action=_action(target_id="LIST-LBL-2"),
+            labels=None,
+        )
+
+        pending = await _call(main, test_session_factory, token, "proposals_list_pending", {})
+        by_id = {p["proposal_id"]: p for p in pending["proposals"]}
+        assert by_id[h1["proposal_id"]]["labels"] == {"lane": "p1"}
+        assert "labels" not in by_id[h2["proposal_id"]]
+
+        # Withdraw both
+        await _call(
+            main,
+            test_session_factory,
+            token,
+            "proposals_withdraw",
+            {"proposal_id": h1["proposal_id"]},
+        )
+        await _call(
+            main,
+            test_session_factory,
+            token,
+            "proposals_withdraw",
+            {"proposal_id": h2["proposal_id"]},
+        )
+
+        history = await _call(main, test_session_factory, token, "proposals_list_history", {})
+        hist_by_id = {p["proposal_id"]: p for p in history["proposals"]}
+        assert hist_by_id[h1["proposal_id"]]["labels"] == {"lane": "p1"}
+        assert "labels" not in hist_by_id[h2["proposal_id"]]
