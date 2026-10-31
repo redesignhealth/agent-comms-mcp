@@ -1946,8 +1946,13 @@ bot self-approving its own proposal structurally impossible here too.
 
 Status transitions from `"pending"`: `"rejected"` (requires a non-empty
 `decision_note` unless a `decision_reason_code` other than `'other'` is
-supplied, 400/`ValueError` otherwise, never touches the target
-system), or on `"approve"` the shared helper re-fetches the current target
+supplied; never touches the target system). The optional `decision_reason_code`
+is accepted and persisted on `"approve"` as well. Validation failures return 400:
+`"invalid_decision_reason_code"` for unknown codes, `"decision_note_required"`
+when reject note/code rules are violated, or `"invalid_request"` if
+`ProposalDecisionValidationError` is raised by the service layer; any other
+`ValueError` from the service/plugin layer propagates as a logged 500
+(`"internal_error"`). On `"approve"`, the shared helper re-fetches the current target
 state via `judge.fingerprint()`, compares it to `hold.target_fingerprint`,
 and either marks the hold `"stale"` or calls `judge.apply()`. What
 `apply()` actually does -- which mutation, against which system -- is
