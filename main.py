@@ -75,6 +75,10 @@ configure_logging()
 
 logger = logging.getLogger(__name__)
 
+# Log configured per-bot proposal rate limit overrides once at startup, after
+# logging is configured (TECH-8080).
+service.log_proposal_rate_limit_overrides()
+
 
 # Uniform denial messages — identical across denial categories so the scope
 # registry cannot be enumerated by probing denial messages. The missing
