@@ -1817,8 +1817,10 @@ stays human-only and HTTP-only.
     (`extra="forbid"`; `logical_id`/`filename`/`revision_id` at most 256 chars, `sha256` exactly 64, at most
     10 citations of at most 4,096 chars each), which `classify()` enforces before any hold row is inserted.
     The board deliberately does not add a second, board-side cap on those keys.
-  - The ORM query uses `defer(ProposalHold.action, raiseload=True)` so that `ProposalHold.action` is never
-    unintentionally lazy-loaded into memory during listing.
+  - The listing query selects an explicit column tuple (rather than ORM entities) and row-tuple serialization,
+    projecting `projected_action` without ever selecting the unprojected `action` column. This completely bypasses
+    ORM identity-map caching, eliminates in-memory staleness across long-lived sessions, and guarantees `action`
+    is never loaded into memory during listing.
   - *Retrieval of full actions*: Callers receiving an elided proposal in a listing can fetch the complete,
     unelided action via the existing sender-scoped single-proposal lookup routes: `GET /proposals/{id}`
     (REST) or the `proposals_get` MCP tool; both use the bot proposal scope and return only that
