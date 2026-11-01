@@ -19,7 +19,7 @@ Covers:
   - Arcana rows <= 16384 bytes and non-Arcana rows remain byte-identical and unelided
   - Correct UTF-8 byte and character counts at the exact multi-byte threshold
     (é/中/emoji at exactly 16384 UTF-8 bytes vs one character over)
-  - raiseload=True proof: ProposalHold.action is not loaded into Python memory
+  - Column-projection proof: list SQL projects column tuples and never selects ProposalHold.action
   - elision still comes from the SQL projection when the session's ORM identity
     map already holds the fully loaded action (the projected column value is
     what the lists return, never the ORM attribute state)
@@ -715,7 +715,16 @@ async def test_bulk_memory_elision_across_listings(session: AsyncSession) -> Non
 # ======================================================================
 
 
-async def test_raiseload_proof_on_listed_orm_objects(session: AsyncSession) -> None:
+async def test_synthetic_raiseload_query_demonstrates_orm_defer_behavior(
+    session: AsyncSession,
+) -> None:
+    """Synthetic demonstration of defer(ProposalHold.action, raiseload=True) on a raw ORM query.
+
+    NOTE: This is NOT the production list memory guarantee. Production listing queries
+    (list_pending_proposal_holds, list_proposals_for_bot, list_proposal_history_for_owner)
+    select explicit column tuples rather than loading ProposalHold ORM entities into the
+    identity map; see test_production_list_sql_never_selects_the_unprojected_action_column.
+    """
     hold = ProposalHold(
         id=uuid.uuid4(),
         kind="arcana_source_add",
@@ -754,6 +763,11 @@ async def test_raiseload_proof_on_listed_orm_objects(session: AsyncSession) -> N
     with pytest.raises(InvalidRequestError) as exc_info:
         _ = orm_hold.action
     assert "'ProposalHold.action' is not available due to raiseload=True" in str(exc_info.value)
+
+
+test_raiseload_proof_on_listed_orm_objects = (
+    test_synthetic_raiseload_query_demonstrates_orm_defer_behavior
+)
 
 
 # ======================================================================
@@ -2052,8 +2066,9 @@ def _assert_projected_list_sql(sql: str) -> None:
     unprojected full ``action`` column. Structural, not textual: the outer
     SELECT list is parsed into items (see ``_top_level_select_items``), so
     this does not depend on whitespace, column order, or where the bare
-    column would be positioned. The ORM-level raiseload assertions in the
-    caller remain the real guarantee that ``action`` is never loaded."""
+    column would be positioned. The column-tuple projection and no-ORM-load
+    proof in the caller (orm_captured == 0, empty session.identity_map, and
+    negative control) prove that ``action`` is never loaded into memory."""
     norm = " ".join(sql.split())
     # The ID-only keyset subquery joined back to the outer query.
     assert re.search(r"JOIN \( ?SELECT proposal_holds\.id AS id\b", norm)
@@ -2127,6 +2142,7 @@ async def test_production_list_sql_never_selects_the_unprojected_action_column(
             "SELECT proposal_holds.id,",
             "SELECT proposal_holds.action, proposal_holds.id,",
         )
+        assert bad_sql != sql_captured[0], "Failed to construct bad_sql for negative control"
         with pytest.raises(AssertionError):
             _assert_projected_list_sql(bad_sql)
 

@@ -990,7 +990,11 @@ by test). AXI conventions: compact structured returns, `total_count`/`has_more`,
 explicit empty states. `comms_list_conversations` deliberately omits
 `total_count`: it would need a second `SELECT COUNT(*)` replaying the same
 filter predicates, and `has_more`/`next_cursor` are sufficient for its
-scroll-to-load-more use case.
+scroll-to-load-more use case. Proposal listings (`proposals_list_pending`,
+`proposals_list_history`) provide pagination through either default `order="created_at"`
+(returning `has_more` without `next_cursor`) or `order="log"` (incremental feed
+ordered by commit-ordered per-bot `log_seq`, returning an opaque `next_cursor`
+watermark; `since` requires `order="log"`).
 
 | Tool | Scope | Notes |
 |---|---|---|
@@ -1757,8 +1761,26 @@ isn't registered there.
 `service.list_proposals_for_bot` -- since a bot previously had no way to
 list its own proposals at all, only poll one by id. Both are sender-only
 (`WHERE proposed_by_bot_id = requesting_bot_sub`, never another bot's
-rows), ordered oldest-first, and clamp `limit` to [1, 200]. `list_pending`
-filters to `status = 'pending'`; `list_history` filters to
+rows), clamp `limit` to [1, 200], and support two ordering modes:
+- **Default `order="created_at"`**: Ordered oldest-first by `created_at ASC, id ASC`.
+  Returns `proposals` and `has_more`, with NO `next_cursor` field in the response (preserving
+  byte-identical legacy behavior). `since` cannot be used with this mode.
+- **Incremental feed `order="log"`**: Ordered strictly by commit-ordered per-bot `log_seq ASC`.
+  `log_seq` is a per-bot monotonic sequence assigned by database trigger `trg_proposal_holds_log_seq`
+  under a row-level lock on `proposal_bot_log_seq` held to transaction commit
+  (`commit(T1) < lock(T2) < commit(T2)`), guaranteeing allocation order strictly equals
+  commit order per bot.
+  `since` requires `order="log"`. Watermark cursors use a v2 kind-bound format:
+  `{"v": 2, "k": "pending" | "history", "s": int}` encoded in URL-safe base64. Mismatched
+  kinds (e.g. passing a pending cursor to `list_history`) fail closed with `invalid cursor`.
+  `next_cursor` is always a persistable watermark: present on the last page even when
+  `has_more=False`; echoed on empty pages when `since` is supplied; `None` on an empty page
+  without `since`.
+  Delivery contract: at-least-once, never-miss, per-bot monotonic. Every `UPDATE` to a
+  `proposal_holds` row re-assigns `log_seq` and re-delivers the row. Consumers must
+  deduplicate by `proposal_id`.
+
+`list_pending` filters to `status = 'pending'`; `list_history` filters to
 `service.PROPOSAL_TERMINAL_STATUSES` (every status in
 `PROPOSAL_HOLD_STATUSES` except `pending`/`applying`/the never-persisted
 `approved`). Every row goes through the same `_bot_facing_proposal_dict`
@@ -1805,9 +1827,10 @@ stays human-only and HTTP-only.
     (`action - 'content'`), and a top-level `elided_action_fields: {"content": {"utf8_bytes": N, "chars": M}}`
     is attached. All other keys (including `sha256`, `target_id`, `logical_id`, `filename`) are preserved.
   - Rows with content <= 16,384 bytes and all non-Arcana rows remain byte-identical and unelided.
-  - Pages are ordered by `created_at` with `ProposalHold.id` as a same-direction tie-breaker, in both the
-    inner `limit + 1` subquery and the outer query, so rows sharing a timestamp page and report `has_more`
-    deterministically.
+  - By default (`order="created_at"`), pages are ordered by `created_at` with `ProposalHold.id`
+    as a same-direction tie-breaker, in both the inner `limit + 1` subquery and the outer query,
+    so rows sharing a timestamp page and report `has_more` deterministically. In incremental feed
+    mode (`order="log"`), queries are ordered by unique per-bot `log_seq ASC`.
   - Existing non-large holds (including legacy holds at or below 16 KiB) are unchanged. The SQL
     `octet_length` check still makes Postgres detoast the JSON value when needed; this projection
     avoids transferring the large string into Python but is not a zero-cost index or a guaranteed
