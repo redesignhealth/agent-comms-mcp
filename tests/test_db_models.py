@@ -688,6 +688,7 @@ class TestProposalHoldsSchema:
             "applied_at",
             "apply_error",
             "apply_result",
+            "decision_reason_code",
             "created_at",
             "updated_at",
         ):
@@ -890,6 +891,102 @@ class TestProposalHoldsSchema:
                             "'bogus_source', 'test-actor', now(), 'deadbeef')"
                         )
                     )
+
+    async def test_decision_reason_code_check_constraint(self, engine: AsyncEngine) -> None:
+        async with engine.connect() as conn:
+            constraint_def = (
+                await conn.execute(
+                    text(
+                        "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                        "WHERE conrelid = 'proposal_holds'::regclass "
+                        "AND conname = 'ck_proposal_holds_decision_reason_code'"
+                    )
+                )
+            ).scalar_one_or_none()
+        assert constraint_def is not None
+        for code in (
+            "not_now",
+            "wrong_target",
+            "incorrect_facts",
+            "insufficient_evidence",
+            "duplicate",
+            "policy",
+            "human_will_handle",
+            "other",
+        ):
+            assert code in constraint_def
+
+    async def test_decision_reason_code_check_constraint_rejects_invalid_value(
+        self, engine: AsyncEngine
+    ) -> None:
+        async with engine.connect() as conn:
+            with pytest.raises(IntegrityError, match="ck_proposal_holds_decision_reason_code"):
+                async with conn.begin():
+                    await conn.execute(
+                        text(
+                            "INSERT INTO proposal_holds "
+                            "(kind, proposed_by_bot_id, owner_sub, action, rationale, "
+                            "confidence, importance, impact, priority, status, "
+                            "decision_source, decided_by_actor_id, decided_at, "
+                            "decision_reason_code, target_fingerprint) "
+                            "VALUES ('linear_progress_update', 'test-bot', 'test-owner', "
+                            "'{}'::jsonb, 'rationale', 'low', 'low', 'low', 'low', 'rejected', "
+                            "'human', 'test-actor', now(), 'bogus_code', 'deadbeef')"
+                        )
+                    )
+
+    async def test_decision_reason_code_migration_upgrade_idempotent(
+        self, engine: AsyncEngine, database_url: str
+    ) -> None:
+        """TECH-8080 PR5: second upgrade attempt of 5ef4403d7f33 after constraint
+        exists succeeds."""
+        env = {**os.environ, "DATABASE_URL": database_url.replace("+asyncpg", "")}
+        try:
+            # Explicit downgrade to 5ef4403d7f33's down_revision (a56cb01a3ebf) so later migrations
+            # are cleanly removed rather than leaving orphaned objects during rewind/reapply.
+            res_down = subprocess.run(
+                [sys.executable, "-m", "alembic", "downgrade", "a56cb01a3ebf"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert res_down.returncode == 0, res_down.stderr
+
+            # Upgrade once to 5ef4403d7f33 so column and check constraint exist
+            res_up1 = subprocess.run(
+                [sys.executable, "-m", "alembic", "upgrade", "5ef4403d7f33"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert res_up1.returncode == 0, res_up1.stderr
+
+            # Rewind version pointer to a56cb01a3ebf while retaining 5ef4403d7f33's schema objects
+            # to simulate a failed/retried migration attempt where the constraint already exists
+            async with engine.begin() as conn:
+                await conn.execute(text("UPDATE alembic_version SET version_num = 'a56cb01a3ebf'"))
+
+            # Second upgrade attempt must succeed idempotently (skipping check constraint creation)
+            res_up2 = subprocess.run(
+                [sys.executable, "-m", "alembic", "upgrade", "5ef4403d7f33"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert res_up2.returncode == 0, res_up2.stderr
+        finally:
+            # Clean forward upgrade back to head restores full schema for subsequent tests
+            subprocess.run(
+                [sys.executable, "-m", "alembic", "upgrade", "head"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
 
     async def test_indexes_exist(self, engine: AsyncEngine) -> None:
         indexes = await _indexes(engine, "proposal_holds")
