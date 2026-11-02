@@ -119,6 +119,17 @@ FOR EACH ROW EXECUTE FUNCTION proposal_holds_assign_log_seq();
 """
 
 
+def _has_column(table_name: str, column_name: str) -> bool:
+    """Return True if column_name already exists on table_name in current_schema()."""
+    if context.is_offline_mode():
+        return False
+    bind = op.get_bind()
+    if bind is None:
+        return False
+    insp = sa.inspect(bind)
+    return any(c["name"] == column_name for c in insp.get_columns(table_name))
+
+
 def _index_validity(name: str) -> bool | None:
     """True = valid, False = present but INVALID/not-ready, None = absent."""
     row = (
@@ -176,20 +187,8 @@ def upgrade() -> None:
     op.execute("SET LOCAL lock_timeout = '5s'")
     op.execute("SET LOCAL statement_timeout = '120s'")
 
-    # 1. Nullable column, idempotent via information_schema guard
-    col_exists = False
-    if not context.is_offline_mode():
-        col_exists = bool(
-            op.get_bind()
-            .execute(
-                sa.text(
-                    "SELECT 1 FROM information_schema.columns "
-                    "WHERE table_schema = current_schema() AND table_name = 'proposal_holds' "
-                    "AND column_name = 'log_seq'"
-                )
-            )
-            .scalar()
-        )
+    # 1. Nullable column, idempotent via inspector guard: skip if column already exists
+    col_exists = _has_column("proposal_holds", "log_seq")
     if not col_exists:
         op.add_column("proposal_holds", sa.Column("log_seq", sa.BigInteger(), nullable=True))
 

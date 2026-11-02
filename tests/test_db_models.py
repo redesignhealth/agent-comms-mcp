@@ -1381,6 +1381,83 @@ class TestProposalHoldsSchema:
                 text=True,
             )
 
+    async def test_tech_8080_migration_column_already_exists_rerun_is_idempotent(
+        self, engine: AsyncEngine, database_url: str
+    ) -> None:
+        """Argus round 6: verify upgrade succeeds and no-ops column addition if log_seq
+        was already added manually by an operator per the runbook."""
+        env = {**os.environ, "DATABASE_URL": database_url.replace("+asyncpg", "")}
+        try:
+            # Downgrade to parent
+            subprocess.run(
+                [sys.executable, "-m", "alembic", "downgrade", "fd6d97e05ca5"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            # Pre-add the column manually as described in the runbook
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("TRUNCATE TABLE proposal_holds, audit_log RESTART IDENTITY CASCADE")
+                )
+                await conn.execute(
+                    text("ALTER TABLE proposal_holds ADD COLUMN IF NOT EXISTS log_seq BIGINT")
+                )
+                insert_sql = (
+                    "INSERT INTO proposal_holds (kind, proposed_by_bot_id, owner_sub, action, "
+                    "rationale, confidence, importance, impact, priority, status, "
+                    "target_fingerprint) "
+                    "VALUES ('linear_progress_update', 'bot-preadd', 'owner-p', '{}'::jsonb, "
+                    "'r', 'low', 'low', 'low', 'low', 'pending', 'fprint')"
+                )
+                await conn.execute(text(insert_sql))
+
+            # Upgrade to head: must NOT fail with "column log_seq already exists"
+            res = subprocess.run(
+                [sys.executable, "-m", "alembic", "upgrade", "head"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert res.returncode == 0, res.stderr
+
+            async with engine.connect() as conn:
+                cols = await _columns(engine, "proposal_holds")
+                assert "log_seq" in cols
+                assert cols["log_seq"] == "bigint"
+
+                # Verify backfill ran and assigned log_seq
+                seq = (
+                    await conn.execute(
+                        text(
+                            "SELECT log_seq FROM proposal_holds "
+                            "WHERE proposed_by_bot_id = 'bot-preadd'"
+                        )
+                    )
+                ).scalar_one()
+                assert seq == 1
+
+                indexes = await _indexes(engine, "proposal_holds")
+                assert "uq_proposal_holds_bot_id_log_seq" in indexes
+                assert "idx_proposal_holds_bot_id_status_log_seq" in indexes
+        finally:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("TRUNCATE TABLE proposal_holds, audit_log RESTART IDENTITY CASCADE")
+                )
+            subprocess.run(
+                [sys.executable, "-m", "alembic", "upgrade", "head"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
     def test_proposal_holds_pending_dedup_index_matches_migration(self) -> None:
         from migrations.versions.a56cb01a3ebf_proposal_dedup_field import _NEW_COLUMNS, _WHERE
 
