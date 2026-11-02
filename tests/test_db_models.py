@@ -1458,6 +1458,60 @@ class TestProposalHoldsSchema:
                 text=True,
             )
 
+    async def test_tech_8080_migration_column_type_mismatch_raises(
+        self, engine: AsyncEngine, database_url: str
+    ) -> None:
+        """Argus round 8: verify upgrade aborts if log_seq was pre-created
+        with wrong type (e.g. INTEGER)."""
+        env = {**os.environ, "DATABASE_URL": database_url.replace("+asyncpg", "")}
+        try:
+            # Downgrade to parent
+            subprocess.run(
+                [sys.executable, "-m", "alembic", "downgrade", "fd6d97e05ca5"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            # Pre-add the column as INTEGER (wrong type)
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("TRUNCATE TABLE proposal_holds, audit_log RESTART IDENTITY CASCADE")
+                )
+                await conn.execute(
+                    text("ALTER TABLE proposal_holds ADD COLUMN IF NOT EXISTS log_seq INTEGER")
+                )
+
+            # Upgrade to head: must fail with type mismatch error naming table,
+            # column, and expected vs actual
+            res = subprocess.run(
+                [sys.executable, "-m", "alembic", "upgrade", "head"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert res.returncode != 0
+            err_msg = "proposal_holds.log_seq has unexpected data type 'integer'; expected 'bigint'"
+            assert err_msg in res.stderr
+        finally:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("TRUNCATE TABLE proposal_holds, audit_log RESTART IDENTITY CASCADE")
+                )
+                # Drop wrong-type column so upgrade head succeeds cleanly
+                await conn.execute(text("ALTER TABLE proposal_holds DROP COLUMN IF EXISTS log_seq"))
+            subprocess.run(
+                [sys.executable, "-m", "alembic", "upgrade", "head"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
     def test_proposal_holds_pending_dedup_index_matches_migration(self) -> None:
         from migrations.versions.a56cb01a3ebf_proposal_dedup_field import _NEW_COLUMNS, _WHERE
 

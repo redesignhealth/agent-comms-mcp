@@ -22,6 +22,10 @@ The database trigger ensures:
 LOCKING & DEPLOYMENT:
 - Migration acquires ACCESS EXCLUSIVE on proposal_holds for the column addition, backfill,
   and trigger installation under a single bounded transaction with lock_timeout = 5s (SET LOCAL).
+- Column type verification: In online mode, the migration asserts proposal_holds.log_seq has
+  data_type = 'bigint' immediately after ADD COLUMN IF NOT EXISTS to prevent silent type
+  mismatch if pre-created manually with wrong type (e.g. INTEGER); in offline mode
+  (alembic upgrade --sql), this live catalog assertion cannot run and is skipped.
 - Mid-migration autocommit_block() exits the transaction to run concurrent index builds,
   temporarily releasing env.py's pg_advisory_xact_lock(0x5245434C). To maintain cross-process
   migration serialization during this window, pg_advisory_lock(0x5245434C) is explicitly acquired
@@ -44,7 +48,8 @@ Mitigation: bulk operations should either:
 BATCHED BACKFILL RUNBOOK (if table exceeds 100,000 rows):
 If proposal_holds has > 100,000 un-backfilled rows, the single-statement UPDATE is aborted
 to avoid holding ACCESS EXCLUSIVE for too long. To backfill manually prior to re-running:
-1. Add the nullable column and create the counter table explicitly if missing:
+1. Add the nullable column (BIGINT required; online migration asserts type is bigint,
+   though offline SQL generation cannot inspect live catalog type) and create the counter table:
    ALTER TABLE proposal_holds ADD COLUMN IF NOT EXISTS log_seq BIGINT;
    CREATE TABLE IF NOT EXISTS proposal_bot_log_seq (
        bot_id TEXT PRIMARY KEY,
@@ -178,6 +183,25 @@ def upgrade() -> None:
 
     # 1. Nullable column, idempotent via raw SQL ADD COLUMN IF NOT EXISTS
     op.execute(sa.text("ALTER TABLE proposal_holds ADD COLUMN IF NOT EXISTS log_seq BIGINT"))
+
+    # Assert column type is bigint in online mode (protect against manual pre-creation with wrong type)
+    if not context.is_offline_mode():
+        col_type = (
+            op.get_bind()
+            .execute(
+                sa.text(
+                    "SELECT data_type FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() AND table_name = 'proposal_holds' "
+                    "AND column_name = 'log_seq'"
+                )
+            )
+            .scalar()
+        )
+        if col_type is None or col_type.lower() != "bigint":
+            raise RuntimeError(
+                f"proposal_holds.log_seq has unexpected data type {col_type!r}; expected 'bigint'. "
+                "If manually pre-creating the column, ensure type is BIGINT."
+            )
 
     # 2. Counter table with idempotent IF NOT EXISTS
     op.create_table(
