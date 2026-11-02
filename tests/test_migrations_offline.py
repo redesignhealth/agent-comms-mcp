@@ -16,6 +16,7 @@ returns `None` in offline mode, crashing with an `AttributeError` on
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -597,4 +598,6 @@ def test_alembic_single_head() -> None:
     assert result.returncode == 0, result.stderr
     heads = [line.strip() for line in result.stdout.strip().splitlines() if line.strip()]
     assert len(heads) == 1, f"Expected single head, got: {heads}"
-    assert heads[0]
+    head_rev = heads[0].split()[0]
+    assert re.fullmatch(r"[0-9a-f]{12}", head_rev), f"Malformed revision id: {heads[0]!r}"
+    assert "(head)" in heads[0]

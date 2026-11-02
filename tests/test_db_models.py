@@ -941,18 +941,18 @@ class TestProposalHoldsSchema:
         """TECH-8080 PR5: second upgrade attempt of 5ef4403d7f33 after constraint
         exists succeeds."""
         env = {**os.environ, "DATABASE_URL": database_url.replace("+asyncpg", "")}
-        # Explicit downgrade to 5ef4403d7f33's down_revision (a56cb01a3ebf) so later migrations
-        # are cleanly removed rather than leaving orphaned objects during rewind/reapply.
-        res_down = subprocess.run(
-            [sys.executable, "-m", "alembic", "downgrade", "a56cb01a3ebf"],
-            cwd=SERVICE_ROOT,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
-        assert res_down.returncode == 0, res_down.stderr
-
         try:
+            # Explicit downgrade to 5ef4403d7f33's down_revision (a56cb01a3ebf) so later migrations
+            # are cleanly removed rather than leaving orphaned objects during rewind/reapply.
+            res_down = subprocess.run(
+                [sys.executable, "-m", "alembic", "downgrade", "a56cb01a3ebf"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert res_down.returncode == 0, res_down.stderr
+
             # Upgrade once to 5ef4403d7f33 so column and check constraint exist
             res_up1 = subprocess.run(
                 [sys.executable, "-m", "alembic", "upgrade", "5ef4403d7f33"],
