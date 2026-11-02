@@ -456,6 +456,339 @@ class TestDedup:
         rows = (await session.execute(select(ProposalHold))).scalars().all()
         assert len(rows) == 1
 
+    async def test_integrity_error_race_falls_back_to_select_and_update_with_dedup_field(
+        self,
+        session: AsyncSession,
+        session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """B2's race-recovery path with a non-empty dedup_field: a concurrent bot
+        wins the INSERT for the same (dedup_field-aware) key between this session's
+        initial SELECT (miss) and its own INSERT attempt, so session.flush() raises
+        IntegrityError on idx_proposal_holds_pending_dedup. Confirms the fallback
+        re-queries with dedup_field included and performs the in-place UPDATE."""
+        winning_row_id: dict[str, Any] = {}
+
+        async def _insert_via_second_session() -> ProposalHold:
+            async with session_factory() as other:
+                winner = await create_proposal(
+                    other,
+                    kind="linear_progress_update",
+                    proposed_by_bot_id="bot-1",
+                    owner_sub="owner-a@example.com",
+                    action=_action(
+                        action_type="set_dates",
+                        target_id="proj-race",
+                        dedup_field="project:targetDate",
+                    ),
+                    rationale="winning rationale",
+                    confidence="medium",
+                    importance="medium",
+                    impact="medium",
+                    judge=_default_judge(),
+                    target_fingerprint="fp-winner",
+                )
+                return winner
+
+        real_flush = session.flush
+        call_count = {"n": 0}
+
+        async def _flush_raising_once() -> None:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                winner = await _insert_via_second_session()
+                winning_row_id["id"] = winner["proposal_id"]
+                cause = Exception()
+                cause.constraint_name = "idx_proposal_holds_pending_dedup"  # type: ignore[attr-defined]
+                orig = Exception()
+                orig.__cause__ = cause
+                raise IntegrityError("duplicate key", params=None, orig=orig)
+            await real_flush()
+
+        monkeypatch.setattr(session, "flush", AsyncMock(side_effect=_flush_raising_once))
+
+        result = await _submit(
+            session,
+            action=_action(
+                action_type="set_dates",
+                target_id="proj-race",
+                dedup_field="project:targetDate",
+            ),
+            rationale="loser rationale",
+            target_fingerprint="fp-loser",
+        )
+
+        assert result["proposal_id"] == winning_row_id["id"]
+        assert result["rationale"] == "loser rationale"
+        assert result["action"]["dedup_field"] == "project:targetDate"
+        rows = (await session.execute(select(ProposalHold))).scalars().all()
+        assert len(rows) == 1
+
+    async def test_different_dedup_field_on_same_target_does_not_dedup(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-8080 PR3: two set_dates proposals on the same project (target_id)
+        with different dedup_field (e.g. 'project:startDate' and 'project:targetDate')
+        must produce two distinct pending rows rather than overwriting in place."""
+        first = await _submit(
+            session,
+            action=_action(
+                action_type="set_dates",
+                target_id="proj-123",
+                dedup_field="project:startDate",
+            ),
+            rationale="set start date",
+        )
+        second = await _submit(
+            session,
+            action=_action(
+                action_type="set_dates",
+                target_id="proj-123",
+                dedup_field="project:targetDate",
+            ),
+            rationale="set target date",
+        )
+
+        assert first["proposal_id"] != second["proposal_id"]
+        rows = (await session.execute(select(ProposalHold))).scalars().all()
+        assert len(rows) == 2
+        assert {row.action["dedup_field"] for row in rows} == {
+            "project:startDate",
+            "project:targetDate",
+        }
+        assert all(row.status == "pending" for row in rows)
+
+    async def test_same_dedup_field_updates_in_place(self, session: AsyncSession) -> None:
+        """A resubmission with the same dedup_field updates the existing pending row."""
+        first = await _submit(
+            session,
+            action=_action(
+                action_type="set_dates",
+                target_id="proj-123",
+                dedup_field="project:targetDate",
+            ),
+            rationale="initial target date",
+        )
+        second = await _submit(
+            session,
+            action=_action(
+                action_type="set_dates",
+                target_id="proj-123",
+                dedup_field="project:targetDate",
+            ),
+            rationale="updated target date",
+        )
+
+        assert first["proposal_id"] == second["proposal_id"]
+        rows = (await session.execute(select(ProposalHold))).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].rationale == "updated target date"
+        assert rows[0].action["dedup_field"] == "project:targetDate"
+
+    async def test_absent_dedup_field_does_not_dedup_against_present_dedup_field(
+        self, session: AsyncSession
+    ) -> None:
+        """A proposal with no dedup_field and one with a dedup_field on the same target
+        are distinct rows."""
+        first = await _submit(
+            session,
+            action=_action(target_id="proj-123"),
+            rationale="no dedup_field",
+        )
+        second = await _submit(
+            session,
+            action=_action(target_id="proj-123", dedup_field="project:targetDate"),
+            rationale="with dedup_field",
+        )
+
+        assert first["proposal_id"] != second["proposal_id"]
+        rows = (await session.execute(select(ProposalHold))).scalars().all()
+        assert len(rows) == 2
+
+    async def test_applying_row_with_different_dedup_field_does_not_block_insert(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-8080 PR3 §3.4: a proposal with dedup_field=A in 'applying' status
+        does not block a new submission with dedup_field=B on the same target."""
+        applying_hold = ProposalHold(
+            kind="linear_progress_update",
+            proposed_by_bot_id="bot-1",
+            owner_sub="owner-a@example.com",
+            action=_action(
+                action_type="set_dates",
+                target_id="proj-123",
+                dedup_field="project:startDate",
+            ),
+            rationale="applying start date",
+            confidence="medium",
+            importance="medium",
+            impact="medium",
+            priority="medium",
+            target_fingerprint="deadbeef",
+            status="applying",
+            decision_source="human",
+            decided_by_actor_id="owner-a@example.com",
+            decided_at=datetime.now(UTC),
+        )
+        session.add(applying_hold)
+        await session.commit()
+
+        result = await _submit(
+            session,
+            action=_action(
+                action_type="set_dates",
+                target_id="proj-123",
+                dedup_field="project:targetDate",
+            ),
+            rationale="pending target date",
+        )
+
+        assert result["status"] == "pending"
+        assert result["proposal_id"] != str(applying_hold.id)
+        rows = (await session.execute(select(ProposalHold))).scalars().all()
+        assert len(rows) == 2
+
+    async def test_applying_row_with_same_dedup_field_returns_as_is(
+        self, session: AsyncSession
+    ) -> None:
+        """A resubmission against an 'applying' row with the SAME dedup_field
+        is dedup-blocked, returning the applying row unmodified."""
+        action = _action(
+            action_type="set_dates",
+            target_id="proj-123",
+            dedup_field="project:targetDate",
+        )
+        applying_hold = ProposalHold(
+            kind="linear_progress_update",
+            proposed_by_bot_id="bot-1",
+            owner_sub="owner-a@example.com",
+            action=action,
+            rationale="applying target date",
+            confidence="medium",
+            importance="medium",
+            impact="medium",
+            priority="medium",
+            target_fingerprint="deadbeef",
+            status="applying",
+            decision_source="human",
+            decided_by_actor_id="owner-a@example.com",
+            decided_at=datetime.now(UTC),
+        )
+        session.add(applying_hold)
+        await session.commit()
+
+        result = await _submit(
+            session,
+            action=action,
+            rationale="resubmitted target date",
+        )
+
+        assert result["status"] == "applying"
+        assert result["proposal_id"] == str(applying_hold.id)
+        # Did not mutate
+        await session.refresh(applying_hold)
+        assert applying_hold.rationale == "applying target date"
+
+    @pytest.mark.parametrize(
+        "bad_dedup_field",
+        [
+            "",
+            123,
+            None,
+            "a" * 100,
+            "a b",
+            "1abc",
+            "a@b",
+        ],
+    )
+    async def test_malformed_dedup_field_raises_value_error(
+        self, session: AsyncSession, bad_dedup_field: Any
+    ) -> None:
+        with pytest.raises(ValueError, match=r"action\.dedup_field"):
+            await _submit(
+                session,
+                action=_action(dedup_field=bad_dedup_field),
+            )
+
+    async def test_six_key_resubmission_never_matches_different_dedup_field_and_legacy_matches_own(
+        self, session: AsyncSession
+    ) -> None:
+        """Regression test for Argus round 2 on TECH-8080 PR3:
+        1. A six-key submission with dedup_field='project:startDate' never matches a legacy
+           pending row without dedup_field.
+        2. A legacy five-key submission (dedup_field='') matches only its own pending row,
+           never any row that has an explicit dedup_field.
+        3. A submission with a different dedup_field ('project:targetDate') creates a new row
+           instead of matching either existing row.
+        """
+        # 1. Seed a legacy proposal (no dedup_field)
+        legacy = await _submit(
+            session,
+            action=_action(action_type="set_dates", target_id="proj-123"),
+            rationale="legacy proposal",
+        )
+        # 2. Seed a six-key proposal on the same target with dedup_field='project:startDate'
+        start_date = await _submit(
+            session,
+            action=_action(
+                action_type="set_dates",
+                target_id="proj-123",
+                dedup_field="project:startDate",
+            ),
+            rationale="start date proposal",
+        )
+        assert legacy["proposal_id"] != start_date["proposal_id"]
+
+        # 3. Resubmit legacy -> updates only the legacy row in place
+        resub_legacy = await _submit(
+            session,
+            action=_action(action_type="set_dates", target_id="proj-123"),
+            rationale="legacy updated",
+        )
+        assert resub_legacy["proposal_id"] == legacy["proposal_id"]
+
+        # 4. Resubmit six-key (startDate) -> updates only the startDate row in place
+        resub_start = await _submit(
+            session,
+            action=_action(
+                action_type="set_dates",
+                target_id="proj-123",
+                dedup_field="project:startDate",
+            ),
+            rationale="start date updated",
+        )
+        assert resub_start["proposal_id"] == start_date["proposal_id"]
+
+        # 5. Submit with different dedup_field ('project:targetDate') -> creates a distinct 3rd row
+        target_date = await _submit(
+            session,
+            action=_action(
+                action_type="set_dates",
+                target_id="proj-123",
+                dedup_field="project:targetDate",
+            ),
+            rationale="target date proposal",
+        )
+        assert target_date["proposal_id"] not in (legacy["proposal_id"], start_date["proposal_id"])
+
+        # Verify all 3 rows exist and their rationales/fields are untouched by cross-resubmission
+        rows = (
+            (
+                await session.execute(
+                    select(ProposalHold).order_by(
+                        ProposalHold.created_at.asc(), ProposalHold.id.asc()
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 3
+        row_map = {row.action.get("dedup_field", ""): row for row in rows}
+        assert row_map[""].rationale == "legacy updated"
+        assert row_map["project:startDate"].rationale == "start date updated"
+        assert row_map["project:targetDate"].rationale == "target date proposal"
+
 
 class TestClassifyDispatch:
     """Board-side coverage of the ``judge.classify()`` call site in

@@ -23,10 +23,11 @@ import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import text
+from sqlalchemy import Index, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -894,6 +895,26 @@ class TestProposalHoldsSchema:
         indexes = await _indexes(engine, "proposal_holds")
         assert "idx_proposal_holds_status_created_at" in indexes
         assert "idx_proposal_holds_owner_sub_status_created_at" in indexes
+        assert "idx_proposal_holds_pending_dedup" in indexes
+
+    def test_proposal_holds_pending_dedup_index_matches_migration(self) -> None:
+        from migrations.versions.a56cb01a3ebf_proposal_dedup_field import _NEW_COLUMNS, _WHERE
+
+        dedup_indexes = [
+            elem
+            for elem in ProposalHold.__table_args__
+            if isinstance(elem, Index) and elem.name == "idx_proposal_holds_pending_dedup"
+        ]
+        assert len(dedup_indexes) == 1
+        idx = dedup_indexes[0]
+        assert idx.unique is True
+        model_where = idx.dialect_options["postgresql"]["where"]
+        assert str(model_where) == str(_WHERE)
+        model_exprs = [
+            expr.name if hasattr(expr, "name") else str(expr) for expr in idx.expressions
+        ]
+        migration_exprs = [str(expr) for expr in _NEW_COLUMNS]
+        assert model_exprs == migration_exprs
 
     async def test_sender_agent_id_fk(self, engine: AsyncEngine) -> None:
         async with engine.connect() as conn:
@@ -974,6 +995,300 @@ class TestProposalHoldsSchema:
             assert res_up.returncode == 0, res_up.stderr
         cols_after_up = await _columns(engine, "proposal_holds")
         assert "sender_agent_id" in cols_after_up
+
+    async def test_tech_8080_downgrade_collision_raises(
+        self, engine: AsyncEngine, database_url: str
+    ) -> None:
+        """TECH-8080 PR3: downgrade must detect collisions on the narrow key among
+        active pending/applying proposals, raise RuntimeError, and NOT delete any rows."""
+        env = {**os.environ, "DATABASE_URL": database_url.replace("+asyncpg", "")}
+        subprocess.run(
+            [sys.executable, "-m", "alembic", "upgrade", "head"],
+            cwd=SERVICE_ROOT,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        row1_id = uuid.uuid4()
+        row2_id = uuid.uuid4()
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO proposal_holds "
+                    "(id, kind, proposed_by_bot_id, owner_sub, action, rationale, "
+                    "confidence, importance, impact, priority, status, target_fingerprint) "
+                    "VALUES "
+                    "(:id1, 'linear_progress_update', 'bot-collision', 'owner-a', "
+                    '\'{"target_id": "proj-col", "action_type": "set_dates", '
+                    '"dedup_field": "project:startDate"}\'::jsonb, '
+                    "'rat1', 'medium', 'medium', 'medium', 'medium', 'pending', 'fp1'), "
+                    "(:id2, 'linear_progress_update', 'bot-collision', 'owner-a', "
+                    '\'{"target_id": "proj-col", "action_type": "set_dates", '
+                    '"dedup_field": "project:targetDate"}\'::jsonb, '
+                    "'rat2', 'medium', 'medium', 'medium', 'medium', 'pending', 'fp2')"
+                ),
+                {"id1": row1_id, "id2": row2_id},
+            )
+
+        try:
+            res = subprocess.run(
+                [sys.executable, "-m", "alembic", "downgrade", "c7665a1b2d3e"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert res.returncode != 0, "Expected downgrade to fail on collision"
+            assert "Cannot downgrade migration a56cb01a3ebf" in res.stderr
+            assert "collision(s) on the narrow proposal dedup key" in res.stderr
+            assert "An operator must manually resolve" in res.stderr
+            assert "No rows were deleted" in res.stderr
+
+            async with engine.connect() as conn:
+                count = (
+                    await conn.execute(
+                        text("SELECT count(*) FROM proposal_holds WHERE id IN (:id1, :id2)"),
+                        {"id1": row1_id, "id2": row2_id},
+                    )
+                ).scalar()
+                assert count == 2, (
+                    "Expected both rows to still exist; downgrade must not delete rows"
+                )
+        finally:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("DELETE FROM proposal_holds WHERE id IN (:id1, :id2)"),
+                    {"id1": row1_id, "id2": row2_id},
+                )
+            subprocess.run(
+                [sys.executable, "-m", "alembic", "upgrade", "head"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+    async def test_tech_8080_downgrade_and_upgrade_clean_without_collisions(
+        self, engine: AsyncEngine, database_url: str
+    ) -> None:
+        """TECH-8080 PR3: verify migration a56cb01a3ebf downgrades and upgrades cleanly
+        when no narrow key collisions exist."""
+        env = {**os.environ, "DATABASE_URL": database_url.replace("+asyncpg", "")}
+        res_down = subprocess.run(
+            [sys.executable, "-m", "alembic", "downgrade", "c7665a1b2d3e"],
+            cwd=SERVICE_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert res_down.returncode == 0, res_down.stderr
+
+        try:
+            async with engine.connect() as conn:
+                result = await conn.execute(
+                    text(
+                        "SELECT indexdef FROM pg_indexes "
+                        "WHERE schemaname = 'public' AND tablename = 'proposal_holds' "
+                        "AND indexname = 'idx_proposal_holds_pending_dedup'"
+                    )
+                )
+                row = result.fetchone()
+                assert row is not None
+                assert "dedup_field" not in row[0]
+
+            res_up = subprocess.run(
+                [sys.executable, "-m", "alembic", "upgrade", "head"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert res_up.returncode == 0, res_up.stderr
+
+            async with engine.connect() as conn:
+                result = await conn.execute(
+                    text(
+                        "SELECT indexdef FROM pg_indexes "
+                        "WHERE schemaname = 'public' AND tablename = 'proposal_holds' "
+                        "AND indexname = 'idx_proposal_holds_pending_dedup'"
+                    )
+                )
+                row = result.fetchone()
+                assert row is not None
+                assert "dedup_field" in row[0]
+        finally:
+            subprocess.run(
+                [sys.executable, "-m", "alembic", "upgrade", "head"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+    async def test_tech_8080_scratch_index_valid_and_ready_guard(self, engine: AsyncEngine) -> None:
+        """TECH-8080 PR3: _assert_scratch_index_valid_and_ready validates both indisvalid
+        and indisready, and raises RuntimeError when missing, invalid, or unready."""
+        from migrations.versions.a56cb01a3ebf_proposal_dedup_field import (
+            _assert_scratch_index_valid_and_ready,
+        )
+
+        async with engine.connect() as conn:
+            # 1. Missing index raises RuntimeError against real pg_index
+            def _check_missing(sync_conn):
+                with pytest.raises(RuntimeError, match="not found in pg_index"):
+                    _assert_scratch_index_valid_and_ready(
+                        "idx_missing_scratch_test", bind=sync_conn
+                    )
+
+            await conn.run_sync(_check_missing)
+
+            # 2. Valid index passes against real pg_index
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_scratch_guard_test ON proposal_holds (id)")
+            )
+            try:
+
+                def _check_valid(sync_conn):
+                    _assert_scratch_index_valid_and_ready("idx_scratch_guard_test", bind=sync_conn)
+
+                await conn.run_sync(_check_valid)
+
+                # 3 & 4. Invalid (indisvalid=false) and unready (indisready=false) guards:
+                # Direct UPDATE pg_index requires PostgreSQL superuser privileges which are
+                # not available in CI/RDS. We exercise the guard logic by monkeypatching the
+                # query execution on the connection, asserting the exact RuntimeError behavior.
+                class _MockRow:
+                    def __init__(self, indisvalid: bool, indisready: bool) -> None:
+                        self._row = (indisvalid, indisready)
+
+                    def __getitem__(self, idx: int) -> bool:
+                        return self._row[idx]
+
+                class _MockQueryResult:
+                    def __init__(self, row: _MockRow | None) -> None:
+                        self._row = row
+
+                    def fetchone(self) -> _MockRow | None:
+                        return self._row
+
+                class _MockBind:
+                    def __init__(self, row: _MockRow | None) -> None:
+                        self._row = row
+
+                    def execute(self, statement: Any, parameters: Any = None) -> _MockQueryResult:
+                        return _MockQueryResult(self._row)
+
+                # indisvalid=False, indisready=True raises
+                with pytest.raises(RuntimeError, match="not valid and ready"):
+                    _assert_scratch_index_valid_and_ready(
+                        "idx_scratch_guard_test", bind=_MockBind(_MockRow(False, True))
+                    )
+
+                # indisvalid=True, indisready=False raises
+                with pytest.raises(RuntimeError, match="not valid and ready"):
+                    _assert_scratch_index_valid_and_ready(
+                        "idx_scratch_guard_test", bind=_MockBind(_MockRow(True, False))
+                    )
+
+                # indisvalid=False, indisready=False raises
+                with pytest.raises(RuntimeError, match="not valid and ready"):
+                    _assert_scratch_index_valid_and_ready(
+                        "idx_scratch_guard_test", bind=_MockBind(_MockRow(False, False))
+                    )
+            finally:
+                await conn.execute(text("DROP INDEX IF EXISTS idx_scratch_guard_test"))
+
+    async def test_tech_8080_upgrade_invalid_scratch_index_leaves_original_intact(
+        self, engine: AsyncEngine, database_url: str
+    ) -> None:
+        """TECH-8080 PR3: if the scratch index check fails during upgrade, the original
+        idx_proposal_holds_pending_dedup index is left completely untouched."""
+        env = {**os.environ, "DATABASE_URL": database_url.replace("+asyncpg", "")}
+        # 1. Downgrade to c7665a1b2d3e
+        subprocess.run(
+            [sys.executable, "-m", "alembic", "downgrade", "c7665a1b2d3e"],
+            cwd=SERVICE_ROOT,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        try:
+            # 2. Record original index definition and OID
+            async with engine.connect() as conn:
+                result = await conn.execute(
+                    text(
+                        "SELECT c.oid, pg_get_indexdef(c.oid) "
+                        "FROM pg_class c "
+                        "WHERE c.relname = 'idx_proposal_holds_pending_dedup'"
+                    )
+                )
+                orig_row = result.fetchone()
+                assert orig_row is not None
+                orig_oid, orig_indexdef = orig_row[0], orig_row[1]
+
+            # 3. Run upgrade with simulated invalid scratch index
+            res_failed = subprocess.run(
+                [sys.executable, "-m", "alembic", "upgrade", "head"],
+                cwd=SERVICE_ROOT,
+                env={**env, "_TEST_FORCE_INVALID_SCRATCH_INDEX": "1"},
+                capture_output=True,
+                text=True,
+            )
+            assert res_failed.returncode != 0
+            assert "is not valid and ready (simulated failure for test)" in res_failed.stderr
+            assert "Aborting swap to keep existing index intact" in res_failed.stderr
+
+            # 4. Verify original index was NOT dropped and still has same OID and definition
+            async with engine.connect() as conn:
+                result = await conn.execute(
+                    text(
+                        "SELECT c.oid, pg_get_indexdef(c.oid) "
+                        "FROM pg_class c "
+                        "WHERE c.relname = 'idx_proposal_holds_pending_dedup'"
+                    )
+                )
+                after_row = result.fetchone()
+                assert after_row is not None
+                assert after_row[0] == orig_oid
+                assert after_row[1] == orig_indexdef
+
+            # 5. Clean upgrade without simulated failure succeeds and cleans up scratch index
+            res_ok = subprocess.run(
+                [sys.executable, "-m", "alembic", "upgrade", "head"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            assert res_ok.returncode == 0, res_ok.stderr
+
+            # 6. Verify upgraded index has dedup_field
+            async with engine.connect() as conn:
+                result = await conn.execute(
+                    text(
+                        "SELECT pg_get_indexdef(c.oid) "
+                        "FROM pg_class c "
+                        "WHERE c.relname = 'idx_proposal_holds_pending_dedup'"
+                    )
+                )
+                upgraded_row = result.fetchone()
+                assert upgraded_row is not None
+                assert "dedup_field" in upgraded_row[0]
+        finally:
+            subprocess.run(
+                [sys.executable, "-m", "alembic", "upgrade", "head"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
 
     async def test_decision_consistency_check_constraint_rejects_pending_with_decision(
         self, engine: AsyncEngine

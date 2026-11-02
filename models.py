@@ -841,6 +841,11 @@ class ProposalHold(Base):
             # (empty string for every non-cross-brain hold, so their dedup is
             # unchanged); see migration c7665a1b2d3e.
             text("COALESCE(cross_brain ->> 'target_sub', '')"),
+            # TECH-8080 (PR3): field-aware proposal dedup so two distinct fields
+            # on the same target (e.g. startDate and targetDate on a project)
+            # do not collapse into one proposal. Empty string when absent;
+            # see migration a56cb01a3ebf.
+            text("COALESCE(action ->> 'dedup_field', '')"),
             postgresql_where=text("status IN ('pending', 'applying')"),
             unique=True,
         ),

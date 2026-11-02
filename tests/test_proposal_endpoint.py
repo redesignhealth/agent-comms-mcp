@@ -631,6 +631,26 @@ class TestSubmitProposal:
         assert str(rows[0].id) == seeded_id
         assert rows[0].rationale == _PROPOSAL_BODY["rationale"]
 
+    async def test_malformed_dedup_field_returns_422(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        _default_proposal_judge: FakeProposalJudge,
+    ) -> None:
+        http_client, provider = client
+        provider.tokens["bot-token"] = _agent_jwt_token(
+            "bot-1", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        body = {
+            **_PROPOSAL_BODY,
+            "action": {**_PROPOSAL_BODY["action"], "dedup_field": "invalid format with spaces"},
+        }
+        resp = await http_client.post(
+            "/proposals", json=body, headers={"Authorization": "Bearer bot-token"}
+        )
+        assert resp.status_code == 422
+        assert resp.json()["error"] == "invalid_request"
+        assert "action.dedup_field" in resp.json()["detail"]
+
     async def test_interactive_token_with_proposal_scope_still_returns_403(
         self, client: tuple[httpx.AsyncClient, _FakeAuthProvider]
     ) -> None:
