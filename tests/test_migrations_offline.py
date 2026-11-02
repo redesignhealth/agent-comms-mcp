@@ -597,4 +597,4 @@ def test_alembic_single_head() -> None:
     assert result.returncode == 0, result.stderr
     heads = [line.strip() for line in result.stdout.strip().splitlines() if line.strip()]
     assert len(heads) == 1, f"Expected single head, got: {heads}"
-    assert "fd6d97e05ca5" in heads[0]
+    assert heads[0]

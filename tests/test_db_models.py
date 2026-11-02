@@ -938,28 +938,47 @@ class TestProposalHoldsSchema:
     async def test_decision_reason_code_migration_upgrade_idempotent(
         self, engine: AsyncEngine, database_url: str
     ) -> None:
-        """Item 4: second upgrade attempt of 5ef4403d7f33 after constraint exists succeeds."""
+        """TECH-8080 PR5: second upgrade attempt of 5ef4403d7f33 after constraint
+        exists succeeds."""
         env = {**os.environ, "DATABASE_URL": database_url.replace("+asyncpg", "")}
-        subprocess.run(
-            [sys.executable, "-m", "alembic", "upgrade", "head"],
+        # Explicit downgrade to 5ef4403d7f33's down_revision (a56cb01a3ebf) so later migrations
+        # are cleanly removed rather than leaving orphaned objects during rewind/reapply.
+        res_down = subprocess.run(
+            [sys.executable, "-m", "alembic", "downgrade", "a56cb01a3ebf"],
             cwd=SERVICE_ROOT,
             env=env,
-            check=True,
             capture_output=True,
             text=True,
         )
+        assert res_down.returncode == 0, res_down.stderr
+
         try:
-            async with engine.begin() as conn:
-                await conn.execute(text("UPDATE alembic_version SET version_num = 'a56cb01a3ebf'"))
-            res = subprocess.run(
+            # Upgrade once to 5ef4403d7f33 so column and check constraint exist
+            res_up1 = subprocess.run(
                 [sys.executable, "-m", "alembic", "upgrade", "5ef4403d7f33"],
                 cwd=SERVICE_ROOT,
                 env=env,
                 capture_output=True,
                 text=True,
             )
-            assert res.returncode == 0, res.stderr
+            assert res_up1.returncode == 0, res_up1.stderr
+
+            # Rewind version pointer to a56cb01a3ebf while retaining 5ef4403d7f33's schema objects
+            # to simulate a failed/retried migration attempt where the constraint already exists
+            async with engine.begin() as conn:
+                await conn.execute(text("UPDATE alembic_version SET version_num = 'a56cb01a3ebf'"))
+
+            # Second upgrade attempt must succeed idempotently (skipping check constraint creation)
+            res_up2 = subprocess.run(
+                [sys.executable, "-m", "alembic", "upgrade", "5ef4403d7f33"],
+                cwd=SERVICE_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert res_up2.returncode == 0, res_up2.stderr
         finally:
+            # Clean forward upgrade back to head restores full schema for subsequent tests
             subprocess.run(
                 [sys.executable, "-m", "alembic", "upgrade", "head"],
                 cwd=SERVICE_ROOT,
