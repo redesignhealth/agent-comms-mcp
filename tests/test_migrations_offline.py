@@ -589,7 +589,7 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
     # b4a2d8e6f1c3 (TECH-8080 PR10): log_seq column, counter table, trigger, and indexes
     assert "SET LOCAL lock_timeout = '5s';" in result.stdout
     assert "SET LOCAL statement_timeout = '120s';" in result.stdout
-    assert "ALTER TABLE proposal_holds ADD COLUMN log_seq BIGINT;" in result.stdout
+    assert "ALTER TABLE proposal_holds ADD COLUMN IF NOT EXISTS log_seq BIGINT" in result.stdout
     assert "CREATE TABLE IF NOT EXISTS proposal_bot_log_seq (" in result.stdout
     assert "CREATE OR REPLACE FUNCTION proposal_holds_assign_log_seq()" in result.stdout
     assert "CREATE TRIGGER trg_proposal_holds_log_seq" in result.stdout

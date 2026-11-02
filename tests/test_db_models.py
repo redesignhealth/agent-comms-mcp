@@ -1384,8 +1384,8 @@ class TestProposalHoldsSchema:
     async def test_tech_8080_migration_column_already_exists_rerun_is_idempotent(
         self, engine: AsyncEngine, database_url: str
     ) -> None:
-        """Argus round 6: verify upgrade succeeds and no-ops column addition if log_seq
-        was already added manually by an operator per the runbook."""
+        """Argus round 6 & 7: verify upgrade succeeds and idempotently adds log_seq
+        via raw SQL if it was already added manually by an operator per the runbook."""
         env = {**os.environ, "DATABASE_URL": database_url.replace("+asyncpg", "")}
         try:
             # Downgrade to parent
