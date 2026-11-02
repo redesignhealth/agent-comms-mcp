@@ -67,7 +67,7 @@ import logging
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Literal
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -331,11 +331,33 @@ async def get(proposal_id: str) -> dict[str, Any]:
 
 
 @proposals_server.tool
-async def list_pending(limit: int = 50) -> dict[str, Any]:
-    """List the calling bot's OWN still-``pending`` proposals, oldest
-    first. Scoped to proposals THIS bot submitted -- never another bot's.
-    ``limit`` is clamped to [1, 200]; ``has_more`` is ``True`` if more
-    pending proposals exist beyond the returned page.
+async def list_pending(
+    limit: int = 50, order: Literal["created_at", "log"] = "created_at", since: str | None = None
+) -> dict[str, Any]:
+    """List the calling bot's OWN still-``pending`` proposals. Scoped to proposals
+    THIS bot submitted -- never another bot's. ``limit`` is clamped to [1, 200];
+    ``has_more`` is ``True`` if more pending proposals exist beyond the returned page.
+
+    Ordering modes:
+    - ``order="created_at"`` (default): Oldest first by ``created_at ASC, id ASC``.
+      Returns ``proposals`` and ``has_more``. ``since`` is not permitted.
+    - ``order="log"``: Incremental feed ordered by commit-ordered ``log_seq ASC``.
+      Returns ``next_cursor`` alongside ``proposals`` and ``has_more``. When ``since``
+      is provided, resumes pagination strictly after the watermark.
+
+    Delivery contract for ``order="log"``: at-least-once, never-miss, per-bot monotonic.
+    Consumer polling pattern:
+    ```python
+    cursor = load_watermark()                     # may be None
+    while True:
+        r = await proposals_list_pending(order="log", since=cursor, limit=200)
+        for p in r["proposals"]:
+            handle(p)                             # idempotent by proposal_id
+        cursor = r.get("next_cursor") or cursor
+        save_watermark(cursor)                    # opaque string, no payloads
+        if not r["has_more"]:
+            break
+    ```
 
     A proposal briefly disappears from this list, WITHOUT appearing in
     ``proposals_list_history`` either, the moment a decide or the
@@ -345,34 +367,74 @@ async def list_pending(limit: int = 50) -> dict[str, Any]:
     window if you need the proposal's status specifically.
     """
     bot_sub = _require_bot_sub()
+    if order not in ("created_at", "log"):
+        raise ToolError("invalid order: must be 'created_at' or 'log'")
+    if since is not None and order != "log":
+        raise ToolError("since requires order='log'")
     async with get_session_factory()() as session, _map_proposal_errors():
         return await service.list_proposals_for_bot(
-            session, requesting_bot_sub=bot_sub, statuses=("pending",), limit=limit
+            session,
+            requesting_bot_sub=bot_sub,
+            statuses=("pending",),
+            limit=limit,
+            order=order,
+            since=since,
+            cursor_kind="pending",
         )
 
 
 @proposals_server.tool
-async def list_history(limit: int = 50) -> dict[str, Any]:
+async def list_history(
+    limit: int = 50, order: Literal["created_at", "log"] = "created_at", since: str | None = None
+) -> dict[str, Any]:
     """List the calling bot's OWN already-actioned proposals -- every one
     that has left ``pending``/the transient ``applying`` state for good
     (``applied``, ``apply_failed``, ``rejected``, ``stale``, or
-    ``withdrawn``), oldest first. Scoped to proposals THIS bot submitted --
-    never another bot's. Omits ``decided_by_actor_id`` on any row decided
-    by a human -- that reviewer's identity is never disclosed to the
-    submitting bot. ``limit`` is clamped to [1, 200]; ``has_more`` is
-    ``True`` if more actioned proposals exist beyond the returned page.
+    ``withdrawn``). Scoped to proposals THIS bot submitted -- never another bot's.
+    Omits ``decided_by_actor_id`` on any row decided by a human -- that reviewer's
+    identity is never disclosed to the submitting bot.
+    ``limit`` is clamped to [1, 200]; ``has_more`` is ``True`` if more actioned
+    proposals exist beyond the returned page.
+
+    Ordering modes:
+    - ``order="created_at"`` (default): Oldest first by ``created_at ASC, id ASC``.
+      Returns ``proposals`` and ``has_more``. ``since`` is not permitted.
+    - ``order="log"``: Incremental feed ordered by commit-ordered ``log_seq ASC``.
+      Returns ``next_cursor`` alongside ``proposals`` and ``has_more``. When ``since``
+      is provided, resumes pagination strictly after the watermark.
+
+    Delivery contract for ``order="log"``: at-least-once, never-miss, per-bot monotonic.
+    Consumer polling pattern:
+    ```python
+    cursor = load_watermark()                     # may be None
+    while True:
+        r = await proposals_list_history(order="log", since=cursor, limit=200)
+        for p in r["proposals"]:
+            handle(p)                             # idempotent by proposal_id
+        cursor = r.get("next_cursor") or cursor
+        save_watermark(cursor)                    # opaque string, no payloads
+        if not r["has_more"]:
+            break
+    ```
 
     A proposal in the transient ``applying`` status (claimed by a decide
     or the TECH-5877 auto-judge, not yet resolved) does not appear here
     either -- see ``proposals_list_pending``'s docstring for that gap.
     """
     bot_sub = _require_bot_sub()
+    if order not in ("created_at", "log"):
+        raise ToolError("invalid order: must be 'created_at' or 'log'")
+    if since is not None and order != "log":
+        raise ToolError("since requires order='log'")
     async with get_session_factory()() as session, _map_proposal_errors():
         return await service.list_proposals_for_bot(
             session,
             requesting_bot_sub=bot_sub,
             statuses=service.PROPOSAL_TERMINAL_STATUSES,
             limit=limit,
+            order=order,
+            since=since,
+            cursor_kind="history",
         )
 
 

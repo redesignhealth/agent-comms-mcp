@@ -19,7 +19,7 @@ Covers:
   - Arcana rows <= 16384 bytes and non-Arcana rows remain byte-identical and unelided
   - Correct UTF-8 byte and character counts at the exact multi-byte threshold
     (é/中/emoji at exactly 16384 UTF-8 bytes vs one character over)
-  - raiseload=True proof: ProposalHold.action is not loaded into Python memory
+  - Column-projection proof: list SQL projects column tuples and never selects ProposalHold.action
   - elision still comes from the SQL projection when the session's ORM identity
     map already holds the fully loaded action (the projected column value is
     what the lists return, never the ORM attribute state)
@@ -715,7 +715,16 @@ async def test_bulk_memory_elision_across_listings(session: AsyncSession) -> Non
 # ======================================================================
 
 
-async def test_raiseload_proof_on_listed_orm_objects(session: AsyncSession) -> None:
+async def test_synthetic_raiseload_query_demonstrates_orm_defer_behavior(
+    session: AsyncSession,
+) -> None:
+    """Synthetic demonstration of defer(ProposalHold.action, raiseload=True) on a raw ORM query.
+
+    NOTE: This is NOT the production list memory guarantee. Production listing queries
+    (list_pending_proposal_holds, list_proposals_for_bot, list_proposal_history_for_owner)
+    select explicit column tuples rather than loading ProposalHold ORM entities into the
+    identity map; see test_production_list_sql_never_selects_the_unprojected_action_column.
+    """
     hold = ProposalHold(
         id=uuid.uuid4(),
         kind="arcana_source_add",
@@ -754,6 +763,11 @@ async def test_raiseload_proof_on_listed_orm_objects(session: AsyncSession) -> N
     with pytest.raises(InvalidRequestError) as exc_info:
         _ = orm_hold.action
     assert "'ProposalHold.action' is not available due to raiseload=True" in str(exc_info.value)
+
+
+test_raiseload_proof_on_listed_orm_objects = (
+    test_synthetic_raiseload_query_demonstrates_orm_defer_behavior
+)
 
 
 # ======================================================================
@@ -2052,8 +2066,9 @@ def _assert_projected_list_sql(sql: str) -> None:
     unprojected full ``action`` column. Structural, not textual: the outer
     SELECT list is parsed into items (see ``_top_level_select_items``), so
     this does not depend on whitespace, column order, or where the bare
-    column would be positioned. The ORM-level raiseload assertions in the
-    caller remain the real guarantee that ``action`` is never loaded."""
+    column would be positioned. The column-tuple projection and no-ORM-load
+    proof in the caller (orm_captured == 0, empty session.identity_map, and
+    negative control) prove that ``action`` is never loaded into memory."""
     norm = " ".join(sql.split())
     # The ID-only keyset subquery joined back to the outer query.
     assert re.search(r"JOIN \( ?SELECT proposal_holds\.id AS id\b", norm)
@@ -2074,17 +2089,13 @@ def _assert_projected_list_sql(sql: str) -> None:
 async def test_production_list_sql_never_selects_the_unprojected_action_column(
     session: AsyncSession, engine: AsyncEngine
 ) -> None:
-    """Team-review Medium 2: the raiseload proof must observe the SQL the
-    THREE PRODUCTION list functions actually emit -- and the ORM objects
-    they actually load -- not a synthetic query, which keeps passing if
-    production ever drops its own ``defer(ProposalHold.action,
-    raiseload=True)``. Each production call must emit exactly ONE
-    statement (no lazy-load follow-up), that statement must carry the
-    projected columns and no bare ``proposal_holds.action`` select item,
-    and the ProposalHold entity each call loads into the session's
-    identity map must have ``action`` raiseloaded (attribute access
-    raises), so removing the production ``defer(...)`` fails this test
-    directly, on both the SQL and the ORM-load axis."""
+    """The projection proof observes the SQL the THREE PRODUCTION list functions
+    actually emit. Each production call must emit exactly ONE statement (no lazy-load
+    follow-up), that statement must carry the projected columns and NO bare
+    ``proposal_holds.action`` select item, and the production call must query column
+    tuples rather than loading ORM entities into the identity map (mapper load event
+    is never fired). A negative control proves that ``_assert_projected_list_sql``
+    would fail if the bare ``proposal_holds.action`` column were ever selected."""
     owner_sub = "owner-sqlcap@example.com"
     bot_sub = "bot-sqlcap"
     elided_hold = _seed_arcana_row(
@@ -2115,51 +2126,33 @@ async def test_production_list_sql_never_selects_the_unprojected_action_column(
     def _capture_orm_load(target: ProposalHold, context: Any) -> None:
         orm_captured.append(target)
 
-    def _loaded_by_call(hold_id: uuid.UUID) -> ProposalHold:
-        for obj in orm_captured:
-            if obj.id == hold_id:
-                return obj
-        pytest.fail(f"ProposalHold {hold_id} was not loaded by the production call")
-
-    def _action_is_raised(hold_id: uuid.UUID) -> None:
-        """An ORM entity the production call loaded must NOT carry the
-        action column: absent from the instance dict, and attribute access
-        raises with the raiseload message specifically (a plain ``defer``
-        would raise MissingGreenlet on lazy access instead -- a subclass of
-        InvalidRequestError with a different message -- and no defer at all
-        would return the fully loaded column)."""
-        obj = _loaded_by_call(hold_id)
-        assert "action" not in obj.__dict__
-        with pytest.raises(InvalidRequestError) as exc_info:
-            _ = obj.action
-        assert "'ProposalHold.action' is not available due to raiseload=True" in str(exc_info.value)
-
     event.listen(engine.sync_engine, "before_cursor_execute", _capture_sql)
-    # The service's ORM objects are unreferenced once the list function
-    # returns (the weak identity map drops them), so capture the REAL
-    # instances as the production call loads them, at the mapper level.
+    # The production call now queries column tuples directly, bypassing ORM
+    # entity loading. Capture mapper loads to prove ProposalHold is never loaded.
     event.listen(ProposalHold, "load", _capture_orm_load)
     try:
-        # Detach everything first: an instance still sitting in the session's
-        # identity map (kept alive by an earlier assertion's traceback cycle)
-        # would be reused without firing the ``load`` event this test relies
-        # on, making the capture depend on garbage-collection timing.
         session.expunge_all()
         sql_captured.clear()
         orm_captured.clear()
         pending = await service.list_pending_proposal_holds(session, owner_sub=owner_sub, limit=50)
         assert len(sql_captured) == 1  # exactly the list statement, no lazy-load follow-up
         _assert_projected_list_sql(sql_captured[0])
+        # Negative control: verify _assert_projected_list_sql fails if bare action were selected
+        bad_sql = sql_captured[0].replace(
+            "SELECT proposal_holds.id,",
+            "SELECT proposal_holds.action, proposal_holds.id,",
+        )
+        assert bad_sql != sql_captured[0], "Failed to construct bad_sql for negative control"
+        with pytest.raises(AssertionError):
+            _assert_projected_list_sql(bad_sql)
+
         pending_by_id = {p["proposal_id"]: p for p in pending["proposals"]}
         assert "content" not in pending_by_id[str(elided_hold.id)]["action"]
         assert pending_by_id[str(small_hold.id)]["action"]["content"] == "x" * 100
-        _action_is_raised(elided_hold.id)
-        _action_is_raised(small_hold.id)
+        # Column projection: no ORM entities were loaded into identity map
+        assert len(orm_captured) == 0
+        assert len(session.identity_map) == 0
 
-        # Detach everything first: an instance still sitting in the session's
-        # identity map (kept alive by an earlier assertion's traceback cycle)
-        # would be reused without firing the ``load`` event this test relies
-        # on, making the capture depend on garbage-collection timing.
         session.expunge_all()
         sql_captured.clear()
         orm_captured.clear()
@@ -2172,15 +2165,12 @@ async def test_production_list_sql_never_selects_the_unprojected_action_column(
             str(elided_hold.id),
             str(small_hold.id),
         }
-        _action_is_raised(elided_hold.id)
+        assert len(orm_captured) == 0
+        assert len(session.identity_map) == 0
 
         for hold in (elided_hold, small_hold):
             await _transition_to_rejected(session, hold.id)
 
-        # Detach everything first: an instance still sitting in the session's
-        # identity map (kept alive by an earlier assertion's traceback cycle)
-        # would be reused without firing the ``load`` event this test relies
-        # on, making the capture depend on garbage-collection timing.
         session.expunge_all()
         sql_captured.clear()
         orm_captured.clear()
@@ -2192,7 +2182,8 @@ async def test_production_list_sql_never_selects_the_unprojected_action_column(
         hist_by_id = {p["proposal_id"]: p for p in history["proposals"]}
         assert "content" not in hist_by_id[str(elided_hold.id)]["action"]
         assert "content" in hist_by_id[str(small_hold.id)]["action"]
-        _action_is_raised(elided_hold.id)
+        assert len(orm_captured) == 0
+        assert len(session.identity_map) == 0
     finally:
         event.remove(engine.sync_engine, "before_cursor_execute", _capture_sql)
         event.remove(ProposalHold, "load", _capture_orm_load)
