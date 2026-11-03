@@ -448,6 +448,7 @@ class TestSchema:
         audit_indexes = await _indexes(engine, "audit_log")
         assert "idx_audit_log_conversation_id" in audit_indexes
         assert "idx_audit_log_at" in audit_indexes
+        assert "idx_audit_log_action_at" in audit_indexes
         assert "idx_audit_log_task_id" not in audit_indexes
 
         message_indexes = await _indexes(engine, "messages")
@@ -1904,6 +1905,80 @@ class TestProposalHoldsSchema:
                 capture_output=True,
                 text=True,
             )
+
+    async def test_tech_8080_pr13_audit_log_index_valid_and_ready_guard(
+        self, engine: AsyncEngine
+    ) -> None:
+        """TECH-8080 PR13: _assert_audit_log_index_valid_and_ready validates both
+        indisvalid and indisready on idx_audit_log_action_at, raising RuntimeError if
+        missing, invalid, or unready."""
+        import importlib
+
+        migration_mod = importlib.import_module(
+            "migrations.versions.58dd9bd941a6_add_idx_audit_log_action_at"
+        )
+        _assert_audit_log_index_valid_and_ready = (
+            migration_mod._assert_audit_log_index_valid_and_ready
+        )
+
+        async with engine.connect() as conn:
+            # 1. Missing index raises RuntimeError
+            def _check_missing(sync_conn):
+                with pytest.raises(RuntimeError, match="not found in pg_index"):
+                    _assert_audit_log_index_valid_and_ready(
+                        "idx_missing_audit_log_test", bind=sync_conn
+                    )
+
+            await conn.run_sync(_check_missing)
+
+            # 2. Existing valid index passes
+            def _check_valid(sync_conn):
+                _assert_audit_log_index_valid_and_ready("idx_audit_log_action_at", bind=sync_conn)
+
+            await conn.run_sync(_check_valid)
+
+            # 3 & 4. Invalid (indisvalid=false) and unready (indisready=false) guards:
+            # Direct UPDATE pg_index requires PostgreSQL superuser privileges which are
+            # not available in CI/RDS. We exercise the guard logic by monkeypatching the
+            # query execution on the connection, asserting the exact RuntimeError behavior.
+            class _MockRow:
+                def __init__(self, indisvalid: bool, indisready: bool) -> None:
+                    self._row = (indisvalid, indisready)
+
+                def __getitem__(self, idx: int) -> bool:
+                    return self._row[idx]
+
+            class _MockQueryResult:
+                def __init__(self, row: _MockRow | None) -> None:
+                    self._row = row
+
+                def fetchone(self) -> _MockRow | None:
+                    return self._row
+
+            class _MockBind:
+                def __init__(self, row: _MockRow | None) -> None:
+                    self._row = row
+
+                def execute(self, statement: Any, parameters: Any = None) -> _MockQueryResult:
+                    return _MockQueryResult(self._row)
+
+            # indisvalid=False, indisready=True raises
+            with pytest.raises(RuntimeError, match="not valid and ready"):
+                _assert_audit_log_index_valid_and_ready(
+                    "idx_audit_guard_test", bind=_MockBind(_MockRow(False, True))
+                )
+
+            # indisvalid=True, indisready=False raises
+            with pytest.raises(RuntimeError, match="not valid and ready"):
+                _assert_audit_log_index_valid_and_ready(
+                    "idx_audit_guard_test", bind=_MockBind(_MockRow(True, False))
+                )
+
+            # indisvalid=False, indisready=False raises
+            with pytest.raises(RuntimeError, match="not valid and ready"):
+                _assert_audit_log_index_valid_and_ready(
+                    "idx_audit_guard_test", bind=_MockBind(_MockRow(False, False))
+                )
 
     async def test_decision_consistency_check_constraint_rejects_pending_with_decision(
         self, engine: AsyncEngine
