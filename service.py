@@ -8738,7 +8738,20 @@ async def create_proposal(
         # TECH-8080 PR13: Emergency kill switch & daily auto-approval cap guards.
         # Metering is strictly by validated action_type (not parsed verdict_rule, which
         # may be None for legacy progress update actions per PR12).
+        #
+        # Lock ordering & deadlock prevention:
+        # 1. Action-type advisory lock:
+        #    pg_advisory_xact_lock(hashtext('proposal_auto_approve_cap:' || action_type))
+        # 2. Row-level lock: proposal_holds FOR UPDATE
+        # decide_proposal (human decision) ONLY acquires the row-level lock on proposal_holds,
+        # never the action-type advisory lock. Because human decisions never request the advisory
+        # lock, no deadlock cycle can form between create_proposal and decide_proposal.
+        # Concurrent create_proposal calls for the same action type serialize on the advisory lock
+        # first before attempting any row lock, strictly preserving this acquisition hierarchy.
         if get_proposal_auto_approve_kill_switch():
+            # Acquire row lock with FOR UPDATE before checking hold.status to close
+            # the check-then-act race against concurrent human decide calls.
+            await session.refresh(hold, with_for_update=True)
             if hold.status != "pending":
                 await session.commit()
                 return _bot_facing_proposal_dict(hold)
@@ -8772,7 +8785,9 @@ async def create_proposal(
                         ),
                         {"action_type": action_type},
                     )
-                    await session.refresh(hold)
+                    # Row lock with FOR UPDATE taken immediately under advisory lock,
+                    # held throughout daily cap check and decision_note write.
+                    await session.refresh(hold, with_for_update=True)
                     if hold.status != "pending":
                         await session.commit()
                         return _bot_facing_proposal_dict(hold)
@@ -8793,10 +8808,6 @@ async def create_proposal(
                         )
                     ).scalar_one()
                     if count >= cap:
-                        await session.refresh(hold)
-                        if hold.status != "pending":
-                            await session.commit()
-                            return _bot_facing_proposal_dict(hold)
                         judged_status = "pending"
                         decision_note = (
                             f"daily auto-approval cap reached for {action_type}; "
@@ -8834,7 +8845,7 @@ async def create_proposal(
                         f"daily auto-approval cap check failed for {action_type}; "
                         "held for human review"
                     )
-                    hold_refetched = await _find_proposal_hold(session, hold_id)
+                    hold_refetched = await _find_proposal_hold(session, hold_id, for_update=True)
                     if hold_refetched is None:
                         raise AssertionError(
                             "invariant violation: hold vanished after rollback"
@@ -8863,8 +8874,15 @@ async def create_proposal(
                 try:
                     auto_approved_at = await _fetch_db_timestamp(session)
                 except (DBAPIError, OperationalError) as exc:
+                    logger.warning(
+                        "database timestamp fetch failed for hold %s on uncapped path: %s; "
+                        "rolling back and falling back to local now",
+                        hold_id,
+                        exc,
+                        exc_info=True,
+                    )
                     await session.rollback()
-                    hold_refetched = await _find_proposal_hold(session, hold_id)
+                    hold_refetched = await _find_proposal_hold(session, hold_id, for_update=True)
                     if hold_refetched is None:
                         raise AssertionError(
                             "invariant violation: hold vanished after rollback"
@@ -8875,6 +8893,7 @@ async def create_proposal(
     auto_approved = judged_status == "approved" and hold.status == "pending"
 
     if not auto_approved:
+        await session.commit()
         return _bot_facing_proposal_dict(hold)
 
     # Argus review B1: resolve the auto-judge's "approved" verdict to a

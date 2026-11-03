@@ -30,7 +30,7 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 from sqlalchemy import select, text, update
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 import service
@@ -2006,11 +2006,15 @@ class TestProposalAutoApproveKillSwitchAndDailyCaps:
         assert len(denial_audits) == 0
 
     async def test_uncapped_db_timestamp_fetch_failure_rolls_back_and_succeeds_without_cascade(
-        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+        self,
+        session: AsyncSession,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """Finding 3: DB error when fetching DB timestamp on the uncapped path must
         properly roll back the session before falling back to _now(), ensuring subsequent
-        statements (like row locking for claim) succeed without InFailedSqlTransaction cascading."""
+        statements (like row locking for claim) succeed without InFailedSqlTransaction cascading.
+        Argus round 2 item 2: Warning must be logged with exc_info."""
         monkeypatch.delenv(PROPOSAL_AUTO_APPROVE_KILL_SWITCH_ENV_VAR, raising=False)
         monkeypatch.delenv(PROPOSAL_AUTO_APPROVE_DAILY_CAPS_ENV_VAR, raising=False)
         reset_proposal_auto_approve_cache()
@@ -2043,16 +2047,84 @@ class TestProposalAutoApproveKillSwitchAndDailyCaps:
 
         monkeypatch.setattr(session, "execute", _failing_execute)
 
-        res = await _submit(
-            session,
-            action=_action(action_type="open_ticket", target_id="T_CLOCK_FAIL"),
-            judge=judge,
-        )
+        with caplog.at_level(logging.WARNING):
+            res = await _submit(
+                session,
+                action=_action(action_type="open_ticket", target_id="T_CLOCK_FAIL"),
+                judge=judge,
+            )
 
         assert clock_failed is True
         assert res["status"] == "applied"
         assert res["decision_source"] == "auto"
         assert len(judge.apply_calls) == 1
+
+        warnings = [rec for rec in caplog.records if rec.levelno >= logging.WARNING]
+        assert any("database timestamp fetch failed" in w.message for w in warnings)
+        assert any(w.exc_info is not None for w in warnings)
+
+    async def test_kill_switch_guard_holds_row_lock_across_check_and_write(
+        self,
+        session: AsyncSession,
+        engine: AsyncEngine,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Argus round 2 item 1: The kill-switch guard must hold the row-level lock
+        (SELECT ... FOR UPDATE) across the status check and decision_note write.
+        Verifies that a concurrent session attempting FOR UPDATE NOWAIT on the hold
+        fails while the guard holds the lock, and succeeds only after commit."""
+        monkeypatch.setenv(PROPOSAL_AUTO_APPROVE_KILL_SWITCH_ENV_VAR, "true")
+        reset_proposal_auto_approve_cache()
+
+        judge = FakeProposalJudge(
+            judge_result=ProposalVerdict(approved=True, decision_note="looks good"),
+        )
+
+        orig_commit = session.commit
+        contention_verified = False
+
+        async def _hooked_commit() -> None:
+            nonlocal contention_verified
+            # The kill switch guard sets decision_note on hold before committing under the row lock.
+            # While the row lock is held, verify that a second session fails on FOR UPDATE NOWAIT.
+            for obj in session.dirty:
+                if isinstance(obj, ProposalHold) and obj.decision_note is not None:
+                    async with AsyncSession(engine) as second_session:
+                        with pytest.raises((DBAPIError, OperationalError)) as exc_info:
+                            await second_session.execute(
+                                text(
+                                    "SELECT id FROM proposal_holds WHERE id = :id FOR UPDATE NOWAIT"
+                                ),
+                                {"id": obj.id},
+                            )
+                        assert "could not obtain lock" in str(exc_info.value).lower()
+                        contention_verified = True
+                    break
+            await orig_commit()
+
+        monkeypatch.setattr(session, "commit", _hooked_commit)
+
+        res = await _submit(
+            session,
+            proposed_by_bot_id="bot-lock-test",
+            action=_action(action_type="open_ticket", target_id="T_LOCK_TEST"),
+            judge=judge,
+        )
+
+        assert contention_verified is True
+        assert res["status"] == "pending"
+        assert res["decision_note"] == "auto-approval is globally disabled; held for human review"
+
+        # After commit, second_session can now acquire the row lock cleanly
+        hold_uuid = uuid.UUID(res["proposal_id"])
+        async with AsyncSession(engine) as second_session:
+            locked_row = (
+                await second_session.execute(
+                    text("SELECT id FROM proposal_holds WHERE id = :id FOR UPDATE NOWAIT"),
+                    {"id": hold_uuid},
+                )
+            ).scalar_one()
+            assert locked_row == hold_uuid
 
 
 class TestProposalResubmissionSnapshot:
