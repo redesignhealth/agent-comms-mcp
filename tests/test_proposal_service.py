@@ -1805,6 +1805,255 @@ class TestProposalAutoApproveKillSwitchAndDailyCaps:
             )
             assert len(audits) == cap_val
 
+    async def test_kill_switch_racing_concurrent_human_decision_leaves_hold_untouched(
+        self, session: AsyncSession, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Finding 1: A hold decided by a human during the judge window must be left
+        untouched by the kill-switch branch (no overwritten decision_note, no spurious
+        denied.proposal_auto_approve audit entry)."""
+        monkeypatch.setenv(PROPOSAL_AUTO_APPROVE_KILL_SWITCH_ENV_VAR, "true")
+        reset_proposal_auto_approve_cache()
+
+        class _RacingHumanJudge(FakeProposalJudge):
+            async def judge(self, ctx: Any) -> ProposalVerdict:
+                # Human reviewer decides the proposal concurrently while judge evaluates
+                async with AsyncSession(engine) as human_session:
+                    await _decide(
+                        human_session,
+                        hold_id=ctx.hold_id,
+                        decision="reject",
+                        decision_note="human rejected: not authorized",
+                        approver_sub="owner-a@example.com",
+                    )
+                return ProposalVerdict(approved=True, decision_note="auto judge approved")
+
+        judge = _RacingHumanJudge(
+            apply_result=ProposalApplyOutcome(
+                applied=True, result={"applied": True}, caller_error=None, log_detail=None
+            )
+        )
+
+        res = await _submit(
+            session,
+            action=_action(action_type="open_ticket", target_id="T_RACE_KILL"),
+            judge=judge,
+        )
+
+        # Returned proposal reflects human decision, NOT kill switch downgrade
+        assert res["status"] == "rejected"
+        assert res["decision_note"] == "human rejected: not authorized"
+        assert res["decision_source"] == "human"
+
+        # Verify hold in DB was not overwritten
+        hold_db = await service._find_proposal_hold(session, uuid.UUID(res["proposal_id"]))
+        assert hold_db is not None
+        assert hold_db.status == "rejected"
+        assert hold_db.decision_note == "human rejected: not authorized"
+        assert hold_db.decision_source == "human"
+
+        # Verify no denied.proposal_auto_approve audit entry was written
+        denial_audits = (
+            (
+                await session.execute(
+                    select(AuditLog).where(AuditLog.action == _AUTO_APPROVE_DENIED_AUDIT_ACTION)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(denial_audits) == 0
+
+    async def test_daily_cap_exhausted_racing_human_decision_releases_lock(
+        self, session: AsyncSession, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Findings 1 & 2: When a hold is decided by a human concurrently, the cap-exhausted
+        branch must leave the hold untouched (no overwritten decision_note, no spurious audit)
+        and must commit/release the xact advisory lock immediately without leaking it."""
+        monkeypatch.setenv(PROPOSAL_AUTO_APPROVE_DAILY_CAPS_ENV_VAR, '{"open_ticket": 0}')
+        reset_proposal_auto_approve_cache()
+
+        class _RacingHumanJudge(FakeProposalJudge):
+            async def judge(self, ctx: Any) -> ProposalVerdict:
+                async with AsyncSession(engine) as human_session:
+                    await _decide(
+                        human_session,
+                        hold_id=ctx.hold_id,
+                        decision="approve",
+                        decision_note="human approved: expedited",
+                        approver_sub="owner-a@example.com",
+                        judge=self,
+                    )
+                return ProposalVerdict(approved=True, decision_note="auto judge approved")
+
+        judge = _RacingHumanJudge(
+            apply_result=ProposalApplyOutcome(
+                applied=True, result={"applied": True}, caller_error=None, log_detail=None
+            )
+        )
+
+        res = await _submit(
+            session,
+            action=_action(action_type="open_ticket", target_id="T_RACE_CAP"),
+            judge=judge,
+        )
+
+        # Returned proposal reflects human decision
+        assert res["status"] == "applied"
+        assert res["decision_note"] == "human approved: expedited"
+        assert res["decision_source"] == "human"
+
+        # Verify hold in DB was not overwritten
+        hold_db = await service._find_proposal_hold(session, uuid.UUID(res["proposal_id"]))
+        assert hold_db is not None
+        assert hold_db.status == "applied"
+        assert hold_db.decision_note == "human approved: expedited"
+        assert hold_db.decision_source == "human"
+
+        # Verify no denied.proposal_auto_approve audit entry was written
+        denial_audits = (
+            (
+                await session.execute(
+                    select(AuditLog).where(AuditLog.action == _AUTO_APPROVE_DENIED_AUDIT_ACTION)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(denial_audits) == 0
+
+        # Finding 2: Advisory lock must not be leaked!
+        # Test that another transaction can acquire the lock immediately without blocking.
+        async with AsyncSession(engine) as check_session:
+            can_lock = (
+                await check_session.execute(
+                    text(
+                        "SELECT pg_try_advisory_xact_lock("
+                        "hashtext('proposal_auto_approve_cap:open_ticket'))"
+                    )
+                )
+            ).scalar_one()
+            assert can_lock is True
+
+    async def test_daily_cap_check_failed_racing_concurrent_human_decision_leaves_hold_untouched(
+        self, session: AsyncSession, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Finding 1: When a human decides the hold concurrently, cap-check-failed error
+        recovery must leave the human's decision untouched (no overwritten decision_note,
+        no spurious cap_check_failed audit entry)."""
+        monkeypatch.setenv(PROPOSAL_AUTO_APPROVE_DAILY_CAPS_ENV_VAR, '{"open_ticket": 5}')
+        reset_proposal_auto_approve_cache()
+
+        class _RacingHumanJudge(FakeProposalJudge):
+            async def judge(self, ctx: Any) -> ProposalVerdict:
+                async with AsyncSession(engine) as human_session:
+                    await _decide(
+                        human_session,
+                        hold_id=ctx.hold_id,
+                        decision="reject",
+                        decision_note="human rejected before cap check",
+                        approver_sub="owner-a@example.com",
+                    )
+                return ProposalVerdict(
+                    approved=True,
+                    decision_note="looks good",
+                    rule="linear_progress_update:open_ticket",
+                )
+
+        judge = _RacingHumanJudge(
+            apply_result=ProposalApplyOutcome(
+                applied=True, result={"applied": True}, caller_error=None, log_detail=None
+            )
+        )
+
+        orig_execute = session.execute
+
+        async def _failing_execute(stmt, *args, **kwargs):
+            if "proposal_auto_approve_cap:" in str(stmt):
+                raise OperationalError(
+                    "simulated deadlock on advisory lock",
+                    params=None,
+                    orig=Exception("deadlock detected"),
+                )
+            return await orig_execute(stmt, *args, **kwargs)
+
+        monkeypatch.setattr(session, "execute", _failing_execute)
+
+        res = await _submit(
+            session,
+            action=_action(action_type="open_ticket", target_id="T_RACE_FAIL"),
+            judge=judge,
+        )
+
+        assert res["status"] == "rejected"
+        assert res["decision_note"] == "human rejected before cap check"
+        assert res["decision_source"] == "human"
+
+        hold_db = await service._find_proposal_hold(session, uuid.UUID(res["proposal_id"]))
+        assert hold_db is not None
+        assert hold_db.status == "rejected"
+        assert hold_db.decision_note == "human rejected before cap check"
+
+        # No cap_check_failed audit row
+        denial_audits = (
+            (
+                await session.execute(
+                    select(AuditLog).where(AuditLog.action == _AUTO_APPROVE_DENIED_AUDIT_ACTION)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(denial_audits) == 0
+
+    async def test_uncapped_db_timestamp_fetch_failure_rolls_back_and_succeeds_without_cascade(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Finding 3: DB error when fetching DB timestamp on the uncapped path must
+        properly roll back the session before falling back to _now(), ensuring subsequent
+        statements (like row locking for claim) succeed without InFailedSqlTransaction cascading."""
+        monkeypatch.delenv(PROPOSAL_AUTO_APPROVE_KILL_SWITCH_ENV_VAR, raising=False)
+        monkeypatch.delenv(PROPOSAL_AUTO_APPROVE_DAILY_CAPS_ENV_VAR, raising=False)
+        reset_proposal_auto_approve_cache()
+
+        judge = FakeProposalJudge(
+            judge_result=ProposalVerdict(
+                approved=True,
+                decision_note="looks good",
+                rule="linear_progress_update:open_ticket",
+            ),
+            apply_result=ProposalApplyOutcome(
+                applied=True, result={"applied": True}, caller_error=None, log_detail=None
+            ),
+        )
+
+        orig_execute = session.execute
+
+        clock_failed = False
+
+        async def _failing_execute(stmt, *args, **kwargs):
+            nonlocal clock_failed
+            if "clock_timestamp()" in str(stmt):
+                clock_failed = True
+                raise OperationalError(
+                    "simulated clock failure",
+                    params=None,
+                    orig=Exception("clock failed"),
+                )
+            return await orig_execute(stmt, *args, **kwargs)
+
+        monkeypatch.setattr(session, "execute", _failing_execute)
+
+        res = await _submit(
+            session,
+            action=_action(action_type="open_ticket", target_id="T_CLOCK_FAIL"),
+            judge=judge,
+        )
+
+        assert clock_failed is True
+        assert res["status"] == "applied"
+        assert res["decision_source"] == "auto"
+        assert len(judge.apply_calls) == 1
+
 
 class TestProposalResubmissionSnapshot:
     """Pins the JSON-normalization behavior of

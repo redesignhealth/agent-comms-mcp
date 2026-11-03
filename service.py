@@ -8739,6 +8739,9 @@ async def create_proposal(
         # Metering is strictly by validated action_type (not parsed verdict_rule, which
         # may be None for legacy progress update actions per PR12).
         if get_proposal_auto_approve_kill_switch():
+            if hold.status != "pending":
+                await session.commit()
+                return _bot_facing_proposal_dict(hold)
             judged_status = "pending"
             decision_note = "auto-approval is globally disabled; held for human review"
             _audit(
@@ -8769,6 +8772,10 @@ async def create_proposal(
                         ),
                         {"action_type": action_type},
                     )
+                    await session.refresh(hold)
+                    if hold.status != "pending":
+                        await session.commit()
+                        return _bot_facing_proposal_dict(hold)
                     db_now = await _fetch_db_timestamp(session)
                     auto_approved_at = db_now
                     day_start = db_now.astimezone(UTC).replace(
@@ -8786,6 +8793,10 @@ async def create_proposal(
                         )
                     ).scalar_one()
                     if count >= cap:
+                        await session.refresh(hold)
+                        if hold.status != "pending":
+                            await session.commit()
+                            return _bot_facing_proposal_dict(hold)
                         judged_status = "pending"
                         decision_note = (
                             f"daily auto-approval cap reached for {action_type}; "
@@ -8829,6 +8840,9 @@ async def create_proposal(
                             "invariant violation: hold vanished after rollback"
                         ) from exc
                     hold = hold_refetched
+                    if hold.status != "pending":
+                        await session.commit()
+                        return _bot_facing_proposal_dict(hold)
                     hold.decision_note = decision_note
                     _audit(
                         session,
@@ -8845,9 +8859,17 @@ async def create_proposal(
                     await session.commit()
                     await session.refresh(hold)
             else:
+                hold_id = hold.id
                 try:
                     auto_approved_at = await _fetch_db_timestamp(session)
-                except (DBAPIError, OperationalError):
+                except (DBAPIError, OperationalError) as exc:
+                    await session.rollback()
+                    hold_refetched = await _find_proposal_hold(session, hold_id)
+                    if hold_refetched is None:
+                        raise AssertionError(
+                            "invariant violation: hold vanished after rollback"
+                        ) from exc
+                    hold = hold_refetched
                     auto_approved_at = _now()
 
     auto_approved = judged_status == "approved" and hold.status == "pending"

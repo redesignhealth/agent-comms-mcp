@@ -1937,43 +1937,48 @@ class TestProposalHoldsSchema:
 
             await conn.run_sync(_check_valid)
 
-            # 3. Invalid (indisvalid=false) raises
-            await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS idx_audit_guard_test ON audit_log (id)")
-            )
-            try:
-                await conn.execute(
-                    text(
-                        "UPDATE pg_index SET indisvalid = false "
-                        "WHERE indexrelid = 'idx_audit_guard_test'::regclass"
-                    )
+            # 3 & 4. Invalid (indisvalid=false) and unready (indisready=false) guards:
+            # Direct UPDATE pg_index requires PostgreSQL superuser privileges which are
+            # not available in CI/RDS. We exercise the guard logic by monkeypatching the
+            # query execution on the connection, asserting the exact RuntimeError behavior.
+            class _MockRow:
+                def __init__(self, indisvalid: bool, indisready: bool) -> None:
+                    self._row = (indisvalid, indisready)
+
+                def __getitem__(self, idx: int) -> bool:
+                    return self._row[idx]
+
+            class _MockQueryResult:
+                def __init__(self, row: _MockRow | None) -> None:
+                    self._row = row
+
+                def fetchone(self) -> _MockRow | None:
+                    return self._row
+
+            class _MockBind:
+                def __init__(self, row: _MockRow | None) -> None:
+                    self._row = row
+
+                def execute(self, statement: Any, parameters: Any = None) -> _MockQueryResult:
+                    return _MockQueryResult(self._row)
+
+            # indisvalid=False, indisready=True raises
+            with pytest.raises(RuntimeError, match="not valid and ready"):
+                _assert_audit_log_index_valid_and_ready(
+                    "idx_audit_guard_test", bind=_MockBind(_MockRow(False, True))
                 )
 
-                def _check_invalid(sync_conn):
-                    with pytest.raises(RuntimeError, match="not valid and ready"):
-                        _assert_audit_log_index_valid_and_ready(
-                            "idx_audit_guard_test", bind=sync_conn
-                        )
-
-                await conn.run_sync(_check_invalid)
-
-                # 4. Unready (indisready=false) raises
-                await conn.execute(
-                    text(
-                        "UPDATE pg_index SET indisvalid = true, indisready = false "
-                        "WHERE indexrelid = 'idx_audit_guard_test'::regclass"
-                    )
+            # indisvalid=True, indisready=False raises
+            with pytest.raises(RuntimeError, match="not valid and ready"):
+                _assert_audit_log_index_valid_and_ready(
+                    "idx_audit_guard_test", bind=_MockBind(_MockRow(True, False))
                 )
 
-                def _check_unready(sync_conn):
-                    with pytest.raises(RuntimeError, match="not valid and ready"):
-                        _assert_audit_log_index_valid_and_ready(
-                            "idx_audit_guard_test", bind=sync_conn
-                        )
-
-                await conn.run_sync(_check_unready)
-            finally:
-                await conn.execute(text("DROP INDEX IF EXISTS idx_audit_guard_test"))
+            # indisvalid=False, indisready=False raises
+            with pytest.raises(RuntimeError, match="not valid and ready"):
+                _assert_audit_log_index_valid_and_ready(
+                    "idx_audit_guard_test", bind=_MockBind(_MockRow(False, False))
+                )
 
     async def test_decision_consistency_check_constraint_rejects_pending_with_decision(
         self, engine: AsyncEngine

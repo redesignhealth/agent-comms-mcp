@@ -52,7 +52,9 @@ def _assert_audit_log_index_valid_and_ready(
             SELECT i.indisvalid, i.indisready
             FROM pg_index i
             JOIN pg_class c ON c.oid = i.indexrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
             WHERE c.relname = :index_name
+              AND n.nspname = current_schema()
         """),
         {"index_name": index_name},
     ).fetchone()
