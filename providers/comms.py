@@ -1687,9 +1687,13 @@ async def post_message(
       verified — same held-for-approval behavior across a crossing boundary.
     - ``task_assign``: ``action`` enum:
       gather_availability/schedule_meeting/reschedule_meeting/cancel_meeting/
-      confirm_slot/report_status. ``gather_availability``,
+      confirm_slot/report_status/send_email. ``gather_availability``,
       ``schedule_meeting``, ``reschedule_meeting`` require ``window`` +
-      ``duration_min``; ``confirm_slot`` requires ``window``. Optional:
+      ``duration_min``; ``confirm_slot`` requires ``window``. ``send_email``
+      is a reference only (no address/subject/body) and requires
+      ``gap_task`` (``site_slug`` + ``task_id``), ``idempotency_key``
+      (``<gap task id>:<n>``) and ``requested_by`` (requester email); those
+      three are rejected on any other action. Optional:
       ``counterparty_agent_ids``, ``related_conversation_id``, ``modality``,
       ``priority``, ``due_at``, ``constraints``.
     - ``task_report``: ``status`` (in_progress/blocked); optional
