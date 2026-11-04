@@ -573,6 +573,78 @@ class TestTaskAssignV1:
     def test_registered_in_schema_registry(self) -> None:
         assert get_schema("task_assign", 1) is TaskAssignV1
 
+    def _email(self, **overrides: object) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "action": "send_email",
+            "idempotency_key": "gap-123:1",
+            "requested_by": "clicker@example.com",
+            "gap_task": {"site_slug": "acme-site", "task_id": "gap-123"},
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_send_email_accepts_reference_only(self) -> None:
+        model = TaskAssignV1.model_validate(self._email())
+        assert model.gap_task is not None and model.gap_task.task_id == "gap-123"
+        assert model.window is None and model.duration_min is None
+
+    @pytest.mark.parametrize("field", ["idempotency_key", "requested_by", "gap_task"])
+    def test_send_email_requires_each_reference_field(self, field: str) -> None:
+        payload = self._email()
+        del payload[field]
+        with pytest.raises(ValidationError, match=f"requires .*{field}"):
+            TaskAssignV1.model_validate(payload)
+
+    def test_send_email_key_must_match_gap_task_id(self) -> None:
+        with pytest.raises(ValidationError, match="must start with"):
+            TaskAssignV1.model_validate(self._email(idempotency_key="other-id:1"))
+
+    @pytest.mark.parametrize(
+        "key", ["gap-123", "gap-123:", "gap-123:x", ":1", "gap-123:1\n", "gap/123:1", "a:1:2"]
+    )
+    def test_bad_idempotency_key_rejected(self, key: str) -> None:
+        with pytest.raises(ValidationError):
+            TaskAssignV1.model_validate(self._email(idempotency_key=key))
+
+    @pytest.mark.parametrize(
+        "email", ["nope", "a@b@c", "a b@c.com", "a@c.com\n", "@c.com", "a@", "x" * 250 + "@c.com"]
+    )
+    def test_bad_requested_by_rejected(self, email: str) -> None:
+        with pytest.raises(ValidationError):
+            TaskAssignV1.model_validate(self._email(requested_by=email))
+
+    @pytest.mark.parametrize(
+        "ref",
+        [
+            {"site_slug": "a/b", "task_id": "gap-123"},
+            {"site_slug": "acme", "task_id": "../x"},
+            {"site_slug": "", "task_id": "gap-123"},
+            {"site_slug": "acme", "task_id": "gap-123", "extra": "x"},
+        ],
+    )
+    def test_bad_gap_task_rejected(self, ref: dict[str, str]) -> None:
+        with pytest.raises(ValidationError):
+            TaskAssignV1.model_validate(self._email(gap_task=ref))
+
+    def test_send_email_rejects_address_subject_body(self) -> None:
+        for field in ("to", "subject", "body", "email"):
+            with pytest.raises(ValidationError):
+                TaskAssignV1.model_validate(self._email(**{field: "x"}))
+
+    def test_email_fields_rejected_on_other_actions(self) -> None:
+        with pytest.raises(ValidationError, match="only valid with action 'send_email'"):
+            TaskAssignV1.model_validate(self._valid(idempotency_key="gap-123:1"))
+
+    def test_pre_existing_payloads_unchanged_by_email_fields(self) -> None:
+        model = TaskAssignV1.model_validate(self._valid())
+        assert model.idempotency_key is None
+        assert model.requested_by is None
+        assert model.gap_task is None
+
+    def test_validate_payload_normalizes_send_email(self) -> None:
+        result = validate_payload("task_assign", 1, self._email())
+        assert result["gap_task"] == {"site_slug": "acme-site", "task_id": "gap-123"}
+
     def test_validate_payload_normalizes_task_assign(self) -> None:
         result = validate_payload("task_assign", 1, self._valid())
         assert result["type"] == "task_assign"

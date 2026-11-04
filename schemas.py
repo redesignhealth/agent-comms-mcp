@@ -555,6 +555,17 @@ def _check_no_duplicates(values: Sequence[Any], field_name: str) -> None:
         raise ValueError(f"{field_name} must not contain duplicates")
 
 
+class GapTaskRef(_StrictModel):
+    """Reference to an Arcadia gap task: site slug + task id. The recipient
+    resolves it against Arcadia itself; nothing about the task's content
+    travels on the board. Same path-injection rationale as ``DocCitation``:
+    word characters and ``-`` only, so no separator can smuggle a path/URL
+    into the downstream lookup."""
+
+    site_slug: str = Field(min_length=1, max_length=100, pattern=r"^[\w-]+$")
+    task_id: str = Field(min_length=1, max_length=100, pattern=r"^[\w-]+$")
+
+
 class TaskAssignV1(_StrictModel):
     """task_assign / v1 — opens a task-coordination conversation (DESIGN.md §9;
     supersedes the ``task_spec``/dedicated ``tasks``
@@ -571,6 +582,14 @@ class TaskAssignV1(_StrictModel):
     ``gather_availability``/``schedule_meeting``/``reschedule_meeting``
     require ``window`` and ``duration_min``; ``confirm_slot`` requires
     ``window``. ``report_status`` needs neither.
+
+    ``send_email`` is a reference, not content: it requires ``gap_task``
+    (Arcadia site slug + gap task id), ``idempotency_key``
+    (``<gap task id>:<n>``, whose id part must match ``gap_task.task_id``)
+    and ``requested_by`` (the requesting user's email). There is no
+    address, subject or body field; the assignee reads those from Arcadia.
+    These three fields are only valid with ``send_email``. Messages
+    without them (every pre-existing action) validate unchanged.
     """
 
     type: Literal["task_assign"] = "task_assign"
@@ -581,6 +600,7 @@ class TaskAssignV1(_StrictModel):
         "cancel_meeting",
         "confirm_slot",
         "report_status",
+        "send_email",
     ]
     counterparty_agent_ids: list[UUID] = Field(default_factory=list, max_length=10)
     related_conversation_id: UUID | None = None
@@ -590,6 +610,18 @@ class TaskAssignV1(_StrictModel):
     priority: Literal["low", "normal", "high"] = "normal"
     due_at: AwareDatetime | None = None
     constraints: list[_CONSTRAINTS] = Field(default_factory=list, max_length=10)
+    idempotency_key: str | None = Field(
+        default=None, min_length=3, max_length=201, pattern=r"^[\w-]+:[0-9]+$"
+    )
+    # Structural email shape only (no email-validator dependency, and no
+    # whitespace/control characters); identity is not derived from this field.
+    requested_by: str | None = Field(
+        default=None,
+        min_length=3,
+        max_length=254,
+        pattern=r"^[^@\x00-\x20\x7f]+@[^@\x00-\x20\x7f]+$",
+    )
+    gap_task: GapTaskRef | None = None
 
     @model_validator(mode="after")
     def _no_duplicates(self) -> TaskAssignV1:
@@ -604,6 +636,22 @@ class TaskAssignV1(_StrictModel):
                 raise ValueError(f"action '{self.action}' requires 'window' and 'duration_min'")
         elif self.action == "confirm_slot" and self.window is None:
             raise ValueError("action 'confirm_slot' requires 'window'")
+        email_fields = {
+            "idempotency_key": self.idempotency_key,
+            "requested_by": self.requested_by,
+            "gap_task": self.gap_task,
+        }
+        if self.action == "send_email":
+            missing = [name for name, value in email_fields.items() if value is None]
+            if missing:
+                raise ValueError(f"action 'send_email' requires {', '.join(missing)}")
+            assert self.idempotency_key is not None and self.gap_task is not None
+            if self.idempotency_key.rsplit(":", 1)[0] != self.gap_task.task_id:
+                raise ValueError("idempotency_key must start with '<gap_task.task_id>:'")
+        else:
+            present = [name for name, value in email_fields.items() if value is not None]
+            if present:
+                raise ValueError(f"{', '.join(present)} only valid with action 'send_email'")
         return self
 
 
@@ -810,6 +858,7 @@ __all__ = [
     "ConversationOpenedV1",
     "CounterProposalV1",
     "DeclineV1",
+    "GapTaskRef",
     "InstructionKind",
     "InstructionRequestV1",
     "InstructionShareV1",
