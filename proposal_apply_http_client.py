@@ -131,12 +131,25 @@ def _tailnet_proxy_mounts_fallback() -> dict[str, httpx.AsyncBaseTransport]:
     return {"all://*.ts.net": httpx.AsyncHTTPTransport(proxy=url)}
 
 
-try:
-    from rh_comms_plugins.tls import (  # type: ignore[import-not-found]
-        tailnet_proxy_mounts,
-    )
-except (ImportError, AttributeError):
-    tailnet_proxy_mounts = _tailnet_proxy_mounts_fallback
+def _resolve_tailnet_proxy_mounts() -> Callable[[], dict[str, httpx.AsyncBaseTransport]]:
+    """Resolve tailnet_proxy_mounts from rh_comms_plugins.tls if present,
+    falling back to _tailnet_proxy_mounts_fallback ONLY if the module or symbol
+    is genuinely absent. Propagates any internal import errors raised within
+    rh_comms_plugins.tls.
+    """
+    try:
+        mod = importlib.import_module("rh_comms_plugins.tls")
+    except ModuleNotFoundError as exc:
+        if exc.name in ("rh_comms_plugins", "rh_comms_plugins.tls"):
+            return _tailnet_proxy_mounts_fallback
+        raise
+    fn = getattr(mod, "tailnet_proxy_mounts", None)
+    if fn is None:
+        return _tailnet_proxy_mounts_fallback
+    return cast(Callable[[], dict[str, httpx.AsyncBaseTransport]], fn)
+
+
+tailnet_proxy_mounts = _resolve_tailnet_proxy_mounts()
 
 
 # Failure disposition categories for the retry loop
@@ -268,6 +281,8 @@ def validate_proposal_apply_configuration() -> None:
         tailnet_proxy_mounts()
     except ValueError as exc:
         raise RuntimeError(str(exc)) from exc
+    except Exception as exc:
+        raise RuntimeError(f"failed to initialize HTTP client transport: {exc}") from exc
 
 
 def _sni_override_hook(sni_host: str) -> Callable[[httpx.Request], Awaitable[None]]:
@@ -590,7 +605,6 @@ async def apply_proposal(ctx: ProposalContext) -> ProposalApplyOutcome:
         backoff_base = _read_retry_backoff_seconds()
         retry_budget_seconds = _read_retry_budget_seconds()
         tls_sni_host = _read_tls_sni_host()
-        tailnet_proxy_mounts()
     except ValueError as exc:
         safe_exc = _sanitize_log_field(str(exc))
         logger.error("invalid proposal apply configuration: %s", safe_exc)

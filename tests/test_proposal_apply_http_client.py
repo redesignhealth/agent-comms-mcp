@@ -837,6 +837,83 @@ class TestTailnetProxyRouting:
         assert outcome.caller_error == "proposal apply service unreachable"
         assert "connection failed" in (outcome.log_detail or "")
 
+    async def test_apply_proposal_dials_connect_proxy_for_ts_net_url(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End-to-end socket-level proof that apply_proposal's *.ts.net POST
+        actually dials the CONNECT proxy: the proxy server records the tunnel
+        request line it received.
+
+        The 502 disposition test above cannot distinguish proxy-routed from
+        direct-dialed traffic -- httpx.ConnectError (direct dial, DNS failure)
+        and httpx.ProxyError map to IDENTICAL outcome strings -- so only the
+        recorded CONNECT line proves routing. A regression that drops
+        ``mounts=`` from the client construction would dial direct and never
+        reach this server. Exactly one CONNECT also pins the no-retry
+        semantics for a definite-clean proxy failure.
+        """
+        connects: list[str] = []
+
+        async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            head = await reader.readuntil(b"\r\n\r\n")
+            connects.append(head.split(b"\r\n")[0].decode())
+            writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+            await writer.drain()
+            writer.close()
+
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+
+        _set_required_env(monkeypatch)
+        monkeypatch.setenv(TAILNET_HTTP_PROXY_ENV_VAR, f"http://127.0.0.1:{port}")
+
+        async with server:
+            # Real _build_apply_client (no MockTransport patch): mounts must
+            # carry the POST through the proxy for the default ts.net base URL.
+            outcome = await apply_proposal(_ctx())
+
+        assert connects == ["CONNECT comms-approvals.example.ts.net:443 HTTP/1.1"]
+        assert outcome.applied is False
+        assert outcome.indeterminate is False
+        assert outcome.caller_error == "proposal apply service unreachable"
+        assert "connection failed" in (outcome.log_detail or "")
+
+    @pytest.mark.parametrize(
+        "bad_port_proxy",
+        [
+            "http://127.0.0.1:abc",
+            "http://127.0.0.1:99999",
+            "http://127.0.0.1:-1",
+        ],
+    )
+    async def test_unparseable_proxy_port_rejected_safely(
+        self, monkeypatch: pytest.MonkeyPatch, bad_port_proxy: str
+    ) -> None:
+        """Ports urlsplit cannot parse (non-numeric / out of 0-65535 range)
+        raise ValueError with messages that do NOT name TAILNET_HTTP_PROXY, so
+        the match="TAILNET_HTTP_PROXY" parametrize above cannot cover them.
+        Every seam must still reject them safely: ValueError from the mounts
+        builder and the client builder, RuntimeError from boot validation, and
+        a safe non-indeterminate outcome from apply_proposal (no raise, no
+        network attempt -- the failure is caught at config pre-flight).
+        """
+        monkeypatch.setenv(TAILNET_HTTP_PROXY_ENV_VAR, bad_port_proxy)
+        with pytest.raises(ValueError):
+            tailnet_proxy_mounts()
+        with pytest.raises(ValueError):
+            proposal_apply_http_client._build_apply_client(10.0, None)
+
+        _set_required_env(monkeypatch)
+        monkeypatch.setenv(TAILNET_HTTP_PROXY_ENV_VAR, bad_port_proxy)
+        with pytest.raises(RuntimeError):
+            validate_proposal_apply_configuration()
+
+        outcome = await apply_proposal(_ctx())
+        assert outcome.applied is False
+        assert outcome.indeterminate is False
+        assert outcome.caller_error == "server configuration error"
+        assert outcome.log_detail  # sanitized parse failure surfaced for operators
+
 
 class _MockJudgeDelegate:
     """Mock delegate representing RHProposalJudge."""
