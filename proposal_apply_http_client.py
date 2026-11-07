@@ -51,12 +51,18 @@ Env vars:
         (default 0.5s), exponential with full jitter capped at 4.0s.
     PROPOSAL_APPLY_RETRY_BUDGET_SECONDS: optional wall-clock ceiling in seconds
         (default 45.0s, minimum 2.0s) for the entire apply operation.
+    TAILNET_HTTP_PROXY: optional ``http://<loopback>:<port>`` HTTP CONNECT proxy
+        URL provided by the Tailscale sidecar listener (TECH-8246). When set,
+        only requests matching ``*.ts.net`` route through the proxy; all other
+        traffic routes directly. Must be an ``http://`` URL with loopback host
+        and port.
 """
 
 from __future__ import annotations
 
 import asyncio
 import importlib
+import ipaddress
 import json
 import logging
 import math
@@ -66,7 +72,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any, cast
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 import httpx
 
@@ -87,6 +93,7 @@ PROPOSAL_APPLY_TIMEOUT_SECONDS_ENV_VAR = "PROPOSAL_APPLY_TIMEOUT_SECONDS"
 PROPOSAL_APPLY_MAX_ATTEMPTS_ENV_VAR = "PROPOSAL_APPLY_MAX_ATTEMPTS"
 PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS_ENV_VAR = "PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS"
 PROPOSAL_APPLY_RETRY_BUDGET_SECONDS_ENV_VAR = "PROPOSAL_APPLY_RETRY_BUDGET_SECONDS"
+TAILNET_HTTP_PROXY_ENV_VAR = "TAILNET_HTTP_PROXY"
 
 DEFAULT_TIMEOUT_SECONDS = 15.0
 DEFAULT_MAX_ATTEMPTS = 3
@@ -102,6 +109,48 @@ _MAX_LOG_FIELD_LENGTH = 200
 _HOSTNAME_RE = re.compile(
     r"[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*\Z"
 )
+
+
+def _tailnet_proxy_mounts_fallback() -> dict[str, httpx.AsyncBaseTransport]:
+    """httpx ``mounts=`` routing only ``*.ts.net`` through the Tailscale sidecar's
+    HTTP CONNECT proxy (everything else dials direct). ``{}`` when unset; raises
+    ``ValueError`` unless the value is an ``http://`` URL on loopback."""
+    url = os.environ.get(TAILNET_HTTP_PROXY_ENV_VAR, "").strip()
+    if not url:
+        return {}
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    try:
+        loopback = host == "localhost" or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = False
+    if parts.scheme != "http" or not loopback or parts.port is None:
+        raise ValueError(
+            f"{TAILNET_HTTP_PROXY_ENV_VAR} must be http://<loopback>:<port>, got {url!r}"
+        )
+    return {"all://*.ts.net": httpx.AsyncHTTPTransport(proxy=url)}
+
+
+def _resolve_tailnet_proxy_mounts() -> Callable[[], dict[str, httpx.AsyncBaseTransport]]:
+    """Resolve tailnet_proxy_mounts from rh_comms_plugins.tls if present,
+    falling back to _tailnet_proxy_mounts_fallback ONLY if the module or symbol
+    is genuinely absent. Propagates any internal import errors raised within
+    rh_comms_plugins.tls.
+    """
+    try:
+        mod = importlib.import_module("rh_comms_plugins.tls")
+    except ModuleNotFoundError as exc:
+        if exc.name in ("rh_comms_plugins", "rh_comms_plugins.tls"):
+            return _tailnet_proxy_mounts_fallback
+        raise
+    fn = getattr(mod, "tailnet_proxy_mounts", None)
+    if fn is None:
+        return _tailnet_proxy_mounts_fallback
+    return cast(Callable[[], dict[str, httpx.AsyncBaseTransport]], fn)
+
+
+tailnet_proxy_mounts = _resolve_tailnet_proxy_mounts()
+
 
 # Failure disposition categories for the retry loop
 _DISPOSITION_DECIDED = "DECIDED"
@@ -229,8 +278,11 @@ def validate_proposal_apply_configuration() -> None:
         _read_retry_backoff_seconds()
         _read_retry_budget_seconds()
         _read_tls_sni_host()
+        tailnet_proxy_mounts()
     except ValueError as exc:
         raise RuntimeError(str(exc)) from exc
+    except Exception as exc:
+        raise RuntimeError(f"failed to initialize HTTP client transport: {exc}") from exc
 
 
 def _sni_override_hook(sni_host: str) -> Callable[[httpx.Request], Awaitable[None]]:
@@ -246,7 +298,8 @@ def _sni_override_hook(sni_host: str) -> Callable[[httpx.Request], Awaitable[Non
 
 
 def _build_apply_client(timeout_seconds: float, tls_sni_host: str | None) -> httpx.AsyncClient:
-    """Construct an httpx.AsyncClient with TLS SNI/Host override if configured.
+    """Construct an httpx.AsyncClient with TLS SNI/Host override and tailnet
+    proxy mounts if configured.
 
     Tests can monkeypatch this function to inject a MockTransport-backed client.
     """
@@ -263,6 +316,7 @@ def _build_apply_client(timeout_seconds: float, tls_sni_host: str | None) -> htt
         timeout=httpx.Timeout(timeout_seconds),
         follow_redirects=False,
         event_hooks=event_hooks,
+        mounts=tailnet_proxy_mounts(),
     )
 
 
@@ -802,8 +856,10 @@ __all__ = [
     "PROPOSAL_APPLY_TLS_SNI_HOST_ENV_VAR",
     "PROPOSAL_APPLY_TOKEN_ENV_VAR",
     "PROPOSAL_APPLY_URL_ENV_VAR",
+    "TAILNET_HTTP_PROXY_ENV_VAR",
     "HttpApplyProposalJudge",
     "apply_proposal",
     "build_rh_proposal_judge",
+    "tailnet_proxy_mounts",
     "validate_proposal_apply_configuration",
 ]

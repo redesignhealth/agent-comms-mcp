@@ -47,9 +47,11 @@ from proposal_apply_http_client import (
     PROPOSAL_APPLY_TLS_SNI_HOST_ENV_VAR,
     PROPOSAL_APPLY_TOKEN_ENV_VAR,
     PROPOSAL_APPLY_URL_ENV_VAR,
+    TAILNET_HTTP_PROXY_ENV_VAR,
     HttpApplyProposalJudge,
     apply_proposal,
     build_rh_proposal_judge,
+    tailnet_proxy_mounts,
     validate_proposal_apply_configuration,
 )
 
@@ -65,6 +67,7 @@ def _set_required_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(PROPOSAL_APPLY_MAX_ATTEMPTS_ENV_VAR, raising=False)
     monkeypatch.delenv(PROPOSAL_APPLY_RETRY_BACKOFF_SECONDS_ENV_VAR, raising=False)
     monkeypatch.delenv(PROPOSAL_APPLY_RETRY_BUDGET_SECONDS_ENV_VAR, raising=False)
+    monkeypatch.delenv(TAILNET_HTTP_PROXY_ENV_VAR, raising=False)
 
 
 def _patch_transport(monkeypatch: pytest.MonkeyPatch, handler: Any) -> None:
@@ -681,6 +684,235 @@ class TestTlsSniOverride:
 
         assert request.headers["host"] == sni_host
         assert request.extensions.get("sni_hostname") == sni_host
+
+
+class TestTailnetProxyRouting:
+    """TECH-8246: Route *.ts.net apply requests through TAILNET_HTTP_PROXY."""
+
+    def test_unset_proxy_env_returns_empty_mounts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv(TAILNET_HTTP_PROXY_ENV_VAR, raising=False)
+        assert tailnet_proxy_mounts() == {}
+
+    def test_empty_proxy_env_returns_empty_mounts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(TAILNET_HTTP_PROXY_ENV_VAR, "")
+        assert tailnet_proxy_mounts() == {}
+        monkeypatch.setenv(TAILNET_HTTP_PROXY_ENV_VAR, "   ")
+        assert tailnet_proxy_mounts() == {}
+
+    @pytest.mark.parametrize(
+        "loopback_url",
+        [
+            "http://127.0.0.1:1055",
+            "http://localhost:1055",
+            "http://[::1]:1055",
+        ],
+    )
+    def test_valid_loopback_proxy_mounts_ts_net(
+        self, monkeypatch: pytest.MonkeyPatch, loopback_url: str
+    ) -> None:
+        monkeypatch.setenv(TAILNET_HTTP_PROXY_ENV_VAR, loopback_url)
+        mounts = tailnet_proxy_mounts()
+        assert list(mounts.keys()) == ["all://*.ts.net"]
+        assert isinstance(mounts["all://*.ts.net"], httpx.AsyncHTTPTransport)
+
+    @pytest.mark.parametrize(
+        "invalid_proxy",
+        [
+            "https://127.0.0.1:1055",
+            "http://example.com:1055",
+            "http://10.0.0.1:1055",
+            "http://192.168.1.1:1055",
+            "http://127.0.0.1",
+            "127.0.0.1:1055",
+            "ftp://127.0.0.1:1055",
+            "socks5://127.0.0.1:1055",
+        ],
+    )
+    async def test_malformed_or_non_loopback_proxy_rejected(
+        self, monkeypatch: pytest.MonkeyPatch, invalid_proxy: str
+    ) -> None:
+        monkeypatch.setenv(TAILNET_HTTP_PROXY_ENV_VAR, invalid_proxy)
+        with pytest.raises(ValueError, match="TAILNET_HTTP_PROXY"):
+            tailnet_proxy_mounts()
+
+        with pytest.raises(ValueError, match="TAILNET_HTTP_PROXY"):
+            proposal_apply_http_client._build_apply_client(10.0, None)
+
+        _set_required_env(monkeypatch)
+        monkeypatch.setenv(TAILNET_HTTP_PROXY_ENV_VAR, invalid_proxy)
+        with pytest.raises(RuntimeError, match="TAILNET_HTTP_PROXY"):
+            validate_proposal_apply_configuration()
+
+        outcome = await apply_proposal(_ctx())
+        assert outcome.applied is False
+        assert outcome.indeterminate is False
+        assert outcome.caller_error == "server configuration error"
+        assert "TAILNET_HTTP_PROXY" in (outcome.log_detail or "")
+
+    def test_tailnet_url_uses_proxy_and_non_tailnet_direct(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(TAILNET_HTTP_PROXY_ENV_VAR, "http://127.0.0.1:1055")
+        client = proposal_apply_http_client._build_apply_client(10.0, None)
+
+        tsnet_req = client.build_request(
+            "POST",
+            "https://comms-approvals.drum-mackarel.ts.net/actions/proposals/apply",
+        )
+        tsnet_transport = client._transport_for_url(tsnet_req.url)
+        # Transport for *.ts.net must be the proxy transport, not client._transport
+        assert tsnet_transport is not client._transport
+        assert isinstance(tsnet_transport, httpx.AsyncHTTPTransport)
+
+        direct_req1 = client.build_request("POST", "https://api.linear.app/graphql")
+        direct_req2 = client.build_request("POST", "https://127.0.0.1:8000/actions")
+        assert client._transport_for_url(direct_req1.url) is client._transport
+        assert client._transport_for_url(direct_req2.url) is client._transport
+
+    async def test_connect_proxy_routing_and_sni_host_preserved(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        connects: list[str] = []
+
+        async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            head = await reader.readuntil(b"\r\n\r\n")
+            connects.append(head.split(b"\r\n")[0].decode())
+            writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+            await writer.drain()
+            writer.close()
+
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        monkeypatch.setenv(TAILNET_HTTP_PROXY_ENV_VAR, f"http://127.0.0.1:{port}")
+        sni_host = "approvals-peer.drum-mackarel.ts.net"
+        client = proposal_apply_http_client._build_apply_client(5.0, sni_host)
+        assert client.follow_redirects is False
+
+        seen: list[tuple[str, str]] = []
+
+        async def record_hook(r: httpx.Request) -> None:
+            seen.append((r.headers["host"], str(r.extensions.get("sni_hostname"))))
+
+        client.event_hooks.setdefault("request", []).append(record_hook)
+
+        async with server, client:
+            # Non-ts.net dials direct (bypasses proxy)
+            with pytest.raises(httpx.ConnectError):
+                await client.get("https://127.0.0.1:1/actions")
+            assert connects == []
+
+            # *.ts.net routes through CONNECT proxy
+            with pytest.raises(httpx.ProxyError):
+                await client.post(
+                    "https://comms-approvals.drum-mackarel.ts.net/actions/proposals/apply"
+                )
+
+        assert connects == ["CONNECT comms-approvals.drum-mackarel.ts.net:443 HTTP/1.1"]
+        assert (sni_host, sni_host) in seen
+
+    async def test_apply_proposal_with_proxy_failure_disposition(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+            await writer.drain()
+            writer.close()
+
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+
+        _set_required_env(monkeypatch)
+        monkeypatch.setenv(
+            proposal_apply_http_client.PROPOSAL_APPLY_URL_ENV_VAR,
+            "https://comms-approvals.drum-mackarel.ts.net/actions",
+        )
+        monkeypatch.setenv(TAILNET_HTTP_PROXY_ENV_VAR, f"http://127.0.0.1:{port}")
+
+        async with server:
+            outcome = await apply_proposal(_ctx())
+
+        assert outcome.applied is False
+        assert outcome.indeterminate is False
+        assert outcome.caller_error == "proposal apply service unreachable"
+        assert "connection failed" in (outcome.log_detail or "")
+
+    async def test_apply_proposal_dials_connect_proxy_for_ts_net_url(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End-to-end socket-level proof that apply_proposal's *.ts.net POST
+        actually dials the CONNECT proxy: the proxy server records the tunnel
+        request line it received.
+
+        The 502 disposition test above cannot distinguish proxy-routed from
+        direct-dialed traffic -- httpx.ConnectError (direct dial, DNS failure)
+        and httpx.ProxyError map to IDENTICAL outcome strings -- so only the
+        recorded CONNECT line proves routing. A regression that drops
+        ``mounts=`` from the client construction would dial direct and never
+        reach this server. Exactly one CONNECT also pins the no-retry
+        semantics for a definite-clean proxy failure.
+        """
+        connects: list[str] = []
+
+        async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            head = await reader.readuntil(b"\r\n\r\n")
+            connects.append(head.split(b"\r\n")[0].decode())
+            writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+            await writer.drain()
+            writer.close()
+
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+
+        _set_required_env(monkeypatch)
+        monkeypatch.setenv(TAILNET_HTTP_PROXY_ENV_VAR, f"http://127.0.0.1:{port}")
+
+        async with server:
+            # Real _build_apply_client (no MockTransport patch): mounts must
+            # carry the POST through the proxy for the default ts.net base URL.
+            outcome = await apply_proposal(_ctx())
+
+        assert connects == ["CONNECT comms-approvals.example.ts.net:443 HTTP/1.1"]
+        assert outcome.applied is False
+        assert outcome.indeterminate is False
+        assert outcome.caller_error == "proposal apply service unreachable"
+        assert "connection failed" in (outcome.log_detail or "")
+
+    @pytest.mark.parametrize(
+        "bad_port_proxy",
+        [
+            "http://127.0.0.1:abc",
+            "http://127.0.0.1:99999",
+            "http://127.0.0.1:-1",
+        ],
+    )
+    async def test_unparseable_proxy_port_rejected_safely(
+        self, monkeypatch: pytest.MonkeyPatch, bad_port_proxy: str
+    ) -> None:
+        """Ports urlsplit cannot parse (non-numeric / out of 0-65535 range)
+        raise ValueError with messages that do NOT name TAILNET_HTTP_PROXY, so
+        the match="TAILNET_HTTP_PROXY" parametrize above cannot cover them.
+        Every seam must still reject them safely: ValueError from the mounts
+        builder and the client builder, RuntimeError from boot validation, and
+        a safe non-indeterminate outcome from apply_proposal (no raise, no
+        network attempt -- the failure is caught at config pre-flight).
+        """
+        monkeypatch.setenv(TAILNET_HTTP_PROXY_ENV_VAR, bad_port_proxy)
+        with pytest.raises(ValueError):
+            tailnet_proxy_mounts()
+        with pytest.raises(ValueError):
+            proposal_apply_http_client._build_apply_client(10.0, None)
+
+        _set_required_env(monkeypatch)
+        monkeypatch.setenv(TAILNET_HTTP_PROXY_ENV_VAR, bad_port_proxy)
+        with pytest.raises(RuntimeError):
+            validate_proposal_apply_configuration()
+
+        outcome = await apply_proposal(_ctx())
+        assert outcome.applied is False
+        assert outcome.indeterminate is False
+        assert outcome.caller_error == "server configuration error"
+        assert outcome.log_detail  # sanitized parse failure surfaced for operators
 
 
 class _MockJudgeDelegate:
