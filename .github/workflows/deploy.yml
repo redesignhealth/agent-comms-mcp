@@ -162,6 +162,58 @@ jobs:
             echo "ERROR: deploy role cannot find dev ECR image ($DIGEST) — image not found." >&2
             exit 1
           fi
+
+          # Recent docker buildx / GitHub Actions runner environments push images as an OCI
+          # image index (application/vnd.oci.image.index.v1+json) containing child platform
+          # manifests plus an attestation manifest (platform os/arch "unknown"). Previous
+          # releases pushed single Docker v2 manifests with a top-level `layers` array.
+          # If an index was returned, resolve the linux/amd64 child manifest digest (falling back
+          # to the first known-platform image manifest) and refetch so we can inspect layers.
+          # DO NOT simplify this back to a single BatchGetImage: index digests do not have layers!
+          if ! CHILD_DIGEST=$(echo "$MANIFEST" | python3 -c '
+          import json, sys
+          m = json.load(sys.stdin)
+          manifests = m.get("manifests")
+          if manifests is not None:
+              for entry in manifests:
+                  plat = entry.get("platform") or {}
+                  if plat.get("os") == "linux" and plat.get("architecture") == "amd64" and entry.get("digest"):
+                      print(entry["digest"])
+                      sys.exit(0)
+              valid_media_types = {
+                  "application/vnd.oci.image.manifest.v1+json",
+                  "application/vnd.docker.distribution.manifest.v2+json",
+              }
+              for entry in manifests:
+                  plat = entry.get("platform") or {}
+                  if (
+                      entry.get("mediaType") in valid_media_types
+                      and plat.get("os") not in (None, "", "unknown")
+                      and plat.get("architecture") not in (None, "", "unknown")
+                      and entry.get("digest")
+                  ):
+                      print(entry["digest"])
+                      sys.exit(0)
+              print("ERROR: no usable child manifest found in dev ECR OCI image index.", file=sys.stderr)
+              sys.exit(1)
+          '); then
+            echo "ERROR: could not resolve child manifest from dev ECR image index ($DIGEST)." >&2
+            exit 1
+          fi
+          if [ -n "$CHILD_DIGEST" ]; then
+            if ! MANIFEST=$(aws ecr batch-get-image \
+              --repository-name rh-platform-dev/apps/reclaw-comms-mcp \
+              --image-ids imageDigest="$CHILD_DIGEST" \
+              --query 'images[0].imageManifest' --output text); then
+              echo "ERROR: deploy role BatchGetImage failed for child manifest ($CHILD_DIGEST). Check ReadDevECRForPromotion IAM permission." >&2
+              exit 1
+            fi
+            if [ -z "$MANIFEST" ] || [ "$MANIFEST" = "None" ]; then
+              echo "ERROR: deploy role cannot find child manifest ($CHILD_DIGEST) — image not found." >&2
+              exit 1
+            fi
+          fi
+
           # 2. Test ecr:GetDownloadUrlForLayer (layer URL fetch) using the first layer digest.
           # Fail explicitly if we can't extract a layer digest — a parse failure that silently
           # skips this check would defeat the purpose of the probe.
