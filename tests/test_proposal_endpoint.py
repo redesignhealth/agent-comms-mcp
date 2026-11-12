@@ -1262,7 +1262,9 @@ class TestListPendingProposals:
 
         # Submit from registered bot
         provider.tokens["registered-bot-token"] = _agent_jwt_token(
-            "registered-bot-pending", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+            "registered-bot-pending",
+            scopes=["comms:proposals:write"],
+            owner_sub="owner-a@example.com",
         )
         body_reg = {
             **_PROPOSAL_BODY,
@@ -1275,14 +1277,18 @@ class TestListPendingProposals:
 
         # Submit from unregistered bot
         provider.tokens["unregistered-bot-token"] = _agent_jwt_token(
-            "unregistered-bot-pending", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+            "unregistered-bot-pending",
+            scopes=["comms:proposals:write"],
+            owner_sub="owner-a@example.com",
         )
         body_unreg = {
             **_PROPOSAL_BODY,
             "action": {**_PROPOSAL_BODY["action"], "target_id": "TECH-UNREG-1"},
         }
         resp = await http_client.post(
-            "/proposals", json=body_unreg, headers={"Authorization": "Bearer unregistered-bot-token"}
+            "/proposals",
+            json=body_unreg,
+            headers={"Authorization": "Bearer unregistered-bot-token"},
         )
         assert resp.status_code == 200
 
@@ -1300,7 +1306,9 @@ class TestListPendingProposals:
 
         assert "unregistered-bot-pending" in by_bot
         assert "proposed_by_display_name" not in by_bot["unregistered-bot-pending"]
-        assert by_bot["unregistered-bot-pending"]["proposed_by_bot_id"] == "unregistered-bot-pending"
+        assert (
+            by_bot["unregistered-bot-pending"]["proposed_by_bot_id"] == "unregistered-bot-pending"
+        )
 
     async def test_keyed_agent_resolves_keyed_display_name_in_pending(
         self,
@@ -1349,7 +1357,8 @@ class TestListPendingProposals:
         match = next(p for p in proposals if p["proposal_id"] == proposal_id)
         # proposed_by_bot_id remains the base sub
         assert match["proposed_by_bot_id"] == "iron-man"
-        # proposed_by_display_name must resolve to the keyed agent's display name, NOT the base agent
+        # proposed_by_display_name must resolve to the keyed agent's display name,
+        # NOT the base agent
         assert match["proposed_by_display_name"] == "Arc Reactor Worker Alpha"
 
     async def test_has_more_with_registered_agents_populates_display_name(
@@ -1872,9 +1881,7 @@ async def _submit_via_http(
     agent_key: str | None = None,
 ) -> str:
     token_key = f"bot-token-{bot_id}"
-    token = _agent_jwt_token(
-        bot_id, scopes=["comms:proposals:write"], owner_sub=owner_sub
-    )
+    token = _agent_jwt_token(bot_id, scopes=["comms:proposals:write"], owner_sub=owner_sub)
     provider.tokens[token_key] = token
     provider.tokens["bot-token"] = token
     body: dict[str, Any] = {
