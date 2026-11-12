@@ -7864,7 +7864,25 @@ async def _list_proposals_with_elision(
 
     stmt = select(*select_items).join(subq, ProposalHold.id == subq.c.id)
     if include_agent_display_name:
-        stmt = stmt.outerjoin(Agent, Agent.sub == ProposalHold.proposed_by_bot_id)
+        # Prefer exact attribution FK ProposalHold.sender_agent_id (resolves
+        # keyed agents whose Agent.sub is {base_sub}::{agent_key} rather than
+        # proposed_by_bot_id). When sender_agent_id is NULL (unregistered bots
+        # or legacy rows), fall back to matching Agent.sub against proposed_by_bot_id.
+        # The mutually exclusive is_not(None) / is_(None) branches ensure a
+        # single left join without double-matching or row fan-out.
+        stmt = stmt.outerjoin(
+            Agent,
+            or_(
+                and_(
+                    ProposalHold.sender_agent_id.is_not(None),
+                    Agent.id == ProposalHold.sender_agent_id,
+                ),
+                and_(
+                    ProposalHold.sender_agent_id.is_(None),
+                    Agent.sub == ProposalHold.proposed_by_bot_id,
+                ),
+            ),
+        )
     stmt = stmt.order_by(*order_clauses)
     rows = (await session.execute(stmt)).all()
     has_more = len(rows) > limit

@@ -1694,7 +1694,14 @@ across two opposite auth postures:
   below) in the trail, even though the client sees a uniform `unauthorized`
   body either way. `service.ALLOWED_SURFACES` enumerates the three valid
   values so an arbitrary caller-supplied string can never become an audit
-  action name.
+  action name. Proposal dicts returned here and on `GET /proposals/history`
+  include `proposed_by_display_name` (TECH-8395): optional, present only when
+  the proposer resolves to a registered agent (preferring attribution FK
+  `sender_agent_id` over `proposed_by_bot_id`), providing a human-readable
+  name; callers must fall back to `proposed_by_bot_id` when omitted or None.
+  Submitting bot-facing responses (`POST /proposals`, `GET /proposals/{id}`,
+  etc.) deliberately omit `proposed_by_display_name` to preserve byte-identical
+  payloads.
 - **`GET /proposals/history`** (TECH-6030) is `GET /proposals/pending`'s
   terminal-status sibling, added so `agent-comms-approvals`'s
   `decision_page` can show a human reviewer their own already-decided (or
@@ -1718,9 +1725,11 @@ across two opposite auth postures:
   `service._proposal_dict` (never the bot-facing formatter) -- the human
   reviewer who decided (or whose bot withdrew) the proposal is exactly
   who's entitled to see `decided_by_actor_id`, unlike the bot-facing
-  surface's deliberate redaction of that same field. Must be registered
-  before the `/proposals/{id}` wildcard route, same ordering requirement
-  `pending` already has.
+  surface's deliberate redaction of that same field. Also includes
+  `proposed_by_display_name` when the proposer resolves to a registered agent
+  (same optional fallback-to-`proposed_by_bot_id` contract as `pending`).
+  Must be registered before the `/proposals/{id}` wildcard route, same ordering
+  requirement `pending` already has.
 
 **Bot-facing MCP tool surface** (`providers/proposals.py`, mounted
 `namespace="proposals"` -- `proposals_submit`, `proposals_get`,
