@@ -15,6 +15,7 @@ import os
 import sys
 import uuid
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -29,7 +30,7 @@ from starlette.routing import Route
 import plugins
 import service
 from exceptions import ProposalDecisionValidationError
-from models import AuditLog, ProposalHold
+from models import Agent, AuditLog, ProposalHold
 from plugins import (
     FINGERPRINT_DIGEST,
     FINGERPRINT_UNAVAILABLE,
@@ -1242,6 +1243,65 @@ class TestListPendingProposals:
         assert len(body["proposals"]) == limit
         assert body["has_more"] is True
 
+    async def test_registered_agent_returns_display_name_and_unregistered_omits(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        http_client, provider = client
+        agent = Agent(
+            sub="registered-bot-pending",
+            owner_sub="owner-a@example.com",
+            owner_email="owner-a@example.com",
+            display_name="Arc Reactor",
+            status="active",
+            bound_at=datetime.now(UTC),
+        )
+        session.add(agent)
+        await session.commit()
+
+        # Submit from registered bot
+        provider.tokens["registered-bot-token"] = _agent_jwt_token(
+            "registered-bot-pending", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        body_reg = {
+            **_PROPOSAL_BODY,
+            "action": {**_PROPOSAL_BODY["action"], "target_id": "TECH-REG-1"},
+        }
+        resp = await http_client.post(
+            "/proposals", json=body_reg, headers={"Authorization": "Bearer registered-bot-token"}
+        )
+        assert resp.status_code == 200
+
+        # Submit from unregistered bot
+        provider.tokens["unregistered-bot-token"] = _agent_jwt_token(
+            "unregistered-bot-pending", scopes=["comms:proposals:write"], owner_sub="owner-a@example.com"
+        )
+        body_unreg = {
+            **_PROPOSAL_BODY,
+            "action": {**_PROPOSAL_BODY["action"], "target_id": "TECH-UNREG-1"},
+        }
+        resp = await http_client.post(
+            "/proposals", json=body_unreg, headers={"Authorization": "Bearer unregistered-bot-token"}
+        )
+        assert resp.status_code == 200
+
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+        pending = await http_client.get(
+            "/proposals/pending", headers={"Authorization": "Bearer human-token"}
+        )
+        assert pending.status_code == 200
+        proposals = pending.json()["proposals"]
+        by_bot = {p["proposed_by_bot_id"]: p for p in proposals}
+
+        assert "registered-bot-pending" in by_bot
+        assert by_bot["registered-bot-pending"]["proposed_by_display_name"] == "Arc Reactor"
+        assert by_bot["registered-bot-pending"]["proposed_by_bot_id"] == "registered-bot-pending"
+
+        assert "unregistered-bot-pending" in by_bot
+        assert "proposed_by_display_name" not in by_bot["unregistered-bot-pending"]
+        assert by_bot["unregistered-bot-pending"]["proposed_by_bot_id"] == "unregistered-bot-pending"
+
 
 class TestProposalHistoryAuthGate:
     async def test_missing_token_returns_401(
@@ -1595,6 +1655,69 @@ class TestListProposalHistory:
         assert len(body["proposals"]) == limit
         assert body["has_more"] is False
 
+    async def test_registered_agent_returns_display_name_and_unregistered_omits_in_history(
+        self,
+        client: tuple[httpx.AsyncClient, _FakeAuthProvider],
+        session: AsyncSession,
+    ) -> None:
+        http_client, provider = client
+        agent = Agent(
+            sub="registered-bot-hist",
+            owner_sub="owner-a@example.com",
+            owner_email="owner-a@example.com",
+            display_name="Arc History Bot",
+            status="active",
+            bound_at=datetime.now(UTC),
+        )
+        session.add(agent)
+        await session.commit()
+
+        # Submit from registered bot and decide (reject)
+        p_reg_id = await _submit_via_http(
+            http_client,
+            provider,
+            owner_sub="owner-a@example.com",
+            target_id="TECH-HIST-REG",
+            bot_id="registered-bot-hist",
+        )
+        provider.tokens["human-token"] = _interactive_token("owner-a@example.com")
+        decide_resp = await http_client.post(
+            f"/proposals/{p_reg_id}/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={"decision": "reject", "decision_note": "not needed"},
+        )
+        assert decide_resp.status_code == 200
+
+        # Submit from unregistered bot and decide (reject)
+        p_unreg_id = await _submit_via_http(
+            http_client,
+            provider,
+            owner_sub="owner-a@example.com",
+            target_id="TECH-HIST-UNREG",
+            bot_id="unregistered-bot-hist",
+        )
+        decide_resp = await http_client.post(
+            f"/proposals/{p_unreg_id}/decide",
+            headers={"Authorization": "Bearer human-token"},
+            json={"decision": "reject", "decision_note": "not needed"},
+        )
+        assert decide_resp.status_code == 200
+
+        history = await http_client.get(
+            "/proposals/history", headers={"Authorization": "Bearer human-token"}
+        )
+        assert history.status_code == 200
+        proposals = history.json()["proposals"]
+        by_bot = {p["proposed_by_bot_id"]: p for p in proposals}
+
+        assert "registered-bot-hist" in by_bot
+        assert by_bot["registered-bot-hist"]["proposed_by_display_name"] == "Arc History Bot"
+        assert by_bot["registered-bot-hist"]["proposed_by_bot_id"] == "registered-bot-hist"
+
+        assert "unregistered-bot-hist" in by_bot
+        assert "proposed_by_display_name" not in by_bot["unregistered-bot-hist"]
+        assert by_bot["unregistered-bot-hist"]["proposed_by_bot_id"] == "unregistered-bot-hist"
+
 
 async def _submit_via_http(
     http_client: httpx.AsyncClient,
@@ -1602,9 +1725,10 @@ async def _submit_via_http(
     *,
     owner_sub: str = "owner-a@example.com",
     target_id: str = "TECH-1",
+    bot_id: str = "bot-1",
 ) -> str:
     provider.tokens["bot-token"] = _agent_jwt_token(
-        "bot-1", scopes=["comms:proposals:write"], owner_sub=owner_sub
+        bot_id, scopes=["comms:proposals:write"], owner_sub=owner_sub
     )
     body = {**_PROPOSAL_BODY, "action": {**_PROPOSAL_BODY["action"], "target_id": target_id}}
     resp = await http_client.post(

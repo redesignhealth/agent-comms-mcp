@@ -7541,6 +7541,7 @@ def _proposal_dict(
     *,
     action_override: Any = _DEFAULT_ACTION,
     elided_action_fields: dict[str, Any] | None = None,
+    display_name: str | None = None,
 ) -> dict[str, Any]:
     action = hold.action if action_override is _DEFAULT_ACTION else action_override
     result: dict[str, Any] = {
@@ -7557,6 +7558,8 @@ def _proposal_dict(
         "created_at": _iso(hold.created_at),
         "updated_at": _iso(hold.updated_at),
     }
+    if display_name:
+        result["proposed_by_display_name"] = display_name
     if elided_action_fields is not None:
         result["elided_action_fields"] = elided_action_fields
     if hold.decision_source is not None:
@@ -7807,6 +7810,7 @@ async def _list_proposals_with_elision(
     to_dict: Callable[..., dict[str, Any]],
     cursor_kind: str | None = None,
     since: str | None = None,
+    include_agent_display_name: bool = False,
 ) -> dict[str, Any]:
     """Shared body of the three proposal list queries (TECH-7720).
 
@@ -7826,39 +7830,42 @@ async def _list_proposals_with_elision(
         .subquery()
     )
     projected_action, elided_utf8_bytes, elided_chars = _proposal_projected_columns()
-    stmt = (
-        select(
-            ProposalHold.id,
-            ProposalHold.kind,
-            ProposalHold.proposed_by_bot_id,
-            ProposalHold.rationale,
-            ProposalHold.confidence,
-            ProposalHold.importance,
-            ProposalHold.impact,
-            ProposalHold.priority,
-            ProposalHold.status,
-            ProposalHold.created_at,
-            ProposalHold.updated_at,
-            ProposalHold.decision_source,
-            ProposalHold.decided_by_actor_id,
-            ProposalHold.decided_at,
-            ProposalHold.decision_note,
-            ProposalHold.decision_reason_code,
-            ProposalHold.applied_at,
-            ProposalHold.apply_error,
-            ProposalHold.apply_result,
-            ProposalHold.sender_agent_id,
-            ProposalHold.cross_brain,
-            ProposalHold.approvals,
-            ProposalHold.labels,
-            ProposalHold.log_seq,
-            projected_action,
-            elided_utf8_bytes,
-            elided_chars,
-        )
-        .join(subq, ProposalHold.id == subq.c.id)
-        .order_by(*order_clauses)
-    )
+    select_items: list[Any] = [
+        ProposalHold.id,
+        ProposalHold.kind,
+        ProposalHold.proposed_by_bot_id,
+        ProposalHold.rationale,
+        ProposalHold.confidence,
+        ProposalHold.importance,
+        ProposalHold.impact,
+        ProposalHold.priority,
+        ProposalHold.status,
+        ProposalHold.created_at,
+        ProposalHold.updated_at,
+        ProposalHold.decision_source,
+        ProposalHold.decided_by_actor_id,
+        ProposalHold.decided_at,
+        ProposalHold.decision_note,
+        ProposalHold.decision_reason_code,
+        ProposalHold.applied_at,
+        ProposalHold.apply_error,
+        ProposalHold.apply_result,
+        ProposalHold.sender_agent_id,
+        ProposalHold.cross_brain,
+        ProposalHold.approvals,
+        ProposalHold.labels,
+        ProposalHold.log_seq,
+        projected_action,
+        elided_utf8_bytes,
+        elided_chars,
+    ]
+    if include_agent_display_name:
+        select_items.append(Agent.display_name.label("proposed_by_display_name"))
+
+    stmt = select(*select_items).join(subq, ProposalHold.id == subq.c.id)
+    if include_agent_display_name:
+        stmt = stmt.outerjoin(Agent, Agent.sub == ProposalHold.proposed_by_bot_id)
+    stmt = stmt.order_by(*order_clauses)
     rows = (await session.execute(stmt)).all()
     has_more = len(rows) > limit
     returned_rows = rows[:limit]
@@ -7869,9 +7876,13 @@ async def _list_proposals_with_elision(
             if row.elided_utf8_bytes is not None
             else None
         )
-        proposals.append(
-            to_dict(row, action_override=row.projected_action, elided_action_fields=elided)
-        )
+        kwargs: dict[str, Any] = {
+            "action_override": row.projected_action,
+            "elided_action_fields": elided,
+        }
+        if include_agent_display_name:
+            kwargs["display_name"] = row.proposed_by_display_name
+        proposals.append(to_dict(row, **kwargs))
 
     if cursor_kind is None:
         return {"proposals": proposals, "has_more": has_more}
@@ -9094,6 +9105,7 @@ async def list_pending_proposal_holds(
         order_clauses=(ProposalHold.created_at.asc(), ProposalHold.id.asc()),
         limit=limit,
         to_dict=_proposal_dict,
+        include_agent_display_name=True,
     )
 
 
@@ -9140,6 +9152,7 @@ async def list_proposal_history_for_owner(
         order_clauses=(ProposalHold.created_at.desc(), ProposalHold.id.desc()),
         limit=limit,
         to_dict=_proposal_dict,
+        include_agent_display_name=True,
     )
 
 
