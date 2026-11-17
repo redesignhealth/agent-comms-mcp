@@ -79,6 +79,7 @@ from db import get_session_factory
 from exceptions import (
     AccessDeniedError,
     HoldAlreadyDecidedError,
+    ProposalImmutableError,
     ProposalTargetUnavailableError,
     RateLimitExceededError,
 )
@@ -145,7 +146,9 @@ async def _map_proposal_errors() -> AsyncIterator[None]:
     ``RateLimitExceededError`` (TECH-5875, per-bot submission
     rate limit) and ``HoldAlreadyDecidedError`` (a withdraw racing an
     already-claimed hold) are both specific-by-design (see their own
-    docstrings in exceptions.py) and pass through unwrapped too.
+    docstrings in exceptions.py) and pass through unwrapped too, as does
+    ``ProposalImmutableError`` (TECH-8951, a changed resubmission of an open
+    ``gmail_send``-style proposal; it names only the bot's own hold).
 
     ``exceptions.ProposalTargetUnavailableError`` (Argus review round-3 B1)
     is raised by ``service.create_proposal`` when the configured
@@ -159,7 +162,12 @@ async def _map_proposal_errors() -> AsyncIterator[None]:
         yield
     except AccessDeniedError as exc:
         raise ToolError(str(exc)) from None
-    except (RateLimitExceededError, HoldAlreadyDecidedError, ValueError) as exc:
+    except (
+        RateLimitExceededError,
+        HoldAlreadyDecidedError,
+        ProposalImmutableError,
+        ValueError,
+    ) as exc:
         raise ToolError(str(exc)) from None
     except ProposalTargetUnavailableError as exc:
         raise ToolError(exc.detail) from None
@@ -200,7 +208,10 @@ async def submit(
     SAME ``(kind, target_id, action_type)`` updates the existing pending
     row in place rather than creating a duplicate. A different bot
     proposing the identical ``(kind, target_id, action_type)`` gets its
-    own separate row.
+    own separate row. Exception: an open ``gmail_send`` proposal is never
+    edited in place -- an identical resubmission returns it unchanged, a
+    changed one fails with ``proposal ... cannot be changed by
+    resubmission``; withdraw it and submit again for a new proposal.
 
     Cross-brain (TECH-7665, off unless the board enables it): for
     ``arcana_source_add``, ``action.target`` may name ANOTHER agent's brain

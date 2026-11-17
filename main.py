@@ -45,6 +45,7 @@ from exceptions import (
     InvalidOwnerReassignmentError,
     InvalidProposalActionError,
     ProposalDecisionValidationError,
+    ProposalImmutableError,
     ProposalTargetUnavailableError,
     RateLimitExceededError,
 )
@@ -951,24 +952,56 @@ async def _authenticate_proposal_submitter(
 # approvals service's own service identity.
 PROPOSAL_APPLY_RECORD_SUBS_ENV = "PROPOSAL_APPLY_RECORD_ALLOWED_SUBS"
 _DEFAULT_PROPOSAL_APPLY_RECORD_SUBS = "agent-comms-approvals"
+# Subjects that may read apply-records of ONLY the listed kinds (TECH-8951):
+# comma-separated ``sub=kind`` entries, one kind per entry (repeat the sub for
+# more kinds), e.g. ``rh-google-mcp=gmail_send``. Lets the Gmail sender read
+# approved ``gmail_send`` proposals without seeing any other kind. Default
+# empty. A sub listed here is kind-restricted even if it is also in
+# ``PROPOSAL_APPLY_RECORD_ALLOWED_SUBS`` (the narrower grant wins). Entries
+# without exactly one ``=`` or with an empty side are ignored (fail closed).
+PROPOSAL_APPLY_RECORD_KIND_SCOPED_SUBS_ENV = "PROPOSAL_APPLY_RECORD_KIND_SCOPED_SUBS"
 
 
-async def _authenticate_apply_record_caller(request: Request) -> tuple[str | None, int]:
+def _apply_record_kind_scoped_subs() -> dict[str, frozenset[str]]:
+    scoped: dict[str, set[str]] = {}
+    for entry in os.environ.get(PROPOSAL_APPLY_RECORD_KIND_SCOPED_SUBS_ENV, "").split(","):
+        parts = entry.split("=")
+        if len(parts) != 2:
+            if entry.strip():
+                logger.warning(
+                    "ignoring malformed %s entry", PROPOSAL_APPLY_RECORD_KIND_SCOPED_SUBS_ENV
+                )
+            continue
+        sub, kind = parts[0].strip(), parts[1].strip()
+        if not sub or not kind:
+            logger.warning(
+                "ignoring malformed %s entry", PROPOSAL_APPLY_RECORD_KIND_SCOPED_SUBS_ENV
+            )
+            continue
+        scoped.setdefault(sub, set()).add(kind)
+    return {sub: frozenset(kinds) for sub, kinds in scoped.items()}
+
+
+async def _authenticate_apply_record_caller(
+    request: Request,
+) -> tuple[str | None, frozenset[str] | None, int]:
     """Gate for ``GET /proposals/{hold_id}/apply-record`` (TECH-7694):
     a verified agent-chain service token (never Okta/interactive) carrying
     ``PROPOSAL_APPLY_RECORD_SCOPE`` whose subject is on the
-    ``PROPOSAL_APPLY_RECORD_ALLOWED_SUBS`` allowlist. Returns
-    ``(sub, 200)`` or ``(None, 401 | 403)``; every 403 is audited under the
-    ``apply_record`` surface."""
+    ``PROPOSAL_APPLY_RECORD_ALLOWED_SUBS`` allowlist or the
+    ``PROPOSAL_APPLY_RECORD_KIND_SCOPED_SUBS`` map (TECH-8951). Returns
+    ``(sub, allowed_kinds, 200)`` -- ``allowed_kinds`` is ``None`` for an
+    all-kinds reader -- or ``(None, None, 401 | 403)``; every 403 is
+    audited under the ``apply_record`` surface."""
     token_str = _extract_bearer_token(request)
     if token_str is None:
-        return None, 401
+        return None, None, 401
     token = await _verify_agent_token(token_str)
     if token is None:
-        return None, 401
+        return None, None, 401
     sub = try_resolve_email(token)
     if sub is None:
-        return None, 401
+        return None, None, 401
     allowed = {
         entry.strip()
         for entry in os.environ.get(
@@ -976,13 +1009,16 @@ async def _authenticate_apply_record_caller(request: Request) -> tuple[str | Non
         ).split(",")
         if entry.strip()
     }
-    if PROPOSAL_APPLY_RECORD_SCOPE not in scopes_for_token(token) or sub not in allowed:
+    allowed_kinds = _apply_record_kind_scoped_subs().get(sub)
+    if PROPOSAL_APPLY_RECORD_SCOPE not in scopes_for_token(token) or (
+        sub not in allowed and allowed_kinds is None
+    ):
         async with get_session_factory()() as session:
             await service.audit_denied_proposal_submission(
                 session, actor_sub=sub, reason="missing_scope", surface="apply_record"
             )
-        return None, 403
-    return sub, 200
+        return None, None, 403
+    return sub, allowed_kinds, 200
 
 
 MAX_PROPOSAL_REQUEST_BYTES = 5 * 1024 * 1024  # 5 MiB (TECH-7720)
@@ -1010,7 +1046,9 @@ async def submit_proposal(request: Request) -> Response:
     a duplicate (TECH-5872) -- scoped to the submitting bot (Argus review
     B1): a different bot proposing the same ``(kind, target_id,
     action_type)`` gets its own row, never silently overwrites another
-    bot's pending proposal.
+    bot's pending proposal. An open ``gmail_send`` row is never updated
+    in place (TECH-8951): a changed resubmission is 409
+    ``proposal_immutable`` (see ``service.IMMUTABLE_PROPOSAL_KINDS``).
     Immediately judged by the TECH-5877 kind-scoped deterministic rules
     engine -- ``priority`` is always server-derived, never caller-supplied.
 
@@ -1160,6 +1198,18 @@ async def submit_proposal(request: Request) -> Response:
             # log (proposal_holds has no dedicated metrics pipeline yet).
             logger.warning("proposal submission rate-limited for proposed_by_bot_id=%s", bot_sub)
             return JSONResponse({"error": "rate_limited", "detail": str(exc)}, status_code=429)
+        except ProposalImmutableError as exc:
+            # TECH-8951: an open proposal of an immutable kind is never
+            # edited in place; withdraw it and submit again.
+            return JSONResponse(
+                {
+                    "error": "proposal_immutable",
+                    "detail": str(exc),
+                    "hold_id": exc.hold_id,
+                    "status": exc.status,
+                },
+                status_code=409,
+            )
         except InvalidProposalActionError as exc:
             # TECH-7711: a supported kind with a malformed action. Same
             # error/detail shape as the plain ValueError below plus an
@@ -1369,10 +1419,13 @@ async def withdraw_proposal_route(request: Request) -> Response:
 @mcp.custom_route("/proposals/{hold_id}/apply-record", methods=["GET"])
 async def get_proposal_apply_record_route(request: Request) -> Response:
     """Service-only read of what the board recorded about a proposal hold's
-    decision (TECH-7694), for the approvals service's pre-apply re-check.
-    Auth: ``_authenticate_apply_record_caller`` (scope + subject allowlist).
+    decision (TECH-7694), for the approvals service's pre-apply re-check and
+    rh-google-mcp's ``send_approved_email`` (TECH-8951, ``gmail_send`` only).
+    Auth: ``_authenticate_apply_record_caller`` (scope + subject allowlist,
+    optionally kind-scoped). A hold of a kind the caller may not read is the
+    same uniform 404 as an unknown one.
     Unknown hold: uniform 404. Read-only; never mutates the hold."""
-    caller_sub, status = await _authenticate_apply_record_caller(request)
+    caller_sub, allowed_kinds, status = await _authenticate_apply_record_caller(request)
     if caller_sub is None:
         return JSONResponse({"error": "unauthorized"}, status_code=status)
 
@@ -1384,7 +1437,7 @@ async def get_proposal_apply_record_route(request: Request) -> Response:
     async with get_session_factory()() as session:
         try:
             result = await service.get_proposal_apply_record(
-                session, hold_id=hold_id, requesting_sub=caller_sub
+                session, hold_id=hold_id, requesting_sub=caller_sub, allowed_kinds=allowed_kinds
             )
         except AccessDeniedError:
             return JSONResponse(_UNIFORM_HOLD_NOT_FOUND, status_code=404)

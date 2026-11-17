@@ -193,6 +193,7 @@ from exceptions import (
     InvalidOwnerReassignmentError,
     InvalidProposalActionError,
     ProposalDecisionValidationError,
+    ProposalImmutableError,
     ProposalTargetUnavailableError,
     RateLimitExceededError,
     SchemaVersionMismatchError,
@@ -8154,6 +8155,47 @@ def _proposal_resubmission_snapshot(hold: ProposalHold) -> tuple[Any, ...]:
     )
 
 
+# TECH-8951: kinds whose open (pending/applying) row is never edited in place by
+# a same-bot resubmission. The owner approves exactly the payload they reviewed:
+# an in-place edit after the reviewer opened the proposal would let the bot swap
+# recipients or body under an approval click. An identical resubmission (a retry)
+# returns the open row unchanged; a different one raises ProposalImmutableError
+# (409) -- withdraw and resubmit for a new row. Decided rows are never dedup
+# matches at all (``_proposal_dedup_where`` only matches pending/applying), so a
+# resubmission after a decision always inserts a new row.
+IMMUTABLE_PROPOSAL_KINDS: frozenset[str] = frozenset({"gmail_send"})
+
+
+def _check_immutable_resubmission(
+    existing: ProposalHold,
+    *,
+    action: dict[str, Any],
+    rationale: str,
+    confidence: str,
+    importance: str,
+    impact: str,
+    priority: str,
+    target_fingerprint: str,
+    labels: dict[str, str] | None,
+) -> None:
+    """Raise ``ProposalImmutableError`` unless the resubmission matches
+    ``existing`` on every column ``_apply_proposal_resubmission`` would have
+    overwritten. Compared through ``_proposal_resubmission_snapshot`` on a
+    detached row so the field set cannot drift from that function's."""
+    submitted = ProposalHold(
+        action=action,
+        rationale=rationale,
+        confidence=confidence,
+        importance=importance,
+        impact=impact,
+        priority=priority,
+        target_fingerprint=target_fingerprint,
+        labels=labels,
+    )
+    if _proposal_resubmission_snapshot(existing) != _proposal_resubmission_snapshot(submitted):
+        raise ProposalImmutableError(str(existing.id), existing.status)
+
+
 async def _dedup_or_insert_proposal(
     session: AsyncSession,
     *,
@@ -8201,6 +8243,19 @@ async def _dedup_or_insert_proposal(
     )
     existing = (await session.execute(stmt)).scalars().first()
     if existing is not None:
+        if kind in IMMUTABLE_PROPOSAL_KINDS:
+            _check_immutable_resubmission(
+                existing,
+                action=action,
+                rationale=rationale,
+                confidence=confidence,
+                importance=importance,
+                impact=impact,
+                priority=priority,
+                target_fingerprint=target_fingerprint,
+                labels=labels,
+            )
+            return existing
         # Argus review round-3 B1: an 'applying' match is mid-flight under
         # a concurrent _apply_or_finalize_proposal_hold -- mutating its
         # action/target_fingerprint here would desync what actually gets
@@ -8260,6 +8315,19 @@ async def _dedup_or_insert_proposal(
             # before this re-read) -- nothing sane to update; surface the
             # original DB error rather than silently proceeding.
             raise
+        if kind in IMMUTABLE_PROPOSAL_KINDS:
+            _check_immutable_resubmission(
+                existing_after_race,
+                action=action,
+                rationale=rationale,
+                confidence=confidence,
+                importance=importance,
+                impact=impact,
+                priority=priority,
+                target_fingerprint=target_fingerprint,
+                labels=labels,
+            )
+            return existing_after_race
         # Argus review round-3 B1: same "don't mutate an in-flight
         # 'applying' row" guard as the common-case SELECT above.
         if existing_after_race.status == "pending":
@@ -9225,8 +9293,26 @@ async def get_proposal_for_bot(
     return _bot_facing_proposal_dict(hold)
 
 
+def proposal_owner_email(owner_sub: str) -> str | None:
+    """The proposal owner's email (TECH-8951), or ``None`` when unknown.
+
+    ``owner_sub`` already IS the owner's email whenever a human can decide the
+    proposal: the RH agent verifier sets the token's ``owner_sub`` claim to
+    the ownership registry's ``owner_email``, ``mint_token --owner-email``
+    does the same, and ``decide_proposal`` only accepts an approver whose
+    Okta identity (``email`` claim) equals ``owner_sub``. A non-email
+    ``owner_sub`` (a self-owned bot that fell back to its own sub) has no
+    email on the board, so this returns ``None`` and consumers must fail
+    closed rather than compare against it."""
+    return owner_sub if "@" in owner_sub else None
+
+
 async def get_proposal_apply_record(
-    session: AsyncSession, *, hold_id: uuid.UUID, requesting_sub: str
+    session: AsyncSession,
+    *,
+    hold_id: uuid.UUID,
+    requesting_sub: str,
+    allowed_kinds: frozenset[str] | None = None,
 ) -> dict[str, Any]:
     """``GET /proposals/{hold_id}/apply-record`` (main.py, non-MCP,
     service-gated -- TECH-7694). What the board itself recorded about a
@@ -9240,6 +9326,11 @@ async def get_proposal_apply_record(
     that the approver is the submitter's owner. ``target_id`` and
     ``action_type`` come from the same extraction the apply path uses, so
     the caller recomputes its request digest from identical inputs.
+
+    ``allowed_kinds`` (TECH-8951): ``None`` means the caller may read every
+    kind; otherwise a hold of any other kind is the same uniform 404 as an
+    unknown one, audited as ``denied.proposal_apply_record_kind_not_allowed``.
+    ``owner_email`` is ``proposal_owner_email(owner_sub)``.
     """
     hold = await _find_proposal_hold(session, hold_id)
     if hold is None:
@@ -9249,6 +9340,15 @@ async def get_proposal_apply_record(
             action="denied.unknown_proposal_hold",
             detail={"attempted_hold_id": str(hold_id)},
         )
+    if allowed_kinds is not None and hold.kind not in allowed_kinds:
+        # TECH-8951: a kind-scoped reader (e.g. rh-google-mcp, gmail_send
+        # only) gets the same uniform 404 as an unknown hold.
+        await _deny(
+            session,
+            actor_sub=requesting_sub,
+            action="denied.proposal_apply_record_kind_not_allowed",
+            detail={"attempted_hold_id": str(hold_id)},
+        )
     target_id, action_type = _extract_proposal_target(hold.action)
     return {
         "hold_id": str(hold.id),
@@ -9256,6 +9356,7 @@ async def get_proposal_apply_record(
         "kind": hold.kind,
         "proposed_by_bot_id": hold.proposed_by_bot_id,
         "owner_sub": hold.owner_sub,
+        "owner_email": proposal_owner_email(hold.owner_sub),
         "action": hold.action,
         "target_id": target_id,
         "action_type": action_type,
@@ -12043,6 +12144,7 @@ __all__ = [
     "DEFAULT_RECONCILIATION_BATCH_SIZE",
     "DOCUMENT_PROPOSAL_CONTENT_ELISION_BYTES",
     "DOCUMENT_PROPOSAL_KINDS",
+    "IMMUTABLE_PROPOSAL_KINDS",
     "MAX_APPROVAL_HOLDS_PER_MINUTE",
     "MAX_CONVERSATION_STARTS_PER_HOUR",
     "MAX_DECISION_REASON_LENGTH",
@@ -12116,6 +12218,7 @@ __all__ = [
     "post_message",
     "proposal_action_serialized_bytes",
     "proposal_auto_approve_daily_cap_for",
+    "proposal_owner_email",
     "proposal_rate_limit_for",
     "reconcile_agent_ownership",
     "register_agent",
