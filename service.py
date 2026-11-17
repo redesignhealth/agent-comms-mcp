@@ -8165,6 +8165,13 @@ def _proposal_resubmission_snapshot(hold: ProposalHold) -> tuple[Any, ...]:
 # resubmission after a decision always inserts a new row.
 IMMUTABLE_PROPOSAL_KINDS: frozenset[str] = frozenset({"gmail_send"})
 
+# TECH-8951: kinds the board never auto-approves, whatever the judge plugin
+# returns (the kill switch and daily caps are irrelevant to them). A
+# ``gmail_send`` sends mail as the owner, so only the owner's own decide call
+# can approve it. Enforced in ``create_proposal`` on every submission,
+# including an identical retry that re-runs the judge against the open row.
+HUMAN_APPROVAL_ONLY_PROPOSAL_KINDS: frozenset[str] = frozenset({"gmail_send"})
+
 
 def _check_immutable_resubmission(
     existing: ProposalHold,
@@ -8879,6 +8886,12 @@ async def create_proposal(
         else:
             judged_status = "pending"
             decision_note = "cross-brain proposals always require human approval"
+
+    if kind in HUMAN_APPROVAL_ONLY_PROPOSAL_KINDS and judged_status == "approved":
+        # TECH-8951 (Argus review): never auto-approve a kind that acts as the
+        # owner (e.g. gmail_send), even if an out-of-repo judge plugin says so.
+        judged_status = "pending"
+        decision_note = f"{kind} proposals always require the owner's approval"
 
     auto_approved_at: datetime | None = None
     if judged_status == "approved":
@@ -12144,6 +12157,7 @@ __all__ = [
     "DEFAULT_RECONCILIATION_BATCH_SIZE",
     "DOCUMENT_PROPOSAL_CONTENT_ELISION_BYTES",
     "DOCUMENT_PROPOSAL_KINDS",
+    "HUMAN_APPROVAL_ONLY_PROPOSAL_KINDS",
     "IMMUTABLE_PROPOSAL_KINDS",
     "MAX_APPROVAL_HOLDS_PER_MINUTE",
     "MAX_CONVERSATION_STARTS_PER_HOUR",

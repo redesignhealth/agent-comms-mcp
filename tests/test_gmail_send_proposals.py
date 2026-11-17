@@ -226,7 +226,7 @@ class TestGmailSendResubmission:
         assert rows[0].action == _GMAIL_ACTION
         assert rows[1].action["to"] == ["new@acme.example"]
 
-    async def test_auto_approve_verdict_on_identical_retry_still_needs_matching_payload(
+    async def test_identical_retry_re_runs_the_judge_on_the_unchanged_row(
         self, session: AsyncSession
     ) -> None:
         """An identical retry re-runs the judge on the unchanged row, exactly
@@ -236,7 +236,53 @@ class TestGmailSendResubmission:
         second = await _submit(session, judge=judge)
         assert second["proposal_id"] == first["proposal_id"]
         assert len(judge.judge_calls) == 1
+        assert (await _rows(session))[0].action == _GMAIL_ACTION
 
+
+class TestGmailSendNeverAutoApproved:
+    """Argus review: the board never auto-approves ``gmail_send``, whatever
+    the (out-of-repo) judge plugin returns."""
+
+    async def test_approving_verdict_on_first_submission_stays_pending(
+        self, session: AsyncSession
+    ) -> None:
+        judge = FakeProposalJudge(judge_result=ProposalVerdict(approved=True, decision_note=None))
+        result = await _submit(session, judge=judge)
+        assert result["status"] == "pending"
+        assert len(judge.judge_calls) == 1
+        assert judge.apply_calls == []
+        rows = await _rows(session)
+        assert [r.status for r in rows] == ["pending"]
+        assert rows[0].decided_at is None
+
+    async def test_approving_verdict_on_identical_retry_stays_pending(
+        self, session: AsyncSession
+    ) -> None:
+        first = await _submit(session)
+        judge = FakeProposalJudge(judge_result=ProposalVerdict(approved=True, decision_note=None))
+        second = await _submit(session, judge=judge)
+        assert second["proposal_id"] == first["proposal_id"]
+        assert second["status"] == "pending"
+        assert judge.apply_calls == []
+        assert [r.status for r in await _rows(session)] == ["pending"]
+
+    async def test_other_kinds_can_still_be_auto_approved(self, session: AsyncSession) -> None:
+        judge = FakeProposalJudge(judge_result=ProposalVerdict(approved=True, decision_note=None))
+        result = await _submit(
+            session,
+            kind="linear_progress_update",
+            action={"action_type": "close_ticket", "target_id": "TECH-1"},
+            judge=judge,
+        )
+        assert result["status"] != "pending"
+        assert len(judge.apply_calls) == 1
+
+    def test_gmail_send_is_human_approval_only_and_immutable(self) -> None:
+        assert "gmail_send" in service.HUMAN_APPROVAL_ONLY_PROPOSAL_KINDS
+        assert "gmail_send" in service.IMMUTABLE_PROPOSAL_KINDS
+
+
+class TestGmailSendResubmissionEdgeCases:
     async def test_integrity_race_against_changed_payload_is_rejected(
         self,
         session: AsyncSession,
