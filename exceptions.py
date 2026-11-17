@@ -507,6 +507,25 @@ class InvalidOwnerReassignmentError(Exception):
     """Raised when an owner reassignment request is rejected by business rules (TECH-7389)."""
 
 
+class ProposalImmutableError(Exception):
+    """A resubmission matched an open (``pending``/``applying``) proposal of an
+    immutable kind (``service.IMMUTABLE_PROPOSAL_KINDS``, e.g. ``gmail_send``)
+    with a DIFFERENT payload (TECH-8951). Such a row is never edited in place:
+    the owner approves exactly what they reviewed. Maps to HTTP 409. The bot
+    must withdraw the open proposal and submit again, which creates a new row.
+    Carries the open hold's id and status; only the submitting bot can match
+    its own row (the dedup key includes ``proposed_by_bot_id``), so neither
+    value tells the caller anything it could not already read."""
+
+    def __init__(self, hold_id: str, status: str) -> None:
+        self.hold_id = hold_id
+        self.status = status
+        super().__init__(
+            f"proposal {hold_id} (status={status!r}) cannot be changed by resubmission; "
+            "withdraw it and submit a new proposal"
+        )
+
+
 __all__ = [
     "AccessDeniedError",
     "AgentAlreadyRegisteredError",
@@ -522,6 +541,7 @@ __all__ = [
     "InvalidExtendError",
     "InvalidOwnerReassignmentError",
     "InvalidProposalActionError",
+    "ProposalImmutableError",
     "ProposalTargetUnavailableError",
     "RateLimitExceededError",
     "SchemaVersionMismatchError",

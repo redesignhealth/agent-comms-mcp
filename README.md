@@ -184,7 +184,15 @@ approval before applying it. Gated on the agent-token chain only (never Okta),
 the `proposals:apply_record:read` scope, and a subject allowlist
 (`PROPOSAL_APPLY_RECORD_ALLOWED_SUBS`, default `agent-comms-approvals`);
 unknown holds are a uniform 404 and denials are audited under
-`denied.proposal_apply_record_missing_scope`. `POST
+`denied.proposal_apply_record_missing_scope`. A subject can instead be granted
+only some kinds via `PROPOSAL_APPLY_RECORD_KIND_SCOPED_SUBS` (comma-separated
+`sub=kind` entries, default empty; e.g. `rh-google-mcp=gmail_send` for
+rh-google-mcp's `send_approved_email`, TECH-8951); a hold of any other kind is
+the same uniform 404, audited as `denied.proposal_apply_record_kind_not_allowed`.
+The record includes `owner_email` (the owner's email, which is the hold's
+`owner_sub` when that is email-shaped, else `null`). An open `gmail_send`
+proposal is never edited in place by a resubmission: an identical retry returns
+it, a changed one is a 409 `proposal_immutable` (withdraw and resubmit). `POST
 /proposals/{id}/decide` (TECH-5873) is the
 human decide-and-synchronously-apply side: `approve`/`reject` on a
 `"pending"` proposal, same interactive-only + owner_sub-scoped gate as
