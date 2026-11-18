@@ -187,7 +187,7 @@ unknown holds are a uniform 404 and denials are audited under
 `denied.proposal_apply_record_missing_scope`. A subject can instead be granted
 only some kinds via `PROPOSAL_APPLY_RECORD_KIND_SCOPED_SUBS` (comma-separated
 `sub=kind` entries, default empty; e.g. `rh-google-mcp=gmail_send` for
-rh-google-mcp's `send_approved_email`, TECH-8951); a hold of any other kind is
+rh-google-mcp's internal send-approved route, TECH-8951); a hold of any other kind is
 the same uniform 404, audited as `denied.proposal_apply_record_kind_not_allowed`.
 The record includes `owner_email` (the owner's email, which is the hold's
 `owner_sub` when that is email-shaped, else `null`). An open `gmail_send`

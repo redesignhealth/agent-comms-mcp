@@ -1420,7 +1420,8 @@ async def withdraw_proposal_route(request: Request) -> Response:
 async def get_proposal_apply_record_route(request: Request) -> Response:
     """Service-only read of what the board recorded about a proposal hold's
     decision (TECH-7694), for the approvals service's pre-apply re-check and
-    rh-google-mcp's ``send_approved_email`` (TECH-8951, ``gmail_send`` only).
+    rh-google-mcp's internal ``/internal/gmail/send-approved`` route, which the
+    approvals service calls to send (TECH-8951, ``gmail_send`` only).
     Auth: ``_authenticate_apply_record_caller`` (scope + subject allowlist,
     optionally kind-scoped). A hold of a kind the caller may not read is the
     same uniform 404 as an unknown one.
