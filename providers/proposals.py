@@ -213,6 +213,28 @@ async def submit(
     changed one fails with ``proposal ... cannot be changed by
     resubmission``; withdraw it and submit again for a new proposal.
 
+    ``kind="gmail_send"`` (propose an email; ``action_type`` must be exactly
+    ``send_email``, ``target_id`` must start with ``gmail:``)::
+
+        {"target_id": "gmail:<token>", "action_type": "send_email",
+         "to": ["a@example.com"], "cc": [], "bcc": [], "subject": "Hi",
+         "body": "Hello", "attachments": []}
+
+    Required: ``to`` (1-50 bare ``user@host.tld`` addresses, <=254 chars each,
+    no names/``<>``/commas/spaces), ``subject`` (<=998), ``body`` (<=12000).
+    Optional: ``cc``, ``bcc`` (50 recipients max across all three) and
+    ``attachments`` (<=10 Google Drive file ID strings, not objects).
+    No other fields (no ``from``); no control or invisible characters in
+    addresses or subject. ``action`` is capped at 16 KiB.
+    Never auto-approved: only the owner's own decision approves it. On
+    approval the approvals service (not you) sends it once as the owner via
+    an internal rh-google-mcp route; agents have no send tool. Via
+    ``proposals_get`` you see only the proposal status: ``applied`` means
+    approved, not delivered. The send result is shown to the owner on the
+    decision page, not to you. A failed or unconfirmed send is final and
+    never retried -- submit a NEW proposal. A changed resubmission of an
+    open one is refused: withdraw and resubmit.
+
     Cross-brain (TECH-7665, off unless the board enables it): for
     ``arcana_source_add``, ``action.target`` may name ANOTHER agent's brain
     (a board agent id or sub). Any agent may propose; the proposal is never
