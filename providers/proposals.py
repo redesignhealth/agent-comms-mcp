@@ -235,6 +235,31 @@ async def submit(
     never retried -- submit a NEW proposal. A changed resubmission of an
     open one is refused: withdraw and resubmit.
 
+    ``kind="catalog_candidate"`` (propose a change to the opportunity catalog;
+    reviewed by Arcadia, TECH-9214)::
+
+        {"target_id": "concept:<slug>" | "pair:<concept-slug>:<MARKET>",
+         "action_type": "create" | "upsert" | "delete",
+         "payload": {...}, "base_version": 3, "reason": "...",
+         "fact_check": [{"round": 1, "agreement_score": 80}],
+         "citations": [{"revision_id": "...", "offset": 0, "length": 40, "quote": "..."}]}
+
+    ``create``/``upsert`` carry ``payload`` (Arcadia's candidate payload schema:
+    a concept for ``concept:<slug>``, a concept-market version for ``pair:...``),
+    a non-empty ``fact_check`` log (no minimum score) and ``citations`` that
+    each resolve to YOUR OWN stored sources (same citation shape and check as
+    Arcana brain proposals). ``base_version`` (integer >= 1) is allowed on
+    ``upsert`` only, naming the catalog version you edited. ``delete`` needs only
+    ``target_id`` and ``reason``. A submission failing any check is refused with
+    the reason. Content from health systems is refused. Never auto-approved:
+    Arcadia's reviewers decide, not the owner. The proposal stays ``pending``
+    until they do; then ``proposals_get`` shows ``status`` ``applied``,
+    ``rejected`` or ``changes_requested``, plus the reviewers' ``decision_note``
+    and ``external_ref`` (the Arcadia candidate id); the reviewer is never named.
+    ``changes_requested`` closes the proposal: submit a NEW one with the changes.
+    An open one is never edited in place (withdraw and resubmit). ``action`` is
+    capped at 256 KiB.
+
     Cross-brain (TECH-7665, off unless the board enables it): for
     ``arcana_source_add``, ``action.target`` may name ANOTHER agent's brain
     (a board agent id or sub). Any agent may propose; the proposal is never
