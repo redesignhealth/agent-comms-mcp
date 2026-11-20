@@ -204,7 +204,11 @@ already-`"applied"` hold is a no-op (returns the existing applied state,
 no second write) -- but retrying while the hold is still `"applying"`
 (another decide call, or the auto-judge, currently has it claimed and is
 mid-flight on its own external round-trip) returns 409, not a no-op: this
-call never got a chance to decide anything. See docs/DESIGN.md's "The
+call never got a chance to decide anything. A `catalog_candidate` proposal
+(TECH-9214, proposals to the opportunity catalog) is never auto-approved by the
+board whatever the judge says, never edited in place by a resubmission, capped
+at 256 KiB, refused by `/decide` (400) and left out of `GET /proposals/pending`:
+its reviewers are external, not the owner. See docs/DESIGN.md's "The
 proposal submission pipeline" section for the create-time dedup key,
 per-bot rate limit, pluggable auto-approval judge, and the full
 decide/apply status-transition and fingerprint-contract details.

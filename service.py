@@ -7712,6 +7712,11 @@ MAX_PROPOSAL_KIND_LENGTH = 200
 MAX_PROPOSAL_ACTION_BYTES = 16_384
 MAX_DOCUMENT_PROPOSAL_ACTION_BYTES = 4 * 1024 * 1024  # 4 MiB (TECH-7720)
 DOCUMENT_PROPOSAL_KINDS: frozenset[str] = frozenset({"arcana_source_add", "arcana_source_revise"})
+# TECH-9214: a catalog candidate carries a full concept-market version (assessments,
+# citations, fact-check rounds), well beyond the 16 KiB default but nowhere near a
+# document's size. Its own cap, so the document limit stays document-only.
+CATALOG_CANDIDATE_KIND = "catalog_candidate"
+MAX_CATALOG_CANDIDATE_ACTION_BYTES = 256 * 1024
 # Listing projection only (TECH-7720): document ``action.content`` larger than
 # this many UTF-8 bytes is elided from list responses. Deliberately its own
 # constant, not ``MAX_PROPOSAL_ACTION_BYTES`` -- that one is a submit-time
@@ -7724,11 +7729,13 @@ def max_proposal_action_bytes(kind: str | None) -> int:
 
     Document proposal kinds (arcana_source_add/revise) are permitted up to 4 MiB
     to accommodate up to 1 MiB of UTF-8 content with JSON Unicode escaping and
-    associated action metadata. All other proposal kinds retain the default
-    16 KiB limit (TECH-7720).
+    associated action metadata (TECH-7720). ``catalog_candidate`` gets 256 KiB
+    (TECH-9214). All other proposal kinds retain the default 16 KiB limit.
     """
     if isinstance(kind, str) and kind in DOCUMENT_PROPOSAL_KINDS:
         return MAX_DOCUMENT_PROPOSAL_ACTION_BYTES
+    if kind == CATALOG_CANDIDATE_KIND:
+        return MAX_CATALOG_CANDIDATE_ACTION_BYTES
     return MAX_PROPOSAL_ACTION_BYTES
 
 
@@ -8163,14 +8170,26 @@ def _proposal_resubmission_snapshot(hold: ProposalHold) -> tuple[Any, ...]:
 # (409) -- withdraw and resubmit for a new row. Decided rows are never dedup
 # matches at all (``_proposal_dedup_where`` only matches pending/applying), so a
 # resubmission after a decision always inserts a new row.
-IMMUTABLE_PROPOSAL_KINDS: frozenset[str] = frozenset({"gmail_send"})
+# ``catalog_candidate`` (TECH-9214) is immutable for the same reason: the reviewer
+# decides on exactly the payload that was forwarded to the catalog.
+IMMUTABLE_PROPOSAL_KINDS: frozenset[str] = frozenset({"gmail_send", CATALOG_CANDIDATE_KIND})
 
 # TECH-8951: kinds the board never auto-approves, whatever the judge plugin
 # returns (the kill switch and daily caps are irrelevant to them). A
 # ``gmail_send`` sends mail as the owner, so only the owner's own decide call
 # can approve it. Enforced in ``create_proposal`` on every submission,
 # including an identical retry that re-runs the judge against the open row.
-HUMAN_APPROVAL_ONLY_PROPOSAL_KINDS: frozenset[str] = frozenset({"gmail_send"})
+# ``catalog_candidate`` (TECH-9214) changes the opportunity catalog, so only its
+# reviewers approve it, never a rules engine.
+HUMAN_APPROVAL_ONLY_PROPOSAL_KINDS: frozenset[str] = frozenset(
+    {"gmail_send", CATALOG_CANDIDATE_KIND}
+)
+
+# TECH-9214: kinds decided by an external reviewer system, not by the proposal
+# owner on the decision page. The owner's decide call is refused and the kind is
+# left out of the owner's pending queue; the external system reports its outcome
+# through the board's admin resolve tool.
+EXTERNALLY_RESOLVED_PROPOSAL_KINDS: frozenset[str] = frozenset({CATALOG_CANDIDATE_KIND})
 
 
 def _check_immutable_resubmission(
@@ -8891,7 +8910,7 @@ async def create_proposal(
         # TECH-8951 (Argus review): never auto-approve a kind that acts as the
         # owner (e.g. gmail_send), even if an out-of-repo judge plugin says so.
         judged_status = "pending"
-        decision_note = f"{kind} proposals always require the owner's approval"
+        decision_note = f"{kind} proposals always require human approval"
 
     auto_approved_at: datetime | None = None
     if judged_status == "approved":
@@ -9200,7 +9219,12 @@ async def list_pending_proposal_holds(
     limit = max(1, min(limit, 200))
     return await _list_proposals_with_elision(
         session,
-        where_clause=and_(_proposal_visible_to_owner(owner_sub), ProposalHold.status == "pending"),
+        where_clause=and_(
+            _proposal_visible_to_owner(owner_sub),
+            ProposalHold.status == "pending",
+            # TECH-9214: owners do not decide these, so they stay out of the queue.
+            ProposalHold.kind.not_in(tuple(EXTERNALLY_RESOLVED_PROPOSAL_KINDS)),
+        ),
         order_clauses=(ProposalHold.created_at.asc(), ProposalHold.id.asc()),
         limit=limit,
         to_dict=_proposal_dict,
@@ -10633,6 +10657,12 @@ async def decide_proposal(
     if hold.status != "pending":
         await session.commit()
         raise HoldAlreadyDecidedError(hold.status)
+    if hold.kind in EXTERNALLY_RESOLVED_PROPOSAL_KINDS:
+        # TECH-9214: the owner is not the reviewer of this kind.
+        await session.commit()
+        raise ProposalDecisionValidationError(
+            f"{hold.kind} proposals are decided by their external reviewers, not by the owner"
+        )
 
     if decision_reason_code is not None and (
         not isinstance(decision_reason_code, str)
@@ -12157,9 +12187,11 @@ __all__ = [
     "DEFAULT_RECONCILIATION_BATCH_SIZE",
     "DOCUMENT_PROPOSAL_CONTENT_ELISION_BYTES",
     "DOCUMENT_PROPOSAL_KINDS",
+    "EXTERNALLY_RESOLVED_PROPOSAL_KINDS",
     "HUMAN_APPROVAL_ONLY_PROPOSAL_KINDS",
     "IMMUTABLE_PROPOSAL_KINDS",
     "MAX_APPROVAL_HOLDS_PER_MINUTE",
+    "MAX_CATALOG_CANDIDATE_ACTION_BYTES",
     "MAX_CONVERSATION_STARTS_PER_HOUR",
     "MAX_DECISION_REASON_LENGTH",
     "MAX_DOCUMENT_PROPOSAL_ACTION_BYTES",
