@@ -9386,6 +9386,10 @@ async def get_proposal_apply_record(
             action="denied.proposal_apply_record_kind_not_allowed",
             detail={"attempted_hold_id": str(hold_id)},
         )
+    return _apply_record_dict(hold)
+
+
+def _apply_record_dict(hold: ProposalHold) -> dict[str, Any]:
     target_id, action_type = _extract_proposal_target(hold.action)
     return {
         "hold_id": str(hold.id),
@@ -9405,6 +9409,90 @@ async def get_proposal_apply_record(
         # service can verify every required owner approved the exact target.
         "cross_brain": hold.cross_brain,
         "approvals": hold.approvals or [],
+    }
+
+
+MAX_EXTERNAL_QUEUE_PAGE = 100
+# UTC, fixed width, no ``+``: safe to paste into a query string unescaped.
+_EXTERNAL_QUEUE_CURSOR_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
+
+
+def _encode_external_queue_cursor(created_at: datetime, hold_id: uuid.UUID) -> str:
+    stamp = created_at.astimezone(UTC).strftime(_EXTERNAL_QUEUE_CURSOR_TIME_FORMAT)
+    return f"{stamp}|{hold_id}"
+
+
+def _decode_external_queue_cursor(cursor: str) -> tuple[datetime, uuid.UUID]:
+    """Strict inverse of ``_encode_external_queue_cursor``; anything else is
+    ``ValueError("invalid cursor")`` (-> 400), never a database error."""
+    try:
+        stamp, hold_id = cursor.rsplit("|", 1)
+        return (
+            datetime.strptime(stamp, _EXTERNAL_QUEUE_CURSOR_TIME_FORMAT).replace(tzinfo=UTC),
+            uuid.UUID(hold_id),
+        )
+    except (ValueError, AttributeError) as exc:
+        raise ValueError("invalid cursor") from exc
+
+
+async def list_external_resolution_queue(
+    session: AsyncSession,
+    *,
+    requesting_sub: str,
+    kind: str,
+    limit: int = 50,
+    cursor: str | None = None,
+    allowed_kinds: frozenset[str] | None = None,
+) -> dict[str, Any]:
+    """``GET /proposals/external-queue`` (main.py, non-MCP, service-gated --
+    TECH-9214). The ``pending`` proposals of one externally resolved kind
+    (``EXTERNALLY_RESOLVED_PROPOSAL_KINDS``), oldest first, for the approvals
+    service to forward to the system that decides them. Each item is the
+    apply-record shape plus ``confidence``/``importance``/``impact`` and
+    ``created_at``. Read-only; never mutates a hold.
+
+    Keyset-paged on ``(created_at, id)`` (``cursor`` is the opaque
+    ``next_cursor`` of the previous page): a page of already-forwarded
+    proposals can never starve newer ones behind it. A kind that is not
+    externally resolved is a ``ValueError`` (-> 400); a kind-scoped caller
+    asking for a kind outside its grant gets the uniform ``AccessDeniedError``
+    (-> 404), audited as ``denied.proposal_apply_record_kind_not_allowed``.
+    """
+    if kind not in EXTERNALLY_RESOLVED_PROPOSAL_KINDS:
+        raise ValueError("kind is not resolved externally")
+    if allowed_kinds is not None and kind not in allowed_kinds:
+        await _deny(
+            session,
+            actor_sub=requesting_sub,
+            action="denied.proposal_apply_record_kind_not_allowed",
+            detail={"attempted_kind": kind},
+        )
+    limit = max(1, min(limit, MAX_EXTERNAL_QUEUE_PAGE))
+    stmt = select(ProposalHold).where(ProposalHold.kind == kind, ProposalHold.status == "pending")
+    if cursor:
+        cursor_ts, cursor_id = _decode_external_queue_cursor(cursor)
+        stmt = stmt.where(
+            tuple_(ProposalHold.created_at, ProposalHold.id)
+            > tuple_(literal(cursor_ts), literal(cursor_id))
+        )
+    stmt = stmt.order_by(ProposalHold.created_at.asc(), ProposalHold.id.asc()).limit(limit + 1)
+    rows = list((await session.execute(stmt)).scalars().all())
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    return {
+        "proposals": [
+            {
+                **_apply_record_dict(hold),
+                "confidence": hold.confidence,
+                "importance": hold.importance,
+                "impact": hold.impact,
+                "created_at": _iso(hold.created_at),
+            }
+            for hold in rows
+        ],
+        "next_cursor": (
+            _encode_external_queue_cursor(rows[-1].created_at, rows[-1].id) if has_more else None
+        ),
     }
 
 
@@ -12247,6 +12335,7 @@ __all__ = [
     "leave",
     "list_agents",
     "list_conversations",
+    "list_external_resolution_queue",
     "list_pending_approval_holds",
     "list_pending_proposal_holds",
     "list_proposal_history_for_owner",

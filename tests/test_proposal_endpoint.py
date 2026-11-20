@@ -2790,6 +2790,9 @@ class TestProposalRouteRegistrationOrder:
         assert "/proposals/{proposal_id}" in paths
         assert paths.index("/proposals/pending") < paths.index("/proposals/{proposal_id}")
         assert paths.index("/proposals/history") < paths.index("/proposals/{proposal_id}")
+        # TECH-9214: the service feed is a static GET path too.
+        assert "/proposals/external-queue" in paths
+        assert paths.index("/proposals/external-queue") < paths.index("/proposals/{proposal_id}")
 
 
 class TestProposalSenderAgentIdAttribution:

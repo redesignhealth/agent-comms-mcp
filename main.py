@@ -1293,6 +1293,54 @@ async def list_proposal_history(request: Request) -> Response:
     return JSONResponse(result, status_code=200)
 
 
+@mcp.custom_route("/proposals/external-queue", methods=["GET"])
+async def list_external_queue_route(request: Request) -> Response:
+    """Service-only list of the pending proposals of one externally resolved
+    kind (TECH-9214), for the approvals service to forward to the system that
+    decides them (today ``catalog_candidate`` -> Arcadia). Query: ``kind``
+    (required), ``limit`` (1-100, default 50), ``cursor`` (the previous page's
+    ``next_cursor``). Same gate as ``GET /proposals/{hold_id}/apply-record``
+    (agent-token chain, ``proposals:apply_record:read``, subject allowlist,
+    optionally kind-scoped); a kind outside a scoped caller's grant is the
+    uniform 404. Read-only.
+
+    Registered BEFORE the wildcard ``GET /proposals/{proposal_id}``: Starlette
+    matches in registration order, so after it this path would resolve to
+    ``get_proposal`` with ``proposal_id="external-queue"``."""
+    caller_sub, allowed_kinds, status = await _authenticate_apply_record_caller(request)
+    if caller_sub is None:
+        return JSONResponse({"error": "unauthorized"}, status_code=status)
+
+    kind = request.query_params.get("kind", "")
+    try:
+        limit = int(request.query_params.get("limit", "50"))
+    except ValueError:
+        return JSONResponse(
+            {"error": "invalid_request", "detail": "invalid limit"}, status_code=400
+        )
+    cursor = request.query_params.get("cursor") or None
+
+    async with get_session_factory()() as session:
+        try:
+            result = await service.list_external_resolution_queue(
+                session,
+                requesting_sub=caller_sub,
+                kind=kind,
+                limit=limit,
+                cursor=cursor,
+                allowed_kinds=allowed_kinds,
+            )
+        except AccessDeniedError:
+            return JSONResponse(_UNIFORM_HOLD_NOT_FOUND, status_code=404)
+        except ValueError as exc:
+            return JSONResponse({"error": "invalid_request", "detail": str(exc)}, status_code=400)
+        except Exception:
+            logger.exception("list_external_resolution_queue failure")
+            return JSONResponse({"error": "internal_error"}, status_code=500)
+
+    return JSONResponse(result, status_code=200)
+
+
 @mcp.custom_route("/proposals/{proposal_id}", methods=["GET"])
 async def get_proposal(request: Request) -> Response:
     """Let the SUBMITTING bot poll a proposal's current status/decision

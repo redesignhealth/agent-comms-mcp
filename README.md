@@ -204,7 +204,14 @@ already-`"applied"` hold is a no-op (returns the existing applied state,
 no second write) -- but retrying while the hold is still `"applying"`
 (another decide call, or the auto-judge, currently has it claimed and is
 mid-flight on its own external round-trip) returns 409, not a no-op: this
-call never got a chance to decide anything. A `catalog_candidate` proposal
+call never got a chance to decide anything. `GET /proposals/external-queue?kind=catalog_candidate`
+(TECH-9214) is the service-only feed of pending proposals of an externally
+resolved kind, which the approvals service forwards to the system that decides
+them: same gate as apply-record (agent-token chain, `proposals:apply_record:read`,
+subject allowlist, optionally kind-scoped; a kind outside a scoped caller's grant
+is the uniform 404), oldest first, `limit` 1-100, keyset `cursor`/`next_cursor`,
+each item the apply-record shape plus `confidence`, `importance`, `impact`,
+`created_at`. A `catalog_candidate` proposal
 (TECH-9214, proposals to the opportunity catalog) is never auto-approved by the
 board whatever the judge says, never edited in place by a resubmission, capped
 at 256 KiB, refused by `/decide` (400) and left out of `GET /proposals/pending`:
