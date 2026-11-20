@@ -1665,7 +1665,7 @@ class TestProposalActionSignalContractConstants:
         assert PROPOSAL_ACTION_ERRORS_ATTR == "proposal_action_errors"
         assert PROPOSAL_SUPPORTED_KINDS_ATTR == "supported_proposal_kinds"
 
-    def test_error_codes_is_the_closed_ten_code_set(self) -> None:
+    def test_error_codes_is_the_closed_code_set(self) -> None:
         expected = {
             "missing",
             "extra_field",
@@ -1678,6 +1678,7 @@ class TestProposalActionSignalContractConstants:
             "not_canonical",
             "digest_mismatch",
             "unsupported",
+            "prohibited_content",
         }
         assert frozenset(expected) == PROPOSAL_ACTION_ERROR_CODES
 
