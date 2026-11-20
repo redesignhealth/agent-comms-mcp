@@ -2773,6 +2773,18 @@ the target. Per-submitter and per-target pending caps bound abuse
 counts, never owner identities. The apply-record read carries `cross_brain` and `approvals` so the
 approvals service can verify every required owner approved the exact target before writing.
 
+**External resolution (`proposals_admin_resolve_external`, TECH-9214).** The external reviewer
+system closes a pending proposal of an externally resolved kind through one admin tool. It needs
+the `proposals:resolve_external` scope and a sub on `PROPOSAL_RESOLVE_EXTERNAL_ALLOWED_SUBS`
+(default empty: nobody), and it can only touch such kinds. Outcomes: `applied` (status `applied`,
+`apply_result` records the external ref), `rejected`, and `changes_requested` (a new terminal
+status; the bot submits a new proposal). The hold stores `decision_source = external`, the resolver
+as `decided_by_actor_id`, the reviewers' note as `decision_note` and the system's id as
+`external_ref`. It is idempotent on `(proposal_id, outcome)`; a different outcome, or a proposal that
+is withdrawn or otherwise not pending, is `already_decided`. The submitting bot sees status, note and
+`external_ref` but never `decided_by_actor_id`, so neither a reviewer nor the service identity is
+disclosed.
+
 Optional, operator-controlled exception: `CROSS_BRAIN_AUTO_APPROVE_RULES` (comma-separated rule
 names, default empty). A judge verdict with `approved=True` and `rule=<name>` where the name is on
 that list stands in for the owners' approvals: the claim records `cross_brain.auto_rule` and an
