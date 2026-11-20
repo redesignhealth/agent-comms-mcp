@@ -1362,6 +1362,9 @@ PROPOSAL_ACTION_ERROR_CODES: frozenset[str] = frozenset(
         "not_canonical",
         "digest_mismatch",
         "unsupported",
+        # TECH-9214: content a kind refuses outright (e.g. health-system material
+        # in a catalog_candidate).
+        "prohibited_content",
     }
 )
 
