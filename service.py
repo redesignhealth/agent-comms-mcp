@@ -185,6 +185,7 @@ from exceptions import (
     ConversationArchivedError,
     DisplayNameCollisionError,
     DocsVerificationFailedError,
+    ExternalResolutionError,
     HoldAlreadyDecidedError,
     HoldAwaitingAutoReviewError,
     HoldExpiredError,
@@ -7586,6 +7587,8 @@ def _proposal_dict(
         result["approvals"] = hold.approvals or []
     if getattr(hold, "labels", None) is not None:
         result["labels"] = hold.labels
+    if getattr(hold, "external_ref", None) is not None:
+        result["external_ref"] = hold.external_ref
     return result
 
 
@@ -7636,7 +7639,9 @@ def _redact_bot_facing_dict(
     second, driftable copy of the ``if decision_source == "human": pop(...)``
     logic (Argus review round-4 suggestion, closing the dead-code inline
     guard this replaced at ``create_proposal``'s auto-judge happy path)."""
-    if decision_source == "human":
+    if decision_source in ("human", "external"):
+        # Neither a human reviewer nor the external system's service identity
+        # is disclosed to the submitting bot (TECH-9214: reviewers stay hidden).
         result.pop("decided_by_actor_id", None)
     cross = result.get("cross_brain")
     if cross is not None:
@@ -9178,6 +9183,7 @@ PROPOSAL_TERMINAL_STATUSES: tuple[str, ...] = (
     "apply_failed",
     "stale",
     "withdrawn",
+    "changes_requested",
 )
 _NON_TERMINAL_PROPOSAL_STATUSES = {"pending", "applying", "approved"}
 # `if`/`raise`, not a bare `assert` (Argus review round-2 suggestion) --
@@ -9406,6 +9412,121 @@ async def get_proposal_apply_record(
         "cross_brain": hold.cross_brain,
         "approvals": hold.approvals or [],
     }
+
+
+EXTERNAL_RESOLUTION_OUTCOMES: dict[str, str] = {
+    "applied": "applied",
+    "rejected": "rejected",
+    "changes_requested": "changes_requested",
+}
+MAX_EXTERNAL_REF_LENGTH = 200
+
+
+async def resolve_external_proposal(
+    session: AsyncSession,
+    *,
+    resolver_sub: str,
+    hold_id: uuid.UUID,
+    outcome: str,
+    note: str | None,
+    external_ref: str,
+) -> dict[str, Any]:
+    """Close a ``pending`` proposal of an externally resolved kind with the
+    external reviewers' decision (``proposals_admin_resolve_external``,
+    TECH-9214). The caller (scope and subject allowlist) is checked by the
+    tool; this function trusts ``resolver_sub``.
+
+    ``outcome`` is ``applied`` (status ``applied``), ``rejected`` or
+    ``changes_requested`` (both terminal; the bot submits a new proposal).
+    ``note`` is the reviewers' note to the bot and is required for the last
+    two; ``external_ref`` is the external system's id (Arcadia's candidate id).
+    Both are stored on the hold and shown to the submitting bot by
+    ``proposals_get``; the resolver's identity is stored as
+    ``decided_by_actor_id`` and never shown to the bot.
+
+    Idempotent on ``(hold_id, outcome)``: repeating the recorded outcome returns
+    the proposal unchanged (``already_recorded``) whatever ``note`` or
+    ``external_ref`` say. A different outcome after one was recorded, or any
+    proposal that is not ``pending`` (withdrawn, decided by other means), is
+    ``ExternalResolutionError('already_decided')``. A hold whose kind is decided
+    by its owner is ``not_externally_resolved``, so this can never close an
+    ordinary proposal. Writes nothing outward and applies nothing.
+    """
+    if outcome not in EXTERNAL_RESOLUTION_OUTCOMES:
+        raise ExternalResolutionError(
+            "invalid_request", f"outcome must be one of {sorted(EXTERNAL_RESOLUTION_OUTCOMES)}"
+        )
+    if not isinstance(external_ref, str) or not external_ref.strip():
+        raise ExternalResolutionError("invalid_request", "external_ref is required")
+    if len(external_ref) > MAX_EXTERNAL_REF_LENGTH or not external_ref.isprintable():
+        raise ExternalResolutionError(
+            "invalid_request",
+            f"external_ref must be printable and at most {MAX_EXTERNAL_REF_LENGTH} characters",
+        )
+    if note is not None and not isinstance(note, str):
+        raise ExternalResolutionError("invalid_request", "note must be a string")
+    if note is not None and len(note) > MAX_DECISION_REASON_LENGTH:
+        raise ExternalResolutionError(
+            "invalid_request", f"note exceeds {MAX_DECISION_REASON_LENGTH} characters"
+        )
+    if outcome != "applied" and not (note and note.strip()):
+        raise ExternalResolutionError(
+            "invalid_request", f"note is required for outcome {outcome!r}"
+        )
+
+    hold = await _find_proposal_hold(session, hold_id, for_update=True)
+    if hold is None:
+        _audit(
+            session,
+            actor_sub=resolver_sub,
+            action="denied.unknown_proposal_hold",
+            detail={"attempted_hold_id": str(hold_id)},
+        )
+        await session.commit()
+        raise ExternalResolutionError("unknown_proposal", "unknown proposal")
+    if hold.kind not in EXTERNALLY_RESOLVED_PROPOSAL_KINDS:
+        _audit(
+            session,
+            actor_sub=resolver_sub,
+            action="denied.proposal_resolve_external_kind_not_allowed",
+            detail={"attempted_hold_id": str(hold_id)},
+        )
+        await session.commit()
+        raise ExternalResolutionError(
+            "not_externally_resolved", "this proposal's kind is not resolved externally"
+        )
+
+    target_status = EXTERNAL_RESOLUTION_OUTCOMES[outcome]
+    if hold.decision_source == "external" and hold.status == target_status:
+        await session.commit()
+        return {**_proposal_dict(hold), "already_recorded": True}
+    if hold.status != "pending":
+        await session.commit()
+        raise ExternalResolutionError(
+            "already_decided",
+            f"proposal is already {hold.status!r}",
+            status=hold.status,
+        )
+
+    now = _now()
+    hold.status = target_status
+    hold.decision_source = "external"
+    hold.decided_by_actor_id = resolver_sub
+    hold.decided_at = now
+    hold.decision_note = note
+    hold.external_ref = external_ref
+    if target_status == "applied":
+        hold.applied_at = now
+        hold.apply_result = {"external": True, "external_ref": external_ref}
+    _audit(
+        session,
+        actor_sub=resolver_sub,
+        action="proposal.resolve_external",
+        detail={"hold_id": str(hold_id), "outcome": outcome, "external_ref": external_ref},
+    )
+    await session.commit()
+    await session.refresh(hold)
+    return {**_proposal_dict(hold), "already_recorded": False}
 
 
 async def withdraw_proposal(
@@ -12182,12 +12303,14 @@ __all__ = [
     "ALLOWED_PROPOSAL_LABEL_KEYS",
     "ALLOWED_SURFACES",
     "APPROVAL_HOLD_TTL",
+    "CATALOG_CANDIDATE_KIND",
     "CONVERSATION_TTL",
     "DEFAULT_OWNERSHIP_CLIENT",
     "DEFAULT_RECONCILIATION_BATCH_SIZE",
     "DOCUMENT_PROPOSAL_CONTENT_ELISION_BYTES",
     "DOCUMENT_PROPOSAL_KINDS",
     "EXTERNALLY_RESOLVED_PROPOSAL_KINDS",
+    "EXTERNAL_RESOLUTION_OUTCOMES",
     "HUMAN_APPROVAL_ONLY_PROPOSAL_KINDS",
     "IMMUTABLE_PROPOSAL_KINDS",
     "MAX_APPROVAL_HOLDS_PER_MINUTE",
@@ -12195,6 +12318,7 @@ __all__ = [
     "MAX_CONVERSATION_STARTS_PER_HOUR",
     "MAX_DECISION_REASON_LENGTH",
     "MAX_DOCUMENT_PROPOSAL_ACTION_BYTES",
+    "MAX_EXTERNAL_REF_LENGTH",
     "MAX_LOOKUP_EMAIL_LENGTH",
     "MAX_MESSAGES_PER_CONVERSATION_PER_HOUR",
     "MAX_PROPOSALS_PER_BOT_PER_WINDOW",
@@ -12276,6 +12400,7 @@ __all__ = [
     "reset_proposal_auto_approve_kill_switch_cache",
     "reset_proposal_rate_limit_overrides_cache",
     "resolve_conversation_participant",
+    "resolve_external_proposal",
     "resolve_inbox_target",
     "resolve_proposal_owner_sub",
     "start_conversation",

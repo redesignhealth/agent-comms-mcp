@@ -526,6 +526,23 @@ class ProposalImmutableError(Exception):
         )
 
 
+class ExternalResolutionError(Exception):
+    """``service.resolve_external_proposal`` refused a call (TECH-9214).
+
+    ``code`` is a short stable token the caller can branch on:
+    ``unknown_proposal``, ``not_externally_resolved`` (the proposal's kind is
+    decided by the owner, not an external system), ``already_decided`` (a
+    different outcome was already recorded, or the proposal is withdrawn or
+    otherwise not pending; ``status`` names it) or ``invalid_request``. The
+    message never carries anything the caller did not already send or cannot
+    read."""
+
+    def __init__(self, code: str, message: str, *, status: str | None = None) -> None:
+        self.code = code
+        self.status = status
+        super().__init__(message)
+
+
 __all__ = [
     "AccessDeniedError",
     "AgentAlreadyRegisteredError",
@@ -534,6 +551,7 @@ __all__ = [
     "ConversationArchivedError",
     "DisplayNameCollisionError",
     "DocsVerificationFailedError",
+    "ExternalResolutionError",
     "HoldAlreadyDecidedError",
     "HoldAwaitingAutoReviewError",
     "HoldExpiredError",
