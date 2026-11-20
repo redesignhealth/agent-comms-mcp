@@ -172,6 +172,8 @@ class TestOutcomes:
         assert [p["proposal_id"] for p in history["proposals"]] == [pid]
         assert pending["proposals"] == []
         assert "decided_by_actor_id" not in history["proposals"][0]
+        assert history["proposals"][0]["external_ref"] == "c"
+        assert history["proposals"][0]["decision_note"] == "n"
 
     async def test_after_resolution_the_bot_can_submit_a_new_proposal_for_the_target(
         self, session: AsyncSession

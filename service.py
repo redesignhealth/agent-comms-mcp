@@ -7867,6 +7867,7 @@ async def _list_proposals_with_elision(
         ProposalHold.cross_brain,
         ProposalHold.approvals,
         ProposalHold.labels,
+        ProposalHold.external_ref,
         ProposalHold.log_seq,
         projected_action,
         elided_utf8_bytes,
