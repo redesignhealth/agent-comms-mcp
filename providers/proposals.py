@@ -64,6 +64,7 @@ scope.
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -78,13 +79,14 @@ import service
 from db import get_session_factory
 from exceptions import (
     AccessDeniedError,
+    ExternalResolutionError,
     HoldAlreadyDecidedError,
     ProposalImmutableError,
     ProposalTargetUnavailableError,
     RateLimitExceededError,
 )
 from identity import try_resolve_email
-from scopes import is_interactive_token
+from scopes import PROPOSAL_RESOLVE_EXTERNAL_SCOPE, is_interactive_token, scopes_for_token
 
 logger = logging.getLogger(__name__)
 
@@ -532,6 +534,93 @@ async def withdraw(proposal_id: str, reason: str | None = None) -> dict[str, Any
         return await service.withdraw_proposal(
             session, hold_id=hold_id, requesting_bot_sub=bot_sub, reason=reason
         )
+
+
+# --- External resolution (TECH-9214) -----------------------------------------------
+#
+# A proposal of an externally resolved kind (``catalog_candidate``) is decided
+# by an external system's reviewers, not by the owner. That system reports the
+# outcome here. Admin tool: only a dedicated service identity may call it, and it
+# can only close proposals of those kinds.
+
+PROPOSAL_RESOLVE_EXTERNAL_ALLOWED_SUBS_ENV = "PROPOSAL_RESOLVE_EXTERNAL_ALLOWED_SUBS"
+
+
+async def _require_resolver_sub() -> str:
+    """The caller's sub, only for a verified agent-jwt service token that carries
+    ``PROPOSAL_RESOLVE_EXTERNAL_SCOPE`` AND whose sub is listed in
+    ``PROPOSAL_RESOLVE_EXTERNAL_ALLOWED_SUBS`` (comma separated, read on every
+    call, default empty so nobody can resolve until an operator names the
+    service identity). The scope is also enforced by ``TOOL_SCOPES``; checking
+    it and the allowlist here keeps the tool closed if either layer slips. Every
+    refusal is audited."""
+    token = get_access_token()
+    if token is None:
+        raise ToolError("no access token provided")
+    sub = try_resolve_email(token)
+    if is_interactive_token(token):
+        reason = "not_agent_token"
+    elif sub is None:
+        raise ToolError("unable to resolve caller identity from token claims")
+    elif PROPOSAL_RESOLVE_EXTERNAL_SCOPE not in scopes_for_token(token):
+        reason = "missing_scope"
+    elif sub not in {
+        entry.strip()
+        for entry in os.environ.get(PROPOSAL_RESOLVE_EXTERNAL_ALLOWED_SUBS_ENV, "").split(",")
+        if entry.strip()
+    }:
+        reason = "sub_not_allowed"
+    else:
+        return sub
+    async with get_session_factory()() as session:
+        await service.audit_denied_resolve_external(
+            session, actor_sub=sub or "unknown", reason=reason
+        )
+    raise ToolError("access_denied: not permitted to resolve proposals")
+
+
+@proposals_server.tool
+async def admin_resolve_external(
+    proposal_id: str,
+    outcome: Literal["applied", "rejected", "changes_requested"],
+    external_ref: str,
+    note: str | None = None,
+) -> dict[str, Any]:
+    """ADMIN (service identity only): report an external reviewer system's
+    decision on a pending ``catalog_candidate`` proposal (TECH-9214). Requires
+    the ``proposals:resolve_external`` scope AND a sub on
+    ``PROPOSAL_RESOLVE_EXTERNAL_ALLOWED_SUBS``; interactive callers and bots are
+    refused. Only a proposal of an externally resolved kind can be resolved.
+
+    ``outcome``: ``applied`` (the catalog accepted it), ``rejected`` or
+    ``changes_requested`` (both close the proposal; the bot submits a new one).
+    ``external_ref`` is the external system's id (Arcadia's candidate id).
+    ``note`` is shown to the submitting bot by ``proposals_get`` and is required
+    for ``rejected`` and ``changes_requested``; never put a reviewer's name or
+    contact in it, since the bot must not learn who decided.
+
+    Idempotent on ``(proposal_id, outcome)``: repeating a recorded outcome
+    returns the proposal with ``already_recorded: true`` and changes nothing.
+    A different outcome after one is recorded, or a proposal that is withdrawn
+    or otherwise not pending, fails with ``already_decided``. Errors are
+    ``unknown_proposal``, ``not_externally_resolved``, ``already_decided`` and
+    ``invalid_request``, prefixed to the message. Applies nothing and writes
+    nothing outward.
+    """
+    resolver_sub = await _require_resolver_sub()
+    hold_id = _parse_proposal_id(proposal_id)
+    try:
+        async with get_session_factory()() as session:
+            return await service.resolve_external_proposal(
+                session,
+                resolver_sub=resolver_sub,
+                hold_id=hold_id,
+                outcome=outcome,
+                note=note,
+                external_ref=external_ref,
+            )
+    except ExternalResolutionError as exc:
+        raise ToolError(f"{exc.code}: {exc}") from None
 
 
 # --- Arcana private-brain source reads (TECH-7170 pilot) -----------------------

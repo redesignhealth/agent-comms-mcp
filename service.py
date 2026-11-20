@@ -9420,6 +9420,20 @@ EXTERNAL_RESOLUTION_OUTCOMES: dict[str, str] = {
     "changes_requested": "changes_requested",
 }
 MAX_EXTERNAL_REF_LENGTH = 200
+_EXTERNAL_RESOLVE_DENIAL_REASONS = frozenset(
+    {"not_agent_token", "missing_scope", "sub_not_allowed"}
+)
+
+
+async def audit_denied_resolve_external(
+    session: AsyncSession, *, actor_sub: str, reason: str
+) -> None:
+    """Audit + commit a refused ``proposals_admin_resolve_external`` caller
+    (TECH-9214), so a probe of the admin tool leaves a persisted row."""
+    if reason not in _EXTERNAL_RESOLVE_DENIAL_REASONS:
+        raise ValueError(f"unexpected denial reason: {reason!r}")
+    _audit(session, actor_sub=actor_sub, action=f"denied.proposal_resolve_external_{reason}")
+    await session.commit()
 
 
 async def resolve_external_proposal(
@@ -12347,6 +12361,7 @@ __all__ = [
     "archive_conversation",
     "audit_denied_approval_requires_interactive",
     "audit_denied_proposal_submission",
+    "audit_denied_resolve_external",
     "audit_resource_subscription",
     "authorize_owner_reassignment",
     "clear_proposal_rate_limit_cache",

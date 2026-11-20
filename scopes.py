@@ -84,6 +84,13 @@ PROPOSAL_SUBMIT_SCOPE = "comms:proposals:write"
 # grant it to an agent or human token.
 PROPOSAL_APPLY_RECORD_SCOPE = "proposals:apply_record:read"
 
+# ``proposals_admin_resolve_external`` (TECH-9214) closes a proposal of an
+# externally resolved kind (``catalog_candidate``) with the external reviewers'
+# decision. Held only by the external system's own service identity (Arcadia),
+# never by a bot or a human token; the tool also checks the caller's sub against
+# ``PROPOSAL_RESOLVE_EXTERNAL_ALLOWED_SUBS`` (default empty: nobody).
+PROPOSAL_RESOLVE_EXTERNAL_SCOPE = "proposals:resolve_external"
+
 
 TOOL_SCOPES: dict[str, str] = {
     # --- comms (provider: providers/comms.py, namespace="comms") ---
@@ -179,6 +186,8 @@ TOOL_SCOPES: dict[str, str] = {
     # board's own service read token does the Arcana-facing work, never the bot.
     "proposals_arcana_source_metadata": PROPOSAL_SUBMIT_SCOPE,
     "proposals_arcana_source_span": PROPOSAL_SUBMIT_SCOPE,
+    # TECH-9214: external reviewers' decision on a proposal. Service identity only.
+    "proposals_admin_resolve_external": PROPOSAL_RESOLVE_EXTERNAL_SCOPE,
 }
 
 
@@ -440,6 +449,7 @@ def scopes_for_token(token: AccessToken) -> list[str]:
 
 __all__ = [
     "PROPOSAL_APPLY_RECORD_SCOPE",
+    "PROPOSAL_RESOLVE_EXTERNAL_SCOPE",
     "PROPOSAL_SUBMIT_SCOPE",
     "RESOURCE_SCOPES",
     "RESOURCE_TEMPLATE_SCOPES",
