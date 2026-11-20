@@ -1805,6 +1805,14 @@ unreachable by any bot's agent-jwt token by construction, not convention
 gate). Approving/rejecting a proposal is the one proposal action that
 stays human-only and HTTP-only.
 
+**Externally resolved kinds (TECH-9214)**: a kind in `EXTERNALLY_RESOLVED_PROPOSAL_KINDS`
+(today `catalog_candidate`) is decided by an external reviewer system (Arcadia), not by the
+proposal owner. The board never writes outward: it keeps the proposal `pending` (never
+auto-approved, never edited in place), refuses the owner's `/decide` (400) and leaves the kind out
+of the owner's `GET /proposals/pending`. The approvals service reads
+`GET /proposals/external-queue?kind=...` (service-only, same gate as the apply-record read,
+keyset-paged, oldest first) and forwards each pending proposal to the external system.
+
 **Action limits, transport bounds, and SQL projection elision (TECH-7720)**:
 - **Authoritative content limit (1 MiB)**: Arcana document proposals
   (`kind IN ("arcana_source_add", "arcana_source_revise")`) allow up to
@@ -1812,7 +1820,9 @@ stays human-only and HTTP-only.
   strictly on the UTF-8 bytes of `action.content` (provenance marker excluded);
   the `sha256` digest is computed over this exact byte stream.
 - **Serialized action limits**:
-  - Non-document proposal kinds retain `MAX_PROPOSAL_ACTION_BYTES = 16_384` (16 KiB serialized JSON).
+  - Non-document proposal kinds retain `MAX_PROPOSAL_ACTION_BYTES = 16_384` (16 KiB serialized JSON),
+    except `catalog_candidate` (TECH-9214), which is capped at `MAX_CATALOG_CANDIDATE_ACTION_BYTES`
+    (256 KiB) because a concept-market version is larger than 16 KiB.
   - Document proposal kinds are permitted up to `MAX_DOCUMENT_PROPOSAL_ACTION_BYTES = 4_194_304`
     (4 MiB serialized JSON). This 4 MiB allowance accommodates up to 1 MiB of UTF-8 content with
     standard JSON ASCII Unicode escaping (`ensure_ascii=True`, where non-ASCII codepoints expand up to
