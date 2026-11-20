@@ -9413,6 +9413,26 @@ def _apply_record_dict(hold: ProposalHold) -> dict[str, Any]:
 
 
 MAX_EXTERNAL_QUEUE_PAGE = 100
+# UTC, fixed width, no ``+``: safe to paste into a query string unescaped.
+_EXTERNAL_QUEUE_CURSOR_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
+
+
+def _encode_external_queue_cursor(created_at: datetime, hold_id: uuid.UUID) -> str:
+    stamp = created_at.astimezone(UTC).strftime(_EXTERNAL_QUEUE_CURSOR_TIME_FORMAT)
+    return f"{stamp}|{hold_id}"
+
+
+def _decode_external_queue_cursor(cursor: str) -> tuple[datetime, uuid.UUID]:
+    """Strict inverse of ``_encode_external_queue_cursor``; anything else is
+    ``ValueError("invalid cursor")`` (-> 400), never a database error."""
+    try:
+        stamp, hold_id = cursor.rsplit("|", 1)
+        return (
+            datetime.strptime(stamp, _EXTERNAL_QUEUE_CURSOR_TIME_FORMAT).replace(tzinfo=UTC),
+            uuid.UUID(hold_id),
+        )
+    except (ValueError, AttributeError) as exc:
+        raise ValueError("invalid cursor") from exc
 
 
 async def list_external_resolution_queue(
@@ -9450,12 +9470,7 @@ async def list_external_resolution_queue(
     limit = max(1, min(limit, MAX_EXTERNAL_QUEUE_PAGE))
     stmt = select(ProposalHold).where(ProposalHold.kind == kind, ProposalHold.status == "pending")
     if cursor:
-        try:
-            ts_part, id_part = cursor.rsplit("|", 1)
-            cursor_ts = datetime.fromisoformat(ts_part)
-            cursor_id = uuid.UUID(id_part)
-        except (ValueError, AttributeError) as exc:
-            raise ValueError("invalid cursor") from exc
+        cursor_ts, cursor_id = _decode_external_queue_cursor(cursor)
         stmt = stmt.where(
             tuple_(ProposalHold.created_at, ProposalHold.id)
             > tuple_(literal(cursor_ts), literal(cursor_id))
@@ -9475,7 +9490,9 @@ async def list_external_resolution_queue(
             }
             for hold in rows
         ],
-        "next_cursor": (f"{rows[-1].created_at.isoformat()}|{rows[-1].id}" if has_more else None),
+        "next_cursor": (
+            _encode_external_queue_cursor(rows[-1].created_at, rows[-1].id) if has_more else None
+        ),
     }
 
 

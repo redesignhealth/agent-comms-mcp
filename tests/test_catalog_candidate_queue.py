@@ -18,6 +18,7 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 
 import plugins
+import service
 from models import AuditLog, ProposalHold
 from scopes import PROPOSAL_APPLY_RECORD_SCOPE
 from tests.proposal_judge_fakes import FakeProposalJudge
@@ -200,15 +201,80 @@ class TestQueueContents:
         self, client: tuple[httpx.AsyncClient, _FakeAuthProvider], session: AsyncSession
     ) -> None:
         http_client, _ = client
-        await _seed(session)
-        assert (await _queue(http_client, limit=0)).status_code == 200
-        assert (await _queue(http_client, limit=100000)).status_code == 200
+        for i in range(service.MAX_EXTERNAL_QUEUE_PAGE + 2):
+            session.add(
+                ProposalHold(
+                    kind=_KIND,
+                    proposed_by_bot_id=_BOT,
+                    owner_sub=_OWNER,
+                    action={**_ACTION, "target_id": f"concept:c{i}"},
+                    rationale="add it",
+                    confidence="low",
+                    importance="high",
+                    impact="medium",
+                    priority="medium",
+                    target_fingerprint="n/a:no-pre-existing-target",
+                    status="pending",
+                )
+            )
+        await session.commit()
+        zero = (await _queue(http_client, limit=0)).json()
+        assert len(zero["proposals"]) == 1  # clamped up to 1
+        huge = (await _queue(http_client, limit=100000)).json()
+        assert len(huge["proposals"]) == service.MAX_EXTERNAL_QUEUE_PAGE
+        assert huge["next_cursor"] is not None
+
+    async def test_holds_with_the_same_created_at_page_without_loss_or_repeats(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider], session: AsyncSession
+    ) -> None:
+        http_client, _ = client
+        stamp = datetime.now(UTC) - timedelta(minutes=5)
+        ids = {
+            str((await _seed(session, target=f"concept:t{i}", created_at=stamp)).id)
+            for i in range(5)
+        }
+        seen: list[str] = []
+        cursor: str | None = None
+        while True:
+            params: dict[str, Any] = {"limit": 2}
+            if cursor:
+                params["cursor"] = cursor
+            page = (await _queue(http_client, **params)).json()
+            seen.extend(p["hold_id"] for p in page["proposals"])
+            cursor = page["next_cursor"]
+            if cursor is None:
+                break
+        assert sorted(seen) == sorted(ids)
+        assert len(seen) == len(set(seen))
+
+    async def test_next_cursor_is_safe_in_a_raw_query_string(
+        self, client: tuple[httpx.AsyncClient, _FakeAuthProvider], session: AsyncSession
+    ) -> None:
+        http_client, _ = client
+        for i in range(2):
+            await _seed(session, target=f"concept:q{i}")
+        first = (await _queue(http_client, limit=1)).json()
+        cursor = first["next_cursor"]
+        assert "+" not in cursor and " " not in cursor
+        resp = await http_client.get(
+            f"/proposals/external-queue?kind={_KIND}&limit=1&cursor={cursor}",
+            headers={"Authorization": "Bearer approvals"},
+        )
+        assert resp.status_code == 200
+        assert len(resp.json()["proposals"]) == 1
 
 
 class TestQueueValidationAndAccess:
     @pytest.mark.parametrize(
         "params",
-        [{"kind": "gmail_send"}, {"kind": ""}, {"cursor": "garbage"}, {"limit": "x"}],
+        [
+            {"kind": "gmail_send"},
+            {"kind": ""},
+            {"cursor": "garbage"},
+            {"cursor": "2026-11-20T12:00:00|3f1c1f0e-8f6a-4a52-9d0b-0c6a5c1f2a11"},
+            {"cursor": "2026-11-20T12:00:00.000000+00:00|3f1c1f0e-8f6a-4a52-9d0b-0c6a5c1f2a11"},
+            {"limit": "x"},
+        ],
     )
     async def test_bad_requests_are_400(
         self, client: tuple[httpx.AsyncClient, _FakeAuthProvider], params: dict[str, str]
