@@ -130,6 +130,9 @@ PROPOSAL_HOLD_STATUSES = (
     "apply_failed",
     "stale",
     "withdrawn",
+    # TECH-9214: an external reviewer asked for changes (terminal; the bot
+    # submits a new proposal). Reached only via proposals_admin_resolve_external.
+    "changes_requested",
 )
 # `withdrawn` (TECH-6018) is reachable only from `pending`, via the
 # SUBMITTING bot's own `POST /proposals/{id}/withdraw` -- a caller-
@@ -142,7 +145,11 @@ PROPOSAL_HOLD_STATUSES = (
 # `(kind, proposed_by_bot_id, target_id, action_type)` key already
 # updates the existing pending row in place at create time, and a
 # DIFFERENT key was never blocked to begin with.
-PROPOSAL_HOLD_DECISION_SOURCES = ("human", "auto", "bot")
+# `"external"` (TECH-9214) marks a decision reported by the external reviewer
+# system that owns the proposal's kind (``proposals_admin_resolve_external``);
+# ``decided_by_actor_id`` then holds that system's service identity, never a
+# reviewer.
+PROPOSAL_HOLD_DECISION_SOURCES = ("human", "auto", "bot", "external")
 # `"bot"` (TECH-6018) marks a decision made by the SUBMITTING bot itself
 # (currently only via withdraw) -- distinct from `"auto"` (the TECH-5877
 # judge, evaluated on the board's own behalf) and `"human"` (a reviewer
@@ -957,6 +964,9 @@ class ProposalHold(Base):
     # TECH-8080: routing and classification labels for routine decision log
     # (lane, source_type, evidence_type).
     labels: Mapped[dict[str, str] | None] = mapped_column(JSONB, nullable=True)
+    # TECH-9214: the external system's id for this proposal (Arcadia's candidate
+    # id), set when it resolves the proposal. NULL for every other hold.
+    external_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _updated_at()
 
