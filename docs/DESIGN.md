@@ -2781,9 +2781,13 @@ the `proposals:resolve_external` scope and a sub on `PROPOSAL_RESOLVE_EXTERNAL_A
 status; the bot submits a new proposal). The hold stores `decision_source = external`, the resolver
 as `decided_by_actor_id`, the reviewers' note as `decision_note` and the system's id as
 `external_ref`. It is idempotent on `(proposal_id, outcome)`; a different outcome, or a proposal that
-is withdrawn or otherwise not pending, is `already_decided`. The submitting bot sees status, note and
-`external_ref` but never `decided_by_actor_id`, so neither a reviewer nor the service identity is
-disclosed.
+is withdrawn or otherwise not pending, is `already_decided`. Inputs: `note` is required (non-blank, at
+most `MAX_DECISION_REASON_LENGTH` characters) for `rejected` and `changes_requested`; `external_ref` is
+required, printable and at most `MAX_EXTERNAL_REF_LENGTH` (200) characters. The response is the
+proposal plus `already_recorded` (true when the outcome was already on record). Error codes, prefixed
+in the tool's message: `unknown_proposal`, `not_externally_resolved`, `already_decided`,
+`invalid_request`. The submitting bot sees status, note and `external_ref` but never
+`decided_by_actor_id`, so neither a reviewer nor the service identity is disclosed.
 
 Optional, operator-controlled exception: `CROSS_BRAIN_AUTO_APPROVE_RULES` (comma-separated rule
 names, default empty). A judge verdict with `approved=True` and `rule=<name>` where the name is on

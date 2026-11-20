@@ -553,7 +553,8 @@ async def _require_resolver_sub() -> str:
     call, default empty so nobody can resolve until an operator names the
     service identity). The scope is also enforced by ``TOOL_SCOPES``; checking
     it and the allowlist here keeps the tool closed if either layer slips. Every
-    refusal is audited."""
+    refusal that reaches this handler is audited (one the scope middleware stops
+    first is only logged)."""
     token = get_access_token()
     if token is None:
         raise ToolError("no access token provided")

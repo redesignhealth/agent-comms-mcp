@@ -202,6 +202,7 @@ class TestWhoMayResolve:
         with pytest.raises(ToolError, match="access_denied"):
             await _resolve(main, session_factory, pid)
         assert (await _hold(session, pid)).status == "pending"
+        assert await _audited(session, "denied.proposal_resolve_external_sub_not_allowed")
 
     async def test_an_interactive_caller_is_refused_and_audited(
         self, main: Any, session_factory: async_sessionmaker[AsyncSession], session: AsyncSession
@@ -211,9 +212,10 @@ class TestWhoMayResolve:
         token.claims = {"iss": "https://example.okta.com/oauth2/default", "email": _OWNER}
         token.scopes = []
         token.client_id = _OWNER
-        with pytest.raises(ToolError):
+        with pytest.raises(ToolError, match="access_denied"):
             await _resolve(main, session_factory, pid, token=token)
         assert (await _hold(session, pid)).status == "pending"
+        assert await _audited(session, "denied.proposal_resolve_external_not_agent_token")
 
     async def test_an_allowlisted_sub_without_the_scope_is_refused_and_audited(
         self, main: Any, session_factory: async_sessionmaker[AsyncSession], session: AsyncSession
@@ -281,6 +283,7 @@ class TestThroughTheTool:
         assert again["already_recorded"] is True
         with pytest.raises(ToolError, match="already_decided"):
             await _resolve(main, session_factory, pid, "applied", "cand-1")
+        assert len(await _audited(session, "proposal.resolve_external")) == 1
         hold = await _hold(session, pid)
         assert (hold.status, hold.decision_note, hold.external_ref) == (
             "rejected",
@@ -301,6 +304,16 @@ class TestThroughTheTool:
         pid = await _seed(session)
         with pytest.raises(ToolError, match="invalid_request"):
             await _resolve(main, session_factory, pid, "rejected", "c1")  # note required
-        with pytest.raises(ToolError):
+        with pytest.raises(ToolError, match="approved"):
             await _resolve(main, session_factory, pid, "approved", "c1", note="n")
         assert (await _hold(session, pid)).status == "pending"
+
+
+class TestAuditHelper:
+    async def test_unknown_denial_reason_is_a_value_error(self, session: AsyncSession) -> None:
+        with pytest.raises(ValueError, match="unexpected denial reason"):
+            await service.audit_denied_resolve_external(session, actor_sub="x", reason="nope")
+
+    async def test_known_reason_persists_a_row(self, session: AsyncSession) -> None:
+        await service.audit_denied_resolve_external(session, actor_sub="x", reason="missing_scope")
+        assert await _audited(session, "denied.proposal_resolve_external_missing_scope")
