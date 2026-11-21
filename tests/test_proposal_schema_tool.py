@@ -1,0 +1,147 @@
+"""TECH-9214: ``proposals_schema`` -- what an agent must follow to submit a
+``catalog_candidate``, and the schema copy staying in step with approvals'."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+from typing import Any
+from unittest.mock import MagicMock, patch
+
+import pytest
+from fastmcp import Client
+from fastmcp.exceptions import ToolError
+
+from providers import proposal_schemas
+from scopes import PROPOSAL_SUBMIT_SCOPE, TOOL_SCOPES
+from tests.test_proposal_tools import _ENV_PATCH, _OIDC_PATCH, _import_main
+
+_BOT = "catalog-agent"
+
+
+@pytest.fixture
+def main() -> Any:
+    return _import_main()
+
+
+def _token(sub: str = _BOT, scopes: list[str] | None = None) -> MagicMock:
+    token = MagicMock()
+    token.claims = {
+        "iss": "agent-jwt",
+        "sub": sub,
+        "scopes": [PROPOSAL_SUBMIT_SCOPE] if scopes is None else scopes,
+        "owner_sub": "owner@example.com",
+    }
+    token.scopes = []
+    token.client_id = sub
+    return token
+
+
+async def _call(main: Any, kind: Any, token: MagicMock | None = None) -> Any:
+    with (
+        _OIDC_PATCH,
+        _ENV_PATCH,
+        patch("main.get_access_token", return_value=token or _token()),
+        patch("providers.proposals.get_access_token", return_value=token or _token()),
+    ):
+        async with Client(main.mcp) as client:
+            return (await client.call_tool("proposals_schema", {"kind": kind})).data
+
+
+class TestTool:
+    async def test_is_mounted_read_only_and_gated_like_other_bot_tools(self, main: Any) -> None:
+        tools = {t.name: t for t in await main.mcp.list_tools()}
+        assert "proposals_schema" in tools
+        assert TOOL_SCOPES["proposals_schema"] == PROPOSAL_SUBMIT_SCOPE
+
+    async def test_catalog_candidate_shape(self, main: Any) -> None:
+        out = await _call(main, "catalog_candidate")
+        assert set(out) == {
+            "kind",
+            "schema_version",
+            "schema_sha256",
+            "schema_source",
+            "schema",
+            "guide",
+            "examples",
+        }
+        assert out["kind"] == "catalog_candidate"
+        assert out["schema_version"] == 2 == out["schema"]["x-schema-version"]
+        assert out["schema_sha256"] == hashlib.sha256(proposal_schemas.schema_bytes()).hexdigest()
+        assert {"ConceptPayload", "ConceptMarketPayload", "DeletePayload"} <= set(
+            out["schema"]["$defs"]
+        )
+        assert set(out["examples"]) == {"create", "upsert", "delete"}
+        for text in ("concept:<slug>", "pair:<concept-slug>:<MARKET>", "base_version", "reason"):
+            assert text in out["guide"]
+
+    async def test_examples_are_shaped_like_the_schema(self, main: Any) -> None:
+        out = await _call(main, "catalog_candidate")
+        create, upsert, delete = (out["examples"][k] for k in ("create", "upsert", "delete"))
+        assert (create["action_type"], upsert["action_type"], delete["action_type"]) == (
+            "create",
+            "upsert",
+            "delete",
+        )
+        assert create["target_id"].startswith("concept:")
+        assert upsert["target_id"].startswith("pair:")
+        assert isinstance(upsert["base_version"], int)
+        assert "payload" not in delete and delete["reason"]
+        concept = out["schema"]["$defs"]["ConceptPayload"]
+        assert set(create["payload"]) <= set(concept["properties"])
+        assert set(concept["required"]) <= set(create["payload"])
+        pair = out["schema"]["$defs"]["ConceptMarketPayload"]
+        assert set(pair["required"]) <= set(upsert["payload"])
+        version = out["schema"]["$defs"]["VersionIn"]
+        assert set(upsert["payload"]["version"]) <= set(version["properties"])
+        assert set(version["required"]) <= set(upsert["payload"]["version"])
+
+    @pytest.mark.parametrize("kind", ["gmail_send", "nope", "Catalog_Candidate"])
+    async def test_unknown_kind_lists_the_kinds_with_a_schema(self, main: Any, kind: str) -> None:
+        with pytest.raises(ToolError, match=r"invalid_request.*catalog_candidate"):
+            await _call(main, kind)
+
+    async def test_empty_kind_is_invalid(self, main: Any) -> None:
+        with pytest.raises(ToolError, match="invalid_request"):
+            await _call(main, "")
+
+    async def test_interactive_callers_are_refused(self, main: Any) -> None:
+        token = _token()
+        token.claims = {"iss": "okta", "sub": "human@example.com"}
+        with pytest.raises(ToolError):
+            await _call(main, "catalog_candidate", token)
+
+    async def test_submit_description_points_at_it(self, main: Any) -> None:
+        tools = {t.name: t for t in await main.mcp.list_tools()}
+        assert "proposals_schema" in (tools["proposals_submit"].description or "")
+
+
+class TestSchemaCopy:
+    def test_file_matches_its_pin(self) -> None:
+        pin = json.loads((Path("providers") / proposal_schemas.PIN_RESOURCE).read_text())
+        data = proposal_schemas.schema_bytes()
+        assert hashlib.sha256(data).hexdigest() == pin["sha256"]
+        blob = hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+        assert blob == pin["blob_sha"]
+        assert json.loads(data)["x-schema-version"] == pin["schema_version"]
+
+    def test_is_declared_as_package_data(self) -> None:
+        import tomllib
+
+        config = tomllib.loads(Path("pyproject.toml").read_text())
+        patterns = config["tool"]["setuptools"]["package-data"]["providers"]
+        assert "catalog_candidate_payload.schema*.json" in patterns
+
+    @pytest.mark.skipif(
+        not os.environ.get("AGENT_COMMS_APPROVALS_DIR"),
+        reason="set AGENT_COMMS_APPROVALS_DIR to a checkout of agent-comms-approvals",
+    )
+    def test_equals_the_approvals_copy(self) -> None:
+        root = Path(os.environ["AGENT_COMMS_APPROVALS_DIR"]) / "rh_comms_plugins"
+        theirs = (root / "catalog_candidate_payload.schema.json").read_bytes()
+        assert theirs == proposal_schemas.schema_bytes()
+        pin = json.loads((root / "catalog_candidate_payload.schema.pin.json").read_text())
+        ours = json.loads((Path("providers") / proposal_schemas.PIN_RESOURCE).read_text())
+        assert pin == ours

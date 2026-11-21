@@ -86,6 +86,7 @@ from exceptions import (
     RateLimitExceededError,
 )
 from identity import try_resolve_email
+from providers import proposal_schemas
 from scopes import PROPOSAL_RESOLVE_EXTERNAL_SCOPE, is_interactive_token, scopes_for_token
 
 logger = logging.getLogger(__name__)
@@ -204,6 +205,12 @@ async def submit(
     skills/paperclip/references/arcana-brain-proposals.md for payloads,
     citation rules, and current document-update support.
 
+    FIRST call ``proposals_schema(kind)`` for the kind you are about to submit
+    (``catalog_candidate`` today): it returns the JSON Schema, its version, a
+    guide to the action fields and valid examples. Follow it exactly; a
+    submission that does not match is refused with 422 and a list of
+    ``{path, rule}`` errors.
+
     ``action`` must contain ``target_id`` and ``action_type`` (both
     strings) -- these are the create-time dedup key, together with
     ``kind`` and the calling bot's own identity: resubmitting with the
@@ -238,7 +245,7 @@ async def submit(
     open one is refused: withdraw and resubmit.
 
     ``kind="catalog_candidate"`` (propose a change to the opportunity catalog;
-    reviewed by Arcadia, TECH-9214)::
+    reviewed by Arcadia, TECH-9214; call ``proposals_schema`` first)::
 
         {"target_id": "concept:<slug>" | "pair:<concept-slug>:<MARKET>",
          "action_type": "create" | "upsert" | "delete",
@@ -378,6 +385,39 @@ async def submit(
             sender_agent_id=agent.id if agent else None,
             labels=labels,
         )
+
+
+@proposals_server.tool
+async def schema(kind: str) -> dict[str, Any]:
+    """Read-only: the schema an agent must follow to submit a proposal of
+    ``kind`` (TECH-9214). Call it before ``proposals_submit``. Available to any
+    bot that can submit proposals.
+
+    For ``kind="catalog_candidate"`` returns ``{"kind", "schema_version",
+    "schema_sha256", "schema_source", "schema", "guide", "examples"}``:
+    ``schema`` is Arcadia's JSON Schema for the ``action.payload`` (a concept,
+    a concept-market row, or a delete: use ``$defs/ConceptPayload`` for a
+    ``concept:<slug>`` target and ``$defs/ConceptMarketPayload`` for a
+    ``pair:<slug>:<MARKET>`` target), ``guide`` explains the actions,
+    ``target_id`` forms and required fields, and ``examples`` holds a valid
+    ``create``, ``upsert`` and ``delete`` action. Re-read it when
+    ``schema_version`` changes. A kind with no published schema raises
+    ``invalid_request`` naming the kinds that have one.
+    """
+    _require_bot_sub()
+    try:
+        kind = service.validate_proposal_string_field(
+            "kind", kind, max_length=service.MAX_PROPOSAL_KIND_LENGTH
+        )
+    except ValueError as exc:
+        raise ToolError(f"invalid_request: {exc}") from exc
+    found = proposal_schemas.schema_for_kind(kind)
+    if found is None:
+        raise ToolError(
+            "invalid_request: no schema is published for this kind; "
+            f"kinds with a schema: {', '.join(sorted(proposal_schemas.SCHEMAS))}"
+        )
+    return found
 
 
 @proposals_server.tool

@@ -1,0 +1,929 @@
+{
+  "$defs": {
+    "AssessmentFlag": {
+      "enum": [
+        "vendor_sourced",
+        "unsourced",
+        "single_case",
+        "stale_source",
+        "derivation_gap"
+      ],
+      "title": "AssessmentFlag",
+      "type": "string"
+    },
+    "AssessmentIn": {
+      "additionalProperties": false,
+      "properties": {
+        "confidence": {
+          "$ref": "#/$defs/Confidence"
+        },
+        "flags": {
+          "items": {
+            "$ref": "#/$defs/AssessmentFlag"
+          },
+          "title": "Flags",
+          "type": "array"
+        },
+        "kind": {
+          "$ref": "#/$defs/AssessmentKind"
+        },
+        "rating": {
+          "$ref": "#/$defs/Rating"
+        },
+        "rationale": {
+          "minLength": 1,
+          "title": "Rationale",
+          "type": "string"
+        },
+        "value_basis": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ValueBasis"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "value_high": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value High"
+        },
+        "value_low": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value Low"
+        },
+        "value_unit": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value Unit"
+        }
+      },
+      "required": [
+        "kind",
+        "rating",
+        "confidence",
+        "rationale"
+      ],
+      "title": "AssessmentIn",
+      "type": "object"
+    },
+    "AssessmentKind": {
+      "enum": [
+        "impact",
+        "technical",
+        "uptake"
+      ],
+      "title": "AssessmentKind",
+      "type": "string"
+    },
+    "BuildScope": {
+      "enum": [
+        "core",
+        "adapt",
+        "narrow",
+        "n_a"
+      ],
+      "title": "BuildScope",
+      "type": "string"
+    },
+    "CitationIn": {
+      "additionalProperties": false,
+      "properties": {
+        "is_vendor": {
+          "default": false,
+          "title": "Is Vendor",
+          "type": "boolean"
+        },
+        "publisher": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Publisher"
+        },
+        "sample_size": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sample Size"
+        },
+        "source_type": {
+          "$ref": "#/$defs/SourceType"
+        },
+        "supports": {
+          "items": {
+            "$ref": "#/$defs/CitationTarget"
+          },
+          "title": "Supports",
+          "type": "array"
+        },
+        "title": {
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        },
+        "url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Url"
+        },
+        "year": {
+          "anyOf": [
+            {
+              "maximum": 2100,
+              "minimum": 1900,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Year"
+        }
+      },
+      "required": [
+        "title",
+        "source_type"
+      ],
+      "title": "CitationIn",
+      "type": "object"
+    },
+    "CitationTarget": {
+      "additionalProperties": false,
+      "description": "What a citation supports. `assessment`: give `assessment_kind`. `related_company` or `replaces`: give the\n0-based `index` into that list. `market_fit`: the version itself, give neither.",
+      "properties": {
+        "assessment_kind": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AssessmentKind"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "index": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Index"
+        },
+        "target_type": {
+          "$ref": "#/$defs/CitationTargetType"
+        }
+      },
+      "required": [
+        "target_type"
+      ],
+      "title": "CitationTarget",
+      "type": "object"
+    },
+    "CitationTargetType": {
+      "enum": [
+        "assessment",
+        "related_company",
+        "replaces",
+        "market_fit"
+      ],
+      "title": "CitationTargetType",
+      "type": "string"
+    },
+    "ConceptMarketPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "concept_slug": {
+          "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+          "title": "Concept Slug",
+          "type": "string"
+        },
+        "market_code": {
+          "pattern": "^[A-Z]{2}$",
+          "title": "Market Code",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 2,
+          "default": 2,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "version": {
+          "$ref": "#/$defs/VersionIn"
+        }
+      },
+      "required": [
+        "concept_slug",
+        "market_code",
+        "version"
+      ],
+      "title": "ConceptMarketPayload",
+      "type": "object"
+    },
+    "ConceptPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "domain_code": {
+          "minLength": 1,
+          "title": "Domain Code",
+          "type": "string"
+        },
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 2,
+          "default": 2,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "slug": {
+          "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+          "title": "Slug",
+          "type": "string"
+        },
+        "summary": {
+          "default": "",
+          "title": "Summary",
+          "type": "string"
+        },
+        "value_types": {
+          "items": {
+            "$ref": "#/$defs/ValueType"
+          },
+          "title": "Value Types",
+          "type": "array"
+        }
+      },
+      "required": [
+        "slug",
+        "name",
+        "domain_code"
+      ],
+      "title": "ConceptPayload",
+      "type": "object"
+    },
+    "Confidence": {
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "title": "Confidence",
+      "type": "string"
+    },
+    "DeletePayload": {
+      "additionalProperties": false,
+      "description": "A delete names its target (`concept:<slug>` or `pair:<slug>:<market>`) and says why.",
+      "properties": {
+        "reason": {
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 2,
+          "default": 2,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "target_key": {
+          "minLength": 1,
+          "title": "Target Key",
+          "type": "string"
+        }
+      },
+      "required": [
+        "target_key",
+        "reason"
+      ],
+      "title": "DeletePayload",
+      "type": "object"
+    },
+    "FactCheckRoundIn": {
+      "additionalProperties": false,
+      "properties": {
+        "agreement_score": {
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Agreement Score",
+          "type": "integer"
+        },
+        "issues_high": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Issues High",
+          "type": "integer"
+        },
+        "issues_low": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Issues Low",
+          "type": "integer"
+        },
+        "issues_medium": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Issues Medium",
+          "type": "integer"
+        },
+        "open_issue_count": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Open Issue Count",
+          "type": "integer"
+        },
+        "round": {
+          "minimum": 1,
+          "title": "Round",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "round",
+        "agreement_score"
+      ],
+      "title": "FactCheckRoundIn",
+      "type": "object"
+    },
+    "GapIn": {
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "field": {
+          "minLength": 1,
+          "title": "Field",
+          "type": "string"
+        }
+      },
+      "required": [
+        "field",
+        "description"
+      ],
+      "title": "GapIn",
+      "type": "object"
+    },
+    "InconsistencyIn": {
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        }
+      },
+      "required": [
+        "description",
+        "severity"
+      ],
+      "title": "InconsistencyIn",
+      "type": "object"
+    },
+    "Rating": {
+      "enum": [
+        "green",
+        "amber",
+        "red",
+        "grey"
+      ],
+      "title": "Rating",
+      "type": "string"
+    },
+    "RelatedCompanyIn": {
+      "additionalProperties": false,
+      "description": "A company related to the concept: its name, an optional http(s) link, the role it plays in the\nspace (free text, such as \"Incumbent\" or \"Partner candidate\") and an optional description.",
+      "properties": {
+        "company": {
+          "minLength": 1,
+          "title": "Company",
+          "type": "string"
+        },
+        "description": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Description"
+        },
+        "role_in_space": {
+          "minLength": 1,
+          "title": "Role In Space",
+          "type": "string"
+        },
+        "source_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Url"
+        }
+      },
+      "required": [
+        "company",
+        "role_in_space"
+      ],
+      "title": "RelatedCompanyIn",
+      "type": "object"
+    },
+    "ReplacesIn": {
+      "additionalProperties": false,
+      "properties": {
+        "cadence": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cadence"
+        },
+        "lag_weeks_high": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Lag Weeks High"
+        },
+        "lag_weeks_low": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Lag Weeks Low"
+        },
+        "product_name": {
+          "minLength": 1,
+          "title": "Product Name",
+          "type": "string"
+        },
+        "vendor_org_id": {
+          "anyOf": [
+            {
+              "format": "uuid",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Vendor Org Id"
+        }
+      },
+      "required": [
+        "product_name"
+      ],
+      "title": "ReplacesIn",
+      "type": "object"
+    },
+    "ResearchDepth": {
+      "enum": [
+        "memo_only",
+        "web_checked",
+        "site_evidenced"
+      ],
+      "title": "ResearchDepth",
+      "type": "string"
+    },
+    "RoleBasis": {
+      "enum": [
+        "memo_named",
+        "author_reading"
+      ],
+      "title": "RoleBasis",
+      "type": "string"
+    },
+    "RoleIn": {
+      "additionalProperties": false,
+      "properties": {
+        "basis": {
+          "$ref": "#/$defs/RoleBasis"
+        },
+        "kind": {
+          "$ref": "#/$defs/RoleKind"
+        },
+        "role": {
+          "minLength": 1,
+          "title": "Role",
+          "type": "string"
+        }
+      },
+      "required": [
+        "role",
+        "kind",
+        "basis"
+      ],
+      "title": "RoleIn",
+      "type": "object"
+    },
+    "RoleKind": {
+      "enum": [
+        "champion",
+        "obstacle"
+      ],
+      "title": "RoleKind",
+      "type": "string"
+    },
+    "Severity": {
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "title": "Severity",
+      "type": "string"
+    },
+    "SourceType": {
+      "enum": [
+        "survey",
+        "government",
+        "academic",
+        "trade_press",
+        "vendor",
+        "memo_assertion"
+      ],
+      "title": "SourceType",
+      "type": "string"
+    },
+    "ValueBasis": {
+      "enum": [
+        "point",
+        "range",
+        "midpoint"
+      ],
+      "title": "ValueBasis",
+      "type": "string"
+    },
+    "ValueType": {
+      "enum": [
+        "revenue",
+        "cost",
+        "capacity"
+      ],
+      "title": "ValueType",
+      "type": "string"
+    },
+    "VersionIn": {
+      "additionalProperties": false,
+      "description": "One version of a concept-market row. A `works` version needs one assessment per kind, a research\ndepth and `sources_as_of`; a `not_viable` one needs only viability, the scores, build scope and the\ndeciding feature.",
+      "properties": {
+        "assessments": {
+          "items": {
+            "$ref": "#/$defs/AssessmentIn"
+          },
+          "title": "Assessments",
+          "type": "array"
+        },
+        "build_scope": {
+          "$ref": "#/$defs/BuildScope"
+        },
+        "citations": {
+          "items": {
+            "$ref": "#/$defs/CitationIn"
+          },
+          "title": "Citations",
+          "type": "array"
+        },
+        "confidence_score": {
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Confidence Score",
+          "type": "integer"
+        },
+        "deciding_feature": {
+          "minLength": 1,
+          "title": "Deciding Feature",
+          "type": "string"
+        },
+        "fact_check_rounds": {
+          "items": {
+            "$ref": "#/$defs/FactCheckRoundIn"
+          },
+          "title": "Fact Check Rounds",
+          "type": "array"
+        },
+        "gaps": {
+          "items": {
+            "$ref": "#/$defs/GapIn"
+          },
+          "title": "Gaps",
+          "type": "array"
+        },
+        "inconsistencies": {
+          "items": {
+            "$ref": "#/$defs/InconsistencyIn"
+          },
+          "title": "Inconsistencies",
+          "type": "array"
+        },
+        "related_companies": {
+          "items": {
+            "$ref": "#/$defs/RelatedCompanyIn"
+          },
+          "title": "Related Companies",
+          "type": "array"
+        },
+        "replaces": {
+          "items": {
+            "$ref": "#/$defs/ReplacesIn"
+          },
+          "title": "Replaces",
+          "type": "array"
+        },
+        "research_depth": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResearchDepth"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "roles": {
+          "items": {
+            "$ref": "#/$defs/RoleIn"
+          },
+          "title": "Roles",
+          "type": "array"
+        },
+        "scoping_questions": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Scoping Questions",
+          "type": "array"
+        },
+        "sources_as_of": {
+          "anyOf": [
+            {
+              "format": "date",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sources As Of"
+        },
+        "viability": {
+          "$ref": "#/$defs/Viability"
+        },
+        "white_space": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "White Space"
+        },
+        "works_score": {
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Works Score",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "viability",
+        "works_score",
+        "confidence_score",
+        "build_scope",
+        "deciding_feature"
+      ],
+      "title": "VersionIn",
+      "type": "object"
+    },
+    "Viability": {
+      "enum": [
+        "works",
+        "not_viable"
+      ],
+      "title": "Viability",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "anyOf": [
+    {
+      "$ref": "#/$defs/ConceptPayload"
+    },
+    {
+      "$ref": "#/$defs/ConceptMarketPayload"
+    },
+    {
+      "$ref": "#/$defs/DeletePayload"
+    }
+  ],
+  "title": "Arcadia opportunity catalog candidate payload",
+  "x-schema-version": 2,
+  "x-vocabularies": {
+    "assessment_flag": [
+      "vendor_sourced",
+      "unsourced",
+      "single_case",
+      "stale_source",
+      "derivation_gap"
+    ],
+    "assessment_kind": [
+      "impact",
+      "technical",
+      "uptake"
+    ],
+    "build_scope": [
+      "core",
+      "adapt",
+      "narrow",
+      "n_a"
+    ],
+    "candidate_action": [
+      "create",
+      "upsert",
+      "delete"
+    ],
+    "candidate_status": [
+      "submitted",
+      "in_review",
+      "changes_requested",
+      "approved",
+      "rejected",
+      "withdrawn",
+      "stale"
+    ],
+    "candidate_target_type": [
+      "concept",
+      "concept_market"
+    ],
+    "citation_target_type": [
+      "assessment",
+      "related_company",
+      "replaces",
+      "market_fit"
+    ],
+    "confidence": [
+      "low",
+      "medium",
+      "high"
+    ],
+    "rating": [
+      "green",
+      "amber",
+      "red",
+      "grey"
+    ],
+    "record_status": [
+      "active",
+      "deleted"
+    ],
+    "requester_kind": [
+      "agent",
+      "person"
+    ],
+    "research_depth": [
+      "memo_only",
+      "web_checked",
+      "site_evidenced"
+    ],
+    "review_decision": [
+      "approve",
+      "request_changes",
+      "reject"
+    ],
+    "role_basis": [
+      "memo_named",
+      "author_reading"
+    ],
+    "role_kind": [
+      "champion",
+      "obstacle"
+    ],
+    "severity": [
+      "low",
+      "medium",
+      "high"
+    ],
+    "source_type": [
+      "survey",
+      "government",
+      "academic",
+      "trade_press",
+      "vendor",
+      "memo_assertion"
+    ],
+    "value_basis": [
+      "point",
+      "range",
+      "midpoint"
+    ],
+    "value_type": [
+      "revenue",
+      "cost",
+      "capacity"
+    ],
+    "version": 2,
+    "viability": [
+      "works",
+      "not_viable"
+    ]
+  },
+  "x-vocabulary-version": 2
+}
