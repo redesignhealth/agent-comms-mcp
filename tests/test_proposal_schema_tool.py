@@ -19,6 +19,7 @@ from scopes import PROPOSAL_SUBMIT_SCOPE, TOOL_SCOPES
 from tests.test_proposal_tools import _ENV_PATCH, _OIDC_PATCH, _import_main
 
 _BOT = "catalog-agent"
+_ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture
@@ -120,7 +121,7 @@ class TestTool:
 
 class TestSchemaCopy:
     def test_file_matches_its_pin(self) -> None:
-        pin = json.loads((Path("providers") / proposal_schemas.PIN_RESOURCE).read_text())
+        pin = json.loads((_ROOT / "providers" / proposal_schemas.PIN_RESOURCE).read_text())
         data = proposal_schemas.schema_bytes()
         assert hashlib.sha256(data).hexdigest() == pin["sha256"]
         blob = hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
@@ -130,7 +131,7 @@ class TestSchemaCopy:
     def test_is_declared_as_package_data(self) -> None:
         import tomllib
 
-        config = tomllib.loads(Path("pyproject.toml").read_text())
+        config = tomllib.loads((_ROOT / "pyproject.toml").read_text())
         patterns = config["tool"]["setuptools"]["package-data"]["providers"]
         assert "catalog_candidate_payload.schema*.json" in patterns
 
@@ -143,5 +144,5 @@ class TestSchemaCopy:
         theirs = (root / "catalog_candidate_payload.schema.json").read_bytes()
         assert theirs == proposal_schemas.schema_bytes()
         pin = json.loads((root / "catalog_candidate_payload.schema.pin.json").read_text())
-        ours = json.loads((Path("providers") / proposal_schemas.PIN_RESOURCE).read_text())
+        ours = json.loads((_ROOT / "providers" / proposal_schemas.PIN_RESOURCE).read_text())
         assert pin == ours

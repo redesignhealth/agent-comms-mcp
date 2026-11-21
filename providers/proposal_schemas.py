@@ -41,7 +41,8 @@ action fields (proposals_submit(kind="catalog_candidate", action=...)):
 - upsert only: "base_version" (integer >= 1), the catalog version you edited. Arcadia
   requires it when it already holds that pair; omit it only if the pair is new. Never on create.
 - delete: only target_id, action_type and "reason" (required, non-empty, at most 2000 characters);
-  "fact_check" and "citations" are optional. No payload.
+  "fact_check" and "citations" are optional. No payload: the schema's DeletePayload definition is
+  built by the approvals service from target_id and reason; never send a payload on a delete.
 - Payload rules the schema alone cannot say: a related company's source_url is lowercase http:// or
   https:// with a host and no spaces; a "works" version has exactly one assessment per kind (impact,
   technical, uptake) plus research_depth and sources_as_of; value_low is not above value_high;

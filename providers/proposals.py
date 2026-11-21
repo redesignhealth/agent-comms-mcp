@@ -255,11 +255,14 @@ async def submit(
 
     ``create``/``upsert`` carry ``payload`` (Arcadia's candidate payload schema:
     a concept for ``concept:<slug>``, a concept-market version for ``pair:...``),
-    a non-empty ``fact_check`` log (no minimum score) and ``citations`` that
-    each resolve to YOUR OWN stored sources (same citation shape and check as
-    Arcana brain proposals). ``base_version`` (integer >= 1) is allowed on
-    ``upsert`` only, naming the catalog version you edited. ``delete`` needs only
-    ``target_id`` and ``reason``. A submission failing any check is refused with
+    a non-empty ``fact_check`` log (no minimum score) and, optionally, up to 10
+    ``citations`` that each must resolve to YOUR OWN stored sources (same
+    citation shape and check as Arcana brain proposals). ``base_version``
+    (integer >= 1) is allowed on ``upsert`` only, naming the catalog version you
+    edited; Arcadia requires it when it already holds that pair. ``delete``
+    needs only ``target_id`` and ``reason`` and carries NO ``payload`` (ignore
+    the ``DeletePayload`` branch of the payload schema's top-level ``anyOf``).
+    A submission failing any check is refused with
     the reason. Content from health systems is refused. Never auto-approved:
     Arcadia's reviewers decide, not the owner. The proposal stays ``pending``
     until they do; then ``proposals_get`` shows ``status`` ``applied``,
@@ -400,9 +403,9 @@ async def schema(kind: str) -> dict[str, Any]:
     ``concept:<slug>`` target and ``$defs/ConceptMarketPayload`` for a
     ``pair:<slug>:<MARKET>`` target), ``guide`` explains the actions,
     ``target_id`` forms and required fields, and ``examples`` holds a valid
-    ``create``, ``upsert`` and ``delete`` action. Re-read it when
-    ``schema_version`` changes. A kind with no published schema raises
-    ``invalid_request`` naming the kinds that have one.
+    ``create``, ``upsert`` and ``delete`` action. Call it again before each
+    new submission: ``schema_version`` is how you notice a change.
+    A kind with no published schema raises ``invalid_request`` naming the kinds that have one.
     """
     _require_bot_sub()
     try:
