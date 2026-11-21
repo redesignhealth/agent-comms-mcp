@@ -364,6 +364,14 @@ MAX_MESSAGES_PER_GET_CONVERSATION = 500
 MAX_UNREAD_CONVERSATIONS_PER_INBOX = 100
 MAX_PENDING_INVITES_PER_INBOX = 100
 
+# TECH-9595: Default automatic 256 KiB serialized message-page budget for
+# ``get_conversation``. Paperclip enforces a hard 1,000,000-byte wire cap on
+# remote MCP tool responses. Because FastMCP duplicates the tool result in
+# TextContent plus structuredContent and text escaping adds overhead, a
+# conservative 256 KiB message-page budget leaves ample headroom under the
+# 1 MB wire cap.
+MAX_BYTES_PER_GET_CONVERSATION = 256 * 1024  # 256 KiB
+
 # TECH-6197: a "fresh" ``get_conversation`` call -- both ``since`` and
 # ``since_seq`` omitted -- previously returned the entire message history
 # from the beginning. It now defaults to only the last
@@ -1568,6 +1576,15 @@ def _message_dict(message: Message, sender_sub: str) -> dict[str, Any]:
         "payload": message.payload,
         "created_at": _iso(message.created_at),
     }
+
+
+def _message_serialized_bytes(msg_dict: dict[str, Any]) -> int:
+    """Return conservative serialized byte size of a message dictionary.
+
+    Uses standard ``json.dumps`` with default ``ensure_ascii=True``, producing
+    an ASCII representation whose character length equals its byte size (TECH-9595).
+    """
+    return len(json.dumps(msg_dict, ensure_ascii=True))
 
 
 # --- Board admission -----------------------------------------------------------
@@ -11383,6 +11400,7 @@ async def get_conversation(
     since: datetime | None = None,
     context_hours: int = GET_CONVERSATION_DEFAULT_CONTEXT_HOURS,
     mark_read: bool = True,
+    max_bytes: int = MAX_BYTES_PER_GET_CONVERSATION,
 ) -> dict[str, Any]:
     """Combined read: conversation + participants + messages since ``since_seq``.
 
@@ -11391,8 +11409,10 @@ async def get_conversation(
     empty ``"messages"`` list — never any message content — and the
     caller's ``last_read_seq`` is NOT advanced (there is nothing to mark
     read). An ``active`` caller gets up to
-    ``MAX_MESSAGES_PER_GET_CONVERSATION`` messages from ``since_seq``
-    onward. ``"has_more"`` signals a truncated page; continue with
+    ``MAX_MESSAGES_PER_GET_CONVERSATION`` (500) messages from ``since_seq``
+    onward, bounded by a 256 KiB serialized message-page budget
+    (``MAX_BYTES_PER_GET_CONVERSATION``, TECH-9595). ``"has_more"`` signals
+    a truncated page (whether truncated by count or by bytes); continue with
     ``since_seq=page_max_seq`` (the max seq actually IN this page), NOT
     ``since_seq=last_read_seq`` (TECH-5377 follow-up) -- ``last_read_seq``
     is the caller's persisted read cursor, which can already be ahead of
@@ -11412,18 +11432,42 @@ async def get_conversation(
     side effect of what looks like a passive read would silently mark
     messages read and drop the conversation out of ``comms_inbox`` results
     on every such re-fetch. Every other aspect of the response (message
-    content, ``has_more``, ``page_max_seq``) is unaffected; the returned
-    ``last_read_seq`` still reflects the caller's persisted cursor as of
-    before this call. Note ``mark_read`` gates ONLY the cursor advance
-    below — it has no effect on ``_load_participant_for_read``'s
-    unconditional lazy-expiry check (Argus round-2 SUGGESTION): if the
-    conversation's deadline has already passed, ``conversation.state``
-    still flips to ``"expired"`` and is committed by this call regardless
-    of ``mark_read``, exactly as it already does for every other read path
-    in this module. A caller who is not a
+    content, ``has_more``, ``page_max_seq``, ``page_truncated_by_bytes``)
+    is unaffected; the returned ``last_read_seq`` still reflects the
+    caller's persisted cursor as of before this call. Note ``mark_read``
+    gates ONLY the cursor advance below — it has no effect on
+    ``_load_participant_for_read``'s unconditional lazy-expiry check (Argus
+    round-2 SUGGESTION): if the conversation's deadline has already passed,
+    ``conversation.state`` still flips to ``"expired"`` and is committed by
+    this call regardless of ``mark_read``, exactly as it already does for
+    every other read path in this module. A caller who is not a
     participant, or who previously left/declined, gets the uniform
     ``AccessDeniedError`` — identical to a non-existent conversation
     (DESIGN.md §4/§8).
+
+    **TECH-9595 -- 256 KiB serialized message-page budget**:
+    Paperclip enforces a hard 1,000,000-byte wire cap on remote MCP responses.
+    Because FastMCP duplicates tool results in TextContent and
+    structuredContent with text-escaping overhead, ``get_conversation``
+    automatically limits returned messages to a 256 KiB serialized budget
+    (``MAX_BYTES_PER_GET_CONVERSATION``), while retaining the 500-message
+    count cap (``MAX_MESSAGES_PER_GET_CONVERSATION``).
+    - Messages are packed as a contiguous prefix in ascending seq order.
+    - Singleton rule: if the very first in-window message alone exceeds the
+      byte budget, it is returned intact as a singleton to make progress
+      and avoid pagination deadlock.
+    - ``page_truncated_by_bytes`` is returned in the response dict for
+      active callers (``True`` if in-window messages were truncated by the
+      byte budget, ``False`` otherwise). Truncation of context messages
+      does not set this flag.
+    - ``has_more`` is ``True`` whenever more in-window messages remain,
+      whether bounded by count (500) or by bytes (256 KiB).
+    - ``page_max_seq`` and ``last_read_seq`` reflect only the returned
+      in-window messages.
+    - Context messages (see TECH-6197 below) receive only the leftover
+      byte budget after in-window messages are packed (closest-to-``since``
+      first, then returned in ascending seq order), and have no cursor or
+      read-mark effects.
 
     **TECH-6197 -- ``since``/``context_hours`` (time-window default)**:
     ``since_seq`` alone is a *cursor* (an opaque "I've already seen up to
@@ -11475,6 +11519,8 @@ async def get_conversation(
     ``page_max_seq`` -- those reflect the in-window page only, exactly as
     before; context messages are purely additive background.
     """
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be > 0")
     if since is not None and since.tzinfo is None:
         raise ValueError("since must be timezone-aware")
     if context_hours < 0:
@@ -11548,18 +11594,50 @@ async def get_conversation(
     )
     if since_ts is not None:
         in_window_stmt = in_window_stmt.where(Message.created_at >= since_ts)
-    msg_rows = (
+    candidate_msg_rows = (
         await session.execute(
             in_window_stmt.order_by(Message.seq).limit(MAX_MESSAGES_PER_GET_CONVERSATION + 1)
         )
     ).all()
-    # Fetch one extra row to detect truncation, then trim -- same pattern as
-    # list_agents (TECH-5377). `has_more`/`page_max_seq` reflect ONLY this
-    # in-window page -- the context band pulled in below is purely
-    # additive background and never participates in pagination.
-    has_more = len(msg_rows) > MAX_MESSAGES_PER_GET_CONVERSATION
-    msg_rows = msg_rows[:MAX_MESSAGES_PER_GET_CONVERSATION]
-    # The max seq actually IN this trimmed page -- distinct from
+    # Fetch one extra row to detect count truncation, then trim (TECH-5377).
+    had_more_by_count = len(candidate_msg_rows) > MAX_MESSAGES_PER_GET_CONVERSATION
+    msg_rows = candidate_msg_rows[:MAX_MESSAGES_PER_GET_CONVERSATION]
+
+    # TECH-9595: Pack contiguous in-window prefix ascending up to max_bytes budget.
+    in_window_messages: list[dict[str, Any]] = []
+    in_window_rows_packed: list[Any] = []
+    in_window_bytes = 0
+    page_truncated_by_bytes = False
+
+    for idx, (m, sender_sub) in enumerate(msg_rows):
+        m_dict = _message_dict(m, sender_sub)
+        m_bytes = _message_serialized_bytes(m_dict)
+        if idx == 0:
+            # Singleton rule (TECH-9595): if the very first in-window row
+            # exceeds the page byte budget, return it intact as a singleton
+            # to make progress and prevent pagination deadlock.
+            in_window_messages.append(m_dict)
+            in_window_rows_packed.append((m, sender_sub))
+            in_window_bytes += m_bytes
+            if in_window_bytes > max_bytes:
+                if len(msg_rows) > 1 or had_more_by_count:
+                    page_truncated_by_bytes = True
+                break
+        else:
+            if in_window_bytes + m_bytes <= max_bytes:
+                in_window_messages.append(m_dict)
+                in_window_rows_packed.append((m, sender_sub))
+                in_window_bytes += m_bytes
+            else:
+                page_truncated_by_bytes = True
+                break
+
+    # `has_more`/`page_max_seq` reflect ONLY this in-window page -- the context
+    # band pulled in below is purely additive background and never participates
+    # in pagination.
+    has_more = had_more_by_count or len(in_window_rows_packed) < len(msg_rows)
+
+    # The max seq actually IN this returned in-window prefix -- distinct from
     # last_read_seq below. Argus round-1 BLOCKING catch: `since_seq` can be
     # below the caller's persisted cursor (a deliberate re-read of older
     # history), in which case this page's own max seq is LESS than that
@@ -11568,7 +11646,7 @@ async def get_conversation(
     # would silently skip every message between page_max_seq and that
     # cursor. Falls back to `since_seq` itself on an empty page, so
     # `since_seq=page_max_seq` is always a safe (no-op) re-call.
-    page_max_seq = max((m.seq for m, _ in msg_rows), default=resolved_since_seq)
+    page_max_seq = max((m.seq for m, _ in in_window_rows_packed), default=resolved_since_seq)
 
     # TECH-6197 anchor-triggered context band: only pulled in when a
     # timestamp bound is actually in effect AND this is a "fresh" read
@@ -11578,10 +11656,19 @@ async def get_conversation(
     # pages must not repeat the context band. `context_hours=0` naturally
     # yields an empty (lower-bound == upper-bound) band with no special
     # case needed.
-    context_rows: list[Any] = []
-    if since_ts is not None and not since_seq_explicit and msg_rows and context_hours > 0:
+    # TECH-9595: Context gets only leftover budget (max_bytes - in_window_bytes),
+    # closest-first then ascending response; no context cursor effects.
+    context_messages: list[dict[str, Any]] = []
+    leftover_bytes = max_bytes - in_window_bytes
+    if (
+        since_ts is not None
+        and not since_seq_explicit
+        and in_window_rows_packed
+        and context_hours > 0
+        and leftover_bytes > 0
+    ):
         context_lower_bound = since_ts - timedelta(hours=context_hours)
-        context_rows = list(
+        candidate_context_rows = list(
             (
                 await session.execute(
                     select(Message, Agent.sub)
@@ -11592,37 +11679,45 @@ async def get_conversation(
                         Message.created_at < since_ts,
                     )
                     # Closest-to-`since` messages kept on truncation --
-                    # descending, capped, then reversed back to ascending
-                    # below for the normal seq-ascending response order.
-                    .order_by(Message.seq.desc())
+                    # descending by created_at (temporal proximity) with
+                    # seq.desc() as tie-breaker, then sorted back into
+                    # seq-ascending order below for response consistency.
+                    .order_by(Message.created_at.desc(), Message.seq.desc())
                     .limit(MAX_MESSAGES_PER_GET_CONVERSATION)
                 )
             ).all()
         )
-        context_rows.reverse()
+        current_context_bytes = 0
+        for m, sender_sub in candidate_context_rows:
+            c_dict = _message_dict(m, sender_sub)
+            c_dict["context"] = True
+            c_bytes = _message_serialized_bytes(c_dict)
+            if current_context_bytes + c_bytes <= leftover_bytes:
+                context_messages.append(c_dict)
+                current_context_bytes += c_bytes
+            else:
+                break
+        context_messages.sort(key=lambda item: item["seq"])
 
     # last_read_seq only ever advances forward, never regresses on an
     # older-history re-read (page_max_seq can be below the existing cursor
-    # in exactly that case). `msg_rows and` is load-bearing, not redundant
-    # (Argus round-2 BLOCKING catch): on an EMPTY page, page_max_seq falls
-    # back to since_seq -- if a caller passes a since_seq ahead of their
+    # in exactly that case). `in_window_rows_packed and` is load-bearing, not
+    # redundant (Argus round-2 BLOCKING catch): on an EMPTY page, page_max_seq
+    # falls back to since_seq -- if a caller passes a since_seq ahead of their
     # own persisted cursor (e.g. since_seq=10, last_read_seq=3) with no
     # messages actually returned, `10 > 3` would otherwise fire and commit
     # last_read_seq=10, permanently hiding seqs 4-10 from inbox's `HAVING
     # max(seq) > last_read_seq` for messages that were never delivered to
     # this caller. The docstring's own contract ("only if any messages
-    # were returned") requires this guard. Deliberately keyed on `msg_rows`
-    # (in-window only), not the combined context+in-window list -- context
-    # messages are background re-shown from before `since` and must not by
-    # themselves drive the read cursor.
-    if mark_read and msg_rows and page_max_seq > participant.last_read_seq:
+    # were returned") requires this guard. Deliberately keyed on
+    # `in_window_rows_packed` (in-window only), not the combined
+    # context+in-window list -- context messages are background re-shown
+    # from before `since` and must not by themselves drive the read cursor.
+    if mark_read and in_window_rows_packed and page_max_seq > participant.last_read_seq:
         participant.last_read_seq = page_max_seq
     await session.commit()
 
-    combined_messages = [_message_dict(m, sender_sub) for m, sender_sub in context_rows]
-    for context_message in combined_messages:
-        context_message["context"] = True
-    combined_messages.extend(_message_dict(m, sender_sub) for m, sender_sub in msg_rows)
+    combined_messages = context_messages + in_window_messages
 
     return {
         "conversation": _conversation_dict(conversation),
@@ -11635,8 +11730,7 @@ async def get_conversation(
         # renamed it to `messages_returned`). Includes any context
         # messages (TECH-6197): the in-window band and the context band
         # are each independently capped at MAX_MESSAGES_PER_GET_CONVERSATION,
-        # so this combined count can be up to ~2x that cap, not a single
-        # 500 ceiling.
+        # bounded by MAX_BYTES_PER_GET_CONVERSATION (TECH-9595).
         "messages_in_page": len(combined_messages),
         "has_more": has_more,
         "page_max_seq": page_max_seq,
@@ -11647,6 +11741,9 @@ async def get_conversation(
         # an explicit `since_seq` continuation with no timestamp concept
         # at all).
         "since_was_defaulted": since_was_defaulted,
+        # TECH-9595: True when in-window messages were truncated because of
+        # the serialized page byte budget (distinct from context truncation).
+        "page_truncated_by_bytes": page_truncated_by_bytes,
     }
 
 
@@ -12417,6 +12514,7 @@ __all__ = [
     "HUMAN_APPROVAL_ONLY_PROPOSAL_KINDS",
     "IMMUTABLE_PROPOSAL_KINDS",
     "MAX_APPROVAL_HOLDS_PER_MINUTE",
+    "MAX_BYTES_PER_GET_CONVERSATION",
     "MAX_CATALOG_CANDIDATE_ACTION_BYTES",
     "MAX_CONVERSATION_STARTS_PER_HOUR",
     "MAX_DECISION_REASON_LENGTH",
