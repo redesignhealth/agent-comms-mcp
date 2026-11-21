@@ -1856,34 +1856,43 @@ async def get_conversation(
     Returns ``conversation``, ``participants``, ``messages``, ``invited``,
     ``has_more``, and either ``invited_by`` (only for an ``invited``
     caller) or ``messages_returned``, ``page_max_seq``, ``last_read_seq``,
-    ``since_was_defaulted`` (only for a non-``invited`` caller).
+    ``since_was_defaulted``, ``page_truncated_by_bytes`` (only for a
+    non-``invited`` caller).
 
     An ``invited`` (not yet accepted) caller gets metadata only -- no
     message content, ``since_seq``/``since``/``context_hours`` are all
     ignored, and ``has_more`` is always ``False``. An ``active`` caller
     gets up to 500 in-window messages (``MAX_MESSAGES_PER_GET_CONVERSATION``)
-    per the ``since_seq``/``since`` resolution below, and their read cursor
+    bounded by an automatic 256 KiB serialized message-page budget
+    (``MAX_BYTES_PER_GET_CONVERSATION``, TECH-9595) per the
+    ``since_seq``/``since`` resolution below, and their read cursor
     advances. ``since_seq``, if passed, must be non-negative -- a negative
     value would silently widen the result window in an unintended way.
 
-    **Pagination**: when ``has_more`` is ``True``, re-call with
-    ``since_seq=page_max_seq`` from THIS response -- NOT
-    ``since_seq=last_read_seq``. ``last_read_seq`` is your persisted read
-    cursor across all calls, which can already be ahead of a page you're
-    re-reading (e.g. you deliberately pass a low ``since_seq`` to revisit
-    older history); re-calling with it instead of ``page_max_seq`` can
-    silently skip messages between this page's end and that cursor.
-    ``page_max_seq``/``has_more`` reflect only the in-window page below,
-    never any additional context messages.
+    **Pagination**: when ``has_more`` is ``True`` (whether bounded by
+    the 500 count cap or the 256 KiB byte budget, flagged via
+    ``page_truncated_by_bytes``), re-call with ``since_seq=page_max_seq``
+    from THIS response -- NOT ``since_seq=last_read_seq``. ``last_read_seq``
+    is your persisted read cursor across all calls, which can already be
+    ahead of a page you're re-reading (e.g. you deliberately pass a low
+    ``since_seq`` to revisit older history); re-calling with it instead of
+    ``page_max_seq`` can silently skip messages between this page's end and
+    that cursor. ``page_max_seq``/``has_more``/``page_truncated_by_bytes``
+    reflect only the in-window page below, never any additional context
+    messages. If a single in-window message alone exceeds the byte budget,
+    it is returned intact as a singleton to make progress.
 
     The returned ``messages_returned`` count is the size of the returned
     (post-filter, capped, context-inclusive) slice, NOT the conversation's
     total message count -- deliberately not named ``total_count`` to avoid
     implying otherwise. The in-window band and the context band are each
     INDEPENDENTLY capped at ``MAX_MESSAGES_PER_GET_CONVERSATION`` (500),
-    so ``messages_returned`` can be up to ~2x that cap on a call that
-    pulls in both a full in-window page and a full context band, not a
-    single combined 500 ceiling.
+    bounded by the 256 KiB page budget (TECH-9595), so ``messages_returned``
+    can be up to ~2x that count cap on a call that pulls in both a full
+    in-window page and a full context band, not a single combined 500
+    ceiling. Context messages receive only the leftover byte budget after
+    in-window messages are packed (closest-to-``since`` first, then returned
+    in ascending seq order), and have no cursor or read-mark effects.
 
     **TECH-6197 -- ``since``/``context_hours`` default behavior (breaking
     change)**: a plain, argument-free call used to return the ENTIRE
@@ -2735,9 +2744,10 @@ async def conversation_resource(conversation_id: str) -> dict[str, Any]:
     membership-is-visibility rule): an ``invited`` (not yet accepted) caller
     gets metadata only, a non-member gets the uniform ``access_denied``
     error, and an ``active`` caller gets up to the same
-    ``MAX_MESSAGES_PER_GET_CONVERSATION`` (500) in-window cap the tool
-    applies -- a conversation longer than that cap is permanently truncated
-    from this
+    ``MAX_MESSAGES_PER_GET_CONVERSATION`` (500) count cap and 256 KiB
+    serialized message-page budget (``MAX_BYTES_PER_GET_CONVERSATION``,
+    TECH-9595) the tool applies -- a conversation longer than those caps is
+    permanently truncated from this
     resource's perspective (no ``since_seq``/pagination parameter exists on
     the URI template to page further; the tool remains the way to read
     past this cap). Because this is a *template*, ``resources/list`` never

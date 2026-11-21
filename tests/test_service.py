@@ -15,6 +15,7 @@ effects the return values don't expose.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -6331,6 +6332,161 @@ class TestGetConversation:
         await session.refresh(row)
         assert row.last_read_seq == 1
 
+    async def test_invalid_max_bytes_rejected(self, session: AsyncSession) -> None:
+        """TECH-9595: max_bytes must be strictly positive."""
+        _owner, target, conversation = await self._start(
+            session, "gc-mb-inv-owner", "gc-mb-inv-target"
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        with pytest.raises(ValueError, match="max_bytes must be > 0"):
+            await get_conversation(
+                session,
+                actor_sub=target.sub,
+                caller_agent_id=target.id,
+                conversation_id=conversation.id,
+                max_bytes=0,
+            )
+        with pytest.raises(ValueError, match="max_bytes must be > 0"):
+            await get_conversation(
+                session,
+                actor_sub=target.sub,
+                caller_agent_id=target.id,
+                conversation_id=conversation.id,
+                max_bytes=-10,
+            )
+
+    async def test_page_budget_truncates_in_window_messages(self, session: AsyncSession) -> None:
+        """TECH-9595: in-window messages are packed up to max_bytes budget,
+        setting page_truncated_by_bytes=True, has_more=True, and advancing
+        last_read_seq only to the returned page's max seq."""
+        owner, target, conversation = await self._start(
+            session, "gc-trunc-owner", "gc-trunc-target"
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        session.add_all(
+            [
+                Message(
+                    conversation_id=conversation.id,
+                    seq=2,
+                    sender_id=owner.id,
+                    type="note",
+                    schema_version=1,
+                    payload={"type": "note", "text": "note two"},
+                ),
+                Message(
+                    conversation_id=conversation.id,
+                    seq=3,
+                    sender_id=owner.id,
+                    type="note",
+                    schema_version=1,
+                    payload={"type": "note", "text": "note three"},
+                ),
+            ]
+        )
+        await session.commit()
+
+        # Read full conversation first to measure message serialized sizes
+        full_result = await get_conversation(
+            session,
+            actor_sub=target.sub,
+            caller_agent_id=target.id,
+            conversation_id=conversation.id,
+            mark_read=False,
+        )
+        assert len(full_result["messages"]) == 3
+        m1_bytes = len(json.dumps(full_result["messages"][0], ensure_ascii=True))
+        m2_bytes = len(json.dumps(full_result["messages"][1], ensure_ascii=True))
+
+        # Budget that accommodates exactly messages 1 and 2, but not message 3
+        budget = m1_bytes + m2_bytes + 5
+        page1 = await get_conversation(
+            session,
+            actor_sub=target.sub,
+            caller_agent_id=target.id,
+            conversation_id=conversation.id,
+            max_bytes=budget,
+        )
+        assert len(page1["messages"]) == 2
+        assert [m["seq"] for m in page1["messages"]] == [1, 2]
+        assert page1["has_more"] is True
+        assert page1["page_truncated_by_bytes"] is True
+        assert page1["page_max_seq"] == 2
+        assert page1["last_read_seq"] == 2
+
+        # Paging forward with since_seq=2 yields the final message
+        page2 = await get_conversation(
+            session,
+            actor_sub=target.sub,
+            caller_agent_id=target.id,
+            conversation_id=conversation.id,
+            since_seq=page1["page_max_seq"],
+            max_bytes=budget,
+        )
+        assert len(page2["messages"]) == 1
+        assert [m["seq"] for m in page2["messages"]] == [3]
+        assert page2["has_more"] is False
+        assert page2["page_truncated_by_bytes"] is False
+        assert page2["page_max_seq"] == 3
+        assert page2["last_read_seq"] == 3
+
+    async def test_oversized_first_message_returned_as_singleton(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-9595: If the very first in-window message exceeds the page budget,
+        it is returned intact as a singleton to make progress and prevent pagination deadlock."""
+        owner, target, conversation = await self._start(
+            session, "gc-single-owner", "gc-single-target"
+        )
+        await accept_invite(
+            session, actor_sub=target.sub, agent_id=target.id, conversation_id=conversation.id
+        )
+        session.add(
+            Message(
+                conversation_id=conversation.id,
+                seq=2,
+                sender_id=owner.id,
+                type="note",
+                schema_version=1,
+                payload={"type": "note", "text": "small second note"},
+            )
+        )
+        await session.commit()
+
+        # Set max_bytes smaller than the first message
+        page1 = await get_conversation(
+            session,
+            actor_sub=target.sub,
+            caller_agent_id=target.id,
+            conversation_id=conversation.id,
+            max_bytes=50,  # smaller than any full message dict
+        )
+        assert len(page1["messages"]) == 1
+        assert page1["messages"][0]["seq"] == 1
+        assert page1["has_more"] is True
+        assert page1["page_truncated_by_bytes"] is True
+        assert page1["page_max_seq"] == 1
+        assert page1["last_read_seq"] == 1
+
+        # Second page also returns seq 2 as singleton
+        page2 = await get_conversation(
+            session,
+            actor_sub=target.sub,
+            caller_agent_id=target.id,
+            conversation_id=conversation.id,
+            since_seq=page1["page_max_seq"],
+            max_bytes=50,
+        )
+        assert len(page2["messages"]) == 1
+        assert page2["messages"][0]["seq"] == 2
+        assert page2["has_more"] is False
+        assert page2["page_truncated_by_bytes"] is False
+        assert page2["page_max_seq"] == 2
+        assert page2["last_read_seq"] == 2
+
 
 class TestGetConversationSinceWindow:
     """TECH-6197: ``since``/``context_hours`` default-window behavior,
@@ -6908,6 +7064,169 @@ class TestGetConversationSinceWindow:
             assert "context" not in m
             assert datetime.fromisoformat(m["created_at"]) >= since_ts
         assert second["has_more"] is False
+
+    async def test_context_band_limited_to_leftover_byte_budget(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-9595: Context band gets only leftover byte budget after in-window
+        messages are packed, closest-first then returned in ascending order.
+        Context truncation does not set page_truncated_by_bytes."""
+        owner = await _register(session, "gcw-owner-budget")
+        target = await _register(session, "gcw-target-budget")
+        now = datetime.now(UTC)
+        since_ts = now - timedelta(hours=_service.GET_CONVERSATION_DEFAULT_LOOKBACK_HOURS)
+        # 2 context messages (seq 1 at 20h before since, seq 2 at 2h before since)
+        # and 1 in-window anchor message (seq 3 at 1h after since)
+        context_time_old = since_ts - timedelta(hours=20)
+        context_time_recent = since_ts - timedelta(hours=2)
+        in_window_time = since_ts + timedelta(hours=1)
+
+        conversation = await self._seed(
+            session,
+            owner=owner,
+            target=target,
+            message_times=[context_time_old, context_time_recent, in_window_time],
+        )
+
+        # Baseline: with default max_bytes, all 3 messages returned (2 context, 1 in-window)
+        baseline = await get_conversation(
+            session,
+            actor_sub=target.sub,
+            caller_agent_id=target.id,
+            conversation_id=conversation.id,
+            mark_read=False,
+        )
+        assert len(baseline["messages"]) == 3
+        c_old_bytes = len(json.dumps(baseline["messages"][0], ensure_ascii=True))
+        c_recent_bytes = len(json.dumps(baseline["messages"][1], ensure_ascii=True))
+        in_win_bytes = len(json.dumps(baseline["messages"][2], ensure_ascii=True))
+        assert c_old_bytes > 0
+
+        # Case 1: budget fits in-window anchor + only the closer context message (seq 2)
+        budget = in_win_bytes + c_recent_bytes + 5
+        result = await get_conversation(
+            session,
+            actor_sub=target.sub,
+            caller_agent_id=target.id,
+            conversation_id=conversation.id,
+            max_bytes=budget,
+            mark_read=False,
+        )
+        assert len(result["messages"]) == 2
+        assert result["messages"][0]["seq"] == 2
+        assert result["messages"][0]["context"] is True
+        assert result["messages"][1]["seq"] == 3
+        assert "context" not in result["messages"][1]
+        assert result["has_more"] is False
+        # Context truncation must NOT set page_truncated_by_bytes
+        assert result["page_truncated_by_bytes"] is False
+        assert result["page_max_seq"] == 3
+
+        # Case 2: budget fits in-window anchor only, leftover is 0 or too small for any context
+        budget_anchor_only = in_win_bytes + 5
+        result_anchor_only = await get_conversation(
+            session,
+            actor_sub=target.sub,
+            caller_agent_id=target.id,
+            conversation_id=conversation.id,
+            max_bytes=budget_anchor_only,
+            mark_read=False,
+        )
+        assert len(result_anchor_only["messages"]) == 1
+        assert result_anchor_only["messages"][0]["seq"] == 3
+        assert "context" not in result_anchor_only["messages"][0]
+        assert result_anchor_only["has_more"] is False
+        assert result_anchor_only["page_truncated_by_bytes"] is False
+        assert result_anchor_only["page_max_seq"] == 3
+
+    async def test_context_candidate_selection_prefers_temporal_proximity_over_seq(
+        self, session: AsyncSession
+    ) -> None:
+        """TECH-9595 review finding regression: when seq order and timestamp
+        proximity diverge, candidate selection prioritizes temporal proximity
+        (created_at DESC, seq DESC), while returning the selected context in
+        seq-ascending order."""
+        owner = await _register(session, "gcw-owner-diverge")
+        target = await _register(session, "gcw-target-diverge")
+        now = datetime.now(UTC)
+        since_ts = now - timedelta(hours=_service.GET_CONVERSATION_DEFAULT_LOOKBACK_HOURS)
+
+        # Context messages where seq and temporal proximity diverge:
+        # seq 1: 1h before since_ts (temporally closest to since)
+        # seq 2: 10h before since_ts (further from since)
+        # seq 3: 20h before since_ts (furthest from since)
+        # seq 4: 1h after since_ts (in-window anchor)
+        t_seq1 = since_ts - timedelta(hours=1)
+        t_seq2 = since_ts - timedelta(hours=10)
+        t_seq3 = since_ts - timedelta(hours=20)
+        t_in_win = since_ts + timedelta(hours=1)
+
+        conversation = await self._seed(
+            session,
+            owner=owner,
+            target=target,
+            message_times=[t_seq1, t_seq2, t_seq3, t_in_win],
+        )
+
+        full = await get_conversation(
+            session,
+            actor_sub=target.sub,
+            caller_agent_id=target.id,
+            conversation_id=conversation.id,
+            mark_read=False,
+        )
+        assert len(full["messages"]) == 4
+        # All messages returned in seq-ascending order
+        assert [m["seq"] for m in full["messages"]] == [1, 2, 3, 4]
+
+        in_win_bytes = len(json.dumps(full["messages"][3], ensure_ascii=True))
+        c1_bytes = len(json.dumps(full["messages"][0], ensure_ascii=True))
+
+        # Budget that accommodates in-window anchor (seq 4) plus exactly ONE context message
+        budget_for_one_context = in_win_bytes + c1_bytes + 5
+        res = await get_conversation(
+            session,
+            actor_sub=target.sub,
+            caller_agent_id=target.id,
+            conversation_id=conversation.id,
+            max_bytes=budget_for_one_context,
+            mark_read=False,
+        )
+
+        # Candidate selection must pick seq 1 (temporally closest: 1h before since),
+        # NOT seq 3 (which had the highest seq among context messages but was 20h before since).
+        assert len(res["messages"]) == 2
+        assert res["messages"][0]["seq"] == 1
+        assert res["messages"][0]["context"] is True
+        assert res["messages"][1]["seq"] == 4
+        assert "context" not in res["messages"][1]
+
+        # Case where multiple context messages are selected with diverging seq/time:
+        # seq 1: 5h before since
+        # seq 2: 1h before since (closer)
+        # Candidate selection picks seq 2 first, then seq 1; output must be
+        # sorted seq-ascending [1, 2].
+        conversation2 = await self._seed(
+            session,
+            owner=owner,
+            target=target,
+            message_times=[since_ts - timedelta(hours=5), since_ts - timedelta(hours=1), t_in_win],
+        )
+        res2 = await get_conversation(
+            session,
+            actor_sub=target.sub,
+            caller_agent_id=target.id,
+            conversation_id=conversation2.id,
+            mark_read=False,
+        )
+        assert len(res2["messages"]) == 3
+        assert [m["seq"] for m in res2["messages"]] == [1, 2, 3]
+        assert res2["messages"][0]["seq"] == 1
+        assert res2["messages"][0]["context"] is True
+        assert res2["messages"][1]["seq"] == 2
+        assert res2["messages"][1]["context"] is True
+        assert res2["messages"][2]["seq"] == 3
+        assert "context" not in res2["messages"][2]
 
 
 # --- resolve_inbox_target -------------------------------------------------------
