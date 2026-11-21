@@ -63,6 +63,7 @@ scope.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import uuid
@@ -81,6 +82,7 @@ from exceptions import (
     AccessDeniedError,
     ExternalResolutionError,
     HoldAlreadyDecidedError,
+    InvalidProposalActionError,
     ProposalImmutableError,
     ProposalTargetUnavailableError,
     RateLimitExceededError,
@@ -143,8 +145,9 @@ async def _map_proposal_errors() -> AsyncIterator[None]:
     profile. This includes ``exceptions.InvalidProposalActionError``
     (TECH-7711, a supported ``kind`` with a malformed ``action``): a
     ``ValueError`` subclass whose ``str()`` is the same sanitized message
-    the REST route returns as ``detail`` (the field reasons are inline in
-    it; the structured ``field_errors`` list is REST-only).
+    the REST route returns as ``detail``. This tool returns it as the JSON
+    text of ``exc.structured()``: ``{code, message, errors: [{path, rule,
+    message}], omitted}`` (REST carries the same keys beside ``field_errors``).
     ``RateLimitExceededError`` (TECH-5875, per-bot submission
     rate limit) and ``HoldAlreadyDecidedError`` (a withdraw racing an
     already-claimed hold) are both specific-by-design (see their own
@@ -164,6 +167,11 @@ async def _map_proposal_errors() -> AsyncIterator[None]:
         yield
     except AccessDeniedError as exc:
         raise ToolError(str(exc)) from None
+    except InvalidProposalActionError as exc:
+        # A refused ``action``: the structured form as JSON text, so an agent can
+        # read each ``{path, rule, message}`` (``message`` repeats the sentence
+        # the plain error carried).
+        raise ToolError(json.dumps(exc.structured())) from None
     except (
         RateLimitExceededError,
         HoldAlreadyDecidedError,

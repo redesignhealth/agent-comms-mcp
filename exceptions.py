@@ -118,6 +118,8 @@ tools boundary — see ``providers/comms.py``'s ``_map_service_errors``.
 
 from __future__ import annotations
 
+from typing import Any
+
 _ACCESS_DENIED_MESSAGE = "access_denied: not authorized for this resource"
 
 
@@ -501,6 +503,45 @@ class InvalidProposalActionError(ValueError):
         self.detail = detail
         self.field_errors = field_errors
         self.omitted = omitted
+
+    def structured(self) -> dict[str, Any]:
+        """``{code, message, errors: [{path, rule, message}]}`` for the caller.
+
+        ``rule`` is the closed-set code and ``message`` a fixed sentence for it
+        (``PROPOSAL_ACTION_RULE_MESSAGES``); nothing a caller submitted is echoed."""
+        fallback = "the value is not valid"
+        return {
+            "code": INVALID_PROPOSAL_ACTION_CODE,
+            "message": self.detail,
+            "errors": [
+                {
+                    "path": path,
+                    "rule": rule,
+                    "message": f"{path}: {PROPOSAL_ACTION_RULE_MESSAGES.get(rule, fallback)}",
+                }
+                for path, rule in self.field_errors
+            ],
+            "omitted": self.omitted,
+        }
+
+
+# One fixed sentence per rule (the closed ``plugins.PROPOSAL_ACTION_ERROR_CODES`` set), so
+# the structured error can say what is wrong without ever carrying plugin or caller text.
+PROPOSAL_ACTION_RULE_MESSAGES: dict[str, str] = {
+    "missing": "this required field is missing",
+    "extra_field": "a field that is not allowed here was sent",
+    "invalid_type": "the value has the wrong type",
+    "too_short": "the value is empty or too short",
+    "too_long": "the value is too long or has too many items",
+    "out_of_range": "the number is outside the allowed range",
+    "invalid_format": "the value does not match the required format",
+    "invalid_value": "the value is not one of the allowed values",
+    "not_canonical": "the value is not in the canonical form or disagrees with another field",
+    "digest_mismatch": "the value does not match its digest",
+    "unsupported": "this is not supported",
+    "prohibited_content": "the content is of a kind this proposal may not carry",
+}
+INVALID_PROPOSAL_ACTION_CODE = "invalid_proposal_action"
 
 
 class InvalidOwnerReassignmentError(Exception):
