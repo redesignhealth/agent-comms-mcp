@@ -251,9 +251,9 @@ async def get(target_key: str) -> dict[str, Any]:
     (a concept has no version); ``payload`` is the row in the version-2 candidate
     payload shape (see ``proposals_schema``). A soft-deleted target reads
     ``exists: true, status: "deleted"``: an upsert restores it. If the lookup
-    itself fails (``catalog_unavailable``) you do not know whether the row exists: do not propose a create. Available only when the board
-    is configured for it (otherwise ``catalog_get is not configured``);
-    rate-limited per bot.
+    itself fails (``catalog_unavailable``) you do not know whether the row exists:
+    do not propose a create. Available only when the board is configured for it
+    (otherwise ``catalog_get is not configured``); rate-limited per bot.
     """
     bot = _require_bot_sub()
     if not isinstance(target_key, str) or not (
