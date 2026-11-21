@@ -38,6 +38,7 @@ from exceptions import (
     AccessDeniedError,
     AgentRetiredError,
     ConversationArchivedError,
+    ExternalResolutionError,
     HoldAlreadyDecidedError,
     HoldAwaitingAutoReviewError,
     HoldExpiredError,
@@ -66,6 +67,7 @@ from providers.comms import (
 from providers.proposals import proposals_server
 from scopes import (
     PROPOSAL_APPLY_RECORD_SCOPE,
+    PROPOSAL_FORWARD_REFUSAL_SCOPE,
     PROPOSAL_SUBMIT_SCOPE,
     check_resource_scope,
     is_interactive_token,
@@ -1023,6 +1025,46 @@ async def _authenticate_apply_record_caller(
     return sub, allowed_kinds, 200
 
 
+# Subjects allowed to call ``POST /proposals/{hold_id}/forward-refusal`` (TECH-9214):
+# comma-separated, read on every call, default empty so nobody can until an
+# operator names the approvals forwarder's service identity.
+PROPOSAL_FORWARD_REFUSAL_SUBS_ENV = "PROPOSAL_FORWARD_REFUSAL_ALLOWED_SUBS"
+
+
+async def _authenticate_forward_refusal_caller(request: Request) -> tuple[str | None, int]:
+    """Gate for ``POST /proposals/{hold_id}/forward-refusal`` (TECH-9214): a
+    verified agent-chain SERVICE token (never Okta/interactive) carrying
+    ``PROPOSAL_FORWARD_REFUSAL_SCOPE`` whose subject is on
+    ``PROPOSAL_FORWARD_REFUSAL_ALLOWED_SUBS``. Returns ``(sub, 200)`` or
+    ``(None, 401 | 403)``; every 403 is audited under the ``forward_refusal``
+    surface."""
+    token_str = _extract_bearer_token(request)
+    if token_str is None:
+        return None, 401
+    token = await _verify_agent_token(token_str)
+    if token is None:
+        return None, 401
+    sub = try_resolve_email(token)
+    if sub is None:
+        return None, 401
+    allowed = {
+        entry.strip()
+        for entry in os.environ.get(PROPOSAL_FORWARD_REFUSAL_SUBS_ENV, "").split(",")
+        if entry.strip()
+    }
+    if (
+        is_interactive_token(token)
+        or PROPOSAL_FORWARD_REFUSAL_SCOPE not in scopes_for_token(token)
+        or sub not in allowed
+    ):
+        async with get_session_factory()() as session:
+            await service.audit_denied_proposal_submission(
+                session, actor_sub=sub, reason="missing_scope", surface="forward_refusal"
+            )
+        return None, 403
+    return sub, 200
+
+
 MAX_PROPOSAL_REQUEST_BYTES = 5 * 1024 * 1024  # 5 MiB (TECH-7720)
 
 
@@ -1494,6 +1536,64 @@ async def get_proposal_apply_record_route(request: Request) -> Response:
             return JSONResponse(_UNIFORM_HOLD_NOT_FOUND, status_code=404)
         except Exception:
             logger.exception("get_proposal_apply_record failure for hold_id=%s", hold_id)
+            return JSONResponse({"error": "internal_error"}, status_code=500)
+
+    return JSONResponse(result, status_code=200)
+
+
+@mcp.custom_route("/proposals/{hold_id}/forward-refusal", methods=["POST"])
+async def forward_refusal_route(request: Request) -> Response:
+    """Service-only: the approvals service's catalog forwarder reports that
+    Arcadia REFUSED a pending ``catalog_candidate`` it forwarded (TECH-9214).
+    Body: ``{"note": str (required, <= 2000 chars; what the submitting agent
+    reads as ``decision_note``), "code": str (optional, Arcadia's error code),
+    "errors": [{"path", "rule", "message"}] (optional, at most 20 kept)}``.
+
+    Closes the proposal as ``rejected`` (decision source ``external``) and stores
+    ``code``/``errors`` as the structured ``external_refusal`` field that
+    ``proposals_get`` returns to the submitting bot. 200 with ``already_recorded``
+    on a repeat; 404 ``unknown_proposal`` for an unknown hold or a kind the owner
+    decides; 409 ``already_decided`` for a proposal that is not pending (withdrawn,
+    decided by someone else); 400 ``invalid_request``. Auth:
+    ``_authenticate_forward_refusal_caller`` (service token, scope
+    ``proposals:forward_refusal``, subject allowlist). Applies nothing and writes
+    nothing outward."""
+    caller_sub, status = await _authenticate_forward_refusal_caller(request)
+    if caller_sub is None:
+        return JSONResponse({"error": "unauthorized"}, status_code=status)
+
+    try:
+        hold_id = uuid.UUID(request.path_params["hold_id"])
+    except ValueError:
+        return JSONResponse({"error": "unknown_proposal"}, status_code=404)
+
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "invalid_json"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse(
+            {"error": "invalid_request", "detail": "body must be an object"}, status_code=400
+        )
+
+    async with get_session_factory()() as session:
+        try:
+            result = await service.record_forward_refusal(
+                session,
+                forwarder_sub=caller_sub,
+                hold_id=hold_id,
+                note=body.get("note"),
+                code=body.get("code"),
+                errors=body.get("errors"),
+            )
+        except ExternalResolutionError as exc:
+            http_status = {"unknown_proposal": 404, "already_decided": 409}.get(exc.code, 400)
+            payload: dict[str, Any] = {"error": exc.code, "detail": str(exc)}
+            if exc.status is not None:
+                payload["status"] = exc.status
+            return JSONResponse(payload, status_code=http_status)
+        except Exception:
+            logger.exception("record_forward_refusal failure for hold_id=%s", hold_id)
             return JSONResponse({"error": "internal_error"}, status_code=500)
 
     return JSONResponse(result, status_code=200)

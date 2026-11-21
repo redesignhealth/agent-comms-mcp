@@ -5978,7 +5978,9 @@ ALLOWED_DENIAL_REASONS = frozenset({"not_agent_token", "missing_scope"})
 # `surface` parameter already exists to prevent on the interactive side.
 # "submit" is the default so every pre-existing call site/test (which never
 # passed a surface) keeps writing the exact same action string as before.
-PROPOSAL_SUBMITTER_SURFACES = frozenset({"submit", "get", "withdraw", "apply_record"})
+PROPOSAL_SUBMITTER_SURFACES = frozenset(
+    {"submit", "get", "withdraw", "apply_record", "forward_refusal"}
+)
 
 
 async def audit_denied_proposal_submission(
@@ -7606,6 +7608,8 @@ def _proposal_dict(
         result["labels"] = hold.labels
     if getattr(hold, "external_ref", None) is not None:
         result["external_ref"] = hold.external_ref
+    if getattr(hold, "external_refusal", None) is not None:
+        result["external_refusal"] = hold.external_refusal
     return result
 
 
@@ -7885,6 +7889,7 @@ async def _list_proposals_with_elision(
         ProposalHold.approvals,
         ProposalHold.labels,
         ProposalHold.external_ref,
+        ProposalHold.external_refusal,
         ProposalHold.log_seq,
         projected_action,
         elided_utf8_bytes,
@@ -9559,6 +9564,116 @@ async def resolve_external_proposal(
         actor_sub=resolver_sub,
         action="proposal.resolve_external",
         detail={"hold_id": str(hold_id), "outcome": outcome, "external_ref": external_ref},
+    )
+    await session.commit()
+    await session.refresh(hold)
+    return {**_proposal_dict(hold), "already_recorded": False}
+
+
+MAX_REFUSAL_ERRORS = 20
+MAX_REFUSAL_FIELD_LENGTH = 500
+MAX_REFUSAL_CODE_LENGTH = 100
+_REFUSAL_ERROR_KEYS = ("path", "rule", "message")
+
+
+def _clean_refusal_errors(errors: Any) -> list[dict[str, str]]:
+    """The structured field errors of a forwarded refusal, bounded for storage:
+    at most ``MAX_REFUSAL_ERRORS`` entries, each only ``path``/``rule``/``message``
+    (strings cut to ``MAX_REFUSAL_FIELD_LENGTH``); anything else on an entry is
+    dropped. A non-list or a non-object entry is ``invalid_request``."""
+    if errors is None:
+        return []
+    if not isinstance(errors, list):
+        raise ExternalResolutionError("invalid_request", "errors must be a list")
+    cleaned: list[dict[str, str]] = []
+    for entry in errors[:MAX_REFUSAL_ERRORS]:
+        if not isinstance(entry, dict):
+            raise ExternalResolutionError("invalid_request", "each error must be an object")
+        item: dict[str, str] = {}
+        for key in _REFUSAL_ERROR_KEYS:
+            value = entry.get(key)
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                raise ExternalResolutionError("invalid_request", f"error {key} must be a string")
+            item[key] = value[:MAX_REFUSAL_FIELD_LENGTH]
+        cleaned.append(item)
+    return cleaned
+
+
+async def record_forward_refusal(
+    session: AsyncSession,
+    *,
+    forwarder_sub: str,
+    hold_id: uuid.UUID,
+    note: Any,
+    code: Any = None,
+    errors: Any = None,
+) -> dict[str, Any]:
+    """Close a ``pending`` proposal of an externally resolved kind as
+    ``rejected`` because the external system REFUSED it when the approvals
+    forwarder delivered it (``POST /proposals/{id}/forward-refusal``,
+    TECH-9214). The caller (scope and subject allowlist) is checked by the
+    route; this function trusts ``forwarder_sub``.
+
+    ``note`` is what the submitting bot reads as ``decision_note``; ``code`` and
+    ``errors`` (``[{path, rule, message}]``, Arcadia's own) are stored on the hold
+    as ``external_refusal`` and returned by ``proposals_get`` as a structured
+    field. Idempotent: a proposal this call already rejected (``decision_source``
+    ``external``, status ``rejected``) returns unchanged with
+    ``already_recorded``, whatever the arguments say. Any other proposal that is
+    not ``pending`` is ``ExternalResolutionError('already_decided')``. A kind the
+    owner decides is ``unknown_proposal`` (uniform, so this cannot probe other
+    kinds). Applies nothing and writes nothing outward.
+    """
+    if not isinstance(note, str) or not note.strip():
+        raise ExternalResolutionError("invalid_request", "note is required")
+    if len(note) > MAX_DECISION_REASON_LENGTH:
+        raise ExternalResolutionError(
+            "invalid_request", f"note exceeds {MAX_DECISION_REASON_LENGTH} characters"
+        )
+    if code is not None and (
+        not isinstance(code, str) or len(code) > MAX_REFUSAL_CODE_LENGTH or not code.isprintable()
+    ):
+        raise ExternalResolutionError(
+            "invalid_request",
+            f"code must be printable text of at most {MAX_REFUSAL_CODE_LENGTH} characters",
+        )
+    cleaned = _clean_refusal_errors(errors)
+
+    hold = await _find_proposal_hold(session, hold_id, for_update=True)
+    if hold is None or hold.kind not in EXTERNALLY_RESOLVED_PROPOSAL_KINDS:
+        _audit(
+            session,
+            actor_sub=forwarder_sub,
+            action="denied.unknown_proposal_hold",
+            detail={"attempted_hold_id": str(hold_id)},
+        )
+        await session.commit()
+        raise ExternalResolutionError("unknown_proposal", "unknown proposal")
+
+    if hold.decision_source == "external" and hold.status == "rejected":
+        await session.commit()
+        return {**_proposal_dict(hold), "already_recorded": True}
+    if hold.status != "pending":
+        await session.commit()
+        raise ExternalResolutionError(
+            "already_decided",
+            f"proposal is already {hold.status!r}",
+            status=hold.status,
+        )
+
+    hold.status = "rejected"
+    hold.decision_source = "external"
+    hold.decided_by_actor_id = forwarder_sub
+    hold.decided_at = _now()
+    hold.decision_note = note
+    hold.external_refusal = {"code": code, "errors": cleaned}
+    _audit(
+        session,
+        actor_sub=forwarder_sub,
+        action="proposal.forward_refusal",
+        detail={"hold_id": str(hold_id), "code": code, "error_count": len(cleaned)},
     )
     await session.commit()
     await session.refresh(hold)
@@ -12594,6 +12709,7 @@ __all__ = [
     "proposal_owner_email",
     "proposal_rate_limit_for",
     "reconcile_agent_ownership",
+    "record_forward_refusal",
     "register_agent",
     "rename_conversation",
     "reopen_conversation",

@@ -214,7 +214,19 @@ them: same gate as apply-record (agent-token chain, `proposals:apply_record:read
 subject allowlist, optionally kind-scoped; a kind outside a scoped caller's grant
 is the uniform 404), oldest first, `limit` 1-100, keyset `cursor`/`next_cursor`,
 each item the apply-record shape plus `confidence`, `importance`, `impact`,
-`created_at`. A `catalog_candidate` proposal
+`created_at`. `POST /proposals/{hold_id}/forward-refusal` (TECH-9214) is the
+service-only way for the forwarder to report that Arcadia REFUSED a pending
+`catalog_candidate`: body `{note, code?, errors?: [{path, rule, message}]}`
+(`note` required, at most 2000 characters; at most 20 errors kept). Auth: an
+agent-chain service token with scope `proposals:forward_refusal` whose sub is on
+`PROPOSAL_FORWARD_REFUSAL_ALLOWED_SUBS` (default empty: nobody; 401/403, 403
+audited). It closes the proposal as `rejected` (decision source `external`),
+stores `note` as `decision_note` and `{code, errors}` as the structured
+`external_refusal` field, both returned to the submitting bot by `proposals_get`
+(never who decided). A repeat is 200 with `already_recorded`; an unknown hold or a
+kind the owner decides is 404 `unknown_proposal`; a proposal that is not pending
+(withdrawn, decided otherwise) is 409 `already_decided`; a bad body is 400
+`invalid_request`. A `catalog_candidate` proposal
 (TECH-9214, proposals to the opportunity catalog) is never auto-approved by the
 board whatever the judge says, never edited in place by a resubmission, capped
 at 256 KiB, refused by `/decide` (400) and left out of `GET /proposals/pending`:
@@ -500,6 +512,7 @@ docker compose up --build
 | `DECISION_PAGE_BASE_URL` | Base URL of the separate `agent-comms-approvals-decision-page` service. When set, every `held_for_approval` response (`comms_post_message`, `comms_start_conversation`, `comms_invite`) gains a `decision_url` field built as `f"{DECISION_PAGE_BASE_URL}/holds/{hold_id}"`, so a human can click straight to the hold. Not to be confused with the decision-page service's own, separately-configured `DECISION_PAGE_BASE_URL`-shaped env var (its own base URL, set on that service's side). Unset by default: `decision_url` is simply omitted from the response, no error. |
 | `PROPOSAL_JUDGE` | Which `ProposalJudge` implementation judges/applies a submitted `proposal_holds` proposal (`POST /proposals`) -- a name from `plugins.PROPOSAL_JUDGES` (e.g. `escalate_all_proposals`, `rh_proposal_judge`), or a `"pkg.module:factory"` import path to plug in your own without forking this repo (see `docs/DESIGN.md`'s "Configuration: pluggable seams" section). Default: `escalate_all_proposals` -- accepts any kind at low priority, never fingerprints a real target, never auto-approves, and never writes anywhere. Redesign Health's Linear/GitHub-backed rules live in `agent-comms-approvals`' `rh_comms_plugins.proposal_judge` for judgment, and `proposal_apply_http_client` executes `apply()` over HTTP. |
 | `PROPOSAL_RESOLVE_EXTERNAL_ALLOWED_SUBS` | Comma-separated subs allowed to call `proposals_admin_resolve_external` (TECH-9214), i.e. Arcadia's service identity. Read on every call. **Default empty: nobody can resolve**, so a deployment that has not set it answers every resolve call with `access_denied`. The caller also needs the `proposals:resolve_external` scope. |
+| `PROPOSAL_FORWARD_REFUSAL_ALLOWED_SUBS` | Comma-separated subs allowed to call `POST /proposals/{id}/forward-refusal` (TECH-9214), i.e. the approvals service's catalog forwarder. Read on every call. **Default empty: nobody can**, so a deployment that has not set it answers every such call 403. The caller also needs the `proposals:forward_refusal` scope. |
 | `ARCADIA_CATALOG_INTAKE_URL` / `ARCADIA_CATALOG_INTAKE_KEY` | Arcadia's API base URL **including `/api/v1`**, e.g. `https://arcadia-dev.example/api/v1` (https; plain http only on loopback) and the long-lived service key (must start `rai_svc_`, else the tool stays off) `catalog_get` exchanges at `POST {URL}/service/v1/token` (`{"api_key": "rai_svc_..."}` -> `{access_token, token_type: "bearer", expires_in}`) for a short-lived service token (cached, refreshed 2 minutes early, re-exchanged once on a 401 from the read; a rejected key, 401 `INVALID_API_KEY`, is not retried for 5 minutes, a 429 backs off for `Retry-After`, a 503 for 15 s), then reads `GET {URL}/catalog/v1/rows/{target_key}`. Both unset (default): `catalog_get` is off. The key is a secret; mint and set it out-of-band. |
 | `CATALOG_GET_RATE_PER_MINUTE` | Per-bot `catalog_get` calls per minute, 1-600, default 30. |
 | `PROPOSAL_APPLY_URL` | Base URL of `agent-comms-approvals`' proposal action API mount point (e.g. `https://comms-approvals.<tailnet>.ts.net/actions`). The board's HTTP applier client appends `/proposals/apply` to dispatch mutations. Required when applying proposals; must start with `https://`. |
