@@ -6966,8 +6966,8 @@ class TestGetConversationSinceWindow:
         ``MAX_MESSAGES_PER_GET_CONVERSATION`` -- seeding one more than that
         many context-band messages must truncate to exactly that many, and
         must keep the ones CLOSEST to ``since`` (highest seq / most recent),
-        since the underlying query is `ORDER BY seq DESC LIMIT 500` then
-        reversed back to ascending order."""
+        since the underlying query selects by ``created_at DESC, seq DESC``
+        with seq ascending output."""
         owner = await _register(session, "gcw-owner-17")
         target = await _register(session, "gcw-target-17")
         now = datetime.now(UTC)
