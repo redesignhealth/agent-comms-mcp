@@ -19,6 +19,9 @@ from scopes import PROPOSAL_SUBMIT_SCOPE, TOOL_SCOPES
 from tests.test_proposal_tools import _ENV_PATCH, _OIDC_PATCH, _import_main
 
 _BOT = "catalog-agent"
+# Same vector as agent-comms-approvals' tests: the canonical-JSON hash Arcadia's
+# schema endpoint reports for this schema (not the raw file hash).
+CANONICAL_VECTOR = "5029b9f3e1ca690dee61a36d9a0063564326aeaaeb82bc7aa7f33d46b61e028d"
 _ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -70,7 +73,8 @@ class TestTool:
         }
         assert out["kind"] == "catalog_candidate"
         assert out["schema_version"] == 2 == out["schema"]["x-schema-version"]
-        assert out["schema_sha256"] == hashlib.sha256(proposal_schemas.schema_bytes()).hexdigest()
+        assert out["schema_sha256"] == CANONICAL_VECTOR
+        assert out["schema_sha256"] == proposal_schemas.canonical_sha256(out["schema"])
         assert {"ConceptPayload", "ConceptMarketPayload", "DeletePayload"} <= set(
             out["schema"]["$defs"]
         )
@@ -127,6 +131,14 @@ class TestSchemaCopy:
         blob = hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
         assert blob == pin["blob_sha"]
         assert json.loads(data)["x-schema-version"] == pin["schema_version"]
+
+    def test_canonical_hash_is_not_the_raw_file_hash(self) -> None:
+        pin = json.loads((Path("providers") / proposal_schemas.PIN_RESOURCE).read_text())
+        assert pin["sha256"] != CANONICAL_VECTOR
+        assert (
+            proposal_schemas.canonical_sha256(json.loads(proposal_schemas.schema_bytes()))
+            == CANONICAL_VECTOR
+        )
 
     def test_is_declared_as_package_data(self) -> None:
         import tomllib

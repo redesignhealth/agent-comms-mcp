@@ -12,6 +12,7 @@ forward while its sha256 differs from Arcadia's).
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from importlib import resources
 from typing import Any
@@ -153,14 +154,24 @@ def schema_bytes() -> bytes:
     return (resources.files("providers") / SCHEMA_RESOURCE).read_bytes()
 
 
+def canonical_sha256(schema: dict[str, Any]) -> str:
+    """SHA-256 of the schema as Arcadia's ``GET /catalog/v1/schema`` hashes it:
+    canonical JSON (``sort_keys``, no spaces, ``ensure_ascii`` off, UTF-8). This
+    is the hash the approvals forwarder compares; the pin file's ``sha256`` is
+    the raw file's."""
+    canonical = json.dumps(schema, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def catalog_candidate_schema() -> dict[str, Any]:
     pin = _read_json(PIN_RESOURCE)
+    schema = _read_json(SCHEMA_RESOURCE)
     return {
         "kind": "catalog_candidate",
         "schema_version": pin["schema_version"],
-        "schema_sha256": pin["sha256"],
+        "schema_sha256": canonical_sha256(schema),
         "schema_source": {"repo": pin["repo"], "path": pin["path"], "commit": pin["commit"]},
-        "schema": _read_json(SCHEMA_RESOURCE),
+        "schema": schema,
         "guide": CATALOG_CANDIDATE_GUIDE,
         "examples": {
             "create": _concept_example(),
