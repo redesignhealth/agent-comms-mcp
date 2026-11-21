@@ -585,6 +585,10 @@ class TestSubmitProposal:
             assert "field_errors" not in payload
         else:
             assert payload["field_errors"] == [{"path": path, "code": code} for path, code in pairs]
+            assert payload["code"] == "invalid_proposal_action"
+            assert payload["message"] == payload["detail"]
+            assert [(e["path"], e["rule"]) for e in payload["errors"]] == list(pairs)
+            assert all(e["message"].startswith(f"{e['path']}: ") for e in payload["errors"])
         assert PLUGIN_SENTINEL not in resp.text
         assert PLUGIN_SENTINEL not in caplog.text
 
