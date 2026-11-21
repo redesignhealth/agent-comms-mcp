@@ -17,7 +17,7 @@ from scopes import PROPOSAL_SUBMIT_SCOPE, TOOL_SCOPES
 from tests.test_proposal_tools import _ENV_PATCH, _OIDC_PATCH, _import_main
 
 URL = "https://arcadia.example.test/api/v1"
-KEY = "fake-intake-key-not-a-secret"
+KEY = "rai_svc_fake_not_a_secret"
 BOT = "catalog-agent"
 
 
@@ -58,7 +58,15 @@ class Arcadia:
     ) -> None:
         self.row = row or (
             lambda r: httpx.Response(
-                200, json={"exists": True, "version": 3, "content": {"slug": "a"}}
+                200,
+                json={
+                    "target_key": "pair:a:US",
+                    "target_type": "pair",
+                    "exists": True,
+                    "status": "active",
+                    "version": 3,
+                    "payload": {"slug": "a"},
+                },
             )
         )
         self.exchange_status = exchange_status
@@ -71,7 +79,7 @@ class Arcadia:
             self.exchanges += 1
             if self.exchange_status != 200:
                 return httpx.Response(self.exchange_status)
-            assert json.loads(request.content) == {"key": KEY}
+            assert json.loads(request.content) == {"api_key": KEY}
             return httpx.Response(
                 200,
                 json={
@@ -105,10 +113,17 @@ class TestRegistration:
 
 
 class TestReads:
-    async def test_returns_exists_version_content(self, main: Any) -> None:
+    async def test_returns_the_six_fields(self, main: Any) -> None:
         arcadia = Arcadia()
         out = await _call(main, arcadia, "pair:remote-patient-monitoring:US")
-        assert out == {"exists": True, "version": 3, "content": {"slug": "a"}}
+        assert out == {
+            "target_key": "pair:a:US",
+            "target_type": "pair",
+            "exists": True,
+            "status": "active",
+            "version": 3,
+            "payload": {"slug": "a"},
+        }
         read = arcadia.requests[-1]
         assert str(read.url) == f"{URL}/catalog/v1/rows/pair:remote-patient-monitoring:US"
         assert read.headers["authorization"] == "Bearer svc-1"
@@ -116,11 +131,38 @@ class TestReads:
     async def test_missing_row_is_arcadias_exists_false(self, main: Any) -> None:
         arcadia = Arcadia(
             row=lambda r: httpx.Response(
-                200, json={"exists": False, "version": None, "content": None}
+                200, json={"exists": False, "status": None, "version": None, "payload": None}
             )
         )
         out = await _call(main, arcadia, "concept:nope")
-        assert out == {"exists": False, "version": None, "content": None}
+        assert out["exists"] is False
+        assert (out["status"], out["version"], out["payload"]) == (None, None, None)
+
+    async def test_a_soft_deleted_target_is_exists_true_status_deleted(self, main: Any) -> None:
+        arcadia = Arcadia(
+            row=lambda r: httpx.Response(
+                200,
+                json={
+                    "target_key": "concept:old",
+                    "target_type": "concept",
+                    "exists": True,
+                    "status": "deleted",
+                    "version": None,
+                    "payload": {"slug": "old"},
+                },
+            )
+        )
+        out = await _call(main, arcadia, "concept:old")
+        assert (out["exists"], out["status"], out["version"]) == (True, "deleted", None)
+
+    async def test_422_invalid_target_key_is_an_invalid_request(self, main: Any) -> None:
+        arcadia = Arcadia(
+            row=lambda r: httpx.Response(
+                422, json={"detail": {"code": "INVALID_TARGET_KEY", "message": "bad"}}
+            )
+        )
+        with pytest.raises(ToolError, match="invalid_request"):
+            await _call(main, arcadia, "concept:a")
 
     @pytest.mark.parametrize("body", [{"detail": "Not Found"}, {"exists": False}, None])
     async def test_a_404_is_an_unavailable_lookup_never_exists_false(
@@ -139,11 +181,25 @@ class TestReads:
         arcadia = Arcadia(
             row=lambda r: httpx.Response(
                 200,
-                json={"exists": True, "version": None, "content": {}, "token": "leak", "x": 1},
+                json={
+                    "exists": True,
+                    "status": "active",
+                    "version": None,
+                    "payload": {},
+                    "token": "leak",
+                    "x": 1,
+                },
             )
         )
         out = await _call(main, arcadia, "concept:a")
-        assert set(out) == {"exists", "version", "content"}
+        assert set(out) == {
+            "target_key",
+            "target_type",
+            "exists",
+            "status",
+            "version",
+            "payload",
+        }
 
     async def test_the_token_is_exchanged_once_and_cached(self, main: Any) -> None:
         arcadia = Arcadia()
@@ -158,7 +214,9 @@ class TestReads:
             seen.append(request.headers["authorization"])
             if len(seen) == 1:
                 return httpx.Response(401)
-            return httpx.Response(200, json={"exists": False, "version": None, "content": None})
+            return httpx.Response(
+                200, json={"exists": False, "status": None, "version": None, "payload": None}
+            )
 
         arcadia = Arcadia(row=row)
         out = await _call(main, arcadia, "concept:a")
@@ -179,7 +237,9 @@ class TestFailuresAreGeneric:
             lambda r: httpx.Response(200, json=[1]),
             lambda r: httpx.Response(200, json={"exists": "yes"}),
             lambda r: httpx.Response(200, json={"exists": True, "version": "3"}),
-            lambda r: httpx.Response(200, json={"exists": True, "content": []}),
+            lambda r: httpx.Response(200, json={"exists": True, "payload": []}),
+            lambda r: httpx.Response(200, json={"exists": True, "status": "gone"}),
+            lambda r: httpx.Response(200, json={"exists": True, "target_type": "table"}),
         ],
     )
     async def test_unusable_replies(self, main: Any, row: Callable[..., httpx.Response]) -> None:
@@ -204,6 +264,13 @@ class TestFailuresAreGeneric:
 
 
 class TestOffUnlessConfigured:
+    async def test_a_key_without_the_service_prefix_is_not_configured(
+        self, main: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(catalog.KEY_ENV, "something-else")
+        with pytest.raises(ToolError, match="not configured"):
+            await _call(main, Arcadia(), "concept:a")
+
     @pytest.mark.parametrize("unset", [catalog.URL_ENV, catalog.KEY_ENV])
     async def test_missing_config(
         self, main: Any, monkeypatch: pytest.MonkeyPatch, unset: str
@@ -304,9 +371,41 @@ class TestTokenCache:
             assert await cache.get(client, URL, KEY) == "svc-2"
 
 
+class TestExchangeErrors:
+    async def _cache_get(self, cache: Any, arcadia: Arcadia) -> str | None:
+        async with arcadia.client() as client:
+            return await cache.get(client, URL, KEY)
+
+    async def test_a_rejected_key_is_not_retried_in_a_loop(self) -> None:
+        now = [0.0]
+        cache = catalog._TokenCache(lambda: now[0])
+        arcadia = Arcadia(exchange_status=401)
+        for _ in range(4):
+            assert await self._cache_get(cache, arcadia) is None
+        assert arcadia.exchanges == 1
+        now[0] = 301.0
+        await self._cache_get(cache, arcadia)
+        assert arcadia.exchanges == 2
+
+    @pytest.mark.parametrize(("status", "wait"), [(429, 30.0), (503, 15.0)])
+    async def test_429_and_503_back_off(self, status: int, wait: float) -> None:
+        now = [0.0]
+        cache = catalog._TokenCache(lambda: now[0])
+        arcadia = Arcadia(exchange_status=status)
+        assert await self._cache_get(cache, arcadia) is None
+        now[0] = wait - 1
+        assert await self._cache_get(cache, arcadia) is None
+        assert arcadia.exchanges == 1
+        now[0] = wait + 1
+        await self._cache_get(cache, arcadia)
+        assert arcadia.exchanges == 2
+
+
 class TestSchemaGuide:
     async def test_proposals_schema_guide_points_at_catalog_get(self) -> None:
         from providers import proposal_schemas
 
         guide = proposal_schemas.CATALOG_CANDIDATE_GUIDE
         assert "catalog_get" in guide and "base_version" in guide
+        for text in ("payload", "status", "deleted", "restores", "never a create"):
+            assert text in guide

@@ -29,10 +29,14 @@ Arcadia checks it again against the live catalog and may still refuse it; then t
 closed as rejected and proposals_get shows Arcadia's code and field errors in decision_note.
 
 Before you write a create or upsert, call catalog_get(target_key) with the same target_key
-("concept:<slug>" or "pair:<concept-slug>:<MARKET>"). It returns {exists, version, content}:
-exists false -> propose a create; exists true -> propose an upsert (never a create), start from
-"content" (the row in the payload shape below) and, for a pair, send "version" as base_version.
-If catalog_get says it is not configured, you cannot see the catalog: say so rather than guess.
+("concept:<slug>" or "pair:<concept-slug>:<MARKET>"). It returns {target_key, target_type, exists,
+status, version, payload}:
+- exists false -> propose a create.
+- exists true -> propose an upsert, never a create. Start from "payload" (the row in the payload
+  shape below). For a pair, send "version" as base_version; a concept has no version, so send none.
+- status "deleted" (exists is still true): the target was soft-deleted; an upsert restores it.
+If catalog_get fails or says it is not configured you cannot see the catalog: say so rather than
+guess, and do not propose a create.
 
 action fields (proposals_submit(kind="catalog_candidate", action=...)):
 - action_type: "create" | "upsert" | "delete".

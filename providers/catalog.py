@@ -10,16 +10,21 @@ editing (``base_version``). This read-only tool asks Arcadia:
 (for example ``https://arcadia-dev.example/api/v1``). The read uses a short-lived
 service token the board gets by exchanging a long-lived key:
 
-    POST {ARCADIA_CATALOG_INTAKE_URL}/service/v1/token  {"key": "..."}
+    POST {ARCADIA_CATALOG_INTAKE_URL}/service/v1/token  {"api_key": "rai_svc_..."}
     -> {"access_token": "...", "token_type": "bearer", "expires_in": <seconds>}
 
 OFF unless both ``ARCADIA_CATALOG_INTAKE_URL`` and ``ARCADIA_CATALOG_INTAKE_KEY``
 are set (the tool then answers ``catalog_get is not configured``). The key and
 token are never returned or logged. Rate-limited per bot (in memory, per process).
 
-Returns ``{"exists", "version", "content"}``: ``content`` is the row in the
-version-2 candidate payload shape (``proposals_schema`` explains it), ``version``
-the current version number of a pair (``null`` for a concept or a missing row).
+Arcadia answers ``{target_key, target_type, exists, status, version, payload}``;
+a missing target is 200 ``{exists: false, status: null, version: null, payload:
+null}`` (so a 404 means the route is not deployed, never "no such row"), and a
+malformed key is 422 ``INVALID_TARGET_KEY``. The tool returns those six fields:
+``payload`` is the row in the version-2 candidate payload shape
+(``proposals_schema`` explains it), ``status`` is ``active``, ``deleted`` (a
+soft-deleted target reads ``exists: true``; an upsert restores it) or ``null``,
+and ``version`` is the pair's current version (``null`` for a concept).
 """
 
 from __future__ import annotations
@@ -52,6 +57,11 @@ MAX_RATE_PER_MINUTE = 600
 TOKEN_PATH = "/service/v1/token"
 ROWS_PATH = "/catalog/v1/rows/"
 REFRESH_MARGIN = 120.0
+KEY_PREFIX = "rai_svc_"
+COOLDOWN_REJECTED = 300.0  # 401 INVALID_API_KEY: unknown or revoked; do not hammer
+COOLDOWN_RATE_LIMITED = 30.0  # 429 without a usable Retry-After
+COOLDOWN_UNAVAILABLE = 15.0  # 503 EXCHANGE_UNAVAILABLE and anything else
+MAX_COOLDOWN = 300.0
 MAX_EXPIRES_IN = 86400
 TIMEOUT = httpx.Timeout(15.0, connect=5.0)
 MAX_TARGET_LENGTH = 300
@@ -78,7 +88,7 @@ def build_client() -> httpx.AsyncClient:
 def _config() -> tuple[str, str] | None:
     url = os.environ.get(URL_ENV, "").strip()
     key = os.environ.get(KEY_ENV, "").strip()
-    if not url or not key:
+    if not url or not key.startswith(KEY_PREFIX):
         return None
     try:
         parts = urlsplit(url)
@@ -100,6 +110,7 @@ class _TokenCache:
         self._ident: tuple[str, str] | None = None
         self._token: str | None = None
         self._refresh_at = 0.0
+        self._blocked_until = 0.0
 
     def invalidate(self, token: str) -> None:
         if self._token == token:
@@ -118,19 +129,36 @@ class _TokenCache:
             ):
                 return self._token
             self._token, self._ident = None, ident
+            if self._clock() < self._blocked_until:
+                return None  # cooling down after a refusal
             try:
-                resp = await client.post(url + TOKEN_PATH, json={"key": key})
+                resp = await client.post(url + TOKEN_PATH, json={"api_key": key})
             except httpx.HTTPError as exc:
                 logger.warning("catalog_get: token exchange failed: %s", type(exc).__name__)
+                self._blocked_until = self._clock() + COOLDOWN_UNAVAILABLE
                 return None
             parsed = _parse_exchange(resp)
             if parsed is None:
                 logger.warning("catalog_get: token exchange refused (HTTP %s)", resp.status_code)
+                self._blocked_until = self._clock() + _cooldown(resp)
                 return None
             token, lifetime = parsed
             margin = REFRESH_MARGIN if lifetime > 2 * REFRESH_MARGIN else lifetime / 2
             self._token, self._refresh_at = token, self._clock() + lifetime - margin
             return token
+
+
+def _cooldown(resp: httpx.Response) -> float:
+    """Seconds before the next exchange after a refusal."""
+    if resp.status_code == 401:
+        return COOLDOWN_REJECTED
+    if resp.status_code == 429:
+        try:
+            after = float(resp.headers.get("retry-after", ""))
+        except ValueError:
+            return COOLDOWN_RATE_LIMITED
+        return min(max(after, 1.0), MAX_COOLDOWN)
+    return COOLDOWN_UNAVAILABLE
 
 
 def _parse_exchange(resp: httpx.Response) -> tuple[str, int] | None:
@@ -181,18 +209,31 @@ def _check_rate(bot: str, now: float | None = None) -> None:
 
 
 def project(data: Any) -> dict[str, Any] | None:
-    """Only ``exists``, ``version`` and ``content`` from Arcadia's reply, checked;
-    ``None`` if it is not that shape."""
+    """Only ``target_key``, ``target_type``, ``exists``, ``status``, ``version`` and
+    ``payload`` from Arcadia's reply, checked; ``None`` if it is not that shape."""
     if not isinstance(data, dict):
         return None
-    exists, version, content = data.get("exists"), data.get("version"), data.get("content")
-    if not isinstance(exists, bool):
+    exists, status = data.get("exists"), data.get("status")
+    version, payload = data.get("version"), data.get("payload")
+    target_key, target_type = data.get("target_key"), data.get("target_type")
+    if not isinstance(exists, bool) or status not in (None, "active", "deleted"):
         return None
     if version is not None and (isinstance(version, bool) or not isinstance(version, int)):
         return None
-    if content is not None and not isinstance(content, dict):
+    if payload is not None and not isinstance(payload, dict):
         return None
-    return {"exists": exists, "version": version, "content": content}
+    if target_key is not None and not isinstance(target_key, str):
+        return None
+    if target_type not in (None, "concept", "pair"):
+        return None
+    return {
+        "target_key": target_key,
+        "target_type": target_type,
+        "exists": exists,
+        "status": status,
+        "version": version,
+        "payload": payload,
+    }
 
 
 @catalog_server.tool
@@ -202,13 +243,15 @@ async def get(target_key: str) -> dict[str, Any]:
     ``proposals_submit(kind="catalog_candidate")``.
 
     ``target_key`` is ``concept:<slug>`` or ``pair:<concept-slug>:<MARKET>``
-    (the same form as the proposal's ``target_id``). Returns ``{"exists": bool,
-    "version": int | null, "content": object | null}``: ``exists`` false means
-    propose a ``create``; for a pair ``version`` is the version number to send as
-    ``base_version`` on an ``upsert``; ``content`` is the row in the version-2
-    candidate payload shape (see ``proposals_schema``). A deleted row reads as not
-    existing. If the lookup itself fails (``catalog_unavailable``) you do not know
-    whether the row exists: do not propose a create. Available only when the board
+    (the same form as the proposal's ``target_id``). Returns ``{"target_key",
+    "target_type": "concept" | "pair", "exists": bool, "status": "active" |
+    "deleted" | null, "version": int | null, "payload": object | null}``.
+    ``exists`` false means propose a ``create``. ``exists`` true means propose an
+    ``upsert`` (never a create): for a pair send ``version`` as ``base_version``
+    (a concept has no version); ``payload`` is the row in the version-2 candidate
+    payload shape (see ``proposals_schema``). A soft-deleted target reads
+    ``exists: true, status: "deleted"``: an upsert restores it. If the lookup
+    itself fails (``catalog_unavailable``) you do not know whether the row exists: do not propose a create. Available only when the board
     is configured for it (otherwise ``catalog_get is not configured``);
     rate-limited per bot.
     """
@@ -239,6 +282,10 @@ async def get(target_key: str) -> dict[str, Any]:
     except (httpx.HTTPError, TimeoutError, ValueError) as exc:
         logger.warning("catalog_get: read failed: %s", type(exc).__name__)
         raise ToolError(_UNAVAILABLE) from None
+    if resp.status_code == 422:  # INVALID_TARGET_KEY: our own check should have caught it
+        raise ToolError(
+            "invalid_request: target_key must be concept:<slug> or pair:<concept-slug>:<MARKET>"
+        )
     # Arcadia answers 200 {"exists": false} for a row that is not there. A 404 means the
     # route itself is missing (not deployed): never read it as "does not exist", or an
     # agent would propose a create on a row that may exist.
