@@ -113,10 +113,27 @@ class TestReads:
         assert str(read.url) == f"{URL}/api/v1/catalog/v1/rows/pair:remote-patient-monitoring:US"
         assert read.headers["authorization"] == "Bearer svc-1"
 
-    async def test_missing_row(self, main: Any) -> None:
-        arcadia = Arcadia(row=lambda r: httpx.Response(404, json={"detail": "no"}))
+    async def test_missing_row_is_arcadias_exists_false(self, main: Any) -> None:
+        arcadia = Arcadia(
+            row=lambda r: httpx.Response(
+                200, json={"exists": False, "version": None, "content": None}
+            )
+        )
         out = await _call(main, arcadia, "concept:nope")
         assert out == {"exists": False, "version": None, "content": None}
+
+    @pytest.mark.parametrize("body", [{"detail": "Not Found"}, {"exists": False}, None])
+    async def test_a_404_is_an_unavailable_lookup_never_exists_false(
+        self, main: Any, body: Any
+    ) -> None:
+        """404 means the route is not deployed; reading it as "no such row" would
+        make an agent propose a create on a row that may exist."""
+        arcadia = Arcadia(
+            row=lambda r: httpx.Response(404, json=body) if body else httpx.Response(404)
+        )
+        with pytest.raises(ToolError, match="catalog_unavailable") as caught:
+            await _call(main, arcadia, "concept:nope")
+        assert "do not propose a create" in str(caught.value)
 
     async def test_only_the_three_fields_are_returned(self, main: Any) -> None:
         arcadia = Arcadia(

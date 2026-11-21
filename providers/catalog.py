@@ -59,7 +59,10 @@ _SLUG = r"[a-z0-9]+(?:-[a-z0-9]+)*"
 _TARGET_RE = re.compile(rf"concept:{_SLUG}|pair:{_SLUG}:[A-Z]{{2}}")
 
 _NOT_CONFIGURED = "catalog_get is not configured"
-_UNAVAILABLE = "catalog_unavailable: Arcadia could not be read; try again later"
+_UNAVAILABLE = (
+    "catalog_unavailable: the catalog lookup is unavailable, so whether the row exists is "
+    "unknown; try again later and do not propose a create meanwhile"
+)
 
 
 def build_client() -> httpx.AsyncClient:
@@ -202,8 +205,10 @@ async def get(target_key: str) -> dict[str, Any]:
     propose a ``create``; for a pair ``version`` is the version number to send as
     ``base_version`` on an ``upsert``; ``content`` is the row in the version-2
     candidate payload shape (see ``proposals_schema``). A deleted row reads as not
-    existing. Available only when the board is configured for it (otherwise
-    ``catalog_get is not configured``); rate-limited per bot.
+    existing. If the lookup itself fails (``catalog_unavailable``) you do not know
+    whether the row exists: do not propose a create. Available only when the board
+    is configured for it (otherwise ``catalog_get is not configured``);
+    rate-limited per bot.
     """
     bot = _require_bot_sub()
     if not isinstance(target_key, str) or not (
@@ -232,8 +237,9 @@ async def get(target_key: str) -> dict[str, Any]:
     except (httpx.HTTPError, TimeoutError, ValueError) as exc:
         logger.warning("catalog_get: read failed: %s", type(exc).__name__)
         raise ToolError(_UNAVAILABLE) from None
-    if resp.status_code == 404:
-        return {"exists": False, "version": None, "content": None}
+    # Arcadia answers 200 {"exists": false} for a row that is not there. A 404 means the
+    # route itself is missing (not deployed): never read it as "does not exist", or an
+    # agent would propose a create on a row that may exist.
     if resp.status_code != 200 or len(resp.content) > MAX_CONTENT_BYTES:
         logger.warning("catalog_get: Arcadia answered HTTP %s", resp.status_code)
         raise ToolError(_UNAVAILABLE)
