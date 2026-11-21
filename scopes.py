@@ -184,6 +184,8 @@ TOOL_SCOPES: dict[str, str] = {
     "proposals_withdraw": PROPOSAL_SUBMIT_SCOPE,
     # TECH-9214: read-only; what a kind's action must look like, for any bot.
     "proposals_schema": PROPOSAL_SUBMIT_SCOPE,
+    # TECH-9214: read-only read of one Arcadia catalog row (off unless configured).
+    "catalog_get": PROPOSAL_SUBMIT_SCOPE,
     # Arcana private-brain source reads (TECH-7170): same bot-submit scope; the
     # board's own service read token does the Arcana-facing work, never the bot.
     "proposals_arcana_source_metadata": PROPOSAL_SUBMIT_SCOPE,

@@ -28,6 +28,12 @@ any rule below is refused at submit with 422 and a list of {path, rule} errors; 
 Arcadia checks it again against the live catalog and may still refuse it; then the proposal is
 closed as rejected and proposals_get shows Arcadia's code and field errors in decision_note.
 
+Before you write a create or upsert, call catalog_get(target_key) with the same target_key
+("concept:<slug>" or "pair:<concept-slug>:<MARKET>"). It returns {exists, version, content}:
+exists false -> propose a create; exists true -> propose an upsert (never a create), start from
+"content" (the row in the payload shape below) and, for a pair, send "version" as base_version.
+If catalog_get says it is not configured, you cannot see the catalog: say so rather than guess.
+
 action fields (proposals_submit(kind="catalog_candidate", action=...)):
 - action_type: "create" | "upsert" | "delete".
 - target_id: "concept:<slug>" for a concept, "pair:<concept-slug>:<MARKET>" for one concept in one
