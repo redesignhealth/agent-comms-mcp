@@ -225,7 +225,7 @@ class TestOffUnlessConfigured:
     async def test_loopback_http_is_allowed(
         self, main: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv(catalog.URL_ENV, "http://localhost:8000")
+        monkeypatch.setenv(catalog.URL_ENV, "http://localhost:8000/api/v1")
         assert (await _call(main, Arcadia(), "concept:a"))["exists"] is True
 
 
