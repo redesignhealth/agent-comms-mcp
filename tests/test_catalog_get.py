@@ -16,7 +16,7 @@ from providers import catalog
 from scopes import PROPOSAL_SUBMIT_SCOPE, TOOL_SCOPES
 from tests.test_proposal_tools import _ENV_PATCH, _OIDC_PATCH, _import_main
 
-URL = "https://arcadia.example.test"
+URL = "https://arcadia.example.test/api/v1"
 KEY = "fake-intake-key-not-a-secret"
 BOT = "catalog-agent"
 
@@ -67,7 +67,7 @@ class Arcadia:
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
-        if request.url.path == catalog.TOKEN_PATH:
+        if request.url.path == "/api/v1" + catalog.TOKEN_PATH:
             self.exchanges += 1
             if self.exchange_status != 200:
                 return httpx.Response(self.exchange_status)
@@ -110,7 +110,7 @@ class TestReads:
         out = await _call(main, arcadia, "pair:remote-patient-monitoring:US")
         assert out == {"exists": True, "version": 3, "content": {"slug": "a"}}
         read = arcadia.requests[-1]
-        assert str(read.url) == f"{URL}/api/v1/catalog/v1/rows/pair:remote-patient-monitoring:US"
+        assert str(read.url) == f"{URL}/catalog/v1/rows/pair:remote-patient-monitoring:US"
         assert read.headers["authorization"] == "Bearer svc-1"
 
     async def test_missing_row_is_arcadias_exists_false(self, main: Any) -> None:

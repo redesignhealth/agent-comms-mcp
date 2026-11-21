@@ -4,11 +4,13 @@ A bot proposing a ``catalog_candidate`` needs to know whether its target already
 exists (create versus upsert) and, for a concept-market pair, the version it is
 editing (``base_version``). This read-only tool asks Arcadia:
 
-    GET {ARCADIA_CATALOG_INTAKE_URL}/api/v1/catalog/v1/rows/{target_key}
+    GET {ARCADIA_CATALOG_INTAKE_URL}/catalog/v1/rows/{target_key}
 
-with a short-lived service token the board gets by exchanging a long-lived key:
+``ARCADIA_CATALOG_INTAKE_URL`` is Arcadia's API base INCLUDING ``/api/v1``
+(for example ``https://arcadia-dev.example/api/v1``). The read uses a short-lived
+service token the board gets by exchanging a long-lived key:
 
-    POST {ARCADIA_CATALOG_INTAKE_URL}/api/v1/service/v1/token  {"key": "..."}
+    POST {ARCADIA_CATALOG_INTAKE_URL}/service/v1/token  {"key": "..."}
     -> {"access_token": "...", "token_type": "bearer", "expires_in": <seconds>}
 
 OFF unless both ``ARCADIA_CATALOG_INTAKE_URL`` and ``ARCADIA_CATALOG_INTAKE_KEY``
@@ -47,8 +49,8 @@ KEY_ENV = "ARCADIA_CATALOG_INTAKE_KEY"
 RATE_ENV = "CATALOG_GET_RATE_PER_MINUTE"
 DEFAULT_RATE_PER_MINUTE = 30
 MAX_RATE_PER_MINUTE = 600
-TOKEN_PATH = "/api/v1/service/v1/token"
-ROWS_PATH = "/api/v1/catalog/v1/rows/"
+TOKEN_PATH = "/service/v1/token"
+ROWS_PATH = "/catalog/v1/rows/"
 REFRESH_MARGIN = 120.0
 MAX_EXPIRES_IN = 86400
 TIMEOUT = httpx.Timeout(15.0, connect=5.0)
