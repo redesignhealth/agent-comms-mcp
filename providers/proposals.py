@@ -245,7 +245,8 @@ async def submit(
     open one is refused: withdraw and resubmit.
 
     ``kind="catalog_candidate"`` (propose a change to the opportunity catalog;
-    reviewed by Arcadia, TECH-9214; call ``proposals_schema`` first)::
+    reviewed by Arcadia, TECH-9214; call ``proposals_schema`` first, and
+    ``catalog_get(target_key)`` to see whether the target exists and its version)::
 
         {"target_id": "concept:<slug>" | "pair:<concept-slug>:<MARKET>",
          "action_type": "create" | "upsert" | "delete",

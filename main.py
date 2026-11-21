@@ -57,6 +57,7 @@ from observability import (
     log_user_active,
 )
 from plugins import validate_configuration as validate_plugin_configuration
+from providers.catalog import catalog_server
 from providers.comms import (
     ResourceSubscribeDeniedError,
     authorize_resource_subscribe,
@@ -462,6 +463,7 @@ mcp.add_middleware(ScopeEnforcementMiddleware())
 
 mcp.mount(comms_server, namespace="comms")
 mcp.mount(proposals_server, namespace="proposals")
+mcp.mount(catalog_server, namespace="catalog")
 
 _RESOURCE_SUBSCRIBE_DENIAL_MESSAGE = "access_denied: not authorized for this resource"
 _RESOURCE_SUBSCRIBE_LIMIT_MESSAGE = (
