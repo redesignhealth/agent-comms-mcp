@@ -9548,6 +9548,42 @@ async def resolve_external_proposal(
     return {**_proposal_dict(hold), "already_recorded": False}
 
 
+FORWARD_REFUSAL_EXTERNAL_REF = "forwarding-refused"
+_FORWARD_REFUSAL_DENIAL_REASONS = frozenset({"missing_scope", "sub_not_allowed"})
+
+
+async def audit_denied_forward_refusal(
+    session: AsyncSession, *, actor_sub: str, reason: str
+) -> None:
+    """Audit + commit a refused ``POST /proposals/{id}/forward-refusal`` caller
+    (TECH-9214)."""
+    if reason not in _FORWARD_REFUSAL_DENIAL_REASONS:
+        raise ValueError(f"unexpected denial reason: {reason!r}")
+    _audit(session, actor_sub=actor_sub, action=f"denied.proposal_forward_refusal_{reason}")
+    await session.commit()
+
+
+async def record_forwarding_refusal(
+    session: AsyncSession, *, resolver_sub: str, hold_id: uuid.UUID, note: str
+) -> dict[str, Any]:
+    """Close a ``pending`` externally resolved proposal as ``rejected`` because
+    the external system permanently refused to take it (TECH-9214). The caller
+    (scope and subject allowlist) is checked by the route. A thin wrapper over
+    ``resolve_external_proposal`` that can only reject: the outcome is fixed, so
+    this path can never approve anything. ``note`` (required) is what the
+    submitting bot reads via ``proposals_get``; the external system's own
+    reviewer decision, if any, still goes through ``resolve_external_proposal``.
+    Same idempotency and ``already_decided`` rules."""
+    return await resolve_external_proposal(
+        session,
+        resolver_sub=resolver_sub,
+        hold_id=hold_id,
+        outcome="rejected",
+        note=note,
+        external_ref=FORWARD_REFUSAL_EXTERNAL_REF,
+    )
+
+
 MAX_EXTERNAL_QUEUE_PAGE = 100
 # UTC, fixed width, no ``+``: safe to paste into a query string unescaped.
 _EXTERNAL_QUEUE_CURSOR_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
@@ -12449,6 +12485,7 @@ __all__ = [
     "apply_owner_reassignment",
     "archive_conversation",
     "audit_denied_approval_requires_interactive",
+    "audit_denied_forward_refusal",
     "audit_denied_proposal_submission",
     "audit_denied_resolve_external",
     "audit_resource_subscription",
@@ -12496,6 +12533,7 @@ __all__ = [
     "proposal_owner_email",
     "proposal_rate_limit_for",
     "reconcile_agent_ownership",
+    "record_forwarding_refusal",
     "register_agent",
     "rename_conversation",
     "reopen_conversation",
