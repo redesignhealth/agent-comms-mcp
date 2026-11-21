@@ -47,7 +47,7 @@ query logic.
 
 | URI (canonical, post-mount) | Kind | Read shape | Backing service fn |
 |---|---|---|---|
-| `comms://comms/conversations/{conversation_id}` | template | Exactly `comms_get_conversation`'s output with cursor fixed at `since_seq=0` (conversation + participants + messages bounded by both the 500-message count cap and 256 KiB serialized byte budget; use the tool to page for more; an `invited` caller gets metadata only, per the existing rule) | `service.get_conversation` |
+| `comms://comms/conversations/{conversation_id}` | template | Exactly `comms_get_conversation`'s output with cursor fixed at `since_seq=0` (conversation + participants + messages bounded by both the 500-message count cap and 256 KiB serialized byte budget, with an oversized first message returned intact as a singleton; use the tool to page for more; an `invited` caller gets metadata only, per the existing rule) | `service.get_conversation` |
 | `comms://comms/agents/{agent_id}/inbox` | template | Exactly `comms_inbox`'s five-key output with default filters | `service.inbox` |
 | `comms://comms/agents` | static | First page of the board directory (`limit=50`, `has_more`) | `service.list_agents` |
 
