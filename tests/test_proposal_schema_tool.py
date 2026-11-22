@@ -21,7 +21,7 @@ from tests.test_proposal_tools import _ENV_PATCH, _OIDC_PATCH, _import_main
 _BOT = "catalog-agent"
 # Same vector as agent-comms-approvals' tests: the canonical-JSON hash Arcadia's
 # schema endpoint reports for this schema (not the raw file hash).
-CANONICAL_VECTOR = "5029b9f3e1ca690dee61a36d9a0063564326aeaaeb82bc7aa7f33d46b61e028d"
+CANONICAL_VECTOR = "23f4eca43c9ae555b490787bf2d84511788f3e2595bb0623cc17a2d28169af81"
 _ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -72,13 +72,13 @@ class TestTool:
             "examples",
         }
         assert out["kind"] == "catalog_candidate"
-        assert out["schema_version"] == 2 == out["schema"]["x-schema-version"]
+        assert out["schema_version"] == 3 == out["schema"]["x-schema-version"]
         assert out["schema_sha256"] == CANONICAL_VECTOR
         assert out["schema_sha256"] == proposal_schemas.canonical_sha256(out["schema"])
         assert {"ConceptPayload", "ConceptMarketPayload", "DeletePayload"} <= set(
             out["schema"]["$defs"]
         )
-        assert set(out["examples"]) == {"create", "upsert", "delete"}
+        assert set(out["examples"]) == {"create", "upsert", "create_pair_with_concept", "delete"}
         for text in ("concept:<slug>", "pair:<concept-slug>:<MARKET>", "base_version", "reason"):
             assert text in out["guide"]
 
@@ -99,6 +99,15 @@ class TestTool:
         assert set(concept["required"]) <= set(create["payload"])
         pair = out["schema"]["$defs"]["ConceptMarketPayload"]
         assert set(pair["required"]) <= set(upsert["payload"])
+        new = out["examples"]["create_pair_with_concept"]
+        assert new["action_type"] == "create" and "base_version" not in new
+        assert set(new["payload"]) <= set(pair["properties"])
+        concept_def = out["schema"]["$defs"]["ConceptIn"]
+        assert set(new["payload"]["concept"]) <= set(concept_def["properties"])
+        assert new["payload"]["concept"]["slug"] == new["payload"]["concept_slug"]
+        assert new["payload"]["schema_version"] == 3
+        for text in ("payload.concept", "CONCEPT_CREATION_PENDING", "first row"):
+            assert text in out["guide"]
         version = out["schema"]["$defs"]["VersionIn"]
         assert set(upsert["payload"]["version"]) <= set(version["properties"])
         assert set(version["required"]) <= set(upsert["payload"]["version"])
