@@ -1,7 +1,7 @@
 """What an agent must follow to submit a proposal of a given kind (TECH-9214).
 
 ``proposals_schema(kind)`` returns this. Today only ``catalog_candidate`` has a
-schema: the vendored copy of Arcadia's payload JSON Schema (version 2) plus a
+schema: the vendored copy of Arcadia's payload JSON Schema (version 3) plus a
 short guide. The schema file is byte-identical to the copy the approvals service
 validates against and forwards with; ``catalog_candidate_payload.schema.pin.json``
 beside it records Arcadia's commit and the file's sha256, and the tests pin both,
@@ -31,7 +31,8 @@ closed as rejected and proposals_get shows Arcadia's code and field errors in de
 Before you write a create or upsert, call catalog_get(target_key) with the same target_key
 ("concept:<slug>" or "pair:<concept-slug>:<MARKET>"). It returns {target_key, target_type, exists,
 status, version, payload}:
-- exists false -> propose a create.
+- exists false -> propose a create. For a pair whose concept is not in the catalog either
+  (catalog_get("concept:<slug>") says exists false), see "New concept with its first row" below.
 - exists true -> propose an upsert, never a create. Start from "payload" (the row in the payload
   shape below). For a pair, send "version" as base_version; a concept has no version, so send none.
 - status "deleted" (exists is still true): the target was soft-deleted; an upsert restores it.
@@ -54,6 +55,16 @@ action fields (proposals_submit(kind="catalog_candidate", action=...)):
 - delete: only target_id, action_type and "reason" (required, non-empty, at most 2000 characters);
   "fact_check" and "citations" are optional. No payload: the schema's DeletePayload definition is
   built by the approvals service from target_id and reason; never send a payload on a delete.
+- New concept with its first row: a brand-new idea is ONE proposal, a create of
+  "pair:<slug>:<MARKET>" whose payload also carries "concept", an object with the fields of a
+  concept create (slug, name, summary, domain_code, value_types). concept.slug must equal
+  concept_slug, the payload must say schema_version 3, and one approval creates the concept and
+  the row's first version. Rules: send "concept" only on a create and only when the concept does
+  not exist (the concept exists -> never send it; otherwise Arcadia refuses with CONCEPT_EXISTS
+  or, on an upsert, CONCEPT_NOT_ALLOWED); only one open candidate may create a given concept, so a
+  second row for the same new concept waits until the first is decided and is then sent WITHOUT
+  "concept" (CONCEPT_CREATION_PENDING); an unknown domain_code is refused at
+  payload.concept.domain_code.
 - Payload rules the schema alone cannot say: a related company's source_url is lowercase http:// or
   https:// with a host and no spaces; a "works" version has exactly one assessment per kind (impact,
   technical, uptake) plus research_depth and sources_as_of; value_low is not above value_high;
@@ -69,7 +80,7 @@ def _concept_example() -> dict[str, Any]:
         "target_id": "concept:remote-patient-monitoring",
         "action_type": "create",
         "payload": {
-            "schema_version": 2,
+            "schema_version": 3,
             "slug": "remote-patient-monitoring",
             "name": "Remote patient monitoring",
             "summary": "Devices and workflows that track patients at home.",
@@ -96,7 +107,7 @@ def _pair_example() -> dict[str, Any]:
         "action_type": "upsert",
         "base_version": 3,
         "payload": {
-            "schema_version": 2,
+            "schema_version": 3,
             "concept_slug": "remote-patient-monitoring",
             "market_code": "US",
             "version": {
@@ -146,6 +157,33 @@ def _pair_example() -> dict[str, Any]:
     }
 
 
+def _new_concept_example() -> dict[str, Any]:
+    return {
+        "target_id": "pair:remote-patient-monitoring:US",
+        "action_type": "create",
+        "payload": {
+            "schema_version": 3,
+            "concept_slug": "remote-patient-monitoring",
+            "market_code": "US",
+            "concept": {
+                "slug": "remote-patient-monitoring",
+                "name": "Remote patient monitoring",
+                "summary": "Devices and workflows that track patients at home.",
+                "domain_code": "chronic-care",
+                "value_types": ["cost"],
+            },
+            "version": {
+                "viability": "not_viable",
+                "works_score": 30,
+                "confidence_score": 45,
+                "build_scope": "n_a",
+                "deciding_feature": "Payers already bundle the same monitoring.",
+            },
+        },
+        "fact_check": copy.deepcopy(_FACT_CHECK),
+    }
+
+
 def _delete_example() -> dict[str, Any]:
     return {
         "target_id": "pair:remote-patient-monitoring:CA",
@@ -186,6 +224,7 @@ def catalog_candidate_schema() -> dict[str, Any]:
         "examples": {
             "create": _concept_example(),
             "upsert": _pair_example(),
+            "create_pair_with_concept": _new_concept_example(),
             "delete": _delete_example(),
         },
     }

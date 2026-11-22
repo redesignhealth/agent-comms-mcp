@@ -247,9 +247,61 @@
       "title": "CitationTargetType",
       "type": "string"
     },
+    "ConceptIn": {
+      "additionalProperties": false,
+      "description": "The fields of a concept: what a concept create carries, and what a pair create carries as `concept`\nwhen the concept does not exist yet.",
+      "properties": {
+        "domain_code": {
+          "minLength": 1,
+          "title": "Domain Code",
+          "type": "string"
+        },
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "slug": {
+          "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+          "title": "Slug",
+          "type": "string"
+        },
+        "summary": {
+          "default": "",
+          "title": "Summary",
+          "type": "string"
+        },
+        "value_types": {
+          "items": {
+            "$ref": "#/$defs/ValueType"
+          },
+          "title": "Value Types",
+          "type": "array"
+        }
+      },
+      "required": [
+        "slug",
+        "name",
+        "domain_code"
+      ],
+      "title": "ConceptIn",
+      "type": "object"
+    },
     "ConceptMarketPayload": {
       "additionalProperties": false,
+      "description": "A row of a concept in a market. `concept` is for a create whose concept is not in the catalog yet: the\none approval creates the concept and the row's first version. Its slug is `concept_slug`.",
       "properties": {
+        "concept": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ConceptIn"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "concept_slug": {
           "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
           "title": "Concept Slug",
@@ -261,8 +313,11 @@
           "type": "string"
         },
         "schema_version": {
-          "const": 2,
-          "default": 2,
+          "default": 3,
+          "enum": [
+            2,
+            3
+          ],
           "title": "Schema Version",
           "type": "integer"
         },
@@ -292,8 +347,11 @@
           "type": "string"
         },
         "schema_version": {
-          "const": 2,
-          "default": 2,
+          "default": 3,
+          "enum": [
+            2,
+            3
+          ],
           "title": "Schema Version",
           "type": "integer"
         },
@@ -342,8 +400,11 @@
           "type": "string"
         },
         "schema_version": {
-          "const": 2,
-          "default": 2,
+          "default": 3,
+          "enum": [
+            2,
+            3
+          ],
           "title": "Schema Version",
           "type": "integer"
         },
@@ -815,7 +876,7 @@
     }
   ],
   "title": "Arcadia opportunity catalog candidate payload",
-  "x-schema-version": 2,
+  "x-schema-version": 3,
   "x-vocabularies": {
     "assessment_flag": [
       "vendor_sourced",
