@@ -91,6 +91,14 @@ PROPOSAL_APPLY_RECORD_SCOPE = "proposals:apply_record:read"
 # ``PROPOSAL_RESOLVE_EXTERNAL_ALLOWED_SUBS`` (default empty: nobody).
 PROPOSAL_RESOLVE_EXTERNAL_SCOPE = "proposals:resolve_external"
 
+# ``POST /proposals/{id}/forward-refusal`` (TECH-9214): the approvals service's
+# catalog forwarder tells the board why Arcadia refused a ``catalog_candidate``,
+# which closes the proposal as ``rejected``. Self-checked by the route (a
+# non-MCP ``mcp.custom_route``), plus a subject allowlist
+# (``PROPOSAL_FORWARD_REFUSAL_ALLOWED_SUBS``, default empty: nobody). Held only by
+# that service identity; never grant it to an agent or human token.
+PROPOSAL_FORWARD_REFUSAL_SCOPE = "proposals:forward_refusal"
+
 
 TOOL_SCOPES: dict[str, str] = {
     # --- comms (provider: providers/comms.py, namespace="comms") ---
@@ -453,6 +461,7 @@ def scopes_for_token(token: AccessToken) -> list[str]:
 
 __all__ = [
     "PROPOSAL_APPLY_RECORD_SCOPE",
+    "PROPOSAL_FORWARD_REFUSAL_SCOPE",
     "PROPOSAL_RESOLVE_EXTERNAL_SCOPE",
     "PROPOSAL_SUBMIT_SCOPE",
     "RESOURCE_SCOPES",

@@ -967,6 +967,11 @@ class ProposalHold(Base):
     # TECH-9214: the external system's id for this proposal (Arcadia's candidate
     # id), set when it resolves the proposal. NULL for every other hold.
     external_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # TECH-9214: Arcadia's structured refusal, ``{"code": str | None, "errors":
+    # [{"path", "rule", "message"}]}``, set when the approvals forwarder relays a
+    # refusal (POST /proposals/{id}/forward-refusal). NULL for every other hold.
+    # Shown to the submitting bot by proposals_get next to ``decision_note``.
+    external_refusal: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _updated_at()
 

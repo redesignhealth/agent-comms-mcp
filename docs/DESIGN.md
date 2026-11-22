@@ -2807,6 +2807,17 @@ in the tool's message: `unknown_proposal`, `not_externally_resolved`, `already_d
 `invalid_request`. The submitting bot sees status, note and `external_ref` but never
 `decided_by_actor_id`, so neither a reviewer nor the service identity is disclosed.
 
+**Forwarded refusals (`POST /proposals/{id}/forward-refusal`, TECH-9214).** When Arcadia refuses a
+forwarded `catalog_candidate` (400/409/422), the approvals forwarder reports it on this service-only
+route (scope `proposals:forward_refusal`, sub on `PROPOSAL_FORWARD_REFUSAL_ALLOWED_SUBS`, default
+empty), so the agent learns why. It closes a pending proposal of an externally resolved kind as
+`rejected` with `decision_source = external`, stores the note as `decision_note` and Arcadia's
+`{code, errors: [{path, rule, message}]}` (at most 20 errors, fields cut to 500 characters, other keys
+dropped) in the `external_refusal` JSONB column, and returns both through `proposals_get`. Idempotent:
+a proposal already rejected this way is 200 `already_recorded` whatever the repeat says. Unknown hold
+or an owner-decided kind: 404 `unknown_proposal`; not pending: 409 `already_decided`; bad body: 400
+`invalid_request`. It applies nothing and writes nothing outward.
+
 Optional, operator-controlled exception: `CROSS_BRAIN_AUTO_APPROVE_RULES` (comma-separated rule
 names, default empty). A judge verdict with `approved=True` and `rule=<name>` where the name is on
 that list stands in for the owners' approvals: the claim records `cross_brain.auto_rule` and an
