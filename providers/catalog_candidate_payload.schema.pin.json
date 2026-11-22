@@ -1,7 +1,7 @@
 {
   "repo": "redesignhealth/arcadia",
   "path": "apps/api/src/arcadia_api/schemas/catalog_candidate_payload.schema.json",
-  "commit": "1774c01dcbcbf9ff4bf6ff2ae419c56bff2996c9",
+  "commit": "21e96d35d3e357412db9ca0994d323419590d4e1",
   "blob_sha": "250dae1c8869cb87f32319feab0cc6ebd9d00c09",
   "sha256": "1269bb8840ae3449922c4e6453e6680f176cee54195570694cec840fae9bbc5e",
   "schema_version": 3,
