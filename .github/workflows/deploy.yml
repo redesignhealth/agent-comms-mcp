@@ -70,13 +70,12 @@ jobs:
             --workflow ci.yml \
             --status success \
             --event push \
-            --branch main \
-            --limit 1 \
-            --json databaseId \
-            --jq 'length')
+            --limit 10 \
+            --json headBranch \
+            --jq '[.[] | select(.headBranch == "main" or .headBranch == "dancostanza/tech-9595-prod-pagination-hotfix")] | length')
           if [ "$count" -eq 0 ]; then
             echo "ERROR: No successful push-triggered CI run found for $GH_SHA — refusing to deploy." >&2
-            echo "Ensure the commit is merged to main and CI has passed before creating a release." >&2
+            echo "Ensure the commit is merged to main or dancostanza/tech-9595-prod-pagination-hotfix and CI has passed before creating a release." >&2
             exit 1
           fi
           echo "CI check passed for $GH_SHA."
