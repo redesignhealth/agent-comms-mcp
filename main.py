@@ -76,6 +76,7 @@ from scopes import (
     safe_client_id,
     scopes_for_token,
 )
+from wake_delivery import wake_delivery_lifespan
 
 configure_logging()
 
@@ -400,6 +401,7 @@ _okta_provider = _okta_server
 
 mcp: FastMCP[Any] = FastMCP(
     "agent-comms-mcp",
+    lifespan=wake_delivery_lifespan,
     instructions=(
         "Permissioned, structured agent-to-agent communications layer. "
         "Supports EA-style agents negotiating availability "
