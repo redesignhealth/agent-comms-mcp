@@ -1218,6 +1218,17 @@ async def test_task_starts_and_stops_with_the_server(
     assert created[0]._loop_task is None
 
 
+async def test_tests_do_not_start_the_delivery_loop(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Regression (test hang): a plain client call must not start the loop on the shared engine."""
+    from tests.test_comms_tools import _call, _import_main, _token
+
+    await _call(_import_main(), factory, _token("no-delivery"), "comms_whoami")
+    async with _import_main().mcp._lifespan_manager():
+        assert not [t for t in asyncio.all_tasks() if t.get_name() == "wake-delivery"]
+
+
 async def test_stop_cancels_sends_in_flight_and_leaves_the_lease(
     session: AsyncSession,
     factory: async_sessionmaker[AsyncSession],
