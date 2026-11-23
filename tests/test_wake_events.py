@@ -301,14 +301,35 @@ async def test_quiet_session_closes_and_rules_apply_again(session: AsyncSession)
     assert closed.closed_reason == "quiet" and closed.closed_at is not None
     assert closed.session_ref == "run-1"
 
-    # Rules say wake: the session reopens, session_ref kept.
+    # Rules say wake: the session reopens as a new period, without the old session_ref.
     await _set_catch_all(session, room.active, "wake")
     await _post(session, room.sender, room.conversation_id)
     assert [e.reason for e in await _events(session)] == ["rule"]
     reopened = await _wake_session(session, room.active, room.conversation_id)
     assert reopened is not None
     assert reopened.closed_at is None and reopened.closed_reason is None
-    assert reopened.session_ref == "run-1"
+    assert reopened.session_ref is None
+
+
+async def test_quiet_session_woken_by_rule_restarts_without_old_session_ref(
+    session: AsyncSession,
+) -> None:
+    room = await _room(session)
+    quiet = timedelta(seconds=WAKE_SESSION_WINDOW_SECONDS + 60)
+    await _set_session(session, room.active, room.conversation_id, age=quiet)  # catch-all wakes
+    await _post(session, room.sender, room.conversation_id)
+    assert [e.reason for e in await _events(session)] == ["rule"]
+    restarted = await _wake_session(session, room.active, room.conversation_id)
+    assert restarted is not None and restarted.closed_at is None
+    assert restarted.session_ref is None
+
+
+async def test_open_session_keeps_its_session_ref(session: AsyncSession) -> None:
+    room = await _room(session)
+    await _set_session(session, room.active, room.conversation_id, age=timedelta(minutes=1))
+    await _post(session, room.sender, room.conversation_id)
+    kept = await _wake_session(session, room.active, room.conversation_id)
+    assert kept is not None and kept.session_ref == "run-1"
 
 
 async def test_explicitly_closed_session_does_not_override_rules(session: AsyncSession) -> None:
