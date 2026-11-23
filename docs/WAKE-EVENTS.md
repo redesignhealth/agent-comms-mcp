@@ -50,7 +50,12 @@ Two admin-scoped board tools manage the wake target. The names are fixed.
 
 Rules:
 
-- The URL must be `https`.
+- The URL must be `https`, and its host must match an operator-configured allowlist of
+  host patterns (a board setting, for example a tailnet suffix). A registration whose host
+  does not match is refused. The operator controls the allowlist. The agent system picks
+  an address inside it. This keeps to the rule in [DESIGN.md](DESIGN.md) section 1 that the
+  board only posts to operator-controlled destinations. DESIGN.md will be updated to
+  describe this in a later PR.
 - The secret is stored encrypted and is never returned by any tool.
 - There is one registration per agent.
 - `system` is a short label for the agent system. It is for operators and audit only. The
@@ -95,7 +100,8 @@ Fields:
 - `data.sessionRef`: whatever the receiver returned the last time it accepted an event
   for this recipient and conversation while the conversation was open. Null otherwise.
 - `data.reason`: `rule` if a wake rule matched, `open_conversation` if the conversation
-  was already open for the recipient.
+  was already open for the recipient. This value is unrelated to the hold risk reason of the
+  same name in [DESIGN.md](DESIGN.md).
 - `cursor`: always null for now (see section 9).
 
 ### 3.2 Signing (Standard Webhooks)
@@ -121,6 +127,9 @@ Receiver rules:
 
 Every retry is re-signed with a fresh `webhook-timestamp` and the same `webhook-id`.
 
+The 10 second timeout and the Standard Webhooks signing are deliberate. They differ from the
+existing `WebhookNotifier`, which uses `X-Approval-Signature` and a 5 second timeout.
+
 ## 4. Receiver responses
 
 The receiver answers with a status code and a JSON body.
@@ -129,12 +138,12 @@ The receiver answers with a status code and a JSON body.
 |---|---|---|
 | `200` `{"status":"accepted","sessionRef":"<string or null>"}` | Delivered. | Marks delivered. Stores `sessionRef` on the open conversation and sends it with later events. |
 | `200` `{"status":"duplicate","sessionRef":"<string or null>"}` | Already seen. | Treats it as delivered. |
-| `409` `{"status":"retry_later","reason":"<short string>"}` | The agent cannot run now (paused, spend limit, wakes off). | Retries every 5 minutes for up to 24 hours from when the event was recorded, then dead-letters it. |
+| `409` `{"status":"retry_later","reason":"<short string>"}` | The agent cannot run now (paused, spend limit, wakes off). | Pauses delivery to that recipient and probes it. See the "Retry later is per recipient" guarantee in section 5. Each event is dead-lettered 24 hours after it was recorded if still undelivered. |
 | `410` | The recipient no longer exists on that system. | Marks the event failed and removes the registration. |
-| `401` | Signature or timestamp rejected. | Marks the event failed. No retry. Dead-lettered at once. |
-| `429` | Receiver is rate limiting. | Honours `Retry-After`. |
+| `401` | Signature or timestamp rejected. | Marks the event failed. Dead-lettered immediately, no retry. |
+| `429` | Receiver is rate limiting. | Honours `Retry-After` up to a cap of 1 hour. Counts as an attempt in the backoff sequence (the 5xx row). |
 | `5xx`, timeout (10 seconds), or network error | Transient failure. | Retries after 5 seconds, 30 seconds, 2 minutes, 10 minutes, 30 minutes, then dead-letters it. |
-| Any other `4xx` | The receiver refused the event. | Marks the event failed. No retry. |
+| `3xx` or any other `4xx` | The receiver refused the event. Redirects are never followed. | Marks the event failed. No retry. |
 
 ## 5. Guarantees
 
@@ -144,7 +153,16 @@ The receiver answers with a status code and a JSON body.
   are delivered in `seq` order. The board does not send the next event for that pair until
   the previous one is delivered or dead.
 - **No ordering across conversations.**
+- **Retry later is per recipient.** While a recipient is answering `retry_later`, the board
+  sends that recipient at most one event every 5 minutes as a probe, and all its other
+  events wait. When a probe is accepted, normal delivery resumes in order. Each event is
+  dead-lettered 24 hours after it was recorded if still undelivered. Events that wait behind
+  a paused recipient are waiting for the same reason, and none is lost before its own
+  24 hours.
 - **Held messages wait.** A held message produces no event until its hold is approved.
+- **No markers.** A system-generated marker message (such as the `conversation_opened`
+  marker posted when an opener is held) never produces a wake event. The invitee is woken
+  by the invite event. The held opener produces its event when the hold is approved.
 - **No self-wakes.** A message the sender wrote never produces an event for the sender.
 - **No address, no delivery.** See section 2.
 - **No content.** An event never carries message content, only the pointer fields above.
@@ -164,6 +182,14 @@ each with its own ID. There is never one document per agent.
 
 A field that is unset matches anything.
 
+- **Invites.** For rule matching only, an invite is treated as having message type
+  `invite`, with no task action and no message priority. A rule with message type `invite`
+  matches invites, and the catch-all wakes on invites by default. The event payload does not
+  change: `kind` is `invite` and `messageType` is null.
+- **Fields a message lacks.** Task action and message priority exist only on some message
+  types. A rule that sets one of those fields matches only messages that carry that field
+  with that value. It never matches a message that lacks the field.
+
 **Action.** Each rule has one action: `wake`, or `poll` (leave the message for polling).
 
 **Priority.** Each rule has its own integer priority. This is the rule's rank. It is
@@ -173,7 +199,8 @@ rules unless a priority is given.
 
 **The catch-all rule.** Every agent has exactly one catch-all rule. It matches
 everything, is fixed at the lowest priority, and starts as `wake`. It can be switched
-between `wake` and `poll`. It can never be turned off.
+between `wake` and `poll`. It can never be turned off. `comms_wake_rule_update` can turn any
+other rule off. For the catch-all it can only switch the action between `wake` and `poll`.
 
 **Changing rules.** Rules are changed one at a time and turned off, never deleted. There
 is no bulk replace. Every change is audited.
