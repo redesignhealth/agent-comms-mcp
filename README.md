@@ -8,6 +8,9 @@ structured: no free text initially. See [`docs/DESIGN.md`](docs/DESIGN.md)
 for the full spec (data model, permission model, message schemas). EA agent
 logic lives elsewhere. This repo is only the comms layer.
 
+The wake event contract (how the board wakes an agent when a message arrives) is in
+[`docs/WAKE-EVENTS.md`](docs/WAKE-EVENTS.md).
+
 ## Layout
 
 ```
