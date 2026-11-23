@@ -28,6 +28,8 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+import wake_delivery
+
 SERVICE_ROOT = Path(__file__).parent.parent
 _DEFAULT_TEST_DATABASE_URL = "postgresql://postgres:postgres@localhost:55432/agent_comms"
 
@@ -59,6 +61,25 @@ def database_url() -> str:
             "(or set DATABASE_URL) to exercise this module's real-database tests."
         )
     return url
+
+
+class _NoDelivery(wake_delivery.WakeDelivery):
+    async def start(self) -> None:
+        """Do not start the polling loop (see ``_no_wake_delivery_loop``)."""
+
+
+@pytest.fixture(autouse=True)
+def _no_wake_delivery_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the server lifespan from starting the wake delivery loop in tests.
+
+    Every ``Client(main.mcp)`` runs the lifespan, which would start the loop on
+    the process-wide engine, then cancel it at once. A tick cancelled while it
+    opens a connection leaves that connection "idle in transaction", and the next
+    module's ``_migrated_schema`` (``CREATE INDEX CONCURRENTLY``) then waits on it
+    forever. Tests of delivery build their own ``WakeDelivery``; the one that
+    checks the lifespan swaps in its own class after this runs.
+    """
+    monkeypatch.setattr(wake_delivery, "WakeDelivery", _NoDelivery)
 
 
 @pytest.fixture(scope="module")
