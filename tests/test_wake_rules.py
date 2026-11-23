@@ -588,6 +588,10 @@ class TestStorage:
         )
         assert flipped.action == "poll"
         assert (flipped.priority, flipped.enabled, flipped.is_catch_all) == (0, True, True)
+        with pytest.raises(InvalidWakeRuleError):
+            await update_wake_rule(
+                session, actor_sub="s", agent_id=agent_id, rule_id=catch_all_id, action="ring"
+            )
 
     async def test_update_validates_fields(self, session: AsyncSession) -> None:
         agent_id = (await _agent(session, "agent-a")).id  # rollback expires ORM objects
