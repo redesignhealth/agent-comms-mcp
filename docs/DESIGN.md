@@ -387,7 +387,8 @@ agent-token access gate. It never gates human users.
 
 ## 5. Data model (Postgres)
 
-Seven tables. `messages` and `audit_log` are append-only: no UPDATE/DELETE paths in code.
+Twelve tables, listed below (the wake tables, TECH-9905, are described in the last
+paragraph of this section). `messages` and `audit_log` are append-only: no UPDATE/DELETE paths in code.
 `approval_holds` (TECH-5389) and `proposal_holds` (TECH-5871) are the two MUTABLE
 tables besides `conversations`/`participants`/`agents`: each hold's `status` flips
 as it moves through its own lifecycle.
@@ -943,6 +944,17 @@ Design notes:
  `agent.register`'s audit trail, where `actor_sub` is always the registering
  identity itself -- so the audit trail unambiguously records who registered which
  identity on whose behalf.
+
+Wake tables (TECH-9905; schema and rule storage only, nothing hooks message delivery yet):
+`wake_rules` (per-agent rules, nullable `match_*` columns where NULL matches anything,
+`action` wake|poll, `priority` where the highest enabled matching rule wins and a newer
+`created_at` breaks a tie; one catch-all per agent, priority 0, always enabled, created
+lazily; rules are never deleted, only set `enabled = false`), `wake_sessions` (one
+open-conversation row per agent and conversation, reopened by UPDATE), `wake_events` (one
+row per recipient per delivered message or invite; its `id` is the event ID sent to
+receivers; unique per recipient, conversation and seq for messages) and `wake_targets`
+(per-agent delivery URL plus encrypted secret). Rule storage and evaluation live in
+`wake_rules.py`.
 
 ## 6. Message schemas (two-axis model)
 

@@ -35,6 +35,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -172,6 +173,15 @@ DECISION_REASON_CODES = (
     "human_will_handle",
     "other",
 )
+
+# Wake feature (TECH-9905). Closed vocabularies, CHECK-constrained; mirrored
+# as literal SQL in the wake-tables migration (migrations are frozen once
+# applied, so editing these needs a NEW migration).
+WAKE_RULE_ACTIONS = ("wake", "poll")
+WAKE_SESSION_CLOSED_REASONS = ("quiet", "agent_closed", "conversation_ended")
+WAKE_EVENT_KINDS = ("message", "invite")
+WAKE_EVENT_REASONS = ("rule", "open_conversation")
+WAKE_EVENT_STATUSES = ("pending", "delivered", "retry", "retry_later", "failed", "dead")
 
 
 class Base(DeclarativeBase):
@@ -992,6 +1002,167 @@ class ProposalBotLogSeq(Base):
     last_seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
 
+class WakeRule(Base):
+    """A per-agent wake rule: which delivered messages wake (or only poll) the agent.
+
+    Every match column is nullable; NULL means "matches anything". The
+    highest-``priority`` enabled matching rule wins (newer ``created_at``
+    breaks a tie). Each agent has at most one catch-all rule (all match
+    columns NULL, priority 0, always enabled) created lazily by
+    ``wake_rules.ensure_catch_all``. Rules are never deleted: a rule is
+    retired by setting ``enabled = false``.
+    """
+
+    __tablename__ = "wake_rules"
+    __table_args__ = (
+        CheckConstraint(f"action IN {WAKE_RULE_ACTIONS!r}", name="ck_wake_rules_action"),
+        CheckConstraint(
+            "(is_catch_all AND match_conversation_id IS NULL "
+            "AND match_sender_agent_id IS NULL AND match_message_type IS NULL "
+            "AND match_task_action IS NULL AND match_message_priority IS NULL "
+            "AND priority = 0 AND enabled) "
+            "OR (NOT is_catch_all AND priority >= 1)",
+            name="ck_wake_rules_catch_all_shape",
+        ),
+        Index("idx_wake_rules_agent_id", "agent_id"),
+        # At most one catch-all per agent; ensure_catch_all relies on this
+        # for its concurrency safety (INSERT ... ON CONFLICT DO NOTHING).
+        Index(
+            "uq_wake_rules_agent_id_catch_all",
+            "agent_id",
+            unique=True,
+            postgresql_where=text("is_catch_all"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    agent_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agents.id"), nullable=False)
+    is_catch_all: Mapped[bool] = mapped_column(
+        nullable=False, default=False, server_default=text("false")
+    )
+    match_conversation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    match_sender_agent_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    match_message_type: Mapped[str | None] = mapped_column(Text)
+    match_task_action: Mapped[str | None] = mapped_column(Text)
+    match_message_priority: Mapped[str | None] = mapped_column(Text)
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    priority: Mapped[int] = mapped_column(Integer, nullable=False)
+    enabled: Mapped[bool] = mapped_column(nullable=False, default=True, server_default=text("true"))
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _updated_at()
+
+
+class WakeSession(Base):
+    """An agent's "open conversation" record: one row per (agent, conversation).
+
+    A closed row is reopened by UPDATE (clear ``closed_at``/``closed_reason``),
+    never by inserting a second row.
+    """
+
+    __tablename__ = "wake_sessions"
+    __table_args__ = (
+        UniqueConstraint(
+            "agent_id", "conversation_id", name="uq_wake_sessions_agent_id_conversation_id"
+        ),
+        CheckConstraint(
+            f"closed_reason IS NULL OR closed_reason IN {WAKE_SESSION_CLOSED_REASONS!r}",
+            name="ck_wake_sessions_closed_reason",
+        ),
+        CheckConstraint(
+            "session_ref IS NULL OR char_length(session_ref) <= 255",
+            name="ck_wake_sessions_session_ref_length",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    agent_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agents.id"), nullable=False)
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id"), nullable=False
+    )
+    opened_at: Mapped[datetime] = _created_at()
+    last_activity_at: Mapped[datetime] = _created_at()
+    closed_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    closed_reason: Mapped[str | None] = mapped_column(Text)
+    session_ref: Mapped[str | None] = mapped_column(Text)
+
+
+class WakeEvent(Base):
+    """One row per recipient per delivered message or invite.
+
+    ``id`` is the event ID sent to receivers.
+
+    ``seq`` is NULL for invites. The partial unique index guarantees one
+    message produces at most one event per recipient.
+    """
+
+    __tablename__ = "wake_events"
+    __table_args__ = (
+        CheckConstraint(f"kind IN {WAKE_EVENT_KINDS!r}", name="ck_wake_events_kind"),
+        CheckConstraint(f"reason IN {WAKE_EVENT_REASONS!r}", name="ck_wake_events_reason"),
+        CheckConstraint(f"status IN {WAKE_EVENT_STATUSES!r}", name="ck_wake_events_status"),
+        CheckConstraint(
+            "(kind = 'message' AND seq IS NOT NULL) OR (kind = 'invite' AND seq IS NULL)",
+            name="ck_wake_events_seq_matches_kind",
+        ),
+        Index(
+            "uq_wake_events_recipient_agent_id_conversation_id_seq",
+            "recipient_agent_id",
+            "conversation_id",
+            "seq",
+            unique=True,
+            postgresql_where=text("kind = 'message'"),
+        ),
+        Index("idx_wake_events_status_next_attempt_at", "status", "next_attempt_at"),
+        # Reads one recipient's events per conversation in order, invites
+        # included (their seq is NULL, so the partial unique index above
+        # cannot serve them).
+        Index(
+            "idx_wake_events_recipient_agent_id_conversation_id_created_at",
+            "recipient_agent_id",
+            "conversation_id",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    recipient_agent_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agents.id"), nullable=False)
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id"), nullable=False
+    )
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    seq: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    message_type: Mapped[str | None] = mapped_column(Text)
+    sender_agent_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agents.id"), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(
+        Text, nullable=False, default="pending", server_default=text("'pending'")
+    )
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    next_attempt_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    session_ref_sent: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = _created_at()
+    delivered_at: Mapped[datetime | None] = mapped_column(nullable=True)
+
+
+class WakeTarget(Base):
+    """An agent's wake address: delivery URL plus encrypted secret.
+
+    Encryption logic lands in a later PR; this is only the column.
+    """
+
+    __tablename__ = "wake_targets"
+
+    agent_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agents.id"), primary_key=True)
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    secret_ciphertext: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    system_label: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _updated_at()
+
+
 __all__ = [
     "AGENT_STATUSES",
     "APPROVAL_HOLD_AUTO_DECISIONS",
@@ -1004,6 +1175,11 @@ __all__ = [
     "PROPOSAL_HOLD_DECISION_SOURCES",
     "PROPOSAL_HOLD_LEVELS",
     "PROPOSAL_HOLD_STATUSES",
+    "WAKE_EVENT_KINDS",
+    "WAKE_EVENT_REASONS",
+    "WAKE_EVENT_STATUSES",
+    "WAKE_RULE_ACTIONS",
+    "WAKE_SESSION_CLOSED_REASONS",
     "Agent",
     "ApprovalHold",
     "AuditLog",
@@ -1013,4 +1189,8 @@ __all__ = [
     "Participant",
     "ProposalBotLogSeq",
     "ProposalHold",
+    "WakeEvent",
+    "WakeRule",
+    "WakeSession",
+    "WakeTarget",
 ]

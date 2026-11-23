@@ -77,7 +77,7 @@ py-modules = [
     "auth", "db", "exceptions", "identity",
     "main", "migrate", "mint_token", "models", "observability", "plugins",
     "proposal_apply_http_client",
-    "scopes", "schemas", "service", "state_machine", "subscriptions",
+    "scopes", "schemas", "service", "state_machine", "subscriptions", "wake_rules",
 ]
 packages = ["providers", "migrations", "migrations.versions"]
 

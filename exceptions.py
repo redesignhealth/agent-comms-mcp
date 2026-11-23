@@ -507,6 +507,11 @@ class InvalidOwnerReassignmentError(Exception):
     """Raised when an owner reassignment request is rejected by business rules (TECH-7389)."""
 
 
+class InvalidWakeRuleError(ValueError):
+    """A wake rule add/update was rejected by validation (TECH-9905): a bad field
+    value, or an attempt to change a catch-all rule beyond its ``action``."""
+
+
 class ProposalImmutableError(Exception):
     """A resubmission matched an open (``pending``/``applying``) proposal of an
     immutable kind (``service.IMMUTABLE_PROPOSAL_KINDS``, e.g. ``gmail_send``)
@@ -559,6 +564,7 @@ __all__ = [
     "InvalidExtendError",
     "InvalidOwnerReassignmentError",
     "InvalidProposalActionError",
+    "InvalidWakeRuleError",
     "ProposalImmutableError",
     "ProposalTargetUnavailableError",
     "RateLimitExceededError",

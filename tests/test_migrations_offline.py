@@ -58,6 +58,9 @@ def test_alembic_offline_mode_emits_sql_without_a_live_connection() -> None:
     assert "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS name VARCHAR(120)" in result.stdout
     # pre-flight guard against dropping non-empty tasks rows
     assert "tasks table is not empty" in result.stdout
+    # wake tables (TECH-9905)
+    for table in ("wake_rules", "wake_sessions", "wake_events", "wake_targets"):
+        assert f"CREATE TABLE {table} (" in result.stdout
     # upgrade()'s index drops are schema-qualified
     # to match the guard. This is upgrade()-side coverage only -- alembic
     # --sql only emits forward DDL, so this offline test never runs
