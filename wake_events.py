@@ -20,7 +20,7 @@ from sqlalchemy import and_, case, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models import WakeEvent, WakeSession, WakeTarget
+from models import AuditLog, WakeEvent, WakeSession, WakeTarget
 from wake_rules import WakeMessage, evaluate_wake_rules, list_wake_rules_for_agents
 
 # A wake session ("open conversation") is open while it is not closed and its
@@ -248,9 +248,75 @@ async def close_wake_sessions_for_conversation(
     )
 
 
+async def list_open_wake_sessions(
+    session: AsyncSession, *, agent_id: uuid.UUID, now: datetime
+) -> list[WakeSession]:
+    """The agent's open conversations, most recently active first. Read-only."""
+    return list(
+        (
+            await session.execute(
+                select(WakeSession)
+                .where(
+                    WakeSession.agent_id == agent_id,
+                    WakeSession.closed_at.is_(None),
+                    WakeSession.last_activity_at
+                    >= now - timedelta(seconds=WAKE_SESSION_WINDOW_SECONDS),
+                )
+                .order_by(WakeSession.last_activity_at.desc(), WakeSession.id)
+            )
+        ).scalars()
+    )
+
+
+async def close_wake_session(
+    session: AsyncSession,
+    *,
+    actor_sub: str,
+    agent_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    now: datetime,
+) -> bool:
+    """Close the agent's open session for one conversation (``agent_closed``).
+
+    Returns ``False`` and writes nothing when the agent has no open session
+    there (already closed, quiet past the window, or never opened), so the
+    call is idempotent and says nothing about conversations the agent is not
+    in. Otherwise writes a ``wake_session.close`` audit row. COMMITS.
+    """
+    closed = (
+        await session.execute(
+            update(WakeSession)
+            .where(
+                WakeSession.agent_id == agent_id,
+                WakeSession.conversation_id == conversation_id,
+                WakeSession.closed_at.is_(None),
+                WakeSession.last_activity_at
+                >= now - timedelta(seconds=WAKE_SESSION_WINDOW_SECONDS),
+            )
+            .values(closed_at=now, closed_reason="agent_closed")
+            .returning(WakeSession.id)
+        )
+    ).scalar_one_or_none()
+    if closed is None:
+        return False
+    session.add(
+        AuditLog(
+            actor_sub=actor_sub,
+            action="wake_session.close",
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            detail={"reason": "agent_closed"},
+        )
+    )
+    await session.commit()
+    return True
+
+
 __all__ = [
     "WAKE_SESSION_WINDOW_SECONDS",
+    "close_wake_session",
     "close_wake_sessions_for_conversation",
+    "list_open_wake_sessions",
     "record_invite_wake_events",
     "record_message_wake_events",
 ]
