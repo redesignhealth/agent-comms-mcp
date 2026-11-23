@@ -27,9 +27,10 @@ from typing import Any, Final
 from urllib.parse import urlsplit
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from exceptions import InvalidWakeTargetError
+from exceptions import InvalidWakeTargetError, WakeTargetMisconfiguredError
 from models import WakeTarget
 from service import _audit, _deny, _find_agent_by_id
 from wake_secrets import encrypt_secret
@@ -45,7 +46,12 @@ MAX_SECRET_BYTES: Final = 64
 _MAX_SECRET_LENGTH: Final = len(SECRET_PREFIX) + 88
 
 _SYSTEM_PATTERN: Final = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
-_HOST_PATTERN: Final = re.compile(r"^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$")
+_LABEL_PATTERN: Final = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
+
+
+def _is_well_formed_host(host: str) -> bool:
+    """Dot-separated DNS labels: no empty label (so no leading, trailing or doubled dot)."""
+    return bool(host) and all(_LABEL_PATTERN.match(label) for label in host.split("."))
 
 
 def parse_allowed_hosts(raw: str | None) -> list[str]:
@@ -59,14 +65,21 @@ def parse_allowed_hosts(raw: str | None) -> list[str]:
     for entry in (raw or "").split(","):
         pattern = entry.strip().lower()
         host = pattern[2:] if pattern.startswith("*.") else pattern
-        if host and _HOST_PATTERN.match(host):
+        if _is_well_formed_host(host):
             patterns.append(pattern)
     return patterns
 
 
 def host_is_allowed(host: str, patterns: list[str]) -> bool:
-    """True if ``host`` matches an exact pattern, or is a subdomain of a ``*.suffix`` one."""
+    """True if ``host`` matches an exact pattern, or is a subdomain of a ``*.suffix`` one.
+
+    A malformed host (empty label, trailing dot, characters outside DNS labels) never
+    matches. A wildcard matches only on a whole-label boundary, with at least one label
+    before the suffix.
+    """
     host = host.lower()
+    if not _is_well_formed_host(host):
+        return False
     for pattern in patterns:
         if pattern.startswith("*."):
             if host.endswith(pattern[1:]):  # keeps the leading dot: "xts.net" never matches
@@ -80,7 +93,7 @@ def validate_url(url: str) -> str:
     """Validate ``url`` against the format rules and the operator allowlist; return its host."""
     patterns = parse_allowed_hosts(os.environ.get(WAKE_TARGET_ALLOWED_HOSTS_ENV_VAR))
     if not patterns:
-        raise InvalidWakeTargetError(
+        raise WakeTargetMisconfiguredError(
             f"no hosts are allowed: {WAKE_TARGET_ALLOWED_HOSTS_ENV_VAR} is empty or unset, "
             "so wake targets cannot be registered"
         )
@@ -104,6 +117,8 @@ def validate_url(url: str) -> str:
         raise InvalidWakeTargetError("url must not contain credentials")
     if "#" in url:
         raise InvalidWakeTargetError("url must not contain a fragment")
+    if not _is_well_formed_host(host.lower()):
+        raise InvalidWakeTargetError("url host is not a valid hostname")
     if not host_is_allowed(host, patterns):
         raise InvalidWakeTargetError(
             f"host {host!r} is not on the allowed host list ({WAKE_TARGET_ALLOWED_HOSTS_ENV_VAR})"
@@ -146,6 +161,12 @@ def _iso(value: datetime) -> str:
     return value.isoformat()
 
 
+async def _get_row(session: AsyncSession, agent_id: uuid.UUID) -> WakeTarget | None:
+    return (
+        await session.execute(select(WakeTarget).where(WakeTarget.agent_id == agent_id))
+    ).scalar_one_or_none()
+
+
 async def set_wake_target(
     session: AsyncSession,
     *,
@@ -184,16 +205,23 @@ async def set_wake_target(
     validate_system(system)
     ciphertext = encrypt_secret(secret)
 
-    row = (
-        await session.execute(select(WakeTarget).where(WakeTarget.agent_id == agent_id))
-    ).scalar_one_or_none()
+    row = await _get_row(session, agent_id)
     replaced = row is not None
     if row is None:
         row = WakeTarget(
             agent_id=agent_id, url=url, secret_ciphertext=ciphertext, system_label=system
         )
-        session.add(row)
-    else:
+        try:
+            # Savepoint: a concurrent first-time set for the same agent can win the
+            # primary-key race. Treat the loser as a replace instead of failing.
+            async with session.begin_nested():
+                session.add(row)
+        except IntegrityError:
+            row = await _get_row(session, agent_id)
+            if row is None:
+                raise
+            replaced = True
+    if replaced:
         row.url = url
         row.secret_ciphertext = ciphertext
         row.system_label = system
@@ -239,9 +267,7 @@ async def remove_wake_target(
             action="denied.unknown_agent",
             detail={"target_agent_id": str(agent_id)},
         )
-    row = (
-        await session.execute(select(WakeTarget).where(WakeTarget.agent_id == agent_id))
-    ).scalar_one_or_none()
+    row = await _get_row(session, agent_id)
     detail: dict[str, Any] = {"removed": row is not None}
     if row is not None:
         detail["system"] = row.system_label

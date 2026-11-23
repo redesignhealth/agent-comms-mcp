@@ -6,6 +6,7 @@ the real mounted server, as in ``tests/test_comms_tools.py``.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import re
@@ -257,7 +258,7 @@ class TestUrlRules:
         else:
             monkeypatch.setenv(wake_targets.WAKE_TARGET_ALLOWED_HOSTS_ENV_VAR, value)
         agent_id = await _agent(main, test_session_factory)
-        with pytest.raises(ToolError, match="no hosts are allowed"):
+        with pytest.raises(ToolError, match=r"misconfigured: .*no hosts are allowed"):
             await _set(main, test_session_factory, agent_id)
         assert await _count(test_session_factory) == 0
 
@@ -281,6 +282,14 @@ class TestUrlRules:
             ("ts.net", False),
             ("ts.net.evil.com", False),
             ("a.ts.net.", False),
+            (".ts.net", False),
+            ("a..ts.net", False),
+            ("..ts.net", False),
+            ("-a.ts.net", False),
+            ("a_b.ts.net", False),
+            ("a.ts.net..", False),
+            ("", False),
+            ("a ts.net", False),
         ],
     )
     def test_wildcard_suffix_matching(self, host: str, expected: bool) -> None:
@@ -288,6 +297,20 @@ class TestUrlRules:
             wake_targets.host_is_allowed(host, wake_targets.parse_allowed_hosts("*.ts.net"))
             is expected
         )
+
+    def test_malformed_patterns_are_dropped(self) -> None:
+        assert wake_targets.parse_allowed_hosts("*.,*.a..b,.ts.net,a..b,*,ts.net.,*.ok.net") == [
+            "*.ok.net"
+        ]
+
+    @pytest.mark.parametrize("host", [".ts.net", "a..ts.net", "a.ts.net."])
+    async def test_malformed_host_refused_end_to_end(
+        self, main: Any, test_session_factory: Any, host: str
+    ) -> None:
+        agent_id = await _agent(main, test_session_factory)
+        with pytest.raises(ToolError):
+            await _set(main, test_session_factory, agent_id, url=f"https://{host}/x")
+        assert await _count(test_session_factory) == 0
 
     def test_exact_pattern_does_not_match_subdomain(self) -> None:
         patterns = wake_targets.parse_allowed_hosts("wake.example.org")
@@ -435,3 +458,48 @@ class TestNoSecretLeaks:
         assert row.actor_sub == "wake-admin"
         assert str(row.agent_id) == agent_id
         assert row.detail == {"system": "paperclip", "host": "wake.example.ts.net"}
+
+
+class TestConcurrentFirstSet:
+    async def _service_set(self, factory: Any, agent_id: str, secret: str) -> dict[str, Any]:
+        async with factory() as session:
+            return await wake_targets.set_wake_target(
+                session,
+                actor_sub="wake-admin",
+                admin_authorized=True,
+                agent_id=uuid.UUID(agent_id),
+                url=GOOD_URL,
+                secret=secret,
+                system="paperclip",
+            )
+
+    async def test_losing_the_insert_race_becomes_a_replace(
+        self, main: Any, test_session_factory: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent_id = await _agent(main, test_session_factory)
+        await _set(main, test_session_factory, agent_id)  # the "winner" commits first
+        real_get_row = wake_targets._get_row
+        calls = 0
+
+        async def stale_first_read(session: AsyncSession, aid: uuid.UUID) -> WakeTarget | None:
+            nonlocal calls
+            calls += 1
+            return None if calls == 1 else await real_get_row(session, aid)
+
+        monkeypatch.setattr(wake_targets, "_get_row", stale_first_read)
+        result = await self._service_set(test_session_factory, agent_id, OTHER_SECRET)
+        assert result["result"] == "replaced"
+        row = await _row(test_session_factory, agent_id)
+        assert row is not None
+        assert wake_secrets.decrypt_secret(row.secret_ciphertext) == OTHER_SECRET
+        assert await _count(test_session_factory) == 1
+
+    async def test_parallel_first_time_sets_both_succeed(
+        self, main: Any, test_session_factory: Any
+    ) -> None:
+        agent_id = await _agent(main, test_session_factory)
+        results = await asyncio.gather(
+            *(self._service_set(test_session_factory, agent_id, GOOD_SECRET) for _ in range(5))
+        )
+        assert sorted(r["result"] for r in results).count("created") == 1
+        assert await _count(test_session_factory) == 1
