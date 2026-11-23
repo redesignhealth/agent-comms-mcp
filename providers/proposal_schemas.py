@@ -2,7 +2,8 @@
 
 ``proposals_schema(kind)`` returns this. Two kinds have a schema:
 ``catalog_candidate`` (the vendored copy of Arcadia's payload JSON Schema, version 3)
-and ``site_catalog_match`` (BLU-18, version 1), each with a short guide. The catalog_candidate schema file is byte-identical to the copy the
+and ``site_catalog_match`` (BLU-18, version 1), each with a short guide. The
+catalog_candidate schema file is byte-identical to the copy the
 approvals service validates against and forwards with; ``catalog_candidate_payload.schema.pin.json``
 beside it records Arcadia's commit and the file's sha256, and the tests pin both,
 so the two repos can only drift on purpose (the approvals service also refuses to
