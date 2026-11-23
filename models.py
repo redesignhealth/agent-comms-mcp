@@ -1113,11 +1113,14 @@ class WakeEvent(Base):
             postgresql_where=text("kind = 'message'"),
         ),
         Index("idx_wake_events_status_next_attempt_at", "status", "next_attempt_at"),
+        # Reads one recipient's events per conversation in order, invites
+        # included (their seq is NULL, so the partial unique index above
+        # cannot serve them).
         Index(
-            "idx_wake_events_recipient_agent_id_conversation_id_seq",
+            "idx_wake_events_recipient_agent_id_conversation_id_created_at",
             "recipient_agent_id",
             "conversation_id",
-            "seq",
+            "created_at",
         ),
     )
 

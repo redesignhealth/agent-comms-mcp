@@ -146,9 +146,9 @@ def upgrade() -> None:
         if_not_exists=True,
     )
     op.create_index(
-        "idx_wake_events_recipient_agent_id_conversation_id_seq",
+        "idx_wake_events_recipient_agent_id_conversation_id_created_at",
         "wake_events",
-        ["recipient_agent_id", "conversation_id", "seq"],
+        ["recipient_agent_id", "conversation_id", "created_at"],
         if_not_exists=True,
     )
 

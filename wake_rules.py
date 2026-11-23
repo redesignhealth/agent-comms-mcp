@@ -14,6 +14,11 @@ Storage invariants:
   catch-all can only have its ``action`` changed.
 - Every add and update writes an ``audit_log`` row recording old and new
   values.
+
+Who commits: ``add_wake_rule`` and ``update_wake_rule`` commit (each is its own
+unit of work). ``ensure_catch_all``, ``list_wake_rules`` and
+``list_wake_rules_for_agents`` never commit, so they are safe inside another
+operation's transaction; the caller commits. ``evaluate_wake_rules`` is pure.
 """
 
 from __future__ import annotations
@@ -22,16 +27,20 @@ import typing
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Final
 
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from exceptions import InvalidWakeRuleError
-from models import WAKE_RULE_ACTIONS, WakeRule
+from exceptions import AccessDeniedError, InvalidWakeRuleError
+from models import WAKE_RULE_ACTIONS, AuditLog, WakeRule
 from schemas import MESSAGE_TYPES, TaskAssignV1
-from service import _audit, _deny
+
+# Deliberately no import of ``service`` here: service.py is expected to import
+# this module, and a module-level import back would be circular. The audit rows
+# below are plain ``AuditLog`` inserts, same shape ``service._audit`` writes.
 
 _TASK_ACTIONS: Final[frozenset[str]] = frozenset(
     typing.get_args(TaskAssignV1.model_fields["action"].annotation)
@@ -39,6 +48,10 @@ _TASK_ACTIONS: Final[frozenset[str]] = frozenset(
 _MESSAGE_PRIORITIES: Final[frozenset[str]] = frozenset(
     typing.get_args(TaskAssignV1.model_fields["priority"].annotation)
 )
+
+# Invites are evaluated as a message of this type (no task action, no priority).
+INVITE_MESSAGE_TYPE: Final = "invite"
+_MATCHABLE_MESSAGE_TYPES: Final[frozenset[str]] = MESSAGE_TYPES | {INVITE_MESSAGE_TYPE}
 
 _RULE_FIELDS: Final = (
     "match_conversation_id",
@@ -62,13 +75,18 @@ class _Unset:
 UNSET: Final = _Unset()
 
 
+_NEWEST: Final = datetime.max.replace(tzinfo=UTC)
+
+
 @dataclass(frozen=True)
 class WakeMessage:
     """What the rules are matched against.
 
     ``task_action`` and ``message_priority`` come from the message payload
     (``payload["action"]`` / ``payload["priority"]`` on ``task_assign``);
-    they are ``None`` for message types that do not carry them.
+    they are ``None`` for message types that do not carry them (and for
+    invites, passed as ``message_type="invite"``). A rule that sets a match
+    field never matches a ``None`` value for it.
     """
 
     conversation_id: uuid.UUID
@@ -105,7 +123,7 @@ def _validate_fields(
     del match_conversation_id, match_sender_agent_id  # typed UUIDs; nothing further to check
     if action not in WAKE_RULE_ACTIONS:
         raise InvalidWakeRuleError(f"action must be one of {WAKE_RULE_ACTIONS}")
-    if match_message_type is not None and match_message_type not in MESSAGE_TYPES:
+    if match_message_type is not None and match_message_type not in _MATCHABLE_MESSAGE_TYPES:
         raise InvalidWakeRuleError("match_message_type is not a known message type")
     if match_task_action is not None and match_task_action not in _TASK_ACTIONS:
         raise InvalidWakeRuleError("match_task_action is not a known task action")
@@ -117,27 +135,54 @@ def _validate_fields(
         raise InvalidWakeRuleError("enabled must be a boolean")
 
 
-async def ensure_catch_all(session: AsyncSession, *, agent_id: uuid.UUID) -> WakeRule:
-    """Return the agent's catch-all rule, creating it (``wake``, priority 0) if missing.
+def _audit(
+    session: AsyncSession,
+    *,
+    actor_sub: str,
+    action: str,
+    agent_id: uuid.UUID,
+    detail: dict[str, Any],
+) -> None:
+    session.add(AuditLog(actor_sub=actor_sub, action=action, agent_id=agent_id, detail=detail))
 
-    Idempotent and safe under concurrent calls: the insert relies on the
-    partial unique index ``uq_wake_rules_agent_id_catch_all`` via
-    ``ON CONFLICT DO NOTHING``. Commits only when it actually created the
-    row (the caller's session may hold other staged state otherwise).
-    """
-    result = await session.execute(
-        pg_insert(WakeRule)
-        .values(agent_id=agent_id, is_catch_all=True, action="wake", priority=0, enabled=True)
-        .on_conflict_do_nothing(index_elements=["agent_id"], index_where=text("is_catch_all"))
-        .returning(WakeRule.id)
-    )
-    if result.first() is not None:
-        await session.commit()
+
+def _catch_all_values(agent_id: uuid.UUID) -> dict[str, Any]:
+    return {
+        "agent_id": agent_id,
+        "is_catch_all": True,
+        "action": "wake",
+        "priority": 0,
+        "enabled": True,
+    }
+
+
+async def _select_catch_all(session: AsyncSession, agent_id: uuid.UUID) -> WakeRule | None:
     return (
         await session.execute(
             select(WakeRule).where(WakeRule.agent_id == agent_id, WakeRule.is_catch_all)
         )
-    ).scalar_one()
+    ).scalar_one_or_none()
+
+
+async def ensure_catch_all(session: AsyncSession, *, agent_id: uuid.UUID) -> WakeRule:
+    """Return the agent's catch-all rule, creating it (``wake``, priority 0) if missing.
+
+    Idempotent and safe under concurrent calls: the insert is ``INSERT ... ON
+    CONFLICT DO NOTHING`` against the partial unique index
+    ``uq_wake_rules_agent_id_catch_all``. Never commits: any row it creates
+    is part of the caller's open transaction, so it is safe to call from
+    inside another operation's transaction (for example message posting) and
+    the CALLER commits.
+    """
+    existing = await _select_catch_all(session, agent_id)
+    if existing is not None:
+        return existing
+    await session.execute(
+        pg_insert(WakeRule).values(**_catch_all_values(agent_id)).on_conflict_do_nothing()
+    )
+    created = await _select_catch_all(session, agent_id)
+    assert created is not None  # inserted above, or inserted by a concurrent committer
+    return created
 
 
 async def add_wake_rule(
@@ -154,7 +199,22 @@ async def add_wake_rule(
     priority: int | None = None,
     enabled: bool = True,
 ) -> WakeRule:
-    """Add a rule. Without ``priority`` the rule goes on top (highest existing + 1)."""
+    """Add a rule. Without ``priority`` the rule goes on top (highest existing + 1).
+
+    Validates before writing anything, so invalid input leaves no rows behind.
+    COMMITS: this is its own unit of work (like the other tool-level service
+    functions); do not call it from inside another operation's transaction.
+    """
+    _validate_fields(
+        match_conversation_id=match_conversation_id,
+        match_sender_agent_id=match_sender_agent_id,
+        match_message_type=match_message_type,
+        match_task_action=match_task_action,
+        match_message_priority=match_message_priority,
+        action=action,
+        priority=1 if priority is None else priority,
+        enabled=enabled,
+    )
     await ensure_catch_all(session, agent_id=agent_id)
     if priority is None:
         highest = (
@@ -166,16 +226,6 @@ async def add_wake_rule(
             )
         ).scalar_one()
         priority = highest + 1
-    _validate_fields(
-        match_conversation_id=match_conversation_id,
-        match_sender_agent_id=match_sender_agent_id,
-        match_message_type=match_message_type,
-        match_task_action=match_task_action,
-        match_message_priority=match_message_priority,
-        action=action,
-        priority=priority,
-        enabled=enabled,
-    )
     rule = WakeRule(
         agent_id=agent_id,
         is_catch_all=False,
@@ -218,9 +268,14 @@ async def update_wake_rule(
 ) -> WakeRule:
     """Change the given fields of one rule; omitted fields are left alone.
 
-    Passing ``None`` for a match field clears it (matches anything). A rule
-    that does not exist or belongs to another agent gets the uniform access
-    denial. The catch-all accepts only an ``action`` change.
+    Passing ``None`` for a match field clears it (matches anything). The row
+    is locked by ``id`` AND ``agent_id`` in one query, so a rule that does not
+    exist or belongs to another agent never makes the caller wait on another
+    agent's row; it gets the uniform access denial, audited as
+    ``denied.wake_rule_not_found`` (the audit row is committed before raising).
+    The catch-all accepts only an ``action`` change. A validation failure rolls
+    back (releasing the row lock) before raising ``InvalidWakeRuleError``.
+    COMMITS on success: this is its own unit of work.
     """
     changes = {
         name: value
@@ -237,24 +292,34 @@ async def update_wake_rule(
         if not isinstance(value, _Unset)
     }
     rule = (
-        await session.execute(select(WakeRule).where(WakeRule.id == rule_id).with_for_update())
+        await session.execute(
+            select(WakeRule)
+            .where(WakeRule.id == rule_id, WakeRule.agent_id == agent_id)
+            .with_for_update()
+        )
     ).scalar_one_or_none()
-    if rule is None or rule.agent_id != agent_id:
-        await _deny(
+    if rule is None:
+        _audit(
             session,
             actor_sub=actor_sub,
             action="denied.wake_rule_not_found",
             agent_id=agent_id,
             detail={"rule_id": str(rule_id)},
         )
-    if rule.is_catch_all and set(changes) - {"action"}:
-        raise InvalidWakeRuleError("the catch-all rule only allows changing its action")
+        await session.commit()
+        raise AccessDeniedError(reason="denied.wake_rule_not_found")
     old = _snapshot(rule)
-    if rule.is_catch_all:
-        if "action" in changes and changes["action"] not in WAKE_RULE_ACTIONS:
-            raise InvalidWakeRuleError(f"action must be one of {WAKE_RULE_ACTIONS}")
-    else:
-        _validate_fields(**{**{k: getattr(rule, k) for k in _RULE_FIELDS}, **changes})
+    try:
+        if rule.is_catch_all:
+            if set(changes) - {"action"}:
+                raise InvalidWakeRuleError("the catch-all rule only allows changing its action")
+            if "action" in changes and changes["action"] not in WAKE_RULE_ACTIONS:
+                raise InvalidWakeRuleError(f"action must be one of {WAKE_RULE_ACTIONS}")
+        else:
+            _validate_fields(**{**{k: getattr(rule, k) for k in _RULE_FIELDS}, **changes})
+    except InvalidWakeRuleError:
+        await session.rollback()
+        raise
     for name, value in changes.items():
         setattr(rule, name, value)
     await session.flush()
@@ -269,16 +334,57 @@ async def update_wake_rule(
     return rule
 
 
+def _order(stmt: Any) -> Any:
+    return stmt.order_by(WakeRule.priority.desc(), WakeRule.created_at.desc(), WakeRule.id)
+
+
 async def list_wake_rules(
     session: AsyncSession, *, agent_id: uuid.UUID, include_disabled: bool = False
 ) -> list[WakeRule]:
-    """The agent's rules in the order they apply: priority descending, newer first."""
-    await ensure_catch_all(session, agent_id=agent_id)
-    stmt = select(WakeRule).where(WakeRule.agent_id == agent_id)
+    """The agent's rules in the order they apply: priority descending, newer first.
+
+    Read-only unless the agent has no catch-all yet, in which case it creates
+    one (the lazy backfill). Never commits: if it created the catch-all, the
+    caller's commit persists it.
+    """
+    return (
+        await list_wake_rules_for_agents(
+            session, agent_ids=[agent_id], include_disabled=include_disabled
+        )
+    )[agent_id]
+
+
+async def list_wake_rules_for_agents(
+    session: AsyncSession, *, agent_ids: Sequence[uuid.UUID], include_disabled: bool = False
+) -> dict[uuid.UUID, list[WakeRule]]:
+    """Load rules for many agents in one query (the delivery hot path).
+
+    Every requested agent appears in the result, each list in the order the
+    rules apply (priority descending, newer first). Agents that lack a
+    catch-all get one created, for all of them in a single INSERT, followed by
+    a reload; when every agent already has one this is a single read. Never
+    commits: if it created catch-alls, the caller's commit persists them.
+    """
+    ids = list(dict.fromkeys(agent_ids))
+    if not ids:
+        return {}
+    stmt = select(WakeRule).where(WakeRule.agent_id.in_(ids))
     if not include_disabled:
         stmt = stmt.where(WakeRule.enabled)
-    stmt = stmt.order_by(WakeRule.priority.desc(), WakeRule.created_at.desc(), WakeRule.id)
-    return list((await session.execute(stmt)).scalars())
+    rules = list((await session.execute(_order(stmt))).scalars())
+    have_catch_all = {r.agent_id for r in rules if r.is_catch_all}
+    missing = [i for i in ids if i not in have_catch_all]
+    if missing:
+        await session.execute(
+            pg_insert(WakeRule)
+            .values([_catch_all_values(i) for i in missing])
+            .on_conflict_do_nothing()
+        )
+        rules = list((await session.execute(_order(stmt))).scalars())
+    result: dict[uuid.UUID, list[WakeRule]] = {i: [] for i in ids}
+    for rule in rules:
+        result[rule.agent_id].append(rule)
+    return result
 
 
 def _matches(rule: WakeRule, message: WakeMessage) -> bool:
@@ -307,11 +413,13 @@ def evaluate_wake_rules(rules: Sequence[WakeRule], message: WakeMessage) -> Wake
     matching = [r for r in rules if r.enabled and _matches(r, message)]
     if not matching:
         raise ValueError("no matching rule: the agent's catch-all rule is missing from rules")
-    winner = max(matching, key=lambda r: (r.priority, r.created_at))
+    # An unflushed rule has no created_at yet; it is the newest by definition.
+    winner = max(matching, key=lambda r: (r.priority, r.created_at or _NEWEST))
     return WakeDecision(rule=winner, action=winner.action)
 
 
 __all__ = [
+    "INVITE_MESSAGE_TYPE",
     "UNSET",
     "WakeDecision",
     "WakeMessage",
@@ -319,5 +427,6 @@ __all__ = [
     "ensure_catch_all",
     "evaluate_wake_rules",
     "list_wake_rules",
+    "list_wake_rules_for_agents",
     "update_wake_rule",
 ]
