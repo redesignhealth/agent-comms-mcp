@@ -279,9 +279,12 @@ async def submit(
         {"target_id": "site-match:<site-slug>:<concept-slug>:<MARKET>:r<seq>",
          "action_type": "rank", "payload": {...}}
 
-    ``payload`` carries ``agent_score``, ``proposed_call``, ``rationale`` and
-    cited ``need`` and ``risk`` lines (offset citations into text Arcadia holds;
-    no quote field, no person names). The board checks structure only and does
+    ``payload`` carries ``schema_version``, ``ranking_request_id``, ``site_slug``,
+    ``target_key``, ``row_version``, ``agent_score``, ``proposed_call``,
+    ``rationale`` and cited ``need`` and ``risk`` lines, plus optional
+    ``follow_up_questions`` and ``client_summary_draft`` (``proposals_schema`` is
+    authoritative; citations are offsets into text Arcadia holds; no quote field,
+    no person names). The board checks structure only and does
     not run the brain citation check or the health-system screen on this kind;
     Arcadia checks the rest. Never auto-approved, never decided by the owner,
     never edited in place (withdraw and resubmit). ``proposals_get`` shows

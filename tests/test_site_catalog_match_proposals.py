@@ -13,12 +13,17 @@ import copy
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
+from unittest.mock import patch
 
+import httpx
 import pytest
 import pytest_asyncio
 from sqlalchemy import select, text
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+from starlette.applications import Starlette
+from starlette.routing import Route
 
+import plugins
 import service
 from exceptions import (
     ExternalResolutionError,
@@ -29,6 +34,13 @@ from models import ProposalHold
 from plugins import ProposalVerdict
 from providers import proposal_schemas
 from tests.proposal_judge_fakes import FakeProposalJudge
+from tests.test_proposal_endpoint import (
+    _ENV_PATCH,
+    _OIDC_PATCH,
+    _agent_jwt_token,
+    _FakeAuthProvider,
+    _import_main,
+)
 
 pytestmark = pytest.mark.usefixtures("_migrated_schema")
 
@@ -172,6 +184,65 @@ class TestImmutable:
         assert [r.status for r in await _rows(session)] == ["pending", "pending"]
 
 
+@pytest.fixture
+def session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
+    return async_sessionmaker(engine, expire_on_commit=False)
+
+
+@pytest_asyncio.fixture
+async def client(
+    session_factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[httpx.AsyncClient]:
+    main = _import_main()
+    monkeypatch.setattr(plugins, "get_proposal_judge", lambda: FakeProposalJudge())
+    fake_provider = _FakeAuthProvider()
+    app = Starlette(routes=[Route("/proposals", main.submit_proposal, methods=["POST"])])
+    with (
+        _OIDC_PATCH,
+        _ENV_PATCH,
+        patch.object(main, "_auth_provider", fake_provider),
+        patch.object(main, "_okta_provider", fake_provider.server),
+        patch("main.get_session_factory", return_value=session_factory),
+    ):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as http_client:
+            fake_provider.tokens["bot"] = _agent_jwt_token(
+                _BOT, scopes=["comms:proposals:write"], owner_sub=_OWNER
+            )
+            yield http_client
+
+
+async def _post(client: httpx.AsyncClient, padding: int) -> httpx.Response:
+    action = copy.deepcopy(_ACTION)
+    action["payload"]["rationale"] = "x" * padding
+    body = {
+        "kind": _KIND,
+        "action": action,
+        "rationale": "a catalog match for the site",
+        "confidence": "medium",
+        "importance": "medium",
+        "impact": "medium",
+    }
+    return await client.post("/proposals", json=body, headers={"Authorization": "Bearer bot"})
+
+
+class TestActionCapOnSubmit:
+    async def test_between_16_and_64_kib_is_accepted(
+        self, client: httpx.AsyncClient, session: AsyncSession
+    ) -> None:
+        resp = await _post(client, 32 * 1024)
+        assert resp.status_code == 200
+        assert [r.kind for r in await _rows(session)] == [_KIND]
+
+    async def test_over_64_kib_is_422_and_stores_nothing(
+        self, client: httpx.AsyncClient, session: AsyncSession
+    ) -> None:
+        resp = await _post(client, 64 * 1024)
+        assert resp.status_code == 422
+        assert "exceeds 65536 bytes" in resp.json()["detail"]
+        assert await _rows(session) == []
+
+
 class TestActionCap:
     def test_cap_is_64_kib(self) -> None:
         assert service.MAX_SITE_CATALOG_MATCH_ACTION_BYTES == 64 * 1024
@@ -212,6 +283,13 @@ class TestExternalResolution:
         await self._resolve(session, pid, "rejected", "not_a_priority: later")
         hold = (await _rows(session))[0]
         assert (hold.status, hold.decision_note) == ("rejected", "not_a_priority: later")
+
+    async def test_repeating_the_same_outcome_is_recorded_once(self, session: AsyncSession) -> None:
+        pid = str((await _submit(session))["proposal_id"])
+        await self._resolve(session, pid, "applied", None)
+        again = await self._resolve(session, pid, "applied", None)
+        assert again["already_recorded"] is True
+        assert (await _rows(session))[0].status == "applied"
 
     async def test_already_decided_is_final(self, session: AsyncSession) -> None:
         pid = str((await _submit(session))["proposal_id"])

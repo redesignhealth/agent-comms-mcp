@@ -1,13 +1,15 @@
 """What an agent must follow to submit a proposal of a given kind (TECH-9214).
 
-``proposals_schema(kind)`` returns this. Two kinds have a schema:
-``catalog_candidate`` (the vendored copy of Arcadia's payload JSON Schema, version 3)
-and ``site_catalog_match`` (BLU-18, version 1), each with a short guide. The
-catalog_candidate schema file is byte-identical to the copy the
-approvals service validates against and forwards with; ``catalog_candidate_payload.schema.pin.json``
-beside it records Arcadia's commit and the file's sha256, and the tests pin both,
-so the two repos can only drift on purpose (the approvals service also refuses to
-forward while its sha256 differs from Arcadia's).
+``proposals_schema(kind)`` returns this. Two kinds have a schema, each with a short guide:
+
+* ``catalog_candidate``: the vendored copy of Arcadia's payload JSON Schema (version 3). The
+  file is byte-identical to the copy the approvals service validates against and forwards with;
+  ``catalog_candidate_payload.schema.pin.json`` beside it records Arcadia's commit and the
+  file's sha256, and the tests pin both, so the two repos can only drift on purpose (the
+  approvals service also refuses to forward while its sha256 differs from Arcadia's).
+* ``site_catalog_match`` (BLU-18, version 1): a provisional local copy authored from the spec.
+  Its pin has ``commit: null`` and the tests pin the file to its own sha256 only, until
+  Arcadia publishes its file. The structure check at submit lives in the approvals plugin.
 """
 
 from __future__ import annotations
@@ -92,8 +94,8 @@ action fields (proposals_submit(kind="site_catalog_match", action=...)):
 - target_id: "site-match:<site-slug>:<concept-slug>:<MARKET>:r<seq>". <site-slug> and <concept-slug>
   are lowercase words joined by single hyphens; <MARKET> is exactly two capital letters, such as DE;
   <seq> is the ranking request sequence number you were given. A new run uses a new <seq>, so it
-  never collides with an earlier pending proposal. The kind is immutable once submitted: to change
-  it, withdraw it and submit again.
+  never collides with an earlier pending proposal. An open proposal is never edited in place: to
+  change it, withdraw it and submit again.
 - payload (required): the schema's root object (schema_version 1). target_key is
   "pair:<concept-slug>:<MARKET>" and must match target_id. Send row_version exactly as the shortlist
   gave it.

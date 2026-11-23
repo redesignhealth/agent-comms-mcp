@@ -1829,7 +1829,7 @@ stays human-only and HTTP-only.
 (today `catalog_candidate` and `site_catalog_match`) is decided by an external reviewer system (Arcadia), not by the
 proposal owner. The board never writes outward: it keeps the proposal `pending` (never
 auto-approved, never edited in place), refuses the owner's `/decide` (400) and leaves the kind out
-of the owner's `GET /proposals/pending`. The approvals service reads
+of the owner's `GET /proposals/pending`. (`site_catalog_match`, BLU-18: its vendored schema is provisional, pinned with `commit: null` until Arcadia publishes its copy, and the structure check at submit and the forwarder live in `agent-comms-approvals`, BLU-26 and BLU-36.) The approvals service reads
 `GET /proposals/external-queue?kind=...` (service-only, same gate as the apply-record read,
 keyset-paged, oldest first) and forwards each pending proposal to the external system.
 
