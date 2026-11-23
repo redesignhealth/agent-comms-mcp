@@ -457,7 +457,15 @@ mcp: FastMCP[Any] = FastMCP(
         "Admin only (comms:admin): comms_admin_wake_target_set registers or replaces the "
         "https address the board sends signed wake notifications to for one agent (the host "
         "must be on the operator's allowed list; the secret is stored encrypted and never "
-        "returned), and comms_admin_wake_target_remove removes it."
+        "returned), and comms_admin_wake_target_remove removes it. "
+        "Wake rules: comms_wake_rules_list shows your own rules (highest priority first); "
+        "comms_wake_rule_add adds one rule (it goes on top unless you give a priority) that "
+        "either wakes you or leaves matching messages for polling via comms_inbox; "
+        "comms_wake_rule_update changes, turns off or turns on one rule by ID (rules are never "
+        "deleted; your catch-all rule can only switch between wake and poll); "
+        "comms_wake_sessions_list shows the conversations currently relaying every message to "
+        "you, and comms_wake_session_close stops relaying one. When two rules match, the higher "
+        "priority wins, then the newer rule."
     ),
     auth=_auth_provider,
 )

@@ -145,6 +145,13 @@ TOOL_SCOPES: dict[str, str] = {
     # (comms:admin OR an interactive/Okta caller) is enforced by an
     # in-handler check, not by this table.
     "comms_request_owner_reassignment": "comms:write",
+    # TECH-9881: an agent's own wake rules and open conversations. Identity comes
+    # from the token, so no scope above comms:read / comms:write is needed.
+    "comms_wake_rules_list": "comms:read",
+    "comms_wake_sessions_list": "comms:read",
+    "comms_wake_rule_add": "comms:write",
+    "comms_wake_rule_update": "comms:write",
+    "comms_wake_session_close": "comms:write",
     "comms_start_conversation": "comms:write",
     "comms_post_message": "comms:write",
     "comms_accept": "comms:write",

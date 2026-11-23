@@ -42,7 +42,7 @@ import uuid
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 from urllib.parse import urlencode
 
@@ -57,6 +57,8 @@ import auth
 import plugins
 import service
 import subscriptions
+import wake_events
+import wake_rules
 import wake_targets
 from db import get_session_factory
 from exceptions import (
@@ -70,6 +72,7 @@ from exceptions import (
     InvalidConversationStateError,
     InvalidExtendError,
     InvalidOwnerReassignmentError,
+    InvalidWakeRuleError,
     InvalidWakeTargetError,
     RateLimitExceededError,
     SchemaVersionMismatchError,
@@ -465,7 +468,12 @@ async def _map_service_errors(error_cls: type[Exception] = ToolError) -> AsyncIt
         yield
     except AccessDeniedError as exc:
         raise error_cls(str(exc)) from None
-    except (InvalidExtendError, InvalidOwnerReassignmentError, InvalidWakeTargetError) as exc:
+    except (
+        InvalidExtendError,
+        InvalidOwnerReassignmentError,
+        InvalidWakeRuleError,
+        InvalidWakeTargetError,
+    ) as exc:
         msg = str(exc)
         if not msg.startswith("invalid_request: "):
             msg = f"invalid_request: {msg}"
@@ -1303,6 +1311,246 @@ async def admin_wake_target_remove(agent_id: str) -> dict[str, Any]:
             admin_authorized=admin_authorized,
             agent_id=target_id,
         )
+
+
+def _wake_rule_view(rule: Any) -> dict[str, Any]:
+    def _id(value: uuid.UUID | None) -> str | None:
+        return None if value is None else str(value)
+
+    return {
+        "rule_id": str(rule.id),
+        "priority": rule.priority,
+        "action": rule.action,
+        "enabled": rule.enabled,
+        "is_catch_all": rule.is_catch_all,
+        "match_conversation_id": _id(rule.match_conversation_id),
+        "match_sender_agent_id": _id(rule.match_sender_agent_id),
+        "match_message_type": rule.match_message_type,
+        "match_task_action": rule.match_task_action,
+        "match_message_priority": rule.match_message_priority,
+    }
+
+
+@comms_server.tool
+async def wake_rules_list(
+    include_disabled: bool = False, agent_key: str | None = None
+) -> dict[str, Any]:
+    """List YOUR wake rules, highest priority first (the order they are tried).
+
+    Being woken means the board tells your agent platform to start a run for a
+    message. Being left for polling means the message waits in ``comms_inbox``
+    until you read it. An open conversation (``comms_wake_sessions_list``)
+    wakes you first; otherwise the enabled rule with the highest priority that
+    matches the message decides, and on equal priority the newer rule wins. A
+    rule matches when every match field it sets equals the message's value;
+    fields left empty match anything. Every agent has one catch-all rule
+    (priority 0, matches everything, starts as ``wake``).
+
+    - ``include_disabled``: also show rules that are turned off (default false).
+
+    Returns ``{"rules": [...]}``; each rule has ``rule_id``, ``priority``,
+    ``action`` (``wake`` or ``poll``), ``enabled``, ``is_catch_all`` and the
+    five ``match_*`` fields (null means matches anything). Only the caller's own
+    rules are ever returned.
+    """
+    token = _require_token()
+    sub = _compose_sub(_require_identity(token), _validate_agent_key(agent_key))
+
+    async with get_session_factory()() as session:
+        caller = await _resolve_caller_agent(session, sub, token)
+        rules = await wake_rules.list_wake_rules(
+            session, agent_id=caller.id, include_disabled=include_disabled
+        )
+        await session.commit()  # persists the catch-all if this call created it
+    return {"rules": [_wake_rule_view(r) for r in rules]}
+
+
+@comms_server.tool
+async def wake_rule_add(
+    action: str,
+    conversation_id: str | None = None,
+    sender_agent_id: str | None = None,
+    message_type: str | None = None,
+    task_action: str | None = None,
+    message_priority: str | None = None,
+    priority: int | None = None,
+    agent_key: str | None = None,
+) -> dict[str, Any]:
+    """Add ONE wake rule for yourself. It goes on top unless ``priority`` is given.
+
+    Example: ``action="poll", message_type="note"`` leaves notes for polling
+    while ``task_assign`` still wakes you under your catch-all. When two rules
+    match, the higher ``priority`` wins; on a tie the newer rule wins. A rule
+    that sets no match field would match everything, so set at least one. You
+    cannot replace or clear your whole rule set; turn a rule off with
+    ``comms_wake_rule_update`` instead.
+
+    - ``action``: ``wake`` (start a run for matching messages) or ``poll``
+      (leave them for ``comms_inbox``).
+    - ``conversation_id`` / ``sender_agent_id``: UUID strings to match.
+    - ``message_type``: a message type such as ``note`` or ``task_assign``, or
+      ``invite`` to match invites.
+    - ``task_action`` / ``message_priority``: match the ``action`` /
+      ``priority`` fields of ``task_assign`` messages.
+    - ``priority``: integer >= 1; higher wins. Default is above all your rules.
+
+    Returns the new rule in the same shape as ``comms_wake_rules_list``.
+    """
+    token = _require_token()
+    sub = _compose_sub(_require_identity(token), _validate_agent_key(agent_key))
+    conv_id = None if conversation_id is None else _parse_uuid("conversation_id", conversation_id)
+    sender_id = None if sender_agent_id is None else _parse_uuid("sender_agent_id", sender_agent_id)
+    if all(v is None for v in (conv_id, sender_id, message_type, task_action, message_priority)):
+        raise ToolError(
+            "invalid_request: set at least one match field (conversation_id, sender_agent_id, "
+            "message_type, task_action, message_priority); to change what happens to every "
+            "message, update your catch-all rule instead"
+        )
+
+    async with get_session_factory()() as session:
+        caller = await _resolve_caller_agent(session, sub, token)
+        async with _map_service_errors():
+            rule = await wake_rules.add_wake_rule(
+                session,
+                actor_sub=sub,
+                agent_id=caller.id,
+                action=action,
+                match_conversation_id=conv_id,
+                match_sender_agent_id=sender_id,
+                match_message_type=message_type,
+                match_task_action=task_action,
+                match_message_priority=message_priority,
+                priority=priority,
+            )
+    return _wake_rule_view(rule)
+
+
+@comms_server.tool
+async def wake_rule_update(
+    rule_id: str,
+    action: str | None = None,
+    priority: int | None = None,
+    enabled: bool | None = None,
+    conversation_id: str | None = None,
+    sender_agent_id: str | None = None,
+    message_type: str | None = None,
+    task_action: str | None = None,
+    message_priority: str | None = None,
+    agent_key: str | None = None,
+) -> dict[str, Any]:
+    """Change ONE of YOUR wake rules by ``rule_id``. Rules are never deleted.
+
+    Omitted fields stay as they are. To stop using a rule, set
+    ``enabled=false``; set ``enabled=true`` to bring it back. To clear a match
+    field (match anything again), pass an empty string for it. Your catch-all
+    rule can only have its ``action`` changed (``wake`` or ``poll``): it cannot
+    be turned off, re-prioritised or given match fields. A ``rule_id`` that is
+    not one of your own rules is refused with the same generic access error as
+    any other resource you cannot see.
+
+    - ``rule_id``: UUID from ``comms_wake_rules_list`` (include_disabled=true
+      to find rules that are off).
+    - ``action``: ``wake`` or ``poll``.
+    - ``priority``: integer >= 1; higher wins, newer wins a tie.
+    - ``enabled``: true or false.
+    - ``conversation_id``, ``sender_agent_id``, ``message_type``,
+      ``task_action``, ``message_priority``: as for ``comms_wake_rule_add``.
+
+    Returns the updated rule in the same shape as ``comms_wake_rules_list``.
+    """
+    token = _require_token()
+    sub = _compose_sub(_require_identity(token), _validate_agent_key(agent_key))
+    rule_uuid = _parse_uuid("rule_id", rule_id)
+
+    def _text(value: str | None) -> Any:
+        return wake_rules.UNSET if value is None else (value or None)
+
+    def _uuid(field: str, value: str | None) -> Any:
+        return wake_rules.UNSET if value is None else (_parse_uuid(field, value) if value else None)
+
+    changes: dict[str, Any] = {
+        "match_conversation_id": _uuid("conversation_id", conversation_id),
+        "match_sender_agent_id": _uuid("sender_agent_id", sender_agent_id),
+        "match_message_type": _text(message_type),
+        "match_task_action": _text(task_action),
+        "match_message_priority": _text(message_priority),
+        "action": wake_rules.UNSET if action is None else action,
+        "priority": wake_rules.UNSET if priority is None else priority,
+        "enabled": wake_rules.UNSET if enabled is None else enabled,
+    }
+    if all(v is wake_rules.UNSET for v in changes.values()):
+        raise ToolError("invalid_request: nothing to change; pass at least one field to update")
+
+    async with get_session_factory()() as session:
+        caller = await _resolve_caller_agent(session, sub, token)
+        async with _map_service_errors():
+            rule = await wake_rules.update_wake_rule(
+                session, actor_sub=sub, agent_id=caller.id, rule_id=rule_uuid, **changes
+            )
+    return _wake_rule_view(rule)
+
+
+@comms_server.tool
+async def wake_sessions_list(agent_key: str | None = None) -> dict[str, Any]:
+    """List YOUR open conversations: the ones relaying every message to you.
+
+    While a conversation is open for you, every message in it wakes you
+    whatever your rules say. A conversation opens when a wake is recorded for
+    you in it or when you post in it, and closes after 10 minutes with no
+    activity, when you close it with ``comms_wake_session_close``, or when the
+    conversation ends.
+
+    Returns ``{"sessions": [...]}``; each has ``conversation_id``,
+    ``opened_at``, ``last_activity_at`` and ``closes_at`` (when it goes quiet
+    if nothing else happens). Only the caller's own sessions are returned.
+    """
+    token = _require_token()
+    sub = _compose_sub(_require_identity(token), _validate_agent_key(agent_key))
+
+    async with get_session_factory()() as session:
+        caller = await _resolve_caller_agent(session, sub, token)
+        open_sessions = await wake_events.list_open_wake_sessions(
+            session, agent_id=caller.id, now=datetime.now(UTC)
+        )
+    window = timedelta(seconds=wake_events.WAKE_SESSION_WINDOW_SECONDS)
+    return {
+        "sessions": [
+            {
+                "conversation_id": str(s.conversation_id),
+                "opened_at": _iso(s.opened_at),
+                "last_activity_at": _iso(s.last_activity_at),
+                "closes_at": _iso(s.last_activity_at + window),
+            }
+            for s in open_sessions
+        ]
+    }
+
+
+@comms_server.tool
+async def wake_session_close(conversation_id: str, agent_key: str | None = None) -> dict[str, Any]:
+    """Stop relaying one conversation to you (close YOUR open conversation record).
+
+    After this the next message in that conversation is judged by your wake
+    rules again instead of waking you automatically. It does not leave the
+    conversation. Closing a conversation that is not open for you is not an
+    error: the result says ``closed: false``.
+
+    Returns ``{"conversation_id": ..., "closed": bool}``.
+    """
+    token = _require_token()
+    sub = _compose_sub(_require_identity(token), _validate_agent_key(agent_key))
+    conv_id = _parse_uuid("conversation_id", conversation_id)
+
+    async with get_session_factory()() as session:
+        caller = await _resolve_caller_agent(session, sub, token)
+        closed = await wake_events.close_wake_session(
+            session,
+            actor_sub=sub,
+            agent_id=caller.id,
+            conversation_id=conv_id,
+            now=datetime.now(UTC),
+        )
+    return {"conversation_id": conversation_id, "closed": closed}
 
 
 @comms_server.tool
