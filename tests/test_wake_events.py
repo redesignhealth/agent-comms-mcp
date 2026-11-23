@@ -12,12 +12,12 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import event, select, text
+from sqlalchemy import delete, event, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 import plugins
 import service as _service
-from models import Agent, ApprovalHold, WakeEvent, WakeSession, WakeTarget
+from models import Agent, ApprovalHold, WakeEvent, WakeRule, WakeSession, WakeTarget
 from schemas import MESSAGE_TYPES, PayloadValidationError
 from service import (
     AgentTableOwnershipClient,
@@ -142,6 +142,14 @@ async def _room(session: AsyncSession) -> _Room:
         await accept_invite(
             session, actor_sub=agent.sub, agent_id=agent.id, conversation_id=conversation.id
         )
+    # Starting the conversation recorded invite events and sessions for the
+    # invitees (TECH-9910, covered in test_wake_events_invites_holds.py). These
+    # tests are about message events, so start them from a clean slate; the
+    # sender's own session, opened by the opener, is kept.
+    await session.execute(delete(WakeEvent))
+    await session.execute(delete(WakeRule))  # catch-alls are created lazily
+    await session.execute(delete(WakeSession).where(WakeSession.agent_id != room.sender.id))
+    await session.commit()
     return room
 
 
@@ -349,7 +357,10 @@ async def test_held_opener_marker_leaves_no_event_or_session(session: AsyncSessi
         risk_scorer=_AlwaysHighRiskScorer(),
     )
     assert conversation.pending_hold is not None
-    assert await _events(session) == []
+    # Only the invitee's invite event: the marker records nothing.
+    assert [(e.kind, e.recipient_agent_id) for e in await _events(session)] == [
+        ("invite", target.id)
+    ]
     assert await _wake_session(session, sender, conversation.id) is None
 
 
@@ -411,7 +422,7 @@ async def test_query_count_does_not_grow_with_recipient_count(
     few = await statements(small, 10)
     many = await statements(large, 11)
     assert many == few
-    assert len(await _events(session)) == 10
+    assert len([e for e in await _events(session) if e.kind == "message"]) == 10
 
 
 async def test_hook_never_commits_so_rollback_leaves_no_wake_rows(

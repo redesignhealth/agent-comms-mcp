@@ -268,7 +268,11 @@ from state_machine import (
     is_message_legal,
     resulting_conversation_state,
 )
-from wake_events import close_wake_sessions_for_conversation, record_message_wake_events
+from wake_events import (
+    close_wake_sessions_for_conversation,
+    record_invite_wake_events,
+    record_message_wake_events,
+)
 
 # Plain stdlib logging, not structlog/observability.py's event-schema
 # helpers: this module's own docstring commits to
@@ -3869,6 +3873,17 @@ async def start_conversation(
             )
         )
     await session.flush()
+    # TECH-9910: the invites are visible to the invitees from here, on both the
+    # direct and the held-opener path (the held content waits, the invite does
+    # not). Nothing below this point can deny, so nothing can leave these rows
+    # behind; recorded exactly once, here.
+    await record_invite_wake_events(
+        session,
+        conversation_id=conversation.id,
+        inviter_agent_id=initiator.id,
+        invitee_agent_ids=[t.id for t in targets],
+        now=now,
+    )
 
     if risk_reason is not None:
         # Diverted opener (TECH-5389 PR2 §6, ratified decision 1): the
@@ -4542,6 +4557,14 @@ async def invite(
         agent_id=target.id,
         conversation_id=conversation.id,
         detail={"invited_by_agent_id": str(inviter_agent_id)},
+    )
+    # TECH-9910: direct invite (the held branch above returns before this).
+    await record_invite_wake_events(
+        session,
+        conversation_id=conversation.id,
+        inviter_agent_id=inviter_agent_id,
+        invitee_agent_ids=[target.id],
+        now=_now(),
     )
     await session.commit()
     return participant
@@ -5544,6 +5567,35 @@ async def _insert_message_for_hold(
     session.add(message)
     await session.flush()
     hold.message_id = message.id
+    # TECH-9910: the message becomes visible here, and this is the only place a
+    # held message gets its row, so this is the single recording point for both
+    # the inline auto-clear and the human approval (the direct post path does
+    # not use this helper). Both callers commit right after, past every gate
+    # that can deny. Recipients: whoever can read it now, i.e. active
+    # participants other than the sender (invitees are woken by their invite).
+    recipient_ids = (
+        (
+            await session.execute(
+                select(Participant.agent_id).where(
+                    Participant.conversation_id == conversation.id,
+                    Participant.agent_id != hold.sender_agent_id,
+                    Participant.status == "active",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    await record_message_wake_events(
+        session,
+        conversation_id=conversation.id,
+        seq=next_seq,
+        message_type=hold.message_type,
+        payload=hold.payload,
+        sender_agent_id=hold.sender_agent_id,
+        recipient_agent_ids=recipient_ids,
+        now=_now(),
+    )
     return message, next_seq
 
 
@@ -5861,6 +5913,16 @@ async def _divert_invite_for_approval(
             agent_id=target_agent_id,
             conversation_id=conversation.id,
             detail={"invited_by_agent_id": str(inviter_agent_id), "hold_id": str(hold.id)},
+        )
+        # TECH-9910: the hold cleared inline, so the invite is visible now. The
+        # only caller (invite) returns straight to its commit; the escalated
+        # branch below records nothing.
+        await record_invite_wake_events(
+            session,
+            conversation_id=conversation.id,
+            inviter_agent_id=inviter_agent_id,
+            invitee_agent_ids=[target_agent_id],
+            now=now,
         )
         participant.auto_approved_hold_id = hold.id  # type: ignore[attr-defined]
         return participant
@@ -6506,6 +6568,15 @@ async def decide_hold(
             agent_id=hold.target_agent_id,
             conversation_id=conversation.id,
             detail={"invited_by_agent_id": str(hold.sender_agent_id), "hold_id": str(hold_id)},
+        )
+        # TECH-9910: human approval makes the invite visible; every gate that
+        # can deny has passed. A rejected hold never reaches here.
+        await record_invite_wake_events(
+            session,
+            conversation_id=conversation.id,
+            inviter_agent_id=hold.sender_agent_id,
+            invitee_agent_ids=[hold.target_agent_id],
+            now=_now(),
         )
         await session.commit()
         result = _hold_dict(hold)
