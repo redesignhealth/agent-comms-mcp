@@ -78,7 +78,7 @@ py-modules = [
     "main", "migrate", "mint_token", "models", "observability", "plugins",
     "proposal_apply_http_client",
     "scopes", "schemas", "service", "state_machine", "subscriptions", "wake_events", "wake_rules",
-    "wake_secrets", "wake_targets",
+    "wake_delivery", "wake_secrets", "wake_targets",
 ]
 packages = ["providers", "migrations", "migrations.versions"]
 
