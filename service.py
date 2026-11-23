@@ -268,6 +268,7 @@ from state_machine import (
     is_message_legal,
     resulting_conversation_state,
 )
+from wake_events import close_wake_sessions_for_conversation, record_message_wake_events
 
 # Plain stdlib logging, not structlog/observability.py's event-schema
 # helpers: this module's own docstring commits to
@@ -4028,6 +4029,19 @@ async def start_conversation(
             detail={"new_state": new_state, "via": message_type},
         )
 
+    # TECH-9907: every target is still `invited` here (and cannot read yet), so
+    # there is no recipient to wake; this only opens the opener's own session.
+    # Last step before the commit, after every gate that can deny.
+    await record_message_wake_events(
+        session,
+        conversation_id=conversation.id,
+        seq=1,
+        message_type=message_type,
+        payload=payload,
+        sender_agent_id=initiator.id,
+        recipient_agent_ids=[],
+        now=now,
+    )
     await session.commit()
     # Not a mapped column (no migration/persistence needed for this,
     # unlike a new Conversation column): the negotiated version
@@ -4647,6 +4661,10 @@ async def archive_conversation(
         await session.commit()
         return conversation
     conversation.archived_at = _now()
+    # TECH-9907: archiving ends every open wake session on this conversation.
+    await close_wake_sessions_for_conversation(
+        session, conversation_id=conversation.id, now=conversation.archived_at
+    )
     _audit(
         session,
         actor_sub=actor_sub,
@@ -11501,6 +11519,19 @@ async def post_message(
                 detail={"new_state": new_state, "via": message_type},
             )
 
+    # TECH-9907: record wake events in this transaction, after every gate that
+    # can deny (a denial commits whatever is staged). Only active participants
+    # can read, so only they are recipients.
+    await record_message_wake_events(
+        session,
+        conversation_id=conversation.id,
+        seq=next_seq,
+        message_type=message_type,
+        payload=validated,
+        sender_agent_id=sender_agent_id,
+        recipient_agent_ids=[p.agent_id for p in boundary_participants if p.status == "active"],
+        now=_now(),
+    )
     await session.commit()
     return message
 
