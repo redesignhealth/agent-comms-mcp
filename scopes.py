@@ -59,9 +59,10 @@ from observability import log_auth_rejected
 #             (gating a privileged PARAMETER within an already-scoped
 #             tool, as opposed to a route-level auth gate like
 #             ``main.py``'s ``/admin/agents/reconcile-ownership``) are
-#             exactly the four: ``comms_set_agent_shared``,
-#             ``comms_deregister_agent``, ``comms_admin_register``, and
-#             ``comms_request_owner_reassignment`` (TECH-7389) --
+#             exactly the six: ``comms_set_agent_shared``,
+#             ``comms_deregister_agent``, ``comms_admin_register``,
+#             ``comms_request_owner_reassignment`` (TECH-7389), and
+#             ``comms_admin_wake_target_set``/``_remove`` (TECH-9908) --
 #             enforced by
 #             ``tests/test_scopes.py::TestCommsAdminConsumers``, which
 #             will fail if a future PR adds another without updating
@@ -133,6 +134,13 @@ TOOL_SCOPES: dict[str, str] = {
     # registration power -- do not assume TOOL_SCOPES alone gates this
     # tool.
     "comms_admin_register": "comms:write",
+    # TECH-9908: registered at comms:write deliberately, same as
+    # comms_admin_register -- the actual authorization (comms:admin OR an
+    # interactive/Okta caller) is enforced by an in-handler check, not by this
+    # table. If that check is ever removed, these entries alone would let every
+    # comms:write token point an agent's wake events at another address.
+    "comms_admin_wake_target_set": "comms:write",
+    "comms_admin_wake_target_remove": "comms:write",
     # Registered at comms:write deliberately -- the actual authorization
     # (comms:admin OR an interactive/Okta caller) is enforced by an
     # in-handler check, not by this table.

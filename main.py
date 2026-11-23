@@ -451,7 +451,11 @@ mcp: FastMCP[Any] = FastMCP(
         "the resource URI, which is pinned at since_seq=0) or comms_inbox for inboxes "
         "(best-effort current-state snapshot, capped at 100 items). Re-subscribe on every "
         "MCP re-initialize and periodically (idempotent) to recover from restarts. "
-        "Subscribe fails with subscription_limit_reached if an agent holds 100 subscriptions."
+        "Subscribe fails with subscription_limit_reached if an agent holds 100 subscriptions. "
+        "Admin only (comms:admin): comms_admin_wake_target_set registers or replaces the "
+        "https address the board sends signed wake notifications to for one agent (the host "
+        "must be on the operator's allowed list; the secret is stored encrypted and never "
+        "returned), and comms_admin_wake_target_remove removes it."
     ),
     auth=_auth_provider,
 )

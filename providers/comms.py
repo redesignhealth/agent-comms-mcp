@@ -57,6 +57,7 @@ import auth
 import plugins
 import service
 import subscriptions
+import wake_targets
 from db import get_session_factory
 from exceptions import (
     AccessDeniedError,
@@ -69,10 +70,12 @@ from exceptions import (
     InvalidConversationStateError,
     InvalidExtendError,
     InvalidOwnerReassignmentError,
+    InvalidWakeTargetError,
     RateLimitExceededError,
     SchemaVersionMismatchError,
     SiblingIdentityExistsError,
     UnknownConversationTypeError,
+    WakeTargetMisconfiguredError,
 )
 from identity import AGENT_JWT_ISSUER, try_resolve_email
 from models import CONVERSATION_STATES, PARTICIPANT_ROLES, Agent, ApprovalHold
@@ -462,7 +465,7 @@ async def _map_service_errors(error_cls: type[Exception] = ToolError) -> AsyncIt
         yield
     except AccessDeniedError as exc:
         raise error_cls(str(exc)) from None
-    except (InvalidExtendError, InvalidOwnerReassignmentError) as exc:
+    except (InvalidExtendError, InvalidOwnerReassignmentError, InvalidWakeTargetError) as exc:
         msg = str(exc)
         if not msg.startswith("invalid_request: "):
             msg = f"invalid_request: {msg}"
@@ -482,6 +485,8 @@ async def _map_service_errors(error_cls: type[Exception] = ToolError) -> AsyncIt
         DocsVerificationFailedError,
     ) as exc:
         raise error_cls(str(exc)) from None
+    except WakeTargetMisconfiguredError as exc:
+        raise error_cls(f"misconfigured: {exc}") from None
     except (ValueError, RuntimeError):
         raise error_cls("invalid_request: the request could not be processed") from None
 
@@ -1224,6 +1229,80 @@ async def admin_register(
         "min_schema_version": agent.min_schema_version,
         "max_schema_version": agent.max_schema_version,
     }
+
+
+@comms_server.tool
+async def admin_wake_target_set(
+    agent_id: str, url: str, secret: str, system: str
+) -> dict[str, Any]:
+    """Admin-gated: register or replace the address the board wakes an agent at (TECH-9908).
+
+    The agent's own platform registers where the board should send a signed
+    "wake" notification when the agent has a new message or invite. Calling
+    this for an agent that already has an address replaces it, which is how
+    the secret is rotated. See docs/WAKE-EVENTS.md.
+
+    Requires the caller's token to carry the ``comms:admin`` scope (or be an
+    interactive/Okta caller) -- same gate as ``comms_admin_register``. A caller
+    without it gets the standard anti-enumeration ``access_denied`` error.
+
+    - ``agent_id``: UUID string of an existing board agent.
+    - ``url``: the address to send wake events to. Must be ``https``, with no
+      username/password and no ``#fragment``, and its host must be on the
+      operator's allowed host list (``WAKE_TARGET_ALLOWED_HOSTS``). If that
+      list is empty, every registration is refused.
+    - ``secret``: the signing secret, ``whsec_`` followed by base64 of 24 to
+      64 bytes. It is stored encrypted and is never returned by any tool.
+    - ``system``: short label for the agent platform (for example
+      ``paperclip``): lowercase letters, digits, ``.``, ``_``, ``-``, up to 32
+      characters. For operators and audit only.
+
+    Returns the agent ID, system label, URL host, ``result`` (``created`` or
+    ``replaced``) and timestamps. Never the secret or the stored ciphertext.
+    """
+    token = _require_token()
+    actor_sub = _require_identity(token)
+    admin_authorized = is_interactive_token(token) or "comms:admin" in scopes_for_token(token)
+    target_id = _parse_uuid("agent_id", agent_id)
+
+    async with get_session_factory()() as session, _map_service_errors():
+        return await wake_targets.set_wake_target(
+            session,
+            actor_sub=actor_sub,
+            admin_authorized=admin_authorized,
+            agent_id=target_id,
+            url=url,
+            secret=secret,
+            system=system,
+        )
+
+
+@comms_server.tool
+async def admin_wake_target_remove(agent_id: str) -> dict[str, Any]:
+    """Admin-gated: remove an agent's wake address (TECH-9908).
+
+    After this the board stops sending wake notifications for the agent; its
+    messages stay unread on the board for polling. Removing an address that
+    does not exist is not an error: the result says ``removed: false``.
+
+    Requires the caller's token to carry the ``comms:admin`` scope (or be an
+    interactive/Okta caller) -- same gate as ``comms_admin_register``. A caller
+    without it gets the standard anti-enumeration ``access_denied`` error.
+
+    - ``agent_id``: UUID string of an existing board agent.
+    """
+    token = _require_token()
+    actor_sub = _require_identity(token)
+    admin_authorized = is_interactive_token(token) or "comms:admin" in scopes_for_token(token)
+    target_id = _parse_uuid("agent_id", agent_id)
+
+    async with get_session_factory()() as session, _map_service_errors():
+        return await wake_targets.remove_wake_target(
+            session,
+            actor_sub=actor_sub,
+            admin_authorized=admin_authorized,
+            agent_id=target_id,
+        )
 
 
 @comms_server.tool

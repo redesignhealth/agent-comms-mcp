@@ -512,6 +512,18 @@ class InvalidWakeRuleError(ValueError):
     value, or an attempt to change a catch-all rule beyond its ``action``."""
 
 
+class InvalidWakeTargetError(Exception):
+    """A wake target registration was rejected by validation (TECH-9908): a bad URL,
+    secret or system label, or a host that is not on the operator allowlist. The
+    message is client-safe and never contains the secret."""
+
+
+class WakeTargetMisconfiguredError(Exception):
+    """The operator settings that wake target registration depends on are missing or
+    malformed (TECH-9908): ``WAKE_TARGET_ALLOWED_HOSTS`` or ``WAKE_TARGET_SECRET_KEY``.
+    Registration fails closed. The message names the setting, never its value."""
+
+
 class ProposalImmutableError(Exception):
     """A resubmission matched an open (``pending``/``applying``) proposal of an
     immutable kind (``service.IMMUTABLE_PROPOSAL_KINDS``, e.g. ``gmail_send``)
@@ -565,10 +577,12 @@ __all__ = [
     "InvalidOwnerReassignmentError",
     "InvalidProposalActionError",
     "InvalidWakeRuleError",
+    "InvalidWakeTargetError",
     "ProposalImmutableError",
     "ProposalTargetUnavailableError",
     "RateLimitExceededError",
     "SchemaVersionMismatchError",
     "SiblingIdentityExistsError",
     "UnknownConversationTypeError",
+    "WakeTargetMisconfiguredError",
 ]
