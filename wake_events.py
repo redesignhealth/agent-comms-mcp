@@ -16,7 +16,7 @@ from collections.abc import Collection
 from datetime import datetime, timedelta
 from typing import Any, Final
 
-from sqlalchemy import select, update
+from sqlalchemy import and_, case, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -199,11 +199,26 @@ async def _record_wake_events(
             .values(closed_at=now, closed_reason="quiet")
         )
 
-    touched = set(reasons)
-    if touch_sender and sender_agent_id in target_ids:
-        touched.add(sender_agent_id)
-    if touched:
-        # Open or extend; session_ref is deliberately left as it is.
+    # Open or extend. A woken recipient's session_ref is kept only while its session
+    # was really open: one that was closed or went quiet starts a new period without
+    # the old ref (docs/WAKE-EVENTS.md sections 3.1 and 7). The sender's own session is
+    # the agent still running, so its ref is left as it is.
+    wake_sessions = WakeSession.__table__
+    keep_ref = and_(
+        wake_sessions.c.closed_at.is_(None),
+        wake_sessions.c.last_activity_at >= now - timedelta(seconds=WAKE_SESSION_WINDOW_SECONDS),
+    )
+    reopen: dict[str, Any] = {"last_activity_at": now, "closed_at": None, "closed_reason": None}
+    groups = [
+        (
+            set(reasons),
+            {**reopen, "session_ref": case((keep_ref, wake_sessions.c.session_ref), else_=None)},
+        ),
+        ({sender_agent_id} if touch_sender and sender_agent_id in target_ids else set(), reopen),
+    ]
+    for agents, set_ in groups:
+        if not agents:
+            continue
         insert = pg_insert(WakeSession).values(
             [
                 {
@@ -212,13 +227,12 @@ async def _record_wake_events(
                     "opened_at": now,
                     "last_activity_at": now,
                 }
-                for a in sorted(touched)
+                for a in sorted(agents)
             ]
         )
         await session.execute(
             insert.on_conflict_do_update(
-                constraint="uq_wake_sessions_agent_id_conversation_id",
-                set_={"last_activity_at": now, "closed_at": None, "closed_reason": None},
+                constraint="uq_wake_sessions_agent_id_conversation_id", set_=set_
             )
         )
 
