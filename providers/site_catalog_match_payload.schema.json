@@ -1,0 +1,350 @@
+{
+  "$defs": {
+    "Absence": {
+      "additionalProperties": false,
+      "properties": {
+        "searched": {
+          "maxLength": 300,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "searched"
+      ],
+      "type": "object"
+    },
+    "AssessmentScoreCitation": {
+      "additionalProperties": false,
+      "properties": {
+        "capability": {
+          "maxLength": 120,
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "const": "assessment_score"
+        },
+        "run_seq": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "sub_capability": {
+          "maxLength": 120,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "run_seq",
+        "capability",
+        "sub_capability"
+      ],
+      "type": "object"
+    },
+    "CatalogRowCitation": {
+      "additionalProperties": false,
+      "properties": {
+        "field": {
+          "maxLength": 80,
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "const": "catalog_row"
+        },
+        "target_key": {
+          "maxLength": 150,
+          "pattern": "^pair:[a-z0-9]+(-[a-z0-9]+)*:[A-Z]{2}$",
+          "type": "string"
+        },
+        "version": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind",
+        "target_key",
+        "version",
+        "field"
+      ],
+      "type": "object"
+    },
+    "Citation": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/InterviewAnswerCitation"
+        },
+        {
+          "$ref": "#/$defs/SiteDocumentCitation"
+        },
+        {
+          "$ref": "#/$defs/AssessmentScoreCitation"
+        },
+        {
+          "$ref": "#/$defs/CatalogRowCitation"
+        }
+      ]
+    },
+    "InterviewAnswerCitation": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "interview_answer"
+        },
+        "length": {
+          "maximum": 1000000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "review_id": {
+          "pattern": "^[A-Za-z0-9_-]{1,64}$",
+          "type": "string"
+        },
+        "start": {
+          "maximum": 1000000,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind",
+        "review_id",
+        "start",
+        "length"
+      ],
+      "type": "object"
+    },
+    "Level": {
+      "enum": [
+        "high",
+        "medium",
+        "low"
+      ]
+    },
+    "NeedLine": {
+      "additionalProperties": false,
+      "properties": {
+        "citations": {
+          "items": {
+            "$ref": "#/$defs/Citation"
+          },
+          "maxItems": 10,
+          "minItems": 1,
+          "type": "array"
+        },
+        "statement": {
+          "maxLength": 400,
+          "minLength": 1,
+          "type": "string"
+        },
+        "strength": {
+          "$ref": "#/$defs/Level"
+        },
+        "type": {
+          "enum": [
+            "interview_pain_point",
+            "interview_priority",
+            "sponsor_interest",
+            "document",
+            "champion_role_present"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "strength",
+        "statement",
+        "citations"
+      ],
+      "type": "object"
+    },
+    "RiskLine": {
+      "additionalProperties": false,
+      "anyOf": [
+        {
+          "properties": {
+            "citations": {
+              "minItems": 1
+            }
+          }
+        },
+        {
+          "required": [
+            "absence"
+          ]
+        }
+      ],
+      "if": {
+        "required": [
+          "absence"
+        ]
+      },
+      "properties": {
+        "absence": {
+          "$ref": "#/$defs/Absence"
+        },
+        "citations": {
+          "items": {
+            "$ref": "#/$defs/Citation"
+          },
+          "maxItems": 10,
+          "type": "array"
+        },
+        "severity": {
+          "$ref": "#/$defs/Level"
+        },
+        "statement": {
+          "maxLength": 400,
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "regulatory_or_market",
+            "interview_objection",
+            "existing_solution",
+            "no_sponsor",
+            "data_or_infrastructure",
+            "obstacle_role_present",
+            "other"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "severity",
+        "statement",
+        "citations"
+      ],
+      "then": {
+        "properties": {
+          "type": {
+            "enum": [
+              "no_sponsor",
+              "other"
+            ]
+          }
+        }
+      },
+      "type": "object"
+    },
+    "SiteDocumentCitation": {
+      "additionalProperties": false,
+      "properties": {
+        "document_id": {
+          "pattern": "^[A-Za-z0-9_-]{1,64}$",
+          "type": "string"
+        },
+        "kind": {
+          "const": "site_document"
+        },
+        "length": {
+          "maximum": 1000000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "start": {
+          "maximum": 1000000,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind",
+        "document_id",
+        "start",
+        "length"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "action.payload of a site_catalog_match proposal (one catalog match for one site). Structure only: Arcadia checks the site, the agent, the shortlist and every citation. No quote field and no person names.",
+  "properties": {
+    "agent_score": {
+      "maximum": 100,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "client_summary_draft": {
+      "maxLength": 300,
+      "minLength": 1,
+      "type": "string"
+    },
+    "follow_up_questions": {
+      "items": {
+        "maxLength": 300,
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 3,
+      "type": "array"
+    },
+    "need": {
+      "items": {
+        "$ref": "#/$defs/NeedLine"
+      },
+      "maxItems": 6,
+      "type": "array"
+    },
+    "proposed_call": {
+      "enum": [
+        "strong",
+        "possible",
+        "blocked"
+      ]
+    },
+    "ranking_request_id": {
+      "pattern": "^[A-Za-z0-9_-]{1,64}$",
+      "type": "string"
+    },
+    "rationale": {
+      "maxLength": 600,
+      "minLength": 1,
+      "type": "string"
+    },
+    "risk": {
+      "items": {
+        "$ref": "#/$defs/RiskLine"
+      },
+      "maxItems": 6,
+      "type": "array"
+    },
+    "row_version": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "site_slug": {
+      "maxLength": 100,
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+      "type": "string"
+    },
+    "target_key": {
+      "maxLength": 150,
+      "pattern": "^pair:[a-z0-9]+(-[a-z0-9]+)*:[A-Z]{2}$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "ranking_request_id",
+    "site_slug",
+    "target_key",
+    "row_version",
+    "agent_score",
+    "proposed_call",
+    "rationale",
+    "need",
+    "risk"
+  ],
+  "title": "SiteCatalogMatchPayload",
+  "type": "object",
+  "x-schema-version": 1
+}

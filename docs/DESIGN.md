@@ -1826,10 +1826,10 @@ gate). Approving/rejecting a proposal is the one proposal action that
 stays human-only and HTTP-only.
 
 **Externally resolved kinds (TECH-9214)**: a kind in `EXTERNALLY_RESOLVED_PROPOSAL_KINDS`
-(today `catalog_candidate`) is decided by an external reviewer system (Arcadia), not by the
+(today `catalog_candidate` and `site_catalog_match`) is decided by an external reviewer system (Arcadia), not by the
 proposal owner. The board never writes outward: it keeps the proposal `pending` (never
 auto-approved, never edited in place), refuses the owner's `/decide` (400) and leaves the kind out
-of the owner's `GET /proposals/pending`. The approvals service reads
+of the owner's `GET /proposals/pending`. (`site_catalog_match`, BLU-18: its vendored schema is provisional, pinned with `commit: null` until Arcadia publishes its copy, and the structure check at submit and the forwarder live in `agent-comms-approvals`, BLU-26 and BLU-36.) The approvals service reads
 `GET /proposals/external-queue?kind=...` (service-only, same gate as the apply-record read,
 keyset-paged, oldest first) and forwards each pending proposal to the external system.
 
@@ -1842,7 +1842,8 @@ keyset-paged, oldest first) and forwards each pending proposal to the external s
 - **Serialized action limits**:
   - Non-document proposal kinds retain `MAX_PROPOSAL_ACTION_BYTES = 16_384` (16 KiB serialized JSON),
     except `catalog_candidate` (TECH-9214), which is capped at `MAX_CATALOG_CANDIDATE_ACTION_BYTES`
-    (256 KiB) because a concept-market version is larger than 16 KiB.
+    (256 KiB) because a concept-market version is larger than 16 KiB, and `site_catalog_match` (BLU-18),
+    which is capped at `MAX_SITE_CATALOG_MATCH_ACTION_BYTES` (64 KiB).
   - Document proposal kinds are permitted up to `MAX_DOCUMENT_PROPOSAL_ACTION_BYTES = 4_194_304`
     (4 MiB serialized JSON). This 4 MiB allowance accommodates up to 1 MiB of UTF-8 content with
     standard JSON ASCII Unicode escaping (`ensure_ascii=True`, where non-ASCII codepoints expand up to
