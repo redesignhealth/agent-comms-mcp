@@ -298,7 +298,6 @@ async def close_wake_session(
         )
     ).scalar_one_or_none()
     if closed is None:
-        await session.rollback()
         return False
     session.add(
         AuditLog(

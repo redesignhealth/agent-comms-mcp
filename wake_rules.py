@@ -53,6 +53,17 @@ _MESSAGE_PRIORITIES: Final[frozenset[str]] = frozenset(
 INVITE_MESSAGE_TYPE: Final = "invite"
 _MATCHABLE_MESSAGE_TYPES: Final[frozenset[str]] = MESSAGE_TYPES | {INVITE_MESSAGE_TYPE}
 
+# The column is a 32-bit integer and new rules default to highest + 1, so keep well clear of it.
+MAX_RULE_PRIORITY: Final = 1_000_000
+
+_MATCH_FIELDS: Final = (
+    "match_conversation_id",
+    "match_sender_agent_id",
+    "match_message_type",
+    "match_task_action",
+    "match_message_priority",
+)
+
 _RULE_FIELDS: Final = (
     "match_conversation_id",
     "match_sender_agent_id",
@@ -129,8 +140,12 @@ def _validate_fields(
         raise InvalidWakeRuleError("match_task_action is not a known task action")
     if match_message_priority is not None and match_message_priority not in _MESSAGE_PRIORITIES:
         raise InvalidWakeRuleError("match_message_priority is not a known message priority")
-    if isinstance(priority, bool) or not isinstance(priority, int) or priority < 1:
-        raise InvalidWakeRuleError("priority must be an integer >= 1")
+    if (
+        isinstance(priority, bool)
+        or not isinstance(priority, int)
+        or not 1 <= priority <= MAX_RULE_PRIORITY
+    ):
+        raise InvalidWakeRuleError(f"priority must be an integer from 1 to {MAX_RULE_PRIORITY}")
     if not isinstance(enabled, bool):
         raise InvalidWakeRuleError("enabled must be a boolean")
 
@@ -316,7 +331,13 @@ async def update_wake_rule(
             if "action" in changes and changes["action"] not in WAKE_RULE_ACTIONS:
                 raise InvalidWakeRuleError(f"action must be one of {WAKE_RULE_ACTIONS}")
         else:
-            _validate_fields(**{**{k: getattr(rule, k) for k in _RULE_FIELDS}, **changes})
+            merged = {**{k: getattr(rule, k) for k in _RULE_FIELDS}, **changes}
+            _validate_fields(**merged)
+            if all(merged[k] is None for k in _MATCH_FIELDS):
+                raise InvalidWakeRuleError(
+                    "a rule needs at least one match field; to change what happens to every "
+                    "message, update the catch-all rule"
+                )
     except InvalidWakeRuleError:
         await session.rollback()
         raise

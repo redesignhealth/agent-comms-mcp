@@ -185,6 +185,7 @@ class TestAdd:
             {"action": "poll", "task_action": "juggle"},
             {"action": "poll", "message_priority": "whenever"},
             {"action": "poll", "message_type": "note", "priority": 0},
+            {"action": "poll", "message_type": "note", "priority": 2**31},
             {"action": "poll", "conversation_id": "not-a-uuid"},
             {"action": "poll"},  # no match field at all
             {"action": "poll", "message_type": "note", "bogus_field": "x"},
@@ -262,6 +263,29 @@ class TestUpdate:
             await a.call(UPDATE, {"rule_id": rule["rule_id"]})
         current = next(r for r in (await a.call(RULES))["rules"] if r["rule_id"] == rule["rule_id"])
         assert current == rule
+
+    async def test_cannot_clear_the_last_match_field(
+        self, main: Any, test_session_factory: Any
+    ) -> None:
+        a = await _agent(main, test_session_factory, "a")
+        rule = await a.call(ADD, {"action": "poll", "message_type": "note"})
+        with pytest.raises(ToolError, match="at least one match field"):
+            await a.call(UPDATE, {"rule_id": rule["rule_id"], "message_type": ""})
+        # Clearing one field while another is set is fine.
+        both = await a.call(
+            ADD, {"action": "poll", "message_type": "note", "message_priority": "high"}
+        )
+        cleared = await a.call(UPDATE, {"rule_id": both["rule_id"], "message_priority": ""})
+        assert cleared["match_message_priority"] is None
+        assert cleared["match_message_type"] == "note"
+
+    async def test_priority_above_the_cap_is_rejected(
+        self, main: Any, test_session_factory: Any
+    ) -> None:
+        a = await _agent(main, test_session_factory, "a")
+        rule = await a.call(ADD, {"action": "poll", "message_type": "note"})
+        with pytest.raises(ToolError, match="invalid_request: priority"):
+            await a.call(UPDATE, {"rule_id": rule["rule_id"], "priority": 2**31 - 1})
 
     async def test_catch_all_action_can_flip_but_nothing_else(
         self, main: Any, test_session_factory: Any
