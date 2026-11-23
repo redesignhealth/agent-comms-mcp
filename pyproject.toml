@@ -91,7 +91,7 @@ packages = ["providers", "migrations", "migrations.versions"]
 # this package-data declaration in an installed wheel too, not just a
 # Docker COPY . . or in-place git clone.
 [tool.setuptools.package-data]
-providers = ["instruction_registry.json", "catalog_candidate_payload.schema*.json"]
+providers = ["instruction_registry.json", "catalog_candidate_payload.schema*.json", "site_catalog_match_payload.schema*.json"]
 
 [tool.uv]
 # Supply-chain defense: refuse packages published in the last 7 days.

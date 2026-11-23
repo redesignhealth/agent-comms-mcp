@@ -1,9 +1,9 @@
 """What an agent must follow to submit a proposal of a given kind (TECH-9214).
 
-``proposals_schema(kind)`` returns this. Today only ``catalog_candidate`` has a
-schema: the vendored copy of Arcadia's payload JSON Schema (version 3) plus a
-short guide. The schema file is byte-identical to the copy the approvals service
-validates against and forwards with; ``catalog_candidate_payload.schema.pin.json``
+``proposals_schema(kind)`` returns this. Two kinds have a schema:
+``catalog_candidate`` (the vendored copy of Arcadia's payload JSON Schema, version 3)
+and ``site_catalog_match`` (BLU-18, version 1), each with a short guide. The catalog_candidate schema file is byte-identical to the copy the
+approvals service validates against and forwards with; ``catalog_candidate_payload.schema.pin.json``
 beside it records Arcadia's commit and the file's sha256, and the tests pin both,
 so the two repos can only drift on purpose (the approvals service also refuses to
 forward while its sha256 differs from Arcadia's).
@@ -19,6 +19,8 @@ from typing import Any
 
 SCHEMA_RESOURCE = "catalog_candidate_payload.schema.json"
 PIN_RESOURCE = "catalog_candidate_payload.schema.pin.json"
+SITE_MATCH_SCHEMA_RESOURCE = "site_catalog_match_payload.schema.json"
+SITE_MATCH_PIN_RESOURCE = "site_catalog_match_payload.schema.pin.json"
 
 _FACT_CHECK = [{"round": 1, "agreement_score": 85, "issues_low": 2}]
 
@@ -72,6 +74,49 @@ action fields (proposals_submit(kind="catalog_candidate", action=...)):
   name a real assessment kind or an in-range index into related_companies/replaces.
 - No unknown fields anywhere. Do not include health-system material; it is refused.
 - schema_version in a payload must be the schema's version (it defaults to it when omitted).
+"""
+
+
+SITE_CATALOG_MATCH_GUIDE = """\
+A site_catalog_match returns ONE catalog match for ONE site: your score, your call and the evidence
+lines behind it. One proposal per match. The board checks structure only; Arcadia checks the site,
+that you are that site's agent, that the row is in your shortlist and every citation, and staff
+decide. It is never auto-approved. A submission that breaks any rule below is refused at submit
+with 422 and a list of {path, rule} errors; nothing is stored. Arcadia may still refuse it; then the
+proposal is closed as rejected and proposals_get shows Arcadia's code and errors. When staff decide,
+proposals_get shows applied (accepted) or rejected (dismissed, or superseded by a newer run).
+
+action fields (proposals_submit(kind="site_catalog_match", action=...)):
+- action_type: exactly "rank".
+- target_id: "site-match:<site-slug>:<concept-slug>:<MARKET>:r<seq>". <site-slug> and <concept-slug>
+  are lowercase words joined by single hyphens; <MARKET> is exactly two capital letters, such as DE;
+  <seq> is the ranking request sequence number you were given. A new run uses a new <seq>, so it
+  never collides with an earlier pending proposal. The kind is immutable once submitted: to change
+  it, withdraw it and submit again.
+- payload (required): the schema's root object (schema_version 1). target_key is
+  "pair:<concept-slug>:<MARKET>" and must match target_id. Send row_version exactly as the shortlist
+  gave it.
+- agent_score 0-100 and proposed_call "strong" | "possible" | "blocked".
+- need: up to 6 lines {type, strength high|medium|low, statement, citations}. type is one of
+  interview_pain_point, interview_priority, sponsor_interest, document, champion_role_present.
+  capability_gap and market_fit are Arcadia's own computed lines: never send them.
+- risk: up to 6 lines {type, severity high|medium|low, statement, citations}. type is one of
+  regulatory_or_market, interview_objection, existing_solution, no_sponsor, data_or_infrastructure,
+  obstacle_role_present, other. geography_not_viable, prerequisite_missing, weak_catalog_evidence
+  and prior_dismissal are Arcadia's: never send them.
+- Every line needs at least one citation. The only exception is a risk line of type no_sponsor or
+  other that carries "absence": {"searched": "<what you read and found nothing in>"}.
+- Citations point into text Arcadia already holds; there is no quote field. Kinds:
+  interview_answer {review_id, start, length}, site_document {document_id, start, length},
+  assessment_score {run_seq, capability, sub_capability}, catalog_row {target_key, version, field}.
+  start is a 0-based character offset.
+- Text limits: statement 400 characters, rationale 600, client_summary_draft 300 (optional, no
+  names, quotes or scores), follow_up_questions at most 3 (optional, each 300).
+- No quotes and no person names. Paraphrase by role ("the Chief Nursing Officer") and cite by id and
+  offset. Arcadia refuses a name of a site contact.
+- No unknown fields anywhere. action is capped at 64 KiB serialized.
+- Do not call verify_citations or add brain citations: this kind has none of the board's citation
+  check. The board's health-system content screen is not applied either: this is site content.
 """
 
 
@@ -192,14 +237,86 @@ def _delete_example() -> dict[str, Any]:
     }
 
 
+def _site_match_example() -> dict[str, Any]:
+    return {
+        "action_type": "rank",
+        "target_id": "site-match:example-health-system:discharge-coordination:DE:r3",
+        "payload": {
+            "schema_version": 1,
+            "ranking_request_id": "7d0c4f1e-2b6a-4c51-9a37-1f5e8d2a0b64",
+            "site_slug": "example-health-system",
+            "target_key": "pair:discharge-coordination:DE",
+            "row_version": 3,
+            "agent_score": 86,
+            "proposed_call": "strong",
+            "rationale": "Two senior roles state the pain and one offers to sponsor it.",
+            "need": [
+                {
+                    "type": "interview_pain_point",
+                    "strength": "high",
+                    "statement": "The Chief Nursing Officer says discharge to rehab is delayed "
+                    "daily and has no owner.",
+                    "citations": [
+                        {
+                            "kind": "interview_answer",
+                            "review_id": "rev-0192",
+                            "start": 112,
+                            "length": 96,
+                        }
+                    ],
+                },
+                {
+                    "type": "document",
+                    "strength": "medium",
+                    "statement": "The site's bed-days report shows 2.7 delayed-discharge days "
+                    "per case.",
+                    "citations": [
+                        {
+                            "kind": "site_document",
+                            "document_id": "doc-0457",
+                            "start": 4410,
+                            "length": 58,
+                        }
+                    ],
+                },
+            ],
+            "risk": [
+                {
+                    "type": "existing_solution",
+                    "severity": "high",
+                    "statement": "The Head of IT says a bed-management product is contracted "
+                    "and goes live in March.",
+                    "citations": [
+                        {
+                            "kind": "interview_answer",
+                            "review_id": "rev-0188",
+                            "start": 40,
+                            "length": 88,
+                        }
+                    ],
+                },
+                {
+                    "type": "no_sponsor",
+                    "severity": "medium",
+                    "statement": "No confirmed answer offers sponsorship for this.",
+                    "absence": {"searched": "all 14 confirmed answers in the brief"},
+                    "citations": [],
+                },
+            ],
+            "follow_up_questions": ["Would finance sponsor a service-line margin view?"],
+            "client_summary_draft": "Your teams described delays in discharge to rehabilitation.",
+        },
+    }
+
+
 def _read_json(name: str) -> dict[str, Any]:
     loaded = json.loads((resources.files("providers") / name).read_text(encoding="utf-8"))
     assert isinstance(loaded, dict)
     return loaded
 
 
-def schema_bytes() -> bytes:
-    return (resources.files("providers") / SCHEMA_RESOURCE).read_bytes()
+def schema_bytes(resource: str = SCHEMA_RESOURCE) -> bytes:
+    return (resources.files("providers") / resource).read_bytes()
 
 
 def canonical_sha256(schema: dict[str, Any]) -> str:
@@ -230,7 +347,24 @@ def catalog_candidate_schema() -> dict[str, Any]:
     }
 
 
-SCHEMAS = {"catalog_candidate": catalog_candidate_schema}
+def site_catalog_match_schema() -> dict[str, Any]:
+    pin = _read_json(SITE_MATCH_PIN_RESOURCE)
+    schema = _read_json(SITE_MATCH_SCHEMA_RESOURCE)
+    return {
+        "kind": "site_catalog_match",
+        "schema_version": pin["schema_version"],
+        "schema_sha256": canonical_sha256(schema),
+        "schema_source": {"repo": pin["repo"], "path": pin["path"], "commit": pin["commit"]},
+        "schema": schema,
+        "guide": SITE_CATALOG_MATCH_GUIDE,
+        "examples": {"rank": _site_match_example()},
+    }
+
+
+SCHEMAS = {
+    "catalog_candidate": catalog_candidate_schema,
+    "site_catalog_match": site_catalog_match_schema,
+}
 
 
 def schema_for_kind(kind: str) -> dict[str, Any] | None:

@@ -7832,6 +7832,10 @@ DOCUMENT_PROPOSAL_KINDS: frozenset[str] = frozenset({"arcana_source_add", "arcan
 # document's size. Its own cap, so the document limit stays document-only.
 CATALOG_CANDIDATE_KIND = "catalog_candidate"
 MAX_CATALOG_CANDIDATE_ACTION_BYTES = 256 * 1024
+# BLU-18: one catalog match returned by a site agent (need and risk lines with
+# offset citations, no quotes). Its own 64 KiB cap, well under a catalog candidate's.
+SITE_CATALOG_MATCH_KIND = "site_catalog_match"
+MAX_SITE_CATALOG_MATCH_ACTION_BYTES = 64 * 1024
 # Listing projection only (TECH-7720): document ``action.content`` larger than
 # this many UTF-8 bytes is elided from list responses. Deliberately its own
 # constant, not ``MAX_PROPOSAL_ACTION_BYTES`` -- that one is a submit-time
@@ -7845,12 +7849,15 @@ def max_proposal_action_bytes(kind: str | None) -> int:
     Document proposal kinds (arcana_source_add/revise) are permitted up to 4 MiB
     to accommodate up to 1 MiB of UTF-8 content with JSON Unicode escaping and
     associated action metadata (TECH-7720). ``catalog_candidate`` gets 256 KiB
-    (TECH-9214). All other proposal kinds retain the default 16 KiB limit.
+    (TECH-9214) and ``site_catalog_match`` 64 KiB (BLU-18). All other proposal kinds retain
+    the default 16 KiB limit.
     """
     if isinstance(kind, str) and kind in DOCUMENT_PROPOSAL_KINDS:
         return MAX_DOCUMENT_PROPOSAL_ACTION_BYTES
     if kind == CATALOG_CANDIDATE_KIND:
         return MAX_CATALOG_CANDIDATE_ACTION_BYTES
+    if kind == SITE_CATALOG_MATCH_KIND:
+        return MAX_SITE_CATALOG_MATCH_ACTION_BYTES
     return MAX_PROPOSAL_ACTION_BYTES
 
 
@@ -8289,7 +8296,11 @@ def _proposal_resubmission_snapshot(hold: ProposalHold) -> tuple[Any, ...]:
 # resubmission after a decision always inserts a new row.
 # ``catalog_candidate`` (TECH-9214) is immutable for the same reason: the reviewer
 # decides on exactly the payload that was forwarded to the catalog.
-IMMUTABLE_PROPOSAL_KINDS: frozenset[str] = frozenset({"gmail_send", CATALOG_CANDIDATE_KIND})
+# ``site_catalog_match`` (BLU-18) likewise: staff decide on exactly the match that
+# Arcadia received.
+IMMUTABLE_PROPOSAL_KINDS: frozenset[str] = frozenset(
+    {"gmail_send", CATALOG_CANDIDATE_KIND, SITE_CATALOG_MATCH_KIND}
+)
 
 # TECH-8951: kinds the board never auto-approves, whatever the judge plugin
 # returns (the kill switch and daily caps are irrelevant to them). A
@@ -8297,16 +8308,20 @@ IMMUTABLE_PROPOSAL_KINDS: frozenset[str] = frozenset({"gmail_send", CATALOG_CAND
 # can approve it. Enforced in ``create_proposal`` on every submission,
 # including an identical retry that re-runs the judge against the open row.
 # ``catalog_candidate`` (TECH-9214) changes the opportunity catalog, so only its
-# reviewers approve it, never a rules engine.
+# reviewers approve it, never a rules engine. ``site_catalog_match`` (BLU-18) is
+# decided by Arcadia staff, so the same applies.
 HUMAN_APPROVAL_ONLY_PROPOSAL_KINDS: frozenset[str] = frozenset(
-    {"gmail_send", CATALOG_CANDIDATE_KIND}
+    {"gmail_send", CATALOG_CANDIDATE_KIND, SITE_CATALOG_MATCH_KIND}
 )
 
 # TECH-9214: kinds decided by an external reviewer system, not by the proposal
 # owner on the decision page. The owner's decide call is refused and the kind is
 # left out of the owner's pending queue; the external system reports its outcome
 # through the board's admin resolve tool.
-EXTERNALLY_RESOLVED_PROPOSAL_KINDS: frozenset[str] = frozenset({CATALOG_CANDIDATE_KIND})
+# ``site_catalog_match`` (BLU-18) is decided by Arcadia staff and resolved the same way.
+EXTERNALLY_RESOLVED_PROPOSAL_KINDS: frozenset[str] = frozenset(
+    {CATALOG_CANDIDATE_KIND, SITE_CATALOG_MATCH_KIND}
+)
 
 
 def _check_immutable_resubmission(
@@ -12745,6 +12760,7 @@ __all__ = [
     "MAX_PROPOSAL_KIND_LENGTH",
     "MAX_PROPOSAL_STRING_FIELD_LENGTH",
     "MAX_RECONCILIATION_BATCH_SIZE",
+    "MAX_SITE_CATALOG_MATCH_ACTION_BYTES",
     "OWNERSHIP_CLIENTS",
     "OWNERSHIP_CLIENT_ENV_VAR",
     "OWNER_REASSIGNMENT_SOURCE",
@@ -12755,6 +12771,7 @@ __all__ = [
     "PROPOSAL_RATE_LIMIT_WINDOW",
     "PROPOSAL_SUBMITTER_SURFACES",
     "PROPOSAL_TERMINAL_STATUSES",
+    "SITE_CATALOG_MATCH_KIND",
     "AgentTableOwnershipClient",
     "ExtendConversationResult",
     "OwnershipClient",

@@ -206,7 +206,7 @@ async def submit(
     citation rules, and current document-update support.
 
     FIRST call ``proposals_schema(kind)`` for the kind you are about to submit
-    (``catalog_candidate`` today): it returns the JSON Schema, its version, a
+    (``catalog_candidate`` or ``site_catalog_match``): it returns the JSON Schema, its version, a
     guide to the action fields and valid examples. Follow it exactly; a
     submission that does not match is refused with 422 and a list of
     ``{path, rule}`` errors.
@@ -272,6 +272,22 @@ async def submit(
     ``changes_requested`` closes the proposal: submit a NEW one with the changes.
     An open one is never edited in place (withdraw and resubmit). ``action`` is
     capped at 256 KiB.
+
+    ``kind="site_catalog_match"`` (BLU-18; a site agent returns ONE catalog match
+    for ONE site; checked and decided by Arcadia; call ``proposals_schema`` first)::
+
+        {"target_id": "site-match:<site-slug>:<concept-slug>:<MARKET>:r<seq>",
+         "action_type": "rank", "payload": {...}}
+
+    ``payload`` carries ``agent_score``, ``proposed_call``, ``rationale`` and
+    cited ``need`` and ``risk`` lines (offset citations into text Arcadia holds;
+    no quote field, no person names). The board checks structure only and does
+    not run the brain citation check or the health-system screen on this kind;
+    Arcadia checks the rest. Never auto-approved, never decided by the owner,
+    never edited in place (withdraw and resubmit). ``proposals_get`` shows
+    ``applied`` (staff accepted) or ``rejected`` (dismissed or superseded) with
+    the ``decision_note``; the reviewer is never named. ``action`` is capped at
+    64 KiB.
 
     Cross-brain (TECH-7665, off unless the board enables it): for
     ``arcana_source_add``, ``action.target`` may name ANOTHER agent's brain
@@ -396,6 +412,9 @@ async def schema(kind: str) -> dict[str, Any]:
     """Read-only: the schema an agent must follow to submit a proposal of
     ``kind`` (TECH-9214). Call it before ``proposals_submit``. Available to any
     bot that can submit proposals.
+
+    For ``kind="site_catalog_match"`` returns the same keys with the version-1
+    payload schema (the root object), a guide and one ``rank`` example.
 
     For ``kind="catalog_candidate"`` returns ``{"kind", "schema_version",
     "schema_sha256", "schema_source", "schema", "guide", "examples"}``:

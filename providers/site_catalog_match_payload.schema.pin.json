@@ -1,0 +1,9 @@
+{
+  "repo": "redesignhealth/arcadia",
+  "path": "apps/api/src/arcadia_api/schemas/site_catalog_match_payload.schema.json",
+  "commit": null,
+  "blob_sha": "b927601ef167a387875a7f28673779d9be84f071",
+  "sha256": "1ed7f2fe6bdc21bf59e535bfecfbc1f8cf389d059c347d5d3ab1e0d3e2d16f84",
+  "schema_version": 1,
+  "note": "Authored from the BLU-18 spec (section 6.3); Arcadia has not published this file yet. When its intake ships, replace the schema with Arcadia's copy and set commit."
+}
