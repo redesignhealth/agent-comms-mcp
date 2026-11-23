@@ -1,4 +1,4 @@
-"""Record wake events and track open conversations when a message is posted (TECH-9907).
+"""Record wake events and track open conversations (TECH-9907, TECH-9910).
 
 ``record_message_wake_events`` runs inside the posting transaction, after
 every gate that can deny, and only stages rows: it never commits, so the
@@ -55,9 +55,83 @@ async def record_message_wake_events(
     nothing). Recording an event opens or extends that recipient's session.
     The sender's own session is opened or extended too, if it has a target.
     """
+    await _record_wake_events(
+        session,
+        conversation_id=conversation_id,
+        kind="message",
+        seq=seq,
+        event_message_type=message_type,
+        wake_message=WakeMessage(
+            conversation_id=conversation_id,
+            sender_agent_id=sender_agent_id,
+            message_type=message_type,
+            task_action=payload.get("action") if isinstance(payload.get("action"), str) else None,
+            message_priority=(
+                payload.get("priority") if isinstance(payload.get("priority"), str) else None
+            ),
+        ),
+        recipient_agent_ids=recipient_agent_ids,
+        touch_sender=True,
+        now=now,
+    )
+
+
+async def record_invite_wake_events(
+    session: AsyncSession,
+    *,
+    conversation_id: uuid.UUID,
+    inviter_agent_id: uuid.UUID,
+    invitee_agent_ids: Collection[uuid.UUID],
+    now: datetime,
+) -> None:
+    """Decide and stage ``kind='invite'`` wake rows for newly visible invites.
+
+    Call once per batch of ``invited`` participant rows, at the moment each
+    becomes visible to its invitee (never while the invite is held). Same
+    decision order as a message (docs/WAKE-EVENTS.md section 8); for rule
+    matching an invite is message type ``invite`` with no task action and no
+    message priority. The row has ``seq`` and ``message_type`` NULL. There is
+    no unique index for invites, so the caller must call this exactly once
+    per invite becoming visible. The inviter's own session is not touched.
+    ``now`` must be timezone-aware.
+    """
+    await _record_wake_events(
+        session,
+        conversation_id=conversation_id,
+        kind="invite",
+        seq=None,
+        event_message_type=None,
+        wake_message=WakeMessage(
+            conversation_id=conversation_id,
+            sender_agent_id=inviter_agent_id,
+            message_type="invite",
+            task_action=None,
+            message_priority=None,
+        ),
+        recipient_agent_ids=invitee_agent_ids,
+        touch_sender=False,
+        now=now,
+    )
+
+
+async def _record_wake_events(
+    session: AsyncSession,
+    *,
+    conversation_id: uuid.UUID,
+    kind: str,
+    seq: int | None,
+    event_message_type: str | None,
+    wake_message: WakeMessage,
+    recipient_agent_ids: Collection[uuid.UUID],
+    touch_sender: bool,
+    now: datetime,
+) -> None:
     if now.tzinfo is None:
         raise ValueError("now must be timezone-aware")
-    candidate_ids = {*recipient_agent_ids, sender_agent_id}
+    sender_agent_id = wake_message.sender_agent_id
+    candidate_ids = {*recipient_agent_ids, sender_agent_id} - (
+        set() if touch_sender else {sender_agent_id}
+    )
     target_ids = set(
         (
             await session.execute(
@@ -89,15 +163,6 @@ async def record_message_wake_events(
         await list_wake_rules_for_agents(session, agent_ids=rule_ids) if rule_ids else {}
     )
 
-    wake_message = WakeMessage(
-        conversation_id=conversation_id,
-        sender_agent_id=sender_agent_id,
-        message_type=message_type,
-        task_action=payload.get("action") if isinstance(payload.get("action"), str) else None,
-        message_priority=(
-            payload.get("priority") if isinstance(payload.get("priority"), str) else None
-        ),
-    )
     reasons: dict[uuid.UUID, str] = {a: "open_conversation" for a in open_ids}
     for agent_id in rule_ids:
         if evaluate_wake_rules(rules_by_agent[agent_id], wake_message).action == "wake":
@@ -110,9 +175,9 @@ async def record_message_wake_events(
                     {
                         "recipient_agent_id": agent_id,
                         "conversation_id": conversation_id,
-                        "kind": "message",
+                        "kind": kind,
                         "seq": seq,
-                        "message_type": message_type,
+                        "message_type": event_message_type,
                         "sender_agent_id": sender_agent_id,
                         "reason": reasons[agent_id],
                         "status": "pending",
@@ -135,7 +200,7 @@ async def record_message_wake_events(
         )
 
     touched = set(reasons)
-    if sender_agent_id in target_ids:
+    if touch_sender and sender_agent_id in target_ids:
         touched.add(sender_agent_id)
     if touched:
         # Open or extend; session_ref is deliberately left as it is.
@@ -172,5 +237,6 @@ async def close_wake_sessions_for_conversation(
 __all__ = [
     "WAKE_SESSION_WINDOW_SECONDS",
     "close_wake_sessions_for_conversation",
+    "record_invite_wake_events",
     "record_message_wake_events",
 ]
