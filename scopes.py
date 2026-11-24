@@ -59,12 +59,13 @@ from observability import log_auth_rejected
 #             (gating a privileged PARAMETER within an already-scoped
 #             tool, as opposed to a route-level auth gate like
 #             ``main.py``'s ``/admin/agents/reconcile-ownership``) are
-#             exactly the eight: ``comms_set_agent_shared``,
+#             exactly the eleven: ``comms_set_agent_shared``,
 #             ``comms_deregister_agent``, ``comms_admin_register``,
 #             ``comms_request_owner_reassignment`` (TECH-7389),
 #             ``comms_admin_wake_target_set``/``_remove`` (TECH-9908), and
-#             ``comms_admin_wake_events_list``/``_event_requeue`` (TECH-9913) --
-#             enforced by
+#             ``comms_admin_wake_events_list``/``_event_requeue`` (TECH-9913), and
+#             ``comms_admin_wake_delivery_status``/``_pause``/``_resume``
+#             (TECH-9890) -- enforced by
 #             ``tests/test_scopes.py::TestCommsAdminConsumers``, which
 #             will fail if a future PR adds another without updating
 #             this comment.
