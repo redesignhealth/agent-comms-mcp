@@ -181,7 +181,15 @@ WAKE_RULE_ACTIONS = ("wake", "poll")
 WAKE_SESSION_CLOSED_REASONS = ("quiet", "agent_closed", "conversation_ended")
 WAKE_EVENT_KINDS = ("message", "invite")
 WAKE_EVENT_REASONS = ("rule", "open_conversation")
-WAKE_EVENT_STATUSES = ("pending", "delivered", "retry", "retry_later", "failed", "dead")
+WAKE_EVENT_STATUSES = (
+    "pending",
+    "delivered",
+    "retry",
+    "retry_later",
+    "failed",
+    "dead",
+    "suppressed",
+)
 
 
 class Base(DeclarativeBase):

@@ -11,21 +11,58 @@ each for targets, sessions, rules, plus one write per table touched.
 
 from __future__ import annotations
 
+import os
 import uuid
 from collections.abc import Collection
 from datetime import datetime, timedelta
-from typing import Any, Final
+from typing import Any, Final, Literal
 
-from sqlalchemy import and_, case, select, update
+from sqlalchemy import and_, case, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import observability
 from models import AuditLog, WakeEvent, WakeSession, WakeTarget
 from wake_rules import WakeMessage, evaluate_wake_rules, list_wake_rules_for_agents
 
 # A wake session ("open conversation") is open while it is not closed and its
 # last activity is at most this many seconds old (docs/WAKE-EVENTS.md section 7).
 WAKE_SESSION_WINDOW_SECONDS: Final = 600
+
+# The loop guard (TECH-9883, docs/WAKE-EVENTS.md section 8.1). Two agents that answer
+# each other wake each other, and each wake costs the receiving system at least one
+# run even when the woken agent has nothing to say, so the board bounds wake EVENTS.
+# Past a limit the message is still posted and readable by polling, but its event is
+# recorded as ``suppressed`` and never delivered. These are the defaults; each can be
+# overridden by the environment variable named beside it. Provisional: the ticket asks
+# for numbers chosen from the dev end-to-end test.
+#
+# Per recipient and conversation: a real exchange rarely reaches 12 wakes in 10
+# minutes (a ten-message exchange is about 5 per side), while a loop reaches it in a
+# couple of minutes and is then held to about 1 wake a minute at most.
+WAKE_CONVERSATION_EVENT_LIMIT: Final = 12  # WAKE_CONVERSATION_EVENT_LIMIT
+WAKE_CONVERSATION_LIMIT_WINDOW_SECONDS: Final = 600  # WAKE_CONVERSATION_LIMIT_WINDOW_SECONDS
+# Per recipient across all conversations, per hour: only a backstop against many
+# conversations looping at once, far above normal use.
+WAKE_AGENT_HOURLY_EVENT_CAP: Final = 300  # WAKE_AGENT_HOURLY_EVENT_CAP
+_AGENT_CAP_WINDOW: Final = timedelta(hours=1)
+
+
+def _setting(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, ""))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def wake_limits() -> tuple[int, int, int]:
+    """(per-conversation limit, its window in seconds, per-agent hourly cap)."""
+    return (
+        _setting("WAKE_CONVERSATION_EVENT_LIMIT", WAKE_CONVERSATION_EVENT_LIMIT),
+        _setting("WAKE_CONVERSATION_LIMIT_WINDOW_SECONDS", WAKE_CONVERSATION_LIMIT_WINDOW_SECONDS),
+        _setting("WAKE_AGENT_HOURLY_EVENT_CAP", WAKE_AGENT_HOURLY_EVENT_CAP),
+    )
 
 
 def _is_open(wake_session: WakeSession, now: datetime) -> bool:
@@ -168,6 +205,7 @@ async def _record_wake_events(
         if evaluate_wake_rules(rules_by_agent[agent_id], wake_message).action == "wake":
             reasons[agent_id] = "rule"
 
+    suppressed = await _limit_reached(session, conversation_id, reasons, now)
     if reasons:
         await session.execute(
             pg_insert(WakeEvent).values(
@@ -180,13 +218,17 @@ async def _record_wake_events(
                         "message_type": event_message_type,
                         "sender_agent_id": sender_agent_id,
                         "reason": reasons[agent_id],
-                        "status": "pending",
+                        "status": "suppressed" if agent_id in suppressed else "pending",
+                        "last_error": suppressed.get(agent_id),
                         "attempt_count": 0,
                     }
                     for agent_id in sorted(reasons)
                 ]
             )
         )
+        # A suppressed recipient is not woken, so its session is not opened or extended.
+        for agent_id in suppressed:
+            del reasons[agent_id]
 
     quiet_ids = stale_ids - reasons.keys()
     if quiet_ids:
@@ -237,6 +279,71 @@ async def _record_wake_events(
         )
 
 
+async def _limit_reached(
+    session: AsyncSession,
+    conversation_id: uuid.UUID,
+    reasons: dict[uuid.UUID, str],
+    now: datetime,
+) -> dict[uuid.UUID, str]:
+    """Recipients in ``reasons`` over a limit, with the short fixed reason to store.
+
+    Counts events that were really recorded (not ``suppressed`` ones), so the
+    window slides. Two queries however many recipients. Not locked: concurrent
+    posts can overshoot a limit by a few events, which is fine for a backstop.
+    """
+    if not reasons:
+        return {}
+    conversation_limit, window_seconds, agent_cap = wake_limits()
+    recorded = WakeEvent.status != "suppressed"
+    in_window = WakeEvent.created_at > now - timedelta(seconds=window_seconds)
+    in_conversation = {
+        agent_id: n
+        for agent_id, n in (
+            await session.execute(
+                select(WakeEvent.recipient_agent_id, func.count())
+                .where(
+                    WakeEvent.recipient_agent_id.in_(reasons),
+                    WakeEvent.conversation_id == conversation_id,
+                    recorded,
+                    in_window,
+                )
+                .group_by(WakeEvent.recipient_agent_id)
+            )
+        ).tuples()
+    }
+    in_hour = {
+        agent_id: n
+        for agent_id, n in (
+            await session.execute(
+                select(WakeEvent.recipient_agent_id, func.count())
+                .where(
+                    WakeEvent.recipient_agent_id.in_(reasons),
+                    recorded,
+                    WakeEvent.created_at > now - _AGENT_CAP_WINDOW,
+                )
+                .group_by(WakeEvent.recipient_agent_id)
+            )
+        ).tuples()
+    }
+    suppressed: dict[uuid.UUID, str] = {}
+    limit: Literal["conversation", "agent"]
+    for agent_id in reasons:
+        if in_conversation.get(agent_id, 0) >= conversation_limit:
+            limit = "conversation"
+            suppressed[agent_id] = (
+                f"conversation wake limit: {conversation_limit} events in {window_seconds} seconds"
+            )
+        elif in_hour.get(agent_id, 0) >= agent_cap:
+            limit = "agent"
+            suppressed[agent_id] = f"agent wake cap: {agent_cap} events in 1 hour"
+        else:
+            continue
+        observability.log_wake_suppressed(
+            limit=limit, recipient_agent_id=str(agent_id), conversation_id=str(conversation_id)
+        )
+    return suppressed
+
+
 async def close_wake_sessions_for_conversation(
     session: AsyncSession, *, conversation_id: uuid.UUID, now: datetime
 ) -> None:
@@ -266,6 +373,40 @@ async def list_open_wake_sessions(
             )
         ).scalars()
     )
+
+
+async def list_wake_limits_hit(
+    session: AsyncSession, *, agent_id: uuid.UUID, now: datetime
+) -> list[dict[str, Any]]:
+    """Limits that stopped wakes for this agent in the last hour, newest first.
+
+    One entry per conversation for the per-conversation limit and one (with a null
+    ``conversation_id``) for the per-agent cap, each with how many events it held
+    back and when it last did. Read-only.
+    """
+    kind = case((WakeEvent.last_error.like("agent wake cap%"), "agent"), else_="conversation")
+    scope = case((kind == "agent", None), else_=WakeEvent.conversation_id)
+    rows = (
+        await session.execute(
+            select(kind, scope, func.count(), func.max(WakeEvent.created_at))
+            .where(
+                WakeEvent.recipient_agent_id == agent_id,
+                WakeEvent.status == "suppressed",
+                WakeEvent.created_at > now - _AGENT_CAP_WINDOW,
+            )
+            .group_by(kind, scope)
+            .order_by(func.max(WakeEvent.created_at).desc())
+        )
+    ).all()
+    return [
+        {
+            "limit": limit,
+            "conversation_id": None if conversation is None else str(conversation),
+            "suppressed_count": count,
+            "last_suppressed_at": last.isoformat(),
+        }
+        for limit, conversation, count, last in rows
+    ]
 
 
 async def close_wake_session(
@@ -313,10 +454,15 @@ async def close_wake_session(
 
 
 __all__ = [
+    "WAKE_AGENT_HOURLY_EVENT_CAP",
+    "WAKE_CONVERSATION_EVENT_LIMIT",
+    "WAKE_CONVERSATION_LIMIT_WINDOW_SECONDS",
     "WAKE_SESSION_WINDOW_SECONDS",
     "close_wake_session",
     "close_wake_sessions_for_conversation",
     "list_open_wake_sessions",
+    "list_wake_limits_hit",
     "record_invite_wake_events",
     "record_message_wake_events",
+    "wake_limits",
 ]

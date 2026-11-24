@@ -232,6 +232,24 @@ def log_scope_denial(
         _fallback_logger.warning("log_scope_denial failed to emit event", exc_info=True)
 
 
+def log_wake_suppressed(
+    *, limit: Literal["conversation", "agent"], recipient_agent_id: str, conversation_id: str
+) -> None:
+    """Emit a ``wake_suppressed`` event: the loop guard held back a wake event (TECH-9883).
+
+    Count these for the metric. IDs only, never message content.
+    """
+    try:
+        obs_log.info(
+            "wake_suppressed",
+            limit=limit,
+            recipient_agent_id=recipient_agent_id,
+            conversation_id=conversation_id,
+        )
+    except Exception:
+        _fallback_logger.warning("log_wake_suppressed failed to emit event", exc_info=True)
+
+
 __all__ = [
     "SERVICE_NAME",
     "configure_logging",
@@ -241,5 +259,6 @@ __all__ = [
     "log_scope_denial",
     "log_tool_call",
     "log_user_active",
+    "log_wake_suppressed",
     "obs_log",
 ]
