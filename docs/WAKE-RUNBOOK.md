@@ -246,7 +246,9 @@ Fallback if the board's admin tools cannot be reached: set
 `infrastructure/environments/{dev,prod}/terraform.tfvars` of rh-data-platform and apply
 (this restarts the board; a prod apply is a local targeted plan, see #13845). The delivery
 task then sends nothing, re-checks every 60 seconds and does not use up attempts, so no
-event is lost for 24 hours. Put the value back (dev `rh-agents-dev.drum-mackarel.ts.net`,
+event is lost for 24 hours. Events stay `pending` or `retry` meanwhile, so
+`wake-oldest-undelivered` fires after 5 minutes and `wake-dead-lettered` after 24 hours,
+like an operator pause. Put the value back (dev `rh-agents-dev.drum-mackarel.ts.net`,
 prod `rh-agents.drum-mackarel.ts.net`) and apply to resume.
 
 ### Stop one org
@@ -257,9 +259,13 @@ on, Paperclip answers every signed wake event for a registered agent of that org
 issue, no comment, no run). The board holds all events for each of those agents and probes
 each one every 5 minutes. Turn the setting back on and the next probe is accepted and the
 held events flow in order. Each event still dies 24 hours after it was recorded, so decide
-within a day: after that, requeue (section 4) what you still want. Held events do not
-raise the "oldest undelivered" alarm (they are `retry_later`, not waiting for delivery), so
-nobody is paged for a deliberate org stop. Turning the setting off does not unregister
+within a day: after that, requeue (section 4) what you still want. Warning: an
+org stop can still raise `wake-oldest-undelivered`. Only the event the board is probing is
+marked `retry_later`; later events for those agents stay `pending` while the probe is held,
+and a `pending` event older than 5 minutes trips the alarm. Expect a page if messages keep
+arriving for the stopped org, and `wake-dead-lettered` after 24 hours when held events
+expire. Tell whoever is on call before you stop an org. This was not exercised on dev (the
+Paperclip change was not deployed there at the time of the test). Turning the setting off does not unregister
 anyone and does not stop new agents from being created; it only makes Paperclip refuse to
 run wakes. Use unsubscribe (section 5) if the agents should leave wake for good.
 
@@ -287,7 +293,7 @@ waiting for delivery: `pending` and `retry`), `retry_later_count` and
 | `wake-oldest-undelivered` | the oldest waiting event is older than 5 minutes | Delivery is stuck or slow: delivery paused, Paperclip failing or unreachable (retry backoff), or the loop stalled | `comms_admin_wake_delivery_status()`. If paused, was it on purpose? Resume. If not paused, list events with status `retry` or `pending` (section 3) and read `last_error`. Check Paperclip health and the board log |
 | `wake-dead-lettered` | any event died in the last 5 minutes | An event gave up: 401 (secret mismatch, section 6), retries used up (Paperclip down about 45 minutes), or it aged out after 24 hours | `comms_admin_wake_events_list(status="dead")`, fix the cause, requeue (section 4) |
 | `wake-loop-guard` | any `wake_suppressed` in the last 5 minutes | Two agents are answering each other and the loop guard cut off wake events (section 7) | Find the conversation, stop the exchange |
-| `wake-loop-down` | no stats event for 15 minutes | The delivery task is not running: the board is down, restarting in a loop, or the task crashed | Check the ECS service `rh-reclaw-comms` and its log for `wake delivery tick failed`. The 15 minutes covers a normal deploy |
+| `wake-loop-down` | no stats event for 15 minutes | The delivery task is not running: the board is down, restarting in a loop, or the task crashed | Check the ECS service `rh-reclaw-comms`: stopped or restarting tasks and their log (container start and exit lines). A tick failure (`wake delivery tick failed`) does not cause this alarm, because the loop keeps running and keeps emitting stats. The 15 minutes covers a normal deploy |
 
 Timings seen on dev (2026-11-24): after a pause with one event held, `oldest-undelivered`
 went to ALARM about 6 minutes 40 seconds later (the 5 minute threshold, plus up to a minute
@@ -296,10 +302,11 @@ was delivered within seconds. An alarm that is still ALARM for a couple of minut
 resumed is normal. The four alarms did not flap, and a normal 3 minute deploy cannot trip
 `wake-loop-down` (three 5 minute periods must all be empty).
 
-None of these means a message was lost. `retry_later` events (a paused agent, an org that is
-switched off) are shown separately and do not alarm. The metric `WakeTickFailed` counts
-`wake delivery tick failed` log lines; it has no alarm, but a rising count explains a
-stalled loop.
+None of these means a message was lost. `retry_later` events (the event of a paused agent that the board is probing) are shown
+separately and are not counted in the alarmed age; but see the org stop warning in section
+8: events queued behind a `retry_later` event are `pending` and are counted. The metric `WakeTickFailed` counts
+`wake delivery tick failed` log lines; it has no alarm, but a rising count explains events that are not being
+delivered.
 
 ## 10. Roll back the board release
 
