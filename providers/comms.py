@@ -57,6 +57,7 @@ import auth
 import plugins
 import service
 import subscriptions
+import wake_admin
 import wake_events
 import wake_rules
 import wake_targets
@@ -72,6 +73,7 @@ from exceptions import (
     InvalidConversationStateError,
     InvalidExtendError,
     InvalidOwnerReassignmentError,
+    InvalidWakeEventError,
     InvalidWakeRuleError,
     InvalidWakeTargetError,
     RateLimitExceededError,
@@ -471,6 +473,7 @@ async def _map_service_errors(error_cls: type[Exception] = ToolError) -> AsyncIt
     except (
         InvalidExtendError,
         InvalidOwnerReassignmentError,
+        InvalidWakeEventError,
         InvalidWakeRuleError,
         InvalidWakeTargetError,
     ) as exc:
@@ -1310,6 +1313,85 @@ async def admin_wake_target_remove(agent_id: str) -> dict[str, Any]:
             actor_sub=actor_sub,
             admin_authorized=admin_authorized,
             agent_id=target_id,
+        )
+
+
+@comms_server.tool
+async def admin_wake_events_list(
+    agent_id: str | None = None,
+    conversation_id: str | None = None,
+    status: str | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Admin-gated: list wake events, newest first, to see what failed and why (TECH-9913).
+
+    Requires the caller's token to carry the ``comms:admin`` scope (or be an
+    interactive/Okta caller). A caller without it gets the standard
+    anti-enumeration ``access_denied`` error.
+
+    - ``agent_id``: optional UUID of the recipient agent.
+    - ``conversation_id``: optional UUID of the conversation.
+    - ``status``: optional, one of ``pending``, ``retry``, ``retry_later``,
+      ``delivered``, ``failed``, ``dead``. ``dead`` is a dead-lettered event
+      (retries ran out, or 24 hours passed).
+    - ``limit``: 1 to 200, default 50.
+
+    Returns ``{"events": [...], "has_more": bool}``. Each event has
+    ``event_id``, ``recipient_agent_id``, ``conversation_id``,
+    ``sender_agent_id``, ``kind``, ``seq``, ``message_type``, ``reason``,
+    ``status``, ``attempt_count``, ``next_attempt_at``, ``last_error`` (a short
+    fixed phrase), ``created_at`` and ``delivered_at``. Never a secret, a
+    signature, a session reference or a request or response body.
+    """
+    token = _require_token()
+    actor_sub = _require_identity(token)
+    admin_authorized = is_interactive_token(token) or "comms:admin" in scopes_for_token(token)
+    agent = None if agent_id is None else _parse_uuid("agent_id", agent_id)
+    conversation = (
+        None if conversation_id is None else _parse_uuid("conversation_id", conversation_id)
+    )
+
+    async with get_session_factory()() as session, _map_service_errors():
+        return await wake_admin.list_wake_events(
+            session,
+            actor_sub=actor_sub,
+            admin_authorized=admin_authorized,
+            agent_id=agent,
+            conversation_id=conversation,
+            status=status,
+            limit=limit,
+        )
+
+
+@comms_server.tool
+async def admin_wake_event_requeue(event_id: str) -> dict[str, Any]:
+    """Admin-gated: send a failed or dead wake event again (TECH-9913).
+
+    Use after fixing the cause (a missing address, a wrong host, a receiver that
+    was down). The event becomes a ``retry`` event due now with a fresh attempt
+    count and a fresh 24 hour life, and goes through the normal delivery task: a
+    message still goes before any later unfinished message for the same recipient
+    and conversation (an invite is ordered by its new recorded time), and it does
+    not disturb an event being sent. It may arrive after
+    later events that were already delivered; the agent reads the board from the
+    event's ``seq`` onward. Audited as ``wake_event.requeued``.
+
+    Requires the caller's token to carry the ``comms:admin`` scope (or be an
+    interactive/Okta caller), same as ``comms_admin_wake_events_list``.
+
+    - ``event_id``: UUID of a wake event whose status is ``failed`` or ``dead``.
+      Any other status is rejected.
+
+    Returns ``event_id``, ``status`` (``retry``) and ``next_attempt_at``.
+    """
+    token = _require_token()
+    actor_sub = _require_identity(token)
+    admin_authorized = is_interactive_token(token) or "comms:admin" in scopes_for_token(token)
+    event = _parse_uuid("event_id", event_id)
+
+    async with get_session_factory()() as session, _map_service_errors():
+        return await wake_admin.requeue_wake_event(
+            session, actor_sub=actor_sub, admin_authorized=admin_authorized, event_id=event
         )
 
 

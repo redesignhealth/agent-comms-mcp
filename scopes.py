@@ -59,10 +59,11 @@ from observability import log_auth_rejected
 #             (gating a privileged PARAMETER within an already-scoped
 #             tool, as opposed to a route-level auth gate like
 #             ``main.py``'s ``/admin/agents/reconcile-ownership``) are
-#             exactly the six: ``comms_set_agent_shared``,
+#             exactly the eight: ``comms_set_agent_shared``,
 #             ``comms_deregister_agent``, ``comms_admin_register``,
-#             ``comms_request_owner_reassignment`` (TECH-7389), and
-#             ``comms_admin_wake_target_set``/``_remove`` (TECH-9908) --
+#             ``comms_request_owner_reassignment`` (TECH-7389),
+#             ``comms_admin_wake_target_set``/``_remove`` (TECH-9908), and
+#             ``comms_admin_wake_events_list``/``_event_requeue`` (TECH-9913) --
 #             enforced by
 #             ``tests/test_scopes.py::TestCommsAdminConsumers``, which
 #             will fail if a future PR adds another without updating
@@ -141,6 +142,12 @@ TOOL_SCOPES: dict[str, str] = {
     # comms:write token point an agent's wake events at another address.
     "comms_admin_wake_target_set": "comms:write",
     "comms_admin_wake_target_remove": "comms:write",
+    # TECH-9913: same arrangement. The list is registered at comms:read and the
+    # requeue at comms:write, and both are enforced by the same in-handler
+    # comms:admin-or-interactive check, so no plain comms:read token can list
+    # another agent's wake events.
+    "comms_admin_wake_events_list": "comms:read",
+    "comms_admin_wake_event_requeue": "comms:write",
     # Registered at comms:write deliberately -- the actual authorization
     # (comms:admin OR an interactive/Okta caller) is enforced by an
     # in-handler check, not by this table.

@@ -518,6 +518,11 @@ class InvalidWakeTargetError(Exception):
     message is client-safe and never contains the secret."""
 
 
+class InvalidWakeEventError(ValueError):
+    """An admin wake event list or requeue request was rejected (TECH-9913): an
+    unknown status, an unknown event, or an event that is not failed or dead."""
+
+
 class WakeTargetMisconfiguredError(Exception):
     """The operator settings that wake target registration depends on are missing or
     malformed (TECH-9908): ``WAKE_TARGET_ALLOWED_HOSTS`` or ``WAKE_TARGET_SECRET_KEY``.
@@ -576,6 +581,7 @@ __all__ = [
     "InvalidExtendError",
     "InvalidOwnerReassignmentError",
     "InvalidProposalActionError",
+    "InvalidWakeEventError",
     "InvalidWakeRuleError",
     "InvalidWakeTargetError",
     "ProposalImmutableError",
