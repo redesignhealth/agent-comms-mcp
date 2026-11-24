@@ -38,7 +38,8 @@ Before you write a create or upsert, call catalog_get(target_key) with the same 
 returns {target_key, target_type, exists, status, version, payload}:
 - exists false -> propose a create (a capability map is never created: see "Capability map" below,
   it is always an upsert, with no base_version while no map exists). For a pair whose concept is
-  not in the catalog either (catalog_get("concept:<slug>") says exists false), see "New concept with its first row" below.
+  not in the catalog either (catalog_get("concept:<slug>") says exists false), see "New concept
+  with its first row" below.
 - exists true -> propose an upsert, never a create. Start from "payload" (the row in the payload
   shape below). For a pair, send "version" as base_version; a concept has no version, so send none.
 - status "deleted" (exists is still true): the target was soft-deleted; an upsert restores it.
