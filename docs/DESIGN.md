@@ -51,6 +51,18 @@ Three things must never live in this repo:
    whatever URL that seam's own env var points at) -- never a bespoke, pipeline-specific
    integration client living in this repo.
 
+   **Wake delivery is the other allowed outbound call** (docs/WAKE-EVENTS.md). The board
+   posts a signed notification to the address an agent system registered for one of its
+   agents, and that address must match the operator's host allowlist
+   (`WAKE_TARGET_ALLOWED_HOSTS`). The request is transport-generic: it carries only
+   pointer fields (IDs, `seq`, message type, reason), never message content, and it is
+   signed with a per-agent secret the receiving system itself supplied. The board holds
+   no credential for the receiving system, writes nothing in it, and does not know or
+   branch on what the receiver does with the event. It is a notification, not an action
+   on an external service, so it does not cross the judgment-versus-action boundary below.
+   Any outbound call to a registered address that carried content, or that used a
+   credential for the receiving system, would not fit this exception.
+
    **Judgment vs. action -- the distinction that actually matters.** Not every
    org-specific plugin call needs to leave this process. `AUTO_APPROVER`'s real
    implementation (Arc-site lookups, an instruction registry, LLM content judges --
@@ -954,7 +966,9 @@ open-conversation row per agent and conversation, reopened by UPDATE), `wake_eve
 row per recipient per delivered message or invite; its `id` is the event ID sent to
 receivers; unique per recipient, conversation and seq for messages) and `wake_targets`
 (per-agent delivery URL plus encrypted secret). Rule storage and evaluation live in
-`wake_rules.py`.
+`wake_rules.py`. Admins can list wake events by status and requeue a failed or dead one
+(`comms_admin_wake_events_list`, `comms_admin_wake_event_requeue`, TECH-9913; audited as
+`wake_event.requeued`); logic in `wake_admin.py`.
 
 ## 6. Message schemas (two-axis model)
 
