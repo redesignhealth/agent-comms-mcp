@@ -57,6 +57,7 @@ from models import WakeEvent, WakeSession, WakeTarget
 from proposal_apply_http_client import tailnet_proxy_mounts
 from service import _audit
 from wake_events import WAKE_SESSION_WINDOW_SECONDS
+from wake_pause import is_delivery_paused
 from wake_secrets import decrypt_secret
 from wake_targets import WAKE_TARGET_ALLOWED_HOSTS_ENV_VAR, host_is_allowed, parse_allowed_hosts
 
@@ -316,6 +317,12 @@ class WakeDelivery:
         """Dead-letter expired events, claim what is due and start sending it. Returns claims."""
         now = self._clock()
         await self._dead_letter_expired(now)
+        # Paused (docs/WAKE-EVENTS.md section 11): claim and send nothing, leave
+        # attempt counts alone. If the read fails the tick fails (logged by the
+        # loop) and nothing is sent: the claim that follows needs the same database.
+        async with self._session_factory()() as session:
+            if await is_delivery_paused(session):
+                return 0
         free = self._max_concurrent - len(self._in_flight)
         if free <= 0:
             return 0

@@ -333,13 +333,16 @@ at an agent system. B's catch-all rule is still `wake`.
 
 ## 11. Operator tools
 
-Two admin-gated board tools (the `comms:admin` scope, or an interactive caller) let an
-operator see and repair stuck events:
+Admin-gated board tools (the `comms:admin` scope, or an interactive caller) let an
+operator see and repair stuck events and pause delivery:
 
 | Tool | Effect |
 |---|---|
 | `comms_admin_wake_events_list(agent_id?, conversation_id?, status?, limit?)` | Lists events newest first (any status, including `suppressed`), with `status`, `attempt_count`, `next_attempt_at` and the short `last_error`. Never returns a secret, a signature, a session reference or a request or response body. |
 | `comms_admin_wake_event_requeue(event_id)` | Turns a `failed` or `dead` event back into a `retry` event due now. Any other status is refused. |
+| `comms_admin_wake_delivery_pause(reason?)` | Pauses all wake sending (see below). Idempotent; audited as `wake_delivery.paused`. |
+| `comms_admin_wake_delivery_resume()` | Resumes wake sending. Idempotent; audited as `wake_delivery.resumed`. |
+| `comms_admin_wake_delivery_status()` | Returns `paused`, `paused_at`, `paused_by` and `reason`. |
 
 A requeue restarts the attempt count, clears `last_error` and sets the event's recorded
 time to now, so the 24 hour limit starts again (an event that died of age would otherwise
@@ -350,6 +353,14 @@ cannot collide with a send, and the ordering rule in section 5 applies, so a req
 event still goes before later unfinished events of its recipient and conversation. It may
 arrive after later events that were already delivered; the agent reads the board from
 `seq` onward, so this does no harm.
+
+The pause switch is one row in `wake_delivery_state` (no row means not paused; it ships
+un-paused and is not a feature flag). While paused, each pass of the delivery task still
+dead-letters events older than 24 hours but claims and sends nothing and does not change
+any attempt count. Events are still recorded as usual. On resume the backlog goes out in
+the normal order; events that passed 24 hours while paused are `dead` and can be requeued.
+A failure to read the switch fails that pass (logged as `wake delivery tick failed`) and
+nothing is sent.
 
 ## 12. Not in scope
 

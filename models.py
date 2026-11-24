@@ -1171,6 +1171,22 @@ class WakeTarget(Base):
     updated_at: Mapped[datetime] = _updated_at()
 
 
+class WakeDeliveryState(Base):
+    """The wake delivery pause switch: at most one row (``id`` is always 1).
+
+    No row means not paused. The delivery task reads it every tick.
+    """
+
+    __tablename__ = "wake_delivery_state"
+    __table_args__ = (CheckConstraint("id = 1", name="ck_wake_delivery_state_single_row"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    paused: Mapped[bool] = mapped_column(nullable=False, server_default=text("false"))
+    paused_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    paused_by: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 __all__ = [
     "AGENT_STATUSES",
     "APPROVAL_HOLD_AUTO_DECISIONS",
@@ -1197,6 +1213,7 @@ __all__ = [
     "Participant",
     "ProposalBotLogSeq",
     "ProposalHold",
+    "WakeDeliveryState",
     "WakeEvent",
     "WakeRule",
     "WakeSession",
