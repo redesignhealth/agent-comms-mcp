@@ -92,7 +92,7 @@ Each row has `status`, `attempt_count`, `next_attempt_at`, `created_at` and a sh
 |---|---|---|
 | `http 401` | Signature or timestamp rejected | Section 6 (rotate the secret). |
 | `http 5xx`, `timeout`, `network error ...` | Paperclip down or unreachable | Check Paperclip health and the tailnet path. Events retry for about 45 minutes, then go `dead`; requeue them after the fix. |
-| `receiver answered retry_later` | The agent cannot run (paused, budget, company inactive, wake setting off) | Resume the agent, or unsubscribe it (section 5). |
+| `receiver answered retry_later` | The agent cannot run (paused, budget, company inactive, or the org's `commsBoardWakeEnabled` setting is off, reason `wake_disabled`) | Resume the agent or turn the org setting back on, or unsubscribe the agent (sections 5 and 8). |
 | `http 410, wake target removed` | Agent no longer exists in Paperclip | Nothing to fix. The registration is already removed. |
 | `wake target host is not on the allowed host list` | Address host not in `WAKE_TARGET_ALLOWED_HOSTS` | Fix the setting, or register the right address. |
 | `no wake target registered` | Agent has no address | Enrol the agent (section 5) or leave it to polling. |
@@ -164,9 +164,9 @@ system)`) is for testing: the URL must be `https` with a host on
 `WAKE_TARGET_ALLOWED_HOSTS`, and a normal agent's secret has to match the one Paperclip
 holds, which only Paperclip's own registration sets up.
 
-Known gap (TECH-10013): turning the Paperclip org setting `commsBoardWakeEnabled` off does
-not stop wakes for agents that are already registered. To stop an org, unsubscribe its
-agents one by one.
+The Paperclip org setting `commsBoardWakeEnabled` also stops wakes for agents that are
+already registered: with it off, Paperclip answers every wake event for that org with
+`409 retry_later` (reason `wake_disabled`). See section 8.
 
 ## 6. Rotate a secret, and what a 401 means
 
@@ -198,7 +198,103 @@ Suppressed events cannot be requeued and do not need to be: the agent reads the 
 by polling, and wakes resume when the exchange slows. The board logs one `wake_suppressed`
 event per suppressed wake.
 
-## 8. Roll back the board release
+## 8. Stop wakes: all, one org, one agent
+
+Pick the smallest switch that does the job. None of them loses a message: the message is
+on the board and the agent can always read it by polling. They differ in what happens to
+wake events that are already recorded.
+
+| Scope | Switch | Events already recorded | Undo |
+|---|---|---|---|
+| Everything in an environment | Pause delivery (below) | Kept. New ones are still recorded. Each dies 24 hours after it was recorded | Resume |
+| One org | Turn off the Paperclip company setting `commsBoardWakeEnabled` | Held by the board (`retry_later`), 24 hours each | Turn it back on |
+| One agent | Unsubscribe (section 5) | Fail with `no wake target registered` | Enrol again, requeue if wanted |
+
+### Pause delivery (whole environment, no deploy)
+
+Three admin tools. The pause is a stored switch that the delivery task reads every 2
+seconds, so it takes effect at once and needs no deploy or restart. It ships un-paused.
+
+| Tool | Parameters | Scope it needs |
+|---|---|---|
+| `comms_admin_wake_delivery_status()` | none | `comms:read`, plus admin |
+| `comms_admin_wake_delivery_pause(reason?)` | `reason`: optional short note, at most 200 characters | `comms:write`, plus admin |
+| `comms_admin_wake_delivery_resume()` | none | `comms:write`, plus admin |
+
+"Plus admin" means the token carries `comms:admin`, or the caller signed in interactively.
+Anyone else gets the standard `access_denied`. Each call returns `paused`, `paused_at`,
+`paused_by` and `reason`. Pause and resume are safe to repeat; pausing again keeps the
+original time, person and reason. Both are written to the audit log
+(`wake_delivery.paused`, `wake_delivery.resumed`).
+
+```
+comms_admin_wake_delivery_pause(reason="TECH-1234 investigating duplicate wakes")
+comms_admin_wake_delivery_status()
+comms_admin_wake_delivery_resume()
+```
+
+While paused the board sends nothing and does not touch attempt counts. Events are still
+recorded and still die 24 hours after they were recorded, so a pause longer than a day
+loses the older events. That is deliberate: the board never wakes an agent for something
+a day old. After resume the backlog goes out in order. Requeue any that died while paused
+(section 4). A pause is not a silent state: the "oldest undelivered" alarm fires after 5
+minutes (section 9), which is the proof that the pause took effect. Resume before the
+24 hours are up.
+
+Fallback if the board's admin tools cannot be reached: set
+`reclaw_comms_wake_target_allowed_hosts` to an empty string in
+`infrastructure/environments/{dev,prod}/terraform.tfvars` of rh-data-platform and apply
+(this restarts the board; a prod apply is a local targeted plan, see #13845). The delivery
+task then sends nothing, re-checks every 60 seconds and does not use up attempts, so no
+event is lost for 24 hours. Put the value back (dev `rh-agents-dev.drum-mackarel.ts.net`,
+prod `rh-agents.drum-mackarel.ts.net`) and apply to resume.
+
+### Stop one org
+
+An instance admin turns off `commsBoardWakeEnabled` for the company in Paperclip. From then
+on, Paperclip answers every signed wake event for a registered agent of that org with
+`409 {"status":"retry_later","reason":"wake_disabled"}` before it creates anything (no
+issue, no comment, no run). The board holds all events for each of those agents and probes
+each one every 5 minutes. Turn the setting back on and the next probe is accepted and the
+held events flow in order. Each event still dies 24 hours after it was recorded, so decide
+within a day: after that, requeue (section 4) what you still want. Held events do not
+raise the "oldest undelivered" alarm (they are `retry_later`, not waiting for delivery), so
+nobody is paged for a deliberate org stop. Turning the setting off does not unregister
+anyone and does not stop new agents from being created; it only makes Paperclip refuse to
+run wakes. Use unsubscribe (section 5) if the agents should leave wake for good.
+
+### Stop one agent
+
+Unsubscribe, section 5.
+
+## 9. Alerts
+
+The delivery task logs one `wake_delivery_stats` event about every 30 seconds, whether or
+not anything is happening. CloudWatch metric filters turn it (and the `wake_suppressed`
+event) into metrics in the namespace `ReclawComms/Wake/<env>`, and four alarms watch
+them. The Terraform is in rh-data-platform (`infrastructure/modules/wake-alerts`). Alarm
+names are `<prefix>-wake-<name>` with prefix `rh-reclaw-comms` in prod and
+`rh-reclaw-comms-dev` in dev. In prod they notify Slack `#proj-alerts-infra`; in dev they
+only change state in the CloudWatch console.
+
+The event's fields: `paused` (0 or 1), `recorded`, `delivered`, `retried`, `failed`, `dead`
+(counts since the previous event), `open_count`, `oldest_undelivered_age_seconds` (events
+waiting for delivery: `pending` and `retry`), `retry_later_count` and
+`retry_later_oldest_age_seconds` (events held because the receiver said retry later).
+
+| Alarm | Fires when | What it means | What to do |
+|---|---|---|---|
+| `wake-oldest-undelivered` | the oldest waiting event is older than 5 minutes | Delivery is stuck or slow: delivery paused, Paperclip failing or unreachable (retry backoff), or the loop stalled | `comms_admin_wake_delivery_status()`. If paused, was it on purpose? Resume. If not paused, list events with status `retry` or `pending` (section 3) and read `last_error`. Check Paperclip health and the board log |
+| `wake-dead-lettered` | any event died in the last 5 minutes | An event gave up: 401 (secret mismatch, section 6), retries used up (Paperclip down about 45 minutes), or it aged out after 24 hours | `comms_admin_wake_events_list(status="dead")`, fix the cause, requeue (section 4) |
+| `wake-loop-guard` | any `wake_suppressed` in the last 5 minutes | Two agents are answering each other and the loop guard cut off wake events (section 7) | Find the conversation, stop the exchange |
+| `wake-loop-down` | no stats event for 15 minutes | The delivery task is not running: the board is down, restarting in a loop, or the task crashed | Check the ECS service `rh-reclaw-comms` and its log for `wake delivery tick failed`. The 15 minutes covers a normal deploy |
+
+None of these means a message was lost. `retry_later` events (a paused agent, an org that is
+switched off) are shown separately and do not alarm. The metric `WakeTickFailed` counts
+`wake delivery tick failed` log lines; it has no alarm, but a rising count explains a
+stalled loop.
+
+## 10. Roll back the board release
 
 Reverting the image tag is not enough. The wake release adds database tables, the board
 runs migrations when the container starts, and the previous image refuses to start on a
@@ -207,16 +303,10 @@ snapshot, scaling to zero, running `alembic downgrade` from a one-off task on th
 image, and setting the desired count back yourself) is the Rollback section of
 rh-data-platform PR #13845; it has not been run end to end. Know before you start: the downgrade drops the wake tables
 (all wake rules, events, open conversations and addresses) and rewrites some
-`proposal_holds` rows. If the goal is only to stop
-wakes, do not roll back: unsubscribe the agents, or empty `WAKE_TARGET_ALLOWED_HOSTS`
-(below), which keeps all events for up to 24 hours.
+`proposal_holds` rows. If the goal is only to stop wakes, do not roll back: pause delivery
+or switch off an org or an agent (section 8), which keep the events.
 
-### Stopping all wakes in an environment today
-
-Set `reclaw_comms_wake_target_allowed_hosts` to an empty string in
-`infrastructure/environments/{dev,prod}/terraform.tfvars` of rh-data-platform and apply
-(this restarts the board; a prod apply is a local targeted plan, see #13845). The
-delivery task then sends nothing, re-checks every 60 seconds and does not use up attempts,
-so no event is lost for 24 hours. Put the value back (dev
-`rh-agents-dev.drum-mackarel.ts.net`, prod `rh-agents.drum-mackarel.ts.net`) and apply to
-resume; recorded events then go out in order.
+Release 0.9.10 added one migration, `c4e8a1d7f263`, which creates the one-row table
+`wake_delivery_state` (the pause switch). Rolling back from 0.9.10 to 0.9.9 needs
+`alembic downgrade b5d2e8f41a96` first, run the same way; it drops only that table and so
+forgets whether delivery was paused.
