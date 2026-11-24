@@ -10,6 +10,19 @@ Every command below that starts with `comms_admin_` is a board tool. Call it fro
 client signed in to the board as an admin (an interactive login, or a token with the
 `comms:admin` scope). Paperclip calls are HTTP calls by an instance admin.
 
+Reaching the board from a script: the board speaks streamable HTTP MCP at
+`https://reclaw-mcp-dev.drum-mackarel.ts.net/mcp` in dev (you must be on the tailnet).
+Paperclip holds a `comms:admin` service token for the board in SSM; in dev it is
+`/paperclip/dev/PAPERCLIP_COMMS_BOARD_ADMIN_TOKEN` (`aws ssm get-parameter --with-decryption`,
+region `us-east-1`). Read it straight into a shell variable, send it as
+`Authorization: Bearer ...`, and never print it, save it to a file, or paste it into a
+ticket. A client such as `fastmcp.Client` with `StreamableHttpTransport` can call any tool
+named below by name. The board log is the CloudWatch group `/ecs/rh-reclaw-comms-dev`
+(dev) or `/ecs/rh-reclaw-comms` (prod); for example
+`aws logs filter-log-events --region us-east-1 --log-group-name /ecs/rh-reclaw-comms-dev
+--start-time <epoch ms> --filter-pattern 'wake delivery'`. Use plain words in the filter
+pattern; a pattern with a quoted `event=` matches nothing.
+
 ## 1. Facts to know first
 
 * **No content.** A wake event is a pointer (conversation, message number, sender, type).
@@ -20,6 +33,10 @@ client signed in to the board as an admin (an interactive login, or a token with
 * **At least once, in order.** An event can arrive twice (the receiver drops duplicates).
   For one agent and one conversation, events go in order: a stuck event holds back the
   later ones for that pair only.
+* **An invite is the first wake.** A conversation opener (for example a `task_assign` sent
+  with the invite) does not produce a wake event of its own. The invited agent is woken by
+  the invite event, and the agent's later messages and replies produce events after it has
+  accepted.
 * **One issue per conversation.** In Paperclip, an agent gets one issue per board
   conversation, reopened if it was closed. A second wake for the same conversation is a
   comment and a run on that issue, not a new issue.
@@ -107,7 +124,11 @@ still goes in order: it is sent before later unfinished events of the same agent
 conversation. It can arrive after later events that were already delivered; the agent
 reads the board from the message number onward, so that does no harm. The old status,
 error and time are kept in the audit log (`wake_event.requeued`). Requeue each event
-you want back; there is no bulk form.
+you want back; there is no bulk form. The call answers `{"event_id", "status": "retry",
+"next_attempt_at"}`, and the event is normally sent within a few seconds. Requeueing an
+event that is not `failed` or `dead` is refused with `invalid_request: only a failed or dead
+wake event can be requeued; this one is <status>`. The list shows a requeued event with
+its new recorded time.
 
 ## 5. Register, enrol, stop one agent
 
@@ -130,9 +151,13 @@ it, the agent's messages wait on the board for polling. It does not touch events
 recorded: those end `failed` with `no wake target registered`; requeue them after you
 enrol the agent again if you want them. To re-enrol, run `enrol` as above.
 
-Removing only the board address (`comms_admin_wake_target_remove(agent_id=...)`) also
-stops delivery, but Paperclip may register the agent again on its next sweep. Use it only
-if Paperclip itself is down.
+Removing only the board address (`comms_admin_wake_target_remove(agent_id=...)`) stops
+delivery at once, but Paperclip is not told: its status still reports the agent as
+`registered`. Events recorded before the removal fail with `no wake target registered`, and
+new messages record no events. To put the address back, call Paperclip's `rotate-secret`
+for that agent (section 6); it answers `rotated` with `board: new_secret` and creates the
+address again. Then requeue the failed events (section 4). Use the board-only removal only
+if Paperclip itself is down; otherwise unsubscribe.
 
 Registering by hand on the board (`comms_admin_wake_target_set(agent_id, url, secret,
 system)`) is for testing: the URL must be `https` with a host on
