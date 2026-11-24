@@ -209,6 +209,8 @@ TOOL_SCOPES: dict[str, str] = {
     "proposals_schema": PROPOSAL_SUBMIT_SCOPE,
     # TECH-9214: read-only read of one Arcadia catalog row (off unless configured).
     "catalog_get": PROPOSAL_SUBMIT_SCOPE,
+    # BLU-31: read-only read of Arcadia's capability rubric (same configuration as catalog_get).
+    "catalog_capabilities": PROPOSAL_SUBMIT_SCOPE,
     # Arcana private-brain source reads (TECH-7170): same bot-submit scope; the
     # board's own service read token does the Arcana-facing work, never the bot.
     "proposals_arcana_source_metadata": PROPOSAL_SUBMIT_SCOPE,

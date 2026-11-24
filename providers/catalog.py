@@ -1,4 +1,6 @@
-"""``catalog_get``: read one row of Arcadia's opportunity catalog (TECH-9214).
+"""``catalog_get`` and ``catalog_capabilities``: read Arcadia's opportunity catalog.
+
+``catalog_get``: read one row of Arcadia's opportunity catalog (TECH-9214).
 
 A bot proposing a ``catalog_candidate`` needs to know whether its target already
 exists (create versus upsert) and, for a concept-market pair, the version it is
@@ -21,10 +23,14 @@ Arcadia answers ``{target_key, target_type, exists, status, version, payload}``;
 a missing target is 200 ``{exists: false, status: null, version: null, payload:
 null}`` (so a 404 means the route is not deployed, never "no such row"), and a
 malformed key is 422 ``INVALID_TARGET_KEY``. The tool returns those six fields:
-``payload`` is the row in the version-2 candidate payload shape
+``payload`` is the row in the candidate payload shape
 (``proposals_schema`` explains it), ``status`` is ``active``, ``deleted`` (a
 soft-deleted target reads ``exists: true``; an upsert restores it) or ``null``,
-and ``version`` is the pair's current version (``null`` for a concept).
+and ``version`` is the pair's (or capability map's) current version (``null`` for a
+concept). A ``capability_map:<concept-slug>`` key reads the concept's current capability map.
+
+``catalog_capabilities`` reads ``GET {URL}/catalog/v1/capabilities`` (same token exchange):
+``{rubric_sha256, capabilities: [{capability, sub_capability, description}]}``.
 """
 
 from __future__ import annotations
@@ -56,6 +62,7 @@ DEFAULT_RATE_PER_MINUTE = 30
 MAX_RATE_PER_MINUTE = 600
 TOKEN_PATH = "/service/v1/token"
 ROWS_PATH = "/catalog/v1/rows/"
+CAPABILITIES_PATH = "/catalog/v1/capabilities"
 REFRESH_MARGIN = 120.0
 KEY_PREFIX = "rai_svc_"
 COOLDOWN_REJECTED = 300.0  # 401 INVALID_API_KEY: unknown or revoked; do not hammer
@@ -68,12 +75,19 @@ MAX_TARGET_LENGTH = 300
 MAX_CONTENT_BYTES = 256 * 1024
 
 _SLUG = r"[a-z0-9]+(?:-[a-z0-9]+)*"
-_TARGET_RE = re.compile(rf"concept:{_SLUG}|pair:{_SLUG}:[A-Z]{{2}}")
+_TARGET_RE = re.compile(rf"concept:{_SLUG}|pair:{_SLUG}:[A-Z]{{2}}|capability_map:{_SLUG}")
+_TARGET_FORMS = "concept:<slug>, pair:<concept-slug>:<MARKET> or capability_map:<concept-slug>"
+MAX_CAPABILITIES = 500
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 _NOT_CONFIGURED = "catalog_get is not configured"
 _UNAVAILABLE = (
     "catalog_unavailable: the catalog lookup is unavailable, so whether the row exists is "
     "unknown; try again later and do not propose a create meanwhile"
+)
+_UNAVAILABLE_RUBRIC = (
+    "catalog_unavailable: the capability rubric is unavailable; try again later and do not "
+    "guess capability labels"
 )
 
 
@@ -224,7 +238,7 @@ def project(data: Any) -> dict[str, Any] | None:
         return None
     if target_key is not None and not isinstance(target_key, str):
         return None
-    if target_type not in (None, "concept", "pair"):
+    if target_type not in (None, "concept", "pair", "capability_map"):
         return None
     return {
         "target_key": target_key,
@@ -242,14 +256,16 @@ async def get(target_key: str) -> dict[str, Any]:
     choose ``create`` or ``upsert`` and set ``base_version`` before calling
     ``proposals_submit(kind="catalog_candidate")``.
 
-    ``target_key`` is ``concept:<slug>`` or ``pair:<concept-slug>:<MARKET>``
-    (the same form as the proposal's ``target_id``). Returns ``{"target_key",
-    "target_type": "concept" | "pair", "exists": bool, "status": "active" |
+    ``target_key`` is ``concept:<slug>``, ``pair:<concept-slug>:<MARKET>`` or
+    ``capability_map:<concept-slug>`` (the same form as the proposal's ``target_id``).
+    Returns ``{"target_key", "target_type": "concept" | "pair" | "capability_map",
+    "exists": bool, "status": "active" |
     "deleted" | null, "version": int | null, "payload": object | null}``.
     ``exists`` false means propose a ``create``. ``exists`` true means propose an
-    ``upsert`` (never a create): for a pair send ``version`` as ``base_version``
-    (a concept has no version); ``payload`` is the row in the version-2 candidate
-    payload shape (see ``proposals_schema``). A soft-deleted target reads
+    ``upsert`` (never a create): for a pair or a capability map send ``version`` as
+    ``base_version`` (a concept has no version); ``payload`` is the row in the candidate
+    payload shape (see ``proposals_schema``); for a ``capability_map`` it is the
+    concept's current map and ``version`` its map version. A soft-deleted target reads
     ``exists: true, status: "deleted"``: an upsert restores it. If the lookup
     itself fails (``catalog_unavailable``) you do not know whether the row exists:
     do not propose a create. Available only when the board is configured for it
@@ -259,33 +275,14 @@ async def get(target_key: str) -> dict[str, Any]:
     if not isinstance(target_key, str) or not (
         len(target_key) <= MAX_TARGET_LENGTH and _TARGET_RE.fullmatch(target_key)
     ):
-        raise ToolError(
-            "invalid_request: target_key must be concept:<slug> or pair:<concept-slug>:<MARKET>"
-        )
+        raise ToolError(f"invalid_request: target_key must be {_TARGET_FORMS}")
     config = _config()
     if config is None:
         raise ToolError(_NOT_CONFIGURED)
     _check_rate(bot)
-    url, key = config
-    try:
-        async with build_client() as client, asyncio.timeout(30.0):
-            token = await _tokens.get(client, url, key)
-            if token is None:
-                raise ToolError(_UNAVAILABLE)
-            resp = await _read(client, url, token, target_key)
-            if resp.status_code == 401:
-                _tokens.invalidate(token)
-                token = await _tokens.get(client, url, key, force=True)
-                if token is None:
-                    raise ToolError(_UNAVAILABLE)
-                resp = await _read(client, url, token, target_key)
-    except (httpx.HTTPError, TimeoutError, ValueError) as exc:
-        logger.warning("catalog_get: read failed: %s", type(exc).__name__)
-        raise ToolError(_UNAVAILABLE) from None
+    resp = await _fetch(config, ROWS_PATH + quote(target_key, safe=":"), "catalog_get")
     if resp.status_code == 422:  # INVALID_TARGET_KEY: our own check should have caught it
-        raise ToolError(
-            "invalid_request: target_key must be concept:<slug> or pair:<concept-slug>:<MARKET>"
-        )
+        raise ToolError(f"invalid_request: target_key must be {_TARGET_FORMS}")
     # Arcadia answers 200 {"exists": false} for a row that is not there. A 404 means the
     # route itself is missing (not deployed): never read it as "does not exist", or an
     # agent would propose a create on a row that may exist.
@@ -302,8 +299,81 @@ async def get(target_key: str) -> dict[str, Any]:
     return shaped
 
 
-async def _read(client: httpx.AsyncClient, url: str, token: str, target_key: str) -> httpx.Response:
-    return await client.get(
-        url + ROWS_PATH + quote(target_key, safe=":"),
-        headers={"Authorization": f"Bearer {token}"},
-    )
+async def _fetch(config: tuple[str, str], path: str, tool: str) -> httpx.Response:
+    """GET ``path`` on Arcadia with the exchanged service token (one re-exchange on a 401).
+    Raises ``catalog_unavailable`` when the token or the read cannot be had."""
+    url, key = config
+    try:
+        async with build_client() as client, asyncio.timeout(30.0):
+            token = await _tokens.get(client, url, key)
+            if token is None:
+                raise ToolError(_UNAVAILABLE)
+            resp = await _read(client, url, token, path)
+            if resp.status_code == 401:
+                _tokens.invalidate(token)
+                token = await _tokens.get(client, url, key, force=True)
+                if token is None:
+                    raise ToolError(_UNAVAILABLE)
+                resp = await _read(client, url, token, path)
+    except (httpx.HTTPError, TimeoutError, ValueError) as exc:
+        logger.warning("%s: read failed: %s", tool, type(exc).__name__)
+        raise ToolError(_UNAVAILABLE) from None
+    return resp
+
+
+def project_capabilities(data: Any) -> dict[str, Any] | None:
+    """Only ``rubric_sha256`` and ``capabilities`` ({capability, sub_capability,
+    description}) from Arcadia's reply, checked; ``None`` if it is not that shape."""
+    if not isinstance(data, dict):
+        return None
+    digest, items = data.get("rubric_sha256"), data.get("capabilities")
+    if not isinstance(digest, str) or not _SHA256_RE.fullmatch(digest):
+        return None
+    if not isinstance(items, list) or len(items) > MAX_CAPABILITIES:
+        return None
+    out: list[dict[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            return None
+        row = {k: item.get(k) for k in ("capability", "sub_capability", "description")}
+        if not all(isinstance(v, str) for v in row.values()):
+            return None
+        out.append({k: str(v) for k, v in row.items()})
+    return {"rubric_sha256": digest, "capabilities": out}
+
+
+@catalog_server.tool
+async def capabilities() -> dict[str, Any]:
+    """Read-only: the capability rubric a concept's capability map is written
+    against. Call it before proposing ``catalog_candidate`` with target
+    ``capability_map:<concept-slug>``. Returns ``{"rubric_sha256": str,
+    "capabilities": [{"capability", "sub_capability", "description"}]}``: send
+    ``rubric_sha256`` as the map payload's ``rubric_sha256`` and use the two labels
+    exactly as listed (a label that is not in the list is refused as
+    ``UNKNOWN_CAPABILITY``, a stale hash as ``RUBRIC_MISMATCH``). This is Redesign
+    Health reference content, not site content. If the lookup fails
+    (``catalog_unavailable``) do not guess labels. Available only when the board is
+    configured for it (otherwise ``catalog_get is not configured``); shares
+    ``catalog_get``'s per-bot rate limit.
+    """
+    bot = _require_bot_sub()
+    config = _config()
+    if config is None:
+        raise ToolError(_NOT_CONFIGURED)
+    _check_rate(bot)
+    resp = await _fetch(config, CAPABILITIES_PATH, "catalog_capabilities")
+    if resp.status_code != 200 or len(resp.content) > MAX_CONTENT_BYTES:
+        logger.warning("catalog_capabilities: Arcadia answered HTTP %s", resp.status_code)
+        raise ToolError(_UNAVAILABLE_RUBRIC)
+    try:
+        shaped = project_capabilities(resp.json())
+    except ValueError:
+        shaped = None
+    if shaped is None:
+        logger.warning("catalog_capabilities: Arcadia's reply was not the expected shape")
+        raise ToolError(_UNAVAILABLE_RUBRIC)
+    return shaped
+
+
+async def _read(client: httpx.AsyncClient, url: str, token: str, path: str) -> httpx.Response:
+    return await client.get(url + path, headers={"Authorization": f"Bearer {token}"})

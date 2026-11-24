@@ -2,7 +2,7 @@
 
 ``proposals_schema(kind)`` returns this. Two kinds have a schema, each with a short guide:
 
-* ``catalog_candidate``: the vendored copy of Arcadia's payload JSON Schema (version 3). The
+* ``catalog_candidate``: the vendored copy of Arcadia's payload JSON Schema (version 4). The
   file is byte-identical to the copy the approvals service validates against and forwards with;
   ``catalog_candidate_payload.schema.pin.json`` beside it records Arcadia's commit and the
   file's sha256, and the tests pin both, so the two repos can only drift on purpose (the
@@ -34,8 +34,8 @@ Arcadia checks it again against the live catalog and may still refuse it; then t
 closed as rejected and proposals_get shows Arcadia's code and field errors in decision_note.
 
 Before you write a create or upsert, call catalog_get(target_key) with the same target_key
-("concept:<slug>" or "pair:<concept-slug>:<MARKET>"). It returns {target_key, target_type, exists,
-status, version, payload}:
+("concept:<slug>", "pair:<concept-slug>:<MARKET>" or "capability_map:<concept-slug>"). It
+returns {target_key, target_type, exists, status, version, payload}:
 - exists false -> propose a create. For a pair whose concept is not in the catalog either
   (catalog_get("concept:<slug>") says exists false), see "New concept with its first row" below.
 - exists true -> propose an upsert, never a create. Start from "payload" (the row in the payload
@@ -63,7 +63,7 @@ action fields (proposals_submit(kind="catalog_candidate", action=...)):
 - New concept with its first row: a brand-new idea is ONE proposal, a create of
   "pair:<slug>:<MARKET>" whose payload also carries "concept", an object with the fields of a
   concept create (slug, name, summary, domain_code, value_types). concept.slug must equal
-  concept_slug, the payload must say schema_version 3, and one approval creates the concept and
+  concept_slug, the payload must say schema_version 3 or 4, and one approval creates the concept and
   the row's first version. Rules: send "concept" only on a create and only when the concept does
   not exist (the concept exists -> never send it; otherwise Arcadia refuses with CONCEPT_EXISTS
   or, on an upsert, CONCEPT_NOT_ALLOWED); only one open candidate may create a given concept, so a
@@ -75,6 +75,18 @@ action fields (proposals_submit(kind="catalog_candidate", action=...)):
   technical, uptake) plus research_depth and sources_as_of; value_low is not above value_high;
   no repeated assessment kind, assessment flag or fact-check round; citation "supports" entries
   name a real assessment kind or an in-range index into related_companies/replaces.
+- Capability map (schema version 4): a concept's mapping to the capability rubric is a
+  catalog_candidate with target_id "capability_map:<concept-slug>" and action_type "upsert" only
+  (no create, no delete). Call catalog_capabilities first: it returns {rubric_sha256, capabilities:
+  [{capability, sub_capability, description}]}. The payload is the schema's CapabilityMapPayload:
+  {schema_version 4, concept_slug (same as target_id), rubric_sha256 (exactly as
+  catalog_capabilities gave it), items}, 1 to 8 items, each {capability, sub_capability (labels
+  exactly as listed), relation "addresses" | "requires", weight 1-3, min_level 2 or 3 (required for
+  "requires", never for "addresses"), rationale (at most 400 characters)}; no item repeats a
+  (capability, sub_capability, relation). catalog_get("capability_map:<slug>") returns the current
+  map and its version: when a map exists send that version as base_version (Arcadia refuses an
+  upsert without it, BASE_VERSION_REQUIRED). Arcadia may refuse with CONCEPT_NOT_FOUND,
+  UNKNOWN_CAPABILITY or RUBRIC_MISMATCH. fact_check is required as for any create or upsert.
 - No unknown fields anywhere. Do not include health-system material; it is refused.
 - schema_version in a payload must be the schema's version (it defaults to it when omitted).
 """
@@ -232,6 +244,37 @@ def _new_concept_example() -> dict[str, Any]:
     }
 
 
+def _capability_map_example() -> dict[str, Any]:
+    return {
+        "target_id": "capability_map:remote-patient-monitoring",
+        "action_type": "upsert",
+        "base_version": 1,
+        "payload": {
+            "schema_version": 4,
+            "concept_slug": "remote-patient-monitoring",
+            "rubric_sha256": "0" * 64,
+            "items": [
+                {
+                    "capability": "11. Tools and Technology",
+                    "sub_capability": "Data",
+                    "relation": "addresses",
+                    "weight": 3,
+                    "rationale": "Builds the shared data layer this sub-capability measures.",
+                },
+                {
+                    "capability": "11. Tools and Technology",
+                    "sub_capability": "Interoperability",
+                    "relation": "requires",
+                    "weight": 2,
+                    "min_level": 2,
+                    "rationale": "Needs feeds from clinical systems.",
+                },
+            ],
+        },
+        "fact_check": copy.deepcopy(_FACT_CHECK),
+    }
+
+
 def _delete_example() -> dict[str, Any]:
     return {
         "target_id": "pair:remote-patient-monitoring:CA",
@@ -346,6 +389,7 @@ def catalog_candidate_schema() -> dict[str, Any]:
             "upsert": _pair_example(),
             "create_pair_with_concept": _new_concept_example(),
             "delete": _delete_example(),
+            "upsert_capability_map": _capability_map_example(),
         },
     }
 

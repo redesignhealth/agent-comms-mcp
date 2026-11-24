@@ -21,7 +21,9 @@ from tests.test_proposal_tools import _ENV_PATCH, _OIDC_PATCH, _import_main
 _BOT = "catalog-agent"
 # Same vector as agent-comms-approvals' tests: the canonical-JSON hash Arcadia's
 # schema endpoint reports for this schema (not the raw file hash).
-CANONICAL_VECTOR = "23f4eca43c9ae555b490787bf2d84511788f3e2595bb0623cc17a2d28169af81"
+CANONICAL_VECTOR = "265a8c93240d97024bcc2483ecf5557e45962b136eb227af93aee06fbaea5c93"
+CANONICAL_V3 = "23f4eca43c9ae555b490787bf2d84511788f3e2595bb0623cc17a2d28169af81"
+CANONICAL_V2 = "5029b9f3e1ca690dee61a36d9a0063564326aeaaeb82bc7aa7f33d46b61e028d"
 _ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -72,13 +74,22 @@ class TestTool:
             "examples",
         }
         assert out["kind"] == "catalog_candidate"
-        assert out["schema_version"] == 3 == out["schema"]["x-schema-version"]
+        assert out["schema_version"] == 4 == out["schema"]["x-schema-version"]
         assert out["schema_sha256"] == CANONICAL_VECTOR
         assert out["schema_sha256"] == proposal_schemas.canonical_sha256(out["schema"])
-        assert {"ConceptPayload", "ConceptMarketPayload", "DeletePayload"} <= set(
-            out["schema"]["$defs"]
-        )
-        assert set(out["examples"]) == {"create", "upsert", "create_pair_with_concept", "delete"}
+        assert {
+            "ConceptPayload",
+            "ConceptMarketPayload",
+            "DeletePayload",
+            "CapabilityMapPayload",
+        } <= set(out["schema"]["$defs"])
+        assert set(out["examples"]) == {
+            "create",
+            "upsert",
+            "create_pair_with_concept",
+            "delete",
+            "upsert_capability_map",
+        }
         for text in ("concept:<slug>", "pair:<concept-slug>:<MARKET>", "base_version", "reason"):
             assert text in out["guide"]
 
@@ -111,6 +122,24 @@ class TestTool:
         version = out["schema"]["$defs"]["VersionIn"]
         assert set(upsert["payload"]["version"]) <= set(version["properties"])
         assert set(version["required"]) <= set(upsert["payload"]["version"])
+
+    async def test_capability_map_example_is_shaped_like_the_schema(self, main: Any) -> None:
+        out = await _call(main, "catalog_candidate")
+        example = out["examples"]["upsert_capability_map"]
+        assert example["action_type"] == "upsert"
+        assert example["target_id"] == "capability_map:" + example["payload"]["concept_slug"]
+        cap_map = out["schema"]["$defs"]["CapabilityMapPayload"]
+        assert set(cap_map["required"]) <= set(example["payload"])
+        assert set(example["payload"]) <= set(cap_map["properties"])
+        assert (
+            example["payload"]["schema_version"] == cap_map["properties"]["schema_version"]["const"]
+        )
+        item = out["schema"]["$defs"]["CapabilityMapItemIn"]
+        for entry in example["payload"]["items"]:
+            assert set(entry) <= set(item["properties"])
+            assert set(item["required"]) <= set(entry)
+        for text in ("capability_map:<concept-slug>", "catalog_capabilities", "UNKNOWN_CAPABILITY"):
+            assert text in out["guide"]
 
     @pytest.mark.parametrize("kind", ["gmail_send", "nope", "Catalog_Candidate"])
     async def test_unknown_kind_lists_the_kinds_with_a_schema(self, main: Any, kind: str) -> None:
@@ -167,3 +196,8 @@ class TestSchemaCopy:
         pin = json.loads((root / "catalog_candidate_payload.schema.pin.json").read_text())
         ours = json.loads((_ROOT / "providers" / proposal_schemas.PIN_RESOURCE).read_text())
         assert pin == ours
+
+    def test_pin_is_v4_and_keeps_v2_and_v3_compatible(self) -> None:
+        pin = json.loads((Path("providers") / proposal_schemas.PIN_RESOURCE).read_text())
+        assert (pin["schema_version"], pin["vocabulary_version"]) == (4, 3)
+        assert pin["compatible_arcadia_sha256"] == {"2": CANONICAL_V2, "3": CANONICAL_V3}

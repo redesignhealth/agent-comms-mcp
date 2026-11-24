@@ -248,14 +248,17 @@ async def submit(
     reviewed by Arcadia, TECH-9214; call ``proposals_schema`` first, and
     ``catalog_get(target_key)`` to see whether the target exists and its version)::
 
-        {"target_id": "concept:<slug>" | "pair:<concept-slug>:<MARKET>",
+        {"target_id": "concept:<slug>" | "pair:<concept-slug>:<MARKET>"
+                       | "capability_map:<concept-slug>",
          "action_type": "create" | "upsert" | "delete",
          "payload": {...}, "base_version": 3, "reason": "...",
          "fact_check": [{"round": 1, "agreement_score": 80}],
          "citations": [{"revision_id": "...", "offset": 0, "length": 40, "quote": "..."}]}
 
     ``create``/``upsert`` carry ``payload`` (Arcadia's candidate payload schema:
-    a concept for ``concept:<slug>``, a concept-market version for ``pair:...``),
+    a concept for ``concept:<slug>``, a concept-market version for ``pair:...``, a
+    capability map for ``capability_map:<slug>`` (``upsert`` only; read the rubric with
+    ``catalog_capabilities``)),
     a non-empty ``fact_check`` log (no minimum score) and, optionally, up to 10
     ``citations`` that each must resolve to YOUR OWN stored sources (same
     citation shape and check as Arcana brain proposals). ``base_version``
@@ -424,7 +427,8 @@ async def schema(kind: str) -> dict[str, Any]:
     ``schema`` is Arcadia's JSON Schema for the ``action.payload`` (a concept,
     a concept-market row, or a delete: use ``$defs/ConceptPayload`` for a
     ``concept:<slug>`` target and ``$defs/ConceptMarketPayload`` for a
-    ``pair:<slug>:<MARKET>`` target), ``guide`` explains the actions,
+    ``pair:<slug>:<MARKET>`` target, ``$defs/CapabilityMapPayload`` for a
+    ``capability_map:<slug>`` target), ``guide`` explains the actions,
     ``target_id`` forms and required fields, and ``examples`` holds a valid
     ``create``, ``upsert`` and ``delete`` action. Call it again before each
     new submission: ``schema_version`` is how you notice a change.
