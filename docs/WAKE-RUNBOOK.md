@@ -310,7 +310,7 @@ safe to repeat; pausing again keeps the original time, person and reason. Both a
 (`wake_delivery.paused`, `wake_delivery.resumed`).
 
 ```
-comms_admin_wake_delivery_pause(reason="TECH-1234 investigating duplicate wakes")
+comms_admin_wake_delivery_pause(reason="<your name>: investigating duplicate wakes")
 comms_admin_wake_delivery_status()
 comms_admin_wake_delivery_resume()
 ```
