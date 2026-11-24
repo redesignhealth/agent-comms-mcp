@@ -1332,8 +1332,10 @@ async def admin_wake_events_list(
     - ``agent_id``: optional UUID of the recipient agent.
     - ``conversation_id``: optional UUID of the conversation.
     - ``status``: optional, one of ``pending``, ``retry``, ``retry_later``,
-      ``delivered``, ``failed``, ``dead``. ``dead`` is a dead-lettered event
-      (retries ran out, or 24 hours passed).
+      ``delivered``, ``failed``, ``dead``, ``suppressed``. ``dead`` is a
+      dead-lettered event (retries ran out, or 24 hours passed). ``suppressed`` is
+      an event the loop guard held back (never sent, cannot be requeued); its
+      ``last_error`` says which limit.
     - ``limit``: 1 to 200, default 50.
 
     Returns ``{"events": [...], "has_more": bool}``. Each event has
@@ -1585,15 +1587,24 @@ async def wake_sessions_list(agent_key: str | None = None) -> dict[str, Any]:
     Returns ``{"sessions": [...]}``; each has ``conversation_id``,
     ``opened_at``, ``last_activity_at`` and ``closes_at`` (when it goes quiet
     if nothing else happens). Only the caller's own sessions are returned.
+
+    ``limits`` explains why you may have stopped being woken: the loop guard
+    holds back wake events when too many are recorded for you in one
+    conversation in a short time, or across all conversations in an hour. The
+    messages are still on the board, so poll for them. Each entry has ``limit``
+    (``conversation`` or ``agent``), ``conversation_id`` (null for ``agent``),
+    ``suppressed_count`` and ``last_suppressed_at``, covering the last hour.
     """
     token = _require_token()
     sub = _compose_sub(_require_identity(token), _validate_agent_key(agent_key))
 
     async with get_session_factory()() as session:
         caller = await _resolve_caller_agent(session, sub, token)
+        now = datetime.now(UTC)
         open_sessions = await wake_events.list_open_wake_sessions(
-            session, agent_id=caller.id, now=datetime.now(UTC)
+            session, agent_id=caller.id, now=now
         )
+        limits = await wake_events.list_wake_limits_hit(session, agent_id=caller.id, now=now)
     window = timedelta(seconds=wake_events.WAKE_SESSION_WINDOW_SECONDS)
     return {
         "sessions": [
@@ -1604,7 +1615,8 @@ async def wake_sessions_list(agent_key: str | None = None) -> dict[str, Any]:
                 "closes_at": _iso(s.last_activity_at + window),
             }
             for s in open_sessions
-        ]
+        ],
+        "limits": limits,
     }
 
 

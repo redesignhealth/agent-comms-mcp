@@ -964,7 +964,8 @@ Wake tables (TECH-9905; schema and rule storage only, nothing hooks message deli
 lazily; rules are never deleted, only set `enabled = false`), `wake_sessions` (one
 open-conversation row per agent and conversation, reopened by UPDATE), `wake_events` (one
 row per recipient per delivered message or invite; its `id` is the event ID sent to
-receivers; unique per recipient, conversation and seq for messages) and `wake_targets`
+receivers; unique per recipient, conversation and seq for messages; status
+`suppressed` marks an event the loop guard held back, docs/WAKE-EVENTS.md section 8.1) and `wake_targets`
 (per-agent delivery URL plus encrypted secret). Rule storage and evaluation live in
 `wake_rules.py`. Admins can list wake events by status and requeue a failed or dead one
 (`comms_admin_wake_events_list`, `comms_admin_wake_event_requeue`, TECH-9913; audited as
