@@ -260,6 +260,11 @@ class TestNormalUse:
         assert len(events) == 10
         assert {e.status for e in events} == {"pending"}
 
+    def test_default_values(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        for name in (CONV_LIMIT, CONV_WINDOW, AGENT_CAP):
+            monkeypatch.delenv(name, raising=False)
+        assert wake_events.wake_limits() == (250, 600, 2500)
+
     def test_defaults_are_the_documented_constants(self, monkeypatch: pytest.MonkeyPatch) -> None:
         for name in (CONV_LIMIT, CONV_WINDOW, AGENT_CAP):
             monkeypatch.delenv(name, raising=False)

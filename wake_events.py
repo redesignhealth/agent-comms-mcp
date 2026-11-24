@@ -37,14 +37,16 @@ WAKE_SESSION_WINDOW_SECONDS: Final = 600
 # overridden by the environment variable named beside it. Provisional: the ticket asks
 # for numbers chosen from the dev end-to-end test.
 #
-# Per recipient and conversation: a real exchange rarely reaches 12 wakes in 10
-# minutes (a ten-message exchange is about 5 per side), while a loop reaches it in a
-# couple of minutes and is then held to about 1 wake a minute at most.
-WAKE_CONVERSATION_EVENT_LIMIT: Final = 12  # WAKE_CONVERSATION_EVENT_LIMIT
+# These are a runaway backstop, not a brake on normal back-and-forth: a two-agent loop
+# can run to 250 wakes per side in ten minutes before it is cut, and a real exchange
+# (a ten-message one is about 5 wakes per side) never comes near. Per recipient and
+# conversation:
+WAKE_CONVERSATION_EVENT_LIMIT: Final = 250  # WAKE_CONVERSATION_EVENT_LIMIT
 WAKE_CONVERSATION_LIMIT_WINDOW_SECONDS: Final = 600  # WAKE_CONVERSATION_LIMIT_WINDOW_SECONDS
-# Per recipient across all conversations, per hour: only a backstop against many
-# conversations looping at once, far above normal use.
-WAKE_AGENT_HOURLY_EVENT_CAP: Final = 300  # WAKE_AGENT_HOURLY_EVENT_CAP
+# Per recipient across all conversations, per hour: kept above what one busy
+# conversation can reach in an hour (6 windows of 250 would be 1,500), so it only
+# trips when several conversations run away at once.
+WAKE_AGENT_HOURLY_EVENT_CAP: Final = 2500  # WAKE_AGENT_HOURLY_EVENT_CAP
 _AGENT_CAP_WINDOW: Final = timedelta(hours=1)
 
 
