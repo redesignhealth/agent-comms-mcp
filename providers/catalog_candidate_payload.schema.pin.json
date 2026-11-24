@@ -1,12 +1,13 @@
 {
   "repo": "redesignhealth/arcadia",
   "path": "apps/api/src/arcadia_api/schemas/catalog_candidate_payload.schema.json",
-  "commit": "21e96d35d3e357412db9ca0994d323419590d4e1",
-  "blob_sha": "250dae1c8869cb87f32319feab0cc6ebd9d00c09",
-  "sha256": "1269bb8840ae3449922c4e6453e6680f176cee54195570694cec840fae9bbc5e",
-  "schema_version": 3,
-  "vocabulary_version": 2,
+  "commit": "b4d8ddb8f96598e52eb73ed83f39c7fc84b0486e",
+  "blob_sha": "f57a1ac5fef77800d3e7db4a195b6df7d2cf16dc",
+  "sha256": "42904ac35dc61c468d2552524fd52390529348cbcfe5b65715f370a26591b05f",
+  "schema_version": 4,
+  "vocabulary_version": 3,
   "compatible_arcadia_sha256": {
-    "2": "5029b9f3e1ca690dee61a36d9a0063564326aeaaeb82bc7aa7f33d46b61e028d"
+    "2": "5029b9f3e1ca690dee61a36d9a0063564326aeaaeb82bc7aa7f33d46b61e028d",
+    "3": "23f4eca43c9ae555b490787bf2d84511788f3e2595bb0623cc17a2d28169af81"
   }
 }

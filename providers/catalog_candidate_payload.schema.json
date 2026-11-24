@@ -117,6 +117,111 @@
       "title": "BuildScope",
       "type": "string"
     },
+    "CapabilityMapItemIn": {
+      "additionalProperties": false,
+      "description": "One mapped sub-capability: its exact rubric labels, `addresses` (a low site level is a need) or\n`requires` (a low level is a risk, below `min_level`), a weight of 1 to 3 and a short rationale.\n`min_level` is required for `requires` and absent for `addresses`.",
+      "properties": {
+        "capability": {
+          "minLength": 1,
+          "title": "Capability",
+          "type": "string"
+        },
+        "min_level": {
+          "anyOf": [
+            {
+              "enum": [
+                2,
+                3
+              ],
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Min Level"
+        },
+        "rationale": {
+          "maxLength": 400,
+          "minLength": 1,
+          "title": "Rationale",
+          "type": "string"
+        },
+        "relation": {
+          "$ref": "#/$defs/CapabilityRelation"
+        },
+        "sub_capability": {
+          "minLength": 1,
+          "title": "Sub Capability",
+          "type": "string"
+        },
+        "weight": {
+          "enum": [
+            1,
+            2,
+            3
+          ],
+          "title": "Weight",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "capability",
+        "sub_capability",
+        "relation",
+        "weight",
+        "rationale"
+      ],
+      "title": "CapabilityMapItemIn",
+      "type": "object"
+    },
+    "CapabilityMapPayload": {
+      "additionalProperties": false,
+      "description": "The capability map of a concept: `rubric_sha256` is the `source_snapshot_sha256` of the rubric the labels\nwere taken from (`GET /catalog/v1/capabilities`). A map has at least one and at most 8 items, none repeated.",
+      "properties": {
+        "concept_slug": {
+          "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+          "title": "Concept Slug",
+          "type": "string"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/CapabilityMapItemIn"
+          },
+          "maxItems": 8,
+          "minItems": 1,
+          "title": "Items",
+          "type": "array"
+        },
+        "rubric_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Rubric Sha256",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 4,
+          "default": 4,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "concept_slug",
+        "rubric_sha256",
+        "items"
+      ],
+      "title": "CapabilityMapPayload",
+      "type": "object"
+    },
+    "CapabilityRelation": {
+      "enum": [
+        "addresses",
+        "requires"
+      ],
+      "title": "CapabilityRelation",
+      "type": "string"
+    },
     "CitationIn": {
       "additionalProperties": false,
       "properties": {
@@ -313,10 +418,11 @@
           "type": "string"
         },
         "schema_version": {
-          "default": 3,
+          "default": 4,
           "enum": [
             2,
-            3
+            3,
+            4
           ],
           "title": "Schema Version",
           "type": "integer"
@@ -347,10 +453,11 @@
           "type": "string"
         },
         "schema_version": {
-          "default": 3,
+          "default": 4,
           "enum": [
             2,
-            3
+            3,
+            4
           ],
           "title": "Schema Version",
           "type": "integer"
@@ -400,10 +507,11 @@
           "type": "string"
         },
         "schema_version": {
-          "default": 3,
+          "default": 4,
           "enum": [
             2,
-            3
+            3,
+            4
           ],
           "title": "Schema Version",
           "type": "integer"
@@ -872,11 +980,14 @@
       "$ref": "#/$defs/ConceptMarketPayload"
     },
     {
+      "$ref": "#/$defs/CapabilityMapPayload"
+    },
+    {
       "$ref": "#/$defs/DeletePayload"
     }
   ],
   "title": "Arcadia opportunity catalog candidate payload",
-  "x-schema-version": 3,
+  "x-schema-version": 4,
   "x-vocabularies": {
     "assessment_flag": [
       "vendor_sourced",
@@ -912,7 +1023,8 @@
     ],
     "candidate_target_type": [
       "concept",
-      "concept_market"
+      "concept_market",
+      "capability_map"
     ],
     "citation_target_type": [
       "assessment",
@@ -980,11 +1092,11 @@
       "cost",
       "capacity"
     ],
-    "version": 2,
+    "version": 3,
     "viability": [
       "works",
       "not_viable"
     ]
   },
-  "x-vocabulary-version": 2
+  "x-vocabulary-version": 3
 }
