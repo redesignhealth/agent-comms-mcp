@@ -289,6 +289,13 @@ waiting for delivery: `pending` and `retry`), `retry_later_count` and
 | `wake-loop-guard` | any `wake_suppressed` in the last 5 minutes | Two agents are answering each other and the loop guard cut off wake events (section 7) | Find the conversation, stop the exchange |
 | `wake-loop-down` | no stats event for 15 minutes | The delivery task is not running: the board is down, restarting in a loop, or the task crashed | Check the ECS service `rh-reclaw-comms` and its log for `wake delivery tick failed`. The 15 minutes covers a normal deploy |
 
+Timings seen on dev (2026-11-24): after a pause with one event held, `oldest-undelivered`
+went to ALARM about 6 minutes 40 seconds later (the 5 minute threshold, plus up to a minute
+for CloudWatch), and returned to OK about 2.5 minutes after resume, even though the event
+was delivered within seconds. An alarm that is still ALARM for a couple of minutes after you
+resumed is normal. The four alarms did not flap, and a normal 3 minute deploy cannot trip
+`wake-loop-down` (three 5 minute periods must all be empty).
+
 None of these means a message was lost. `retry_later` events (a paused agent, an org that is
 switched off) are shown separately and do not alarm. The metric `WakeTickFailed` counts
 `wake delivery tick failed` log lines; it has no alarm, but a rising count explains a
