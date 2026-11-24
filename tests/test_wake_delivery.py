@@ -18,6 +18,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -26,10 +27,11 @@ from cryptography.fernet import Fernet
 from sqlalchemy import delete, select, text, update
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+import observability
 import wake_delivery
 import wake_secrets
 import wake_targets
-from models import Agent, AuditLog, WakeEvent, WakeSession, WakeTarget
+from models import Agent, AuditLog, WakeDeliveryState, WakeEvent, WakeSession, WakeTarget
 from tests.test_wake_events import _agent, _post, _Room, _room, _start
 from wake_delivery import (
     ALLOWLIST_MISCONFIGURED_RETRY_SECONDS,
@@ -1257,3 +1259,173 @@ async def test_stop_cancels_sends_in_flight_and_leaves_the_lease(
     event = await _get(session, event_id)
     assert (event.status, event.attempt_count) == ("pending", 1)
     assert event.next_attempt_at == clock.now + timedelta(seconds=LEASE_SECONDS)
+
+
+# --- wake_delivery_stats (TECH-9890) ---------------------------------------
+
+STATS_KEYS = {
+    "interval_seconds",
+    "paused",
+    "recorded",
+    "delivered",
+    "retried",
+    "failed",
+    "dead",
+    "open_count",
+    "oldest_undelivered_age_seconds",
+    "retry_later_count",
+    "retry_later_oldest_age_seconds",
+}
+
+
+async def _stats(delivery: WakeDelivery, clock: Clock) -> dict[str, Any]:
+    """Open the stats window, let 31 seconds pass, and return the one event emitted."""
+    with patch.object(observability.obs_log, "info") as info:
+        await delivery._emit_stats_if_due()
+        info.assert_not_called()  # the window opens, nothing is due yet
+        clock.advance(seconds=31)
+        await delivery._emit_stats_if_due()
+    info.assert_called_once()
+    assert info.call_args.args == ("wake_delivery_stats",)
+    fields: dict[str, Any] = info.call_args.kwargs
+    assert set(fields) == STATS_KEYS
+    assert all(type(v) is int for v in fields.values())  # JSON numbers, never booleans
+    return fields
+
+
+async def test_stats_emitted_on_an_idle_tick_with_zeros(
+    session: AsyncSession, delivery: WakeDelivery, clock: Clock
+) -> None:
+    await _fresh_room(session)
+    fields = await _stats(delivery, clock)
+    assert fields == dict.fromkeys(STATS_KEYS, 0) | {"interval_seconds": 31}
+
+
+async def test_stats_not_emitted_before_the_interval(
+    session: AsyncSession, delivery: WakeDelivery, clock: Clock
+) -> None:
+    with patch.object(observability.obs_log, "info") as info:
+        await delivery._emit_stats_if_due()
+        clock.advance(seconds=29)
+        await delivery._emit_stats_if_due()
+    info.assert_not_called()
+
+
+async def test_stats_say_paused_while_paused(
+    session: AsyncSession, delivery: WakeDelivery, clock: Clock
+) -> None:
+    session.add(WakeDeliveryState(id=1, paused=True))
+    await session.commit()
+    try:
+        assert (await _stats(delivery, clock))["paused"] == 1
+    finally:  # the table is not truncated between tests
+        await session.execute(delete(WakeDeliveryState))
+        await session.commit()
+
+
+async def test_stats_ages_count_pending_and_retry_and_exclude_retry_later(
+    session: AsyncSession, delivery: WakeDelivery, clock: Clock
+) -> None:
+    room = await _fresh_room(session)
+    conv = room.conversation_id
+    await _event(session, room.active, conv, room.sender, 1, age=timedelta(seconds=100))
+    await _event(
+        session, room.invited, conv, room.sender, 1, age=timedelta(seconds=50), status="retry"
+    )
+    await _event(
+        session, room.sender, conv, room.active, 1, age=timedelta(seconds=900), status="retry_later"
+    )
+    await _event(
+        session, room.sender, conv, room.active, 2, age=timedelta(seconds=800), status="delivered"
+    )
+    fields = await _stats(delivery, clock)
+    assert fields["open_count"] == 2
+    assert 130 <= fields["oldest_undelivered_age_seconds"] <= 140  # 100s old + the 31s advance
+    assert fields["retry_later_count"] == 1
+    assert 930 <= fields["retry_later_oldest_age_seconds"] <= 940
+
+
+async def test_stats_recorded_counts_new_events_except_suppressed(
+    session: AsyncSession, delivery: WakeDelivery, clock: Clock
+) -> None:
+    room = await _fresh_room(session)
+    with patch.object(observability.obs_log, "info"):
+        await delivery._emit_stats_if_due()  # opens the window
+    conv = room.conversation_id
+    await _event(session, room.active, conv, room.sender, 1, age=timedelta(0))
+    await _event(session, room.invited, conv, room.sender, 1, age=timedelta(0), status="suppressed")
+    await _event(
+        session, room.sender, conv, room.active, 1, age=timedelta(minutes=5)
+    )  # before the window
+    clock.advance(seconds=31)
+    with patch.object(observability.obs_log, "info") as info:
+        await delivery._emit_stats_if_due()
+    assert info.call_args.kwargs["recorded"] == 1
+
+
+async def test_stats_counters_reflect_delivered_retried_and_dead_then_reset(
+    session: AsyncSession, delivery: WakeDelivery, receiver: Receiver, clock: Clock
+) -> None:
+    room = await _fresh_room(session)
+    conv = room.conversation_id
+    answers = {
+        str(room.active.id): httpx.Response(200, json=ACCEPTED),
+        str(room.invited.id): httpx.Response(503),
+        str(room.sender.id): httpx.Response(401),
+    }
+    receiver.respond = lambda request: answers[
+        json.loads(request.content)["data"]["recipientAgentId"]
+    ]
+    await _event(session, room.active, conv, room.sender, 1)
+    await _event(session, room.invited, conv, room.sender, 1)
+    await _event(session, room.sender, conv, room.active, 1)
+    # Expired: dead-lettered by the pass itself, counted by its row count.
+    await _event(session, room.active, conv, room.sender, 2, age=timedelta(hours=25))
+    with patch.object(observability.obs_log, "info"):
+        await delivery._emit_stats_if_due()  # opens the window
+    assert await _run(delivery) == 3
+    fields = await _stats(delivery, clock)
+    assert (fields["delivered"], fields["retried"], fields["failed"], fields["dead"]) == (
+        1,
+        1,
+        0,
+        2,
+    )
+    # Counters start over after an emission.
+    clock.advance(seconds=31)
+    with patch.object(observability.obs_log, "info") as info:
+        await delivery._emit_stats_if_due()
+    assert (info.call_args.kwargs["delivered"], info.call_args.kwargs["dead"]) == (0, 0)
+
+
+async def test_stats_retry_later_counts_as_neither_retry_nor_failure(
+    session: AsyncSession, delivery: WakeDelivery, receiver: Receiver, clock: Clock
+) -> None:
+    room = await _fresh_room(session)
+    receiver.respond = lambda request: httpx.Response(409, json={"status": "retry_later"})
+    await _event(session, room.active, room.conversation_id, room.sender, 1)
+    with patch.object(observability.obs_log, "info"):
+        await delivery._emit_stats_if_due()
+    assert await _run(delivery) == 1
+    fields = await _stats(delivery, clock)
+    assert (fields["retried"], fields["failed"], fields["dead"]) == (0, 0, 0)
+    assert (fields["open_count"], fields["retry_later_count"]) == (0, 1)
+
+
+async def test_a_failing_stats_query_does_not_stop_the_loop(
+    session: AsyncSession,
+    factory: async_sessionmaker[AsyncSession],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    delivery = WakeDelivery(session_factory=lambda: factory, loop_interval=0.01, stats_interval=0)
+    with patch.object(WakeDelivery, "_emit_stats", side_effect=RuntimeError("boom-secret")) as emit:
+        with caplog.at_level(logging.ERROR, logger="wake_delivery"):
+            await delivery.start()
+            try:
+                await asyncio.sleep(0.3)
+                assert delivery._loop_task is not None and not delivery._loop_task.done()
+            finally:
+                await delivery.stop()
+    assert emit.call_count > 1
+    assert "wake delivery stats failed: RuntimeError" in caplog.text
+    assert "boom-secret" not in caplog.text

@@ -46,6 +46,22 @@ scope_denial:
 user_active:
     {"event": "user_active", "service": "...", "user_id": "<local-part|slug>"}
 
+wake_delivery_stats:
+    {"event": "wake_delivery_stats", "service": "agent-comms-mcp",
+     "interval_seconds": 30, "paused": 0, "recorded": 0, "delivered": 0,
+     "retried": 0, "failed": 0, "dead": 0, "open_count": 0,
+     "oldest_undelivered_age_seconds": 0, "retry_later_count": 0,
+     "retry_later_oldest_age_seconds": 0}
+    Emitted about every 30 seconds by the wake delivery loop (TECH-9890),
+    including while paused and when idle; every value is a whole number
+    (``paused`` is 0 or 1). ``recorded`` counts events created since the last
+    emission (not ``suppressed``); ``delivered``, ``retried``, ``failed`` and
+    ``dead`` count outcomes in this process since the last emission.
+    ``open_count`` and ``oldest_undelivered_age_seconds`` cover pending and
+    retry events only; events held by ``retry_later`` are reported apart in
+    ``retry_later_count`` and ``retry_later_oldest_age_seconds``. Ages are 0
+    when there is no such event. Counts only, never ids or content.
+
 Notes
 -----
 * Never log message content, tokens, or attacker-controlled claim values.
@@ -250,6 +266,43 @@ def log_wake_suppressed(
         _fallback_logger.warning("log_wake_suppressed failed to emit event", exc_info=True)
 
 
+def log_wake_delivery_stats(
+    *,
+    interval_seconds: int,
+    paused: int,
+    recorded: int,
+    delivered: int,
+    retried: int,
+    failed: int,
+    dead: int,
+    open_count: int,
+    oldest_undelivered_age_seconds: int,
+    retry_later_count: int,
+    retry_later_oldest_age_seconds: int,
+) -> None:
+    """Emit a ``wake_delivery_stats`` event: one periodic snapshot of wake delivery (TECH-9890).
+
+    Numbers only, for metric filters. See the module docstring for the fields.
+    """
+    try:
+        obs_log.info(
+            "wake_delivery_stats",
+            interval_seconds=interval_seconds,
+            paused=paused,
+            recorded=recorded,
+            delivered=delivered,
+            retried=retried,
+            failed=failed,
+            dead=dead,
+            open_count=open_count,
+            oldest_undelivered_age_seconds=oldest_undelivered_age_seconds,
+            retry_later_count=retry_later_count,
+            retry_later_oldest_age_seconds=retry_later_oldest_age_seconds,
+        )
+    except Exception:
+        _fallback_logger.warning("log_wake_delivery_stats failed to emit event", exc_info=True)
+
+
 __all__ = [
     "SERVICE_NAME",
     "configure_logging",
@@ -259,6 +312,7 @@ __all__ = [
     "log_scope_denial",
     "log_tool_call",
     "log_user_active",
+    "log_wake_delivery_stats",
     "log_wake_suppressed",
     "obs_log",
 ]
