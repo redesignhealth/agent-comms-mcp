@@ -58,8 +58,10 @@ wake_delivery_stats:
     emission (not ``suppressed``); ``delivered``, ``retried``, ``failed`` and
     ``dead`` count outcomes in this process since the last emission.
     ``open_count`` and ``oldest_undelivered_age_seconds`` cover pending and
-    retry events only; events held by ``retry_later`` are reported apart in
-    ``retry_later_count`` and ``retry_later_oldest_age_seconds``. Ages are 0
+    retry events only, and leave out those queued behind a ``retry_later``
+    event of the same recipient; ``retry_later`` events and the events held
+    behind them are reported apart in ``retry_later_count`` and
+    ``retry_later_oldest_age_seconds``. Ages are 0
     when there is no such event. Counts only, never ids or content.
 
 Notes

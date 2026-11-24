@@ -32,7 +32,7 @@ import wake_delivery
 import wake_secrets
 import wake_targets
 from models import Agent, AuditLog, WakeDeliveryState, WakeEvent, WakeSession, WakeTarget
-from tests.test_wake_events import _agent, _post, _Room, _room, _start
+from tests.test_wake_events import _agent, _opener, _post, _Room, _room, _start
 from wake_delivery import (
     ALLOWLIST_MISCONFIGURED_RETRY_SECONDS,
     BACKOFF_SCHEDULE_SECONDS,
@@ -1343,6 +1343,87 @@ async def test_stats_ages_count_pending_and_retry_and_exclude_retry_later(
     assert 130 <= fields["oldest_undelivered_age_seconds"] <= 140  # 100s old + the 31s advance
     assert fields["retry_later_count"] == 1
     assert 930 <= fields["retry_later_oldest_age_seconds"] <= 940
+
+
+async def _held_recipient_stats(
+    session: AsyncSession, delivery: WakeDelivery, clock: Clock, queued_status: str
+) -> dict[str, Any]:
+    room = await _fresh_room(session)
+    conv = room.conversation_id
+    await _event(
+        session, room.active, conv, room.sender, 1, age=timedelta(seconds=400), status="retry_later"
+    )
+    await _event(
+        session, room.active, conv, room.sender, 2, age=timedelta(seconds=700), status=queued_status
+    )
+    return await _stats(delivery, clock)
+
+
+async def test_stats_pending_queued_behind_retry_later_is_held_not_undelivered(
+    session: AsyncSession, delivery: WakeDelivery, clock: Clock
+) -> None:
+    fields = await _held_recipient_stats(session, delivery, clock, "pending")
+    assert (fields["open_count"], fields["oldest_undelivered_age_seconds"]) == (0, 0)
+    assert fields["retry_later_count"] == 2
+    assert 730 <= fields["retry_later_oldest_age_seconds"] <= 740  # the older, queued event
+
+
+async def test_stats_retry_queued_behind_retry_later_is_held_not_undelivered(
+    session: AsyncSession, delivery: WakeDelivery, clock: Clock
+) -> None:
+    fields = await _held_recipient_stats(session, delivery, clock, "retry")
+    assert (fields["open_count"], fields["oldest_undelivered_age_seconds"]) == (0, 0)
+    assert fields["retry_later_count"] == 2
+    assert 730 <= fields["retry_later_oldest_age_seconds"] <= 740
+
+
+async def test_stats_queued_event_in_another_conversation_is_held_too(
+    session: AsyncSession, delivery: WakeDelivery, clock: Clock
+) -> None:
+    room = await _fresh_room(session)
+    other = await _start(
+        session,
+        actor_sub=room.sender.sub,
+        initiator_agent_id=room.sender.id,
+        conversation_type="open",
+        target_agent_ids=[room.active.id],
+        initial_message=_opener(),
+        message_type="task_assign",
+    )
+    await session.execute(delete(WakeEvent))  # drop the invite events starting it recorded
+    await session.commit()
+    await _event(
+        session,
+        room.active,
+        room.conversation_id,
+        room.sender,
+        1,
+        age=timedelta(seconds=400),
+        status="retry_later",
+    )
+    await _event(
+        session, room.active, other.id, room.sender, 1, age=timedelta(seconds=700)
+    )  # the rule is per recipient, not per conversation
+    fields = await _stats(delivery, clock)
+    assert (fields["open_count"], fields["oldest_undelivered_age_seconds"]) == (0, 0)
+    assert fields["retry_later_count"] == 2
+    assert 730 <= fields["retry_later_oldest_age_seconds"] <= 740
+
+
+async def test_stats_other_recipients_pending_still_counts_as_undelivered(
+    session: AsyncSession, delivery: WakeDelivery, clock: Clock
+) -> None:
+    room = await _fresh_room(session)
+    conv = room.conversation_id
+    await _event(
+        session, room.active, conv, room.sender, 1, age=timedelta(seconds=400), status="retry_later"
+    )
+    await _event(session, room.active, conv, room.sender, 2, age=timedelta(seconds=700))
+    await _event(session, room.invited, conv, room.sender, 1, age=timedelta(seconds=600))
+    fields = await _stats(delivery, clock)
+    assert fields["open_count"] == 1
+    assert 630 <= fields["oldest_undelivered_age_seconds"] <= 640
+    assert fields["retry_later_count"] == 2
 
 
 async def test_stats_recorded_counts_new_events_except_suppressed(
