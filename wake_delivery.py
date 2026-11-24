@@ -345,8 +345,16 @@ class WakeDelivery:
 
     async def _emit_stats(self, now: datetime, since: datetime) -> None:
         ev = WakeEvent
-        undelivered = ev.status.in_(("pending", "retry"))
-        held = ev.status == "retry_later"
+        paused_peer = aliased(WakeEvent)
+        # _claim sends a recipient nothing else while it has a retry_later event, so its
+        # other pending/retry events are held with it, not stalled.
+        recipient_held = exists().where(
+            paused_peer.recipient_agent_id == ev.recipient_agent_id,
+            paused_peer.status == "retry_later",
+        )
+        queued = ev.status.in_(("pending", "retry"))
+        undelivered = queued & ~recipient_held
+        held = (ev.status == "retry_later") | (queued & recipient_held)
         async with self._session_factory()() as session:
             paused = await is_delivery_paused(session)
             recorded = await session.scalar(
