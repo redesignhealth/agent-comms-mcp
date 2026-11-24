@@ -52,6 +52,7 @@ from sqlalchemy import and_, delete, exists, func, or_, select, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
 
+import observability
 from db import get_session_factory
 from models import WakeEvent, WakeSession, WakeTarget
 from proposal_apply_http_client import tailnet_proxy_mounts
@@ -83,6 +84,8 @@ ALLOWLIST_MISCONFIGURED_RETRY_SECONDS: Final = 60
 MAX_RETRY_AFTER_SECONDS: Final = 3600
 # An event still undelivered this long after it was recorded is dead-lettered.
 EVENT_LIFETIME: Final = timedelta(hours=24)
+# Seconds between wake_delivery_stats log events (an alarm treats a missing one as "loop down").
+STATS_INTERVAL_SECONDS: Final = 30.0
 # Most sends in flight at once.
 MAX_CONCURRENT_SENDS: Final = 8
 # Most due rows one claim looks at (before the one-probe-per-recipient filter).
@@ -95,6 +98,8 @@ SYSTEM_ACTOR: Final = "system:wake-delivery"
 
 _OPEN_STATUSES: Final = ("pending", "retry", "retry_later")
 _SECRET_PREFIX: Final = "whsec_"
+# Outcomes counted for wake_delivery_stats (retry_later is neither a retry nor a failure).
+_COUNTED_OUTCOMES: Final = ("delivered", "retry", "failed", "dead")
 
 
 class _RedactUrlQuery(logging.Filter):
@@ -261,6 +266,7 @@ class WakeDelivery:
         loop_interval: float = LOOP_INTERVAL_SECONDS,
         send_timeout: float = SEND_TIMEOUT_SECONDS,
         max_concurrent: int = MAX_CONCURRENT_SENDS,
+        stats_interval: float = STATS_INTERVAL_SECONDS,
     ) -> None:
         self._session_factory = session_factory or (lambda: get_session_factory())
         self._client = client
@@ -271,6 +277,11 @@ class WakeDelivery:
         self._max_concurrent = max_concurrent
         self._loop_task: asyncio.Task[None] | None = None
         self._in_flight: set[asyncio.Task[None]] = set()
+        self._stats_interval = stats_interval
+        self._stats_since: datetime | None = None
+        self._stats_next_at: datetime | None = None
+        # Outcomes written by this process since the last stats event.
+        self._counts: dict[str, int] = dict.fromkeys(_COUNTED_OUTCOMES, 0)
 
     # -- lifecycle --
 
@@ -309,7 +320,69 @@ class WakeDelivery:
                 raise
             except Exception as exc:
                 logger.error("wake delivery tick failed: %s", type(exc).__name__)
+            await self._emit_stats_if_due()
             await asyncio.sleep(self._loop_interval)
+
+    # -- stats (TECH-9890) --
+
+    async def _emit_stats_if_due(self) -> None:
+        """Emit ``wake_delivery_stats`` when due. Never raises: it must not stall the loop."""
+        try:
+            now = self._clock()
+            if self._stats_since is None or self._stats_next_at is None:
+                self._stats_since = now
+                self._stats_next_at = now + timedelta(seconds=self._stats_interval)
+                return
+            if now < self._stats_next_at:
+                return
+            self._stats_next_at = now + timedelta(seconds=self._stats_interval)
+            await self._emit_stats(now, self._stats_since)
+            self._stats_since = now
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("wake delivery stats failed: %s", type(exc).__name__)
+
+    async def _emit_stats(self, now: datetime, since: datetime) -> None:
+        ev = WakeEvent
+        undelivered = ev.status.in_(("pending", "retry"))
+        held = ev.status == "retry_later"
+        async with self._session_factory()() as session:
+            paused = await is_delivery_paused(session)
+            recorded = await session.scalar(
+                select(func.count()).where(
+                    ev.created_at > since, ev.created_at <= now, ev.status != "suppressed"
+                )
+            )
+            # One aggregate over the open statuses (idx_wake_events_status_next_attempt_at).
+            open_row = (
+                await session.execute(
+                    select(
+                        func.count().filter(undelivered),
+                        func.min(ev.created_at).filter(undelivered),
+                        func.count().filter(held),
+                        func.min(ev.created_at).filter(held),
+                    ).where(ev.status.in_(("pending", "retry", "retry_later")))
+                )
+            ).one()
+
+        def age(oldest: datetime | None) -> int:
+            return 0 if oldest is None else max(0, int((now - oldest).total_seconds()))
+
+        counts, self._counts = self._counts, dict.fromkeys(_COUNTED_OUTCOMES, 0)
+        observability.log_wake_delivery_stats(
+            interval_seconds=int((now - since).total_seconds()),
+            paused=1 if paused else 0,
+            recorded=int(recorded or 0),
+            delivered=counts["delivered"],
+            retried=counts["retry"],
+            failed=counts["failed"],
+            dead=counts["dead"],
+            open_count=int(open_row[0]),
+            oldest_undelivered_age_seconds=age(open_row[1]),
+            retry_later_count=int(open_row[2]),
+            retry_later_oldest_age_seconds=age(open_row[3]),
+        )
 
     # -- one pass --
 
@@ -340,7 +413,7 @@ class WakeDelivery:
 
     async def _dead_letter_expired(self, now: datetime) -> None:
         async with self._session_factory()() as session:
-            await session.execute(
+            result = await session.execute(
                 update(WakeEvent)
                 .where(
                     WakeEvent.status.in_(_OPEN_STATUSES),
@@ -351,6 +424,7 @@ class WakeDelivery:
                 )
             )
             await session.commit()
+        self._counts["dead"] += max(0, result.rowcount)  # type: ignore[attr-defined]
 
     async def _claim(self, limit: int, now: datetime) -> list[_Claim]:
         ev = WakeEvent
@@ -582,6 +656,8 @@ class WakeDelivery:
                     "wake delivery event=%s outcome superseded, not recorded", claim.event_id
                 )
                 return
+            if outcome.status in self._counts:
+                self._counts[outcome.status] += 1
             if outcome.status == "delivered":
                 # A sessionRef key in the answer (null included) replaces the stored ref;
                 # an answer without the key leaves it. Only an open conversation holds one.
@@ -657,6 +733,7 @@ __all__ = [
     "MAX_RETRY_AFTER_SECONDS",
     "RETRY_LATER_SECONDS",
     "SEND_TIMEOUT_SECONDS",
+    "STATS_INTERVAL_SECONDS",
     "WakeDelivery",
     "parse_retry_after",
     "sign",

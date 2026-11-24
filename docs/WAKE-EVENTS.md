@@ -362,6 +362,25 @@ the normal order; events that passed 24 hours while paused are `dead` and can be
 A failure to read the switch fails that pass (logged as `wake delivery tick failed`) and
 nothing is sent.
 
+### 11.1 Metrics
+
+About every 30 seconds the delivery task logs one `wake_delivery_stats` event, including
+while paused and when idle (a missing event means the loop is down). Every value is a whole
+number; there are no booleans or strings besides `event` and `service`.
+
+| Field | Meaning |
+|---|---|
+| `interval_seconds` | Seconds since the previous event. |
+| `paused` | 1 while delivery is paused, else 0. |
+| `recorded` | Events recorded since the previous event, not counting `suppressed`. |
+| `delivered`, `retried`, `failed`, `dead` | Outcomes this process wrote since the previous event. A `retry_later` answer counts in none of them. A restart loses the partial window. |
+| `open_count` | Events in `pending` or `retry`. |
+| `oldest_undelivered_age_seconds` | Age of the oldest of those (0 if none). |
+| `retry_later_count`, `retry_later_oldest_age_seconds` | The same for events held in `retry_later`, which `open_count` leaves out so a paused agent or a switched-off organisation does not look like a stuck queue. |
+
+A failure to gather the numbers is logged as `wake delivery stats failed` and does not
+affect delivery.
+
 ## 12. Not in scope
 
 - **No message content in events.** Events point at a message. The agent reads it through
