@@ -59,6 +59,7 @@ import service
 import subscriptions
 import wake_admin
 import wake_events
+import wake_pause
 import wake_rules
 import wake_targets
 from db import get_session_factory
@@ -1394,6 +1395,64 @@ async def admin_wake_event_requeue(event_id: str) -> dict[str, Any]:
     async with get_session_factory()() as session, _map_service_errors():
         return await wake_admin.requeue_wake_event(
             session, actor_sub=actor_sub, admin_authorized=admin_authorized, event_id=event
+        )
+
+
+@comms_server.tool
+async def admin_wake_delivery_pause(reason: str | None = None) -> dict[str, Any]:
+    """Admin-gated: stop the board sending wake events until resumed (TECH-9890).
+
+    While paused nothing is claimed or sent and attempt counts do not change.
+    Events are still recorded and still dead-letter 24 hours after they were
+    recorded. Idempotent: pausing again keeps the original ``paused_at``,
+    ``paused_by`` and ``reason``. Audited as ``wake_delivery.paused``. Requires
+    ``comms:admin`` (or an interactive/Okta caller).
+
+    - ``reason``: optional short note, at most 200 characters.
+
+    Returns ``paused``, ``paused_at``, ``paused_by`` and ``reason``.
+    """
+    token = _require_token()
+    actor_sub = _require_identity(token)
+    admin_authorized = is_interactive_token(token) or "comms:admin" in scopes_for_token(token)
+    async with get_session_factory()() as session, _map_service_errors():
+        return await wake_pause.pause_delivery(
+            session, actor_sub=actor_sub, admin_authorized=admin_authorized, reason=reason
+        )
+
+
+@comms_server.tool
+async def admin_wake_delivery_resume() -> dict[str, Any]:
+    """Admin-gated: let the board send wake events again (TECH-9890).
+
+    The backlog goes out in the normal order, except events older than 24 hours,
+    which are dead-lettered (requeue them with ``comms_admin_wake_event_requeue``).
+    Idempotent. Audited as ``wake_delivery.resumed``. Requires ``comms:admin`` (or
+    an interactive/Okta caller). Returns the same shape as
+    ``comms_admin_wake_delivery_status``.
+    """
+    token = _require_token()
+    actor_sub = _require_identity(token)
+    admin_authorized = is_interactive_token(token) or "comms:admin" in scopes_for_token(token)
+    async with get_session_factory()() as session, _map_service_errors():
+        return await wake_pause.resume_delivery(
+            session, actor_sub=actor_sub, admin_authorized=admin_authorized
+        )
+
+
+@comms_server.tool
+async def admin_wake_delivery_status() -> dict[str, Any]:
+    """Admin-gated: whether wake delivery is paused (TECH-9890).
+
+    Requires ``comms:admin`` (or an interactive/Okta caller). Returns ``paused``,
+    ``paused_at``, ``paused_by`` and ``reason``.
+    """
+    token = _require_token()
+    actor_sub = _require_identity(token)
+    admin_authorized = is_interactive_token(token) or "comms:admin" in scopes_for_token(token)
+    async with get_session_factory()() as session, _map_service_errors():
+        return await wake_pause.get_status(
+            session, actor_sub=actor_sub, admin_authorized=admin_authorized
         )
 
 

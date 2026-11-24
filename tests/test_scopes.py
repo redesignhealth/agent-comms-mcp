@@ -392,13 +392,14 @@ class TestCommsAdminConsumers:
     an already-``comms:write``-scoped tool, distinct from a route-level
     auth gate) are exactly ``set_agent_shared``, ``deregister_agent``,
     ``admin_register``, ``request_owner_reassignment`` and the two
-    ``admin_wake_target_*`` tools (TECH-9908) and the two ``admin_wake_event*`` tools (TECH-9913) in
+    ``admin_wake_target_*`` tools (TECH-9908) the two ``admin_wake_event*`` tools (TECH-9913) and the three
+    ``admin_wake_delivery_*`` tools (TECH-9890) in
     ``providers/comms.py``. Enumerates every function in that module whose
     source contains the ``comms:admin`` scope check -- if a future PR adds
     another, this test fails and forces an intentional update rather than
     letting the comment quietly go stale."""
 
-    def test_exactly_eight_functions_gate_on_comms_admin(self) -> None:
+    def test_exactly_eleven_functions_gate_on_comms_admin(self) -> None:
         admin_gated = []
         for name, func in inspect.getmembers(comms_provider, inspect.iscoroutinefunction):
             source = inspect.getsource(func)
@@ -407,6 +408,9 @@ class TestCommsAdminConsumers:
 
         assert sorted(admin_gated) == [
             "admin_register",
+            "admin_wake_delivery_pause",
+            "admin_wake_delivery_resume",
+            "admin_wake_delivery_status",
             "admin_wake_event_requeue",
             "admin_wake_events_list",
             "admin_wake_target_remove",

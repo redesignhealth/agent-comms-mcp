@@ -148,6 +148,10 @@ TOOL_SCOPES: dict[str, str] = {
     # another agent's wake events.
     "comms_admin_wake_events_list": "comms:read",
     "comms_admin_wake_event_requeue": "comms:write",
+    # TECH-9890: the delivery pause switch (admin-gated like the two above).
+    "comms_admin_wake_delivery_status": "comms:read",
+    "comms_admin_wake_delivery_pause": "comms:write",
+    "comms_admin_wake_delivery_resume": "comms:write",
     # Registered at comms:write deliberately -- the actual authorization
     # (comms:admin OR an interactive/Okta caller) is enforced by an
     # in-handler check, not by this table.
