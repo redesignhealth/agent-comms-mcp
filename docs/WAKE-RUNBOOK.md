@@ -259,13 +259,20 @@ on, Paperclip answers every signed wake event for a registered agent of that org
 issue, no comment, no run). The board holds all events for each of those agents and probes
 each one every 5 minutes. Turn the setting back on and the next probe is accepted and the
 held events flow in order. Each event still dies 24 hours after it was recorded, so decide
-within a day: after that, requeue (section 4) what you still want. Warning: an
-org stop can still raise `wake-oldest-undelivered`. Only the event the board is probing is
-marked `retry_later`; later events for those agents stay `pending` while the probe is held,
-and a `pending` event older than 5 minutes trips the alarm. Expect a page if messages keep
-arriving for the stopped org, and `wake-dead-lettered` after 24 hours when held events
-expire. Tell whoever is on call before you stop an org. This was not exercised on dev (the
-Paperclip change was not deployed there at the time of the test). Turning the setting off does not unregister
+within a day: after that, requeue (section 4) what you still want. From board 0.9.11,
+stopping an org does not raise `wake-oldest-undelivered` and does not page: only the event
+the board is probing is marked `retry_later`, and the later `pending` or `retry` events for
+the same agent are counted as held (`retry_later_count`), not as undelivered. Before 0.9.11
+those queued events were counted as undelivered and tripped the alarm after 5 minutes.
+`wake-dead-lettered` still fires after 24 hours, when held events are dropped
+(dead-lettered). A global operator pause (`comms_admin_wake_delivery_pause`) is different: it
+still counts events as undelivered and raises `wake-oldest-undelivered` after 5 minutes.
+
+The org off switch was tested on dev on 2026-11-24: setting off at 13:51 UTC, an invite was
+answered `retry_later` (HTTP 409) and no issue was created; setting back on at 13:52, the
+board's next probe at 13:56:46 delivered it, with one issue and one run. The switch needs
+Paperclip with paperclip #533. Before relying on it in an environment, check that its
+`/api/health` commit is `d9120c6e` or later. Turning the setting off does not unregister
 anyone and does not stop new agents from being created; it only makes Paperclip refuse to
 run wakes. Use unsubscribe (section 5) if the agents should leave wake for good.
 
@@ -280,13 +287,15 @@ not anything is happening. CloudWatch metric filters turn it (and the `wake_supp
 event) into metrics in the namespace `ReclawComms/Wake/<env>`, and four alarms watch
 them. The Terraform is in rh-data-platform (`infrastructure/modules/wake-alerts`). Alarm
 names are `<prefix>-wake-<name>` with prefix `rh-reclaw-comms` in prod and
-`rh-reclaw-comms-dev` in dev. In prod they notify Slack `#proj-alerts-infra`; in dev they
+`rh-reclaw-comms-dev` in dev. In prod they notify Slack `#proj-alerts-infra` (applied on 2026-11-24 at 13:48 UTC); in dev they
 only change state in the CloudWatch console.
 
 The event's fields: `paused` (0 or 1), `recorded`, `delivered`, `retried`, `failed`, `dead`
 (counts since the previous event), `open_count`, `oldest_undelivered_age_seconds` (events
-waiting for delivery: `pending` and `retry`), `retry_later_count` and
-`retry_later_oldest_age_seconds` (events held because the receiver said retry later).
+waiting for delivery: `pending` and `retry` events of recipients that have no `retry_later`
+event), `retry_later_count` and `retry_later_oldest_age_seconds` (held events: `retry_later`
+events, plus the `pending` and `retry` events of a recipient that has one). The held split
+applies from board 0.9.11.
 
 | Alarm | Fires when | What it means | What to do |
 |---|---|---|---|
@@ -302,9 +311,11 @@ was delivered within seconds. An alarm that is still ALARM for a couple of minut
 resumed is normal. The four alarms did not flap, and a normal 3 minute deploy cannot trip
 `wake-loop-down` (three 5 minute periods must all be empty).
 
-None of these means a message was lost. `retry_later` events (the event of a paused agent that the board is probing) are shown
-separately and are not counted in the alarmed age; but see the org stop warning in section
-8: events queued behind a `retry_later` event are `pending` and are counted. The metric `WakeTickFailed` counts
+None of these means a message was lost. From board 0.9.11, events held for a recipient (its
+`retry_later` event, and the `pending` or `retry` events queued behind it) are reported
+separately and are not counted in the alarmed age, so stopping an org or pausing one agent
+does not page. A global operator pause still counts events as undelivered and does alarm.
+The metric `WakeTickFailed` counts
 `wake delivery tick failed` log lines; it has no alarm, but a rising count explains events that are not being
 delivered.
 

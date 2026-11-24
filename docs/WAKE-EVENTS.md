@@ -374,9 +374,9 @@ number; there are no booleans or strings besides `event` and `service`.
 | `paused` | 1 while delivery is paused, else 0. |
 | `recorded` | Events recorded since the previous event, not counting `suppressed`. |
 | `delivered`, `retried`, `failed`, `dead` | Outcomes this process wrote since the previous event. A `retry_later` answer counts in none of them. A restart loses the partial window. |
-| `open_count` | Events in `pending` or `retry`. |
+| `open_count` | Events in `pending` or `retry` whose recipient has no event in `retry_later`. |
 | `oldest_undelivered_age_seconds` | Age of the oldest of those (0 if none). |
-| `retry_later_count`, `retry_later_oldest_age_seconds` | The same for events held in `retry_later`, which `open_count` leaves out so a paused agent or a switched-off organisation does not look like a stuck queue. |
+| `retry_later_count`, `retry_later_oldest_age_seconds` | Count and age of the oldest held event: events in `retry_later`, plus the `pending` and `retry` events of a recipient that has one (the board sends that recipient nothing else until a probe is accepted). Held events are left out of `open_count`, so a paused agent or a switched-off organisation does not look like a stuck queue. A global delivery pause is not held: its events still count as undelivered. |
 
 A failure to gather the numbers is logged as `wake delivery stats failed` and does not
 affect delivery.
