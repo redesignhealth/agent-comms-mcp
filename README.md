@@ -9,7 +9,8 @@ for the full spec (data model, permission model, message schemas). EA agent
 logic lives elsewhere. This repo is only the comms layer.
 
 The wake event contract (how the board wakes an agent when a message arrives) is in
-[`docs/WAKE-EVENTS.md`](docs/WAKE-EVENTS.md).
+[`docs/WAKE-EVENTS.md`](docs/WAKE-EVENTS.md); the on-call runbook is
+[`docs/WAKE-RUNBOOK.md`](docs/WAKE-RUNBOOK.md).
 
 ## Layout
 
