@@ -11,17 +11,77 @@ client signed in to the board as an admin (an interactive login, or a token with
 `comms:admin` scope). Paperclip calls are HTTP calls by an instance admin.
 
 Reaching the board from a script: the board speaks streamable HTTP MCP at
-`https://reclaw-mcp-dev.drum-mackarel.ts.net/mcp` in dev (you must be on the tailnet).
-Paperclip holds a `comms:admin` service token for the board in SSM; in dev it is
-`/paperclip/dev/PAPERCLIP_COMMS_BOARD_ADMIN_TOKEN` (`aws ssm get-parameter --with-decryption`,
-region `us-east-1`). Read it straight into a shell variable, send it as
-`Authorization: Bearer ...`, and never print it, save it to a file, or paste it into a
-ticket. A client such as `fastmcp.Client` with `StreamableHttpTransport` can call any tool
-named below by name. The board log is the CloudWatch group `/ecs/rh-reclaw-comms-dev`
-(dev) or `/ecs/rh-reclaw-comms` (prod); for example
-`aws logs filter-log-events --region us-east-1 --log-group-name /ecs/rh-reclaw-comms-dev
---start-time <epoch ms> --filter-pattern 'wake delivery'`. Use plain words in the filter
-pattern; a pattern with a quoted `event=` matches nothing.
+`https://reclaw-mcp-dev.drum-mackarel.ts.net/mcp` in dev and
+`https://reclaw-mcp.drum-mackarel.ts.net/mcp` in prod (you must be on the tailnet).
+Paperclip holds a `comms:admin` service token for the board in SSM:
+
+| | Board URL | Admin token parameter |
+|---|---|---|
+| dev | `https://reclaw-mcp-dev.drum-mackarel.ts.net/mcp` | `/paperclip/dev/PAPERCLIP_COMMS_BOARD_ADMIN_TOKEN` |
+| prod | `https://reclaw-mcp.drum-mackarel.ts.net/mcp` | `/paperclip/prod/PAPERCLIP_COMMS_BOARD_ADMIN_TOKEN` |
+
+Read it with `aws ssm get-parameter --with-decryption`, region `us-east-1`, straight into a
+variable, send it as `Authorization: Bearer ...`, and never print it, save it to a file, or
+paste it into a ticket. This snippet (dev) calls a tool by name; it needs a Python with
+`fastmcp` installed and the AWS CLI signed in. Change the URL and parameter name for prod.
+
+```python
+import asyncio, subprocess
+from fastmcp import Client
+from fastmcp.client.transports import StreamableHttpTransport
+
+URL = "https://reclaw-mcp-dev.drum-mackarel.ts.net/mcp"
+PARAM = "/paperclip/dev/PAPERCLIP_COMMS_BOARD_ADMIN_TOKEN"
+token = subprocess.check_output(
+    ["aws", "ssm", "get-parameter", "--region", "us-east-1", "--with-decryption",
+     "--name", PARAM, "--query", "Parameter.Value", "--output", "text"], text=True).strip()
+
+async def main():
+    async with Client(StreamableHttpTransport(URL, auth=token)) as client:
+        result = await client.call_tool("comms_admin_wake_delivery_status", {})
+        print(result.data)  # tool name and arguments: any tool named below
+
+asyncio.run(main())
+```
+
+A `401` from the board URL means no token or the wrong one, not that you are off the
+network (off the tailnet the connection fails or times out). If you cannot read the
+parameter, ask in `#proj-alerts-infra`.
+
+Version of the board that is running: see "Which board version is deployed" below.
+
+### Quick health check
+
+Four alarms and the latest stats line. Dev (use `rh-reclaw-comms-wake` for prod, and log
+group `/ecs/rh-reclaw-comms`):
+
+```
+aws cloudwatch describe-alarms --region us-east-1 --alarm-name-prefix rh-reclaw-comms-dev-wake \
+  --query 'MetricAlarms[].[AlarmName,StateValue]' --output text
+aws logs filter-log-events --region us-east-1 --log-group-name /ecs/rh-reclaw-comms-dev \
+  --start-time <epoch ms, 10 minutes ago> --filter-pattern '"wake_delivery_stats"'
+```
+
+Healthy: all four alarms `OK`, and the latest stats line has `paused` 0 and
+`oldest_undelivered_age_seconds` near 0 (section 9 lists every field). On macOS, a start
+time 10 minutes ago is `$(( ($(date +%s) - 600) * 1000 ))`.
+
+### Which board version is deployed
+
+The ECS task definition image tag ends `-base-<agent-comms-mcp commit>`. Dev:
+
+```
+aws ecs describe-services --region us-east-1 --cluster rh-platform-dev-cluster \
+  --services rh-reclaw-comms-dev --query 'services[0].taskDefinition' --output text
+aws ecs describe-task-definition --region us-east-1 --task-definition <that value> \
+  --query 'taskDefinition.containerDefinitions[?name==`app`].image' --output text
+```
+
+Prod: cluster `rh-platform-cluster`, service `rh-reclaw-comms`. The tag looks like
+`sha-<deploy repo commit>-base-292439af...`; compare the part after `-base-` with the
+commit you need. Release 0.9.11 is commit `292439af`, so a tag whose `-base-` commit is
+that one or a later one has it (check with `git merge-base --is-ancestor 292439af <commit>`
+in this repo). The board's `/health` route answers only `ok`; it does not show a version.
 
 ## 1. Facts to know first
 
@@ -77,7 +137,10 @@ What the receiver's answers do (full table: WAKE-EVENTS.md section 4):
 ## 3. See what is stuck
 
 List events, newest first. Filter by agent, conversation and status; `limit` is 1 to 200
-(default 50):
+(default 50). The answer is `{events: [...], has_more}`; `has_more` is true when more rows
+match than `limit`. Without a `status` filter the list holds every status. An unknown
+status is refused with `invalid_request: status must be one of pending, delivered, retry,
+retry_later, failed, dead, suppressed`.
 
 ```
 comms_admin_wake_events_list(status="dead")
@@ -85,8 +148,13 @@ comms_admin_wake_events_list(agent_id="<board agent id>", status="retry_later")
 comms_admin_wake_events_list(status="suppressed")
 ```
 
-Each row has `status`, `attempt_count`, `next_attempt_at`, `created_at` and a short
-`last_error`. Reading `last_error`:
+Each row has `event_id`, `recipient_agent_id`, `conversation_id`, `sender_agent_id`,
+`kind` (`message` or `invite`), `seq` (the message number; empty for an invite),
+`message_type`, `reason` (why it was recorded: `rule` or `open_conversation`), `status`,
+`attempt_count`, `next_attempt_at`, `created_at`, `delivered_at` (empty until delivered)
+and a short `last_error`. Filter on `status`, not on `last_error`: `last_error` is kept
+after a later successful delivery, so a `delivered` event can still show `receiver
+answered retry_later`. Reading `last_error` (for an event that is not delivered):
 
 | `last_error` | Meaning | Do |
 |---|---|---|
@@ -109,7 +177,20 @@ wake delivery event=<id> recipient=<agent id> attempt=<n> outcome=<label> status
 `outcome` is one of `delivered`, `retry`, `retry_later`, `refused`, `gone`, `unauthorized`,
 `retries_exhausted`, `no_target`, `host_not_allowed`, `allowlist_misconfigured`. A failed
 pass of the loop logs `wake delivery tick failed: <ExceptionClass>`. Log groups:
-`/ecs/rh-reclaw-comms-dev` (dev) and `/ecs/rh-reclaw-comms` (prod).
+`/ecs/rh-reclaw-comms-dev` (dev) and `/ecs/rh-reclaw-comms` (prod). Two filters, dev
+shown:
+
+```
+aws logs filter-log-events --region us-east-1 --log-group-name /ecs/rh-reclaw-comms-dev \
+  --start-time <epoch ms> --filter-pattern 'wake delivery'
+aws logs filter-log-events --region us-east-1 --log-group-name /ecs/rh-reclaw-comms-dev \
+  --start-time <epoch ms> --filter-pattern '"wake_delivery_stats"'
+```
+
+The first (two words, no `_`) returns the per-event delivery lines above and the tick
+failure lines. The second returns the stats event, one JSON line about every 30 seconds
+(section 9). Use plain words or one quoted phrase in a filter pattern; a pattern with a
+quoted `event=` matches nothing.
 
 ## 4. Requeue
 
@@ -223,8 +304,9 @@ seconds, so it takes effect at once and needs no deploy or restart. It ships un-
 
 "Plus admin" means the token carries `comms:admin`, or the caller signed in interactively.
 Anyone else gets the standard `access_denied`. Each call returns `paused`, `paused_at`,
-`paused_by` and `reason`. Pause and resume are safe to repeat; pausing again keeps the
-original time, person and reason. Both are written to the audit log
+`paused_by` and `reason`. When the shared admin token is used, `paused_by` shows the
+service token's name, not the person, so put your name in `reason`. Pause and resume are
+safe to repeat; pausing again keeps the original time, person and reason. Both are written to the audit log
 (`wake_delivery.paused`, `wake_delivery.resumed`).
 
 ```
@@ -237,9 +319,12 @@ While paused the board sends nothing and does not touch attempt counts. Events a
 recorded and still die 24 hours after they were recorded, so a pause longer than a day
 loses the older events. That is deliberate: the board never wakes an agent for something
 a day old. After resume the backlog goes out in order. Requeue any that died while paused
-(section 4). A pause is not a silent state: the "oldest undelivered" alarm fires after 5
-minutes (section 9), which is the proof that the pause took effect. Resume before the
-24 hours are up.
+(section 4). The proof that a pause took effect is `paused: true` from
+`comms_admin_wake_delivery_status()`, or `paused: 1` in the `wake_delivery_stats` line
+(section 9). The "oldest undelivered" alarm is not that proof: it fires only if an event is
+waiting for more than 5 minutes. There is no enforced maximum pause; the only limit is
+that an event held for more than 24 hours is dropped (dead-lettered). Keep test pauses
+under 5 minutes, and resume before the 24 hours are up.
 
 Fallback if the board's admin tools cannot be reached: set
 `reclaw_comms_wake_target_allowed_hosts` to an empty string in
@@ -302,7 +387,7 @@ applies from board 0.9.11.
 | `wake-oldest-undelivered` | the oldest waiting event is older than 5 minutes | Delivery is stuck or slow: delivery paused, Paperclip failing or unreachable (retry backoff), or the loop stalled | `comms_admin_wake_delivery_status()`. If paused, was it on purpose? Resume. If not paused, list events with status `retry` or `pending` (section 3) and read `last_error`. Check Paperclip health and the board log |
 | `wake-dead-lettered` | any event died in the last 5 minutes | An event gave up: 401 (secret mismatch, section 6), retries used up (Paperclip down about 45 minutes), or it aged out after 24 hours | `comms_admin_wake_events_list(status="dead")`, fix the cause, requeue (section 4) |
 | `wake-loop-guard` | any `wake_suppressed` in the last 5 minutes | Two agents are answering each other and the loop guard cut off wake events (section 7) | Find the conversation, stop the exchange |
-| `wake-loop-down` | no stats event for 15 minutes | The delivery task is not running: the board is down, restarting in a loop, or the task crashed | Check the ECS service `rh-reclaw-comms`: stopped or restarting tasks and their log (container start and exit lines). A tick failure (`wake delivery tick failed`) does not cause this alarm, because the loop keeps running and keeps emitting stats. The 15 minutes covers a normal deploy |
+| `wake-loop-down` | no stats event for 15 minutes | The delivery task is not running: the board is down, restarting in a loop, or the task crashed | Check the ECS service (dev `rh-reclaw-comms-dev` in cluster `rh-platform-dev-cluster`, prod `rh-reclaw-comms` in cluster `rh-platform-cluster`): stopped or restarting tasks and their log (container start and exit lines). A tick failure (`wake delivery tick failed`) does not cause this alarm, because the loop keeps running and keeps emitting stats. The 15 minutes covers a normal deploy |
 
 Timings seen on dev (2026-11-24): after a pause with one event held, `oldest-undelivered`
 went to ALARM about 6 minutes 40 seconds later (the 5 minute threshold, plus up to a minute
@@ -318,6 +403,18 @@ does not page. A global operator pause still counts events as undelivered and do
 The metric `WakeTickFailed` counts
 `wake delivery tick failed` log lines; it has no alarm, but a rising count explains events that are not being
 delivered.
+
+### Prod access and where alerts land
+
+Prod alarms notify Slack `#proj-alerts-infra`. No on-call rota is documented in this
+repo: responders are whoever is watching that channel. To act on prod you need the tailnet
+and the prod admin token (top of this file). Check Paperclip health (tailnet only; the
+JSON has `status` and `commit`):
+
+```
+curl -s https://rh-agents.drum-mackarel.ts.net/api/health        # prod
+curl -s https://rh-agents-dev.drum-mackarel.ts.net/api/health    # dev
+```
 
 ## 10. Roll back the board release
 
