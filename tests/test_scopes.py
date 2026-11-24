@@ -392,8 +392,8 @@ class TestCommsAdminConsumers:
     an already-``comms:write``-scoped tool, distinct from a route-level
     auth gate) are exactly ``set_agent_shared``, ``deregister_agent``,
     ``admin_register``, ``request_owner_reassignment`` and the two
-    ``admin_wake_target_*`` tools (TECH-9908) the two ``admin_wake_event*`` tools (TECH-9913) and the three
-    ``admin_wake_delivery_*`` tools (TECH-9890) in
+    ``admin_wake_target_*`` tools (TECH-9908), the two ``admin_wake_event*`` tools
+    (TECH-9913) and the three ``admin_wake_delivery_*`` tools (TECH-9890) in
     ``providers/comms.py``. Enumerates every function in that module whose
     source contains the ``comms:admin`` scope check -- if a future PR adds
     another, this test fails and forces an intentional update rather than
