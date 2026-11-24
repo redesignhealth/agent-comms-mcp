@@ -299,7 +299,9 @@ async def get(target_key: str) -> dict[str, Any]:
     return shaped
 
 
-async def _fetch(config: tuple[str, str], path: str, tool: str) -> httpx.Response:
+async def _fetch(
+    config: tuple[str, str], path: str, tool: str, unavailable: str = _UNAVAILABLE
+) -> httpx.Response:
     """GET ``path`` on Arcadia with the exchanged service token (one re-exchange on a 401).
     Raises ``catalog_unavailable`` when the token or the read cannot be had."""
     url, key = config
@@ -307,17 +309,17 @@ async def _fetch(config: tuple[str, str], path: str, tool: str) -> httpx.Respons
         async with build_client() as client, asyncio.timeout(30.0):
             token = await _tokens.get(client, url, key)
             if token is None:
-                raise ToolError(_UNAVAILABLE)
+                raise ToolError(unavailable)
             resp = await _read(client, url, token, path)
             if resp.status_code == 401:
                 _tokens.invalidate(token)
                 token = await _tokens.get(client, url, key, force=True)
                 if token is None:
-                    raise ToolError(_UNAVAILABLE)
+                    raise ToolError(unavailable)
                 resp = await _read(client, url, token, path)
     except (httpx.HTTPError, TimeoutError, ValueError) as exc:
         logger.warning("%s: read failed: %s", tool, type(exc).__name__)
-        raise ToolError(_UNAVAILABLE) from None
+        raise ToolError(unavailable) from None
     return resp
 
 
@@ -336,9 +338,11 @@ def project_capabilities(data: Any) -> dict[str, Any] | None:
         if not isinstance(item, dict):
             return None
         row = {k: item.get(k) for k in ("capability", "sub_capability", "description")}
-        if not all(isinstance(v, str) for v in row.values()):
+        label_ok = isinstance(row["capability"], str) and row["capability"]
+        sub_ok = isinstance(row["sub_capability"], str) and row["sub_capability"]
+        if not (label_ok and sub_ok and isinstance(row["description"], str)):
             return None
-        out.append({k: str(v) for k, v in row.items()})
+        out.append({k: v for k, v in row.items() if isinstance(v, str)})
     return {"rubric_sha256": digest, "capabilities": out}
 
 
@@ -361,7 +365,7 @@ async def capabilities() -> dict[str, Any]:
     if config is None:
         raise ToolError(_NOT_CONFIGURED)
     _check_rate(bot)
-    resp = await _fetch(config, CAPABILITIES_PATH, "catalog_capabilities")
+    resp = await _fetch(config, CAPABILITIES_PATH, "catalog_capabilities", _UNAVAILABLE_RUBRIC)
     if resp.status_code != 200 or len(resp.content) > MAX_CONTENT_BYTES:
         logger.warning("catalog_capabilities: Arcadia answered HTTP %s", resp.status_code)
         raise ToolError(_UNAVAILABLE_RUBRIC)

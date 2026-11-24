@@ -36,8 +36,9 @@ closed as rejected and proposals_get shows Arcadia's code and field errors in de
 Before you write a create or upsert, call catalog_get(target_key) with the same target_key
 ("concept:<slug>", "pair:<concept-slug>:<MARKET>" or "capability_map:<concept-slug>"). It
 returns {target_key, target_type, exists, status, version, payload}:
-- exists false -> propose a create. For a pair whose concept is not in the catalog either
-  (catalog_get("concept:<slug>") says exists false), see "New concept with its first row" below.
+- exists false -> propose a create (a capability map is never created: see "Capability map" below,
+  it is always an upsert, with no base_version while no map exists). For a pair whose concept is
+  not in the catalog either (catalog_get("concept:<slug>") says exists false), see "New concept with its first row" below.
 - exists true -> propose an upsert, never a create. Start from "payload" (the row in the payload
   shape below). For a pair, send "version" as base_version; a concept has no version, so send none.
 - status "deleted" (exists is still true): the target was soft-deleted; an upsert restores it.
@@ -47,16 +48,19 @@ guess, and do not propose a create.
 action fields (proposals_submit(kind="catalog_candidate", action=...)):
 - action_type: "create" | "upsert" | "delete".
 - target_id: "concept:<slug>" for a concept, "pair:<concept-slug>:<MARKET>" for one concept in one
-  market. <slug> is lowercase words joined by single hyphens ([a-z0-9]+(-[a-z0-9]+)*); <MARKET> is
-  exactly two capital letters, such as US. No other form is accepted.
-- create / upsert: "payload" (required) is the schema's ConceptPayload for a concept target or
-  ConceptMarketPayload for a pair target, and must name the same slug (and market) as target_id.
+  market, "capability_map:<concept-slug>" for a concept's capability map. <slug> is lowercase words
+  joined by single hyphens ([a-z0-9]+(-[a-z0-9]+)*); <MARKET> is exactly two capital letters, such
+  as US. No other form is accepted.
+- create / upsert: "payload" (required) is the schema's ConceptPayload for a concept target,
+  ConceptMarketPayload for a pair target or CapabilityMapPayload for a capability map target, and
+  must name the same slug (and market) as target_id.
   Also required: "fact_check", a non-empty list of rounds {round >= 1, agreement_score 0-100,
   issues_high/medium/low >= 0, open_issue_count >= 0}; no minimum score, at most 20 rounds.
   Optional: "citations" (at most 10, each resolving to YOUR OWN stored sources; same shape as Arcana
   brain proposals), "reason" (text, at most 2000 characters).
 - upsert only: "base_version" (integer >= 1), the catalog version you edited. Arcadia
-  requires it when it already holds that pair; omit it only if the pair is new. Never on create.
+  requires it when it already holds that pair (or capability map); omit it only if it is new.
+  Never on create.
 - delete: only target_id, action_type and "reason" (required, non-empty, at most 2000 characters);
   "fact_check" and "citations" are optional. No payload: the schema's DeletePayload definition is
   built by the approvals service from target_id and reason; never send a payload on a delete.
@@ -79,7 +83,7 @@ action fields (proposals_submit(kind="catalog_candidate", action=...)):
   catalog_candidate with target_id "capability_map:<concept-slug>" and action_type "upsert" only
   (no create, no delete). Call catalog_capabilities first: it returns {rubric_sha256, capabilities:
   [{capability, sub_capability, description}]}. The payload is the schema's CapabilityMapPayload:
-  {schema_version 4, concept_slug (same as target_id), rubric_sha256 (exactly as
+  {schema_version 4, concept_slug (the <concept-slug> part of target_id), rubric_sha256 (exactly as
   catalog_capabilities gave it), items}, 1 to 8 items, each {capability, sub_capability (labels
   exactly as listed), relation "addresses" | "requires", weight 1-3, min_level 2 or 3 (required for
   "requires", never for "addresses"), rationale (at most 400 characters)}; no item repeats a
@@ -88,7 +92,9 @@ action fields (proposals_submit(kind="catalog_candidate", action=...)):
   upsert without it, BASE_VERSION_REQUIRED). Arcadia may refuse with CONCEPT_NOT_FOUND,
   UNKNOWN_CAPABILITY or RUBRIC_MISMATCH. fact_check is required as for any create or upsert.
 - No unknown fields anywhere. Do not include health-system material; it is refused.
-- schema_version in a payload must be the schema's version (it defaults to it when omitted).
+- schema_version in a payload: a capability map must say 4. Concept, pair and delete payloads may
+  say 2, 3 or 4 (an embedded concept needs 3 or 4); it defaults to the schema's version when
+  omitted.
 """
 
 

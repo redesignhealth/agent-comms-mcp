@@ -198,6 +198,6 @@ class TestSchemaCopy:
         assert pin == ours
 
     def test_pin_is_v4_and_keeps_v2_and_v3_compatible(self) -> None:
-        pin = json.loads((Path("providers") / proposal_schemas.PIN_RESOURCE).read_text())
+        pin = json.loads((_ROOT / "providers" / proposal_schemas.PIN_RESOURCE).read_text())
         assert (pin["schema_version"], pin["vocabulary_version"]) == (4, 3)
         assert pin["compatible_arcadia_sha256"] == {"2": CANONICAL_V2, "3": CANONICAL_V3}

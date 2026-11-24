@@ -179,3 +179,43 @@ class TestCapabilityMapKeys:
         reply = {"exists": False, "status": None, "version": None, "payload": None}
         assert catalog.project({**reply, "target_type": "capability_map"}) is not None
         assert catalog.project({**reply, "target_type": "site"}) is None
+
+
+class TestProjectCapabilities:
+    def test_empty_labels_are_not_the_expected_shape(self) -> None:
+        bad = {"rubric_sha256": RUBRIC, "capabilities": [{**LABELS[0], "sub_capability": ""}]}
+        assert catalog.project_capabilities(bad) is None
+
+    def test_a_non_string_description_is_not_the_expected_shape(self) -> None:
+        bad = {"rubric_sha256": RUBRIC, "capabilities": [{**LABELS[0], "description": 3}]}
+        assert catalog.project_capabilities(bad) is None
+
+    def test_too_many_labels(self) -> None:
+        many = {
+            "rubric_sha256": RUBRIC,
+            "capabilities": [LABELS[0]] * (catalog.MAX_CAPABILITIES + 1),
+        }
+        assert catalog.project_capabilities(many) is None
+
+    async def test_an_oversized_reply_is_unavailable(self, main: Any) -> None:
+        big = httpx.Response(200, content=b" " * (catalog.MAX_CONTENT_BYTES + 1))
+        with pytest.raises(ToolError, match="rubric is unavailable"):
+            await _capabilities(main, Arcadia(row=lambda r: big))
+
+    async def test_a_refused_exchange_says_the_rubric_is_unavailable(self, main: Any) -> None:
+        with pytest.raises(ToolError, match="rubric is unavailable"):
+            await _capabilities(main, Arcadia(row=_rubric, exchange_status=401))
+
+    async def test_interactive_callers_are_refused(self, main: Any) -> None:
+        token = _token()
+        token.claims = {"iss": "okta", "sub": "human@example.com"}
+        with (
+            _OIDC_PATCH,
+            _ENV_PATCH,
+            patch.object(catalog, "build_client", Arcadia(row=_rubric).client),
+            patch("main.get_access_token", return_value=token),
+            patch("providers.proposals.get_access_token", return_value=token),
+            pytest.raises(ToolError),
+        ):
+            async with Client(main.mcp) as client:
+                await client.call_tool("catalog_capabilities", {})
