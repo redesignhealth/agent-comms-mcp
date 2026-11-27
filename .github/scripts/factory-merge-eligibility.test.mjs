@@ -6,12 +6,13 @@ import {
   hasGateApprovalAtHead,
   isFactoryOwned,
   REQUIRED_CHECKS,
+  checksGreen,
 } from "./factory-merge-eligibility.mjs";
 
 const REPO = "redesignhealth/agent-comms-mcp";
 const SHA = "a".repeat(40);
 const OLD = "b".repeat(40);
-const gate = (over = {}) => ({ user: { login: "github-actions[bot]", type: "Bot" }, state: "APPROVED", commit_id: SHA, ...over });
+const gate = (over = {}) => ({ user: { login: "github-actions[bot]", type: "Bot" }, state: "APPROVED", commit_id: SHA, body: `<!-- argus-gate-approval:${SHA} -->\n## Auto-Approved (Argus)`, ...over });
 const green = () => REQUIRED_CHECKS.map((name) => ({ name, status: "completed", conclusion: "success" }));
 
 function base(over = {}) {
@@ -84,6 +85,10 @@ test("hold-list paths hold the PR with the paths listed", () => {
     "auth.py",
     "identity.py",
     "wake_secrets.py",
+    "scopes.py",
+    "providers/token_store.py",
+    "nested/Dockerfile.dev",
+    "sub/pyproject.toml",
     "Dockerfile",
     "entrypoint.sh",
     "docker-compose.yml",
@@ -146,4 +151,38 @@ test("conflicts, draft, closed, behind and blocked are skipped", () => {
   assert.equal(evaluateFactoryPr(base({ pr: { state: "closed" } })).action, "skip");
   assert.equal(evaluateFactoryPr(base({ pr: { mergeable_state: "behind" } })).action, "skip");
   assert.equal(evaluateFactoryPr(base({ pr: { mergeable_state: "blocked" } })).action, "skip");
+});
+
+test("approval without the gate marker for the head SHA does not count", () => {
+  assert.equal(evaluateFactoryPr(base({ reviews: [gate({ body: "approved" })] })).action, "skip");
+  assert.equal(evaluateFactoryPr(base({ reviews: [gate({ body: `<!-- argus-gate-approval:${OLD} -->` })] })).action, "skip");
+  assert.equal(evaluateFactoryPr(base({ reviews: [gate({ body: undefined })] })).action, "skip");
+});
+
+test("a dismissed gate approval does not count", () => {
+  assert.equal(evaluateFactoryPr(base({ reviews: [gate({ state: "DISMISSED" })] })).action, "skip");
+});
+
+test("the infrastructure label leaves the PR for a person", () => {
+  assert.equal(evaluateFactoryPr(base({ pr: { labels: [{ name: "auto-approved" }, { name: "builder:infrastructure" }] } })).action, "skip");
+});
+
+test("only a clean merge state merges (unstable, has no allow-list match)", () => {
+  assert.equal(evaluateFactoryPr(base({ pr: { mergeable_state: "unstable" } })).action, "skip");
+  assert.equal(evaluateFactoryPr(base({ pr: { mergeable_state: "has_hooks" } })).action, "merge");
+});
+
+test("a renamed file keeps its old path in play (workflow passes both names)", () => {
+  const r = evaluateFactoryPr(base({ files: ["docs/new.md", "migrations/versions/old.py"] }));
+  assert.equal(r.action, "hold");
+});
+
+test("checksGreen needs every required check", () => {
+  assert.equal(checksGreen(green()), true);
+  assert.equal(checksGreen([]), false);
+  assert.equal(checksGreen(undefined), false);
+});
+
+test("missing repo name never counts as same-repo", () => {
+  assert.equal(isFactoryOwned({ ...base().pr, head: { ref: "factory/x", sha: SHA, repo: {} } }, undefined), false);
 });

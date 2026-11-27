@@ -21,15 +21,18 @@ name: Factory Auto-Merge
 # fully in force: GitHub refuses the merge if it is not satisfied. Consequence:
 # merges by GITHUB_TOKEN do not start push-triggered workflows, so the CI run on
 # `main` that a person's merge would start does not run for a factory merge.
-# Deploy and publish run on `release: published`, which a person cuts, so they
-# are unaffected.
+# deploy.yml and publish.yml (on `release: published`) require a successful
+# push-triggered ci.yml run on the exact release commit, so a release cut at a
+# factory-merged commit is REFUSED (fail closed) until a later push to main has
+# CI. After a merge this workflow comments that on the PR.
 #
 # The Argus store is not read here: the IAM role that reads it trusts only
 # auto-approve.yml. The gate's APPROVED review at the head SHA is the evidence.
 #
 # OFF SWITCH: set repo variable FACTORY_AUTO_MERGE_DISABLED to `true` to stop all
 # factory merges. Delete it or set it to anything else to resume.
-# DRY RUN: dispatch with dry_run=true to log decisions without merging.
+# DRY RUN: dispatch with dry_run=true to log decisions without merging; without
+# pr_number it evaluates every open PR (so a person's PR shows as rejected).
 
 on:
   workflow_run:
@@ -98,13 +101,11 @@ jobs:
             const dryRun = process.env.DRY_RUN === 'true';
             const only = process.env.ONLY_PR ? parseInt(process.env.ONLY_PR, 10) : null;
 
-            // Dry run lists every open PR so the log also shows a person's PR being rejected.
+            // Dry run covers every open PR so the log also shows a person's PR being rejected.
             const open = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', base: BASE_BRANCH, per_page: 100 });
             const candidates = open.filter(p =>
-              (dryRun && only ? p.number === only : (
-                p.head?.ref?.startsWith(FACTORY_BRANCH_PREFIX) &&
-                p.user?.login === FACTORY_BOT_LOGIN &&
-                (!only || p.number === only))));
+              (!only || p.number === only) &&
+              (dryRun || (p.head?.ref?.startsWith(FACTORY_BRANCH_PREFIX) && p.user?.login === FACTORY_BOT_LOGIN)));
             core.info(`${candidates.length} candidate PR(s)${dryRun ? ' (dry run)' : ''}`);
 
             let failures = 0;
@@ -142,6 +143,8 @@ jobs:
                 try {
                   await github.rest.pulls.merge({ owner, repo, pull_number: c.number, sha, merge_method: 'squash' });
                   core.info(`PR #${c.number} merged at ${sha}`);
+                  await github.rest.issues.createComment({ owner, repo, issue_number: c.number, body:
+                    `Factory auto-merge merged this PR at \`${sha.slice(0, 7)}\` (squash). The merge was made with the workflow token, so no CI run starts on \`main\` for the new commit. deploy.yml and publish.yml refuse a release cut at a commit with no push-triggered CI run: cut releases at a commit that has one.` });
                 } catch (e) {
                   // 405/409: head moved or the ruleset is not satisfied right now; the schedule retries.
                   if (e.status === 405 || e.status === 409) { core.warning(`PR #${c.number}: not mergeable (${e.status}: ${e.message}); retrying next run`); continue; }

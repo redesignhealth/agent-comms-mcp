@@ -30,16 +30,17 @@ export const HOLD_PATH_PATTERNS = [
   /(^|\/)(migrations?|alembic)\//i,
   /^alembic\.ini$/i,
   /(^|\/)auth([-_][^/]*|n|z|entication|orization)?\//i,
-  /(^|\/)(auth|authn|authz|oauth|okta|identity|mint_token|wake_secrets)[^/]*\.(py|ts|tsx|js|mjs|tf|ya?ml)$/i,
+  /(^|\/)(auth|authn|authz|oauth|okta|identity|scopes?|mint_token|secrets?|tokens?|wake_secrets)[^/]*\.(py|ts|tsx|js|mjs|tf|ya?ml)$/i,
+  /(^|\/)(secrets?|tokens?)\//i,
   // All of .github/: workflows and the gate scripts themselves. A factory PR must
   // never change the rules that decide whether it merges.
   /^\.github\//,
   // Image, packaging and release inputs (releases are cut by hand from main).
-  /(^|\/)Dockerfile[^/]*$/,
-  /^entrypoint\.sh$/,
-  /^docker-compose[^/]*\.ya?ml$/,
-  /^pyproject\.toml$/,
-  /^uv\.lock$/,
+  /(^|\/)Dockerfile[^/]*$/i,
+  /(^|\/)entrypoint\.sh$/,
+  /(^|\/)docker-compose[^/]*\.ya?ml$/i,
+  /(^|\/)pyproject\.toml$/,
+  /(^|\/)uv\.lock$/,
 ];
 
 // PRs from the infrastructure builder are always a person's to merge.
@@ -47,10 +48,11 @@ const INFRA_BRANCH = /^factory\/infrastructure([/-]|$)/i;
 const INFRA_LABEL = "builder:infrastructure";
 
 export function holdPaths(files) {
-  return files.filter((f) => HOLD_PATH_PATTERNS.some((re) => re.test(f)));
+  return (files ?? []).filter((f) => HOLD_PATH_PATTERNS.some((re) => re.test(f)));
 }
 
 export function isFactoryOwned(pr, repoFullName) {
+  if (!repoFullName) return false;
   const headRef = pr?.head?.ref ?? "";
   return (
     headRef.startsWith(FACTORY_BRANCH_PREFIX) &&
@@ -61,10 +63,15 @@ export function isFactoryOwned(pr, repoFullName) {
   );
 }
 
-/** Latest-per-reviewer APPROVED review at the head SHA from the gate (github-actions[bot]). */
+/**
+ * Latest-per-reviewer APPROVED review at the head SHA from the gate (github-actions[bot]),
+ * carrying the gate's marker for that full SHA. The marker is a tripwire, not proof: the
+ * repo lets any workflow approve as github-actions[bot], so a writer could forge it. That
+ * writer could already approve and merge their own PR, so this adds no new privilege.
+ */
 export function hasGateApprovalAtHead(reviews, headSha, authorLogin) {
   const latest = new Map();
-  for (const r of reviews) {
+  for (const r of reviews ?? []) {
     if (!r.user || r.state === "COMMENTED" || r.state === "PENDING") continue;
     latest.set(r.user.login, r);
   }
@@ -76,7 +83,8 @@ export function hasGateApprovalAtHead(reviews, headSha, authorLogin) {
       r.commit_id === headSha &&
       r.user.type === "Bot" &&
       r.user.login === GATE_APPROVER_LOGIN &&
-      r.user.login !== authorLogin,
+      r.user.login !== authorLogin &&
+      (r.body ?? "").includes(`<!-- argus-gate-approval:${headSha} -->`),
   );
 }
 
@@ -127,7 +135,8 @@ export function evaluateFactoryPr({ pr, repo, files, reviews, checkRuns, disable
   if (pr.mergeable === false || pr.mergeable_state === "dirty") {
     return { action: "skip", reason: "merge conflicts" };
   }
-  if (pr.mergeable_state === "behind" || pr.mergeable_state === "blocked") {
+  // Allow-list: anything but a clean state (behind, blocked, unstable, ...) is left alone.
+  if (pr.mergeable_state !== "clean" && pr.mergeable_state !== "has_hooks") {
     return { action: "skip", reason: `merge state ${pr.mergeable_state}` };
   }
   return { action: "merge", reason: "all conditions hold", paths: [] };
