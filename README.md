@@ -454,6 +454,40 @@ error, the "Argus Auto-Approval Unavailable" comment above is posted on the
 PR, and PRs fall back to requiring a human review -- a safe, fail-closed
 default.
 
+### Factory auto-merge
+
+`.github/workflows/factory-auto-merge.yml` merges PRs from the code factory
+without a person. A PR merges unattended only if all of these hold:
+
+- the head branch starts with `factory/` and the PR was opened by
+  `rh-code-factory[bot]`;
+- the Argus gate (`auto-approve.yml`) has approved the PR at its exact head SHA;
+- all four required checks are green: `Lint & type-check`, `Tests`,
+  `Docker build` and `All checks passed`.
+
+The merge is a squash, pinned to the head SHA, so a later push makes GitHub
+refuse it. It uses the workflow's `GITHUB_TOKEN`, so the `main` ruleset still
+applies in full.
+
+**Held for a person** (the workflow comments instead of merging) when the PR
+touches migrations or `alembic`, auth or secrets/token modules, anything under
+`.github/`, a `Dockerfile`, `entrypoint.sh`, `docker-compose*.yml`,
+`pyproject.toml` or `uv.lock`, or comes from the infrastructure builder
+(`factory/infrastructure` branch or `builder:infrastructure` label). The exact
+rules are `HOLD_PATH_PATTERNS` in `.github/scripts/factory-merge-eligibility.mjs`.
+
+**Off switch:** set the repository variable `FACTORY_AUTO_MERGE_DISABLED` to
+`true`. Delete it, or set anything else, to resume.
+
+**Dry run:** `gh workflow run factory-auto-merge.yml -f dry_run=true` logs each
+decision and merges nothing. Without `-f pr_number=<n>` it evaluates every open
+PR.
+
+**Release caveat:** `GITHUB_TOKEN` merges do not start push-triggered
+workflows, so no `ci.yml` run starts on `main` for a factory merge. `deploy.yml`
+and `publish.yml` require a push-triggered `ci.yml` run on the release commit,
+so cut a release at a commit that has one.
+
 ## Observability
 
 Structured JSON logs via `structlog` to stdout. Events follow the schema in
