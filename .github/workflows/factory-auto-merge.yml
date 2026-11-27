@@ -1,0 +1,159 @@
+name: Factory Auto-Merge
+
+# TECH-11016, ported from rh-data-platform's factory-auto-merge.yml (TECH-9802).
+# Merges PRs the code factory owns, and only those.
+#
+# A PR is the factory's only if BOTH hold: head branch starts with `factory/`
+# AND it was opened by the rh-code-factory GitHub App (rh-code-factory[bot]).
+# It merges only when, for the exact head SHA: all four required checks are
+# green, and the Argus gate (auto-approve.yml) has approved that SHA (it does so
+# only when the Argus store holds an APPROVE at that SHA and CI is green). The
+# merge call is pinned to that SHA, so a push after the check makes GitHub refuse
+# it. Squash. Rules live in .github/scripts/factory-merge-eligibility.mjs
+# (unit-tested by factory-auto-merge-test.yml).
+#
+# Never merged here: any other PR; PRs touching migrations, auth, image,
+# packaging or anything under .github/ (commented for a person).
+#
+# MERGE IDENTITY: this workflow's own GITHUB_TOKEN, not an App with ruleset
+# bypass. The `main branch protection` ruleset (1 approving review with
+# last-push approval, four required checks, no bypass actors) therefore stays
+# fully in force: GitHub refuses the merge if it is not satisfied. Consequence:
+# merges by GITHUB_TOKEN do not start push-triggered workflows, so the CI run on
+# `main` that a person's merge would start does not run for a factory merge.
+# deploy.yml and publish.yml (on `release: published`) require a successful
+# push-triggered ci.yml run on the exact release commit, so a release cut at a
+# factory-merged commit is REFUSED (fail closed) until a later push to main has
+# CI. After a merge this workflow comments that on the PR.
+#
+# The Argus store is not read here: the IAM role that reads it trusts only
+# auto-approve.yml. The gate's APPROVED review at the head SHA is the evidence.
+#
+# OFF SWITCH: set repo variable FACTORY_AUTO_MERGE_DISABLED to `true` to stop all
+# factory merges. Delete it or set it to anything else to resume.
+# DRY RUN: dispatch with dry_run=true to log decisions without merging; without
+# pr_number it evaluates every open PR (so a person's PR shows as rejected).
+
+on:
+  workflow_run:
+    workflows: ["Auto-Approve PR (Argus)"]
+    types: [completed]
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Only consider this PR number (default: all open factory PRs)"
+        required: false
+        type: number
+      dry_run:
+        description: "Log the decision for each candidate and do not merge or comment"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: factory-auto-merge
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  merge:
+    if: |
+      vars.FACTORY_AUTO_MERGE_DISABLED != 'true' &&
+      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+      checks: read
+      issues: write
+    steps:
+      - name: Require the default branch
+        run: test "$GITHUB_REF" = refs/heads/main || { echo "::error::factory auto-merge runs only from refs/heads/main"; exit 1; }
+
+      - name: Checkout eligibility script from main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: refs/heads/main
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Evaluate and merge eligible factory PRs
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          ONLY_PR: ${{ github.event.inputs.pr_number }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          DISABLED: ${{ vars.FACTORY_AUTO_MERGE_DISABLED }}
+        with:
+          script: |
+            const { pathToFileURL } = require('url');
+            const path = require('path');
+            const { evaluateFactoryPr, FACTORY_BRANCH_PREFIX, FACTORY_BOT_LOGIN, BASE_BRANCH } = await import(
+              pathToFileURL(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/factory-merge-eligibility.mjs')).href
+            );
+            const { owner, repo } = context.repo;
+            const repoFull = `${owner}/${repo}`;
+            const disabled = process.env.DISABLED === 'true';
+            const dryRun = process.env.DRY_RUN === 'true';
+            const only = process.env.ONLY_PR ? parseInt(process.env.ONLY_PR, 10) : null;
+
+            // Dry run covers every open PR so the log also shows a person's PR being rejected.
+            const open = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', base: BASE_BRANCH, per_page: 100 });
+            const candidates = open.filter(p =>
+              (!only || p.number === only) &&
+              (dryRun || (p.head?.ref?.startsWith(FACTORY_BRANCH_PREFIX) && p.user?.login === FACTORY_BOT_LOGIN)));
+            core.info(`${candidates.length} candidate PR(s)${dryRun ? ' (dry run)' : ''}`);
+
+            let failures = 0;
+            for (const c of candidates) {
+              try {
+                let pr = (await github.rest.pulls.get({ owner, repo, pull_number: c.number })).data;
+                // mergeable is computed lazily: poll a few times before calling it unknown.
+                for (let i = 0; i < 5 && (pr.mergeable === null || pr.mergeable_state === 'unknown'); i++) {
+                  await new Promise(r => setTimeout(r, 4000));
+                  pr = (await github.rest.pulls.get({ owner, repo, pull_number: c.number })).data;
+                }
+                const sha = pr.head.sha;
+                if (pr.changed_files >= 3000) { core.warning(`PR #${c.number}: ${pr.changed_files} files, file list may be truncated; leaving for a person`); continue; }
+                const files = (await github.paginate(github.rest.pulls.listFiles, { owner, repo, pull_number: c.number, per_page: 100 })).flatMap(f => f.previous_filename ? [f.filename, f.previous_filename] : [f.filename]);
+                const reviews = await github.paginate(github.rest.pulls.listReviews, { owner, repo, pull_number: c.number, per_page: 100 });
+                const checkRuns = await github.paginate(github.rest.checks.listForRef, { owner, repo, ref: sha, per_page: 100 });
+
+                const result = evaluateFactoryPr({ pr, repo: repoFull, files, reviews, checkRuns, disabled });
+                core.info(`PR #${c.number} @ ${sha.slice(0, 7)}: ${result.action} (${result.reason})`);
+                if (dryRun) continue;
+
+                if (result.action === 'hold') {
+                  const marker = `<!-- factory-auto-merge-hold ${require('crypto').createHash('sha1').update([...new Set(result.paths)].sort().join('\n')).digest('hex')} -->`;
+                  const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: c.number, per_page: 100 });
+                  if (!comments.some(x => x.body?.includes(marker))) {
+                    await github.rest.issues.createComment({ owner, repo, issue_number: c.number, body:
+                      `${marker}\nFactory auto-merge is not merging this PR: it touches hold-list paths (migrations, auth, image and packaging files, anything under .github/). A person must merge it.\n\n` +
+                      result.paths.map(p => `- \`${p}\``).join('\n') });
+                  }
+                  continue;
+                }
+                if (result.action !== 'merge') continue;
+
+                // Pinned to the evaluated head SHA: GitHub returns 409 if the head moved.
+                try {
+                  await github.rest.pulls.merge({ owner, repo, pull_number: c.number, sha, merge_method: 'squash' });
+                  core.info(`PR #${c.number} merged at ${sha}`);
+                  await github.rest.issues.createComment({ owner, repo, issue_number: c.number, body:
+                    `Factory auto-merge merged this PR at \`${sha.slice(0, 7)}\` (squash). The merge was made with the workflow token, so no CI run starts on \`main\` for the new commit. deploy.yml and publish.yml refuse a release cut at a commit with no push-triggered CI run: cut releases at a commit that has one.` });
+                } catch (e) {
+                  // 405/409: head moved or the ruleset is not satisfied right now; the schedule retries.
+                  if (e.status === 405 || e.status === 409) { core.warning(`PR #${c.number}: not mergeable (${e.status}: ${e.message}); retrying next run`); continue; }
+                  throw e;
+                }
+              } catch (e) {
+                // One PR failing must not stop the others; the schedule retries.
+                failures++;
+                core.error(`PR #${c.number}: ${e.message}`);
+              }
+            }
+            if (failures > 0) core.setFailed(`${failures} factory PR(s) failed to evaluate or merge; the schedule retries`);
