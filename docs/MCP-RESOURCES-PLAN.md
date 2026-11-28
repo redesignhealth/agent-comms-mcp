@@ -272,3 +272,14 @@ non-test code)
 
 **A ships as its own PR** (independently useful, zero new state); **B follows**. No DB migration
 in either phase.
+
+## 8. Sibling identity resolution (TECH-6697 / TECH-6700)
+
+Conversation resource reads and conversation/inbox subscriptions previously required the caller's bare `base_sub` identity to be active and admitted. Under the org's convention of always registering with `agent_key="claude-code"`, a bare identity was often not registered or not a participant in the conversation.
+
+Rather than auto-guessing or falling back among sibling identities, this limitation is solved via an explicit identity selector in the URI, mirroring the `agent_inbox_resource` pattern (`comms://comms/agents/{agent_id}/inbox`):
+
+- **Explicit conversation resource**: `comms://comms/agents/{agent_id}/conversations/{conversation_id}` (`agent_conversation_resource`). Self-only: `agent_id` must resolve to the caller's own board identity (bare base sub or one of its `{base_sub}::`-prefixed siblings) via `service.resolve_inbox_target`. Once resolved, the conversation is read as that explicit identity (`actor_sub=target.sub`, `caller_agent_id=caller.id`).
+- **Identity-qualified conversation subscriptions**: `authorize_resource_subscribe` recognizes the `comms://comms/agents/{agent_id}/conversations/{conversation_id}` URI shape, authorizes against the resolved sibling's active participant status, charges the subscription cap and audits against that sibling `agent_id`, and registers the subscription under the **canonical** conversation URI (`subscriptions.conversation_uri(conversation_id)`). This canonicalization ensures `notify_conversation_event` pings (which are always emitted on the canonical URI) are received by the subscriber.
+- **Inbox subscription bug fix**: `authorize_resource_subscribe`'s inbox branch resolves `caller` via `target.sub` (the resolved sibling) rather than discarding it and defaulting to `base_sub`, allowing sibling inbox subscriptions when the bare identity is unregistered or suspended.
+- **Plain conversation resource unchanged**: `comms://comms/conversations/{conversation_id}` remains strictly bare-identity-only with no guessing or fallback machinery.

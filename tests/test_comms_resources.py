@@ -423,6 +423,269 @@ class TestConversationResource:
             )
 
 
+class TestAgentConversationResource:
+    """TECH-6697 / TECH-6700: comms://comms/agents/{agent_id}/conversations/{conversation_id}."""
+
+    async def test_bare_identity_conversation_read_succeeds(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        _conversation_id, ids = await _start_open_conversation(
+            main, test_session_factory, "agent-conv-owner", "agent-conv-member"
+        )
+        member_token = _token("agent-conv-member")
+        member_id = ids["agent-conv-member"]
+
+        await _call(
+            main,
+            test_session_factory,
+            member_token,
+            "comms_accept",
+            {"conversation_id": _conversation_id},
+        )
+
+        tool_result = await _call(
+            main,
+            test_session_factory,
+            member_token,
+            "comms_get_conversation",
+            {"conversation_id": _conversation_id, "since_seq": 0},
+        )
+        resource_result = await _read_resource(
+            main,
+            test_session_factory,
+            member_token,
+            f"comms://comms/agents/{member_id}/conversations/{_conversation_id}",
+        )
+        assert resource_result == tool_result
+        assert resource_result["invited"] is False
+        assert len(resource_result["messages"]) >= 1
+
+    async def test_sibling_identity_conversation_read_succeeds(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        base_sub = "agent-conv-sib-base"
+        token = _token(base_sub)
+        # Register sibling only; bare is unregistered
+        await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {
+                "display_name": "Claude Code Sibling",
+                "accepted_types": sorted(MESSAGE_TYPES),
+                "agent_key": "claude-code",
+            },
+        )
+        await _register(main, test_session_factory, "agent-conv-counter")
+        counter_token = _token("agent-conv-counter")
+
+        list_res = await _call(main, test_session_factory, token, "comms_list_agents")
+        ids = {a["sub"]: a["agent_id"] for a in list_res["agents"]}
+        sibling_id = ids[f"{base_sub}::claude-code"]
+
+        started = await _call(
+            main,
+            test_session_factory,
+            counter_token,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [sibling_id],
+                "initial_message": _availability_request(),
+            },
+        )
+        conv_id = started["conversation_id"]
+
+        await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_accept",
+            {"conversation_id": conv_id, "agent_key": "claude-code"},
+        )
+
+        tool_result = await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_get_conversation",
+            {"conversation_id": conv_id, "agent_key": "claude-code", "since_seq": 0},
+        )
+        resource_result = await _read_resource(
+            main,
+            test_session_factory,
+            token,
+            f"comms://comms/agents/{sibling_id}/conversations/{conv_id}",
+        )
+        assert resource_result == tool_result
+        assert resource_result["invited"] is False
+        assert len(resource_result["messages"]) >= 1
+
+    async def test_stranger_agent_id_is_uniformly_denied(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        conv_id, ids = await _start_open_conversation(
+            main, test_session_factory, "agent-conv-a", "agent-conv-b"
+        )
+        await _register(main, test_session_factory, "agent-conv-stranger")
+        stranger_token = _token("agent-conv-stranger")
+
+        with pytest.raises(
+            McpError, match=re.escape("access_denied: not authorized for this resource")
+        ):
+            await _read_resource(
+                main,
+                test_session_factory,
+                stranger_token,
+                f"comms://comms/agents/{ids['agent-conv-b']}/conversations/{conv_id}",
+            )
+
+    async def test_unknown_agent_id_is_uniformly_denied(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        conv_id, _ids = await _start_open_conversation(
+            main, test_session_factory, "agent-conv-u1", "agent-conv-u2"
+        )
+        unknown_id = "00000000-0000-0000-0000-000000000000"
+        with pytest.raises(
+            McpError, match=re.escape("access_denied: not authorized for this resource")
+        ):
+            await _read_resource(
+                main,
+                test_session_factory,
+                _token("agent-conv-u1"),
+                f"comms://comms/agents/{unknown_id}/conversations/{conv_id}",
+            )
+
+    async def test_suspended_sibling_conversation_resource_is_denied(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        base_sub = "agent-conv-susp-sib"
+        token = _token(base_sub)
+        await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {
+                "display_name": "Worker Sibling",
+                "accepted_types": sorted(MESSAGE_TYPES),
+                "agent_key": "worker",
+            },
+        )
+        await _register(main, test_session_factory, "agent-conv-susp-counter")
+        counter_token = _token("agent-conv-susp-counter")
+
+        list_res = await _call(main, test_session_factory, token, "comms_list_agents")
+        ids = {a["sub"]: a["agent_id"] for a in list_res["agents"]}
+        worker_id = ids[f"{base_sub}::worker"]
+
+        started = await _call(
+            main,
+            test_session_factory,
+            counter_token,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [worker_id],
+                "initial_message": _availability_request(),
+            },
+        )
+        conv_id = started["conversation_id"]
+
+        await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_accept",
+            {"conversation_id": conv_id, "agent_key": "worker"},
+        )
+
+        admin_token = _token("admin-operator", scopes=["comms:read", "comms:write", "comms:admin"])
+        await _call(
+            main,
+            test_session_factory,
+            admin_token,
+            "comms_deregister_agent",
+            {"agent_id": worker_id},
+        )
+
+        with pytest.raises(McpError, match="agent_suspended"):
+            await _read_resource(
+                main,
+                test_session_factory,
+                token,
+                f"comms://comms/agents/{worker_id}/conversations/{conv_id}",
+            )
+
+    async def test_plain_conversation_resource_does_not_fallback_to_sibling(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Regression guard: comms://comms/conversations/{conv_id} strictly resolves
+        against bare base_sub and does NOT fall back to active sibling."""
+        base_sub = "conv-res-no-fallback"
+        token = _token(base_sub)
+        # Register sibling only (bare is unregistered)
+        await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {
+                "display_name": "Active Sibling",
+                "accepted_types": sorted(MESSAGE_TYPES),
+                "agent_key": "worker",
+            },
+        )
+        await _register(main, test_session_factory, "conv-res-nf-counter")
+        counter_token = _token("conv-res-nf-counter")
+
+        list_res = await _call(main, test_session_factory, token, "comms_list_agents")
+        ids = {a["sub"]: a["agent_id"] for a in list_res["agents"]}
+        worker_id = ids[f"{base_sub}::worker"]
+
+        started = await _call(
+            main,
+            test_session_factory,
+            counter_token,
+            "comms_start_conversation",
+            {
+                "conversation_type": "open",
+                "target_agent_ids": [worker_id],
+                "initial_message": _availability_request(),
+            },
+        )
+        conv_id = started["conversation_id"]
+
+        await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_accept",
+            {"conversation_id": conv_id, "agent_key": "worker"},
+        )
+
+        # Plain conversation resource fails because bare identity is not registered
+        with pytest.raises(McpError, match="not_registered"):
+            await _read_resource(
+                main,
+                test_session_factory,
+                token,
+                f"comms://comms/conversations/{conv_id}",
+            )
+
+        # Explicit agent conversation resource succeeds
+        result = await _read_resource(
+            main,
+            test_session_factory,
+            token,
+            f"comms://comms/agents/{worker_id}/conversations/{conv_id}",
+        )
+        assert result["invited"] is False
+        assert len(result["messages"]) >= 1
+
+
 class TestAgentInboxResource:
     async def test_suspended_agent_own_inbox_resource_is_denied(
         self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
@@ -591,6 +854,45 @@ class TestAgentInboxResource:
         assert result["total_count"] == 0
         assert result["unread"] == []
         assert result["pending_invites"] == []
+
+    async def test_suspended_sibling_inbox_resource_is_denied(
+        self, main: Any, test_session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Regression test: inbox read path is unaffected by conversation fallback
+        changes — a suspended sibling agent's own inbox is still denied."""
+        base_sub = "inbox-res-sib-susp"
+        token = _token(base_sub)
+        await _call(
+            main,
+            test_session_factory,
+            token,
+            "comms_register",
+            {
+                "display_name": "Suspended Sibling",
+                "accepted_types": sorted(MESSAGE_TYPES),
+                "agent_key": "worker",
+            },
+        )
+        list_res = await _call(main, test_session_factory, token, "comms_list_agents")
+        ids = {a["sub"]: a["agent_id"] for a in list_res["agents"]}
+        worker_id = ids[f"{base_sub}::worker"]
+
+        admin_token = _token("admin-operator", scopes=["comms:read", "comms:write", "comms:admin"])
+        await _call(
+            main,
+            test_session_factory,
+            admin_token,
+            "comms_deregister_agent",
+            {"agent_id": worker_id},
+        )
+
+        with pytest.raises(McpError, match="agent_suspended"):
+            await _read_resource(
+                main,
+                test_session_factory,
+                token,
+                f"comms://comms/agents/{worker_id}/inbox",
+            )
 
 
 class TestAgentsDirectoryResource:
