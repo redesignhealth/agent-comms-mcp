@@ -1282,6 +1282,9 @@ async def submit_proposal(request: Request) -> Response:
                     "error": "invalid_request",
                     "detail": str(exc),
                     "field_errors": [{"path": p, "code": c} for p, c in exc.field_errors],
+                    # The structured form (a fixed sentence per rule; no submitted
+                    # value): {code, message, errors: [{path, rule, message}]}.
+                    **exc.structured(),
                 },
                 status_code=422,
             )
